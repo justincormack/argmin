@@ -1,0 +1,189 @@
+Far-future heartbeat can poison node lease deadlines
+Link: https://chatgpt.com/codex/cloud/security/findings/96b878dc6c7c819194862ec25a6909a7?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 0d61d3f
+Author: justin@specialbusservice.com
+Created: 09/07/2026, 18:41:31
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: far-future heartbeat timestamps are no longer rejected, but only the committed high-water mark is bounded. The persisted lease_deadline_ms remains derived from the unbounded authority time and is monotonic, so it can poison availability/failover state across clock correction.
+Before this commit, RecordNodeHeartbeat used validate_committed_timestamp and rejected heartbeat_at_ms values more than MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS ahead of the durable high-water mark. The new code only rejects regressions, computes a bounded committed timestamp, and records that bounded value as max_committed_timestamp_ms. However, the lease deadline is still computed from the original unbounded heartbeat_at_ms / authority_now_ms and is persisted into the node record. Because later heartbeats preserve the maximum existing lease deadline and expiry only clears a node when expire_at_ms reaches that stored deadline, a single heartbeat processed while the authority clock is far in the future can leave the node with an effectively unexpirable lease after the clock is corrected. The node may continue to be considered serving, and if it later dies, failover/expiry can be suppressed until the far-future timestamp. This appears introduced by replacing the previous forward-jump rejection on heartbeats with bounded high-water catch-up without similarly bounding or making recoverable the recorded lease deadline.
+
+# Validation
+## Rubric
+- [x] Confirm the commit changed heartbeat timestamp validation from rejecting forward jumps to accepting them while bounding only `max_committed_timestamp_ms`.
+- [x] Confirm the heartbeat lease deadline is computed from unbounded `heartbeat_at_ms` / `authority_now_ms` and max-preserved against any current deadline.
+- [x] Reproduce with the real `SingleAuthorityControlPlane::heartbeat` API that a far-future heartbeat stores a far-future `lease_deadline_ms` while committed high-water advances only by the bound.
+- [x] Show that a later corrected-time heartbeat after bounded catch-up cannot reduce the poisoned lease deadline and can still report serving.
+- [x] Show that normal-time lease expiry does not mark the node unavailable because the persisted deadline remains far in the future; confirm the final state under a debugger.
+## Report
+Validated the finding as a logic/availability bug. Direct crash is not expected for this class of issue; the PoC uses assertions that would fail if the vulnerable behavior were absent. I first built and ran the targeted Rust PoC with `cargo run -p storage --example lease_poison_poc`, then attempted valgrind (`valgrind not installed`), then used LLDB non-interactively to stop at a validation marker and inspect the poisoned state.
+
+Key code evidence: `crates/storage/src/control_plane.rs:929-932` bounds only the committed timestamp step. In `RecordNodeHeartbeat`, `expected_lease_deadline_ms` is still derived from unbounded `heartbeat_at_ms` at lines 1476-1478, the far-future heartbeat is rejected only if it regresses below the committed high-water mark at lines 1486-1493, and the bounded timestamp is used only for `record_committed_timestamp` at lines 1494-1495 and 1598-1599. The unbounded/max-preserved `lease_deadline_ms` is persisted into the node record at line 1622. Later expiry only marks unavailable when stored `lease_deadline_ms <= expire_at_ms` at lines 1727-1732. The public heartbeat path also preserves the maximum current deadline at lines 3800-3808.
+
+The PoC establishes a normal committed timestamp of 1000ms, submits a far-future heartbeat at 1000000000000ms, observes the committed high-water bounded to 3601000ms while the node lease deadline is persisted as 1000000000100ms, sends a normal corrected-time heartbeat at 3601001ms, and then attempts expiry at 3602001ms. Despite being far beyond the normal 100ms requested lease, the node remains Healthy and `expired_nodes=0` because the far-future deadline remains stored.
+
+Command output from the direct PoC run: `VULNERABLE: far_future_now=1000000000000 bounded_high_water=3601000 poisoned_deadline=1000000000100 normal_expire_at=3602001 remaining_deadline=1000000000100 expired_nodes=0`.
+
+LLDB evidence stopped at `validation_marker`: `poisoned_deadline=1000000000100, bounded_high_water=3601000, normal_expire_at=3602001, remaining_deadline=1000000000100, expired_count=0`, with the backtrace showing the marker was reached from `lease_poison_poc::main` after the expiry attempt.
+
+# Evidence
+crates/storage/src/control_plane.rs (L1476 to 1500)
+  Note: RecordNodeHeartbeat now rejects only timestamp regressions. A far-future heartbeat_at_ms is accepted, bounded only for committed_heartbeat_at_ms, while committed_lease_deadline_ms is still calculated from the unbounded heartbeat_at_ms and preserves any existing far-future deadline.
+```
+                let expected_lease_deadline_ms = heartbeat_at_ms
+                    .checked_add(heartbeat.requested_lease_duration_ms)
+                    .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+                let current_epoch = self.cluster_epoch;
+                let record =
+                    self.nodes
+                        .get(&heartbeat.node_id)
+                        .ok_or(ControlPlaneError::UnknownNode {
+                            node_id: heartbeat.node_id.as_u32(),
+                        })?;
+                if let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms {
+                    if heartbeat_at_ms < max_committed_timestamp_ms {
+                        return Err(ControlPlaneError::CommittedTimestampRegression {
+                            timestamp_ms: heartbeat_at_ms,
+                            max_committed_timestamp_ms,
+                        });
+                    }
+                }
+                let committed_heartbeat_at_ms =
+                    self.bounded_committed_timestamp_step(heartbeat_at_ms);
+                let committed_lease_deadline_ms = record.lease_deadline_ms.map_or(
+                    expected_lease_deadline_ms,
+                    |current_lease_deadline_ms| {
+                        current_lease_deadline_ms.max(expected_lease_deadline_ms)
+                    },
+```
+
+crates/storage/src/control_plane.rs (L1598 to 1622)
+  Note: The snapshot records the bounded committed timestamp but persists the unbounded lease_deadline_ms into the node record, making the far-future lease durable.
+```
+                let mut next_snapshot = self.clone();
+                next_snapshot.record_committed_timestamp(committed_heartbeat_at_ms);
+                {
+                    let record = next_snapshot
+                        .nodes
+                        .get_mut(&heartbeat.node_id)
+                        .expect("node record validated before heartbeat mutation");
+                    if heartbeat.node_incarnation > record.node_incarnation {
+                        record.node_incarnation = heartbeat.node_incarnation;
+                        epoch_changed = true;
+                        affected_node = Some(heartbeat.node_id);
+                    }
+                    if record.endpoint != heartbeat.endpoint {
+                        record.endpoint = heartbeat.endpoint;
+                        epoch_changed = true;
+                        affected_node = Some(heartbeat.node_id);
+                    }
+                    if record.availability != NodeAvailabilityState::Healthy {
+                        record.availability = NodeAvailabilityState::Healthy;
+                        epoch_changed = true;
+                        affected_node = Some(heartbeat.node_id);
+                    }
+                    record.record_observed_epoch(heartbeat.observed_epoch);
+                    record.last_heartbeat_ms = Some(heartbeat_at_ms);
+                    record.lease_deadline_ms = Some(lease_deadline_ms);
+```
+
+crates/storage/src/control_plane.rs (L1727 to 1732)
+  Note: Lease expiry only clears a node once expire_at_ms reaches the stored lease_deadline_ms, so a poisoned far-future deadline prevents normal expiry/failover.
+```
+                    if record
+                        .lease_deadline_ms
+                        .is_some_and(|lease_deadline_ms| lease_deadline_ms <= expire_at_ms)
+                    {
+                        record.availability = NodeAvailabilityState::Unavailable;
+                        record.lease_deadline_ms = None;
+```
+
+crates/storage/src/control_plane.rs (L3800 to 3809)
+  Note: The public heartbeat path computes lease_deadline_ms from authority_now_ms and then takes the max with the current deadline, so later normal-time heartbeats cannot reduce a poisoned far-future lease.
+```
+        let lease_deadline_ms = authority_now_ms
+            .checked_add(heartbeat.requested_lease_duration_ms)
+            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+        let lease_deadline_ms = self
+            .snapshot
+            .node(heartbeat.node_id)
+            .and_then(NodeControlRecord::lease_deadline_ms)
+            .map_or(lease_deadline_ms, |current_lease_deadline_ms| {
+                current_lease_deadline_ms.max(lease_deadline_ms)
+            });
+```
+
+crates/storage/src/control_plane.rs (L929 to 932)
+  Note: The new helper bounds only the committed timestamp high-water mark; it does not bound the heartbeat timestamp used for lease calculation.
+```
+    fn bounded_committed_timestamp_step(&self, timestamp_ms: u64) -> u64 {
+        self.max_committed_timestamp_ms.map_or(timestamp_ms, |max| {
+            timestamp_ms.min(max.saturating_add(MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS))
+        })
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from medium to low for attacker-reachability reasons. The bug is real and the validation PoC demonstrates durable lease poisoning and skipped expiry. However, static review shows the normal reachable heartbeat RPC supplies heartbeat_at_ms from the control-plane authority clock, not attacker-controlled request data, and the interface is an internal Unix socket with private-directory checks and optional scoped authentication. The resulting impact is availability/failover degradation, not data exposure or privilege escalation. A practical attack needs an internal/storage-node actor and far-future control-plane clock influence, making likelihood low despite medium operational impact.
+## Likelihood
+low - The executable PoC proves the state-machine bug, but it uses internal storage/control-plane APIs. The production heartbeat path takes the dangerous timestamp from the control-plane clock, and the control-plane interface is local/private and optionally authenticated. Exploitation therefore requires internal access plus clock-skew influence or a coincident far-future authority clock.
+## Impact
+medium - If triggered, a failed storage node can remain Healthy and lease expiry/failover can be suppressed until a far-future deadline, degrading availability and potentially routing correctness. There is no evidence of confidentiality loss, authentication bypass for S3 data, code execution, or secret exposure.
+## Assumptions
+- The vulnerable control-plane and storage-node process roles are deployed; the default legacy-local single-node S3 mode does not appear to exercise this heartbeat lease path.
+- The normal production heartbeat RPC path uses the control-plane authority clock, not a client-supplied heartbeat timestamp.
+- An attacker would need local/internal control-plane access or a storage-node credential, plus a way to cause or wait for a far-future authority clock sample.
+- argmin-s3 deployed with control-plane/storage-node roles or experimental Raft control-plane
+- heartbeat processed while the control-plane authority clock is far in the future
+- attacker has local Unix-socket access, storage-node heartbeat credential, or another way to trigger a node heartbeat during the skew
+- node later fails before the poisoned far-future lease deadline
+## Path
+Internal heartbeat RPC -> far-future authority clock -> accepted RecordNodeHeartbeat -> unbounded lease_deadline_ms persisted -> normal-time expiry skipped -> failover/availability impact
+## Path evidence
+- `crates/storage/src/control_plane.rs:929-932` - bounded_committed_timestamp_step limits only the committed timestamp high-water mark.
+- `crates/storage/src/control_plane.rs:1476-1500` - RecordNodeHeartbeat computes expected_lease_deadline_ms from unbounded heartbeat_at_ms and rejects only timestamp regressions, then separately computes the bounded committed heartbeat timestamp.
+- `crates/storage/src/control_plane.rs:1598-1622` - The snapshot records the bounded committed timestamp but persists record.lease_deadline_ms from the unbounded/max-preserved deadline.
+- `crates/storage/src/control_plane.rs:1727-1732` - Lease expiry only marks a node unavailable when expire_at_ms reaches the stored lease_deadline_ms, so a far-future stored deadline suppresses normal expiry.
+- `crates/storage/src/control_plane.rs:3800-3809` - The public control-plane heartbeat path computes lease_deadline_ms from authority_now_ms and preserves the maximum existing deadline, preventing later normal-time heartbeats from reducing a poisoned deadline.
+- `crates/storage/src/control_plane.rs:7954-7981` - Heartbeat RPC preparation verifies storage-node heartbeat authentication only when the verifier has storage-node credentials configured; otherwise it decodes the payload and refreshes the heartbeat.
+- `crates/argmin-s3/src/main.rs:3051-3062` - The control-plane RPC worker supplies storage::clock::current_time_millis() as authority_now_ms for heartbeat processing, showing the far-future timestamp is authority-clock derived rather than directly client supplied.
+- `crates/argmin-s3/src/main.rs:3640-3693` - The control-plane server binds a Unix socket after creating/checking a private owner-only socket directory.
+- `crates/argmin-s3/src/config.rs:429` - Default S3 frontend listen address is 127.0.0.1:9000; public exposure requires configuration.
+- `crates/argmin-s3/src/config.rs:871-881` - Configured heartbeat lease duration must be positive, at least refresh interval, and no more than MAX_HEARTBEAT_LEASE_MS, reducing but not eliminating the far-future authority-time issue.
+## Narrative
+The finding is a real control-plane logic bug: validation evidence demonstrates that a far-future heartbeat can persist a lease deadline such as 1000000000100 while the committed timestamp is bounded to 3601000, and later expiry at normal time does not mark the node unavailable. Static review supports this: only max_committed_timestamp_ms is bounded, while lease_deadline_ms is computed from unbounded heartbeat_at_ms/authority_now_ms and max-preserved. The security reachability is limited. In the normal Unix RPC path the timestamp comes from storage::clock::current_time_millis() on the control-plane authority, not directly from attacker payload, and the control-plane socket is local/private with optional authentication. Therefore this is best treated as a low-likelihood internal availability issue rather than a remotely exploitable S3 vulnerability.
+## Controls
+- S3 SigV4 authentication for public HTTP object API
+- control-plane RPC over local Unix socket rather than TCP
+- control-plane socket directory must be private and service-user owned
+- optional scoped control-plane authentication for storage heartbeat/frontend/admin/Raft
+- heartbeat lease duration cap via MAX_HEARTBEAT_LEASE_MS
+- control-plane RPC worker limits and I/O timeouts
+- non-root process guard
+## Blindspots
+- No Kubernetes, Terraform, or deployment manifests were present in the shallow repository search, so actual production socket placement, auth configuration, and public exposure could not be verified.
+- Static-only attack-path review did not exercise a full multi-process distributed deployment.
+- The validation PoC demonstrates the state-machine effect but does not prove exploitation through an external S3 HTTP request path.
+- Clock-skew influence depends on host/NTP/operator environment outside repository artifacts.
+
+# Resolution
+Fixed in `159828be8e9f5093eabcce78faae06d69e6f60b3` (`Enforce bounded control-plane lease clocks`).
+
+The reported split between a bounded committed timestamp and an unbounded persisted heartbeat lease deadline no longer exists:
+
+- heartbeat renewal computes the deadline through `bounded_renewal_deadline`, which rejects a new or max-preserved deadline beyond `effective_committed_now + MAX_HEARTBEAT_LEASE_MS + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS`;
+- deterministic command apply recomputes that deadline from the committed heartbeat timestamp and rejects a caller-supplied mismatch before mutation;
+- snapshot publication and reload validation reject persisted node lease deadlines outside the same serving bound; and
+- the process-local `ControlPlaneAuthorityClock` compares wall-clock progress with an independent monotonic health source, latches unhealthy on a forward discontinuity, and prevents a far-future wall sample from becoming a proposed heartbeat timestamp. Raft leadership changes also invalidate clock authority until it is explicitly re-established.
+
+The deterministic state-machine API intentionally treats its committed timestamp as trusted consensus input. Real-time validity is established before proposal by the process-local authority clock, while replay independently enforces timestamp monotonicity and the serving-deadline bound. This trust boundary and the corresponding consumer lease rules are documented in `guides/control-plane-clock-and-lease-model.md`.
+
+Regression coverage includes far-future authority-clock rejection, rejection of serving deadlines beyond the replicated bound, refusal to preserve an already out-of-bounds deadline during renewal, arithmetic-overflow failure, leadership-term clock invalidation, and independent-clock lease model cases covering clock steps, suspend, and delayed stale-map rebinding.
