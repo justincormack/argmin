@@ -23,7 +23,7 @@ bucket class.
 That said, directory-bucket-only request features still need to behave like
 AWS when they are sent to a standard bucket. We keep explicit compatibility
 coverage for that behavior in
-[crates/s3-tests/tests/directory_bucket_features.rs](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/tests/directory_bucket_features.rs),
+[crates/s3-tests/tests/directory_bucket_features.rs](../crates/s3-tests/tests/directory_bucket_features.rs),
 including cases where AWS ignores a directory-bucket-specific query and cases
 where AWS rejects a directory-bucket-specific header or parameter with the
 corresponding error.
@@ -257,8 +257,8 @@ instead:
 
 Related notes:
 
-- [plans/completed/territory-map.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/territory-map.md)
-- [plans/completed/sse-c-encryption-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/sse-c-encryption-plan.md)
+- [plans/completed/territory-map.md](../plans/completed/territory-map.md)
+- [plans/completed/sse-c-encryption-plan.md](../plans/completed/sse-c-encryption-plan.md)
 
 ### 2. `SSE-KMS` is not implemented
 
@@ -267,7 +267,7 @@ yet.
 
 Related plan:
 
-- [plans/encryption-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/encryption-compat-plan.md)
+- [plans/encryption-compat-plan.md](../plans/encryption-compat-plan.md)
 
 ### 3. Bucket logging is not implemented
 
@@ -278,8 +278,8 @@ This also means the logging-specific ACL compatibility work remains deferred.
 
 Related notes:
 
-- [plans/completed/ceph-closeout-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/ceph-closeout-plan.md)
-- [plans/completed/acl-compatibility-follow-up-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/acl-compatibility-follow-up-plan.md)
+- [plans/completed/ceph-closeout-plan.md](../plans/completed/ceph-closeout-plan.md)
+- [plans/completed/acl-compatibility-follow-up-plan.md](../plans/completed/acl-compatibility-follow-up-plan.md)
 
 ### 4. Bucket website support is only partial
 
@@ -300,7 +300,7 @@ endpoint, not the website endpoint or bucket website configuration APIs.
 
 Related note:
 
-- [plans/website-behavior-note.md](/home/justin/src/github.com/justincormack/argmin/plans/website-behavior-note.md)
+- [plans/website-behavior-note.md](../plans/website-behavior-note.md)
 
 ### 5. Alternate AWS access URL forms are not supported
 
@@ -331,7 +331,7 @@ Unsupported URL/addressing forms include:
 
 Related note:
 
-- [guides/threat_model.md](/home/justin/src/github.com/justincormack/argmin/guides/threat_model.md)
+- [guides/threat_model.md](threat_model.md)
 
 ### 6. Billing surfaces are not implemented
 
@@ -439,7 +439,7 @@ In practice:
 
 Related note:
 
-- [plans/sigv2-compat-note.md](/home/justin/src/github.com/justincormack/argmin/plans/sigv2-compat-note.md)
+- [plans/sigv2-compat-note.md](../plans/sigv2-compat-note.md)
 
 ### 11. Account-level Block Public Access is not implemented
 
@@ -452,7 +452,7 @@ bucket ACL and public-write behavior can still differ from AWS.
 
 Related plan:
 
-- [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
+- [plans/aws-auth-compat-plan.md](../plans/aws-auth-compat-plan.md)
 
 ### 12. The `s3-control` API family is not implemented
 
@@ -479,15 +479,20 @@ In practice, any AWS behavior that depends on `s3-control` APIs, endpoint
 routing, or control-plane state such as `TagResource` / `UntagResource` should
 be treated as unsupported apart from this narrow bucket-ABAC tagging subset.
 
-### 12. Bucket-policy condition acceptance and runtime context are still partial
+### 12. Bucket-policy condition support is broad but still partial
 
 Argmin's compatibility target is to accept the same bucket-policy condition
 keys that AWS accepts on the implemented S3 surface, even when the current
 runtime does not yet have enough request context to make every condition
 equally useful.
 
-Today, that means two different compatibility questions have to be kept
-separate:
+The important split is between condition operators and condition keys. The AWS
+IAM operator reference groups operators into string, numeric, date/time,
+boolean, binary, IP address, ARN, `...IfExists`, and `Null` families. The AWS
+S3 service-authorization reference separately lists the S3-specific condition
+keys and their value types.
+
+Today, two compatibility questions have to be kept separate:
 
 - policy upload acceptance
 - runtime evaluation of a stored policy against a live request
@@ -503,12 +508,27 @@ Current runtime-evaluation limits include:
   `aws:PrincipalOrgID`, `s3:DataAccessPointAccount`, and
   `s3:DataAccessPointArn` still remain outside the current accepted/evaluable
   object-condition subset
-- `s3:ResourceTag/*` object-policy evaluation is still deferred
+- S3 request-context keys that require additional HTTP/auth/transport context
+  are still deferred, including `s3:authType`, `s3:ResourceAccount`,
+  `s3:signatureAge`, `s3:signatureversion`, `s3:TlsVersion`, and
+  `s3:x-amz-content-sha256`
+- S3 object-lock condition keys such as `s3:object-lock-mode`,
+  `s3:object-lock-legal-hold`, `s3:object-lock-retain-until-date`, and
+  `s3:object-lock-remaining-retention-days` are not yet runtime-evaluable
+- access point, access grants, storage lens, batch job, replication, annotation,
+  and KMS-specific condition keys remain outside the current general-purpose
+  bucket/object API subset
 
 The current implemented evaluator is strongest on:
 
 - `s3:ExistingObjectTag/*`
+- `s3:BucketTag/*`
+- `aws:ResourceTag/*`, as bucket tags on the currently supported bucket-ABAC
+  surface
 - `s3:RequestObjectTag/*`
+- `aws:RequestTag/*`
+- `s3:RequestObjectTagKeys`
+- `aws:TagKeys`
 - `aws:SourceIp`
 - `aws:CurrentTime`
 - `aws:EpochTime`
@@ -552,15 +572,23 @@ Current supported condition operators are:
 - `ForAllValues:NotIpAddress`, `ForAnyValue:NotIpAddress`
 
 Compared with the IAM condition-operator reference, unsupported operator
-families are:
+forms are:
 
-- numeric set operators such as `ForAllValues:NumericEquals` and
-  `ForAnyValue:NumericEquals`
-- date set operators such as `ForAllValues:DateEquals` and
-  `ForAnyValue:DateEquals`
 - ARN operators: `ArnEquals`, `ArnLike`, `ArnNotEquals`, `ArnNotLike`, and
-  their applicable set/`IfExists` forms
+  their applicable set/`IfExists` forms. These are intentionally deferred
+  rather than stubbed because the interesting S3 ARN condition keys mostly
+  depend on service-to-service, access point, KMS, or delivery-source context
+  that Argmin does not yet authenticate or model.
+- `BoolIfExists`
 - boolean set operators: `ForAllValues:Bool` and `ForAnyValue:Bool`
+- case-sensitive negated string set operators:
+  `ForAllValues:StringNotEquals` and `ForAnyValue:StringNotEquals`
+
+AWS documents generic set-operator semantics for multivalued context keys. The
+implemented set-qualified operators are the forms already needed by the current
+AWS-pinned S3 bucket-policy surface; any additional set-qualified numeric,
+date, or binary forms should be added only with AWS-facing coverage for the
+specific S3 condition key that exposes multiple values.
 
 `BinaryEquals` decodes the policy operand and request-context value as
 standard base64 and compares the resulting bytes exactly. It does not perform
@@ -584,6 +612,8 @@ References:
 
 - AWS IAM condition operators:
   <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html>
+- AWS S3 condition keys:
+  <https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3.html#amazons3-policy-keys>
 - AWS IAM policy variables:
   <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_variables.html>
 
@@ -594,7 +624,7 @@ those request attributes are modeled directly.
 
 Related plan:
 
-- [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
+- [plans/aws-auth-compat-plan.md](../plans/aws-auth-compat-plan.md)
 
 ### 13. `AccessDenied` does not yet match AWS principal-specific error text
 
@@ -627,7 +657,7 @@ through to error rendering.
 
 Related plan:
 
-- [plans/persistent-account-and-credential-management.md](/home/justin/src/github.com/justincormack/argmin/plans/persistent-account-and-credential-management.md)
+- [plans/persistent-account-and-credential-management.md](../plans/persistent-account-and-credential-management.md)
 
 ### 14. Bucket-policy principal validation is format-level only
 
