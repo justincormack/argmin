@@ -548,6 +548,7 @@ Current supported condition operators are:
 - `ForAllValues:StringEquals`, `ForAnyValue:StringEquals`
 - `ForAllValues:StringEqualsIgnoreCase`,
   `ForAnyValue:StringEqualsIgnoreCase`
+- `ForAllValues:StringNotEquals`, `ForAnyValue:StringNotEquals`
 - `ForAllValues:StringNotEqualsIgnoreCase`,
   `ForAnyValue:StringNotEqualsIgnoreCase`
 - `ForAllValues:StringLike`, `ForAnyValue:StringLike`
@@ -581,8 +582,6 @@ forms are:
   that Argmin does not yet authenticate or model.
 - `BoolIfExists`
 - boolean set operators: `ForAllValues:Bool` and `ForAnyValue:Bool`
-- case-sensitive negated string set operators:
-  `ForAllValues:StringNotEquals` and `ForAnyValue:StringNotEquals`
 
 AWS documents generic set-operator semantics for multivalued context keys. The
 implemented set-qualified operators are the forms already needed by the current

@@ -238,6 +238,18 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
+        name: "ForAllValues:StringNotEquals",
+        kind: ConditionOpKind::StringNotEquals,
+        evaluate: eval_for_all_values_string_not_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:StringNotEquals",
+        kind: ConditionOpKind::StringNotEquals,
+        evaluate: eval_for_any_value_string_not_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
         name: "StringNotEqualsIfExists",
         kind: ConditionOpKind::StringNotEquals,
         // StringNotEquals already treats Absent as Matches, so the IfExists
@@ -1107,6 +1119,60 @@ fn eval_string_not_equals(operands: &[String], actual: ActualValue<'_>) -> Condi
     }
 }
 
+fn eval_for_all_values_string_not_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands.iter().all(|expected| expected != actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals
+                .iter()
+                .all(|actual| operands.iter().all(|expected| expected != actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_string_not_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if operands.iter().all(|expected| expected != actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals
+                .iter()
+                .any(|actual| operands.iter().all(|expected| expected != actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
 fn eval_string_not_equals_ignore_case(
     operands: &[String],
     actual: ActualValue<'_>,
@@ -1525,14 +1591,20 @@ fn eval_for_all_values_ip_address(
     operands: &[String],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
-    eval_ip_address(operands, actual)
+    match actual {
+        ActualValue::Absent => ConditionMatchResult::Matches,
+        _ => eval_ip_address(operands, actual),
+    }
 }
 
 fn eval_for_any_value_ip_address(
     operands: &[String],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
-    eval_ip_address(operands, actual)
+    match actual {
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+        _ => eval_ip_address(operands, actual),
+    }
 }
 
 fn eval_ip_address_if_exists(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
@@ -1547,14 +1619,20 @@ fn eval_for_all_values_not_ip_address(
     operands: &[String],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
-    eval_not_ip_address(operands, actual)
+    match actual {
+        ActualValue::Absent => ConditionMatchResult::Matches,
+        _ => eval_not_ip_address(operands, actual),
+    }
 }
 
 fn eval_for_any_value_not_ip_address(
     operands: &[String],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
-    eval_not_ip_address(operands, actual)
+    match actual {
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+        _ => eval_not_ip_address(operands, actual),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2249,6 +2327,52 @@ mod tests {
     }
 
     #[test]
+    fn for_all_values_string_not_equals_requires_every_actual_value_to_differ() {
+        let op = lookup("ForAllValues:StringNotEquals").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringNotEquals);
+        let expected = operands(&["security", "team"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project", "owner"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["project", "team"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&[])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn for_any_value_string_not_equals_requires_one_actual_value_to_differ() {
+        let op = lookup("ForAnyValue:StringNotEquals").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::StringNotEquals);
+        let expected = operands(&["security"]);
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security", "project"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, present_values(&["security"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
     fn string_not_equals_ignore_case_absent_matches_regardless_of_if_exists() {
         let base = lookup("StringNotEqualsIgnoreCase").unwrap();
         let if_exists = lookup("StringNotEqualsIgnoreCaseIfExists").unwrap();
@@ -2545,6 +2669,48 @@ mod tests {
         );
         assert_eq!(
             (op.evaluate)(&operands(&["127.0.0.0/8"]), source_ip("127.0.0.1")),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn source_ip_set_operators_handle_absent_context() {
+        let operands = operands(&["127.0.0.0/8"]);
+
+        for name in ["IpAddress", "ForAnyValue:IpAddress"] {
+            let op = lookup(name).unwrap();
+            assert_eq!(
+                (op.evaluate)(&operands, ActualValue::Absent),
+                ConditionMatchResult::NoMatch,
+                "{name}"
+            );
+        }
+
+        assert_eq!(
+            (lookup("ForAllValues:IpAddress").unwrap().evaluate)(&operands, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+
+        assert_eq!(
+            (lookup("IpAddressIfExists").unwrap().evaluate)(&operands, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+
+        for name in [
+            "NotIpAddress",
+            "ForAllValues:NotIpAddress",
+            "NotIpAddressIfExists",
+        ] {
+            let op = lookup(name).unwrap();
+            assert_eq!(
+                (op.evaluate)(&operands, ActualValue::Absent),
+                ConditionMatchResult::Matches,
+                "{name}"
+            );
+        }
+
+        assert_eq!(
+            (lookup("ForAnyValue:NotIpAddress").unwrap().evaluate)(&operands, ActualValue::Absent),
             ConditionMatchResult::NoMatch
         );
     }

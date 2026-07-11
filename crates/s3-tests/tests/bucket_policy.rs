@@ -8939,6 +8939,270 @@ fn test_bucket_policy_request_object_tag_keys_for_any_value_binary_equals() {
 }
 
 #[test]
+fn test_bucket_policy_request_object_tag_keys_for_all_values_string_not_equals() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_key = "string-not-equals-for-all-allowed";
+        let denied_key = "string-not-equals-for-all-denied";
+
+        for key in [allowed_key, denied_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"object"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObjectTagging",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "ForAllValues:StringNotEquals": {
+                        "s3:RequestObjectTagKeys": ["blocked", "private"]
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging with ForAllValues:StringNotEquals request tag keys",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(allowed_key)
+                    .tagging(tagging(vec![tag("public", "1"), tag("shared", "2")]))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(denied_key)
+            .tagging(tagging(vec![tag("public", "1"), tag("blocked", "2")]))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(&bucket, &[allowed_key, denied_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_keys_for_any_value_string_not_equals() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_key = "string-not-equals-for-any-allowed";
+        let denied_key = "string-not-equals-for-any-denied";
+
+        for key in [allowed_key, denied_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"object"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObjectTagging",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "ForAnyValue:StringNotEquals": {
+                        "s3:RequestObjectTagKeys": ["blocked", "private"]
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging with ForAnyValue:StringNotEquals request tag keys",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(allowed_key)
+                    .tagging(tagging(vec![tag("blocked", "1"), tag("public", "2")]))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(denied_key)
+            .tagging(tagging(vec![tag("blocked", "1")]))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(&bucket, &[allowed_key, denied_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_no_tag_keys_for_all_values_string_not_equals() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_key = "string-not-equals-for-all-no-tags";
+        let denied_key = "string-not-equals-for-all-blocked-tag";
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "ForAllValues:StringNotEquals": {
+                        "s3:RequestObjectTagKeys": ["blocked", "private"]
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject without tag keys under ForAllValues:StringNotEquals",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(allowed_key)
+                    .body(ByteStream::from_static(b"for-all-no-tags"))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(denied_key)
+            .tagging("blocked=1")
+            .body(ByteStream::from_static(b"for-all-blocked-tag"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(&bucket, &[allowed_key, denied_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_no_tag_keys_for_any_value_string_not_equals() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_key = "string-not-equals-for-any-public-tag";
+        let denied_key = "string-not-equals-for-any-no-tags";
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "ForAnyValue:StringNotEquals": {
+                        "s3:RequestObjectTagKeys": ["blocked", "private"]
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject with nonmatching tag key under ForAnyValue:StringNotEquals",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(allowed_key)
+                    .tagging("public=1")
+                    .body(ByteStream::from_static(b"for-any-public-tag"))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(denied_key)
+            .body(ByteStream::from_static(b"for-any-no-tags"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(&bucket, &[allowed_key, denied_key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_object_tagging_request_object_tag() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
