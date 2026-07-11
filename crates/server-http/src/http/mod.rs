@@ -1745,12 +1745,8 @@ impl HttpFrontend {
                             sse_customer: sse_customer.as_ref(),
                         },
                     )?;
-                    let tag_count = result.tag_count;
                     let mut resp = S3Response::get_object_part(result);
                     apply_response_overrides(&mut resp, req);
-                    if let Some(tag_count) = tag_count {
-                        add_tagging_count_header(&mut resp, tag_count);
-                    }
                     Ok(resp)
                 } else if let Some(range_header) = req.header("range") {
                     match crate::range::ByteRange::parse(range_header) {
@@ -1779,12 +1775,7 @@ impl HttpFrontend {
                                     sse_customer: sse_customer.as_ref(),
                                 },
                             )?;
-                            let tag_count = result.tag_count;
-                            let mut resp = S3Response::get_object_range(result);
-                            if let Some(tag_count) = tag_count {
-                                add_tagging_count_header(&mut resp, tag_count);
-                            }
-                            Ok(resp)
+                            Ok(S3Response::get_object_range(result))
                         }
                         Err(_) => {
                             #[cfg(feature = "deep-tracing")]
@@ -1814,12 +1805,8 @@ impl HttpFrontend {
                                 },
                             )?;
                             let checksum_mode = req.header("x-amz-checksum-mode");
-                            let tag_count = result.tag_count;
                             let mut resp = S3Response::get_object(result, checksum_mode);
                             apply_response_overrides(&mut resp, req);
-                            if let Some(tag_count) = tag_count {
-                                add_tagging_count_header(&mut resp, tag_count);
-                            }
                             Ok(resp)
                         }
                     }
@@ -1838,12 +1825,8 @@ impl HttpFrontend {
                                 sse_customer: sse_customer.as_ref(),
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
-                    let tag_count = result.tag_count;
                     let mut resp = S3Response::get_object(result, checksum_mode);
                     apply_response_overrides(&mut resp, req);
-                    if let Some(tag_count) = tag_count {
-                        add_tagging_count_header(&mut resp, tag_count);
-                    }
                     Ok(resp)
                 }
             }
@@ -1908,11 +1891,7 @@ impl HttpFrontend {
                             sse_customer: sse_customer.as_ref(),
                         },
                     )?;
-                    let mut resp = S3Response::head_object_part(&result);
-                    if let Some(tag_count) = result.tag_count {
-                        add_tagging_count_header(&mut resp, tag_count);
-                    }
-                    Ok(resp)
+                    Ok(S3Response::head_object_part(&result))
                 } else {
                     let result =
                         self.coordinator
@@ -1928,11 +1907,7 @@ impl HttpFrontend {
                                 sse_customer: sse_customer.as_ref(),
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
-                    let mut resp = S3Response::head_object(&result, checksum_mode);
-                    if let Some(tag_count) = result.tag_count {
-                        add_tagging_count_header(&mut resp, tag_count);
-                    }
-                    Ok(resp)
+                    Ok(S3Response::head_object(&result, checksum_mode))
                 }
             }
             S3Operation::GetObjectAttributes { bucket, key } => {
@@ -5717,11 +5692,6 @@ fn reject_anonymous_response_overrides(
         });
     }
     Ok(())
-}
-
-fn add_tagging_count_header(resp: &mut S3Response, count: usize) {
-    resp.headers
-        .push(("x-amz-tagging-count".to_string(), count.to_string()));
 }
 
 fn parse_create_bucket_acl(

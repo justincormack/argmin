@@ -992,7 +992,7 @@ impl Coordinator {
                             &bucket_info,
                             bucket_tags.as_deref(),
                             stored,
-                            Coordinator::get_object_tagging_policy_action(req.version_id),
+                            req.modern_action,
                             bucket_policy.as_deref(),
                         )
                     } else {

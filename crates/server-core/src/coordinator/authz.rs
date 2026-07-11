@@ -1352,9 +1352,13 @@ impl Coordinator {
         bucket: &BucketSummary,
         bucket_tags: Option<&[(String, String)]>,
         object: &StoredObject,
-        tagging_action: auth::PolicyAction,
+        action: ModernReadAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<ObjectAttributePermissions, ServerError> {
+        if !action.discloses_optional_attributes() {
+            return Ok(ObjectAttributePermissions::default());
+        }
+
         let object_lock_retention = self.requester_can_manage_object_lock_with_bucket_policy(
             requester,
             bucket,
@@ -1379,7 +1383,7 @@ impl Coordinator {
                 policy,
             },
             object,
-            tagging_action,
+            action.tagging_policy_action(),
             None,
         )?;
 

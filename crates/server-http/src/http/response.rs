@@ -1230,6 +1230,13 @@ impl S3Response {
         self
     }
 
+    fn apply_tagging_count_header(mut self, tag_count: Option<usize>) -> Self {
+        if let Some(count) = tag_count {
+            self = self.header("x-amz-tagging-count", &count.to_string());
+        }
+        self
+    }
+
     fn apply_checksum_mode_headers(mut self, metadata: &SystemMetadata) -> Self {
         for (name, value) in metadata.checksum_header_pairs() {
             self = self.header(name, value);
@@ -1366,7 +1373,8 @@ impl S3Response {
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
             .apply_user_metadata_headers(&result.metadata)
-            .apply_object_lock_headers(result.object_lock);
+            .apply_object_lock_headers(result.object_lock)
+            .apply_tagging_count_header(result.tag_count);
 
         // Checksum headers (only when ChecksumMode=ENABLED)
         if checksum_mode.is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")) {
@@ -1411,7 +1419,8 @@ impl S3Response {
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
             .apply_user_metadata_headers(&result.metadata)
-            .apply_object_lock_headers(result.object_lock);
+            .apply_object_lock_headers(result.object_lock)
+            .apply_tagging_count_header(result.tag_count);
 
         // Checksum headers (only when ChecksumMode=ENABLED)
         if checksum_mode.is_some_and(|m| m.eq_ignore_ascii_case("ENABLED")) {
@@ -1446,7 +1455,8 @@ impl S3Response {
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
             .apply_user_metadata_headers(&result.metadata)
-            .apply_object_lock_headers(result.object_lock);
+            .apply_object_lock_headers(result.object_lock)
+            .apply_tagging_count_header(result.tag_count);
 
         // Part-level requests report the part checksum, and the checksum
         // type only alongside it: AWS omits x-amz-checksum-type on
@@ -1484,7 +1494,8 @@ impl S3Response {
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
             .apply_user_metadata_headers(&result.metadata)
-            .apply_object_lock_headers(result.object_lock);
+            .apply_object_lock_headers(result.object_lock)
+            .apply_tagging_count_header(result.tag_count);
 
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
             .apply_managed_encryption_headers(result.managed_encryption)
@@ -1519,7 +1530,8 @@ impl S3Response {
         resp = resp
             .apply_system_metadata_headers(&result.system_metadata)
             .apply_user_metadata_headers(&result.metadata)
-            .apply_object_lock_headers(result.object_lock);
+            .apply_object_lock_headers(result.object_lock)
+            .apply_tagging_count_header(result.tag_count);
 
         // Part-level requests report the part checksum, and the checksum
         // type (e.g. COMPOSITE, FULL_OBJECT) only alongside it: AWS omits

@@ -133,6 +133,22 @@ impl ModernReadAction {
             Self::AttributesVersion => auth::PolicyAction::GetObjectVersionAttributes,
         }
     }
+
+    pub(in crate::coordinator) fn discloses_optional_attributes(self) -> bool {
+        match self {
+            Self::ReadCurrent | Self::ReadVersion => true,
+            Self::AttributesCurrent | Self::AttributesVersion => false,
+        }
+    }
+
+    pub(in crate::coordinator) fn tagging_policy_action(self) -> auth::PolicyAction {
+        match self {
+            Self::ReadCurrent | Self::AttributesCurrent => auth::PolicyAction::GetObjectTagging,
+            Self::ReadVersion | Self::AttributesVersion => {
+                auth::PolicyAction::GetObjectVersionTagging
+            }
+        }
+    }
 }
 
 impl Coordinator {
@@ -559,7 +575,7 @@ impl Coordinator {
                             &bucket_info,
                             bucket_tags.as_deref(),
                             stored,
-                            Coordinator::get_object_tagging_policy_action(req.version_id),
+                            req.modern_action,
                             bucket_policy.as_deref(),
                         )
                     } else {
