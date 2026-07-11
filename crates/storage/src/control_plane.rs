@@ -6617,18 +6617,14 @@ impl AuthenticatedUnixControlPlaneClient {
         payload: Vec<u8>,
         read_timeout: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let start = Instant::now();
+        // The server signs after dispatch, so verify against a fresh receive-time wall sample.
+        // Projecting the request timestamp with elapsed monotonic time diverges after a wall step.
         self.send_admin_request_with_read_timeout_and_clocks(
             kind,
             payload,
             read_timeout,
             || Ok(authority_now_ms),
-            || {
-                let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                Ok(authority_now_ms
-                    .saturating_add(elapsed_ms)
-                    .saturating_add(1))
-            },
+            || Ok(crate::clock::current_time_millis()),
         )
     }
 
@@ -16968,7 +16964,10 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             admin_auth_credential("auth-cluster", "admin-1"),
         );
-        let status = client.reestablish_authority_clock(wall_ms).unwrap();
+        let status = crate::clock::with_time_override(wall_ms, || {
+            client.reestablish_authority_clock(wall_ms)
+        })
+        .unwrap();
         assert!(status.established());
         let server_status = server.join().unwrap();
         assert_eq!(status, server_status);
@@ -17052,9 +17051,10 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             admin_auth_credential("auth-cluster", "admin-1"),
         );
-        let cluster_epoch = client
-            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1)], 2_000)
-            .unwrap();
+        let cluster_epoch = crate::clock::with_time_override(2_000, || {
+            client.set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1)], 2_000)
+        })
+        .unwrap();
 
         server.join().unwrap();
         assert!(cluster_epoch.get() >= 2);
@@ -17108,9 +17108,10 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             old_signer,
         );
-        let cluster_epoch = client
-            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1)], 2_000)
-            .unwrap();
+        let cluster_epoch = crate::clock::with_time_override(2_000, || {
+            client.set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1)], 2_000)
+        })
+        .unwrap();
 
         server.join().unwrap();
         assert!(cluster_epoch.get() >= 2);
@@ -17374,9 +17375,10 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             admin_auth_credential("auth-cluster", "admin-1"),
         );
-        let cluster_epoch = client
-            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)], 2_000)
-            .unwrap();
+        let cluster_epoch = crate::clock::with_time_override(2_000, || {
+            client.set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)], 2_000)
+        })
+        .unwrap();
 
         let authority = server.join().unwrap();
         assert!(cluster_epoch.get() >= 2);
@@ -17384,6 +17386,41 @@ mod tests {
             authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
             &[NodeId::new(1)]
         );
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_resamples_wall_clock_for_admin_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                4_000,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let cluster_epoch = crate::clock::with_time_override(4_000, || {
+            client.set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)], 2_000)
+        })
+        .unwrap();
+
+        server.join().unwrap();
+        assert!(cluster_epoch.get() >= 2);
     }
 
     #[test]
@@ -17445,9 +17482,10 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             admin_auth_credential("auth-cluster", "admin-1"),
         );
-        let error = client
-            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(99)], 2_000)
-            .expect_err("signed admin error response should decode after auth verification");
+        let error = crate::clock::with_time_override(2_000, || {
+            client.set_pg_acting_set(PgId::new(7), vec![NodeId::new(99)], 2_000)
+        })
+        .expect_err("signed admin error response should decode after auth verification");
 
         server.join().unwrap();
         assert!(
@@ -17591,7 +17629,8 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             admin_auth_credential("auth-cluster", "admin-1"),
         );
-        client.transfer_raft_leadership_to(102, 2_000).unwrap();
+        crate::clock::with_time_override(2_000, || client.transfer_raft_leadership_to(102, 2_000))
+            .unwrap();
 
         let authority = server.join().unwrap();
         assert_eq!(authority.transferred_to, vec![102]);
@@ -17737,6 +17776,7 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             admin_auth_credential("auth-cluster", "admin-1"),
         );
+        let clock = crate::clock::test_time_override_guard(2_003);
         let fenced = client
             .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
                 PgId::new(43),
@@ -17745,6 +17785,7 @@ mod tests {
             .unwrap();
         let fence_epoch = fenced.runtime_map().cluster_epoch();
         let expected_transfer_epoch = ClusterEpoch::new(fence_epoch.get() + 1).unwrap();
+        clock.set(2_004);
         let runtime_map = client
             .set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
                 PgId::new(43),
@@ -18907,11 +18948,10 @@ mod tests {
             .unwrap_err();
 
         server.join().unwrap();
-        assert!(matches!(error, ControlPlaneError::Io { source, .. }
-            if source.kind() == ErrorKind::ConnectionRefused
-                || source.kind() == ErrorKind::NotFound
-                || source.kind() == ErrorKind::UnexpectedEof
-                || source.kind() == ErrorKind::ConnectionReset));
+        assert!(
+            error.is_retryable_control_plane_rpc_transport_error(),
+            "heartbeat retry should return its terminal retryable transport error: {error}"
+        );
     }
 
     #[test]
