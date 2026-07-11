@@ -54,6 +54,11 @@ impl BucketPolicy {
         self.requires_condition_input_for_action(action, condition_key::ConditionInput::SourceIp)
     }
 
+    #[must_use]
+    pub fn requires_current_time_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(action, condition_key::ConditionInput::CurrentTime)
+    }
+
     fn requires_condition_input_for_action(
         &self,
         action: PolicyAction,
@@ -327,6 +332,7 @@ pub struct PolicyRequest<'a> {
     object_ownership: RequestField<'a>,
     version_id: RequestField<'a>,
     source_ip: Option<IpAddr>,
+    current_time_epoch_seconds: Option<u64>,
 }
 
 impl<'a> PolicyRequest<'a> {
@@ -368,6 +374,7 @@ impl<'a> PolicyRequest<'a> {
             object_ownership: RequestField::Unavailable,
             version_id: RequestField::Unavailable,
             source_ip: None,
+            current_time_epoch_seconds: None,
         }
     }
 
@@ -408,6 +415,7 @@ impl<'a> PolicyRequest<'a> {
             object_ownership: RequestField::Unavailable,
             version_id: RequestField::Unavailable,
             source_ip: None,
+            current_time_epoch_seconds: None,
         }
     }
 
@@ -625,6 +633,15 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub const fn with_current_time_epoch_seconds(
+        mut self,
+        current_time_epoch_seconds: Option<u64>,
+    ) -> Self {
+        self.current_time_epoch_seconds = current_time_epoch_seconds;
+        self
+    }
+
+    #[must_use]
     fn copy_source(&self) -> RequestField<'a> {
         self.copy_source
     }
@@ -727,6 +744,11 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn source_ip(&self) -> Option<IpAddr> {
         self.source_ip
+    }
+
+    #[must_use]
+    fn current_time_epoch_seconds(&self) -> Option<u64> {
+        self.current_time_epoch_seconds
     }
 }
 
@@ -1814,10 +1836,13 @@ fn validate_condition_operands(clause: &PolicyConditionClause) -> Result<(), Buc
     let Some(op) = condition_op::lookup(clause.operator()) else {
         return Ok(());
     };
+    if clause.operator() == "Null" {
+        return Ok(());
+    }
+    if condition_op::is_binary_condition_kind(op.kind) {
+        return validate_binary_condition_operands(clause);
+    }
     if !condition_op::is_ip_condition_kind(op.kind) {
-        if condition_op::is_binary_condition_kind(op.kind) {
-            return validate_binary_condition_operands(clause);
-        }
         return Ok(());
     }
     if clause
@@ -3298,6 +3323,33 @@ mod tests {
             PolicyEvaluation::NoMatch
         );
         assert!(policy.requires_source_ip_for_action(PolicyAction::GetObject));
+    }
+
+    #[test]
+    fn current_time_condition_evaluates_request_epoch_time() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/date","Condition":{"DateEquals":{"aws:CurrentTime":"2024-01-01T00:00:00Z"}}},{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/epoch","Condition":{"NumericEquals":{"aws:EpochTime":1704067200}}}]}"#,
+        )
+        .unwrap();
+        let date_request = request(PolicyAction::GetObject, "bucket", "date", None, &[])
+            .with_current_time_epoch_seconds(Some(1_704_067_200));
+        let epoch_request = request(PolicyAction::GetObject, "bucket", "epoch", None, &[])
+            .with_current_time_epoch_seconds(Some(1_704_067_200));
+        let missing_time_request = request(PolicyAction::GetObject, "bucket", "date", None, &[]);
+
+        assert_eq!(
+            policy.evaluate(&date_request),
+            PolicyEvaluation::ExplicitAllow
+        );
+        assert_eq!(
+            policy.evaluate(&epoch_request),
+            PolicyEvaluation::ExplicitAllow
+        );
+        assert_eq!(
+            policy.evaluate(&missing_time_request),
+            PolicyEvaluation::NoMatch
+        );
+        assert!(policy.requires_current_time_for_action(PolicyAction::GetObject));
     }
 
     #[test]

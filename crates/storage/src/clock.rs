@@ -63,26 +63,26 @@ pub fn with_time_override<T>(now_millis: u64, f: impl FnOnce() -> T) -> T {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub struct TestTimeOverrideGuard {
     previous: Option<u64>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl TestTimeOverrideGuard {
     pub fn set(&self, now_millis: u64) {
         TIME_OVERRIDE_MILLIS.with(|slot| slot.set(Some(now_millis)));
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for TestTimeOverrideGuard {
     fn drop(&mut self) {
         TIME_OVERRIDE_MILLIS.with(|slot| slot.set(self.previous));
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn test_time_override_guard(now_millis: u64) -> TestTimeOverrideGuard {
     TIME_OVERRIDE_MILLIS.with(|slot| TestTimeOverrideGuard {
         previous: slot.replace(Some(now_millis)),

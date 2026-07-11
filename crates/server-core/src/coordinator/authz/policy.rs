@@ -144,6 +144,18 @@ pub(super) fn object_policy_request<'a>(
         "bucket policy request for {:?} requires source IP",
         input.action
     );
+    let current_time_required = input.policy.requires_current_time_for_action(input.action);
+    if current_time_required && input.requester.request_epoch_seconds().is_none() {
+        return Err(required_policy_input_unavailable_error(
+            input.action,
+            "request time",
+        ));
+    }
+    debug_assert!(
+        !(current_time_required && input.requester.request_epoch_seconds().is_none()),
+        "bucket policy request for {:?} requires request time",
+        input.action
+    );
 
     Ok(auth::PolicyRequest::for_object(
         input.action,
@@ -154,6 +166,7 @@ pub(super) fn object_policy_request<'a>(
         input.existing_object_tags,
     )
     .with_source_ip(input.requester.source_ip())
+    .with_current_time_epoch_seconds(input.requester.request_epoch_seconds())
     .with_bucket_tags(bucket_tag_input_for_policy_action(
         input.bucket_abac_enabled,
         input.policy,
@@ -229,6 +242,18 @@ fn bucket_policy_request<'a>(
         "bucket policy request for {:?} requires source IP",
         input.action
     );
+    let current_time_required = input.policy.requires_current_time_for_action(input.action);
+    if current_time_required && input.requester.request_epoch_seconds().is_none() {
+        return Err(required_policy_input_unavailable_error(
+            input.action,
+            "request time",
+        ));
+    }
+    debug_assert!(
+        !(current_time_required && input.requester.request_epoch_seconds().is_none()),
+        "bucket policy request for {:?} requires request time",
+        input.action
+    );
 
     let mut request = auth::PolicyRequest::for_bucket(
         input.action,
@@ -238,6 +263,7 @@ fn bucket_policy_request<'a>(
         input.bucket_tags,
     )
     .with_source_ip(input.requester.source_ip())
+    .with_current_time_epoch_seconds(input.requester.request_epoch_seconds())
     .with_absent_request_headers()
     .with_absent_list_parameters();
 
@@ -977,6 +1003,61 @@ mod tests {
     }
 
     #[test]
+    fn object_policy_request_rejects_missing_required_current_time() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"DateEquals":{"aws:CurrentTime":"2024-01-01T00:00:00Z"}}}]}"#,
+        );
+
+        let error = object_policy_request(ObjectPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            key: "key",
+            action: auth::PolicyAction::GetObject,
+            policy_context: PutObjectPolicyContext::default(),
+            policy: &policy,
+            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+            existing_object_tags_not_evaluable: false,
+            bucket_tags: &[],
+            request_object_tags: &[],
+            version_id: None,
+        })
+        .unwrap_err();
+
+        assert_required_input_error(error, "request time", auth::PolicyAction::GetObject);
+    }
+
+    #[test]
+    fn object_policy_request_propagates_current_time() {
+        let requester = requester().with_request_epoch_seconds(Some(1_704_067_200));
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"DateEquals":{"aws:CurrentTime":"2024-01-01T00:00:00Z"}}}]}"#,
+        );
+
+        let request = object_policy_request(ObjectPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            key: "key",
+            action: auth::PolicyAction::GetObject,
+            policy_context: PutObjectPolicyContext::default(),
+            policy: &policy,
+            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+            existing_object_tags_not_evaluable: false,
+            bucket_tags: &[],
+            request_object_tags: &[],
+            version_id: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            policy.evaluate(&request),
+            auth::PolicyEvaluation::ExplicitAllow
+        );
+    }
+
+    #[test]
     fn bucket_policy_request_rejects_missing_required_bucket_tags_when_abac_enabled() {
         let requester = requester();
         let policy = parse_policy(
@@ -1073,6 +1154,55 @@ mod tests {
         let requester = requester().with_source_ip(Some("127.0.0.1".parse().unwrap()));
         let policy = parse_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}}]}"#,
+        );
+
+        let request = bucket_policy_request(BucketPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            action: auth::PolicyAction::ListBucket,
+            policy: &policy,
+            bucket_tags: auth::bucket_policy::BucketTags::Unavailable,
+            request_tags: None,
+            policy_context: None,
+            requested_max_keys: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            policy.evaluate(&request),
+            auth::PolicyEvaluation::ExplicitAllow
+        );
+    }
+
+    #[test]
+    fn bucket_policy_request_rejects_missing_required_current_time() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"DateEquals":{"aws:CurrentTime":"2024-01-01T00:00:00Z"}}}]}"#,
+        );
+
+        let error = bucket_policy_request(BucketPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            action: auth::PolicyAction::ListBucket,
+            policy: &policy,
+            bucket_tags: auth::bucket_policy::BucketTags::Unavailable,
+            request_tags: None,
+            policy_context: None,
+            requested_max_keys: None,
+        })
+        .unwrap_err();
+
+        assert_required_input_error(error, "request time", auth::PolicyAction::ListBucket);
+    }
+
+    #[test]
+    fn bucket_policy_request_propagates_current_time() {
+        let requester = requester().with_request_epoch_seconds(Some(1_704_067_200));
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"DateEquals":{"aws:CurrentTime":"2024-01-01T00:00:00Z"}}}]}"#,
         );
 
         let request = bucket_policy_request(BucketPolicyRequestInput {

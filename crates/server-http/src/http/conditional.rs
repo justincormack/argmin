@@ -132,6 +132,7 @@ mod tests {
                     .collect(),
             ),
             vec![],
+            0,
         )
     }
 

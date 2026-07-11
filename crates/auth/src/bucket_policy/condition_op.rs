@@ -25,6 +25,7 @@ pub(super) enum ActualValue<'a> {
     Present(&'a str),
     PresentValues(Vec<&'a str>),
     SourceIp(IpAddr),
+    EpochSeconds(u64),
     Absent,
 }
 
@@ -36,6 +37,12 @@ pub(super) enum ActualValue<'a> {
 pub(super) enum ConditionOpKind {
     BinaryEquals,
     Bool,
+    DateEquals,
+    DateNotEquals,
+    DateLessThan,
+    DateLessThanEquals,
+    DateGreaterThan,
+    DateGreaterThanEquals,
     StringEquals,
     StringEqualsIgnoreCase,
     StringNotEquals,
@@ -102,6 +109,78 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         name: "BinaryEqualsIfExists",
         kind: ConditionOpKind::BinaryEquals,
         evaluate: eval_binary_equals_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateEquals",
+        kind: ConditionOpKind::DateEquals,
+        evaluate: eval_date_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateEqualsIfExists",
+        kind: ConditionOpKind::DateEquals,
+        evaluate: eval_date_equals_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateNotEquals",
+        kind: ConditionOpKind::DateNotEquals,
+        evaluate: eval_date_not_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateNotEqualsIfExists",
+        kind: ConditionOpKind::DateNotEquals,
+        evaluate: eval_date_not_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateLessThan",
+        kind: ConditionOpKind::DateLessThan,
+        evaluate: eval_date_less_than,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateLessThanIfExists",
+        kind: ConditionOpKind::DateLessThan,
+        evaluate: eval_date_less_than_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateLessThanEquals",
+        kind: ConditionOpKind::DateLessThanEquals,
+        evaluate: eval_date_less_than_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateLessThanEqualsIfExists",
+        kind: ConditionOpKind::DateLessThanEquals,
+        evaluate: eval_date_less_than_equals_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateGreaterThan",
+        kind: ConditionOpKind::DateGreaterThan,
+        evaluate: eval_date_greater_than,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateGreaterThanIfExists",
+        kind: ConditionOpKind::DateGreaterThan,
+        evaluate: eval_date_greater_than_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateGreaterThanEquals",
+        kind: ConditionOpKind::DateGreaterThanEquals,
+        evaluate: eval_date_greater_than_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "DateGreaterThanEqualsIfExists",
+        kind: ConditionOpKind::DateGreaterThanEquals,
+        evaluate: eval_date_greater_than_equals_if_exists,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
@@ -405,6 +484,19 @@ pub(super) const fn is_binary_condition_kind(kind: ConditionOpKind) -> bool {
     matches!(kind, ConditionOpKind::BinaryEquals)
 }
 
+pub(super) const fn is_date_condition_kind(kind: ConditionOpKind) -> bool {
+    matches!(
+        kind,
+        ConditionOpKind::DateEquals
+            | ConditionOpKind::DateNotEquals
+            | ConditionOpKind::DateLessThan
+            | ConditionOpKind::DateLessThanEquals
+            | ConditionOpKind::DateGreaterThan
+            | ConditionOpKind::DateGreaterThanEquals
+            | ConditionOpKind::Null
+    )
+}
+
 pub(super) const fn is_ip_condition_kind(kind: ConditionOpKind) -> bool {
     matches!(
         kind,
@@ -454,7 +546,9 @@ fn eval_binary_equals(operands: &[String], actual: ActualValue<'_>) -> Condition
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -481,7 +575,7 @@ fn eval_for_all_values_binary_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -508,7 +602,7 @@ fn eval_for_any_value_binary_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -521,9 +615,281 @@ fn eval_binary_equals_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_binary_equals(operands, actual)
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
+}
+
+#[derive(Clone, Copy)]
+enum DateComparison {
+    Equals,
+    NotEquals,
+    LessThan,
+    LessThanEquals,
+    GreaterThan,
+    GreaterThanEquals,
+}
+
+fn eval_date_comparison(
+    operands: &[String],
+    actual: ActualValue<'_>,
+    comparison: DateComparison,
+    if_exists: bool,
+) -> ConditionMatchResult {
+    let actual_nanos = match actual {
+        ActualValue::EpochSeconds(actual) => i128::from(actual) * 1_000_000_000,
+        ActualValue::Present(actual) => {
+            let Some(actual) = parse_date_epoch_nanos(actual) else {
+                return ConditionMatchResult::NoMatch;
+            };
+            actual
+        }
+        ActualValue::Absent if if_exists || matches!(comparison, DateComparison::NotEquals) => {
+            return ConditionMatchResult::Matches;
+        }
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::Absent => {
+            return ConditionMatchResult::NoMatch;
+        }
+    };
+    eval_date_operands(operands, actual_nanos, comparison)
+}
+
+fn eval_date_operands(
+    operands: &[String],
+    actual_nanos: i128,
+    comparison: DateComparison,
+) -> ConditionMatchResult {
+    let matches = match comparison {
+        DateComparison::Equals => operands
+            .iter()
+            .filter_map(|expected| parse_date_epoch_nanos(expected))
+            .any(|expected| actual_nanos == expected),
+        DateComparison::NotEquals => {
+            operands
+                .iter()
+                .all(|expected| match parse_date_epoch_nanos(expected) {
+                    Some(expected) => actual_nanos != expected,
+                    None => true,
+                })
+        }
+        DateComparison::LessThan => operands
+            .iter()
+            .filter_map(|expected| parse_date_epoch_nanos(expected))
+            .any(|expected| actual_nanos < expected),
+        DateComparison::LessThanEquals => operands
+            .iter()
+            .filter_map(|expected| parse_date_epoch_nanos(expected))
+            .any(|expected| actual_nanos <= expected),
+        DateComparison::GreaterThan => operands
+            .iter()
+            .filter_map(|expected| parse_date_epoch_nanos(expected))
+            .any(|expected| actual_nanos > expected),
+        DateComparison::GreaterThanEquals => operands
+            .iter()
+            .filter_map(|expected| parse_date_epoch_nanos(expected))
+            .any(|expected| actual_nanos >= expected),
+    };
+    if matches {
+        ConditionMatchResult::Matches
+    } else {
+        ConditionMatchResult::NoMatch
+    }
+}
+
+fn eval_date_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::Equals, false)
+}
+
+fn eval_date_equals_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::Equals, true)
+}
+
+fn eval_date_not_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::NotEquals, false)
+}
+
+fn eval_date_less_than(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::LessThan, false)
+}
+
+fn eval_date_less_than_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::LessThan, true)
+}
+
+fn eval_date_less_than_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::LessThanEquals, false)
+}
+
+fn eval_date_less_than_equals_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::LessThanEquals, true)
+}
+
+fn eval_date_greater_than(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::GreaterThan, false)
+}
+
+fn eval_date_greater_than_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::GreaterThan, true)
+}
+
+fn eval_date_greater_than_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::GreaterThanEquals, false)
+}
+
+fn eval_date_greater_than_equals_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_date_comparison(operands, actual, DateComparison::GreaterThanEquals, true)
+}
+
+fn parse_date_epoch_nanos(value: &str) -> Option<i128> {
+    let (datetime, offset_seconds) = split_datetime_offset(value)?;
+    let (date, time) = datetime.split_once('T')?;
+    let (year, month, day) = parse_date(date)?;
+    let (hour, minute, second, nanos) = parse_time(time)?;
+    let days = days_from_civil(year, month, day)?;
+    let seconds = i128::from(days) * 86_400
+        + i128::from(hour) * 3_600
+        + i128::from(minute) * 60
+        + i128::from(second)
+        - i128::from(offset_seconds);
+    Some(seconds * 1_000_000_000 + i128::from(nanos))
+}
+
+fn split_datetime_offset(value: &str) -> Option<(&str, i32)> {
+    if let Some(datetime) = value.strip_suffix('Z') {
+        return Some((datetime, 0));
+    }
+    let time_start = value.find('T')? + 1;
+    let offset_pos = value[time_start..]
+        .rfind(['+', '-'])
+        .map(|pos| time_start + pos)?;
+    let offset = &value[offset_pos..];
+    let sign = if offset.starts_with('+') { 1 } else { -1 };
+    let offset = &offset[1..];
+    let (hours, minutes) = offset.split_once(':')?;
+    if hours.len() != 2 || minutes.len() != 2 {
+        return None;
+    }
+    let hours = parse_fixed_u32(hours)?;
+    let minutes = parse_fixed_u32(minutes)?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let offset_seconds = i32::try_from(hours * 3_600 + minutes * 60).ok()? * sign;
+    Some((&value[..offset_pos], offset_seconds))
+}
+
+fn parse_date(value: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = value.split('-');
+    let year = parts.next()?;
+    let month = parts.next()?;
+    let day = parts.next()?;
+    if parts.next().is_some() || year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return None;
+    }
+    let year = i32::try_from(parse_fixed_u32(year)?).ok()?;
+    let month = parse_fixed_u32(month)?;
+    let day = parse_fixed_u32(day)?;
+    if year == 0 || !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+fn parse_time(value: &str) -> Option<(u32, u32, u32, u32)> {
+    let mut parts = value.split(':');
+    let hour = parts.next()?;
+    let minute = parts.next()?;
+    let second = parts.next()?;
+    if parts.next().is_some() || hour.len() != 2 || minute.len() != 2 {
+        return None;
+    }
+    let (second, nanos) = parse_second_and_nanos(second)?;
+    let hour = parse_fixed_u32(hour)?;
+    let minute = parse_fixed_u32(minute)?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some((hour, minute, second, nanos))
+}
+
+fn parse_second_and_nanos(value: &str) -> Option<(u32, u32)> {
+    let (second, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if second.len() != 2 {
+        return None;
+    }
+    let second = parse_fixed_u32(second)?;
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        if fraction.len() > 9 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let mut nanos = 0;
+        for index in 0..9 {
+            nanos *= 10;
+            nanos += fraction
+                .as_bytes()
+                .get(index)
+                .map_or(0, |byte| u32::from(byte - b'0'));
+        }
+        nanos
+    };
+    Some((second, nanos))
+}
+
+fn parse_fixed_u32(value: &str) -> Option<u32> {
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        value.parse().ok()
+    } else {
+        None
+    }
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
+    let month = i32::try_from(month).ok()?;
+    let day = i32::try_from(day).ok()?;
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_for_formula = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_for_formula + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(i64::from(era * 146_097 + day_of_era - 719_468))
 }
 
 fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
@@ -538,7 +904,9 @@ fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResu
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -552,7 +920,9 @@ fn eval_string_equals(operands: &[String], actual: ActualValue<'_>) -> Condition
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -579,7 +949,7 @@ fn eval_for_all_values_string_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -606,7 +976,7 @@ fn eval_for_any_value_string_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -619,7 +989,7 @@ fn eval_string_equals_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_string_equals(operands, actual)
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -639,7 +1009,9 @@ fn eval_string_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -670,7 +1042,7 @@ fn eval_for_all_values_string_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -701,7 +1073,7 @@ fn eval_for_any_value_string_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -714,7 +1086,7 @@ fn eval_string_equals_ignore_case_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_string_equals_ignore_case(operands, actual)
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -728,7 +1100,9 @@ fn eval_string_not_equals(operands: &[String], actual: ActualValue<'_>) -> Condi
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -748,7 +1122,9 @@ fn eval_string_not_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -779,7 +1155,7 @@ fn eval_for_all_values_string_not_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -810,7 +1186,7 @@ fn eval_for_any_value_string_not_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -827,7 +1203,9 @@ fn eval_string_like(operands: &[String], actual: ActualValue<'_>) -> ConditionMa
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -858,7 +1236,7 @@ fn eval_for_all_values_string_like(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -889,7 +1267,7 @@ fn eval_for_any_value_string_like(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -902,7 +1280,7 @@ fn eval_string_like_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_string_like(operands, actual)
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -919,7 +1297,9 @@ fn eval_string_not_like(operands: &[String], actual: ActualValue<'_>) -> Conditi
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -950,7 +1330,7 @@ fn eval_for_all_values_string_not_like(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -981,7 +1361,7 @@ fn eval_for_any_value_string_not_like(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1008,6 +1388,9 @@ fn eval_numeric_comparison(
                 return ConditionMatchResult::NoMatch;
             };
             eval_numeric_operands(operands, actual, comparison)
+        }
+        ActualValue::EpochSeconds(actual) => {
+            eval_numeric_operands(operands, actual as f64, comparison)
         }
         ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent if if_exists || matches!(comparison, NumericComparison::NotEquals) => {
@@ -1194,7 +1577,10 @@ fn eval_ip_address_comparison(
         ActualValue::Absent if if_exists || matches!(comparison, IpComparison::NotEquals) => {
             return ConditionMatchResult::Matches;
         }
-        ActualValue::Present(_) | ActualValue::PresentValues(_) | ActualValue::Absent => false,
+        ActualValue::Present(_)
+        | ActualValue::PresentValues(_)
+        | ActualValue::EpochSeconds(_)
+        | ActualValue::Absent => false,
     };
     let matches = match comparison {
         IpComparison::Equals => matches,
@@ -1266,6 +1652,10 @@ mod tests {
 
     fn source_ip(value: &str) -> ActualValue<'_> {
         ActualValue::SourceIp(value.parse().expect("test source IP is valid"))
+    }
+
+    fn epoch_seconds(value: u64) -> ActualValue<'static> {
+        ActualValue::EpochSeconds(value)
     }
 
     fn operands(values: &[&str]) -> Vec<String> {
@@ -1487,6 +1877,146 @@ mod tests {
         );
         assert_eq!(
             (op.evaluate)(&operands(&["not-a-number"]), present("2")),
+            ConditionMatchResult::Matches
+        );
+    }
+
+    #[test]
+    fn numeric_operators_match_epoch_seconds_actuals() {
+        let op = lookup("NumericGreaterThan").unwrap();
+        assert_eq!(
+            (op.evaluate)(&operands(&["946684800"]), epoch_seconds(1_704_067_200)),
+            ConditionMatchResult::Matches
+        );
+        let op = lookup("NumericLessThan").unwrap();
+        assert_eq!(
+            (op.evaluate)(&operands(&["946684800"]), epoch_seconds(1_704_067_200)),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn date_operators_match_epoch_seconds_actuals() {
+        let actual = epoch_seconds(1_704_067_200); // 2024-01-01T00:00:00Z
+        let cases = [
+            (
+                "DateEquals",
+                "2024-01-01T00:00:00Z",
+                ConditionMatchResult::Matches,
+            ),
+            (
+                "DateEquals",
+                "2024-01-01T00:00:01Z",
+                ConditionMatchResult::NoMatch,
+            ),
+            (
+                "DateNotEquals",
+                "2024-01-01T00:00:01Z",
+                ConditionMatchResult::Matches,
+            ),
+            (
+                "DateLessThan",
+                "2024-01-01T00:00:01Z",
+                ConditionMatchResult::Matches,
+            ),
+            (
+                "DateLessThanEquals",
+                "2024-01-01T00:00:00Z",
+                ConditionMatchResult::Matches,
+            ),
+            (
+                "DateGreaterThan",
+                "2023-12-31T23:59:59Z",
+                ConditionMatchResult::Matches,
+            ),
+            (
+                "DateGreaterThanEquals",
+                "2024-01-01T00:00:00Z",
+                ConditionMatchResult::Matches,
+            ),
+        ];
+
+        for (operator, expected, outcome) in cases {
+            let op = lookup(operator).unwrap();
+            assert_eq!(
+                (op.evaluate)(&operands(&[expected]), actual.clone()),
+                outcome,
+                "{operator} {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_if_exists_variants_match_absent_values() {
+        for operator in [
+            "DateEqualsIfExists",
+            "DateNotEqualsIfExists",
+            "DateLessThanIfExists",
+            "DateLessThanEqualsIfExists",
+            "DateGreaterThanIfExists",
+            "DateGreaterThanEqualsIfExists",
+        ] {
+            let op = lookup(operator).unwrap();
+            assert_eq!(
+                (op.evaluate)(&operands(&["2024-01-01T00:00:00Z"]), ActualValue::Absent),
+                ConditionMatchResult::Matches,
+                "{operator}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_parser_accepts_utc_offsets_and_rejects_invalid_dates() {
+        assert_eq!(
+            parse_date_epoch_nanos("2024-01-01T01:00:00+01:00"),
+            parse_date_epoch_nanos("2024-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            parse_date_epoch_nanos("2024-01-01T00:00:00.123Z"),
+            Some(1_704_067_200_123_000_000)
+        );
+        assert_eq!(
+            parse_date_epoch_nanos("2024-01-01T00:00:00.000000001Z"),
+            Some(1_704_067_200_000_000_001)
+        );
+        assert!(parse_date_epoch_nanos("2024-02-30T00:00:00Z").is_none());
+        assert!(parse_date_epoch_nanos("2024-01-01T00:00:00").is_none());
+        assert!(parse_date_epoch_nanos("2024-01-01T00:00:00.0000000001Z").is_none());
+    }
+
+    #[test]
+    fn date_fractional_seconds_are_not_truncated_to_millis() {
+        let actual = epoch_seconds(1_704_067_200); // 2024-01-01T00:00:00Z
+        let equals = lookup("DateEquals").unwrap();
+        assert_eq!(
+            (equals.evaluate)(&operands(&["2024-01-01T00:00:00.0001Z"]), actual.clone()),
+            ConditionMatchResult::NoMatch
+        );
+
+        let less_than = lookup("DateLessThan").unwrap();
+        assert_eq!(
+            (less_than.evaluate)(&operands(&["2024-01-01T00:00:00.0001Z"]), actual.clone()),
+            ConditionMatchResult::Matches
+        );
+
+        let greater_than_equals = lookup("DateGreaterThanEquals").unwrap();
+        assert_eq!(
+            (greater_than_equals.evaluate)(&operands(&["2024-01-01T00:00:00.0001Z"]), actual),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn date_invalid_operands_follow_operator_match_semantics() {
+        let less_than = lookup("DateLessThan").unwrap();
+        assert_eq!(
+            (less_than.evaluate)(&operands(&["not-a-date"]), epoch_seconds(1_704_067_200)),
+            ConditionMatchResult::NoMatch
+        );
+
+        let not_equals = lookup("DateNotEquals").unwrap();
+        assert_eq!(
+            (not_equals.evaluate)(&operands(&["not-a-date"]), epoch_seconds(1_704_067_200)),
             ConditionMatchResult::Matches
         );
     }

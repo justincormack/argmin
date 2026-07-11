@@ -717,6 +717,7 @@ async fn handle(
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
+    let request_epoch_seconds = storage::clock::current_time_millis() / 1_000;
     let response_trace = crate::http::ResponseTraceMeta::new(
         trace.clone(),
         state.host_id.clone(),
@@ -843,6 +844,7 @@ async fn handle(
             parts,
             transport_security,
             source_ip,
+            request_epoch_seconds,
         ) {
             Ok(req) => req,
             Err(err) => {
@@ -941,6 +943,7 @@ async fn handle(
             parts,
             transport_security,
             source_ip,
+            request_epoch_seconds,
         ) {
             Ok(req) => req,
             Err(err) => {
@@ -989,6 +992,7 @@ async fn handle(
             parts,
             transport_security,
             source_ip,
+            request_epoch_seconds,
         ) {
             Ok(req) => req,
             Err(err) => {
@@ -1043,6 +1047,7 @@ async fn handle(
         body_bytes,
         transport_security,
         source_ip,
+        request_epoch_seconds,
     ) {
         Ok(req) => req,
         Err(err) => {
@@ -2457,6 +2462,7 @@ pub fn fuzz_conditional_header_entrypoints(inputs: ConditionalFuzzInputs<'_>) {
     let Ok(req) = crate::http::request::S3Request::from_hyper_headers(
         request.into_parts().0,
         crate::http::request::TransportSecurity::Tls,
+        storage::clock::current_time_millis() / 1_000,
     ) else {
         return;
     };
@@ -2505,7 +2511,10 @@ pub fn fuzz_streaming_request_entrypoints(
     }
 
     if let Some(parts) = build_parts(method, uri, headers) {
-        let Ok(req) = S3Request::from_hyper_headers(parts, transport_security) else {
+        let request_epoch_seconds = storage::clock::current_time_millis() / 1_000;
+        let Ok(req) =
+            S3Request::from_hyper_headers(parts, transport_security, request_epoch_seconds)
+        else {
             return;
         };
 
@@ -4943,7 +4952,7 @@ mod tests {
     }
 
     fn make_s3req(method: &str, uri: &str, headers: &[(&str, &str)]) -> S3Request {
-        S3Request::from_hyper_headers(make_parts(method, uri, headers), TransportSecurity::Tls)
+        S3Request::from_hyper_headers(make_parts(method, uri, headers), TransportSecurity::Tls, 0)
             .unwrap()
     }
 
@@ -5158,6 +5167,79 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.ends_with("source-ip-body"), "{response}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_policy_time_is_captured_before_admission_and_body_wait() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let clock = storage::clock::test_time_override_guard(1_000);
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "time-admission-bucket");
+        put_test_object(&frontend, "time-admission-bucket", "time-key", b"time-body");
+        frontend
+            .coordinator
+            .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
+                bucket: bucket_request("time-admission-bucket"),
+                config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::time-admission-bucket/*","Condition":{"DateEquals":{"aws:CurrentTime":"1970-01-01T00:00:01Z"}}}]}"#,
+                confirm_remove_self_bucket_access: false,
+            })
+            .unwrap();
+
+        let config = ServeConfig {
+            body_idle_timeout: Duration::from_secs(5),
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 1).await;
+
+        let mut holder = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        holder
+            .write_all(
+                concat!(
+                    "GET /hold-bucket/hold-key HTTP/1.1\r\n",
+                    "Host: hold-bucket\r\n",
+                    "Content-Length: 4\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let mut delayed = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        delayed
+            .write_all(
+                concat!(
+                    "GET /time-admission-bucket/time-key HTTP/1.1\r\n",
+                    "Host: time-admission-bucket\r\n",
+                    "Content-Length: 4\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        clock.set(2_000);
+        drop(holder);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        delayed.write_all(b"body").await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), delayed.read_to_end(&mut response))
+            .await
+            .expect("response should arrive")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "request should use admission timestamp captured before clock advance: {response}"
+        );
+        assert!(response.ends_with("time-body"), "{response}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

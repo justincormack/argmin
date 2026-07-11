@@ -607,6 +607,10 @@ fn bucket_wildcard_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}/*")
 }
 
+fn object_resource(bucket: &str, key: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/{key}")
+}
+
 fn source_ip_list_bucket_policy(bucket: &str, operator: &str, cidr: &str) -> String {
     json!({
         "Version": "2012-10-17",
@@ -8418,6 +8422,314 @@ fn test_bucket_policy_request_object_tag_binary_equals_does_not_wildcard_match()
             &["binary-wildcard-literal-allowed", "binary-wildcard-denied"],
         )
         .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_current_time_date_condition_operators() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_keys = [
+            "date-less-than-allowed",
+            "date-less-than-fractional-allowed",
+            "date-less-than-nanos-allowed",
+            "date-less-than-equals-allowed",
+            "date-greater-than-allowed",
+            "date-greater-than-fractional-allowed",
+            "date-greater-than-equals-allowed",
+            "date-not-equals-allowed",
+            "date-not-equals-invalid-allowed",
+            "date-less-than-if-exists-allowed",
+            "date-equals-false-fallback-allowed",
+        ];
+        let denied_keys = [
+            "date-less-than-denied",
+            "date-greater-than-denied",
+            "date-equals-denied",
+            "date-less-than-invalid-denied",
+        ];
+        for key in allowed_keys.iter().chain(denied_keys.iter()) {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(*key)
+                .body(ByteStream::from((*key).as_bytes().to_vec()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-less-than-allowed"),
+                    "Condition": {"DateLessThan": {"aws:CurrentTime": "2999-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-less-than-fractional-allowed"),
+                    "Condition": {"DateLessThan": {"aws:CurrentTime": "2999-01-01T00:00:00.0001Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-less-than-nanos-allowed"),
+                    "Condition": {"DateLessThan": {"aws:CurrentTime": "2999-01-01T00:00:00.123456789Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-less-than-equals-allowed"),
+                    "Condition": {"DateLessThanEquals": {"aws:CurrentTime": "2999-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-greater-than-allowed"),
+                    "Condition": {"DateGreaterThan": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-greater-than-fractional-allowed"),
+                    "Condition": {"DateGreaterThan": {"aws:CurrentTime": "2000-01-01T00:00:00.0001Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-greater-than-equals-allowed"),
+                    "Condition": {"DateGreaterThanEquals": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-not-equals-allowed"),
+                    "Condition": {"DateNotEquals": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-not-equals-invalid-allowed"),
+                    "Condition": {"DateNotEquals": {"aws:CurrentTime": "not-a-date"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-less-than-if-exists-allowed"),
+                    "Condition": {"DateLessThanIfExists": {"aws:CurrentTime": "2999-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-equals-false-fallback-allowed")
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-equals-false-fallback-allowed"),
+                    "Condition": {"DateEquals": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-less-than-denied"),
+                    "Condition": {"DateLessThan": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-greater-than-denied"),
+                    "Condition": {"DateGreaterThan": {"aws:CurrentTime": "2999-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-equals-denied"),
+                    "Condition": {"DateEquals": {"aws:CurrentTime": "2000-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-less-than-invalid-denied"),
+                    "Condition": {"DateLessThan": {"aws:CurrentTime": "not-a-date"}}
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "GetObject with DateLessThan aws:CurrentTime condition",
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key("date-less-than-allowed")
+                    .send()
+            },
+        )
+        .await;
+
+        for key in allowed_keys {
+            let response = alt_client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.body.collect().await.unwrap().into_bytes().as_ref(),
+                key.as_bytes()
+            );
+        }
+
+        for key in denied_keys {
+            let denied = alt_client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await;
+            assert_eq!(err_status(&denied), 403, "{key}");
+            assert_s3_err_code(&denied, "AccessDenied");
+        }
+
+        let cleanup_keys = [&allowed_keys[..], &denied_keys[..]].concat();
+        cleanup(&bucket, &cleanup_keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_epoch_time_numeric_conditions() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_keys = ["epoch-less-than-allowed", "epoch-greater-than-allowed"];
+        let denied_keys = ["epoch-less-than-denied", "epoch-greater-than-denied"];
+        for key in allowed_keys.iter().chain(denied_keys.iter()) {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(*key)
+                .body(ByteStream::from((*key).as_bytes().to_vec()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "epoch-less-than-allowed"),
+                    "Condition": {"NumericLessThan": {"aws:EpochTime": 32503680000u64}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "epoch-greater-than-allowed"),
+                    "Condition": {"NumericGreaterThan": {"aws:EpochTime": 946684800}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "epoch-less-than-denied"),
+                    "Condition": {"NumericLessThan": {"aws:EpochTime": 946684800}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "epoch-greater-than-denied"),
+                    "Condition": {"NumericGreaterThan": {"aws:EpochTime": 32503680000u64}}
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "GetObject with NumericLessThan aws:EpochTime condition",
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key("epoch-less-than-allowed")
+                    .send()
+            },
+        )
+        .await;
+
+        for key in allowed_keys {
+            let response = alt_client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.body.collect().await.unwrap().into_bytes().as_ref(),
+                key.as_bytes()
+            );
+        }
+
+        for key in denied_keys {
+            let denied = alt_client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await;
+            assert_eq!(err_status(&denied), 403, "{key}");
+            assert_s3_err_code(&denied, "AccessDenied");
+        }
+
+        let cleanup_keys = [&allowed_keys[..], &denied_keys[..]].concat();
+        cleanup(&bucket, &cleanup_keys).await;
     });
 }
 

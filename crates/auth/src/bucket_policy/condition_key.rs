@@ -26,6 +26,7 @@ pub(super) enum ResolvedValue<'a> {
     Present(&'a str),
     PresentValues(Vec<&'a str>),
     SourceIp(std::net::IpAddr),
+    EpochSeconds(u64),
     Absent,
     Unavailable,
 }
@@ -40,7 +41,9 @@ pub(super) enum ResolvedValue<'a> {
 pub(super) enum OperatorSupport {
     AnyEvaluable,
     BoolOnly,
+    DateOnly,
     IpOnly,
+    NumericOnly,
     StringOrNumeric,
     StringEqualsOnly,
 }
@@ -78,6 +81,7 @@ pub(super) enum ConditionInput {
     Request,
     Bucket,
     SourceIp,
+    CurrentTime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +149,22 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         operator_support: OperatorSupport::IpOnly,
         input: Some(ConditionInput::SourceIp),
         resolve: resolve_source_ip,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:CurrentTime"),
+        operator_support: OperatorSupport::DateOnly,
+        input: Some(ConditionInput::CurrentTime),
+        resolve: resolve_current_time,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:EpochTime"),
+        operator_support: OperatorSupport::NumericOnly,
+        input: Some(ConditionInput::CurrentTime),
+        resolve: resolve_current_time,
         evaluable_for_action: None,
         supported_for_action: None,
     },
@@ -386,6 +406,13 @@ fn resolve_bucket_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedV
 fn resolve_source_ip<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
     match request.source_ip() {
         Some(source_ip) => ResolvedValue::SourceIp(source_ip),
+        None => ResolvedValue::Unavailable,
+    }
+}
+
+fn resolve_current_time<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    match request.current_time_epoch_seconds() {
+        Some(epoch_seconds) => ResolvedValue::EpochSeconds(epoch_seconds),
         None => ResolvedValue::Unavailable,
     }
 }
@@ -738,6 +765,7 @@ pub(super) fn evaluate_clause(
         ResolvedValue::Present(value) => ActualValue::Present(value),
         ResolvedValue::PresentValues(values) => ActualValue::PresentValues(values),
         ResolvedValue::SourceIp(source_ip) => ActualValue::SourceIp(source_ip),
+        ResolvedValue::EpochSeconds(epoch_seconds) => ActualValue::EpochSeconds(epoch_seconds),
         ResolvedValue::Absent => ActualValue::Absent,
         ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
     };
@@ -755,6 +783,14 @@ fn operator_supported_for_key(operator: &str, support: OperatorSupport) -> bool 
             op.evaluable_on_evaluable_object_actions
                 && (condition_op::is_string_condition_kind(op.kind)
                     || condition_op::is_numeric_condition_kind(op.kind))
+        }),
+        OperatorSupport::DateOnly => condition_op::lookup(operator).is_some_and(|op| {
+            op.evaluable_on_evaluable_object_actions
+                && condition_op::is_date_condition_kind(op.kind)
+        }),
+        OperatorSupport::NumericOnly => condition_op::lookup(operator).is_some_and(|op| {
+            op.evaluable_on_evaluable_object_actions
+                && condition_op::is_numeric_condition_kind(op.kind)
         }),
         OperatorSupport::StringEqualsOnly => {
             matches!(operator, "StringEquals" | "StringEqualsIfExists")
@@ -900,6 +936,62 @@ mod tests {
         assert_eq!(resolver.operator_support, OperatorSupport::AnyEvaluable);
         assert!(resolver.evaluable_for_action.is_none());
         assert!(resolver.supported_for_action.is_some());
+    }
+
+    #[test]
+    fn lookup_time_keys_returns_exact_resolvers() {
+        let (current_time, param) = lookup("aws:CurrentTime").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(current_time.operator_support, OperatorSupport::DateOnly);
+        assert_eq!(current_time.input, Some(ConditionInput::CurrentTime));
+
+        let (epoch_time, param) = lookup("aws:EpochTime").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(epoch_time.operator_support, OperatorSupport::NumericOnly);
+        assert_eq!(epoch_time.input, Some(ConditionInput::CurrentTime));
+    }
+
+    #[test]
+    fn time_keys_accept_only_their_operator_families() {
+        let date_clause = PolicyConditionClause {
+            operator: "DateLessThan".to_string(),
+            key: "aws:CurrentTime".to_string(),
+            values: vec!["2024-01-01T00:00:00Z".to_string()],
+        };
+        assert!(supports_clause_for_action(
+            &date_clause,
+            PolicyAction::GetObject
+        ));
+
+        let string_clause = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "aws:CurrentTime".to_string(),
+            values: vec!["2024-01-01T00:00:00Z".to_string()],
+        };
+        assert!(!supports_clause_for_action(
+            &string_clause,
+            PolicyAction::GetObject
+        ));
+
+        let numeric_clause = PolicyConditionClause {
+            operator: "NumericLessThan".to_string(),
+            key: "aws:EpochTime".to_string(),
+            values: vec!["32503680000".to_string()],
+        };
+        assert!(supports_clause_for_action(
+            &numeric_clause,
+            PolicyAction::GetObject
+        ));
+
+        let date_epoch_clause = PolicyConditionClause {
+            operator: "DateLessThan".to_string(),
+            key: "aws:EpochTime".to_string(),
+            values: vec!["2999-01-01T00:00:00Z".to_string()],
+        };
+        assert!(!supports_clause_for_action(
+            &date_epoch_clause,
+            PolicyAction::GetObject
+        ));
     }
 
     #[test]
@@ -1056,6 +1148,16 @@ mod tests {
             };
             assert_eq!(clause_input(&clause), Some(ConditionInput::Bucket));
         }
+
+        let time_clause = PolicyConditionClause {
+            operator: "DateLessThan".to_string(),
+            key: "aws:CurrentTime".to_string(),
+            values: vec!["2999-01-01T00:00:00Z".to_string()],
+        };
+        assert_eq!(
+            clause_input(&time_clause),
+            Some(ConditionInput::CurrentTime)
+        );
 
         let header_clause = PolicyConditionClause {
             operator: "StringEquals".to_string(),

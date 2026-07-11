@@ -48,6 +48,7 @@ pub struct S3Request {
     pub body: Vec<u8>,
     pub transport_security: TransportSecurity,
     pub source_ip: Option<IpAddr>,
+    pub request_epoch_seconds: u64,
 }
 
 pub(crate) struct RequestHeaderSource<'a>(&'a http::HeaderMap);
@@ -104,8 +105,15 @@ impl S3Request {
         parts: http::request::Parts,
         body: bytes::Bytes,
         transport_security: TransportSecurity,
+        request_epoch_seconds: u64,
     ) -> Result<Self, ServerError> {
-        Self::from_hyper_with_source_ip(parts, body, transport_security, None)
+        Self::from_hyper_with_source_ip(
+            parts,
+            body,
+            transport_security,
+            None,
+            request_epoch_seconds,
+        )
     }
 
     pub fn from_hyper_with_source_ip(
@@ -113,6 +121,7 @@ impl S3Request {
         body: bytes::Bytes,
         transport_security: TransportSecurity,
         source_ip: Option<IpAddr>,
+        request_epoch_seconds: u64,
     ) -> Result<Self, ServerError> {
         let method = parts.method;
         let uri = parts.uri;
@@ -143,6 +152,7 @@ impl S3Request {
             body,
             transport_security,
             source_ip,
+            request_epoch_seconds,
         })
     }
 
@@ -154,16 +164,29 @@ impl S3Request {
     pub fn from_hyper_headers(
         parts: http::request::Parts,
         transport_security: TransportSecurity,
+        request_epoch_seconds: u64,
     ) -> Result<Self, ServerError> {
-        Self::from_hyper(parts, bytes::Bytes::new(), transport_security)
+        Self::from_hyper(
+            parts,
+            bytes::Bytes::new(),
+            transport_security,
+            request_epoch_seconds,
+        )
     }
 
     pub fn from_hyper_headers_with_source_ip(
         parts: http::request::Parts,
         transport_security: TransportSecurity,
         source_ip: Option<IpAddr>,
+        request_epoch_seconds: u64,
     ) -> Result<Self, ServerError> {
-        Self::from_hyper_with_source_ip(parts, bytes::Bytes::new(), transport_security, source_ip)
+        Self::from_hyper_with_source_ip(
+            parts,
+            bytes::Bytes::new(),
+            transport_security,
+            source_ip,
+            request_epoch_seconds,
+        )
     }
 
     /// Get a header value by lowercase name.
@@ -192,6 +215,11 @@ impl S3Request {
     #[must_use]
     pub fn source_ip(&self) -> Option<IpAddr> {
         self.source_ip
+    }
+
+    #[must_use]
+    pub fn request_epoch_seconds(&self) -> u64 {
+        self.request_epoch_seconds
     }
 
     pub(crate) fn header_source(&self) -> RequestHeaderSource<'_> {
@@ -257,6 +285,7 @@ impl S3Request {
             body,
             transport_security: self.transport_security,
             source_ip: self.source_ip,
+            request_epoch_seconds: self.request_epoch_seconds,
         }
     }
 
@@ -291,6 +320,7 @@ impl S3Request {
         query_string: &str,
         headers: http::HeaderMap,
         body: Vec<u8>,
+        request_epoch_seconds: u64,
     ) -> Self {
         Self::new_for_test_with_transport(
             method,
@@ -299,6 +329,7 @@ impl S3Request {
             headers,
             body,
             TransportSecurity::Tls,
+            request_epoch_seconds,
         )
     }
 
@@ -310,6 +341,7 @@ impl S3Request {
         headers: http::HeaderMap,
         body: Vec<u8>,
         transport_security: TransportSecurity,
+        request_epoch_seconds: u64,
     ) -> Self {
         let path = if path.is_empty() { "/" } else { path };
         let uri = if query_string.is_empty() {
@@ -324,6 +356,7 @@ impl S3Request {
             body,
             transport_security,
             source_ip: None,
+            request_epoch_seconds,
         }
     }
 }
@@ -494,6 +527,7 @@ mod tests {
             "list-type=2&prefix=photos%2F&max-keys=10",
             test_headers(vec![]),
             vec![],
+            0,
         );
         assert_eq!(req.query_param("list-type"), Some("2".to_string()));
         assert_eq!(req.query_param("prefix"), Some("photos/".to_string()));
@@ -621,7 +655,8 @@ mod tests {
 
     #[test]
     fn query_param_empty_query_string() {
-        let req = S3Request::new_for_test(http::Method::GET, "/", "", test_headers(vec![]), vec![]);
+        let req =
+            S3Request::new_for_test(http::Method::GET, "/", "", test_headers(vec![]), vec![], 0);
         assert_eq!(req.query_param("anything"), None);
     }
 
@@ -633,6 +668,7 @@ mod tests {
             "flagonly&key=val",
             test_headers(vec![]),
             vec![],
+            0,
         );
         // "flagonly" with no = has empty value
         assert_eq!(req.query_param("flagonly"), Some(String::new()));
@@ -647,6 +683,7 @@ mod tests {
             "a=1&b=2&c=3",
             test_headers(vec![]),
             vec![],
+            0,
         );
         assert_eq!(req.query_param("c"), Some("3".to_string()));
     }
@@ -662,6 +699,7 @@ mod tests {
                 ("content-type".to_string(), "text/plain".to_string()),
             ]),
             vec![],
+            0,
         );
         let pairs = req.header_pairs();
         assert_eq!(pairs.len(), 2);
@@ -697,6 +735,7 @@ mod tests {
             "",
             test_headers(vec![("host".to_string(), "example.com".to_string())]),
             vec![],
+            0,
         );
         assert_eq!(req.header("content-type"), None);
         assert_eq!(req.header("host"), Some("example.com"));
@@ -846,7 +885,7 @@ mod tests {
             .into_parts();
         parts.headers = headers;
         let req =
-            S3Request::from_hyper(parts, bytes::Bytes::new(), TransportSecurity::Tls).unwrap();
+            S3Request::from_hyper(parts, bytes::Bytes::new(), TransportSecurity::Tls, 0).unwrap();
         assert_eq!(req.header("x-amz-meta-tag"), Some("caf\u{e9}"));
     }
 
@@ -869,7 +908,7 @@ mod tests {
             .unwrap()
             .into_parts();
         parts.headers = headers;
-        match S3Request::from_hyper(parts, bytes::Bytes::new(), TransportSecurity::Tls) {
+        match S3Request::from_hyper(parts, bytes::Bytes::new(), TransportSecurity::Tls, 0) {
             Err(ServerError::InvalidRequest { reason }) => {
                 assert!(
                     reason.contains("invalid UTF-8") && reason.contains("x-amz-meta-raw"),

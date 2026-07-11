@@ -510,6 +510,8 @@ The current implemented evaluator is strongest on:
 - `s3:ExistingObjectTag/*`
 - `s3:RequestObjectTag/*`
 - `aws:SourceIp`
+- `aws:CurrentTime`
+- `aws:EpochTime`
 - the supported `s3:x-amz-*` request condition keys already threaded through
   `PolicyRequest`
 
@@ -532,6 +534,12 @@ Current supported condition operators are:
 - `ForAllValues:StringNotLike`, `ForAnyValue:StringNotLike`
 - `BinaryEquals`, `BinaryEqualsIfExists`
 - `ForAllValues:BinaryEquals`, `ForAnyValue:BinaryEquals`
+- `DateEquals`, `DateEqualsIfExists`
+- `DateNotEquals`, `DateNotEqualsIfExists`
+- `DateLessThan`, `DateLessThanIfExists`
+- `DateLessThanEquals`, `DateLessThanEqualsIfExists`
+- `DateGreaterThan`, `DateGreaterThanIfExists`
+- `DateGreaterThanEquals`, `DateGreaterThanEqualsIfExists`
 - `NumericEquals`, `NumericEqualsIfExists`
 - `NumericNotEquals`, `NumericNotEqualsIfExists`
 - `NumericLessThan`, `NumericLessThanIfExists`
@@ -548,8 +556,8 @@ families are:
 
 - numeric set operators such as `ForAllValues:NumericEquals` and
   `ForAnyValue:NumericEquals`
-- date operators, including date comparisons and their applicable
-  set/`IfExists` forms
+- date set operators such as `ForAllValues:DateEquals` and
+  `ForAnyValue:DateEquals`
 - ARN operators: `ArnEquals`, `ArnLike`, `ArnNotEquals`, `ArnNotLike`, and
   their applicable set/`IfExists` forms
 - boolean set operators: `ForAllValues:Bool` and `ForAnyValue:Bool`
@@ -557,6 +565,13 @@ families are:
 `BinaryEquals` decodes the policy operand and request-context value as
 standard base64 and compares the resulting bytes exactly. It does not perform
 string wildcard matching.
+
+`aws:CurrentTime` is evaluated against a single timestamp captured for the S3
+request with date comparison operators, including fractional seconds accepted
+by AWS up to nanosecond precision. `aws:EpochTime` exposes the same timestamp
+as Unix epoch seconds for numeric operators. AWS accepts malformed date
+operands in stored bucket policies; invalid operands are therefore handled at
+evaluation time rather than rejected by `PutBucketPolicy`.
 
 Policy variables are also not implemented. AWS supports variables such as
 `${aws:PrincipalTag/team}` in `Resource` ARNs and in string/ARN condition

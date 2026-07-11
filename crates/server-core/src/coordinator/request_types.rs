@@ -416,6 +416,7 @@ pub struct Requester {
     pub(super) account: Option<AccountIdentity>,
     pub(super) authorization_profile: auth::AuthorizationProfile,
     pub(super) source_ip: Option<std::net::IpAddr>,
+    pub(super) request_epoch_seconds: Option<u64>,
 }
 
 /// Parsed x-amz-acl value relevant to PutObject authorization rules.
@@ -1195,6 +1196,7 @@ impl Requester {
             account: auth.account.clone(),
             authorization_profile: auth.authorization_profile,
             source_ip: None,
+            request_epoch_seconds: None,
         }
     }
 
@@ -1205,6 +1207,7 @@ impl Requester {
             account: None,
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
+            request_epoch_seconds: None,
         }
     }
 
@@ -1215,6 +1218,7 @@ impl Requester {
             account: Some(account),
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
+            request_epoch_seconds: None,
         }
     }
 
@@ -1225,6 +1229,7 @@ impl Requester {
             account: account.cloned(),
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
+            request_epoch_seconds: None,
         }
     }
 
@@ -1235,6 +1240,7 @@ impl Requester {
             account: Some(account),
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
             source_ip: None,
+            request_epoch_seconds: None,
         }
     }
 
@@ -1250,12 +1256,24 @@ impl Requester {
     }
 
     #[must_use]
+    pub const fn with_request_epoch_seconds(mut self, request_epoch_seconds: Option<u64>) -> Self {
+        self.request_epoch_seconds = request_epoch_seconds;
+        self
+    }
+
+    #[must_use]
+    pub const fn request_epoch_seconds(&self) -> Option<u64> {
+        self.request_epoch_seconds
+    }
+
+    #[must_use]
     #[cfg(any(test, feature = "test-utils"))]
     pub fn from_account_owner_account_admin(account: Option<&AccountIdentity>) -> Self {
         Self {
             account: account.cloned(),
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
             source_ip: None,
+            request_epoch_seconds: None,
         }
     }
 
@@ -1269,6 +1287,7 @@ impl Requester {
             account: Some(account),
             authorization_profile,
             source_ip: None,
+            request_epoch_seconds: None,
         }
     }
 
@@ -1282,6 +1301,7 @@ impl Requester {
             account: account.cloned(),
             authorization_profile,
             source_ip: None,
+            request_epoch_seconds: None,
         }
     }
 
