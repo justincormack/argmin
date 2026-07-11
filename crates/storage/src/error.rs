@@ -503,6 +503,14 @@ pub enum ClusterBuildError {
     #[error("runtime route-map lease could not bind to the process clock: {message}")]
     RouteMapLeaseBinding { message: String },
 
+    #[error(
+        "historical recovery runtime map node set {candidate:?} does not match current local node set {current:?}"
+    )]
+    HistoricalRecoveryNodeSetMismatch {
+        current: Vec<u32>,
+        candidate: Vec<u32>,
+    },
+
     #[error("duplicate local node id {id}")]
     DuplicateNodeId { id: u32 },
 

@@ -22,8 +22,8 @@ use local::{LocalClusterRuntimeState, MetadataCommandRecoveryAdmission};
 pub use request_ops::BucketIdentityGenerations;
 
 use crate::control_plane::{
-    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource, PgMetadataProof,
-    PgRouteSnapshot,
+    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource,
+    PendingMetadataCommandObservation, PgMetadataProof, PgRouteSnapshot,
 };
 use crate::error::{ClusterBuildError, PgMetadataTransferError, ShardIoError, StoreError};
 #[cfg(test)]
@@ -1056,6 +1056,64 @@ pub enum StorageClusterRuntimeMapRefreshError {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+enum PendingMetadataCommandRefreshRecoveryError {
+    #[error("load PG-scoped runtime map: {0}")]
+    ControlPlane(#[from] ControlPlaneError),
+    #[error("build historical recovery cluster: {0}")]
+    Build(#[from] ClusterBuildError),
+    #[error("load pending metadata command: {0}")]
+    Store(#[from] StoreError),
+    #[error("recover pending metadata command: {0}")]
+    Recover(#[from] ObjectPgActionError),
+    #[error(
+        "pending metadata command recovery discovery failed for PG {pg_id} ({kind:?}): {detail}"
+    )]
+    DiscoveryFailure {
+        pg_id: u32,
+        kind: crate::control_plane::PendingMetadataCommandRecoveryDiscoveryFailureKind,
+        detail: String,
+    },
+    #[error(
+        "pending metadata command recovery authorization changed for PG {pg_id}: expected {expected:?}, current route state {actual_state}, authorization {actual:?}"
+    )]
+    AuthorizationChanged {
+        pg_id: u32,
+        expected: crate::control_plane::PendingMetadataCommandRecovery,
+        actual_state: PgState,
+        actual: Option<crate::control_plane::PendingMetadataCommandRecovery>,
+    },
+    #[error(
+        "reported pending metadata command PG {pg_id} epoch {pending_epoch} route primary is node {actual_primary}, not reporting node {reporting_node}"
+    )]
+    ReportingNodeNotHistoricalPrimary {
+        pg_id: u32,
+        pending_epoch: ClusterEpoch,
+        reporting_node: u32,
+        actual_primary: u32,
+    },
+    #[error(
+        "reported pending metadata command PG {pg_id} epoch {pending_epoch} historical route is {state}, not active"
+    )]
+    HistoricalRouteNotActive {
+        pg_id: u32,
+        pending_epoch: ClusterEpoch,
+        state: PgState,
+    },
+    #[error(
+        "reported pending metadata command identity changed for PG {pg_id}: expected epoch {expected_epoch} index {expected_index} checksum {expected_checksum}, got epoch {actual_epoch} index {actual_index} checksum {actual_checksum}"
+    )]
+    IdentityChanged {
+        pg_id: u32,
+        expected_epoch: ClusterEpoch,
+        expected_index: u64,
+        expected_checksum: u64,
+        actual_epoch: ClusterEpoch,
+        actual_index: u64,
+        actual_checksum: u64,
+    },
+}
+
 #[derive(Clone)]
 pub struct StorageCluster {
     local_map: Arc<LocalClusterMap>,
@@ -1318,6 +1376,23 @@ impl StorageClusterRuntimeMapHandle {
             .name("argmin-storage-cluster-control-plane-refresh".to_string())
             .spawn(move || loop {
                 let now_ms = authority_now_ms();
+                let discovered_recovery_result = match control_plane
+                    .pending_metadata_command_recoveries(now_ms)
+                {
+                    Ok(listing)
+                        if !listing.tasks().is_empty() || !listing.failures().is_empty() => Some(
+                        self.recover_authorized_pending_metadata_commands(
+                            &control_plane,
+                            now_ms,
+                            admission_settings,
+                            listing,
+                        ),
+                    ),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(
+                        PendingMetadataCommandRefreshRecoveryError::ControlPlane(error),
+                    )),
+                };
                 let result = match admission_settings {
                     Some(admission_settings) => self
                         .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
@@ -1327,13 +1402,38 @@ impl StorageClusterRuntimeMapHandle {
                         ),
                     None => self.refresh_from_control_plane_runtime_map(&control_plane, now_ms),
                 };
-                let recovery_result = result.as_ref().err().map(|error| {
-                    if runtime_map_refresh_error_requires_current_map_invalidation(error) {
-                        self.expire_same_epoch_generations(now_ms);
-                    }
-                    self.current()
-                        .drain_pending_metadata_commands_for_current_map()
-                });
+                let recovery_result = match discovered_recovery_result {
+                    Some(result) => Some(result),
+                    None => match &result {
+                        Ok(_) => None,
+                        Err(error) => {
+                        if runtime_map_refresh_error_requires_current_map_invalidation(error) {
+                            self.expire_same_epoch_generations(now_ms);
+                        }
+                        Some(match error {
+                        StorageClusterRuntimeMapRefreshError::ControlPlane(
+                            ControlPlaneError::PgPeeringPendingMetadataCommand {
+                                pg_id,
+                                node_id,
+                                pending,
+                                ..
+                            },
+                        ) => self.recover_reported_pending_metadata_command(
+                            &control_plane,
+                            now_ms,
+                            admission_settings,
+                            PgId::new(*pg_id),
+                            NodeId::new(*node_id),
+                            *pending,
+                        ),
+                        _ => self
+                            .current()
+                            .drain_pending_metadata_commands_for_current_map()
+                            .map_err(PendingMetadataCommandRefreshRecoveryError::Recover),
+                        })
+                        }
+                    },
+                };
                 {
                     let mut status = worker_status
                         .lock()
@@ -1347,7 +1447,11 @@ impl StorageClusterRuntimeMapHandle {
                                     cluster_epoch: cluster.cluster_epoch(),
                                     route_map_validity: cluster.route_map_validity(),
                                 });
-                            status.last_error = None;
+                            status.last_error = recovery_result.as_ref().and_then(|result| {
+                                result.as_ref().err().map(|error| {
+                                    format!("pending metadata command recovery failed: {error}")
+                                })
+                            });
                         }
                         Err(error) => {
                             status.failures += 1;
@@ -1355,7 +1459,7 @@ impl StorageClusterRuntimeMapHandle {
                             match recovery_result {
                                 Some(Ok(drained)) if drained > 0 => {
                                     error.push_str(&format!(
-                                        "; drained {drained} pending metadata command(s) from current map"
+                                        "; drained {drained} pending metadata command(s)"
                                     ));
                                 }
                                 Some(Err(recovery_error)) => {
@@ -1390,20 +1494,161 @@ impl StorageClusterRuntimeMapHandle {
             handle: Some(handle),
         })
     }
+
+    fn recover_reported_pending_metadata_command(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+        admission_settings: Option<LocalUnixStorageNodeClientAdmissionSettings>,
+        pg_id: PgId,
+        reporting_node: NodeId,
+        pending: PendingMetadataCommandObservation,
+    ) -> Result<usize, PendingMetadataCommandRefreshRecoveryError> {
+        let pg_runtime_map = control_plane.pg_runtime_map_snapshot(pg_id, authority_now_ms)?;
+        let expected_recovery =
+            crate::control_plane::PendingMetadataCommandRecovery::new(reporting_node, pending);
+        let current_route = pg_runtime_map
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        let actual_recovery = current_route.pending_metadata_command_recovery();
+        if current_route.state() != PgState::Peering || actual_recovery != Some(expected_recovery) {
+            return Err(
+                PendingMetadataCommandRefreshRecoveryError::AuthorizationChanged {
+                    pg_id: pg_id.get(),
+                    expected: expected_recovery,
+                    actual_state: current_route.state(),
+                    actual: actual_recovery,
+                },
+            );
+        }
+        let historical_route =
+            pg_runtime_map.reconstructed_pg_route_at_epoch(pg_id, pending.cluster_epoch())?;
+        if historical_route.state() != PgState::Active {
+            return Err(
+                PendingMetadataCommandRefreshRecoveryError::HistoricalRouteNotActive {
+                    pg_id: pg_id.get(),
+                    pending_epoch: pending.cluster_epoch(),
+                    state: historical_route.state(),
+                },
+            );
+        }
+        if historical_route.primary_node_id() != reporting_node {
+            return Err(
+                PendingMetadataCommandRefreshRecoveryError::ReportingNodeNotHistoricalPrimary {
+                    pg_id: pg_id.get(),
+                    pending_epoch: pending.cluster_epoch(),
+                    reporting_node: reporting_node.as_u32(),
+                    actual_primary: historical_route.primary_node_id().as_u32(),
+                },
+            );
+        }
+
+        let historical_runtime_map =
+            pg_runtime_map.runtime_map_at_epoch(pending.cluster_epoch())?;
+        let current = self.current();
+        let recovery_cluster = match admission_settings {
+            Some(admission_settings) => {
+                StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings(
+                    current.metadata_node_id(),
+                    &historical_runtime_map,
+                    current.default_payload_ec_shape(),
+                    admission_settings,
+                )?
+            }
+            None => {
+                let local_map = LocalClusterMap::open_runtime_map_with_existing_local_nodes(
+                    &current.local_map,
+                    &historical_runtime_map,
+                )?;
+                StorageCluster::from_local_map(Arc::new(local_map))?
+            }
+        };
+        let primary = recovery_cluster
+            .local_map
+            .metadata_pg_primary_node_for_metadata_command_recovery(
+                pending.cluster_epoch(),
+                pg_id,
+            )?;
+        let Some(command) = primary
+            .metadata_command_client()
+            .pending_metadata_command_envelope(pg_id, pending.cluster_epoch())?
+        else {
+            return Ok(0);
+        };
+        let command_id = command.id();
+        if command_id.cluster_epoch() != pending.cluster_epoch()
+            || command_id.log_index().get() != pending.log_index()
+            || command.checksum_crc64() != pending.command_checksum()
+        {
+            return Err(
+                PendingMetadataCommandRefreshRecoveryError::IdentityChanged {
+                    pg_id: pg_id.get(),
+                    expected_epoch: pending.cluster_epoch(),
+                    expected_index: pending.log_index(),
+                    expected_checksum: pending.command_checksum(),
+                    actual_epoch: command_id.cluster_epoch(),
+                    actual_index: command_id.log_index().get(),
+                    actual_checksum: command.checksum_crc64(),
+                },
+            );
+        }
+        let _ =
+            recovery_cluster.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
+        Ok(1)
+    }
+
+    fn recover_authorized_pending_metadata_commands(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+        admission_settings: Option<LocalUnixStorageNodeClientAdmissionSettings>,
+        listing: crate::control_plane::PendingMetadataCommandRecoveryListing,
+    ) -> Result<usize, PendingMetadataCommandRefreshRecoveryError> {
+        let mut recovered = 0;
+        let mut first_error = None;
+        let (recoveries, discovery_failures) = listing.into_parts();
+        for task in recoveries {
+            let recovery = task.recovery();
+            match self.recover_reported_pending_metadata_command(
+                control_plane,
+                authority_now_ms,
+                admission_settings,
+                task.pg_id(),
+                recovery.reporting_node_id(),
+                recovery.pending(),
+            ) {
+                Ok(count) => recovered += count,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if first_error.is_none() {
+            first_error = discovery_failures.into_iter().next().map(|failure| {
+                PendingMetadataCommandRefreshRecoveryError::DiscoveryFailure {
+                    pg_id: failure.pg_id().get(),
+                    kind: failure.kind(),
+                    detail: failure.detail().to_owned(),
+                }
+            });
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(recovered)
+    }
 }
 
 fn runtime_map_refresh_error_requires_current_map_invalidation(
     error: &StorageClusterRuntimeMapRefreshError,
 ) -> bool {
-    match error {
+    matches!(
+        error,
         StorageClusterRuntimeMapRefreshError::ControlPlane(
-            ControlPlaneError::PgPeeringPendingMetadataCommand { .. },
-        ) => true,
-        StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::RpcRemote {
-            message,
-        }) => message.contains("reported unresolved pending metadata command"),
-        _ => false,
-    }
+            ControlPlaneError::PgPeeringPendingMetadataCommand { .. }
+        )
+    )
 }
 
 #[cfg(test)]
@@ -1484,13 +1729,13 @@ mod runtime_map_refresh_invalidation_tests {
                     pg_id: 31,
                     node_id: 1,
                     cluster_epoch: ClusterEpoch::INITIAL,
+                    pending: crate::control_plane::PendingMetadataCommandObservation::new(
+                        ClusterEpoch::INITIAL,
+                        std::num::NonZeroU64::MIN,
+                        0,
+                    ),
                 },
             ),
-        ));
-        assert!(runtime_map_refresh_error_requires_current_map_invalidation(
-            &StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::RpcRemote {
-                message: "node 1 reported unresolved pending metadata command for PG 31 in cluster epoch 1".to_string(),
-            }),
         ));
         assert!(
             !runtime_map_refresh_error_requires_current_map_invalidation(
@@ -4009,12 +4254,10 @@ impl StorageCluster {
         authority_now_ms: u64,
     ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
         let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
-        let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
-            self.metadata_node_id(),
+        let local_map = LocalClusterMap::open_runtime_map_with_existing_local_nodes(
+            &self.local_map,
             &runtime_map,
-            self.default_payload_ec_shape(),
         )?;
-        local_map.inherit_process_local_state_from(&self.local_map);
         Ok(Self::from_local_map(Arc::new(local_map))?)
     }
 

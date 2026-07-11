@@ -122,8 +122,8 @@ Required design:
    is insufficient unless a newer fence cannot install between that check and
    commit.
 3. Separate ordinary current-epoch mutation permits from narrowly typed
-   historical recovery permits. A historical route must not be able to invoke
-   the normal mutation surface.
+   historical recovery authorization. A historical route must not be able to
+   invoke the normal mutation surface.
 4. Define expiry behavior for in-flight operations. Either stop admitting work
    with a proven completion guard before expiry and drain it, or delay successor
    activation until old permits cannot commit. Merely checking wall time at RPC
@@ -152,14 +152,14 @@ release cleanup while draining so a session-held lock cannot deadlock the
 transition. Metadata mutation families recheck route expiry after acquiring
 the PG lock. Visible metadata command application carries a request-bound
 fence into its SQLite transaction and checks it immediately before commit. A
-historical Active route is mutable only with a process-local recovery permit
-created while an observed current Active route is drained into the exact
-retained historical route; bare retained topology and restart reconstruction
-do not grant that capability. The permit expires with the old route map, and
-the route-admission permit prevents a newer config fence from publishing
-between the check and commit. The transaction rolls back on guard failure.
-Deterministic tests pin permit drain/publication ordering, cleanup during
-drain, bare-history rejection, pre-expiry recovery, post-expiry rejection, and
+historical Active route is mutable only when the current Peering runtime map
+authorizes the exact PG, command epoch, log index, and checksum; bare retained
+topology and restart reconstruction do not grant that capability. The
+authorization uses the current map's process-bound monotonic lease, and the
+route-admission permit prevents a newer config fence from publishing between
+the check and commit. The transaction rolls back on guard failure.
+Deterministic tests pin drain/publication ordering, cleanup during drain,
+bare-history and unlisted-command rejection, bounded authorized recovery, and
 rollback at the commit guard.
 
 The paired `CL1` fix persists the previous primary's node ID, incarnation,
@@ -206,13 +206,44 @@ pressure, that publication window could exceed the one-second storage RPC
 response deadline. Terminal metadata-command cleanup or cross-PG LIST fanout
 then timed out before dispatch. Installation now stages the candidate temp file
 while the old route remains admitted, then closes and drains the gate only for
-the atomic rename, historical-recovery-permit publication, and in-memory config
-swap. More importantly, the 100 ms heartbeat path no longer drains frames for
+the atomic rename and in-memory config swap. More importantly, the 100 ms heartbeat path no longer drains frames for
 a structurally identical same-epoch map that only extends its bounded validity;
 deadline shrink and every topology/history change still use the full fence.
 Deterministic regressions prove slow staging and monotonic lease refresh remain
 non-blocking, deadline shrink drains, and no old frame overlaps real route
 publication.
+
+Follow-up pending-command convergence hardening (2026-07-10): a repeat-100
+route-change-restart soak retained a pending command on an old primary after
+the PG entered a later Peering epoch. The control plane correctly rejected
+activation, but the refresh worker's current-map-only recovery could not reach
+the command, creating a circular liveness failure. Heartbeats now carry a typed
+pending identity `(command epoch, log index, checksum)`, and the pending epoch
+also contributes to the storage node's durable cluster-map history floor.
+The authority now exposes a dedicated pending-command recovery listing that
+does not construct the full serving map; each listed task obtains a PG-scoped
+map independently. This prevents unrelated unavailable PGs from blocking
+discovery. Validation failures are returned as typed per-PG listing outcomes,
+so one malformed authority observation does not suppress valid tasks for other
+PGs. The fresh PG-scoped map must still carry the exact listed reporting
+primary and command identity before recovery can start; a listing that became
+stale between the two reads is rejected without mutation. Peering runtime maps
+carry that same exact recovery authorization. Storage-node refresh
+distributes that authorization and the referenced historical Active route to every node,
+so replicas without the pending slot cannot prune the route needed for
+acting-set convergence. Historical mutation is admitted only for that exact
+command and only under the current bounded runtime-map validity; it no longer
+depends on the original route-transition deadline. Refresh recovery reconstructs
+the exact command epoch, proves the reporting node was the historical Active
+primary, reloads and matches the durable command, and only then invokes the
+established acting-set convergence algorithm. The heartbeat/observation path
+remains non-mutating. Persistence, command, runtime-config, and RPC baselines
+were advanced rather than retaining legacy decoders because upgrades are not
+yet supported. Focused tests use the real single authority, verify every node's
+refresh retains the required route, exercise Unix recovery after the original
+deadline, and prove background old-epoch zero-apply convergence despite both
+an unrelated full-map failure and an earlier independently failing recovery
+task.
 
 ### DCC-2. HIGH - bounded timestamp catch-up still grants unbounded serving leases
 
@@ -243,9 +274,10 @@ storage-node runtime maps bind authority deadlines to qualified or defensively
 monitored process-local monotonic deadlines with the skew budget subtracted,
 and every serving admission revalidates process clock health. Apple uses a
 separate adjusted monotonic health source so normal frequency correction does
-not accumulate against its raw continuous lease clock. Historical metadata-
-recovery permits carry the same monotonic fence, and successor activation waits
-until the old deadline plus skew.
+not accumulate against its raw continuous lease clock. Exact historical
+metadata-recovery authorization carries the current runtime map's same
+monotonic fence, and successor activation waits until the old deadline plus
+skew.
 
 This finding remains open for availability and operational closeout: add the
 explicit authenticated authority-clock re-establishment operation required

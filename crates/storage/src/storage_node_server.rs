@@ -13,14 +13,17 @@ use std::time::{Duration, Instant};
 
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatRuntimeMapSource,
-    ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PgRouteSnapshot,
+    ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PendingMetadataCommandObservation,
+    PendingMetadataCommandRecovery, PgRouteSnapshot,
 };
 use crate::control_plane_lease::{
     validate_process_lease_clock, BoundRouteMapLease, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
 };
 use crate::data_dir::prepare_private_data_dir;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
-use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
+use crate::metadata_command::{
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+};
 use crate::node::SharedStorageNode;
 use crate::node_client::{
     complete_multipart_expected_object_parts, BucketMetadataNodeClient,
@@ -336,6 +339,7 @@ pub struct StorageNodeProcessConfig {
     pub(crate) socket_path: PathBuf,
     pub(crate) pg_routes: Vec<StorageNodePgRoute>,
     pub(crate) historical_pg_routes: Vec<StorageNodePgRoute>,
+    pub(crate) pending_metadata_command_recoveries: Vec<(PgId, PendingMetadataCommandRecovery)>,
 }
 
 #[derive(Debug, Clone)]
@@ -349,6 +353,7 @@ pub struct StorageNodeProcessConfigParts {
     pub socket_path: PathBuf,
     pub pg_routes: Vec<StorageNodePgRoute>,
     pub historical_pg_routes: Vec<StorageNodePgRoute>,
+    pub pending_metadata_command_recoveries: Vec<(PgId, PendingMetadataCommandRecovery)>,
 }
 
 #[derive(Debug, Clone)]
@@ -400,6 +405,7 @@ impl StorageNodeProcessConfig {
             socket_path: parts.socket_path,
             pg_routes: parts.pg_routes,
             historical_pg_routes: parts.historical_pg_routes,
+            pending_metadata_command_recoveries: parts.pending_metadata_command_recoveries,
         };
         validate_process_config_route_table(&config)?;
         Ok(config)
@@ -474,6 +480,15 @@ impl StorageNodeProcessConfig {
             .iter()
             .map(StorageNodePgRoute::from)
             .collect();
+        let pending_metadata_command_recoveries = runtime_map
+            .pg_routes()
+            .iter()
+            .filter_map(|route| {
+                route
+                    .pending_metadata_command_recovery()
+                    .map(|recovery| (route.pg_id(), recovery))
+            })
+            .collect();
         let pg_ids: Vec<u32> = pg_routes.iter().map(|route| route.pg_id).collect();
         validate_pg_ids(&pg_ids)?;
         validate_pg_routes(&pg_ids, &pg_routes)?;
@@ -496,6 +511,7 @@ impl StorageNodeProcessConfig {
             socket_path: PathBuf::from(node.endpoint()),
             pg_routes,
             historical_pg_routes,
+            pending_metadata_command_recoveries,
         })
     }
 
@@ -558,6 +574,8 @@ impl StorageNodeProcessConfig {
             && self.socket_path == current.socket_path
             && self.pg_routes == current.pg_routes
             && self.historical_pg_routes == current.historical_pg_routes
+            && self.pending_metadata_command_recoveries
+                == current.pending_metadata_command_recoveries
     }
 
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
@@ -815,10 +833,17 @@ fn metadata_transfer_source_route_keys_for_refresh(
         .pg_routes()
         .iter()
         .chain(runtime_map.historical_pg_routes())
-        .filter_map(|route| {
-            route
-                .peering_metadata_transfer_source_route_epoch()
-                .map(|source_epoch| (source_epoch, route.pg_id().get()))
+        .flat_map(|route| {
+            [
+                route
+                    .peering_metadata_transfer_source_route_epoch()
+                    .map(|source_epoch| (source_epoch, route.pg_id().get())),
+                route
+                    .pending_metadata_command_recovery()
+                    .map(|recovery| (recovery.pending().cluster_epoch(), route.pg_id().get())),
+            ]
+            .into_iter()
+            .flatten()
         })
         .collect()
 }
@@ -829,7 +854,7 @@ fn control_plane_runtime_config_path(data_dir: &Path) -> PathBuf {
 
 fn encode_control_plane_runtime_config(config: &StorageNodeProcessConfig) -> String {
     let mut out = String::new();
-    out.push_str("argmin-storage-node-runtime-config-v1\n");
+    out.push_str("argmin-storage-node-runtime-config-v2\n");
     out.push_str(&format!("node_id {}\n", config.node_id.as_u32()));
     out.push_str(&format!("cluster_epoch {}\n", config.cluster_epoch.get()));
     match config.route_map_validity {
@@ -859,6 +884,20 @@ fn encode_control_plane_runtime_config(config: &StorageNodeProcessConfig) -> Str
         "historical_pg_routes",
         &config.historical_pg_routes,
     );
+    out.push_str(&format!(
+        "pending_metadata_command_recoveries {}\n",
+        config.pending_metadata_command_recoveries.len()
+    ));
+    for (pg_id, recovery) in &config.pending_metadata_command_recoveries {
+        out.push_str(&format!(
+            "{} {} {} {} {}\n",
+            pg_id.get(),
+            recovery.reporting_node_id().as_u32(),
+            recovery.pending().cluster_epoch().get(),
+            recovery.pending().log_index(),
+            recovery.pending().command_checksum()
+        ));
+    }
     out
 }
 
@@ -890,7 +929,7 @@ fn decode_control_plane_runtime_config(
     let magic = lines
         .next()
         .ok_or_else(|| runtime_config_invalid(path, "empty config"))?;
-    if magic != "argmin-storage-node-runtime-config-v1" {
+    if magic != "argmin-storage-node-runtime-config-v2" {
         return Err(runtime_config_invalid(path, "invalid magic"));
     }
     let node_id = NodeId::new(parse_labeled_u32(path, lines.next(), "node_id")?);
@@ -918,6 +957,39 @@ fn decode_control_plane_runtime_config(
     let pg_routes = decode_storage_node_routes(path, &mut lines, "pg_routes")?;
     let historical_pg_routes =
         decode_storage_node_routes(path, &mut lines, "historical_pg_routes")?;
+    let recovery_count =
+        parse_labeled_usize(path, lines.next(), "pending_metadata_command_recoveries")?;
+    let mut pending_metadata_command_recoveries = Vec::with_capacity(recovery_count);
+    for _ in 0..recovery_count {
+        let line = lines.next().ok_or_else(|| {
+            runtime_config_invalid(path, "missing pending metadata command recovery")
+        })?;
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() != 5 {
+            return Err(runtime_config_invalid(
+                path,
+                "invalid pending metadata command recovery",
+            ));
+        }
+        pending_metadata_command_recoveries.push((
+            PgId::new(parse_u32_field(path, fields[0], "recovery PG id")?),
+            PendingMetadataCommandRecovery::new(
+                NodeId::new(parse_u32_field(path, fields[1], "recovery reporting node")?),
+                PendingMetadataCommandObservation::new(
+                    parse_cluster_epoch_field(path, fields[2], "recovery command epoch")?,
+                    std::num::NonZeroU64::new(parse_u64_field(
+                        path,
+                        fields[3],
+                        "recovery command log index",
+                    )?)
+                    .ok_or_else(|| {
+                        runtime_config_invalid(path, "recovery command log index must be nonzero")
+                    })?,
+                    parse_u64_field(path, fields[4], "recovery command checksum")?,
+                ),
+            ),
+        ));
+    }
     if lines.next().is_some() {
         return Err(runtime_config_invalid(path, "trailing data"));
     }
@@ -931,6 +1003,7 @@ fn decode_control_plane_runtime_config(
         socket_path,
         pg_routes,
         historical_pg_routes,
+        pending_metadata_command_recoveries,
     })
 }
 
@@ -1381,6 +1454,8 @@ pub enum StorageNodeServerError {
         route_epoch: ClusterEpoch,
         config_epoch: ClusterEpoch,
     },
+    #[error("invalid pending metadata command recovery for PG {pg_id}: {reason}")]
+    InvalidPendingMetadataCommandRecovery { pg_id: u32, reason: String },
     #[error("storage-node PG route {pg_id} primary node {primary_node_id} is not in acting set")]
     RoutePrimaryNotInActingSet { pg_id: u32, primary_node_id: u32 },
     #[error("storage node {node_id} is absent from runtime map for cluster epoch {cluster_epoch}")]
@@ -2053,15 +2128,6 @@ impl StorageNodeServer {
         let mut current_config = self.config.write().unwrap_or_else(|e| e.into_inner());
         validate_runtime_config_install(&current_config, &next_config)?;
         staged_config.publish()?;
-        self.route_admission
-            .publish_historical_metadata_recovery_permits(
-                &current_config,
-                *self
-                    .route_map_lease
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                &next_config,
-            );
         *current_config = Arc::new(next_config);
         *self
             .route_map_lease
@@ -2454,15 +2520,6 @@ enum StorageNodeRouteTransitionState {
 struct StorageNodeRouteAdmissionState {
     active_frames: usize,
     transition: StorageNodeRouteTransitionState,
-    historical_metadata_recovery_permits:
-        BTreeMap<(ClusterEpoch, u32), HistoricalMetadataRecoveryPermit>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct HistoricalMetadataRecoveryPermit {
-    route: StorageNodePgRoute,
-    valid_until_ms: u64,
-    local_valid_until_monotonic_ms: u64,
 }
 
 impl StorageNodeRouteAdmissionGate {
@@ -2510,84 +2567,6 @@ impl StorageNodeRouteAdmissionGate {
         }
         state.transition = StorageNodeRouteTransitionState::Publishing;
         StorageNodeRouteTransitionGuard { gate: self.clone() }
-    }
-
-    fn publish_historical_metadata_recovery_permits(
-        &self,
-        current: &StorageNodeProcessConfig,
-        current_route_map_lease: Option<BoundRouteMapLease>,
-        next: &StorageNodeProcessConfig,
-    ) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(
-            state.transition,
-            StorageNodeRouteTransitionState::Publishing,
-            "historical metadata recovery permits must publish under the route transition gate"
-        );
-        state
-            .historical_metadata_recovery_permits
-            .retain(|&(cluster_epoch, pg_id), permit| {
-                next.historical_pg_routes.iter().any(|route| {
-                    route.cluster_epoch == cluster_epoch
-                        && route.pg_id == pg_id
-                        && route == &permit.route
-                        && route.state == PgState::Active
-                })
-            });
-        let Some(valid_until_ms) = current.route_map_valid_until_ms() else {
-            return;
-        };
-        let Some(local_valid_until_monotonic_ms) =
-            current_route_map_lease.map(BoundRouteMapLease::local_valid_until_monotonic_ms)
-        else {
-            return;
-        };
-        for route in current
-            .pg_routes
-            .iter()
-            .filter(|route| route.state == PgState::Active)
-        {
-            let retained_exactly = next.historical_pg_routes.iter().any(|historical| {
-                historical.pg_id == route.pg_id
-                    && historical.cluster_epoch == route.cluster_epoch
-                    && historical.state == route.state
-                    && historical.primary_node_id == route.primary_node_id
-                    && historical.acting_set == route.acting_set
-            });
-            if retained_exactly {
-                state
-                    .historical_metadata_recovery_permits
-                    .entry((route.cluster_epoch, route.pg_id))
-                    .and_modify(|permit| {
-                        permit.route = route.clone();
-                        permit.valid_until_ms = valid_until_ms;
-                        permit.local_valid_until_monotonic_ms = local_valid_until_monotonic_ms;
-                    })
-                    .or_insert_with(|| HistoricalMetadataRecoveryPermit {
-                        route: route.clone(),
-                        valid_until_ms,
-                        local_valid_until_monotonic_ms,
-                    });
-            }
-        }
-    }
-
-    fn historical_metadata_recovery_deadline(
-        &self,
-        cluster_epoch: ClusterEpoch,
-        pg_id: PgId,
-    ) -> Option<(u64, u64)> {
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .historical_metadata_recovery_permits
-            .get(&(cluster_epoch, pg_id.get()))
-            .map(|permit| (permit.valid_until_ms, permit.local_valid_until_monotonic_ms))
     }
 }
 
@@ -9795,8 +9774,8 @@ impl StorageNodeConnectionHandler {
         let mutation_fence = if allowed_states == [PgState::Active] {
             match self.validate_pg_route_for_metadata_command_apply(
                 request.node_id,
-                request.cluster_epoch,
                 request.pg_id,
+                &request.command,
             ) {
                 Ok(fence) => fence,
                 Err(error) => return encode_storage_rpc_error_response(&error),
@@ -10539,9 +10518,10 @@ impl StorageNodeConnectionHandler {
     fn validate_pg_route_for_metadata_command_apply(
         &self,
         node_id: NodeId,
-        cluster_epoch: ClusterEpoch,
         pg_id: PgId,
+        command: &MetadataCommandEnvelope,
     ) -> Result<MetadataMutationRouteFence, StorageRpcErrorResponse> {
+        let cluster_epoch = command.id().cluster_epoch();
         match self.validate_pg_route(node_id, cluster_epoch, pg_id) {
             Ok(()) => Ok(MetadataMutationRouteFence::current(
                 &self.config,
@@ -10553,13 +10533,44 @@ impl StorageNodeConnectionHandler {
                     cluster_epoch,
                     pg_id,
                 )?;
-                let (valid_until_ms, local_valid_until_monotonic_ms) = self
-                    .route_admission
-                    .historical_metadata_recovery_deadline(cluster_epoch, pg_id)
+                let expected = PendingMetadataCommandObservation::new(
+                    cluster_epoch,
+                    std::num::NonZeroU64::new(command.id().log_index().get())
+                        .expect("typed metadata command log index must be nonzero"),
+                    command.checksum_crc64(),
+                );
+                let authorized = self.config.pending_metadata_command_recoveries.iter().any(
+                    |(authorized_pg_id, recovery)| {
+                        *authorized_pg_id == pg_id && recovery.pending() == expected
+                    },
+                );
+                if !authorized {
+                    return Err(StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::StaleShardLocation,
+                        message: format!(
+                            "historical metadata command recovery for PG {} at epoch {} is not authorized by the current runtime map",
+                            pg_id.get(),
+                            cluster_epoch.get()
+                        ),
+                    });
+                }
+                let valid_until_ms = self.config.route_map_valid_until_ms().ok_or_else(|| {
+                    StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::StaleShardLocation,
+                        message: format!(
+                            "historical metadata command recovery for PG {} at epoch {} has no bounded runtime-map validity",
+                            pg_id.get(),
+                            cluster_epoch.get()
+                        ),
+                    }
+                })?;
+                let local_valid_until_monotonic_ms = self
+                    .current_route_map_lease()
+                    .map(BoundRouteMapLease::local_valid_until_monotonic_ms)
                     .ok_or_else(|| StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::StaleShardLocation,
                         message: format!(
-                            "historical metadata command recovery for PG {} at epoch {} has no route-transition permit",
+                            "historical metadata command recovery for PG {} at epoch {} has no process-bound runtime-map lease",
                             pg_id.get(),
                             cluster_epoch.get()
                         ),
@@ -12022,6 +12033,46 @@ fn validate_process_config_route_table(
             });
         }
     }
+    let mut recovery_pgs = BTreeSet::new();
+    for (pg_id, recovery) in &config.pending_metadata_command_recoveries {
+        if config.route_map_valid_until_ms().is_none() {
+            return Err(
+                StorageNodeServerError::InvalidPendingMetadataCommandRecovery {
+                    pg_id: pg_id.get(),
+                    reason: "authorization requires bounded runtime-map validity".to_owned(),
+                },
+            );
+        }
+        if !recovery_pgs.insert(*pg_id) {
+            return Err(
+                StorageNodeServerError::InvalidPendingMetadataCommandRecovery {
+                    pg_id: pg_id.get(),
+                    reason: "duplicate authorization".to_owned(),
+                },
+            );
+        }
+        let current_route = config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == pg_id.get());
+        let historical_route = config.historical_pg_routes.iter().find(|route| {
+            route.pg_id == pg_id.get() && route.cluster_epoch == recovery.pending().cluster_epoch()
+        });
+        if current_route.is_none_or(|route| route.state != PgState::Peering)
+            || recovery.pending().cluster_epoch() >= config.cluster_epoch
+            || historical_route.is_none_or(|route| {
+                route.state != PgState::Active
+                    || route.primary_node_id != recovery.reporting_node_id()
+            })
+        {
+            return Err(
+                StorageNodeServerError::InvalidPendingMetadataCommandRecovery {
+                    pg_id: pg_id.get(),
+                    reason: "authorization does not reference a current Peering route and its Active historical primary".to_owned(),
+                },
+            );
+        }
+    }
     Ok(())
 }
 
@@ -12338,6 +12389,7 @@ mod tests {
                 acting_set: vec![NodeId::new(7)],
             }],
             historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
         }
     }
 
@@ -12388,6 +12440,7 @@ mod tests {
             socket_path: tmp.path().join("sock").join("storage.sock"),
             pg_routes: Vec::new(),
             historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
         })
         .unwrap_err();
         assert!(matches!(
@@ -13537,6 +13590,7 @@ mod tests {
             crate::PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(retained_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             },
         )
         .unwrap();
@@ -13712,6 +13766,7 @@ mod tests {
             crate::PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(ClusterEpoch::new(5).unwrap()),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             },
         )
         .unwrap();
@@ -13805,7 +13860,7 @@ mod tests {
                         pg_id,
                         state: PgState::Peering,
                         metadata_proof: active_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 2_000,
@@ -13829,7 +13884,7 @@ mod tests {
                         pg_id,
                         state: PgState::Active,
                         metadata_proof: active_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 2_002,
@@ -14003,6 +14058,7 @@ mod tests {
             }],
 
             historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
         };
         let server = Arc::new(StorageNodeServer::bind(config).unwrap());
         let authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
@@ -15050,22 +15106,8 @@ mod tests {
             PgState::Peering
         );
 
-        // Expire the process-local recovery permit directly so this transition test
-        // does not depend on scheduler timing or waiting for a route deadline.
-        {
-            let mut admission = server
-                .route_admission
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let permit = admission
-                .historical_metadata_recovery_permits
-                .get_mut(&(config.cluster_epoch, 0))
-                .expect("Peering transition should retain the source recovery permit");
-            permit.valid_until_ms = crate::clock::current_time_millis().saturating_sub(1);
-            permit.local_valid_until_monotonic_ms = crate::clock::monotonic_time_millis();
-        }
+        // Once the successor route is Active, its runtime configuration carries no
+        // exact pending-command recovery authorization for the old epoch.
         let peering_route = server.config_snapshot().pg_routes[0].clone();
         let mut successor_config = bounded_runtime_refresh_config(server.config_snapshot());
         successor_config.cluster_epoch = ClusterEpoch::new(3).unwrap();
@@ -15100,7 +15142,7 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(stale_error.code, StorageRpcErrorCode::StaleShardLocation);
-        assert!(stale_error.message.contains("expired"));
+        assert!(stale_error.message.contains("not authorized"));
         assert_eq!(
             server
                 ._node
@@ -17516,15 +17558,16 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(apply_error.code, StorageRpcErrorCode::StaleShardLocation);
-        assert!(apply_error.message.contains("no route-transition permit"));
+        assert!(apply_error.message.contains("not authorized"));
     }
 
     #[test]
-    fn storage_node_server_allows_historical_recovery_before_transition_permit_expiry() {
+    fn storage_node_server_allows_exact_historical_recovery_from_current_runtime_map() {
         let tmp = test_util::tempdir();
         let source_route_epoch = ClusterEpoch::new(1).unwrap();
         let current_epoch = ClusterEpoch::new(2).unwrap();
         let config = bounded_runtime_refresh_config(test_config(&tmp));
+        let command = test_metadata_command(0, 1);
         private_socket_dir(config.socket_path.parent().unwrap());
         let source_route = config.pg_routes[0].clone();
         let socket_path = config.socket_path.clone();
@@ -17534,10 +17577,117 @@ mod tests {
         next_config.pg_routes[0].cluster_epoch = current_epoch;
         next_config.pg_routes[0].state = PgState::Peering;
         next_config.historical_pg_routes.push(source_route);
+        next_config.pending_metadata_command_recoveries.push((
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                NodeId::new(7),
+                PendingMetadataCommandObservation::new(
+                    source_route_epoch,
+                    std::num::NonZeroU64::MIN,
+                    command.checksum_crc64(),
+                ),
+            ),
+        ));
         server
             .install_control_plane_runtime_config(next_config)
             .unwrap();
+        let installed = server.config_snapshot();
+        let reloaded = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &installed.data_dir,
+            installed.node_id,
+            installed.default_ec_shape,
+            &installed.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            reloaded.pending_metadata_command_recoveries,
+            installed.pending_metadata_command_recoveries
+        );
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+                command,
+            })
+            .unwrap(),
+        );
+        let unlisted_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+                command: test_metadata_command(0, 2),
+            })
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let applied = decode_metadata_command_state_outcome_response(&payload).unwrap();
+        assert!(matches!(
+            applied.outcome,
+            StorageRpcMetadataCommandStateOutcome::State(
+                crate::metadata_command::MetadataCommandReplicaState {
+                    cluster_epoch,
+                    applied_log_index: 1,
+                    ..
+                }
+            ) if cluster_epoch == source_route_epoch
+        ));
+        let unlisted_error = decode_storage_rpc_response_payload(&unlisted_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(unlisted_error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(unlisted_error.message.contains("not authorized"));
+    }
+
+    #[test]
+    fn storage_node_server_allows_historical_recovery_after_original_route_deadline() {
+        let tmp = test_util::tempdir();
+        let source_route_epoch = ClusterEpoch::new(1).unwrap();
+        let current_epoch = ClusterEpoch::new(2).unwrap();
         let command = test_metadata_command(0, 1);
+        let mut config = test_config(&tmp);
+        config.route_map_validity =
+            RouteMapValidity::until_ms(crate::clock::current_time_millis().saturating_sub(1))
+                .unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let source_route = config.pg_routes[0].clone();
+        let socket_path = config.socket_path.clone();
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut next_config = bounded_runtime_refresh_config(config);
+        next_config.cluster_epoch = current_epoch;
+        next_config.pg_routes[0].cluster_epoch = current_epoch;
+        next_config.pg_routes[0].state = PgState::Peering;
+        next_config.historical_pg_routes.push(source_route);
+        next_config.pending_metadata_command_recoveries.push((
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                NodeId::new(7),
+                PendingMetadataCommandObservation::new(
+                    source_route_epoch,
+                    std::num::NonZeroU64::MIN,
+                    command.checksum_crc64(),
+                ),
+            ),
+        ));
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
         let join = thread::spawn(move || server.accept_one().unwrap());
 
         let mut client = UnixStream::connect(socket_path).unwrap();
@@ -17570,53 +17720,6 @@ mod tests {
                 }
             ) if cluster_epoch == source_route_epoch
         ));
-    }
-
-    #[test]
-    fn storage_node_server_rejects_historical_recovery_after_transition_permit_expiry() {
-        let tmp = test_util::tempdir();
-        let source_route_epoch = ClusterEpoch::new(1).unwrap();
-        let current_epoch = ClusterEpoch::new(2).unwrap();
-        let mut config = test_config(&tmp);
-        config.route_map_validity =
-            RouteMapValidity::until_ms(crate::clock::current_time_millis().saturating_sub(1))
-                .unwrap();
-        private_socket_dir(config.socket_path.parent().unwrap());
-        let source_route = config.pg_routes[0].clone();
-        let socket_path = config.socket_path.clone();
-        let server = StorageNodeServer::bind(config.clone()).unwrap();
-        let mut next_config = bounded_runtime_refresh_config(config);
-        next_config.cluster_epoch = current_epoch;
-        next_config.pg_routes[0].cluster_epoch = current_epoch;
-        next_config.pg_routes[0].state = PgState::Peering;
-        next_config.historical_pg_routes.push(source_route);
-        server
-            .install_control_plane_runtime_config(next_config)
-            .unwrap();
-        let command = test_metadata_command(0, 1);
-        let join = thread::spawn(move || server.accept_one().unwrap());
-
-        let mut client = UnixStream::connect(socket_path).unwrap();
-        let response = send_frame(
-            &mut client,
-            1,
-            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
-            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
-                node_id: NodeId::new(7),
-                cluster_epoch: source_route_epoch,
-                pg_id: PgId::new(0),
-                command,
-            })
-            .unwrap(),
-        );
-        drop(client);
-        join.join().unwrap();
-
-        let error = decode_storage_rpc_response_payload(&response.payload)
-            .unwrap()
-            .unwrap_err();
-        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
-        assert!(error.message.contains("expired"));
     }
 
     #[test]

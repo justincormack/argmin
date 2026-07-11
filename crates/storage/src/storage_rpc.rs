@@ -9185,6 +9185,13 @@ pub(crate) fn encode_cluster_map_history_reference_summary_response(
             .oldest_durable_backfill_epoch
             .map(ClusterEpoch::get),
     );
+    put_optional_u64(
+        &mut out,
+        response
+            .summary
+            .oldest_pending_metadata_command_epoch
+            .map(ClusterEpoch::get),
+    );
     out
 }
 
@@ -9195,11 +9202,14 @@ pub(crate) fn decode_cluster_map_history_reference_summary_response(
     let oldest_live_placement_epoch = decode_optional_cluster_epoch(decoder.read_optional_u64()?)?;
     let oldest_durable_backfill_epoch =
         decode_optional_cluster_epoch(decoder.read_optional_u64()?)?;
+    let oldest_pending_metadata_command_epoch =
+        decode_optional_cluster_epoch(decoder.read_optional_u64()?)?;
     decoder.finish()?;
     Ok(StorageRpcClusterMapHistoryReferenceSummaryResponse {
         summary: PgClusterMapHistoryReferenceSummary {
             oldest_live_placement_epoch,
             oldest_durable_backfill_epoch,
+            oldest_pending_metadata_command_epoch,
         },
     })
 }
@@ -17557,6 +17567,7 @@ mod tests {
             summary: PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(ClusterEpoch::new(2).unwrap()),
                 oldest_durable_backfill_epoch: Some(ClusterEpoch::new(5).unwrap()),
+                oldest_pending_metadata_command_epoch: Some(ClusterEpoch::new(3).unwrap()),
             },
         };
         let bytes = encode_cluster_map_history_reference_summary_response(&history_response);

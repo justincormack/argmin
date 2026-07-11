@@ -4252,7 +4252,7 @@ fn metadata_command_checkpoint_catalogue_prunes_old_epochs() {
 }
 
 #[test]
-fn cluster_map_history_reference_summary_reports_live_payload_and_backfill_epochs() {
+fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_command_epochs() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 7).unwrap();
     assert_eq!(
@@ -4309,6 +4309,21 @@ fn cluster_map_history_reference_summary_reports_live_payload_and_backfill_epoch
     store
         .record_placed_segment_shard_backfill(&backfill, backfill.request.ec.m, None)
         .unwrap();
+    let pending_bucket = trusted_bucket_name("history-floor-pending-command");
+    let pending_payload = create_bucket_probe_command(7, 1, pending_bucket.clone(), 2)
+        .payload()
+        .clone();
+    let pending = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::new(2).unwrap(),
+            PgId::new(7),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        pending_payload,
+    );
+    store
+        .try_insert_pending_metadata_command_slot(0, &pending, Some(&pending_bucket))
+        .unwrap();
 
     let summary = store.cluster_map_history_reference_summary().unwrap();
     assert_eq!(
@@ -4320,8 +4335,12 @@ fn cluster_map_history_reference_summary_reports_live_payload_and_backfill_epoch
         Some(ClusterEpoch::new(3).unwrap())
     );
     assert_eq!(
+        summary.oldest_pending_metadata_command_epoch,
+        Some(ClusterEpoch::new(2).unwrap())
+    );
+    assert_eq!(
         summary.oldest_required_epoch(),
-        Some(ClusterEpoch::new(3).unwrap())
+        Some(ClusterEpoch::new(2).unwrap())
     );
 }
 

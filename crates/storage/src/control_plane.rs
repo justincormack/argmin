@@ -33,11 +33,12 @@ const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
+const CONTROL_PLANE_RPC_VERSION: u16 = 3;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 15;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 16;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -49,8 +50,10 @@ const CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS: u64 = 5_000;
 const CONTROL_PLANE_RPC_RESPONSE_AUTH_FUTURE_SKEW_MS: u64 = 10;
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
-const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
+const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 1 + 4 + 1;
 const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
+const CONTROL_PLANE_RPC_PENDING_RECOVERY_TASK_MIN_LEN: usize = 4 + 4 + 8 + 8 + 8;
+const CONTROL_PLANE_RPC_PENDING_RECOVERY_FAILURE_MIN_LEN: usize = 4 + 1 + 4;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY: u8 = 1;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED: u8 = 2;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX: u8 = 3;
@@ -587,6 +590,7 @@ impl ClusterControlSnapshot {
             peering_metadata_transfer: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
+            pending_metadata_command_recovery: None,
         })
     }
 
@@ -663,6 +667,7 @@ impl ClusterControlSnapshot {
                     peering_metadata_transfer: None,
                     peering_metadata_transfer_source_route_epoch: None,
                     peering_metadata_transfer_source_node_id: None,
+                    pending_metadata_command_recovery: None,
                 });
             }
             Err(error) => return Err(error),
@@ -677,6 +682,7 @@ impl ClusterControlSnapshot {
             peering_metadata_transfer: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
+            pending_metadata_command_recovery: None,
         })
     }
 
@@ -708,6 +714,8 @@ impl ClusterControlSnapshot {
                 });
             }
         }
+        let pending_metadata_command_recovery =
+            self.pending_metadata_command_recovery_for_pg(record)?;
         Ok(PgRouteSnapshot {
             cluster_epoch: self.cluster_epoch,
             pg_id,
@@ -720,7 +728,84 @@ impl ClusterControlSnapshot {
                 .peering_metadata_transfer_source_route_epoch,
             peering_metadata_transfer_source_node_id: record
                 .peering_metadata_transfer_source_node_id,
+            pending_metadata_command_recovery,
         })
+    }
+
+    fn pending_metadata_command_recovery_for_pg(
+        &self,
+        record: &PgControlRecord,
+    ) -> Result<Option<PendingMetadataCommandRecovery>, ControlPlaneError> {
+        let mut recovery: Option<PendingMetadataCommandRecovery> = None;
+        for node_id in &record.acting_set {
+            let Some(observation) = self
+                .node(*node_id)
+                .and_then(|node| node.pg_observation(record.pg_id))
+                .filter(|observation| observation.observed_epoch == self.cluster_epoch)
+            else {
+                continue;
+            };
+            let Some(pending) = observation.pending_metadata_command() else {
+                continue;
+            };
+            let historical =
+                self.reconstructed_pg_route_at_epoch(record.pg_id, pending.cluster_epoch())?;
+            if historical.state() != PgState::Active || historical.primary_node_id() != *node_id {
+                return Err(
+                    ControlPlaneError::PgPeeringPendingMetadataCommandReporterNotHistoricalPrimary {
+                        pg_id: record.pg_id.get(),
+                        cluster_epoch: self.cluster_epoch,
+                        node_id: node_id.as_u32(),
+                        pending_epoch: pending.cluster_epoch(),
+                        historical_state: historical.state(),
+                        historical_primary_node_id: historical.primary_node_id().as_u32(),
+                    },
+                );
+            }
+            let candidate = PendingMetadataCommandRecovery {
+                reporting_node_id: *node_id,
+                pending,
+            };
+            if let Some(existing) = recovery {
+                if existing.pending != pending {
+                    return Err(ControlPlaneError::PgPeeringPendingMetadataCommandMismatch {
+                        pg_id: record.pg_id.get(),
+                        cluster_epoch: self.cluster_epoch,
+                        first_node_id: existing.reporting_node_id.as_u32(),
+                        first: existing.pending,
+                        second_node_id: node_id.as_u32(),
+                        second: pending,
+                    });
+                }
+            } else {
+                recovery = Some(candidate);
+            }
+        }
+        Ok(recovery)
+    }
+
+    pub fn pending_metadata_command_recoveries(&self) -> PendingMetadataCommandRecoveryListing {
+        let mut tasks = Vec::new();
+        let mut failures = Vec::new();
+        for record in self
+            .pgs
+            .values()
+            .filter(|record| record.state == PgState::Peering)
+        {
+            match self.pending_metadata_command_recovery_for_pg(record) {
+                Ok(Some(recovery)) => tasks.push(PendingMetadataCommandRecoveryTask::new(
+                    record.pg_id,
+                    recovery,
+                )),
+                Ok(None) => {}
+                Err(error) => failures.push(PendingMetadataCommandRecoveryDiscoveryFailure::new(
+                    record.pg_id,
+                    PendingMetadataCommandRecoveryDiscoveryFailureKind::from_error(&error),
+                    error.to_string(),
+                )),
+            }
+        }
+        PendingMetadataCommandRecoveryListing::new(tasks, failures)
     }
 
     fn pg_route_for_storage_node_refresh(
@@ -793,10 +878,14 @@ impl ClusterControlSnapshot {
         let record = self
             .pg(pg_id)
             .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-        let route =
+        let mut route =
             reconstruct_pg_route_from_record(self.cluster_epoch, pg_id, record, |node_id| {
                 self.nodes.contains_key(&node_id)
             })?;
+        if record.state == PgState::Peering {
+            route.pending_metadata_command_recovery =
+                self.pending_metadata_command_recovery_for_pg(record)?;
+        }
         self.runtime_map_from_pg_routes_with_history(
             vec![route],
             self.historical_pg_routes_for_runtime_map_pg(pg_id)?,
@@ -992,6 +1081,14 @@ impl ClusterControlSnapshot {
                     &mut required_keys,
                     &mut pending_keys,
                     source_epoch,
+                    route.pg_id(),
+                );
+            }
+            if let Some(recovery) = route.pending_metadata_command_recovery() {
+                add_required_historical_route_key(
+                    &mut required_keys,
+                    &mut pending_keys,
+                    recovery.pending().cluster_epoch(),
                     route.pg_id(),
                 );
             }
@@ -1398,7 +1495,7 @@ impl ClusterControlSnapshot {
                     && pg.active_primary == Some(node.node_id)
                     && observation.state == PgState::Active
                 {
-                    if observation.has_pending_metadata_command {
+                    if observation.has_pending_metadata_command() {
                         return Err(format!(
                             "active primary node {} observation for PG {} has pending metadata command",
                             node.node_id.as_u32(),
@@ -1925,8 +2022,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                                 observed_epoch: heartbeat.observed_epoch,
                                 observed_at_ms: heartbeat_at_ms,
                                 metadata_proof: observation.metadata_proof,
-                                has_pending_metadata_command: observation
-                                    .has_pending_metadata_command,
+                                pending_metadata_command: observation.pending_metadata_command,
                             },
                         );
                     }
@@ -1945,7 +2041,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         || pg.active_primary != Some(heartbeat.node_id)
                         || (observation.state != PgState::Active
                             && !primary_restart_peering_observation)
-                        || observation.has_pending_metadata_command
+                        || observation.has_pending_metadata_command()
                     {
                         continue;
                     }
@@ -2737,6 +2833,7 @@ pub struct PgRouteSnapshot {
     peering_metadata_transfer: Option<PgMetadataTransferProof>,
     peering_metadata_transfer_source_route_epoch: Option<ClusterEpoch>,
     peering_metadata_transfer_source_node_id: Option<NodeId>,
+    pending_metadata_command_recovery: Option<PendingMetadataCommandRecovery>,
 }
 
 impl PgRouteSnapshot {
@@ -2757,6 +2854,7 @@ impl PgRouteSnapshot {
             peering_metadata_transfer: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
+            pending_metadata_command_recovery: None,
         }
     }
 
@@ -2806,6 +2904,11 @@ impl PgRouteSnapshot {
     }
 
     #[must_use]
+    pub fn pending_metadata_command_recovery(&self) -> Option<PendingMetadataCommandRecovery> {
+        self.pending_metadata_command_recovery
+    }
+
+    #[must_use]
     pub fn without_serving_authority(&self) -> Self {
         let mut route = self.clone();
         route.primary_lease_deadline_ms = None;
@@ -2817,6 +2920,32 @@ impl PgRouteSnapshot {
         let mut route = self.clone();
         route.cluster_epoch = cluster_epoch;
         route
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingMetadataCommandRecovery {
+    reporting_node_id: NodeId,
+    pending: PendingMetadataCommandObservation,
+}
+
+impl PendingMetadataCommandRecovery {
+    #[must_use]
+    pub fn new(reporting_node_id: NodeId, pending: PendingMetadataCommandObservation) -> Self {
+        Self {
+            reporting_node_id,
+            pending,
+        }
+    }
+
+    #[must_use]
+    pub fn reporting_node_id(self) -> NodeId {
+        self.reporting_node_id
+    }
+
+    #[must_use]
+    pub fn pending(self) -> PendingMetadataCommandObservation {
+        self.pending
     }
 }
 
@@ -3133,6 +3262,7 @@ fn reconstruct_pg_route_from_record(
         peering_metadata_transfer_source_route_epoch: record
             .peering_metadata_transfer_source_route_epoch,
         peering_metadata_transfer_source_node_id: record.peering_metadata_transfer_source_node_id,
+        pending_metadata_command_recovery: None,
     })
 }
 
@@ -3442,7 +3572,7 @@ pub struct NodePgObservationRecord {
     observed_epoch: ClusterEpoch,
     observed_at_ms: u64,
     metadata_proof: PgMetadataProof,
-    has_pending_metadata_command: bool,
+    pending_metadata_command: Option<PendingMetadataCommandObservation>,
 }
 
 impl NodePgObservationRecord {
@@ -3473,7 +3603,49 @@ impl NodePgObservationRecord {
 
     #[must_use]
     pub fn has_pending_metadata_command(&self) -> bool {
-        self.has_pending_metadata_command
+        self.pending_metadata_command.is_some()
+    }
+
+    #[must_use]
+    pub fn pending_metadata_command(&self) -> Option<PendingMetadataCommandObservation> {
+        self.pending_metadata_command
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingMetadataCommandObservation {
+    cluster_epoch: ClusterEpoch,
+    log_index: NonZeroU64,
+    command_checksum: u64,
+}
+
+impl PendingMetadataCommandObservation {
+    #[must_use]
+    pub const fn new(
+        cluster_epoch: ClusterEpoch,
+        log_index: NonZeroU64,
+        command_checksum: u64,
+    ) -> Self {
+        Self {
+            cluster_epoch,
+            log_index,
+            command_checksum,
+        }
+    }
+
+    #[must_use]
+    pub const fn cluster_epoch(self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub const fn log_index(self) -> u64 {
+        self.log_index.get()
+    }
+
+    #[must_use]
+    pub const fn command_checksum(self) -> u64 {
+        self.command_checksum
     }
 }
 
@@ -3482,7 +3654,14 @@ pub struct NodePgHeartbeatObservation {
     pub pg_id: PgId,
     pub state: PgState,
     pub metadata_proof: PgMetadataProof,
-    pub has_pending_metadata_command: bool,
+    pub pending_metadata_command: Option<PendingMetadataCommandObservation>,
+}
+
+impl NodePgHeartbeatObservation {
+    #[must_use]
+    pub fn has_pending_metadata_command(&self) -> bool {
+        self.pending_metadata_command.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3645,6 +3824,24 @@ pub trait ControlPlaneRuntimeMapSource {
         ))
     }
 
+    fn pending_metadata_command_recoveries(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+        Ok(PendingMetadataCommandRecoveryListing::new(
+            self.runtime_map_snapshot(authority_now_ms)?
+                .pg_routes()
+                .iter()
+                .filter_map(|route| {
+                    route.pending_metadata_command_recovery().map(|recovery| {
+                        PendingMetadataCommandRecoveryTask::new(route.pg_id(), recovery)
+                    })
+                })
+                .collect(),
+            Vec::new(),
+        ))
+    }
+
     fn pg_runtime_map_snapshot(
         &self,
         pg_id: PgId,
@@ -3659,6 +3856,144 @@ pub trait ControlPlaneRuntimeMapSource {
             return Ok(runtime_map);
         }
         Err(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingMetadataCommandRecoveryTask {
+    pg_id: PgId,
+    recovery: PendingMetadataCommandRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingMetadataCommandRecoveryDiscoveryFailureKind {
+    HistoricalRouteInvalid,
+    ReporterNotHistoricalPrimary,
+    ConflictingIdentity,
+}
+
+impl PendingMetadataCommandRecoveryDiscoveryFailureKind {
+    fn from_error(error: &ControlPlaneError) -> Self {
+        match error {
+            ControlPlaneError::PgPeeringPendingMetadataCommandReporterNotHistoricalPrimary {
+                ..
+            } => Self::ReporterNotHistoricalPrimary,
+            ControlPlaneError::PgPeeringPendingMetadataCommandMismatch { .. } => {
+                Self::ConflictingIdentity
+            }
+            _ => Self::HistoricalRouteInvalid,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::HistoricalRouteInvalid => 1,
+            Self::ReporterNotHistoricalPrimary => 2,
+            Self::ConflictingIdentity => 3,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self, ControlPlaneError> {
+        match value {
+            1 => Ok(Self::HistoricalRouteInvalid),
+            2 => Ok(Self::ReporterNotHistoricalPrimary),
+            3 => Ok(Self::ConflictingIdentity),
+            _ => Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "invalid pending metadata command recovery discovery failure kind {value}"
+                ),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMetadataCommandRecoveryDiscoveryFailure {
+    pg_id: PgId,
+    kind: PendingMetadataCommandRecoveryDiscoveryFailureKind,
+    detail: String,
+}
+
+impl PendingMetadataCommandRecoveryDiscoveryFailure {
+    #[must_use]
+    pub fn new(
+        pg_id: PgId,
+        kind: PendingMetadataCommandRecoveryDiscoveryFailureKind,
+        detail: String,
+    ) -> Self {
+        Self {
+            pg_id,
+            kind,
+            detail,
+        }
+    }
+
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> PendingMetadataCommandRecoveryDiscoveryFailureKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMetadataCommandRecoveryListing {
+    tasks: Vec<PendingMetadataCommandRecoveryTask>,
+    failures: Vec<PendingMetadataCommandRecoveryDiscoveryFailure>,
+}
+
+impl PendingMetadataCommandRecoveryListing {
+    #[must_use]
+    pub fn new(
+        tasks: Vec<PendingMetadataCommandRecoveryTask>,
+        failures: Vec<PendingMetadataCommandRecoveryDiscoveryFailure>,
+    ) -> Self {
+        Self { tasks, failures }
+    }
+
+    #[must_use]
+    pub fn tasks(&self) -> &[PendingMetadataCommandRecoveryTask] {
+        &self.tasks
+    }
+
+    #[must_use]
+    pub fn failures(&self) -> &[PendingMetadataCommandRecoveryDiscoveryFailure] {
+        &self.failures
+    }
+
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<PendingMetadataCommandRecoveryTask>,
+        Vec<PendingMetadataCommandRecoveryDiscoveryFailure>,
+    ) {
+        (self.tasks, self.failures)
+    }
+}
+
+impl PendingMetadataCommandRecoveryTask {
+    #[must_use]
+    pub fn new(pg_id: PgId, recovery: PendingMetadataCommandRecovery) -> Self {
+        Self { pg_id, recovery }
+    }
+
+    #[must_use]
+    pub fn pg_id(self) -> PgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub fn recovery(self) -> PendingMetadataCommandRecovery {
+        self.recovery
     }
 }
 
@@ -4658,6 +4993,13 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
         ))
     }
 
+    fn pending_metadata_command_recoveries(
+        &self,
+        _authority_now_ms: u64,
+    ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+        Ok(self.snapshot.pending_metadata_command_recoveries())
+    }
+
     fn pg_runtime_map_snapshot(
         &self,
         pg_id: PgId,
@@ -5275,6 +5617,7 @@ impl UnixControlPlaneClient {
             ControlPlaneRpcKind::RuntimeMapSnapshot
                 | ControlPlaneRpcKind::PgRuntimeMapSnapshot
                 | ControlPlaneRpcKind::RuntimeMapStatus
+                | ControlPlaneRpcKind::PendingMetadataCommandRecoveries
         ));
         let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
         loop {
@@ -5306,6 +5649,7 @@ impl UnixControlPlaneClient {
             ControlPlaneRpcKind::RuntimeMapSnapshot
                 | ControlPlaneRpcKind::PgRuntimeMapSnapshot
                 | ControlPlaneRpcKind::RuntimeMapStatus
+                | ControlPlaneRpcKind::PendingMetadataCommandRecoveries
         ));
         let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
         loop {
@@ -5771,6 +6115,20 @@ impl UnixControlPlaneClient {
         _authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         self.pg_runtime_map_snapshot_with_read_timeout(pg_id, 0, CONTROL_PLANE_RPC_IO_TIMEOUT)
+    }
+
+    pub fn pending_metadata_command_recoveries(
+        &self,
+    ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+        let payload = self.send_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::PendingMetadataCommandRecoveries,
+            &[],
+            CONTROL_PLANE_RPC_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let listing = read_pending_metadata_command_recovery_listing(&mut reader)?;
+        reader.finish()?;
+        Ok(listing)
     }
 
     fn pg_runtime_map_snapshot_with_read_timeout(
@@ -7568,6 +7926,13 @@ impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
         self.runtime_map_status_with_read_timeout(CONTROL_PLANE_RPC_IO_TIMEOUT)
     }
 
+    fn pending_metadata_command_recoveries(
+        &self,
+        _authority_now_ms: u64,
+    ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+        UnixControlPlaneClient::pending_metadata_command_recoveries(self)
+    }
+
     fn pg_runtime_map_snapshot(
         &self,
         pg_id: PgId,
@@ -7608,6 +7973,22 @@ impl ControlPlaneRuntimeMapSource for AuthenticatedUnixControlPlaneClient {
         let status = read_runtime_map_status(&mut reader)?;
         reader.finish()?;
         Ok(status)
+    }
+
+    fn pending_metadata_command_recoveries(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+        let payload = self.send_signed_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::PendingMetadataCommandRecoveries,
+            authority_now_ms,
+            Vec::new(),
+            CONTROL_PLANE_RPC_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let listing = read_pending_metadata_command_recovery_listing(&mut reader)?;
+        reader.finish()?;
+        Ok(listing)
     }
 
     fn pg_runtime_map_snapshot(
@@ -8022,6 +8403,38 @@ where
                 response_authority_now_ms,
             );
         }
+        ControlPlaneRpcKind::PendingMetadataCommandRecoveries => {
+            let (payload, response_auth) = match auth_verifier {
+                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
+                    let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    (
+                        verified.payload,
+                        Some((verified.response_credential, verified.response_target)),
+                    )
+                }
+                _ => (payload, None),
+            };
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            let response = control_plane
+                .pending_metadata_command_recoveries(authority_now_ms)
+                .and_then(|listing| {
+                    let mut response = Vec::new();
+                    write_pending_metadata_command_recovery_listing(&mut response, &listing)?;
+                    Ok(response)
+                });
+            let response_authority_now_ms = response_authority_now_ms()?;
+            return build_runtime_map_rpc_response(
+                kind,
+                response,
+                response_auth,
+                response_authority_now_ms,
+            );
+        }
         ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
             let mut admin_response_auth = None;
             let auth_payload_operation = if control_plane_auth_payload_has_magic(&payload) {
@@ -8309,6 +8722,7 @@ enum ControlPlaneRpcKind {
     TriggerRaftSnapshotAndPurge = 10,
     TriggerRaftElection = 11,
     RuntimeMapStatus = 12,
+    PendingMetadataCommandRecoveries = 13,
 }
 
 impl ControlPlaneRpcKind {
@@ -8329,6 +8743,7 @@ impl ControlPlaneRpcKind {
             10 => Ok(Self::TriggerRaftSnapshotAndPurge),
             11 => Ok(Self::TriggerRaftElection),
             12 => Ok(Self::RuntimeMapStatus),
+            13 => Ok(Self::PendingMetadataCommandRecoveries),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),
@@ -8337,7 +8752,10 @@ impl ControlPlaneRpcKind {
 
     fn auth_operation(self) -> ControlPlaneAuthOperation {
         match self {
-            Self::RuntimeMapSnapshot | Self::PgRuntimeMapSnapshot | Self::RuntimeMapStatus => {
+            Self::RuntimeMapSnapshot
+            | Self::PgRuntimeMapSnapshot
+            | Self::RuntimeMapStatus
+            | Self::PendingMetadataCommandRecoveries => {
                 ControlPlaneAuthOperation::FrontendRuntimeMapRead
             }
             Self::RefreshNodeHeartbeat => ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
@@ -8432,12 +8850,17 @@ fn write_control_plane_rpc_frame(
             source,
         })?;
     let mut header = Vec::with_capacity(8);
-    write_u16(&mut header, 1);
+    write_u16(&mut header, CONTROL_PLANE_RPC_VERSION);
     write_u16(&mut header, kind as u16);
     write_u32(&mut header, payload_len);
     write_u64(
         &mut header,
-        control_plane_rpc_frame_checksum(1, kind as u16, payload_len, payload),
+        control_plane_rpc_frame_checksum(
+            CONTROL_PLANE_RPC_VERSION,
+            kind as u16,
+            payload_len,
+            payload,
+        ),
     );
     stream
         .write_all(&header)
@@ -8472,7 +8895,7 @@ fn read_control_plane_rpc_frame(
         })?;
     let mut reader = PayloadReader::new(&header);
     let version = reader.read_u16()?;
-    if version != 1 {
+    if version != CONTROL_PLANE_RPC_VERSION {
         return Err(ControlPlaneError::RpcProtocol {
             message: format!("unsupported control-plane RPC version {version}"),
         });
@@ -8532,6 +8955,20 @@ fn encode_control_plane_rpc_response(
             write_u8(&mut payload, 0);
             write_bytes(&mut payload, &response)?;
         }
+        Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+            pg_id,
+            node_id,
+            cluster_epoch,
+            pending,
+        }) => {
+            write_u8(&mut payload, 2);
+            write_u32(&mut payload, pg_id);
+            write_u32(&mut payload, node_id);
+            write_u64(&mut payload, cluster_epoch.get());
+            write_u64(&mut payload, pending.cluster_epoch().get());
+            write_u64(&mut payload, pending.log_index());
+            write_u64(&mut payload, pending.command_checksum());
+        }
         Err(error) => {
             write_u8(&mut payload, 1);
             write_string(&mut payload, &error.to_string())?;
@@ -8553,6 +8990,30 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             let message = reader.read_string()?.to_owned();
             reader.finish()?;
             Err(ControlPlaneError::RpcRemote { message })
+        }
+        2 => {
+            let pg_id = reader.read_u32()?;
+            let node_id = reader.read_u32()?;
+            let cluster_epoch = read_cluster_epoch(&mut reader, "pending blocker cluster epoch")?;
+            let pending_cluster_epoch =
+                read_cluster_epoch(&mut reader, "pending command cluster epoch")?;
+            let pending_log_index = NonZeroU64::new(reader.read_u64()?).ok_or_else(|| {
+                ControlPlaneError::RpcProtocol {
+                    message: "pending command log index must be nonzero".to_owned(),
+                }
+            })?;
+            let pending_command_checksum = reader.read_u64()?;
+            reader.finish()?;
+            Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id,
+                node_id,
+                cluster_epoch,
+                pending: PendingMetadataCommandObservation::new(
+                    pending_cluster_epoch,
+                    pending_log_index,
+                    pending_command_checksum,
+                ),
+            })
         }
         _ => Err(ControlPlaneError::RpcProtocol {
             message: format!("invalid control-plane RPC response status {status}"),
@@ -8596,6 +9057,13 @@ fn write_node_heartbeat(
             .oldest_durable_backfill_epoch
             .map(ClusterEpoch::get),
     );
+    write_option_u64(
+        out,
+        heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_pending_metadata_command_epoch
+            .map(ClusterEpoch::get),
+    );
     write_u32(
         out,
         len_as_u32(heartbeat.pg_observations.len(), "PG observations")?,
@@ -8604,7 +9072,7 @@ fn write_node_heartbeat(
         write_u32(out, observation.pg_id.get());
         write_pg_state(out, observation.state);
         write_pg_metadata_proof(out, observation.metadata_proof);
-        write_u8(out, u8::from(observation.has_pending_metadata_command));
+        write_pending_metadata_command_observation(out, observation.pending_metadata_command);
     }
     Ok(())
 }
@@ -8619,6 +9087,8 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         read_option_cluster_epoch(reader, "heartbeat oldest live placement epoch")?;
     let oldest_durable_backfill_epoch =
         read_option_cluster_epoch(reader, "heartbeat oldest durable backfill epoch")?;
+    let oldest_pending_metadata_command_epoch =
+        read_option_cluster_epoch(reader, "heartbeat oldest pending command epoch")?;
     let observation_count = reader.read_collection_len(
         "PG observations",
         CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN,
@@ -8629,7 +9099,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
             pg_id: PgId::new(reader.read_u32()?),
             state: read_pg_state(reader)?,
             metadata_proof: read_pg_metadata_proof(reader)?,
-            has_pending_metadata_command: reader.read_bool()?,
+            pending_metadata_command: read_pending_metadata_command_observation(reader)?,
         });
     }
     Ok(NodeHeartbeat {
@@ -8641,6 +9111,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
             oldest_live_placement_epoch,
             oldest_durable_backfill_epoch,
+            oldest_pending_metadata_command_epoch,
         },
         pg_observations,
     })
@@ -8771,6 +9242,92 @@ fn read_runtime_map_status(
     ))
 }
 
+fn write_pending_metadata_command_recovery_listing(
+    out: &mut Vec<u8>,
+    listing: &PendingMetadataCommandRecoveryListing,
+) -> Result<(), ControlPlaneError> {
+    write_u32(
+        out,
+        len_as_u32(listing.tasks().len(), "pending metadata command recoveries")?,
+    );
+    for task in listing.tasks() {
+        write_u32(out, task.pg_id().get());
+        write_u32(out, task.recovery().reporting_node_id().as_u32());
+        write_u64(out, task.recovery().pending().cluster_epoch().get());
+        write_u64(out, task.recovery().pending().log_index());
+        write_u64(out, task.recovery().pending().command_checksum());
+    }
+    write_u32(
+        out,
+        len_as_u32(
+            listing.failures().len(),
+            "pending metadata command recovery discovery failures",
+        )?,
+    );
+    for failure in listing.failures() {
+        write_u32(out, failure.pg_id().get());
+        out.push(failure.kind().as_u8());
+        write_string(out, failure.detail())?;
+    }
+    Ok(())
+}
+
+fn read_pending_metadata_command_recovery_listing(
+    reader: &mut PayloadReader<'_>,
+) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+    let count = reader.read_collection_len(
+        "pending metadata command recoveries",
+        CONTROL_PLANE_RPC_PENDING_RECOVERY_TASK_MIN_LEN,
+    )?;
+    let mut tasks = Vec::with_capacity(count);
+    let mut pg_ids = BTreeSet::new();
+    for _ in 0..count {
+        let pg_id = PgId::new(reader.read_u32()?);
+        if !pg_ids.insert(pg_id) {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "pending metadata command recoveries repeat PG {}",
+                    pg_id.get()
+                ),
+            });
+        }
+        let reporting_node_id = NodeId::new(reader.read_u32()?);
+        let pending = PendingMetadataCommandObservation::new(
+            read_cluster_epoch(reader, "pending recovery command epoch")?,
+            NonZeroU64::new(reader.read_u64()?).ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: "pending recovery command log index must be nonzero".to_owned(),
+            })?,
+            reader.read_u64()?,
+        );
+        tasks.push(PendingMetadataCommandRecoveryTask::new(
+            pg_id,
+            PendingMetadataCommandRecovery::new(reporting_node_id, pending),
+        ));
+    }
+    let failure_count = reader.read_collection_len(
+        "pending metadata command recovery discovery failures",
+        CONTROL_PLANE_RPC_PENDING_RECOVERY_FAILURE_MIN_LEN,
+    )?;
+    let mut failures = Vec::with_capacity(failure_count);
+    for _ in 0..failure_count {
+        let pg_id = PgId::new(reader.read_u32()?);
+        if !pg_ids.insert(pg_id) {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "pending metadata command recovery listing repeats PG {}",
+                    pg_id.get()
+                ),
+            });
+        }
+        let kind = PendingMetadataCommandRecoveryDiscoveryFailureKind::from_u8(reader.read_u8()?)?;
+        let detail = reader.read_string()?.to_owned();
+        failures.push(PendingMetadataCommandRecoveryDiscoveryFailure::new(
+            pg_id, kind, detail,
+        ));
+    }
+    Ok(PendingMetadataCommandRecoveryListing::new(tasks, failures))
+}
+
 fn write_runtime_map_snapshot(
     out: &mut Vec<u8>,
     snapshot: &ClusterRuntimeMapSnapshot,
@@ -8854,6 +9411,16 @@ fn write_pg_route_snapshots(
                         .peering_metadata_transfer_source_node_id()
                         .map(NodeId::as_u32),
                 );
+            }
+            None => write_u8(out, 0),
+        }
+        match route.pending_metadata_command_recovery() {
+            Some(recovery) => {
+                write_u8(out, 1);
+                write_u32(out, recovery.reporting_node_id().as_u32());
+                write_u64(out, recovery.pending().cluster_epoch().get());
+                write_u64(out, recovery.pending().log_index());
+                write_u64(out, recovery.pending().command_checksum());
             }
             None => write_u8(out, 0),
         }
@@ -8946,6 +9513,44 @@ fn validate_runtime_map_snapshot(
         false,
         snapshot.historical_pg_routes(),
     )?;
+    for route in snapshot.pg_routes() {
+        let Some(recovery) = route.pending_metadata_command_recovery() else {
+            continue;
+        };
+        if route.state() != PgState::Peering {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "runtime map route for PG {} authorizes pending command recovery while {:?}",
+                    route.pg_id().get(),
+                    route.state()
+                ),
+            });
+        }
+        if recovery.pending().cluster_epoch() >= snapshot.cluster_epoch() {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "runtime map route for PG {} pending command epoch {} is not older than current epoch {}",
+                    route.pg_id().get(),
+                    recovery.pending().cluster_epoch().get(),
+                    snapshot.cluster_epoch().get()
+                ),
+            });
+        }
+        let historical = snapshot
+            .reconstructed_pg_route_at_epoch(route.pg_id(), recovery.pending().cluster_epoch())?;
+        if historical.state() != PgState::Active
+            || historical.primary_node_id() != recovery.reporting_node_id()
+        {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "runtime map route for PG {} pending command recovery reporter {} is not the Active historical primary at epoch {}",
+                    route.pg_id().get(),
+                    recovery.reporting_node_id().as_u32(),
+                    recovery.pending().cluster_epoch().get()
+                ),
+            });
+        }
+    }
     validate_runtime_map_transfer_sources(snapshot)
 }
 
@@ -9148,6 +9753,16 @@ fn validate_runtime_map_routes(
                 ),
             });
         }
+        if route.pending_metadata_command_recovery().is_some()
+            && (!is_current_route_set || route.state() != PgState::Peering)
+        {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{label} route for PG {} has pending metadata command recovery outside a current Peering route",
+                    route.pg_id().get()
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -9255,6 +9870,27 @@ fn read_pg_route_snapshots(
                 });
             }
         };
+        let pending_metadata_command_recovery = match reader.read_u8()? {
+            0 => None,
+            1 => Some(PendingMetadataCommandRecovery {
+                reporting_node_id: NodeId::new(reader.read_u32()?),
+                pending: PendingMetadataCommandObservation::new(
+                    read_cluster_epoch(reader, "pending metadata command recovery epoch")?,
+                    NonZeroU64::new(reader.read_u64()?).ok_or_else(|| {
+                        ControlPlaneError::RpcProtocol {
+                            message: "pending metadata command recovery log index must be nonzero"
+                                .to_owned(),
+                        }
+                    })?,
+                    reader.read_u64()?,
+                ),
+            }),
+            tag => {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!("invalid pending metadata command recovery tag {tag}"),
+                });
+            }
+        };
         let acting_set_len = reader.read_collection_len(
             "PG route acting set",
             CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN,
@@ -9273,6 +9909,7 @@ fn read_pg_route_snapshots(
             peering_metadata_transfer,
             peering_metadata_transfer_source_route_epoch,
             peering_metadata_transfer_source_node_id,
+            pending_metadata_command_recovery,
         });
     }
     Ok(routes)
@@ -9282,6 +9919,47 @@ fn write_pg_metadata_proof(out: &mut Vec<u8>, proof: PgMetadataProof) {
     write_u64(out, proof.applied_log_index);
     write_u64(out, proof.applied_log_hash);
     write_u64(out, proof.state_digest);
+}
+
+fn write_pending_metadata_command_observation(
+    out: &mut Vec<u8>,
+    pending: Option<PendingMetadataCommandObservation>,
+) {
+    match pending {
+        Some(pending) => {
+            write_u8(out, 1);
+            write_u64(out, pending.cluster_epoch().get());
+            write_u64(out, pending.log_index());
+            write_u64(out, pending.command_checksum());
+        }
+        None => write_u8(out, 0),
+    }
+}
+
+fn read_pending_metadata_command_observation(
+    reader: &mut PayloadReader<'_>,
+) -> Result<Option<PendingMetadataCommandObservation>, ControlPlaneError> {
+    match reader.read_u8()? {
+        0 => Ok(None),
+        1 => {
+            let cluster_epoch =
+                read_cluster_epoch(reader, "pending metadata command cluster epoch")?;
+            let log_index = NonZeroU64::new(reader.read_u64()?).ok_or_else(|| {
+                ControlPlaneError::RpcProtocol {
+                    message: "pending metadata command log index must be nonzero".to_owned(),
+                }
+            })?;
+            let command_checksum = reader.read_u64()?;
+            Ok(Some(PendingMetadataCommandObservation::new(
+                cluster_epoch,
+                log_index,
+                command_checksum,
+            )))
+        }
+        present => Err(ControlPlaneError::RpcProtocol {
+            message: format!("invalid pending metadata command presence code {present}"),
+        }),
+    }
 }
 
 fn read_pg_metadata_proof(
@@ -9865,12 +10543,40 @@ pub enum ControlPlaneError {
     },
 
     #[error(
-        "node {node_id} reported unresolved pending metadata command for PG {pg_id} in cluster epoch {cluster_epoch}"
+        "node {node_id} reported unresolved pending metadata command for PG {pg_id} in cluster epoch {cluster_epoch}: command epoch {}, log index {}, checksum {}",
+        pending.cluster_epoch(),
+        pending.log_index(),
+        pending.command_checksum()
     )]
     PgPeeringPendingMetadataCommand {
         pg_id: u32,
         node_id: u32,
         cluster_epoch: ClusterEpoch,
+        pending: PendingMetadataCommandObservation,
+    },
+
+    #[error(
+        "PG {pg_id} has conflicting pending metadata command observations in cluster epoch {cluster_epoch}: node {first_node_id} reported {first:?}, node {second_node_id} reported {second:?}"
+    )]
+    PgPeeringPendingMetadataCommandMismatch {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        first_node_id: u32,
+        first: PendingMetadataCommandObservation,
+        second_node_id: u32,
+        second: PendingMetadataCommandObservation,
+    },
+
+    #[error(
+        "node {node_id} reported pending metadata command for PG {pg_id} at epoch {pending_epoch}, but that historical route was {historical_state} with primary {historical_primary_node_id} (current epoch {cluster_epoch})"
+    )]
+    PgPeeringPendingMetadataCommandReporterNotHistoricalPrimary {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        node_id: u32,
+        pending_epoch: ClusterEpoch,
+        historical_state: PgState,
+        historical_primary_node_id: u32,
     },
 
     #[error(
@@ -10275,7 +10981,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
 
 fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{}",
         node_id.as_u32(),
         record.pg_id.get(),
         pg_state_as_str(record.state),
@@ -10284,7 +10990,22 @@ fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> S
         record.metadata_proof.applied_log_index,
         record.metadata_proof.applied_log_hash,
         record.metadata_proof.state_digest,
-        u8::from(record.has_pending_metadata_command)
+        option_u64(
+            record
+                .pending_metadata_command
+                .map(PendingMetadataCommandObservation::cluster_epoch)
+                .map(ClusterEpoch::get)
+        ),
+        option_u64(
+            record
+                .pending_metadata_command
+                .map(PendingMetadataCommandObservation::log_index)
+        ),
+        option_u64(
+            record
+                .pending_metadata_command
+                .map(PendingMetadataCommandObservation::command_checksum)
+        )
     )
 }
 
@@ -10560,7 +11281,7 @@ fn validate_current_pg_observations(
                 && pg.active_primary == Some(node.node_id)
                 && observation.state == PgState::Active
             {
-                if observation.has_pending_metadata_command {
+                if observation.has_pending_metadata_command() {
                     return Err(parse_error(
                         line,
                         "active node PG observation must not have pending metadata command",
@@ -10790,10 +11511,10 @@ fn parse_node_pg_record(
     value: &str,
 ) -> Result<(NodeId, NodePgObservationRecord), ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 9 {
+    if fields.len() != 11 {
         return Err(parse_error(
             line,
-            "node PG observation record must have nine fields",
+            "node PG observation record must have eleven fields",
         ));
     }
     let node_id = NodeId::new(parse_u32(line, fields[0], "node id")?);
@@ -10807,7 +11528,32 @@ fn parse_node_pg_record(
         applied_log_hash: parse_u64(line, fields[6], "applied log hash")?,
         state_digest: parse_u64(line, fields[7], "state digest")?,
     };
-    let has_pending_metadata_command = parse_bool_u8(line, fields[8], "pending metadata command")?;
+    let pending_cluster_epoch =
+        parse_option_cluster_epoch(line, fields[8], "pending command cluster epoch")?;
+    let pending_log_index = parse_option_u64(line, fields[9], "pending command log index")?;
+    let pending_command_checksum = parse_option_u64(line, fields[10], "pending command checksum")?;
+    let pending_metadata_command = match (
+        pending_cluster_epoch,
+        pending_log_index,
+        pending_command_checksum,
+    ) {
+        (None, None, None) => None,
+        (Some(cluster_epoch), Some(log_index), Some(command_checksum)) => {
+            let log_index = NonZeroU64::new(log_index)
+                .ok_or_else(|| parse_error(line, "pending command log index must be nonzero"))?;
+            Some(PendingMetadataCommandObservation::new(
+                cluster_epoch,
+                log_index,
+                command_checksum,
+            ))
+        }
+        _ => {
+            return Err(parse_error(
+                line,
+                "pending command identity fields must all be present or absent",
+            ));
+        }
+    };
     Ok((
         node_id,
         NodePgObservationRecord {
@@ -10816,7 +11562,7 @@ fn parse_node_pg_record(
             observed_epoch,
             observed_at_ms,
             metadata_proof,
-            has_pending_metadata_command,
+            pending_metadata_command,
         },
     ))
 }
@@ -11452,11 +12198,12 @@ fn validate_pg_heartbeat_observations(
             && pg.active_primary == Some(node_id)
             && observation.state == PgState::Active
         {
-            if observation.has_pending_metadata_command {
+            if let Some(pending) = observation.pending_metadata_command {
                 return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
                     pg_id: observation.pg_id.get(),
                     node_id: node_id.as_u32(),
                     cluster_epoch: snapshot.cluster_epoch,
+                    pending,
                 });
             }
             let expected = pg.active_metadata_proof.ok_or(
@@ -11720,11 +12467,12 @@ fn validate_pg_peering_observations(
                 state: observation.state,
             });
         }
-        if observation.has_pending_metadata_command {
+        if let Some(pending) = observation.pending_metadata_command() {
             return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
                 pg_id: pg_id.get(),
                 node_id: node_id.as_u32(),
                 cluster_epoch: snapshot.cluster_epoch,
+                pending,
             });
         }
         match expected_proof {
@@ -11978,7 +12726,7 @@ fn validate_authoritative_metadata_migration_source(
         };
         if observation.observed_epoch != snapshot.cluster_epoch
             || observation.state != PgState::Active
-            || observation.has_pending_metadata_command
+            || observation.has_pending_metadata_command()
             || !proof_satisfies_floor
         {
             continue;
@@ -12020,7 +12768,7 @@ fn validate_peering_metadata_migration_source(
         };
         if observation.observed_epoch == snapshot.cluster_epoch
             && observation.state == PgState::Peering
-            && !observation.has_pending_metadata_command
+            && !observation.has_pending_metadata_command()
             && metadata_proof_satisfies_active_floor(floor, observation.metadata_proof)
         {
             return Ok(());
@@ -12106,7 +12854,7 @@ fn primary_has_current_pg_state(
         .is_some_and(|observation| {
             observation.observed_epoch == snapshot.cluster_epoch
                 && observation.state == expected_state
-                && !observation.has_pending_metadata_command
+                && !observation.has_pending_metadata_command()
                 && (expected_state != PgState::Active
                     || expected_active_proof.is_some_and(|(expected, imported, expected_epoch)| {
                         metadata_proof_satisfies_active_primary_observation_floor(
@@ -12158,11 +12906,12 @@ fn validate_pg_primary_active_observation(
             state: observation.state,
         });
     }
-    if observation.has_pending_metadata_command {
+    if let Some(pending) = observation.pending_metadata_command() {
         return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
             pg_id: pg_id.get(),
             node_id: primary.as_u32(),
             cluster_epoch: snapshot.cluster_epoch,
+            pending,
         });
     }
     if !metadata_proof_satisfies_active_primary_observation_floor(
@@ -12195,14 +12944,23 @@ fn required_cluster_map_history_protection<'a, 'b>(
     pgs: impl IntoIterator<Item = &'a PgControlRecord>,
     nodes: impl IntoIterator<Item = &'b NodeControlRecord>,
 ) -> ClusterMapHistoryProtection {
-    let exact_epochs: BTreeSet<_> = pgs
+    let mut exact_epochs: BTreeSet<_> = pgs
         .into_iter()
         .filter_map(PgControlRecord::peering_metadata_transfer_source_route_epoch)
         .collect();
-    let retain_from_epoch = nodes
-        .into_iter()
-        .filter_map(NodeControlRecord::cluster_map_history_floor_epoch)
-        .min();
+    let mut retain_from_epoch: Option<ClusterEpoch> = None;
+    for node in nodes {
+        retain_from_epoch = match (retain_from_epoch, node.cluster_map_history_floor_epoch()) {
+            (Some(current), Some(candidate)) => Some(current.min(candidate)),
+            (None, Some(candidate)) => Some(candidate),
+            (current, None) => current,
+        };
+        exact_epochs.extend(node.pg_observations().filter_map(|observation| {
+            observation
+                .pending_metadata_command()
+                .map(PendingMetadataCommandObservation::cluster_epoch)
+        }));
+    }
     ClusterMapHistoryProtection {
         exact_epochs,
         retain_from_epoch,
@@ -12967,7 +13725,7 @@ mod tests {
             pg_id: PgId::new(pg_id),
             state,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(heartbeat, now_ms).unwrap()
     }
@@ -13016,7 +13774,9 @@ mod tests {
             pg_id: PgId::new(pg_id),
             state,
             metadata_proof,
-            has_pending_metadata_command,
+            pending_metadata_command: has_pending_metadata_command.then_some(
+                test_pending_metadata_command(authority.snapshot().cluster_epoch()),
+            ),
         }];
         heartbeat.requested_lease_duration_ms = requested_lease_duration_ms;
         authority.heartbeat(heartbeat, now_ms).unwrap()
@@ -13355,6 +14115,104 @@ mod tests {
         }
     }
 
+    fn test_pending_metadata_command(
+        cluster_epoch: ClusterEpoch,
+    ) -> PendingMetadataCommandObservation {
+        PendingMetadataCommandObservation::new(cluster_epoch, NonZeroU64::MIN, 0xfeed)
+    }
+
+    #[test]
+    fn pending_recovery_listing_preserves_valid_task_after_other_pg_validation_failure() {
+        let valid_pg = PgId::new(1);
+        let invalid_pg = PgId::new(2);
+        let historical_epoch = ClusterEpoch::INITIAL;
+        let current_epoch = ClusterEpoch::new(2).unwrap();
+        let primary = NodeId::new(1);
+        let invalid_reporter = NodeId::new(2);
+
+        let mut historical = ClusterControlSnapshot::empty();
+        for node_id in [primary, invalid_reporter] {
+            historical.nodes.insert(
+                node_id,
+                NodeControlRecord::new(node_id, NodeMembershipState::Active),
+            );
+        }
+        for pg_id in [valid_pg, invalid_pg] {
+            historical.pgs.insert(
+                pg_id,
+                PgControlRecord {
+                    state: PgState::Active,
+                    active_primary: Some(primary),
+                    active_metadata_proof: Some(PgMetadataProof::empty()),
+                    active_metadata_proof_epoch: Some(historical_epoch),
+                    ..PgControlRecord::new(pg_id, vec![primary, invalid_reporter])
+                },
+            );
+        }
+
+        let mut snapshot = historical.clone();
+        snapshot.cluster_epoch = current_epoch;
+        snapshot.history = vec![ClusterMapHistoryRecord::from_snapshot(&historical)];
+        for pg in snapshot.pgs.values_mut() {
+            pg.state = PgState::Peering;
+            pg.active_primary = None;
+            pg.active_metadata_proof = None;
+            pg.active_metadata_proof_epoch = None;
+        }
+        let valid_pending =
+            PendingMetadataCommandObservation::new(historical_epoch, NonZeroU64::MIN, 0x1111);
+        let invalid_pending =
+            PendingMetadataCommandObservation::new(historical_epoch, NonZeroU64::MIN, 0x2222);
+        snapshot
+            .nodes
+            .get_mut(&primary)
+            .unwrap()
+            .pg_observations
+            .insert(
+                valid_pg,
+                NodePgObservationRecord {
+                    pg_id: valid_pg,
+                    state: PgState::Peering,
+                    observed_epoch: current_epoch,
+                    observed_at_ms: 10,
+                    metadata_proof: PgMetadataProof::empty(),
+                    pending_metadata_command: Some(valid_pending),
+                },
+            );
+        snapshot
+            .nodes
+            .get_mut(&invalid_reporter)
+            .unwrap()
+            .pg_observations
+            .insert(
+                invalid_pg,
+                NodePgObservationRecord {
+                    pg_id: invalid_pg,
+                    state: PgState::Peering,
+                    observed_epoch: current_epoch,
+                    observed_at_ms: 10,
+                    metadata_proof: PgMetadataProof::empty(),
+                    pending_metadata_command: Some(invalid_pending),
+                },
+            );
+
+        let listing = snapshot.pending_metadata_command_recoveries();
+
+        assert_eq!(
+            listing.tasks(),
+            &[PendingMetadataCommandRecoveryTask::new(
+                valid_pg,
+                PendingMetadataCommandRecovery::new(primary, valid_pending),
+            )]
+        );
+        assert_eq!(listing.failures().len(), 1);
+        assert_eq!(listing.failures()[0].pg_id(), invalid_pg);
+        assert_eq!(
+            listing.failures()[0].kind(),
+            PendingMetadataCommandRecoveryDiscoveryFailureKind::ReporterNotHistoricalPrimary
+        );
+    }
+
     fn heartbeat_model_acting_set(shape: u8) -> Vec<NodeId> {
         match shape % 7 {
             0 => vec![NodeId::new(1)],
@@ -13383,7 +14241,7 @@ mod tests {
                     pg_id,
                     state: PgState::Peering,
                     metadata_proof: heartbeat_model_proof(observation_kind),
-                    has_pending_metadata_command: false,
+                    pending_metadata_command: None,
                 }],
             };
         }
@@ -13393,13 +14251,15 @@ mod tests {
                 pg_id,
                 state: PgState::Peering,
                 metadata_proof: heartbeat_model_proof(1),
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             }],
             2 => vec![NodePgHeartbeatObservation {
                 pg_id,
                 state: PgState::Peering,
                 metadata_proof: heartbeat_model_proof(2),
-                has_pending_metadata_command: true,
+                pending_metadata_command: Some(test_pending_metadata_command(
+                    snapshot.cluster_epoch(),
+                )),
             }],
             3 => vec![NodePgHeartbeatObservation {
                 pg_id,
@@ -13407,13 +14267,13 @@ mod tests {
                 metadata_proof: pg
                     .active_metadata_proof()
                     .unwrap_or_else(|| heartbeat_model_proof(3)),
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             }],
             _ => vec![NodePgHeartbeatObservation {
                 pg_id,
                 state: PgState::Active,
                 metadata_proof: heartbeat_model_proof(observation_kind),
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             }],
         }
     }
@@ -13427,6 +14287,7 @@ mod tests {
             1 => PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(snapshot.cluster_epoch()),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             },
             2 => PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: snapshot
@@ -13434,12 +14295,14 @@ mod tests {
                     .first()
                     .map(ClusterMapHistoryRecord::cluster_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             },
             _ => PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: None,
                 oldest_durable_backfill_epoch: Some(
                     ClusterEpoch::new(snapshot.cluster_epoch().get() + 1).unwrap(),
                 ),
+                oldest_pending_metadata_command_epoch: None,
             },
         }
     }
@@ -14370,6 +15233,34 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_preserves_pending_metadata_command_error_identity() {
+        let pending = PendingMetadataCommandObservation::new(
+            ClusterEpoch::new(41).unwrap(),
+            NonZeroU64::new(17).unwrap(),
+            0xfeed_beef,
+        );
+        let encoded = encode_control_plane_rpc_response(Err(
+            ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id: 7,
+                node_id: 3,
+                cluster_epoch: ClusterEpoch::new(44).unwrap(),
+                pending,
+            },
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            decode_control_plane_rpc_response(encoded),
+            Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id: 7,
+                node_id: 3,
+                cluster_epoch,
+                pending: decoded,
+            }) if cluster_epoch == ClusterEpoch::new(44).unwrap() && decoded == pending
+        ));
+    }
+
+    #[test]
     fn unix_control_plane_client_fetches_pg_runtime_map_with_bounded_non_serving_validity() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -14475,6 +15366,7 @@ mod tests {
                     cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
                         oldest_live_placement_epoch: Some(heartbeat_epoch),
                         oldest_durable_backfill_epoch: None,
+                        oldest_pending_metadata_command_epoch: None,
                     },
                     pg_observations: Vec::new(),
                 },
@@ -14640,6 +15532,50 @@ mod tests {
         assert!(response.is_empty());
         assert_eq!(issued_rx.recv().unwrap(), 1_000);
         assert_eq!(issued_rx.recv().unwrap(), 6_500);
+    }
+
+    #[test]
+    fn unix_control_plane_client_reads_pending_recoveries_without_runtime_map() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let expected = PendingMetadataCommandRecoveryListing::new(
+            vec![PendingMetadataCommandRecoveryTask::new(
+                PgId::new(7),
+                PendingMetadataCommandRecovery::new(
+                    NodeId::new(3),
+                    PendingMetadataCommandObservation::new(
+                        ClusterEpoch::new(9).unwrap(),
+                        NonZeroU64::new(11).unwrap(),
+                        0x1234,
+                    ),
+                ),
+            )],
+            vec![PendingMetadataCommandRecoveryDiscoveryFailure::new(
+                PgId::new(8),
+                PendingMetadataCommandRecoveryDiscoveryFailureKind::ConflictingIdentity,
+                "conflicting observations".to_owned(),
+            )],
+        );
+        let server_expected = expected.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let (kind, payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
+            assert_eq!(kind, ControlPlaneRpcKind::PendingMetadataCommandRecoveries);
+            assert!(payload.is_empty());
+            let mut response = Vec::new();
+            write_pending_metadata_command_recovery_listing(&mut response, &server_expected)
+                .unwrap();
+            let response = encode_control_plane_rpc_response(Ok(response)).unwrap();
+            write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        assert_eq!(
+            client.pending_metadata_command_recoveries().unwrap(),
+            expected
+        );
+        server.join().unwrap();
     }
 
     #[test]
@@ -16193,6 +17129,7 @@ mod tests {
                     cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
                         oldest_live_placement_epoch: Some(heartbeat_epoch),
                         oldest_durable_backfill_epoch: None,
+                        oldest_pending_metadata_command_epoch: None,
                     },
                     pg_observations: Vec::new(),
                 },
@@ -16839,6 +17776,7 @@ mod tests {
                     cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
                         oldest_live_placement_epoch: Some(heartbeat_epoch),
                         oldest_durable_backfill_epoch: None,
+                        oldest_pending_metadata_command_epoch: None,
                     },
                     pg_observations: Vec::new(),
                 },
@@ -16935,6 +17873,7 @@ mod tests {
                     cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
                         oldest_live_placement_epoch: Some(heartbeat_epoch),
                         oldest_durable_backfill_epoch: None,
+                        oldest_pending_metadata_command_epoch: None,
                     },
                     pg_observations: Vec::new(),
                 },
@@ -16970,7 +17909,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
@@ -17060,6 +17999,7 @@ mod tests {
                     cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
                         oldest_live_placement_epoch: Some(heartbeat_epoch),
                         oldest_durable_backfill_epoch: None,
+                        oldest_pending_metadata_command_epoch: None,
                     },
                     pg_observations: Vec::new(),
                 },
@@ -17120,6 +18060,7 @@ mod tests {
                 cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
                     oldest_live_placement_epoch: Some(heartbeat_epoch),
                     oldest_durable_backfill_epoch: None,
+                    oldest_pending_metadata_command_epoch: None,
                 },
                 pg_observations: Vec::new(),
             },
@@ -18530,7 +19471,7 @@ mod tests {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         let payload = b"not a valid request";
         writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
-        write_u16_to_stream(&mut writer, 1);
+        write_u16_to_stream(&mut writer, CONTROL_PLANE_RPC_VERSION);
         write_u16_to_stream(
             &mut writer,
             ControlPlaneRpcKind::RefreshNodeHeartbeat as u16,
@@ -18553,13 +19494,13 @@ mod tests {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         let payload = b"";
         let checksum = control_plane_rpc_frame_checksum(
-            1,
+            CONTROL_PLANE_RPC_VERSION,
             ControlPlaneRpcKind::RuntimeMapSnapshot as u16,
             payload.len() as u32,
             payload,
         );
         writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
-        write_u16_to_stream(&mut writer, 1);
+        write_u16_to_stream(&mut writer, CONTROL_PLANE_RPC_VERSION);
         write_u16_to_stream(
             &mut writer,
             ControlPlaneRpcKind::RefreshNodeHeartbeat as u16,
@@ -18586,7 +19527,7 @@ mod tests {
             let _request = read_control_plane_unix_request(&mut stream).unwrap();
             let payload = [0u8];
             stream.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
-            write_u16_to_stream(&mut stream, 1);
+            write_u16_to_stream(&mut stream, CONTROL_PLANE_RPC_VERSION);
             write_u16_to_stream(&mut stream, ControlPlaneRpcKind::RuntimeMapSnapshot as u16);
             write_u32_to_stream(&mut stream, payload.len() as u32);
             write_u64_to_stream(&mut stream, 0);
@@ -18614,6 +19555,7 @@ mod tests {
         write_u64(&mut payload, 100);
         write_option_u64(&mut payload, None);
         write_option_u64(&mut payload, None);
+        write_option_u64(&mut payload, None);
         write_u32(&mut payload, u32::MAX);
 
         let mut reader = PayloadReader::new(&payload);
@@ -18627,13 +19569,14 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_rpc_rejects_malformed_heartbeat_pending_command_boolean() {
+    fn control_plane_rpc_rejects_malformed_heartbeat_pending_command_presence() {
         let mut payload = Vec::new();
         write_u32(&mut payload, 1);
         write_u64(&mut payload, 1);
         write_string(&mut payload, "/tmp/argmin-node-1.sock").unwrap();
         write_u64(&mut payload, ClusterEpoch::INITIAL.get());
         write_u64(&mut payload, 100);
+        write_option_u64(&mut payload, None);
         write_option_u64(&mut payload, None);
         write_option_u64(&mut payload, None);
         write_u32(&mut payload, 1);
@@ -18655,7 +19598,7 @@ mod tests {
         assert!(matches!(
             error,
             ControlPlaneError::RpcProtocol { message }
-                if message.contains("invalid boolean value 2")
+                if message.contains("invalid pending metadata command presence code 2")
         ));
     }
 
@@ -18709,6 +19652,7 @@ mod tests {
         write_u32(&mut payload, 1);
         write_pg_state(&mut payload, PgState::Active);
         write_option_u64(&mut payload, None);
+        write_u8(&mut payload, 0);
         write_u8(&mut payload, 0);
         write_u32(&mut payload, u32::MAX);
 
@@ -18837,6 +19781,29 @@ mod tests {
             ControlPlaneError::RpcProtocol { message }
                 if message.contains("runtime map contains duplicate route for PG 7")
         ));
+    }
+
+    #[test]
+    fn control_plane_rpc_round_trips_pending_command_recovery_authorization() {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        let historical = snapshot.pg_routes[0].without_serving_authority();
+        snapshot.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        snapshot.pg_routes[0].cluster_epoch = snapshot.cluster_epoch;
+        snapshot.pg_routes[0].state = PgState::Peering;
+        snapshot.pg_routes[0].primary_lease_deadline_ms = None;
+        snapshot.pg_routes[0].pending_metadata_command_recovery =
+            Some(PendingMetadataCommandRecovery::new(
+                NodeId::new(1),
+                PendingMetadataCommandObservation::new(
+                    ClusterEpoch::INITIAL,
+                    NonZeroU64::MIN,
+                    0x1234,
+                ),
+            ));
+        snapshot.historical_pg_routes.push(historical);
+
+        let decoded = decode_runtime_map_test_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(decoded, snapshot);
     }
 
     #[test]
@@ -19140,6 +20107,7 @@ mod tests {
                 peering_metadata_transfer: None,
                 peering_metadata_transfer_source_route_epoch: None,
                 peering_metadata_transfer_source_node_id: None,
+                pending_metadata_command_recovery: None,
             }],
             historical_pg_routes: Vec::new(),
         }
@@ -19293,7 +20261,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=15\nauthority_incarnation=1\ncluster_epoch=1\n",
+            "version=16\nauthority_incarnation=1\ncluster_epoch=1\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -19463,6 +20431,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(protected_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         assert!(authority
             .heartbeat(floor_heartbeat, 10_100)
@@ -19499,6 +20468,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(advanced_floor),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         assert!(authority
             .heartbeat(advanced_floor_heartbeat, 11_000)
@@ -19533,6 +20503,80 @@ mod tests {
     }
 
     #[test]
+    fn cluster_map_history_pruning_preserves_reported_pending_command_epoch_exactly() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(1), vec![NodeId::new(1)])
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 10_000).serving());
+        let protected_epoch = authority.snapshot().cluster_epoch();
+        let mut heartbeat = heartbeat_from_record(&authority, 1, protected_epoch, 10_100);
+        heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_pending_metadata_command_epoch = Some(protected_epoch);
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(1),
+            state: PgState::Peering,
+            metadata_proof: PgMetadataProof::empty(),
+            pending_metadata_command: Some(PendingMetadataCommandObservation::new(
+                protected_epoch,
+                NonZeroU64::MIN,
+                0x1234,
+            )),
+        }];
+        authority.heartbeat(heartbeat, 10_100).unwrap();
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .pg_observation(PgId::new(1))
+                .unwrap()
+                .pending_metadata_command(),
+            Some(PendingMetadataCommandObservation::new(
+                protected_epoch,
+                NonZeroU64::MIN,
+                0x1234,
+            ))
+        );
+
+        for node_id in 10..(10 + CLUSTER_MAP_HISTORY_LIMIT as u32 + 8) {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            let now_ms = 20_000 + u64::from(node_id);
+            let current_epoch = authority.snapshot().cluster_epoch();
+            let mut heartbeat = heartbeat_from_record(&authority, 1, current_epoch, now_ms);
+            heartbeat
+                .cluster_map_history_reference_summary
+                .oldest_pending_metadata_command_epoch = Some(protected_epoch);
+            heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+                pg_id: PgId::new(1),
+                state: PgState::Peering,
+                metadata_proof: PgMetadataProof::empty(),
+                pending_metadata_command: Some(PendingMetadataCommandObservation::new(
+                    protected_epoch,
+                    NonZeroU64::MIN,
+                    0x1234,
+                )),
+            }];
+            authority.heartbeat(heartbeat, now_ms).unwrap();
+        }
+
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(protected_epoch)
+            .is_some());
+        let persisted = store.load().unwrap().unwrap();
+        assert!(persisted.cluster_map_at_epoch(protected_epoch).is_some());
+    }
+
+    #[test]
     fn cluster_map_history_pruning_preserves_durable_backfill_reference_floor() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -19550,6 +20594,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: None,
                 oldest_durable_backfill_epoch: Some(protected_epoch),
+                oldest_pending_metadata_command_epoch: None,
             };
         assert!(authority
             .heartbeat(floor_heartbeat, 10_100)
@@ -19607,6 +20652,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(protected_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         assert!(authority
             .heartbeat(floor_heartbeat, 10_100)
@@ -19689,6 +20735,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(first_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         let error = authority
             .heartbeat(stale_floor_heartbeat, 11_000)
@@ -19797,6 +20844,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(source_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         let error = authority
             .heartbeat(stale_range_heartbeat, heartbeat_at_ms)
@@ -19837,6 +20885,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: None,
                 oldest_durable_backfill_epoch: Some(future_epoch),
+                oldest_pending_metadata_command_epoch: None,
             };
         let error = authority
             .heartbeat(future_floor_heartbeat, 11_000)
@@ -20092,7 +21141,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=1\n",
@@ -20115,7 +21164,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -20139,7 +21188,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -20164,7 +21213,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -20207,7 +21256,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -20230,7 +21279,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -20255,7 +21304,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
@@ -20306,13 +21355,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node=2,active,healthy,12,2,100,200,-,6e6f64652d322e736f636b\n",
-                "node_pg=2,7,peering,2,100,0,0,0,0\n",
+                "node_pg=2,7,peering,2,100,0,0,0,-,-,-\n",
                 "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
             ),
         )
@@ -20332,12 +21381,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "node=1,active,healthy,11,3,100,200,-,6e6f64652d312e736f636b\n",
-                "node_pg=1,7,peering,2,100,0,0,0,0\n",
+                "node_pg=1,7,peering,2,100,0,0,0,-,-,-\n",
                 "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
             ),
         )
@@ -20357,12 +21406,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "node_pg=1,7,active,2,100,9,10,12,0\n",
+                "node_pg=1,7,active,2,100,9,10,12,-,-,-\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0\n",
             ),
         )
@@ -20383,12 +21432,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "max_committed_timestamp_ms=100\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "node_pg=1,7,active,2,100,10,20,30,0\n",
+                "node_pg=1,7,active,2,100,10,20,30,-,-,-\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0\n",
             ),
         )
@@ -20423,12 +21472,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=15\n",
+                "version=16\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "node_pg=1,7,active,2,100,9,10,11,1\n",
+                "node_pg=1,7,active,2,100,9,10,11,2,1,1\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0\n",
             ),
         )
@@ -20603,7 +21652,7 @@ mod tests {
             pg_id: PgId::new(39),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let changed = authority.heartbeat(moved, 204).unwrap();
         assert!(!changed.serving());
@@ -20856,7 +21905,7 @@ mod tests {
                         pg_id: PgId::new(7),
                         state: PgState::Peering,
                         metadata_proof: PgMetadataProof::empty(),
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 heartbeat_at_ms: 1_100,
@@ -20987,7 +22036,7 @@ mod tests {
             pg_id: PgId::new(7),
             state: PgState::Peering,
             metadata_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let before = authority.snapshot().clone();
         let applied = before
@@ -21038,7 +22087,7 @@ mod tests {
             pg_id: PgId::new(8),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let before = authority.snapshot().clone();
         let applied = before
@@ -21076,6 +22125,7 @@ mod tests {
         heartbeat.cluster_map_history_reference_summary = PgClusterMapHistoryReferenceSummary {
             oldest_live_placement_epoch: Some(future_epoch),
             oldest_durable_backfill_epoch: None,
+            oldest_pending_metadata_command_epoch: None,
         };
         let before = authority.snapshot().clone();
         let error = before
@@ -21674,7 +22724,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let refresh = authority
             .refresh_node_heartbeat(peering_heartbeat, 2_000)
@@ -21709,7 +22759,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let refresh = authority
             .refresh_node_heartbeat(active_heartbeat, 2_002)
@@ -21755,7 +22805,7 @@ mod tests {
                 pg_id: PgId::new(77),
                 state: PgState::Peering,
                 metadata_proof: proof,
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             }];
             if node_id == 1 {
                 authority.heartbeat(heartbeat, now_ms).unwrap();
@@ -21806,7 +22856,7 @@ mod tests {
             pg_id: PgId::new(77),
             state: PgState::Active,
             metadata_proof: proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let active_refresh = authority
             .refresh_node_heartbeat(active_heartbeat, 2_005)
@@ -21868,7 +22918,7 @@ mod tests {
             pg_id: PgId::new(70),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let refresh = authority
             .refresh_node_heartbeat(unrelated_heartbeat, 1_014)
@@ -22051,7 +23101,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Peering,
             metadata_proof: accepted_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
         authority
@@ -22069,7 +23119,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Active,
             metadata_proof: accepted_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(active_heartbeat, 2_020).unwrap();
         assert!(authority
@@ -22102,7 +23152,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Active,
             metadata_proof: progressed_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(progressed_heartbeat, 2_031).unwrap();
 
@@ -22210,7 +23260,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Peering,
             metadata_proof: accepted_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
         authority
@@ -22228,7 +23278,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Active,
             metadata_proof: accepted_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(active_heartbeat, 2_020).unwrap();
         let accepted_proof_epoch = authority
@@ -22248,7 +23298,7 @@ mod tests {
             pg_id: PgId::new(22),
             state: PgState::Active,
             metadata_proof: cleanup_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         assert!(matches!(
             authority.heartbeat(cleanup_heartbeat, 2_030),
@@ -22301,7 +23351,7 @@ mod tests {
                 pg_id: PgId::new(23),
                 state: PgState::Peering,
                 metadata_proof: accepted_proof,
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             }];
             authority
                 .heartbeat(peering_heartbeat, 2_000 + u64::from(node_id))
@@ -22327,7 +23377,7 @@ mod tests {
             pg_id: PgId::new(23),
             state: PgState::Active,
             metadata_proof: progressed_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(non_primary_active, 2_020).unwrap();
         assert_eq!(authority.serving_pg_primary(PgId::new(23), 2_030), None);
@@ -22405,7 +23455,7 @@ mod tests {
                     } else {
                         stale_proof
                     },
-                    has_pending_metadata_command: false,
+                    pending_metadata_command: None,
                 },
             );
         }
@@ -22417,7 +23467,7 @@ mod tests {
             pg_id: PgId::new(24),
             state: PgState::Active,
             metadata_proof: stale_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(stale_replica_heartbeat, 2_020).unwrap();
         assert_eq!(
@@ -22736,6 +23786,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(protected_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         assert!(authority
             .heartbeat(floor_heartbeat, 1_100)
@@ -22806,6 +23857,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(protected_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         assert!(authority
             .heartbeat(floor_heartbeat, 1_100)
@@ -22867,6 +23919,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(protected_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         assert!(authority
             .heartbeat(floor_heartbeat, 1_100)
@@ -22884,6 +23937,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(protected_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         assert!(authority
             .heartbeat(observed_heartbeat, 2_000)
@@ -22903,6 +23957,7 @@ mod tests {
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(protected_epoch),
                 oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
             };
         authority
             .heartbeat(restart_heartbeat.clone(), 2_100)
@@ -24968,7 +26023,7 @@ mod tests {
             pg_id: PgId::new(17),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let refreshed = authority.heartbeat(shorter_lease, 3_061).unwrap();
         assert_eq!(
@@ -25056,7 +26111,7 @@ mod tests {
                 applied_log_hash: 10,
                 state_digest: 11,
             },
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(heartbeat, 2_000).unwrap();
 
@@ -25134,7 +26189,7 @@ mod tests {
                 pg_id: PgId::new(19),
                 state: PgState::Peering,
                 metadata_proof,
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             }];
             authority
                 .heartbeat(heartbeat, 2_000 + u64::from(node_id))
@@ -25162,7 +26217,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Peering,
             metadata_proof: matching_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(heartbeat, 2_060).unwrap();
         authority
@@ -25486,7 +26541,9 @@ mod tests {
             pg_id: PgId::new(29),
             state: PgState::Peering,
             metadata_proof: proof,
-            has_pending_metadata_command: true,
+            pending_metadata_command: Some(test_pending_metadata_command(
+                authority.snapshot().cluster_epoch(),
+            )),
         }];
         authority.heartbeat(heartbeat, 2_000).unwrap();
 
@@ -25510,7 +26567,7 @@ mod tests {
             pg_id: PgId::new(29),
             state: PgState::Peering,
             metadata_proof: proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(heartbeat, 2_060).unwrap();
         authority
@@ -25547,7 +26604,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Peering,
             metadata_proof: accepted_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
         authority
@@ -25569,7 +26626,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Active,
             metadata_proof: accepted_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(equal_active, 2_020).unwrap();
         let pg = authority.snapshot().pg(PgId::new(19)).unwrap();
@@ -25596,7 +26653,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Active,
             metadata_proof: progressed_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let lease = authority.heartbeat(progressed_active, 2_030).unwrap();
         assert_eq!(lease.lease_deadline_ms(), 2_130);
@@ -25659,13 +26716,13 @@ mod tests {
                 pg_id: PgId::new(21),
                 state: PgState::Peering,
                 metadata_proof: proof_21,
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             },
             NodePgHeartbeatObservation {
                 pg_id: PgId::new(22),
                 state: PgState::Peering,
                 metadata_proof: proof_22,
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             },
         ];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
@@ -25692,7 +26749,7 @@ mod tests {
             pg_id: PgId::new(21),
             state: PgState::Active,
             metadata_proof: progressed_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(active_heartbeat, 2_020).unwrap();
         let pg = authority.snapshot().pg(PgId::new(21)).unwrap();
@@ -25724,7 +26781,7 @@ mod tests {
             pg_id: PgId::new(23),
             state: PgState::Peering,
             metadata_proof: observed_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
 
@@ -25780,7 +26837,7 @@ mod tests {
             pg_id: PgId::new(24),
             state: PgState::Peering,
             metadata_proof: observed_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
 
@@ -25830,7 +26887,7 @@ mod tests {
             pg_id: PgId::new(25),
             state: PgState::Peering,
             metadata_proof: observed_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
 
@@ -25867,7 +26924,7 @@ mod tests {
             pg_id: PgId::new(25),
             state: PgState::Active,
             metadata_proof: progressed_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(active_heartbeat, 2_010).unwrap();
         let replayed = authority
@@ -25909,7 +26966,7 @@ mod tests {
             pg_id: PgId::new(51),
             state: PgState::Peering,
             metadata_proof: observed_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
 
@@ -25993,7 +27050,7 @@ mod tests {
                 pg_id: PgId::new(26),
                 state: PgState::Peering,
                 metadata_proof: observed_proof,
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             }];
             authority.heartbeat(peering_heartbeat, 2_000).unwrap();
         }
@@ -26132,7 +27189,9 @@ mod tests {
             pg_id: PgId::new(32),
             state: PgState::Active,
             metadata_proof: active_proof,
-            has_pending_metadata_command: true,
+            pending_metadata_command: Some(test_pending_metadata_command(
+                authority.snapshot().cluster_epoch(),
+            )),
         }];
         assert!(matches!(
             authority.refresh_node_heartbeat(pending_active, 2_020),
@@ -26182,7 +27241,7 @@ mod tests {
             pg_id: PgId::new(16),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let response = authority.heartbeat(stale, 2_000).unwrap();
         assert!(!response.serving());
@@ -26216,13 +27275,13 @@ mod tests {
                 pg_id: PgId::new(17),
                 state: PgState::Peering,
                 metadata_proof: PgMetadataProof::empty(),
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             },
             NodePgHeartbeatObservation {
                 pg_id: PgId::new(17),
                 state: PgState::Peering,
                 metadata_proof: PgMetadataProof::empty(),
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             },
         ];
         assert!(matches!(
@@ -26239,7 +27298,7 @@ mod tests {
             pg_id: PgId::new(99),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         assert!(matches!(
             authority.heartbeat(unknown, 2_001),
@@ -26252,7 +27311,7 @@ mod tests {
             pg_id: PgId::new(17),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         assert!(matches!(
             authority.heartbeat(wrong_node, 2_002),
@@ -26281,7 +27340,7 @@ mod tests {
             pg_id: PgId::new(18),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(heartbeat, 2_000).unwrap();
         assert!(authority
@@ -26341,7 +27400,7 @@ mod tests {
             pg_id: PgId::new(18),
             state: PgState::Peering,
             metadata_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(heartbeat, 2_000).unwrap();
         assert!(authority
@@ -26403,7 +27462,7 @@ mod tests {
             pg_id: PgId::new(26),
             state: PgState::Peering,
             metadata_proof: active_metadata_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
         authority
@@ -26420,7 +27479,7 @@ mod tests {
             pg_id: PgId::new(26),
             state: PgState::Active,
             metadata_proof: active_metadata_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let active = authority.heartbeat(active_heartbeat, 2_002).unwrap();
         let active_epoch = active.cluster_epoch();
@@ -26469,7 +27528,7 @@ mod tests {
             pg_id: PgId::new(26),
             state: PgState::Active,
             metadata_proof: active_metadata_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let refresh = restarted
             .refresh_node_heartbeat(stale_active_heartbeat, 2_003)
@@ -26501,7 +27560,7 @@ mod tests {
             pg_id: PgId::new(26),
             state: PgState::Peering,
             metadata_proof: active_metadata_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let refresh = restarted
             .refresh_node_heartbeat(current_peering_heartbeat, 2_005)
@@ -26609,7 +27668,7 @@ mod tests {
             pg_id: PgId::new(1),
             state: PgState::Active,
             metadata_proof: proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         assert!(authority
             .heartbeat(active_heartbeat, 2_020)
@@ -26630,7 +27689,7 @@ mod tests {
             pg_id: PgId::new(1),
             state: PgState::Active,
             metadata_proof: proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
 
         assert!(matches!(
@@ -26702,7 +27761,7 @@ mod tests {
                 pg_id: heartbeat_model_pg_id(),
                 state: PgState::Active,
                 metadata_proof: initial_proof,
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             }];
             authority.heartbeat(active_primary_heartbeat, 2_003).unwrap();
 
@@ -26891,7 +27950,7 @@ mod tests {
                 pg_id: heartbeat_model_pg_id(),
                 state: PgState::Active,
                 metadata_proof: initial_proof,
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             }];
             authority.heartbeat(active_primary_heartbeat, 2_003).unwrap();
 
@@ -27669,7 +28728,7 @@ mod tests {
             pg_id: PgId::new(19),
             state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let refresh = authority
             .refresh_node_heartbeat(stale_active_heartbeat, active_valid_until_ms + 1)
@@ -28212,7 +29271,7 @@ mod tests {
             pg_id: PgId::new(20),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(stale_node_two_peering, 2_013).unwrap();
         assert!(matches!(
@@ -28233,7 +29292,7 @@ mod tests {
             pg_id: PgId::new(20),
             state: PgState::Peering,
             metadata_proof: active_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(ready_but_fenced, 2_015).unwrap();
         assert!(authority
@@ -28246,7 +29305,7 @@ mod tests {
             pg_id: PgId::new(20),
             state: PgState::Peering,
             metadata_proof: active_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(fence_bridge, 2_103).unwrap();
         let mut stale_node_two_peering = heartbeat_from_record(&authority, 2, peering_epoch, 3_103);
@@ -28254,7 +29313,7 @@ mod tests {
             pg_id: PgId::new(20),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(stale_node_two_peering, 3_103).unwrap();
         assert!(matches!(
@@ -28278,7 +29337,7 @@ mod tests {
             pg_id: PgId::new(20),
             state: PgState::Peering,
             metadata_proof: active_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(node_two_peering, 3_104).unwrap();
         authority
@@ -28295,7 +29354,7 @@ mod tests {
             pg_id: PgId::new(20),
             state: PgState::Active,
             metadata_proof: active_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         let new_active = authority.heartbeat(new_active_heartbeat, 3_105).unwrap();
         let new_epoch = new_active.cluster_epoch();
@@ -28629,7 +29688,7 @@ mod tests {
             pg_id: PgId::new(49),
             state: PgState::Peering,
             metadata_proof: epoch_local_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(restarting_primary, 2_002).unwrap();
         let peering_epoch = authority.snapshot().cluster_epoch();
@@ -28642,7 +29701,7 @@ mod tests {
             pg_id: PgId::new(49),
             state: PgState::Peering,
             metadata_proof: epoch_local_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(current_peering, 2_003).unwrap();
         assert!(matches!(
@@ -28758,7 +29817,7 @@ mod tests {
             pg_id: PgId::new(50),
             state: PgState::Peering,
             metadata_proof: epoch_local_proof,
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }];
         authority.heartbeat(current_peering, 2_003).unwrap();
         assert!(matches!(

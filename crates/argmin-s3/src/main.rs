@@ -3314,6 +3314,19 @@ impl ControlPlaneRuntimeMapSource for FrontendControlPlaneClient {
         }
     }
 
+    fn pending_metadata_command_recoveries(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<storage::control_plane::PendingMetadataCommandRecoveryListing, ControlPlaneError>
+    {
+        match self {
+            Self::Plain(client) => client.pending_metadata_command_recoveries(),
+            Self::Authenticated(client) => {
+                client.pending_metadata_command_recoveries(authority_now_ms)
+            }
+        }
+    }
+
     fn pg_runtime_map_snapshot(
         &self,
         pg_id: PgId,
@@ -4096,6 +4109,7 @@ fn build_storage_node_process_config(
             pg_routes,
 
             historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
         })
         .map_err(|error| error.to_string())?,
         None,
@@ -5790,7 +5804,7 @@ mod tests {
                         pg_id: PgId::new(7),
                         state: PgState::Peering,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 20_100,
@@ -5829,7 +5843,7 @@ mod tests {
                         pg_id: PgId::new(7),
                         state: PgState::Active,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 20_200,
@@ -5995,6 +6009,7 @@ mod tests {
         let protected_floor = storage::PgClusterMapHistoryReferenceSummary {
             oldest_live_placement_epoch: Some(protected_epoch),
             oldest_durable_backfill_epoch: None,
+            oldest_pending_metadata_command_epoch: None,
         };
         for node_id in 10..18 {
             harness
@@ -7435,7 +7450,7 @@ mod tests {
                         pg_id: PgId::new(7),
                         state: PgState::Peering,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 20_100,
@@ -7466,7 +7481,7 @@ mod tests {
                         pg_id: PgId::new(7),
                         state: PgState::Active,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 20_200,
@@ -7565,7 +7580,7 @@ mod tests {
                         pg_id: PgId::new(17),
                         state: PgState::Peering,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 50_100,
@@ -7591,7 +7606,7 @@ mod tests {
                         pg_id: PgId::new(17),
                         state: PgState::Active,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 50_200,
@@ -7698,7 +7713,7 @@ mod tests {
                         pg_id: PgId::new(17),
                         state: PgState::Peering,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 50_100,
@@ -7724,7 +7739,7 @@ mod tests {
                         pg_id: PgId::new(17),
                         state: PgState::Active,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 50_200,
@@ -7854,7 +7869,7 @@ mod tests {
                         pg_id: PgId::new(17),
                         state: PgState::Peering,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 50_100,
@@ -7880,7 +7895,7 @@ mod tests {
                         pg_id: PgId::new(17),
                         state: PgState::Active,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 50_200,
@@ -7977,7 +7992,7 @@ mod tests {
                         pg_id: PgId::new(9),
                         state: PgState::Peering,
                         metadata_proof: proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 0,
@@ -8493,7 +8508,7 @@ mod tests {
                         pg_id: PgId::new(13),
                         state: PgState::Peering,
                         metadata_proof: active_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 40_100,
@@ -8519,7 +8534,7 @@ mod tests {
                         pg_id: PgId::new(13),
                         state: PgState::Active,
                         metadata_proof: active_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 40_200,
@@ -8668,7 +8683,7 @@ mod tests {
                         pg_id: PgId::new(13),
                         state: PgState::Peering,
                         metadata_proof: active_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 40_100,
@@ -8701,7 +8716,7 @@ mod tests {
                         pg_id: PgId::new(13),
                         state: PgState::Active,
                         metadata_proof: active_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 40_200,
@@ -8851,7 +8866,7 @@ mod tests {
                         pg_id: PgId::new(14),
                         state: PgState::Peering,
                         metadata_proof: active_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 41_100,
@@ -8877,7 +8892,7 @@ mod tests {
                         pg_id: PgId::new(14),
                         state: PgState::Active,
                         metadata_proof: active_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 41_150,
@@ -9087,7 +9102,7 @@ mod tests {
                         pg_id,
                         state: PgState::Peering,
                         metadata_proof: source_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 now_ms,
@@ -9112,7 +9127,7 @@ mod tests {
                         pg_id,
                         state: PgState::Active,
                         metadata_proof: source_proof,
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 now_ms + 1,
@@ -9394,6 +9409,7 @@ mod tests {
                         storage::PgClusterMapHistoryReferenceSummary {
                             oldest_live_placement_epoch: Some(floor_epoch),
                             oldest_durable_backfill_epoch: None,
+                            oldest_pending_metadata_command_epoch: None,
                         },
                     pg_observations: Vec::new(),
                 },
@@ -9691,7 +9707,7 @@ mod tests {
                     pg_id: PgId::new(0),
                     state: PgState::Peering,
                     metadata_proof: PgMetadataProof::empty(),
-                    has_pending_metadata_command: false,
+                    pending_metadata_command: None,
                 }]
             } else {
                 Vec::new()
@@ -9736,7 +9752,7 @@ mod tests {
                                 pg_id: PgId::new(0),
                                 state: PgState::Active,
                                 metadata_proof: PgMetadataProof::empty(),
-                                has_pending_metadata_command: false,
+                                pending_metadata_command: None,
                             }],
                         },
                         1_005,
@@ -9790,7 +9806,7 @@ mod tests {
                                 pg_id: PgId::new(0),
                                 state: PgState::Peering,
                                 metadata_proof: PgMetadataProof::empty(),
-                                has_pending_metadata_command: false,
+                                pending_metadata_command: None,
                             }],
                         },
                         now_ms,
@@ -9823,7 +9839,7 @@ mod tests {
                                 pg_id: PgId::new(1),
                                 state: PgState::Peering,
                                 metadata_proof: PgMetadataProof::empty(),
-                                has_pending_metadata_command: false,
+                                pending_metadata_command: None,
                             }],
                         },
                         now_ms,
@@ -9854,7 +9870,7 @@ mod tests {
                             pg_id: PgId::new(0),
                             state: PgState::Active,
                             metadata_proof: PgMetadataProof::empty(),
-                            has_pending_metadata_command: false,
+                            pending_metadata_command: None,
                         }],
                     },
                     1_007,
@@ -9972,7 +9988,7 @@ mod tests {
                 pg_id: PgId::new(0),
                 state: PgState::Peering,
                 metadata_proof: PgMetadataProof::empty(),
-                has_pending_metadata_command: false,
+                pending_metadata_command: None,
             };
             for now_ms in 1_000..1_004 {
                 let observed_epoch = authority.snapshot().cluster_epoch();
@@ -10014,7 +10030,7 @@ mod tests {
                             pg_id: PgId::new(0),
                             state: PgState::Active,
                             metadata_proof: PgMetadataProof::empty(),
-                            has_pending_metadata_command: false,
+                            pending_metadata_command: None,
                         }],
                     },
                     1_003,
@@ -10026,6 +10042,9 @@ mod tests {
 
             let (mut stream, _addr) = listener.accept().unwrap();
             handle_control_plane_unix_stream(&mut authority, &mut stream, 1_005).unwrap();
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_006).unwrap();
         })
     }
 
@@ -10229,7 +10248,7 @@ mod tests {
                         pg_id: PgId::new(0),
                         state: PgState::Peering,
                         metadata_proof: PgMetadataProof::empty(),
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 61_100,
@@ -10255,7 +10274,7 @@ mod tests {
                         pg_id: PgId::new(0),
                         state: PgState::Active,
                         metadata_proof: PgMetadataProof::empty(),
-                        has_pending_metadata_command: false,
+                        pending_metadata_command: None,
                     }],
                 },
                 61_200,
@@ -10271,7 +10290,7 @@ mod tests {
         )
         .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
         let server =
-            spawn_experimental_raft_unix_rpc_server_requests(&restarted, &socket_path, 61_300, 2);
+            spawn_experimental_raft_unix_rpc_server_requests(&restarted, &socket_path, 61_300, 3);
 
         let ec_config = EcConfig::new(1, 0).unwrap();
         let mut frontend_config = test_server_config();

@@ -1,15 +1,16 @@
 use crate::control_plane::{
     format_snapshot, parse_snapshot, validate_control_plane_snapshot, ClusterControlSnapshot,
     ClusterRuntimeMapSnapshot, ControlPlaneError, NodeAvailabilityState, NodeHeartbeat,
-    NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof, PgMetadataTransferProof,
-    RuntimeMapFreshnessProof,
+    NodeMembershipState, NodePgHeartbeatObservation, PendingMetadataCommandObservation,
+    PgMetadataProof, PgMetadataTransferProof, RuntimeMapFreshnessProof,
 };
 use crate::types::{PgId, PgState};
 use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary};
 use placement::NodeId;
+use std::num::NonZeroU64;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 2;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 3;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -926,6 +927,12 @@ fn write_node_heartbeat(
             .cluster_map_history_reference_summary
             .oldest_durable_backfill_epoch,
     );
+    write_option_cluster_epoch(
+        out,
+        heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_pending_metadata_command_epoch,
+    );
     write_u32(
         out,
         len_as_u32(heartbeat.pg_observations.len(), "PG observations")?,
@@ -934,7 +941,7 @@ fn write_node_heartbeat(
         write_u32(out, observation.pg_id.get());
         write_pg_state(out, observation.state);
         write_pg_metadata_proof(out, observation.metadata_proof);
-        write_u8(out, u8::from(observation.has_pending_metadata_command));
+        write_pending_metadata_command_observation(out, observation.pending_metadata_command);
     }
     Ok(())
 }
@@ -949,6 +956,8 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         read_option_cluster_epoch(reader, "heartbeat oldest live placement epoch")?;
     let oldest_durable_backfill_epoch =
         read_option_cluster_epoch(reader, "heartbeat oldest durable backfill epoch")?;
+    let oldest_pending_metadata_command_epoch =
+        read_option_cluster_epoch(reader, "heartbeat oldest pending command epoch")?;
     let observation_count = reader.read_collection_len(
         "PG observations",
         CONTROL_PLANE_COMMAND_HEARTBEAT_OBSERVATION_MIN_LEN,
@@ -959,7 +968,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
             pg_id: PgId::new(reader.read_u32()?),
             state: read_pg_state(reader)?,
             metadata_proof: read_pg_metadata_proof(reader)?,
-            has_pending_metadata_command: reader.read_bool()?,
+            pending_metadata_command: read_pending_metadata_command_observation(reader)?,
         });
     }
     Ok(NodeHeartbeat {
@@ -971,6 +980,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
             oldest_live_placement_epoch,
             oldest_durable_backfill_epoch,
+            oldest_pending_metadata_command_epoch,
         },
         pg_observations,
     })
@@ -1077,6 +1087,45 @@ fn write_pg_metadata_proof(out: &mut Vec<u8>, proof: PgMetadataProof) {
     write_u64(out, proof.applied_log_index);
     write_u64(out, proof.applied_log_hash);
     write_u64(out, proof.state_digest);
+}
+
+fn write_pending_metadata_command_observation(
+    out: &mut Vec<u8>,
+    pending: Option<PendingMetadataCommandObservation>,
+) {
+    match pending {
+        Some(pending) => {
+            write_u8(out, 1);
+            write_u64(out, pending.cluster_epoch().get());
+            write_u64(out, pending.log_index());
+            write_u64(out, pending.command_checksum());
+        }
+        None => write_u8(out, 0),
+    }
+}
+
+fn read_pending_metadata_command_observation(
+    reader: &mut PayloadReader<'_>,
+) -> Result<Option<PendingMetadataCommandObservation>, ControlPlaneError> {
+    match reader.read_u8()? {
+        0 => Ok(None),
+        1 => {
+            let cluster_epoch =
+                read_cluster_epoch(reader, "pending metadata command cluster epoch")?;
+            let log_index = NonZeroU64::new(reader.read_u64()?).ok_or_else(|| {
+                command_protocol_error("pending metadata command log index must be nonzero")
+            })?;
+            let command_checksum = reader.read_u64()?;
+            Ok(Some(PendingMetadataCommandObservation::new(
+                cluster_epoch,
+                log_index,
+                command_checksum,
+            )))
+        }
+        present => Err(command_protocol_error(format!(
+            "invalid pending metadata command presence code {present}"
+        ))),
+    }
 }
 
 fn read_pg_metadata_proof(
@@ -1239,16 +1288,6 @@ impl<'a> PayloadReader<'a> {
         ]))
     }
 
-    fn read_bool(&mut self) -> Result<bool, ControlPlaneError> {
-        match self.read_u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            value => Err(command_protocol_error(format!(
-                "invalid boolean value {value}"
-            ))),
-        }
-    }
-
     fn read_option_u64(&mut self) -> Result<Option<u64>, ControlPlaneError> {
         match self.read_u8()? {
             0 => Ok(None),
@@ -1343,12 +1382,17 @@ mod tests {
                     cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
                         oldest_live_placement_epoch: Some(ClusterEpoch::new(12).unwrap()),
                         oldest_durable_backfill_epoch: Some(ClusterEpoch::new(10).unwrap()),
+                        oldest_pending_metadata_command_epoch: Some(ClusterEpoch::new(11).unwrap()),
                     },
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(3),
                         state: PgState::Peering,
                         metadata_proof: proof,
-                        has_pending_metadata_command: true,
+                        pending_metadata_command: Some(PendingMetadataCommandObservation::new(
+                            ClusterEpoch::new(13).unwrap(),
+                            NonZeroU64::new(7).unwrap(),
+                            0xfeed,
+                        )),
                     }],
                 },
                 heartbeat_at_ms: 1_000,
@@ -1624,8 +1668,9 @@ mod tests {
         });
         assert_decode_error_contains(&invalid_pg_state, "invalid PG state code 99");
 
-        let invalid_bool = command_frame(4, |body| {
+        let invalid_pending_presence = command_frame(4, |body| {
             write_minimal_heartbeat_prefix(body);
+            write_u8(body, 0);
             write_u8(body, 0);
             write_u8(body, 0);
             write_u32(body, 1);
@@ -1641,7 +1686,10 @@ mod tests {
             );
             write_u8(body, 2);
         });
-        assert_decode_error_contains(&invalid_bool, "invalid boolean value 2");
+        assert_decode_error_contains(
+            &invalid_pending_presence,
+            "invalid pending metadata command presence code 2",
+        );
 
         let invalid_option = command_frame(4, |body| {
             write_minimal_heartbeat_prefix(body);

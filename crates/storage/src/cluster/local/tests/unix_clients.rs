@@ -559,6 +559,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
             acting_set: node_ids.to_vec(),
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
@@ -751,6 +752,7 @@ fn frontend_unix_shard_mode_uses_storage_node_owned_data_dir() {
             acting_set: node_ids.to_vec(),
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
@@ -820,6 +822,7 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
@@ -926,6 +929,7 @@ fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
                 acting_set: node_ids.to_vec(),
             }],
 
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
@@ -998,6 +1002,7 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
@@ -1092,6 +1097,7 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
@@ -1272,6 +1278,7 @@ fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     })
     .unwrap();
@@ -1342,6 +1349,7 @@ fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
@@ -1476,6 +1484,7 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let bucket = crate::tests::bucket_name("remote-stream-scavenge");
@@ -1590,6 +1599,7 @@ fn frontend_unix_cluster_map_history_reference_summary_reads_storage_node_owned_
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     {
@@ -1714,6 +1724,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
             },
         ],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let topology = crate::PgTopology::new(&server_config.pg_ids).unwrap();
@@ -1798,6 +1809,7 @@ fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let bucket = crate::tests::bucket_name("remote-bucket-metadata-read");
@@ -1989,6 +2001,7 @@ fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
@@ -2085,6 +2098,7 @@ fn frontend_unix_object_version_mode_reserves_on_storage_node() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
@@ -2170,6 +2184,7 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let bucket = crate::tests::bucket_name("remote-bucket-write-reservation");
@@ -2349,6 +2364,7 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let source_bucket = crate::tests::bucket_name("remote-pair-source");
@@ -2507,6 +2523,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
@@ -2601,6 +2618,7 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
@@ -2733,6 +2751,7 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
             acting_set: vec![node_id],
         }],
 
+        pending_metadata_command_recoveries: Vec::new(),
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
@@ -3276,6 +3295,7 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
                 acting_set: node_ids.to_vec(),
             }],
 
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
@@ -3406,6 +3426,7 @@ fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes,
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
@@ -3758,6 +3779,7 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -4143,6 +4165,7 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -4501,6 +4524,7 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -4798,6 +4822,7 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -5098,6 +5123,7 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -5423,6 +5449,7 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -5754,6 +5781,7 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -6167,6 +6195,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -6610,6 +6639,7 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -7083,6 +7113,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: current_pg_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: historical_pg_routes.clone(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
@@ -7347,6 +7378,7 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes,
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
@@ -7550,6 +7582,7 @@ fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes,
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
@@ -7738,6 +7771,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes,
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
@@ -8009,6 +8043,7 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes,
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
@@ -8298,6 +8333,7 @@ fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutat
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes,
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
@@ -8458,6 +8494,7 @@ fn non_current_epoch_unix_object_metadata_update_fails_closed_without_remote_mut
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes,
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
@@ -8614,6 +8651,7 @@ fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes,
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
@@ -8765,6 +8803,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
                 acting_set: node_ids.to_vec(),
             }],
 
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: vec![StorageNodePgRoute {
                 pg_id: historical_route.pg_id().get(),
                 cluster_epoch: historical_route.cluster_epoch(),
@@ -8859,6 +8898,7 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
             pg_ids: pg_ids.to_vec(),
             socket_path: socket_path.clone(),
             pg_routes: vec![StorageNodePgRoute::from(&old_route)],
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
@@ -9000,6 +9040,7 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
                 acting_set: node_ids.to_vec(),
             }],
 
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
@@ -9147,6 +9188,7 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
                 acting_set: node_ids.to_vec(),
             }],
 
+            pending_metadata_command_recoveries: Vec::new(),
             historical_pg_routes: Vec::new(),
         });
         shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));

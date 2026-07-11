@@ -1,4 +1,292 @@
 use super::*;
+use crate::control_plane::{
+    ControlPlaneError, ControlPlaneRuntimeMapSource, PendingMetadataCommandObservation,
+    PendingMetadataCommandRecovery, PendingMetadataCommandRecoveryListing,
+    PendingMetadataCommandRecoveryTask,
+};
+use crate::StorageClusterRuntimeMapHandle;
+
+struct UnrelatedFullMapFailureSource<S> {
+    authority: crate::control_plane::SingleAuthorityControlPlane<S>,
+    tasks: Vec<PendingMetadataCommandRecoveryTask>,
+}
+
+impl<S: crate::control_plane::ControlPlaneStore> ControlPlaneRuntimeMapSource
+    for UnrelatedFullMapFailureSource<S>
+{
+    fn runtime_map_snapshot(
+        &self,
+        _authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        Err(ControlPlaneError::PgHasNoServingPrimary {
+            pg_id: 999,
+            cluster_epoch: self.authority.snapshot().cluster_epoch(),
+        })
+    }
+
+    fn pending_metadata_command_recoveries(
+        &self,
+        _authority_now_ms: u64,
+    ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+        Ok(PendingMetadataCommandRecoveryListing::new(
+            self.tasks.clone(),
+            Vec::new(),
+        ))
+    }
+
+    fn pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.authority
+            .pg_runtime_map_snapshot(pg_id, authority_now_ms)
+    }
+}
+
+#[test]
+fn route_independent_listing_recovers_later_real_authority_task_after_earlier_failure() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "old-epoch-zero-apply-");
+    let pg_id = PgId::new(1);
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let handle = StorageClusterRuntimeMapHandle::new(cluster);
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            node_ids
+                .into_iter()
+                .map(|node_id| {
+                    (
+                        node_id,
+                        format!("/tmp/real-authority-node-{}.sock", node_id.as_u32()),
+                    )
+                })
+                .collect(),
+            vec![pg_id],
+        )
+        .unwrap();
+    for (node_id, now_ms) in node_ids.into_iter().zip([990, 991, 992]) {
+        heartbeat_authority_with_pending(&mut authority, &map, node_id, pg_id, None, now_ms);
+    }
+    for (node_id, now_ms) in node_ids.into_iter().zip([1_000, 1_001, 1_002]) {
+        heartbeat_authority_with_pending(&mut authority, &map, node_id, pg_id, None, now_ms);
+    }
+    let primary_incarnation = authority
+        .snapshot()
+        .node(NodeId::new(0))
+        .unwrap()
+        .node_incarnation();
+    authority
+        .complete_pg_peering(pg_id, NodeId::new(0), primary_incarnation, 1_003)
+        .unwrap();
+    let active_epoch = authority.snapshot().cluster_epoch();
+    let command = create_bucket_metadata_command_at_epoch(active_epoch, pg_id, 1, bucket.clone());
+    let pending = PendingMetadataCommandObservation::new(
+        active_epoch,
+        std::num::NonZeroU64::MIN,
+        command.checksum_crc64(),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    authority.set_pg_state(pg_id, PgState::Peering).unwrap();
+    for (node_id, now_ms) in node_ids.into_iter().zip([1_010, 1_011, 1_012]) {
+        heartbeat_authority_with_pending(
+            &mut authority,
+            &map,
+            node_id,
+            pg_id,
+            (node_id == NodeId::new(0)).then_some(pending),
+            now_ms,
+        );
+    }
+    let runtime_map =
+        crate::control_plane::ControlPlaneRuntimeMapSource::runtime_map_snapshot(&authority, 1_020)
+            .unwrap();
+    assert_eq!(
+        runtime_map.pg_routes()[0]
+            .pending_metadata_command_recovery()
+            .unwrap()
+            .pending(),
+        pending
+    );
+    for node_id in node_ids {
+        let node_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(
+                1_020,
+                node_id,
+                authority.snapshot().cluster_epoch(),
+            )
+            .unwrap();
+        assert!(node_map.historical_pg_routes().iter().any(|route| {
+            route.pg_id() == pg_id
+                && route.cluster_epoch() == active_epoch
+                && route.state() == PgState::Active
+        }));
+        assert_eq!(
+            node_map.pg_routes()[0]
+                .pending_metadata_command_recovery()
+                .unwrap()
+                .pending(),
+            pending,
+            "node {} did not receive the acting-set-wide recovery authorization",
+            node_id.as_u32()
+        );
+    }
+
+    let stale_task = authority
+        .snapshot()
+        .pending_metadata_command_recoveries()
+        .tasks()
+        .iter()
+        .copied()
+        .next()
+        .unwrap();
+    heartbeat_authority_with_pending(&mut authority, &map, NodeId::new(0), pg_id, None, 1_021);
+    let stale_recovery = stale_task.recovery();
+    let error = handle
+        .recover_reported_pending_metadata_command(
+            &authority,
+            1_022,
+            None,
+            stale_task.pg_id(),
+            stale_recovery.reporting_node_id(),
+            stale_recovery.pending(),
+        )
+        .expect_err("fresh PG map must reject stale listed recovery authorization");
+    assert!(
+        error.to_string().contains("authorization changed"),
+        "unexpected stale authorization error: {error}"
+    );
+    assert!(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .pending_metadata_command_envelope(NodeId::new(0).as_u32(), active_epoch)
+            .unwrap()
+            .is_some(),
+        "stale listed authorization must not mutate the pending slot"
+    );
+    heartbeat_authority_with_pending(
+        &mut authority,
+        &map,
+        NodeId::new(0),
+        pg_id,
+        Some(pending),
+        1_023,
+    );
+    let real_task = authority
+        .snapshot()
+        .pending_metadata_command_recoveries()
+        .tasks()
+        .iter()
+        .copied()
+        .next()
+        .unwrap();
+    let refreshed_pg_map = authority.pg_runtime_map_snapshot(pg_id, 1_024).unwrap();
+    assert_eq!(
+        refreshed_pg_map.pg_routes()[0].pending_metadata_command_recovery(),
+        Some(real_task.recovery()),
+        "fresh PG map must carry the restored exact recovery authorization"
+    );
+    let unavailable_first_task = PendingMetadataCommandRecoveryTask::new(
+        PgId::new(0),
+        PendingMetadataCommandRecovery::new(NodeId::new(0), pending),
+    );
+    let source = UnrelatedFullMapFailureSource {
+        authority,
+        tasks: vec![unavailable_first_task, real_task],
+    };
+
+    let refresh_loop = handle
+        .spawn_control_plane_refresh_loop(source, Duration::from_millis(1), || 1_020)
+        .unwrap();
+    let pending_on_old_primary = || {
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .pending_metadata_command_envelope(NodeId::new(0).as_u32(), active_epoch)
+            .unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pending_on_old_primary().is_some() || refresh_loop.status().failures == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "background runtime-map refresh did not converge old-epoch pending command: {:?}",
+            refresh_loop.status()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(refresh_loop.status().failures > 0);
+    drop(refresh_loop);
+
+    assert!(pending_on_old_primary().is_none());
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
+        assert_eq!(pg.max_metadata_command_log_index(active_epoch).unwrap(), 1);
+    }
+}
+
+fn heartbeat_authority_with_pending<S: crate::control_plane::ControlPlaneStore>(
+    authority: &mut crate::control_plane::SingleAuthorityControlPlane<S>,
+    map: &Arc<LocalClusterMap>,
+    node_id: NodeId,
+    pg_id: PgId,
+    pending_metadata_command: Option<PendingMetadataCommandObservation>,
+    now_ms: u64,
+) {
+    let state = map
+        .node(node_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .metadata_command_replica_state()
+        .unwrap();
+    let record = authority.snapshot().node(node_id).unwrap();
+    authority
+        .heartbeat(
+            crate::control_plane::NodeHeartbeat {
+                node_id,
+                node_incarnation: record.node_incarnation().max(1),
+                endpoint: record.endpoint().to_owned(),
+                observed_epoch: authority.snapshot().cluster_epoch(),
+                requested_lease_duration_ms: 10_000,
+                cluster_map_history_reference_summary:
+                    crate::PgClusterMapHistoryReferenceSummary::default(),
+                pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
+                    pg_id,
+                    state: PgState::Peering,
+                    metadata_proof: crate::control_plane::PgMetadataProof {
+                        applied_log_index: state.applied_log_index,
+                        applied_log_hash: state.applied_log_hash,
+                        state_digest: state.state_digest,
+                    },
+                    pending_metadata_command,
+                }],
+            },
+            now_ms,
+        )
+        .unwrap();
+}
 
 #[test]
 fn metadata_command_recovery_single_flight_waits_for_matching_command() {
@@ -5568,7 +5856,7 @@ fn heartbeat_authority_with_local_pg_proof<S: crate::control_plane::ControlPlane
                 applied_log_hash: state.applied_log_hash,
                 state_digest: state.state_digest,
             },
-            has_pending_metadata_command: false,
+            pending_metadata_command: None,
         }],
     };
     authority.heartbeat(heartbeat, now_ms).unwrap();

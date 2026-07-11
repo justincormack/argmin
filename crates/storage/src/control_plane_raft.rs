@@ -14971,6 +14971,7 @@ mod tests {
                             PgClusterMapHistoryReferenceSummary {
                                 oldest_live_placement_epoch: None,
                                 oldest_durable_backfill_epoch: None,
+                                oldest_pending_metadata_command_epoch: None,
                             },
                         pg_observations: Vec::new(),
                     },

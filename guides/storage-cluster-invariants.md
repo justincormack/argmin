@@ -162,13 +162,12 @@ Metadata mutations recheck route expiry after acquiring the per-PG lock.
 Visible metadata command application additionally checks its request-bound
 route fence inside the SQLite transaction immediately before commit. A current
 command uses the installed map validity. A historical Active command requires
-an explicit recovery permit created when this process drains and replaces that
-exact current Active route with a retained historical route; retained topology
-alone grants no mutation authority. The permit is keyed by route epoch and PG,
-bound to the exact primary/acting-set shape, expires with the old map, and is
-not reconstructed from persisted historical topology after restart. The
-route-admission permit means a newer runtime config cannot publish between the
-check and commit; expiry or guard failure rolls the transaction back,
+the current Peering runtime map to authorize its exact PG, command epoch, log
+index, and checksum; retained topology alone grants no mutation authority.
+That authorization is bounded by the current map's process-bound monotonic
+lease and disappears when the authority no longer reports the pending command.
+The route-admission permit means a newer runtime config cannot publish between
+the check and commit; expiry or guard failure rolls the transaction back,
 including command-log, pending, and materialized metadata changes.
 
 The control plane independently fences successor activation. Whenever a PG

@@ -106,6 +106,7 @@ FROM stream_uploads";
 pub struct PgClusterMapHistoryReferenceSummary {
     pub oldest_live_placement_epoch: Option<ClusterEpoch>,
     pub oldest_durable_backfill_epoch: Option<ClusterEpoch>,
+    pub oldest_pending_metadata_command_epoch: Option<ClusterEpoch>,
 }
 
 impl PgClusterMapHistoryReferenceSummary {
@@ -114,6 +115,7 @@ impl PgClusterMapHistoryReferenceSummary {
         [
             self.oldest_live_placement_epoch,
             self.oldest_durable_backfill_epoch,
+            self.oldest_pending_metadata_command_epoch,
         ]
         .into_iter()
         .flatten()
@@ -128,6 +130,10 @@ impl PgClusterMapHistoryReferenceSummary {
         self.oldest_durable_backfill_epoch = min_optional_epoch(
             self.oldest_durable_backfill_epoch,
             other.oldest_durable_backfill_epoch,
+        );
+        self.oldest_pending_metadata_command_epoch = min_optional_epoch(
+            self.oldest_pending_metadata_command_epoch,
+            other.oldest_pending_metadata_command_epoch,
         );
     }
 }
@@ -541,6 +547,7 @@ impl PgStore {
         Ok(PgClusterMapHistoryReferenceSummary {
             oldest_live_placement_epoch: self.oldest_live_payload_placement_epoch()?,
             oldest_durable_backfill_epoch: self.oldest_durable_backfill_epoch()?,
+            oldest_pending_metadata_command_epoch: self.oldest_pending_metadata_command_epoch()?,
         })
     }
 
@@ -571,6 +578,16 @@ impl PgStore {
             |row| row.get::<_, Option<i64>>(0),
         )?;
         parse_optional_cluster_epoch(raw_epoch, "oldest durable backfill epoch")
+    }
+
+    fn oldest_pending_metadata_command_epoch(&self) -> Result<Option<ClusterEpoch>, StoreError> {
+        let raw_epoch = self.query_row_cached(
+            "SELECT MIN(cluster_epoch) FROM metadata_command_pending_slot",
+            [],
+            "compute oldest pending metadata command epoch",
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        parse_optional_cluster_epoch(raw_epoch, "oldest pending metadata command epoch")
     }
 
     fn query_row_cached<T, P, F>(

@@ -10976,12 +10976,49 @@ Phase 12.4 progress:
   response deadline and prevent terminal pending-command cleanup or cross-PG
   LIST fanout from being dispatched. Runtime configs are now written to a
   staged temp file while the old route remains admitted; the gate covers only
-  atomic rename, recovery permit publication, and the in-memory config swap.
+  atomic rename and the in-memory config swap.
   Structurally identical same-epoch heartbeat maps that only extend bounded
   validity publish without draining frames; deadline shrink and any
   topology/history change retain the full fence. Deterministic tests prove
   staging and lease-only refresh remain non-blocking while real publication
   still drains old frames.
+  A later repeat-100 route-change-restart soak exposed a separate convergence
+  cycle: an old primary retained an epoch-824 pending metadata command while
+  the PG had moved to Peering at a later epoch. Heartbeat correctly refused to
+  publish the PG as converged, but frontend recovery scanned only the current
+  map, so it could not reach the old primary through the command's historical
+  acting set. The heartbeat contract now reports the pending command's typed
+  epoch, log index, and checksum rather than a boolean. Pending command epochs
+  are included in each storage node's durable cluster-map history reference
+  floor, and the control plane retains the required history while the slot
+  exists. A dedicated authoritative recovery listing exposes exact typed tasks
+  `(PG, reporting primary, command epoch, log index, checksum)` without
+  constructing the full serving map, so an unrelated unavailable PG cannot
+  block discovery. Each task then fetches its own PG-scoped authoritative map
+  before recovery and must find the exact listed authorization again before
+  mutation. A task that becomes stale between listing and this second read is
+  rejected. Discovery validation failures are typed per PG and returned beside
+  valid tasks, so one invalid observation cannot starve independent recovery.
+  Peering runtime maps carry the same exact authorization for storage-node
+  admission; discovery does not depend on either full-map success or
+  runtime-map generation failing.
+  Storage-node refresh sends that authorization and the exact historical Active
+  route to every node, including historical acting-set replicas that do not own
+  the pending slot. The authorization is bounded by the current runtime-map
+  validity and is removed when the observation clears; it replaces the expired
+  route-transition permit and authorizes only the named command. The frontend
+  reconstructs the exact command epoch, verifies that the reporting node was
+  that route's Active primary and that the durable command identity still
+  matches, then runs the existing zero/partial/full-apply convergence algorithm
+  over the historical acting set. Heartbeat remains observation-only: it does
+  not clear or apply the slot. A real single-authority background refresh-loop
+  regression proves an old-epoch zero-apply command is discovered while an
+  unrelated full-map read fails, converges without a client operation, and
+  leaves every old acting-set replica at the same terminal log state. Recovery
+  attempts are independent: a failed earlier PG does not block a later task in
+  the same listing. Unix RPC tests
+  prove exact authorization works after the original route deadline and that
+  unlisted historical commands remain rejected.
   CL1 is closed by the paired control-plane fence; RPC4's cross-epoch physical
   shard alias remains separate work.
 

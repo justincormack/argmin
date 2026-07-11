@@ -1655,6 +1655,28 @@ impl LocalClusterMap {
         Ok(local_map)
     }
 
+    pub(crate) fn open_runtime_map_with_existing_local_nodes(
+        current: &Self,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<Self, ClusterBuildError> {
+        let mut local_map = Self::open_frontend_topology_only_with_runtime_map(
+            current.metadata_primary_node_id,
+            runtime_map,
+            current.default_ec_shape,
+        )?;
+        let current_node_ids = current.nodes.keys().copied().collect::<Vec<_>>();
+        let candidate_node_ids = local_map.nodes.keys().copied().collect::<Vec<_>>();
+        if current_node_ids != candidate_node_ids {
+            return Err(ClusterBuildError::HistoricalRecoveryNodeSetMismatch {
+                current: current_node_ids.into_iter().map(NodeId::as_u32).collect(),
+                candidate: candidate_node_ids.into_iter().map(NodeId::as_u32).collect(),
+            });
+        }
+        local_map.nodes.clone_from(&current.nodes);
+        local_map.inherit_process_local_state_from(current);
+        Ok(local_map)
+    }
+
     pub(crate) fn inherit_process_local_state_from(&mut self, previous: &Self) {
         self.runtime_state = Arc::clone(&previous.runtime_state);
         self.process_local_registry_key = previous.process_local_registry_key;

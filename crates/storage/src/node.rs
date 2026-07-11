@@ -3,6 +3,7 @@ use ec::{EcConfig, ErasureCodec};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Read;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
@@ -15,7 +16,9 @@ use s3_types::VersionId;
 #[cfg(test)]
 use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId};
 
-use crate::control_plane::{NodeHeartbeat, NodePgHeartbeatObservation, PgMetadataProof};
+use crate::control_plane::{
+    NodeHeartbeat, NodePgHeartbeatObservation, PendingMetadataCommandObservation, PgMetadataProof,
+};
 use crate::data_dir::prepare_private_data_dir;
 #[cfg(test)]
 use crate::error::BucketWriteDrainError;
@@ -1195,7 +1198,14 @@ impl SharedStorageNode {
         // before apply/record advances durable replica state, and terminal
         // same-epoch slots are also command/recovery cleanup work, not
         // heartbeat work.
-        let has_pending_metadata_command = pending_slot.is_some();
+        let pending_metadata_command = pending_slot.map(|slot| {
+            PendingMetadataCommandObservation::new(
+                slot.id.cluster_epoch(),
+                NonZeroU64::new(slot.id.log_index().get())
+                    .expect("pending metadata command log index is nonzero"),
+                slot.command_checksum,
+            )
+        });
         Ok(NodePgHeartbeatObservation {
             pg_id,
             state,
@@ -1204,7 +1214,7 @@ impl SharedStorageNode {
                 applied_log_hash: metadata_state.applied_log_hash,
                 state_digest: metadata_state.state_digest,
             },
-            has_pending_metadata_command,
+            pending_metadata_command,
         })
     }
 
@@ -1954,7 +1964,7 @@ mod tests {
             observation.metadata_proof.state_digest,
             metadata_state.state_digest
         );
-        assert!(!observation.has_pending_metadata_command);
+        assert!(!observation.has_pending_metadata_command());
     }
 
     #[test]
@@ -1996,7 +2006,7 @@ mod tests {
             .pg_heartbeat_observation(NodeId::new(7), PgId::new(0), PgState::Peering)
             .unwrap();
 
-        assert!(observation.has_pending_metadata_command);
+        assert!(observation.has_pending_metadata_command());
     }
 
     #[test]
@@ -2048,7 +2058,7 @@ mod tests {
             observation.metadata_proof.applied_log_index,
             metadata_state.applied_log_index
         );
-        assert!(observation.has_pending_metadata_command);
+        assert!(observation.has_pending_metadata_command());
         let pg = node.get_pg(0).unwrap();
         let slot = pg
             .pending_metadata_command_slot_any_epoch(7)
@@ -2103,7 +2113,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(observation.metadata_proof.applied_log_index, 1);
-        assert!(observation.has_pending_metadata_command);
+        assert!(observation.has_pending_metadata_command());
         let pg = node.get_pg(0).unwrap();
         let slot = pg
             .pending_metadata_command_slot(7, ClusterEpoch::INITIAL)

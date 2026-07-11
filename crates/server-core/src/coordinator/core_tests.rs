@@ -456,6 +456,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
             socket_path: socket_path.clone(),
             pg_routes: vec![StorageNodePgRoute::from(&desired_route)],
             historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
         })
         .unwrap();
         let server = Arc::new(StorageNodeServer::bind(server_config).unwrap());
@@ -3949,6 +3950,7 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_rea
                 .iter()
                 .map(StorageNodePgRoute::from)
                 .collect(),
+            pending_metadata_command_recoveries: Vec::new(),
         })
         .unwrap();
         let server = Arc::new(StorageNodeServer::bind(server_config).unwrap());
