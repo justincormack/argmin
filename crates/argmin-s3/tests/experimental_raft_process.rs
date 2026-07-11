@@ -467,10 +467,19 @@ fn run_authority_clock_admin_with_extra_env(
         .expect("authority-clock admin helper should run")
 }
 
-fn run_trigger_raft_snapshot_purge(bin: &Path, socket_path: &Path) -> Output {
-    Command::new(bin)
+fn run_trigger_raft_snapshot_purge_with_extra_env(
+    bin: &Path,
+    socket_path: &Path,
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let mut command = Command::new(bin);
+    command
         .arg("control-plane-trigger-raft-snapshot-purge")
-        .arg(socket_path)
+        .arg(socket_path);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command
         .output()
         .expect("trigger Raft snapshot purge helper should run")
 }
@@ -2198,11 +2207,59 @@ fn experimental_raft_restarted_process_follower_catches_up_from_leader_snapshot(
             .as_nanos()
     );
     let raft_node_ids = [101, 102, 103];
-    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    let auth = ProcessTestControlPlaneAuth::new(&cluster_name);
+    let admin_instance_id = "snapshot-catchup-admin";
+    let admin_credentials = auth.admin_credentials_env(&[admin_instance_id]);
+    let server_auth_env = [
+        (
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            cluster_name.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+            admin_credentials.as_str(),
+        ),
+    ];
+    let admin_helper_auth_env = [
+        (
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            cluster_name.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID",
+            admin_instance_id,
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+            admin_credentials.as_str(),
+        ),
+    ];
+    let mut node102 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        102,
+        &raft_node_ids,
+        &server_auth_env,
+    );
     wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
-    let mut node103 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    let mut node103 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        103,
+        &raft_node_ids,
+        &server_auth_env,
+    );
     wait_for_socket_file(&peer_socket(test_dir.path(), 103), &mut node103);
-    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+    let mut node101 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        101,
+        &raft_node_ids,
+        &server_auth_env,
+    );
     let leader_control_socket = control_socket(test_dir.path(), 101);
 
     wait_for_runtime_map_ready_on(
@@ -2217,7 +2274,13 @@ fn experimental_raft_restarted_process_follower_catches_up_from_leader_snapshot(
     );
 
     node103.stop();
-    let snapshot_covered_write = run_set_pg_acting_set_live(&bin, &leader_control_socket, 0, &[1]);
+    let snapshot_covered_write = run_set_pg_acting_set_live_with_extra_env(
+        &bin,
+        &leader_control_socket,
+        0,
+        &[1],
+        &admin_helper_auth_env,
+    );
     assert!(
         snapshot_covered_write.status.success(),
         "snapshot-covered acting-set change failed: {}\n{}",
@@ -2231,7 +2294,11 @@ fn experimental_raft_restarted_process_follower_catches_up_from_leader_snapshot(
         &mut [&mut node101, &mut node102],
     );
 
-    let snapshot_purge = run_trigger_raft_snapshot_purge(&bin, &leader_control_socket);
+    let snapshot_purge = run_trigger_raft_snapshot_purge_with_extra_env(
+        &bin,
+        &leader_control_socket,
+        &admin_helper_auth_env,
+    );
     assert!(
         snapshot_purge.status.success(),
         "snapshot purge failed: {}\n{}",
@@ -2243,11 +2310,36 @@ fn experimental_raft_restarted_process_follower_catches_up_from_leader_snapshot(
         .parse()
         .expect("snapshot purge helper should report a snapshot index");
 
-    let mut restarted103 =
-        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    let mut restarted103 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        103,
+        &raft_node_ids,
+        &server_auth_env,
+    );
     wait_for_socket_file(&peer_socket(test_dir.path(), 103), &mut restarted103);
 
-    let suffix_write = run_set_pg_acting_set_live(&bin, &leader_control_socket, 0, &[0]);
+    let clock_recovery = run_authority_clock_admin_with_extra_env(
+        &bin,
+        &leader_control_socket,
+        "control-plane-reestablish-authority-clock",
+        &admin_helper_auth_env,
+    );
+    assert!(
+        clock_recovery.status.success(),
+        "leader clock re-establishment failed: {}\n{}",
+        format_admin_failure(clock_recovery.status, &clock_recovery),
+        process_logs(test_dir.path())
+    );
+
+    let suffix_write = run_set_pg_acting_set_live_with_extra_env(
+        &bin,
+        &leader_control_socket,
+        0,
+        &[0],
+        &admin_helper_auth_env,
+    );
     assert!(
         suffix_write.status.success(),
         "post-snapshot suffix acting-set change failed: {}\n{}",

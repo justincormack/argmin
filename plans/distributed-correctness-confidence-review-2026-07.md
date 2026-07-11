@@ -306,6 +306,15 @@ wall/monotonic steps, suspend, restart, delayed maps, and successor overlap.
 Multi-VM independent-host clock-step testing remains part of the pre-release
 evidence program rather than an unimplemented DCC-2 recovery mechanism.
 
+Soak follow-up (2026-07-11): high-RPC-load physical-host runs repeatedly
+latched apparent 1,017-1,145 ms wall regressions. The authority had sampled
+wall time before `CLOCK_BOOTTIME`, so a scheduler pause between those reads was
+indistinguishable from a backward wall step. Authority sampling now brackets
+wall time with health-clock reads, retries until both health reads occupy one
+millisecond, and treats a persistently wide window as a transient admission
+failure without latching or changing clock generation. This retains the exact
+1,000 ms skew budget rather than increasing it to accommodate scheduler load.
+
 Required design:
 
 1. Write and enforce the invariant

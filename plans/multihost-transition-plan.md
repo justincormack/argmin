@@ -11041,6 +11041,11 @@ Phase 12.4 progress:
   the first request to observe the blocked term fence, performs authenticated
   recovery, resumes runtime-map service, removes the old leader, and continues
   serving.
+  Physical-host soak follow-up found that separately reading wall time before
+  `CLOCK_BOOTTIME` could classify a scheduler pause between the reads as clock
+  regression. Authority sampling now brackets wall time with health-clock
+  reads, retries wide windows, and defers persistently imprecise samples
+  without latching. Accepted reads add no uncertainty to the 1,000 ms budget.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

@@ -1,6 +1,45 @@
 use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const CLOCK_HEALTH_SAMPLE_MAX_WINDOW_MS: u64 = 0;
+const CLOCK_HEALTH_SAMPLE_ATTEMPTS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WallClockHealthSample {
+    wall_time_ms: u64,
+    health_time_ms: Option<u64>,
+}
+
+impl WallClockHealthSample {
+    #[must_use]
+    pub(crate) fn wall_time_ms(self) -> u64 {
+        self.wall_time_ms
+    }
+
+    #[must_use]
+    pub(crate) fn health_time_ms(self) -> Option<u64> {
+        self.health_time_ms
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WallClockHealthSampleWindowTooWide {
+    narrowest_window_ms: u64,
+    max_window_ms: u64,
+}
+
+impl WallClockHealthSampleWindowTooWide {
+    #[must_use]
+    pub(crate) fn narrowest_window_ms(self) -> u64 {
+        self.narrowest_window_ms
+    }
+
+    #[must_use]
+    pub(crate) fn max_window_ms(self) -> u64 {
+        self.max_window_ms
+    }
+}
+
 thread_local! {
     static TIME_OVERRIDE_MILLIS: Cell<Option<u64>> = const { Cell::new(None) };
 }
@@ -81,6 +120,51 @@ pub fn clock_health_time_millis() -> Option<u64> {
         return Some(now_millis);
     }
     clock_health_time_millis_inner()
+}
+
+/// Sample wall and health clocks without mistaking scheduler delay for drift.
+pub(crate) fn wall_clock_health_sample(
+) -> Result<WallClockHealthSample, WallClockHealthSampleWindowTooWide> {
+    wall_clock_health_sample_with(current_time_millis, clock_health_time_millis)
+}
+
+fn wall_clock_health_sample_with(
+    mut wall_time: impl FnMut() -> u64,
+    mut health_time: impl FnMut() -> Option<u64>,
+) -> Result<WallClockHealthSample, WallClockHealthSampleWindowTooWide> {
+    let mut narrowest_window_ms = u64::MAX;
+    for _ in 0..CLOCK_HEALTH_SAMPLE_ATTEMPTS {
+        let Some(health_before_ms) = health_time() else {
+            return Ok(WallClockHealthSample {
+                wall_time_ms: wall_time(),
+                health_time_ms: None,
+            });
+        };
+        let wall_time_ms = wall_time();
+        let Some(health_after_ms) = health_time() else {
+            return Ok(WallClockHealthSample {
+                wall_time_ms,
+                health_time_ms: None,
+            });
+        };
+        let Some(window_ms) = health_after_ms.checked_sub(health_before_ms) else {
+            return Ok(WallClockHealthSample {
+                wall_time_ms,
+                health_time_ms: None,
+            });
+        };
+        if window_ms == CLOCK_HEALTH_SAMPLE_MAX_WINDOW_MS {
+            return Ok(WallClockHealthSample {
+                wall_time_ms,
+                health_time_ms: Some(health_before_ms + window_ms / 2),
+            });
+        }
+        narrowest_window_ms = narrowest_window_ms.min(window_ms);
+    }
+    Err(WallClockHealthSampleWindowTooWide {
+        narrowest_window_ms,
+        max_window_ms: CLOCK_HEALTH_SAMPLE_MAX_WINDOW_MS,
+    })
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "openbsd"))]
@@ -165,7 +249,51 @@ fn clock_health_time_millis_inner() -> Option<u64> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{clock_health_time_millis_inner, lease_time_millis};
+    use std::cell::Cell;
+
+    use super::{
+        clock_health_time_millis_inner, lease_time_millis, wall_clock_health_sample_with,
+        CLOCK_HEALTH_SAMPLE_ATTEMPTS,
+    };
+
+    #[test]
+    fn wall_clock_health_sample_retries_scheduler_delay() {
+        let mut walls = [1_000, 2_001].into_iter();
+        let mut health = [0, 1_001, 2_000, 2_000].into_iter();
+
+        let sample = wall_clock_health_sample_with(
+            || walls.next().expect("each sampling attempt needs wall time"),
+            || {
+                Some(
+                    health
+                        .next()
+                        .expect("each sampling attempt needs two health times"),
+                )
+            },
+        )
+        .expect("the narrow retry should be accepted");
+
+        assert_eq!(sample.wall_time_ms(), 2_001);
+        assert_eq!(sample.health_time_ms(), Some(2_000));
+    }
+
+    #[test]
+    fn wall_clock_health_sample_rejects_persistently_wide_windows() {
+        let health = Cell::new(0u64);
+        let error = wall_clock_health_sample_with(
+            || 1_000,
+            || {
+                let value = health.get();
+                health.set(value + 20);
+                Some(value)
+            },
+        )
+        .expect_err("every sample window should exceed the precision bound");
+
+        assert_eq!(health.get(), 2 * 20 * CLOCK_HEALTH_SAMPLE_ATTEMPTS as u64);
+        assert_eq!(error.narrowest_window_ms(), 20);
+        assert_eq!(error.max_window_ms(), 0);
+    }
 
     #[test]
     fn platform_lease_clock_is_available_and_monotonic() {

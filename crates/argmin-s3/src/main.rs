@@ -1591,10 +1591,8 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to bootstrap control-plane state: {error}");
         std::process::exit(1);
     });
-    let authority_clock = ControlPlaneAuthorityClock::new(
+    let authority_clock = ControlPlaneAuthorityClock::new_from_process_clock(
         authority.snapshot().max_committed_timestamp_ms(),
-        storage::clock::current_time_millis(),
-        storage::clock::clock_health_time_millis(),
     )
     .unwrap_or_else(|error| {
         eprintln!("failed to initialize control-plane authority clock: {error}");
@@ -1642,7 +1640,6 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 }
             }
         }
-        let wall_ms = storage::clock::current_time_millis();
         let expiry = {
             let mut authority = authority
                 .lock()
@@ -1650,7 +1647,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
             authority_clock
                 .lock()
                 .expect("control-plane authority clock mutex poisoned")
-                .effective_now_ms(wall_ms, storage::clock::clock_health_time_millis())
+                .effective_process_now_ms()
                 .and_then(|effective_now_ms| authority.expire_heartbeat_leases(effective_now_ms))
         };
         match expiry {
@@ -1663,6 +1660,11 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 );
             }
             Ok(_) => {}
+            Err(error @ ControlPlaneError::AuthorityClockSampleWindowTooWide { .. }) => {
+                eprintln!(
+                    "control-plane lease expiry deferred because a coherent clock sample was unavailable: {error}"
+                );
+            }
             Err(error) if control_plane_lease_expiry_error_is_clock_wait(&error) => {
                 eprintln!(
                     "control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
@@ -1734,7 +1736,6 @@ impl ExperimentalRaftControlPlane {
         if !self.resample_authority_time {
             return Ok(supplied_now_ms);
         }
-        let wall_ms = storage::clock::current_time_millis();
         let status = self.block_on(self.authority.status())?;
         if !status.local_leader() {
             return Err(ControlPlaneError::RpcRemote {
@@ -1753,7 +1754,7 @@ impl ExperimentalRaftControlPlane {
             message: "local OpenRaft leader has no current term".to_string(),
         })?;
         authority_clock.validate_raft_leadership_term(current_term)?;
-        authority_clock.effective_now_ms(wall_ms, storage::clock::clock_health_time_millis())
+        authority_clock.effective_process_now_ms()
     }
 
     fn durable_poison_error(&self) -> Option<ControlPlaneError> {
@@ -2938,10 +2939,8 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             eprintln!("failed to read experimental OpenRaft leadership state: {error}");
             std::process::exit(1);
         });
-    let mut initial_authority_clock = ControlPlaneAuthorityClock::new(
+    let mut initial_authority_clock = ControlPlaneAuthorityClock::new_from_process_clock(
         initial_clock_snapshot.max_committed_timestamp_ms(),
-        storage::clock::current_time_millis(),
-        storage::clock::clock_health_time_millis(),
     )
     .unwrap_or_else(|error| {
         eprintln!("failed to initialize experimental OpenRaft authority clock: {error}");
@@ -3100,6 +3099,11 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 );
             }
             Ok(_) => {}
+            Err(error @ ControlPlaneError::AuthorityClockSampleWindowTooWide { .. }) => {
+                eprintln!(
+                    "experimental OpenRaft control-plane lease expiry deferred because a coherent clock sample was unavailable: {error}"
+                );
+            }
             Err(error) if experimental_raft_error_is_forward_to_leader(&error) => {}
             Err(error) if control_plane_lease_expiry_error_is_clock_wait(&error) => {
                 eprintln!(
@@ -3122,6 +3126,7 @@ fn control_plane_lease_expiry_error_is_clock_wait(error: &ControlPlaneError) -> 
             | ControlPlaneError::CommittedTimestampTooFarAhead { .. }
             | ControlPlaneError::AuthorityClockLeadershipChanged { .. }
             | ControlPlaneError::AuthorityClockSourceUnavailable
+            | ControlPlaneError::AuthorityClockNotEstablished { .. }
     )
 }
 
@@ -3307,17 +3312,12 @@ fn spawn_control_plane_rpc_worker(
                 let mut authority_clock = authority_clock
                     .lock()
                     .expect("control-plane authority clock mutex poisoned");
-                let wall_ms = storage::clock::current_time_millis();
                 build_control_plane_authority_clock_admin_response(
                     &*authority,
                     &mut authority_clock,
                     request,
                     auth_verifier.as_deref(),
-                    ControlPlaneAuthorityClockAdminSample::new(
-                        wall_ms,
-                        wall_ms,
-                        storage::clock::clock_health_time_millis(),
-                    ),
+                    ControlPlaneAuthorityClockAdminSample::from_process_clock()?,
                     || Ok(storage::clock::current_time_millis()),
                 )
             } else if request.is_refresh_node_heartbeat() {
@@ -3325,18 +3325,14 @@ fn spawn_control_plane_rpc_worker(
                     let mut authority = authority
                         .lock()
                         .expect("control-plane authority mutex poisoned");
-                    let wall_ms = storage::clock::current_time_millis();
                     let now_ms = match &authority_clock {
                         Some(authority_clock) if gate_request_time_with_authority_clock => {
                             authority_clock
                                 .lock()
                                 .expect("control-plane authority clock mutex poisoned")
-                                .effective_now_ms(
-                                    wall_ms,
-                                    storage::clock::clock_health_time_millis(),
-                                )?
+                                .effective_process_now_ms()?
                         }
-                        _ => wall_ms,
+                        _ => storage::clock::current_time_millis(),
                     };
                     prepare_control_plane_heartbeat_response(
                         &mut *authority,
@@ -3354,15 +3350,14 @@ fn spawn_control_plane_rpc_worker(
                 let mut authority = authority
                     .lock()
                     .expect("control-plane authority mutex poisoned");
-                let wall_ms = storage::clock::current_time_millis();
                 let now_ms = match &authority_clock {
                     Some(authority_clock) if gate_request_time_with_authority_clock => {
                         authority_clock
                             .lock()
                             .expect("control-plane authority clock mutex poisoned")
-                            .effective_now_ms(wall_ms, storage::clock::clock_health_time_millis())?
+                            .effective_process_now_ms()?
                     }
-                    _ => wall_ms,
+                    _ => storage::clock::current_time_millis(),
                 };
                 match auth_verifier.as_deref() {
                     Some(auth_verifier) => {
@@ -5241,6 +5236,13 @@ mod tests {
                 timestamp_ms: 3_601_002,
                 max_committed_timestamp_ms: 1_001,
                 max_forward_jump_ms: 3_600_000,
+            }
+        ));
+        assert!(control_plane_lease_expiry_error_is_clock_wait(
+            &ControlPlaneError::AuthorityClockNotEstablished {
+                blocked_reason: Some(
+                    storage::control_plane::ControlPlaneAuthorityClockBlockedReason::WallClockRegression,
+                ),
             }
         ));
         assert!(!control_plane_lease_expiry_error_is_clock_wait(

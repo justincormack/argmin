@@ -85,6 +85,14 @@ established only when local wall time is within the skew budget of the
 persisted timestamp high-water. A larger discontinuity requires the explicit
 authority clock re-establishment procedure.
 
+Wall and clock-health reads are not an atomic operating-system operation. The
+authority brackets each wall read with two health-clock reads and accepts it
+only when both health reads fall in the same millisecond. It retries a wide
+window locally; if every attempt is descheduled, that admission is deferred
+without changing clock generation or health state. Scheduler delay therefore
+cannot masquerade as wall-clock regression, and sampling uncertainty does not
+consume or enlarge the stated skew budget.
+
 Replicated apply independently rejects timestamp regression and validates that
 every serving deadline is bounded relative to the command's committed time.
 It cannot infer real elapsed time from the logical high-water; the

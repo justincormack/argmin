@@ -85,6 +85,16 @@ fn control_plane_lease_clock_error(error: LeaseClockError) -> ControlPlaneError 
     }
 }
 
+fn control_plane_process_clock_sample(
+) -> Result<crate::clock::WallClockHealthSample, ControlPlaneError> {
+    crate::clock::wall_clock_health_sample().map_err(|error| {
+        ControlPlaneError::AuthorityClockSampleWindowTooWide {
+            narrowest_window_ms: error.narrowest_window_ms(),
+            max_window_ms: error.max_window_ms(),
+        }
+    })
+}
+
 /// Process-local authority clock gate for timestamp-bearing control-plane work.
 ///
 /// Replicated apply can validate timestamp ordering and deadline relationships,
@@ -172,6 +182,15 @@ impl ControlPlaneAuthorityClockAdminSample {
             clock_health_ms,
         }
     }
+
+    pub fn from_process_clock() -> Result<Self, ControlPlaneError> {
+        let sample = control_plane_process_clock_sample()?;
+        Ok(Self::new(
+            sample.wall_time_ms(),
+            sample.wall_time_ms(),
+            sample.health_time_ms(),
+        ))
+    }
 }
 
 impl ControlPlaneAuthorityClockContext {
@@ -202,6 +221,17 @@ pub struct ControlPlaneAuthorityClock {
 }
 
 impl ControlPlaneAuthorityClock {
+    pub fn new_from_process_clock(
+        max_committed_timestamp_ms: Option<u64>,
+    ) -> Result<Self, ControlPlaneError> {
+        let sample = control_plane_process_clock_sample()?;
+        Self::new(
+            max_committed_timestamp_ms,
+            sample.wall_time_ms(),
+            sample.health_time_ms(),
+        )
+    }
+
     pub fn new(
         max_committed_timestamp_ms: Option<u64>,
         wall_ms: u64,
@@ -400,17 +430,8 @@ impl ControlPlaneAuthorityClock {
         };
         let max_committed_timestamp_ms = self.minimum_timestamp_ms.unwrap_or(wall_ms);
         if !self.established {
-            return Err(if wall_ms < max_committed_timestamp_ms {
-                ControlPlaneError::CommittedTimestampRegression {
-                    timestamp_ms: wall_ms,
-                    max_committed_timestamp_ms,
-                }
-            } else {
-                ControlPlaneError::CommittedTimestampTooFarAhead {
-                    timestamp_ms: wall_ms,
-                    max_committed_timestamp_ms,
-                    max_forward_jump_ms: CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
-                }
+            return Err(ControlPlaneError::AuthorityClockNotEstablished {
+                blocked_reason: self.blocked_reason,
             });
         }
 
@@ -450,6 +471,11 @@ impl ControlPlaneAuthorityClock {
         let effective_now_ms = wall_ms.max(max_committed_timestamp_ms);
         self.minimum_timestamp_ms = Some(effective_now_ms);
         Ok(effective_now_ms)
+    }
+
+    pub fn effective_process_now_ms(&mut self) -> Result<u64, ControlPlaneError> {
+        let sample = control_plane_process_clock_sample()?;
+        self.effective_now_ms(sample.wall_time_ms(), sample.health_time_ms())
     }
 }
 
@@ -11197,6 +11223,19 @@ pub enum ControlPlaneError {
 
     #[error("control-plane authority clock-health source is unavailable")]
     AuthorityClockSourceUnavailable,
+
+    #[error("control-plane authority clock is not established: {blocked_reason:?}")]
+    AuthorityClockNotEstablished {
+        blocked_reason: Option<ControlPlaneAuthorityClockBlockedReason>,
+    },
+
+    #[error(
+        "control-plane authority clock sample window {narrowest_window_ms}ms exceeds maximum {max_window_ms}ms"
+    )]
+    AuthorityClockSampleWindowTooWide {
+        narrowest_window_ms: u64,
+        max_window_ms: u64,
+    },
 
     #[error("control-plane authority clock is already established")]
     AuthorityClockAlreadyEstablished,
@@ -23342,7 +23381,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             clock.effective_now_ms(far_future_now_ms, Some(20)),
-            Err(ControlPlaneError::CommittedTimestampTooFarAhead { .. })
+            Err(ControlPlaneError::AuthorityClockNotEstablished {
+                blocked_reason: Some(
+                    ControlPlaneAuthorityClockBlockedReason::InitialTimestampDiscontinuity
+                ),
+            })
         ));
         assert_eq!(authority.snapshot(), &before);
     }
@@ -23556,13 +23599,21 @@ mod tests {
         let before = authority.snapshot().clone();
         let mut clock = ControlPlaneAuthorityClock::new(Some(1_101), 1_101, Some(10)).unwrap();
         let far_future_now_ms = 1_101 + CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 123;
-        for _ in 0..3 {
+        assert!(matches!(
+            clock.effective_now_ms(far_future_now_ms, Some(11)),
+            Err(ControlPlaneError::CommittedTimestampTooFarAhead { .. })
+        ));
+        for _ in 0..2 {
             assert!(matches!(
                 clock.effective_now_ms(far_future_now_ms, Some(11)),
-                Err(ControlPlaneError::CommittedTimestampTooFarAhead { .. })
+                Err(ControlPlaneError::AuthorityClockNotEstablished {
+                    blocked_reason: Some(
+                        ControlPlaneAuthorityClockBlockedReason::WallClockForwardJump
+                    ),
+                })
             ));
-            assert_eq!(authority.snapshot(), &before);
         }
+        assert_eq!(authority.snapshot(), &before);
     }
 
     #[test]
