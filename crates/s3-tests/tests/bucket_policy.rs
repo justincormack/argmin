@@ -14294,6 +14294,60 @@ fn test_bucket_policy_copy_object_if_match_condition() {
 }
 
 #[test]
+fn test_bucket_policy_object_creation_operation_bool_variants_allow_put_object() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        for operator in ["BoolIfExists", "ForAllValues:Bool", "ForAnyValue:Bool"] {
+            let bucket = create_bucket_allowing_public_policy(client).await;
+            let key = format!(
+                "object-creation-{}",
+                operator.to_ascii_lowercase().replace(':', "-")
+            );
+            let policy = json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        operator: {
+                            "s3:ObjectCreationOperation": "true"
+                        }
+                    }
+                }],
+            })
+            .to_string();
+            client
+                .put_bucket_policy()
+                .bucket(&bucket)
+                .policy(policy)
+                .send()
+                .await
+                .unwrap();
+
+            eventually_ok(
+                &format!("PutObject with {operator} s3:ObjectCreationOperation condition"),
+                || {
+                    alt_client
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(&key)
+                        .body(ByteStream::from_static(b"object-creation-bool"))
+                        .send()
+                },
+            )
+            .await;
+
+            cleanup(&bucket, &[&key]).await;
+        }
+    });
+}
+
+#[test]
 fn test_bucket_policy_copy_object_if_none_match_condition() {
     s3_tests::run(async {
         let client = CTX.client();

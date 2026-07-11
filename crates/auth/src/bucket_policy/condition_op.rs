@@ -88,6 +88,24 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
+        name: "BoolIfExists",
+        kind: ConditionOpKind::Bool,
+        evaluate: eval_bool_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAllValues:Bool",
+        kind: ConditionOpKind::Bool,
+        evaluate: eval_for_all_values_bool,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:Bool",
+        kind: ConditionOpKind::Bool,
+        evaluate: eval_for_any_value_bool,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
         name: "BinaryEquals",
         kind: ConditionOpKind::BinaryEquals,
         evaluate: eval_binary_equals,
@@ -919,6 +937,68 @@ fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResu
         ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
             ConditionMatchResult::NoMatch
         }
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
+fn bool_operand_matches(operands: &[String], actual: &str) -> bool {
+    operands
+        .iter()
+        .any(|expected| expected.eq_ignore_ascii_case(actual))
+}
+
+fn eval_bool_if_exists(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(_) | ActualValue::PresentValues(_) => eval_bool(operands, actual),
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_all_values_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if bool_operand_matches(operands, actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals
+                .iter()
+                .all(|actual| bool_operand_matches(operands, actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if bool_operand_matches(operands, actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals
+                .iter()
+                .any(|actual| bool_operand_matches(operands, actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1782,6 +1862,78 @@ mod tests {
         );
         assert_eq!(
             (op.evaluate)(&operands(&["true"]), ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn bool_if_exists_matches_absent_context() {
+        let op = lookup("BoolIfExists").expect("BoolIfExists is in the table");
+        assert_eq!(op.kind, ConditionOpKind::Bool);
+        assert_eq!(
+            (op.evaluate)(&operands(&["true"]), ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["true"]), present("true")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["false"]), present("true")),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn bool_set_operators_apply_generic_missing_context_semantics() {
+        let all = lookup("ForAllValues:Bool").expect("ForAllValues:Bool is in the table");
+        let any = lookup("ForAnyValue:Bool").expect("ForAnyValue:Bool is in the table");
+        let expected = operands(&["true"]);
+
+        assert_eq!(all.kind, ConditionOpKind::Bool);
+        assert_eq!(any.kind, ConditionOpKind::Bool);
+        assert_eq!(
+            (all.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (any.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (all.evaluate)(&expected, present_values(&[])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (any.evaluate)(&expected, present_values(&[])),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn bool_set_operators_match_present_values() {
+        let all = lookup("ForAllValues:Bool").unwrap();
+        let any = lookup("ForAnyValue:Bool").unwrap();
+        let expected = operands(&["true"]);
+
+        assert_eq!(
+            (all.evaluate)(&expected, present("true")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (all.evaluate)(&expected, present_values(&["true", "TRUE"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (all.evaluate)(&expected, present_values(&["true", "false"])),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (any.evaluate)(&expected, present_values(&["false", "true"])),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (any.evaluate)(&expected, present_values(&["false"])),
             ConditionMatchResult::NoMatch
         );
     }

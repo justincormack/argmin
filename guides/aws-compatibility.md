@@ -537,7 +537,8 @@ The current implemented evaluator is strongest on:
 
 Current supported condition operators are:
 
-- `Bool`
+- `Bool`, `BoolIfExists`
+- `ForAllValues:Bool`, `ForAnyValue:Bool`
 - `Null`
 - `StringEquals`, `StringEqualsIfExists`
 - `StringEqualsIgnoreCase`, `StringEqualsIgnoreCaseIfExists`
@@ -580,8 +581,6 @@ forms are:
   rather than stubbed because the interesting S3 ARN condition keys mostly
   depend on service-to-service, access point, KMS, or delivery-source context
   that Argmin does not yet authenticate or model.
-- `BoolIfExists`
-- boolean set operators: `ForAllValues:Bool` and `ForAnyValue:Bool`
 
 AWS documents generic set-operator semantics for multivalued context keys. The
 implemented set-qualified operators are the forms already needed by the current

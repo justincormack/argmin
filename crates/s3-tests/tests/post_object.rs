@@ -1216,6 +1216,158 @@ fn test_post_object_bucket_policy_object_creation_operation_condition_is_absent(
 }
 
 #[test]
+fn test_post_object_bucket_policy_object_creation_bool_if_exists_absent_matches() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let post_key = "post-object-bool-if-exists-denied";
+        let convergence_key = "post-object-bool-if-exists-convergence";
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                "Condition": {
+                    "BoolIfExists": {
+                        "s3:ObjectCreationOperation": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        wait_for_put_object_access_denied(client, &bucket, convergence_key).await;
+
+        let fields = sigv4_fields(&bucket, post_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object(&bucket, &field_refs, b"denied", "test.txt");
+        assert_eq!(status, 403, "expected 403, got {status} body={body}");
+        assert_error_code(&body, "AccessDenied");
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_bucket_policy_object_creation_for_all_values_bool_absent_matches() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let post_key = "post-object-for-all-bool-denied";
+        let convergence_key = "post-object-for-all-bool-convergence";
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                "Condition": {
+                    "ForAllValues:Bool": {
+                        "s3:ObjectCreationOperation": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        wait_for_put_object_access_denied(client, &bucket, convergence_key).await;
+
+        let fields = sigv4_fields(&bucket, post_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object(&bucket, &field_refs, b"denied", "test.txt");
+        assert_eq!(status, 403, "expected 403, got {status} body={body}");
+        assert_error_code(&body, "AccessDenied");
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_bucket_policy_object_creation_for_any_value_bool_absent_no_match() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let post_key = "post-object-for-any-bool-allowed";
+        let convergence_key = "post-object-for-any-bool-convergence";
+        let file_data = b"ForAnyValue Bool does not match absent ObjectCreationOperation";
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                "Condition": {
+                    "ForAnyValue:Bool": {
+                        "s3:ObjectCreationOperation": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        wait_for_put_object_access_denied(client, &bucket, convergence_key).await;
+
+        let fields = sigv4_fields(&bucket, post_key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (status, body) = post_object(&bucket, &field_refs, file_data, "test.txt");
+        assert_eq!(status, 204, "expected 204, got {status} body={body}");
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(post_key)
+            .send()
+            .await
+            .unwrap();
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], file_data);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(post_key)
+            .send()
+            .await
+            .unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_post_object_bucket_policy_if_none_match_header_is_policy_only() {
     s3_tests::run(async {
         let client = CTX.client();

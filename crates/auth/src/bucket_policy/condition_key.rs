@@ -795,7 +795,10 @@ fn operator_supported_for_key(operator: &str, support: OperatorSupport) -> bool 
         OperatorSupport::StringEqualsOnly => {
             matches!(operator, "StringEquals" | "StringEqualsIfExists")
         }
-        OperatorSupport::BoolOnly => operator == "Bool",
+        OperatorSupport::BoolOnly => matches!(
+            operator,
+            "Bool" | "BoolIfExists" | "ForAllValues:Bool" | "ForAnyValue:Bool"
+        ),
         OperatorSupport::IpOnly => condition_op::lookup(operator).is_some_and(|op| {
             op.evaluable_on_evaluable_object_actions && condition_op::is_ip_condition_kind(op.kind)
         }),
@@ -1291,6 +1294,18 @@ mod tests {
             values: vec!["true".to_string()],
         };
         assert!(supports_clause_for_action(&clause, PolicyAction::PutObject));
+
+        for operator in ["BoolIfExists", "ForAllValues:Bool", "ForAnyValue:Bool"] {
+            let clause = PolicyConditionClause {
+                operator: operator.to_string(),
+                key: "s3:ObjectCreationOperation".to_string(),
+                values: vec!["true".to_string()],
+            };
+            assert!(
+                supports_clause_for_action(&clause, PolicyAction::PutObject),
+                "{operator}"
+            );
+        }
 
         let wrong_operator = PolicyConditionClause {
             operator: "StringEquals".to_string(),
