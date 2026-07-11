@@ -15,6 +15,9 @@ use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatRuntimeMapSource,
     ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PgRouteSnapshot,
 };
+use crate::control_plane_lease::{
+    validate_process_lease_clock, BoundRouteMapLease, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+};
 use crate::data_dir::prepare_private_data_dir;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
@@ -475,6 +478,14 @@ impl StorageNodeProcessConfig {
         validate_pg_ids(&pg_ids)?;
         validate_pg_routes(&pg_ids, &pg_routes)?;
 
+        runtime_map
+            .bind_process_local_lease_at(
+                crate::clock::current_time_millis(),
+                crate::clock::monotonic_time_millis(),
+            )
+            .map_err(|error| StorageNodeServerError::RouteMapLeaseBinding {
+                message: error.to_string(),
+            })?;
         Ok(Self {
             node_id,
             cluster_epoch: runtime_map.cluster_epoch(),
@@ -741,6 +752,35 @@ impl Drop for StagedControlPlaneRuntimeConfig {
             let _ = fs::remove_file(&self.tmp_path);
         }
     }
+}
+
+fn bind_storage_node_route_map_lease(
+    validity: RouteMapValidity,
+) -> Result<Option<BoundRouteMapLease>, StorageNodeServerError> {
+    let Some(valid_until_ms) = validity.valid_until_ms() else {
+        return Ok(None);
+    };
+    let local_wall_ms = crate::clock::current_time_millis();
+    let local_monotonic_ms = crate::clock::monotonic_time_millis();
+    validate_process_lease_clock(
+        local_wall_ms,
+        crate::clock::clock_health_time_millis(),
+        CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+    )
+    .map_err(|error| StorageNodeServerError::RouteMapLeaseBinding {
+        message: error.to_string(),
+    })?;
+    BoundRouteMapLease::bind(
+        local_wall_ms,
+        valid_until_ms,
+        local_wall_ms,
+        local_monotonic_ms,
+        CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+    )
+    .map(Some)
+    .map_err(|error| StorageNodeServerError::RouteMapLeaseBinding {
+        message: error.to_string(),
+    })
 }
 
 fn prune_refresh_historical_pg_routes(
@@ -1348,6 +1388,8 @@ pub enum StorageNodeServerError {
         node_id: u32,
         cluster_epoch: ClusterEpoch,
     },
+    #[error("storage-node runtime route-map lease could not bind to the process clock: {message}")]
+    RouteMapLeaseBinding { message: String },
     #[error(
         "storage-node route map for cluster epoch {cluster_epoch} expired at {valid_until_ms}ms, now {now_ms}ms"
     )]
@@ -1550,6 +1592,7 @@ fn validate_runtime_config_install(
 pub struct StorageNodeServer {
     config: Arc<RwLock<Arc<StorageNodeProcessConfig>>>,
     runtime_config_install_lock: Mutex<()>,
+    route_map_lease: Arc<RwLock<Option<BoundRouteMapLease>>>,
     route_admission: StorageNodeRouteAdmissionGate,
     _data_dir_lock: StorageNodeDataDirLock,
     control_plane_incarnation_lock: Mutex<()>,
@@ -1730,9 +1773,11 @@ impl StorageNodeServer {
                 source,
             }
         })?;
+        let route_map_lease = bind_storage_node_route_map_lease(config.route_map_validity)?;
         Ok(Self {
             config: Arc::new(RwLock::new(Arc::new(config))),
             runtime_config_install_lock: Mutex::new(()),
+            route_map_lease: Arc::new(RwLock::new(route_map_lease)),
             route_admission: StorageNodeRouteAdmissionGate::default(),
             _data_dir_lock: data_dir_lock,
             control_plane_incarnation_lock: Mutex::new(()),
@@ -1970,6 +2015,8 @@ impl StorageNodeServer {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         validate_process_config_route_table(&next_config)?;
+        let next_route_map_lease =
+            bind_storage_node_route_map_lease(next_config.route_map_validity)?;
         let current_config = self.config_snapshot_arc();
         validate_runtime_config_install(&current_config, &next_config)?;
         #[cfg(test)]
@@ -1994,6 +2041,10 @@ impl StorageNodeServer {
             if next_config.only_extends_route_map_validity_from(&current_config) {
                 staged_config.publish()?;
                 *current_config = Arc::new(next_config);
+                *self
+                    .route_map_lease
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_route_map_lease;
                 return Ok(());
             }
         }
@@ -2003,8 +2054,19 @@ impl StorageNodeServer {
         validate_runtime_config_install(&current_config, &next_config)?;
         staged_config.publish()?;
         self.route_admission
-            .publish_historical_metadata_recovery_permits(&current_config, &next_config);
+            .publish_historical_metadata_recovery_permits(
+                &current_config,
+                *self
+                    .route_map_lease
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                &next_config,
+            );
         *current_config = Arc::new(next_config);
+        *self
+            .route_map_lease
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_route_map_lease;
         Ok(())
     }
 
@@ -2038,6 +2100,7 @@ impl StorageNodeServer {
         StorageNodeConnectionHandler {
             config: self.config_snapshot_arc(),
             config_source: Arc::clone(&self.config),
+            route_map_lease: Arc::clone(&self.route_map_lease),
             route_admission: self.route_admission.clone(),
             node: Arc::clone(&self._node),
             read_handles: Arc::clone(&self.read_handles),
@@ -2399,6 +2462,7 @@ struct StorageNodeRouteAdmissionState {
 struct HistoricalMetadataRecoveryPermit {
     route: StorageNodePgRoute,
     valid_until_ms: u64,
+    local_valid_until_monotonic_ms: u64,
 }
 
 impl StorageNodeRouteAdmissionGate {
@@ -2451,6 +2515,7 @@ impl StorageNodeRouteAdmissionGate {
     fn publish_historical_metadata_recovery_permits(
         &self,
         current: &StorageNodeProcessConfig,
+        current_route_map_lease: Option<BoundRouteMapLease>,
         next: &StorageNodeProcessConfig,
     ) {
         let mut state = self
@@ -2476,6 +2541,11 @@ impl StorageNodeRouteAdmissionGate {
         let Some(valid_until_ms) = current.route_map_valid_until_ms() else {
             return;
         };
+        let Some(local_valid_until_monotonic_ms) =
+            current_route_map_lease.map(BoundRouteMapLease::local_valid_until_monotonic_ms)
+        else {
+            return;
+        };
         for route in current
             .pg_routes
             .iter()
@@ -2495,10 +2565,12 @@ impl StorageNodeRouteAdmissionGate {
                     .and_modify(|permit| {
                         permit.route = route.clone();
                         permit.valid_until_ms = valid_until_ms;
+                        permit.local_valid_until_monotonic_ms = local_valid_until_monotonic_ms;
                     })
                     .or_insert_with(|| HistoricalMetadataRecoveryPermit {
                         route: route.clone(),
                         valid_until_ms,
+                        local_valid_until_monotonic_ms,
                     });
             }
         }
@@ -2508,14 +2580,14 @@ impl StorageNodeRouteAdmissionGate {
         &self,
         cluster_epoch: ClusterEpoch,
         pg_id: PgId,
-    ) -> Option<u64> {
+    ) -> Option<(u64, u64)> {
         self.inner
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .historical_metadata_recovery_permits
             .get(&(cluster_epoch, pg_id.get()))
-            .map(|permit| permit.valid_until_ms)
+            .map(|permit| (permit.valid_until_ms, permit.local_valid_until_monotonic_ms))
     }
 }
 
@@ -2547,28 +2619,53 @@ struct StorageNodeRouteTransitionGuard {
 struct MetadataMutationRouteFence {
     cluster_epoch: ClusterEpoch,
     valid_until_ms: Option<u64>,
+    local_valid_until_monotonic_ms: Option<u64>,
 }
 
 impl MetadataMutationRouteFence {
-    fn current(config: &StorageNodeProcessConfig) -> Self {
+    fn current(
+        config: &StorageNodeProcessConfig,
+        route_map_lease: Option<BoundRouteMapLease>,
+    ) -> Self {
         Self {
             cluster_epoch: config.cluster_epoch,
             valid_until_ms: config.route_map_valid_until_ms(),
+            local_valid_until_monotonic_ms: route_map_lease
+                .map(BoundRouteMapLease::local_valid_until_monotonic_ms),
         }
     }
 
-    fn historical(cluster_epoch: ClusterEpoch, valid_until_ms: u64) -> Self {
+    fn historical(
+        cluster_epoch: ClusterEpoch,
+        valid_until_ms: u64,
+        local_valid_until_monotonic_ms: u64,
+    ) -> Self {
         Self {
             cluster_epoch,
             valid_until_ms: Some(valid_until_ms),
+            local_valid_until_monotonic_ms: Some(local_valid_until_monotonic_ms),
         }
     }
 
-    fn validate_rpc_at(self, now_ms: u64) -> Result<(), StorageRpcErrorResponse> {
+    fn validate_rpc_at(
+        self,
+        now_ms: u64,
+        local_monotonic_ms: u64,
+    ) -> Result<(), StorageRpcErrorResponse> {
         let Some(valid_until_ms) = self.valid_until_ms else {
             return Ok(());
         };
-        if valid_until_ms > now_ms {
+        if self.local_valid_until_monotonic_ms.is_some()
+            && validate_process_lease_clock(
+                now_ms,
+                crate::clock::clock_health_time_millis(),
+                CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+            )
+            .is_ok()
+            && self
+                .local_valid_until_monotonic_ms
+                .is_some_and(|deadline| deadline > local_monotonic_ms)
+        {
             return Ok(());
         }
         Err(StorageRpcErrorResponse {
@@ -2580,11 +2677,21 @@ impl MetadataMutationRouteFence {
         })
     }
 
-    fn validate_store_at(self, now_ms: u64) -> Result<(), StoreError> {
+    fn validate_store_at(self, now_ms: u64, local_monotonic_ms: u64) -> Result<(), StoreError> {
         let Some(valid_until_ms) = self.valid_until_ms else {
             return Ok(());
         };
-        if valid_until_ms > now_ms {
+        if self.local_valid_until_monotonic_ms.is_some()
+            && validate_process_lease_clock(
+                now_ms,
+                crate::clock::clock_health_time_millis(),
+                CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+            )
+            .is_ok()
+            && self
+                .local_valid_until_monotonic_ms
+                .is_some_and(|deadline| deadline > local_monotonic_ms)
+        {
             return Ok(());
         }
         Err(StoreError::RouteMapExpired {
@@ -2612,6 +2719,7 @@ impl Drop for StorageNodeRouteTransitionGuard {
 struct StorageNodeConnectionHandler {
     config: Arc<StorageNodeProcessConfig>,
     config_source: Arc<RwLock<Arc<StorageNodeProcessConfig>>>,
+    route_map_lease: Arc<RwLock<Option<BoundRouteMapLease>>>,
     route_admission: StorageNodeRouteAdmissionGate,
     node: Arc<SharedStorageNode>,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
@@ -2661,20 +2769,62 @@ impl StorageNodeConnectionHandler {
     }
 
     fn validate_metadata_mutation_route_not_expired(&self) -> Result<(), StorageRpcErrorResponse> {
-        let now_ms = crate::clock::current_time_millis();
-        if let Some(valid_until_ms) = self.config.route_map_valid_until_ms() {
-            if valid_until_ms > now_ms {
-                return Ok(());
-            }
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::StaleShardLocation,
-                message: format!(
-                    "storage-node route map for cluster epoch {} expired at {valid_until_ms}ms before metadata mutation at {now_ms}ms",
-                    self.config.cluster_epoch.get()
-                ),
-            });
+        if self.current_route_map_lease_is_valid() {
+            return Ok(());
         }
-        Ok(())
+        let valid_until_ms = self.config.route_map_valid_until_ms().unwrap_or(0);
+        let now_ms = crate::clock::current_time_millis();
+        Err(StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::StaleShardLocation,
+            message: format!(
+                "storage-node route map for cluster epoch {} expired at {valid_until_ms}ms before metadata mutation at {now_ms}ms",
+                self.config.cluster_epoch.get()
+            ),
+        })
+    }
+
+    fn current_route_map_lease(&self) -> Option<BoundRouteMapLease> {
+        *self
+            .route_map_lease
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn current_route_map_lease_is_valid(&self) -> bool {
+        if self.config.route_map_validity == RouteMapValidity::Forever {
+            return true;
+        }
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        if validate_process_lease_clock(
+            crate::clock::current_time_millis(),
+            crate::clock::clock_health_time_millis(),
+            CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )
+        .is_err()
+        {
+            *self
+                .route_map_lease
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            return false;
+        }
+        self.current_route_map_lease()
+            .is_some_and(|lease| lease.is_valid_at_monotonic(local_monotonic_ms))
+    }
+
+    fn require_current_route_map_valid_rpc(&self) -> Result<(), StorageRpcErrorResponse> {
+        if self.current_route_map_lease_is_valid() {
+            return Ok(());
+        }
+        let valid_until_ms = self.config.route_map_valid_until_ms().unwrap_or(0);
+        let now_ms = crate::clock::current_time_millis();
+        Err(StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::StaleShardLocation,
+            message: format!(
+                "storage-node route map for cluster epoch {} expired at {valid_until_ms}ms, now {now_ms}ms",
+                self.config.cluster_epoch.get()
+            ),
+        })
     }
 
     fn handle_session(
@@ -9660,17 +9810,25 @@ impl StorageNodeConnectionHandler {
             ) {
                 return encode_storage_rpc_error_response(&error);
             }
-            MetadataMutationRouteFence::current(&self.config)
+            MetadataMutationRouteFence::current(&self.config, self.current_route_map_lease())
         };
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
-        if let Err(error) = mutation_fence.validate_rpc_at(crate::clock::current_time_millis()) {
+        if let Err(error) = mutation_fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let response = match self.node.get_pg(request.pg_id.get()) {
             Ok(pg) => match pg.apply_metadata_command_and_record_with_commit_guard(
                 self.config.node_id.as_u32(),
                 &request.command,
-                || mutation_fence.validate_store_at(crate::clock::current_time_millis()),
+                || {
+                    mutation_fence.validate_store_at(
+                        crate::clock::current_time_millis(),
+                        crate::clock::monotonic_time_millis(),
+                    )
+                },
             ) {
                 Ok(state) => {
                     let payload = encode_metadata_command_state_outcome_response(
@@ -10385,14 +10543,17 @@ impl StorageNodeConnectionHandler {
         pg_id: PgId,
     ) -> Result<MetadataMutationRouteFence, StorageRpcErrorResponse> {
         match self.validate_pg_route(node_id, cluster_epoch, pg_id) {
-            Ok(()) => Ok(MetadataMutationRouteFence::current(&self.config)),
+            Ok(()) => Ok(MetadataMutationRouteFence::current(
+                &self.config,
+                self.current_route_map_lease(),
+            )),
             Err(_) if cluster_epoch < self.config.cluster_epoch => {
                 self.validate_pg_route_for_metadata_command_recovery(
                     node_id,
                     cluster_epoch,
                     pg_id,
                 )?;
-                let valid_until_ms = self
+                let (valid_until_ms, local_valid_until_monotonic_ms) = self
                     .route_admission
                     .historical_metadata_recovery_deadline(cluster_epoch, pg_id)
                     .ok_or_else(|| StorageRpcErrorResponse {
@@ -10403,8 +10564,15 @@ impl StorageNodeConnectionHandler {
                             cluster_epoch.get()
                         ),
                     })?;
-                let fence = MetadataMutationRouteFence::historical(cluster_epoch, valid_until_ms);
-                fence.validate_rpc_at(crate::clock::current_time_millis())?;
+                let fence = MetadataMutationRouteFence::historical(
+                    cluster_epoch,
+                    valid_until_ms,
+                    local_valid_until_monotonic_ms,
+                );
+                fence.validate_rpc_at(
+                    crate::clock::current_time_millis(),
+                    crate::clock::monotonic_time_millis(),
+                )?;
                 Ok(fence)
             }
             Err(error) => Err(error),
@@ -10611,18 +10779,7 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        let now_ms = crate::clock::current_time_millis();
-        if let Some(valid_until_ms) = self.config.route_map_valid_until_ms() {
-            if valid_until_ms <= now_ms {
-                return Err(StorageRpcErrorResponse {
-                    code: StorageRpcErrorCode::StaleShardLocation,
-                    message: format!(
-                        "storage-node route map for cluster epoch {} expired at {valid_until_ms}ms, now {now_ms}ms",
-                        self.config.cluster_epoch.get()
-                    ),
-                });
-            }
-        }
+        self.require_current_route_map_valid_rpc()?;
         let raw_pg_id = pg_id.get();
         if let Some(route) = self
             .config
@@ -10688,18 +10845,7 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        let now_ms = crate::clock::current_time_millis();
-        if let Some(valid_until_ms) = self.config.route_map_valid_until_ms() {
-            if valid_until_ms <= now_ms {
-                return Err(StorageRpcErrorResponse {
-                    code: StorageRpcErrorCode::StaleShardLocation,
-                    message: format!(
-                        "storage-node route map for cluster epoch {} expired at {valid_until_ms}ms, now {now_ms}ms",
-                        self.config.cluster_epoch.get()
-                    ),
-                });
-            }
-        }
+        self.require_current_route_map_valid_rpc()?;
         let raw_pg_id = pg_id.get();
         let Some(route) = self
             .config
@@ -14913,11 +15059,12 @@ mod tests {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            admission
+            let permit = admission
                 .historical_metadata_recovery_permits
                 .get_mut(&(config.cluster_epoch, 0))
-                .expect("Peering transition should retain the source recovery permit")
-                .valid_until_ms = crate::clock::current_time_millis().saturating_sub(1);
+                .expect("Peering transition should retain the source recovery permit");
+            permit.valid_until_ms = crate::clock::current_time_millis().saturating_sub(1);
+            permit.local_valid_until_monotonic_ms = crate::clock::monotonic_time_millis();
         }
         let peering_route = server.config_snapshot().pg_routes[0].clone();
         let mut successor_config = bounded_runtime_refresh_config(server.config_snapshot());

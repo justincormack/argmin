@@ -20,13 +20,18 @@ use crate::control_plane_command::{
     AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
     ControlPlaneCommandStateMachine, ControlPlaneLogId, ReadyPgPeeringCompletion,
 };
+use crate::control_plane_lease::{
+    bounded_renewal_deadline, successor_activation_fence_satisfied, validate_process_lease_clock,
+    validate_serving_deadline_bound, BoundRouteMapLease, LeaseClockError,
+    CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+};
 use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgId, PgState, RouteMapValidity};
 
 // PG backfill can lag a burst of placement changes; retain enough recent
 // snapshots that scanner references can still reconstruct historical routes.
 const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
-pub const MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS: u64 = 60 * 60 * 1_000;
+pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
@@ -52,6 +57,161 @@ const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX: u8 = 3;
 
 fn non_serving_runtime_map_validity(now_ms: u64) -> RouteMapValidity {
     RouteMapValidity::until_ms_saturating(now_ms.saturating_add(MAX_HEARTBEAT_LEASE_MS))
+}
+
+fn control_plane_lease_clock_error(error: LeaseClockError) -> ControlPlaneError {
+    match error {
+        LeaseClockError::TimestampOverflow { .. } => ControlPlaneError::LeaseDeadlineOverflow,
+        LeaseClockError::ServingDeadlineOutOfBounds {
+            serving_deadline_ms,
+            effective_committed_now_ms,
+            max_lease_ms,
+            skew_budget_ms,
+        } => ControlPlaneError::LeaseDeadlineOutOfBounds {
+            serving_deadline_ms,
+            effective_committed_now_ms,
+            max_lease_ms,
+            skew_budget_ms,
+        },
+        LeaseClockError::AuthorityClockTooFarAhead { .. }
+        | LeaseClockError::LocalClockUnhealthy { .. }
+        | LeaseClockError::ClockHealthSourceUnavailable => {
+            unreachable!("authority clock comparison is only used by runtime-map consumers")
+        }
+    }
+}
+
+/// Process-local authority clock gate for timestamp-bearing control-plane work.
+///
+/// Replicated apply can validate timestamp ordering and deadline relationships,
+/// but only the command issuer can compare wall-clock progress with monotonic
+/// elapsed time. A new process starts established only when its wall clock is
+/// within the configured skew budget of the persisted timestamp high-water.
+#[derive(Debug)]
+pub struct ControlPlaneAuthorityClock {
+    reference_wall_ms: u64,
+    reference_clock_health_ms: u64,
+    minimum_timestamp_ms: Option<u64>,
+    raft_leadership_term: Option<u64>,
+    initial_raft_term_binding_available: bool,
+    established: bool,
+}
+
+impl ControlPlaneAuthorityClock {
+    pub fn new(
+        max_committed_timestamp_ms: Option<u64>,
+        wall_ms: u64,
+        clock_health_ms: Option<u64>,
+    ) -> Result<Self, ControlPlaneError> {
+        let clock_health_ms =
+            clock_health_ms.ok_or(ControlPlaneError::AuthorityClockSourceUnavailable)?;
+        let established = max_committed_timestamp_ms.is_none_or(|committed_ms| {
+            wall_ms.abs_diff(committed_ms) <= CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS
+        });
+        Ok(Self {
+            reference_wall_ms: wall_ms,
+            reference_clock_health_ms: clock_health_ms,
+            minimum_timestamp_ms: max_committed_timestamp_ms,
+            raft_leadership_term: None,
+            initial_raft_term_binding_available: max_committed_timestamp_ms.is_none(),
+            established,
+        })
+    }
+
+    pub fn bind_initial_raft_leadership_term(&mut self, term: Option<u64>) {
+        self.raft_leadership_term = term;
+        self.initial_raft_term_binding_available = false;
+    }
+
+    pub fn observe_committed_timestamp_high_water(&mut self, timestamp_ms: Option<u64>) {
+        if let Some(timestamp_ms) = timestamp_ms {
+            self.minimum_timestamp_ms = Some(
+                self.minimum_timestamp_ms
+                    .map_or(timestamp_ms, |current| current.max(timestamp_ms)),
+            );
+        }
+    }
+
+    /// Bind clock authority to one locally serving Raft leadership term.
+    pub fn validate_raft_leadership_term(&mut self, term: u64) -> Result<(), ControlPlaneError> {
+        match self.raft_leadership_term {
+            Some(established_term) if established_term == term => Ok(()),
+            None if self.minimum_timestamp_ms.is_none()
+                && self.initial_raft_term_binding_available =>
+            {
+                self.raft_leadership_term = Some(term);
+                self.initial_raft_term_binding_available = false;
+                Ok(())
+            }
+            established_term => {
+                self.established = false;
+                Err(ControlPlaneError::AuthorityClockLeadershipChanged {
+                    established_term,
+                    current_term: term,
+                })
+            }
+        }
+    }
+
+    /// Validate the process clock and return a non-regressing command timestamp.
+    pub fn effective_now_ms(
+        &mut self,
+        wall_ms: u64,
+        clock_health_ms: Option<u64>,
+    ) -> Result<u64, ControlPlaneError> {
+        let Some(clock_health_ms) = clock_health_ms else {
+            self.established = false;
+            return Err(ControlPlaneError::AuthorityClockSourceUnavailable);
+        };
+        let max_committed_timestamp_ms = self.minimum_timestamp_ms.unwrap_or(wall_ms);
+        if !self.established {
+            return Err(if wall_ms < max_committed_timestamp_ms {
+                ControlPlaneError::CommittedTimestampRegression {
+                    timestamp_ms: wall_ms,
+                    max_committed_timestamp_ms,
+                }
+            } else {
+                ControlPlaneError::CommittedTimestampTooFarAhead {
+                    timestamp_ms: wall_ms,
+                    max_committed_timestamp_ms,
+                    max_forward_jump_ms: CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+                }
+            });
+        }
+
+        let Some(monotonic_elapsed_ms) =
+            clock_health_ms.checked_sub(self.reference_clock_health_ms)
+        else {
+            self.established = false;
+            return Err(ControlPlaneError::CommittedTimestampRegression {
+                timestamp_ms: clock_health_ms,
+                max_committed_timestamp_ms: self.reference_clock_health_ms,
+            });
+        };
+        let expected_wall_ms = self
+            .reference_wall_ms
+            .checked_add(monotonic_elapsed_ms)
+            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+        if wall_ms.abs_diff(expected_wall_ms) > CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS {
+            self.established = false;
+            return Err(if wall_ms < expected_wall_ms {
+                ControlPlaneError::CommittedTimestampRegression {
+                    timestamp_ms: wall_ms,
+                    max_committed_timestamp_ms: expected_wall_ms,
+                }
+            } else {
+                ControlPlaneError::CommittedTimestampTooFarAhead {
+                    timestamp_ms: wall_ms,
+                    max_committed_timestamp_ms: expected_wall_ms,
+                    max_forward_jump_ms: CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+                }
+            });
+        }
+
+        let effective_now_ms = wall_ms.max(max_committed_timestamp_ms);
+        self.minimum_timestamp_ms = Some(effective_now_ms);
+        Ok(effective_now_ms)
+    }
 }
 
 pub(crate) fn validate_control_plane_snapshot(
@@ -912,43 +1072,9 @@ impl ClusterControlSnapshot {
         Ok(())
     }
 
-    fn validate_committed_timestamp(&self, timestamp_ms: u64) -> Result<(), ControlPlaneError> {
-        if let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms {
-            if timestamp_ms < max_committed_timestamp_ms {
-                return Err(ControlPlaneError::CommittedTimestampRegression {
-                    timestamp_ms,
-                    max_committed_timestamp_ms,
-                });
-            }
-            if self.committed_timestamp_exceeds_forward_bound(timestamp_ms) {
-                return Err(ControlPlaneError::CommittedTimestampTooFarAhead {
-                    timestamp_ms,
-                    max_committed_timestamp_ms,
-                    max_forward_jump_ms: MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS,
-                });
-            }
-        }
-        Ok(())
-    }
-
     #[must_use]
-    pub fn committed_timestamp_exceeds_forward_bound(&self, timestamp_ms: u64) -> bool {
-        self.max_committed_timestamp_ms.is_some_and(|max| {
-            timestamp_ms > max.saturating_add(MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS)
-        })
-    }
-
-    #[must_use]
-    pub fn has_heartbeat_lease_expiring_at(&self, timestamp_ms: u64) -> bool {
-        self.nodes.values().any(|record| {
-            !matches!(
-                record.membership,
-                NodeMembershipState::Out | NodeMembershipState::Removed
-            ) && record.availability != NodeAvailabilityState::Unavailable
-                && record
-                    .lease_deadline_ms
-                    .is_some_and(|lease_deadline_ms| lease_deadline_ms <= timestamp_ms)
-        })
+    pub fn heartbeat_lease_expiry_timestamp(&self, now_ms: u64) -> u64 {
+        now_ms
     }
 
     fn record_committed_timestamp(&mut self, timestamp_ms: u64) -> bool {
@@ -960,10 +1086,40 @@ impl ClusterControlSnapshot {
         self.max_committed_timestamp_ms != previous
     }
 
-    fn bounded_committed_timestamp_step(&self, timestamp_ms: u64) -> u64 {
-        self.max_committed_timestamp_ms.map_or(timestamp_ms, |max| {
-            timestamp_ms.min(max.saturating_add(MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS))
-        })
+    fn validate_serving_timestamp(&self, timestamp_ms: u64) -> Result<(), ControlPlaneError> {
+        let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms else {
+            return Ok(());
+        };
+        if timestamp_ms < max_committed_timestamp_ms {
+            return Err(ControlPlaneError::CommittedTimestampRegression {
+                timestamp_ms,
+                max_committed_timestamp_ms,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn heartbeat_lease_deadline(
+        &self,
+        node_id: NodeId,
+        heartbeat_at_ms: u64,
+        requested_lease_duration_ms: u64,
+    ) -> Result<u64, ControlPlaneError> {
+        self.validate_serving_timestamp(heartbeat_at_ms)?;
+        let current_deadline_ms = self
+            .node(node_id)
+            .ok_or(ControlPlaneError::UnknownNode {
+                node_id: node_id.as_u32(),
+            })?
+            .lease_deadline_ms();
+        bounded_renewal_deadline(
+            current_deadline_ms,
+            heartbeat_at_ms,
+            requested_lease_duration_ms,
+            MAX_HEARTBEAT_LEASE_MS,
+            CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )
+        .map_err(control_plane_lease_clock_error)
     }
 
     pub(crate) fn validate_publication_invariants(&self) -> Result<(), String> {
@@ -1174,6 +1330,26 @@ impl ClusterControlSnapshot {
         }
 
         for node in self.nodes.values() {
+            if let Some(lease_deadline_ms) = node.lease_deadline_ms {
+                let max_committed_timestamp_ms = self.max_committed_timestamp_ms.ok_or_else(|| {
+                    format!(
+                        "node {} has lease deadline {lease_deadline_ms} without a committed timestamp high-water",
+                        node.node_id.as_u32()
+                    )
+                })?;
+                validate_serving_deadline_bound(
+                    lease_deadline_ms,
+                    max_committed_timestamp_ms,
+                    MAX_HEARTBEAT_LEASE_MS,
+                    CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+                )
+                .map_err(|error| {
+                    format!(
+                        "node {} has an out-of-bounds serving lease: {error}",
+                        node.node_id.as_u32()
+                    )
+                })?;
+            }
             if let Some(observed_epoch) = node.last_observed_epoch {
                 if observed_epoch > self.cluster_epoch {
                     return Err(format!(
@@ -1303,7 +1479,10 @@ impl ClusterControlSnapshot {
             ClusterControlSnapshot {
                 authority_incarnation: history.authority_incarnation,
                 cluster_epoch: history.cluster_epoch,
-                max_committed_timestamp_ms: None,
+                // History records predate the timestamp high-water field. The
+                // current high-water is monotonic and therefore a conservative
+                // upper bound for validating retained historical leases.
+                max_committed_timestamp_ms: self.max_committed_timestamp_ms,
                 nodes,
                 pgs,
                 history: Vec::new(),
@@ -1599,9 +1778,6 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         max_ms: MAX_HEARTBEAT_LEASE_MS,
                     });
                 }
-                let expected_lease_deadline_ms = heartbeat_at_ms
-                    .checked_add(heartbeat.requested_lease_duration_ms)
-                    .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
                 let current_epoch = self.cluster_epoch;
                 let record =
                     self.nodes
@@ -1609,22 +1785,12 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         .ok_or(ControlPlaneError::UnknownNode {
                             node_id: heartbeat.node_id.as_u32(),
                         })?;
-                if let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms {
-                    if heartbeat_at_ms < max_committed_timestamp_ms {
-                        return Err(ControlPlaneError::CommittedTimestampRegression {
-                            timestamp_ms: heartbeat_at_ms,
-                            max_committed_timestamp_ms,
-                        });
-                    }
-                }
-                let committed_heartbeat_at_ms =
-                    self.bounded_committed_timestamp_step(heartbeat_at_ms);
-                let committed_lease_deadline_ms = record.lease_deadline_ms.map_or(
-                    expected_lease_deadline_ms,
-                    |current_lease_deadline_ms| {
-                        current_lease_deadline_ms.max(expected_lease_deadline_ms)
-                    },
-                );
+                let committed_heartbeat_at_ms = heartbeat_at_ms;
+                let committed_lease_deadline_ms = self.heartbeat_lease_deadline(
+                    heartbeat.node_id,
+                    heartbeat_at_ms,
+                    heartbeat.requested_lease_duration_ms,
+                )?;
                 if let Some(current_lease_deadline_ms) = record.lease_deadline_ms {
                     if lease_deadline_ms < current_lease_deadline_ms {
                         return Err(ControlPlaneError::NodeLeaseDeadlineRegression {
@@ -1826,18 +1992,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         });
                     }
                 }
-                if self.committed_timestamp_exceeds_forward_bound(expire_at_ms)
-                    && !self.has_heartbeat_lease_expiring_at(expire_at_ms)
-                {
-                    return Err(ControlPlaneError::CommittedTimestampTooFarAhead {
-                        timestamp_ms: expire_at_ms,
-                        max_committed_timestamp_ms: self
-                            .max_committed_timestamp_ms
-                            .expect("forward-bound check requires a previous timestamp"),
-                        max_forward_jump_ms: MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS,
-                    });
-                }
-                let committed_expire_at_ms = self.bounded_committed_timestamp_step(expire_at_ms);
+                let committed_expire_at_ms = expire_at_ms;
                 let mut next_snapshot = self.clone();
                 let timestamp_changed =
                     next_snapshot.record_committed_timestamp(committed_expire_at_ms);
@@ -2298,7 +2453,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 node_incarnation,
                 complete_at_ms,
             } => {
-                self.validate_committed_timestamp(complete_at_ms)?;
+                self.validate_serving_timestamp(complete_at_ms)?;
                 let validated = validate_pg_peering_completion(PgPeeringCompletionValidation {
                     snapshot: self,
                     pg_id,
@@ -2361,7 +2516,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 }
             }
             ControlPlaneCommand::CompleteReadyPgPeerings { ready_at_ms, ready } => {
-                self.validate_committed_timestamp(ready_at_ms)?;
+                self.validate_serving_timestamp(ready_at_ms)?;
                 if ready.is_empty() {
                     let mut next_snapshot = self.clone();
                     let changed = next_snapshot.record_committed_timestamp(ready_at_ms);
@@ -2785,6 +2940,35 @@ impl ClusterRuntimeMapSnapshot {
         self.validity
     }
 
+    pub(crate) fn bind_process_local_lease_at(
+        &self,
+        local_wall_ms: u64,
+        local_monotonic_ms: u64,
+    ) -> Result<Option<BoundRouteMapLease>, LeaseClockError> {
+        let Some(authority_valid_until_ms) = self.valid_until_ms() else {
+            return Ok(None);
+        };
+        validate_process_lease_clock(
+            local_wall_ms,
+            crate::clock::clock_health_time_millis(),
+            CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )?;
+        let Some(authority_issued_at_ms) = self.freshness_proof.issued_at_ms() else {
+            return Ok(Some(BoundRouteMapLease::expired(
+                authority_valid_until_ms,
+                local_monotonic_ms,
+            )));
+        };
+        BoundRouteMapLease::bind(
+            authority_issued_at_ms,
+            authority_valid_until_ms,
+            local_wall_ms,
+            local_monotonic_ms,
+            CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )
+        .map(Some)
+    }
+
     #[must_use]
     pub fn freshness_proof(&self) -> &RuntimeMapFreshnessProof {
         &self.freshness_proof
@@ -3065,7 +3249,11 @@ impl PreviousPrimaryLease {
         now_ms: u64,
     ) -> bool {
         !self.matches_process(primary, primary_incarnation, primary_endpoint)
-            && self.lease_deadline_ms > now_ms
+            && !successor_activation_fence_satisfied(
+                now_ms,
+                self.lease_deadline_ms,
+                CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+            )
     }
 }
 
@@ -4027,16 +4215,11 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 max_ms: MAX_HEARTBEAT_LEASE_MS,
             });
         }
-        let lease_deadline_ms = authority_now_ms
-            .checked_add(heartbeat.requested_lease_duration_ms)
-            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
-        let lease_deadline_ms = self
-            .snapshot
-            .node(heartbeat.node_id)
-            .and_then(NodeControlRecord::lease_deadline_ms)
-            .map_or(lease_deadline_ms, |current_lease_deadline_ms| {
-                current_lease_deadline_ms.max(lease_deadline_ms)
-            });
+        let lease_deadline_ms = self.snapshot.heartbeat_lease_deadline(
+            heartbeat.node_id,
+            authority_now_ms,
+            heartbeat.requested_lease_duration_ms,
+        )?;
         let observed_epoch = heartbeat.observed_epoch;
         let current_epoch = self.snapshot.cluster_epoch;
         let node_id = heartbeat.node_id;
@@ -4072,21 +4255,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &mut self,
         now_ms: u64,
     ) -> Result<HeartbeatLeaseExpiry, ControlPlaneError> {
-        if self
-            .snapshot
-            .committed_timestamp_exceeds_forward_bound(now_ms)
-            && !self.snapshot.has_heartbeat_lease_expiring_at(now_ms)
-        {
-            return Ok(HeartbeatLeaseExpiry {
-                cluster_epoch: self.snapshot.cluster_epoch,
-                expired_nodes: Vec::new(),
-                peering_pgs: Vec::new(),
-                snapshot: self.snapshot.clone(),
-            });
-        }
+        let expire_at_ms = self.snapshot.heartbeat_lease_expiry_timestamp(now_ms);
         let applied =
             self.apply_and_commit_command(ControlPlaneCommand::ExpireHeartbeatLeases {
-                expire_at_ms: now_ms,
+                expire_at_ms,
             })?;
         let ControlPlaneCommandResponse::ExpireHeartbeatLeases {
             expired_nodes,
@@ -9775,6 +9947,16 @@ pub enum ControlPlaneError {
     LeaseDeadlineOverflow,
 
     #[error(
+        "serving deadline {serving_deadline_ms}ms exceeds effective committed time {effective_committed_now_ms}ms plus maximum lease {max_lease_ms}ms and skew budget {skew_budget_ms}ms"
+    )]
+    LeaseDeadlineOutOfBounds {
+        serving_deadline_ms: u64,
+        effective_committed_now_ms: u64,
+        max_lease_ms: u64,
+        skew_budget_ms: u64,
+    },
+
+    #[error(
         "committed timestamp {timestamp_ms}ms regressed below previous maximum {max_committed_timestamp_ms}ms"
     )]
     CommittedTimestampRegression {
@@ -9790,6 +9972,17 @@ pub enum ControlPlaneError {
         max_committed_timestamp_ms: u64,
         max_forward_jump_ms: u64,
     },
+
+    #[error(
+        "control-plane authority clock was established for Raft term {established_term:?}, not current local leadership term {current_term}"
+    )]
+    AuthorityClockLeadershipChanged {
+        established_term: Option<u64>,
+        current_term: u64,
+    },
+
+    #[error("control-plane authority clock-health source is unavailable")]
+    AuthorityClockSourceUnavailable,
 
     #[error(
         "node {node_id} heartbeat lease deadline {requested_lease_deadline_ms}ms regressed below current deadline {current_lease_deadline_ms}ms"
@@ -19190,14 +19383,14 @@ mod tests {
             PgState::Peering,
             active_proof,
             false,
-            20_000,
+            11_000,
         );
         authority
             .complete_pg_peering(
                 PgId::new(42),
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
-                20_001,
+                11_001,
             )
             .unwrap();
         heartbeat_with_pg_proof(
@@ -19207,7 +19400,7 @@ mod tests {
             PgState::Active,
             active_proof,
             false,
-            20_002,
+            11_002,
         );
         let initial_epoch = ClusterEpoch::INITIAL;
         let source_epoch = authority.snapshot().cluster_epoch();
@@ -19301,14 +19494,14 @@ mod tests {
         );
         let current_epoch = authority.snapshot().cluster_epoch();
         let mut advanced_floor_heartbeat =
-            heartbeat_from_record(&authority, 1, current_epoch, 20_000);
+            heartbeat_from_record(&authority, 1, current_epoch, 11_000);
         advanced_floor_heartbeat.cluster_map_history_reference_summary =
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(advanced_floor),
                 oldest_durable_backfill_epoch: None,
             };
         assert!(authority
-            .heartbeat(advanced_floor_heartbeat, 20_000)
+            .heartbeat(advanced_floor_heartbeat, 11_000)
             .unwrap()
             .serving());
         assert_eq!(
@@ -19333,7 +19526,7 @@ mod tests {
             Some(advanced_floor)
         );
         assert_eq!(
-            persisted.snapshot().runtime_map(20_000).unwrap().nodes()[0]
+            persisted.snapshot().runtime_map(11_000).unwrap().nodes()[0]
                 .cluster_map_history_floor_epoch(),
             Some(advanced_floor)
         );
@@ -19431,9 +19624,9 @@ mod tests {
             .is_some());
 
         let current_epoch = authority.snapshot().cluster_epoch();
-        let clear_floor_heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 20_000);
+        let clear_floor_heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 11_000);
         assert!(authority
-            .heartbeat(clear_floor_heartbeat, 20_000)
+            .heartbeat(clear_floor_heartbeat, 11_000)
             .unwrap()
             .serving());
         assert_eq!(
@@ -19491,14 +19684,14 @@ mod tests {
             .is_none());
 
         let current_epoch = authority.snapshot().cluster_epoch();
-        let mut stale_floor_heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 20_000);
+        let mut stale_floor_heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 11_000);
         stale_floor_heartbeat.cluster_map_history_reference_summary =
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(first_epoch),
                 oldest_durable_backfill_epoch: None,
             };
         let error = authority
-            .heartbeat(stale_floor_heartbeat, 20_000)
+            .heartbeat(stale_floor_heartbeat, 11_000)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -19545,14 +19738,14 @@ mod tests {
             PgState::Peering,
             active_proof,
             false,
-            20_000,
+            11_000,
         );
         authority
             .complete_pg_peering(
                 PgId::new(42),
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
-                20_001,
+                11_001,
             )
             .unwrap();
         heartbeat_with_pg_proof(
@@ -19562,7 +19755,7 @@ mod tests {
             PgState::Active,
             active_proof,
             false,
-            20_002,
+            11_002,
         );
         let source_epoch = authority.snapshot().cluster_epoch();
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
@@ -19639,14 +19832,14 @@ mod tests {
         let current_epoch = authority.snapshot().cluster_epoch();
         let future_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
         let mut future_floor_heartbeat =
-            heartbeat_from_record(&authority, 1, current_epoch, 20_000);
+            heartbeat_from_record(&authority, 1, current_epoch, 11_000);
         future_floor_heartbeat.cluster_map_history_reference_summary =
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: None,
                 oldest_durable_backfill_epoch: Some(future_epoch),
             };
         let error = authority
-            .heartbeat(future_floor_heartbeat, 20_000)
+            .heartbeat(future_floor_heartbeat, 11_000)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -19693,14 +19886,14 @@ mod tests {
             PgState::Peering,
             active_proof,
             false,
-            20_000,
+            11_000,
         );
         authority
             .complete_pg_peering(
                 PgId::new(42),
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
-                20_001,
+                11_001,
             )
             .unwrap();
         heartbeat_with_pg_proof(
@@ -19710,7 +19903,7 @@ mod tests {
             PgState::Active,
             active_proof,
             false,
-            20_002,
+            11_002,
         );
         let source_epoch = authority.snapshot().cluster_epoch();
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
@@ -19732,7 +19925,7 @@ mod tests {
             PgState::Peering,
             transfer.metadata_proof(),
             false,
-            20_003,
+            11_003,
         );
 
         authority
@@ -19780,14 +19973,14 @@ mod tests {
             PgState::Peering,
             active_proof,
             false,
-            20_000,
+            11_000,
         );
         authority
             .complete_pg_peering(
                 PgId::new(42),
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
-                20_001,
+                11_001,
             )
             .unwrap();
         heartbeat_with_pg_proof(
@@ -19797,7 +19990,7 @@ mod tests {
             PgState::Active,
             active_proof,
             false,
-            20_002,
+            11_002,
         );
         let source_epoch = authority.snapshot().cluster_epoch();
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
@@ -20193,7 +20386,7 @@ mod tests {
                 "version=15\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "max_committed_timestamp_ms=-\n",
+                "max_committed_timestamp_ms=100\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,10,20,30,0\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0\n",
@@ -20497,16 +20690,17 @@ mod tests {
             })
         ));
         heartbeat_with_pg_observation(&mut authority, 5, 39, PgState::Peering, 302);
+        heartbeat_with_pg_observation(&mut authority, 5, 39, PgState::Peering, 1_302);
         authority
             .complete_pg_peering(
                 PgId::new(39),
                 NodeId::new(5),
                 node_incarnation(&authority, 5),
-                302,
+                1_302,
             )
             .unwrap();
         let active_again =
-            heartbeat_with_pg_observation(&mut authority, 5, 39, PgState::Active, 303);
+            heartbeat_with_pg_observation(&mut authority, 5, 39, PgState::Active, 1_303);
         authority
             .authorize_pg_operation(
                 PgServiceOperation::MetadataWrite,
@@ -20514,7 +20708,7 @@ mod tests {
                 NodeId::new(5),
                 node_incarnation(&authority, 5),
                 active_again.cluster_epoch(),
-                304,
+                1_304,
             )
             .unwrap();
     }
@@ -20950,18 +21144,18 @@ mod tests {
                 && max_ms == MAX_HEARTBEAT_LEASE_MS
         ));
 
-        let heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 2_002);
+        let heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 2_001);
         assert!(matches!(
             before.apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
                 heartbeat,
-                heartbeat_at_ms: 2_002,
+                heartbeat_at_ms: 2_001,
                 lease_deadline_ms: 2_200,
             },),
             Err(ControlPlaneError::LeaseDeadlineMismatch {
                 node_id: 1,
-                heartbeat_at_ms: 2_002,
+                heartbeat_at_ms: 2_001,
                 requested_ms: 100,
-                expected_deadline_ms: 2_102,
+                expected_deadline_ms: 2_101,
                 actual_deadline_ms: 2_200,
             })
         ));
@@ -20998,7 +21192,7 @@ mod tests {
     }
 
     #[test]
-    fn record_node_heartbeat_command_bounds_committed_timestamp_forward_jump() {
+    fn record_node_heartbeat_command_accepts_elapsed_forward_progress() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -21008,7 +21202,7 @@ mod tests {
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
 
         let before = authority.snapshot().clone();
-        let heartbeat_at_ms = 1_001 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 1;
+        let heartbeat_at_ms = 1_001 + CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 1;
         let heartbeat =
             heartbeat_from_record(&authority, 1, before.cluster_epoch(), heartbeat_at_ms);
         let applied = before
@@ -21017,11 +21211,11 @@ mod tests {
                 heartbeat_at_ms,
                 lease_deadline_ms: heartbeat_at_ms + 100,
             })
-            .expect("heartbeat should apply with bounded timestamp catch-up");
+            .unwrap();
 
         assert_eq!(
             applied.snapshot().max_committed_timestamp_ms(),
-            Some(1_001 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS)
+            Some(heartbeat_at_ms)
         );
         assert_eq!(
             applied
@@ -21187,7 +21381,7 @@ mod tests {
     }
 
     #[test]
-    fn expire_heartbeat_leases_command_rejects_forward_jump_without_expired_lease() {
+    fn expire_heartbeat_leases_command_accepts_elapsed_forward_progress() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -21198,153 +21392,132 @@ mod tests {
         authority.expire_heartbeat_leases(1_101).unwrap();
 
         let before = authority.snapshot().clone();
-        let expire_at_ms = 1_101 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 1;
-        let error = before
+        let expire_at_ms = 1_101 + CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 1;
+        let applied = before
             .apply_control_plane_command(ControlPlaneCommand::ExpireHeartbeatLeases {
                 expire_at_ms,
             })
-            .unwrap_err();
+            .unwrap();
 
+        assert_eq!(
+            applied.snapshot().max_committed_timestamp_ms(),
+            Some(expire_at_ms)
+        );
+        assert_eq!(authority.snapshot(), &before);
+    }
+
+    #[test]
+    fn authority_clock_rejects_restart_discontinuity_before_expiry() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        drop(authority);
+        let store = FileControlPlaneStore::new(&state_path);
+        let authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let before = authority.snapshot().clone();
+        let far_future_now_ms = 1_001 + CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 123;
+        let mut clock = ControlPlaneAuthorityClock::new(
+            before.max_committed_timestamp_ms(),
+            far_future_now_ms,
+            Some(20),
+        )
+        .unwrap();
         assert!(matches!(
-            error,
-            ControlPlaneError::CommittedTimestampTooFarAhead {
-                timestamp_ms,
-                max_committed_timestamp_ms: 1_101,
-                max_forward_jump_ms: MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS,
-            } if timestamp_ms == expire_at_ms
+            clock.effective_now_ms(far_future_now_ms, Some(20)),
+            Err(ControlPlaneError::CommittedTimestampTooFarAhead { .. })
         ));
         assert_eq!(authority.snapshot(), &before);
     }
 
     #[test]
-    fn expire_heartbeat_leases_proposal_recovers_after_long_downtime() {
-        let tmp = test_util::tempdir();
-        let state_path = tmp.path().join("control-plane.state");
-        let store = FileControlPlaneStore::new(&state_path);
-        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
-        authority
-            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
-            .unwrap();
-        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-
-        drop(authority);
-        let store = FileControlPlaneStore::new(&state_path);
-        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
-        let far_future_now_ms = 1_001 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
-        let expected_expiry_timestamp = authority
-            .snapshot()
-            .max_committed_timestamp_ms()
-            .unwrap()
-            .saturating_add(MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS);
-        let expiry = authority
-            .expire_heartbeat_leases(far_future_now_ms)
-            .expect("lease expiry proposal should recover expired leases after downtime");
-
-        assert_eq!(expiry.expired_nodes(), &[NodeId::new(1)]);
+    fn authority_clock_accepts_healthy_elapsed_time_after_idle() {
+        let mut clock = ControlPlaneAuthorityClock::new(Some(1_000), 1_000, Some(50)).unwrap();
         assert_eq!(
-            authority.snapshot().max_committed_timestamp_ms(),
-            Some(expected_expiry_timestamp)
-        );
-        assert_eq!(
-            authority
-                .snapshot()
-                .node(NodeId::new(1))
-                .unwrap()
-                .availability(),
-            NodeAvailabilityState::Unavailable
-        );
-
-        let heartbeat_at_ms = far_future_now_ms + 1;
-        let heartbeat = heartbeat_from_record(
-            &authority,
-            1,
-            authority.snapshot().cluster_epoch(),
-            heartbeat_at_ms,
-        );
-        authority
-            .heartbeat(heartbeat, heartbeat_at_ms)
-            .expect("heartbeat should renew after downtime expiry recovery");
-        assert_eq!(
-            authority.snapshot().max_committed_timestamp_ms(),
-            Some(heartbeat_at_ms)
+            clock.effective_now_ms(11_000, Some(10_050)).unwrap(),
+            11_000
         );
     }
 
     #[test]
-    fn heartbeat_re_admission_catches_up_after_clean_expiry_downtime() {
-        let tmp = test_util::tempdir();
-        let state_path = tmp.path().join("control-plane.state");
-        let store = FileControlPlaneStore::new(&state_path);
-        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
-        authority
-            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
-            .unwrap();
-        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-        authority
-            .expire_heartbeat_leases(1_101)
-            .expect("clean expiry should apply before downtime");
-
-        drop(authority);
-        let store = FileControlPlaneStore::new(&state_path);
-        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
-        let before = authority.snapshot().clone();
-        assert_eq!(before.max_committed_timestamp_ms(), Some(1_101));
-        assert_eq!(
-            before.node(NodeId::new(1)).unwrap().availability(),
-            NodeAvailabilityState::Unavailable
-        );
-        assert_eq!(
-            before.node(NodeId::new(1)).unwrap().lease_deadline_ms(),
-            None
-        );
-
-        let far_future_now_ms = 1_101 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
-        let deferred = authority
-            .expire_heartbeat_leases(far_future_now_ms)
-            .expect("lease expiry scan without live leases should defer far-future timestamp");
-        assert!(deferred.expired_nodes().is_empty());
-        assert_eq!(authority.snapshot(), &before);
-
-        let heartbeat = heartbeat_from_record(
-            &authority,
-            1,
-            authority.snapshot().cluster_epoch(),
-            far_future_now_ms,
-        );
-        authority
-            .heartbeat(heartbeat, far_future_now_ms)
-            .expect("heartbeat should re-admit after clean expiry downtime");
-        assert_eq!(
-            authority.snapshot().max_committed_timestamp_ms(),
-            Some(1_101 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS)
-        );
-        assert_eq!(
-            authority
-                .snapshot()
-                .node(NodeId::new(1))
-                .unwrap()
-                .availability(),
-            NodeAvailabilityState::Healthy
-        );
-
-        let follow_up_at_ms = far_future_now_ms + 1;
-        let follow_up = heartbeat_from_record(
-            &authority,
-            1,
-            authority.snapshot().cluster_epoch(),
-            follow_up_at_ms,
-        );
-        authority
-            .heartbeat(follow_up, follow_up_at_ms)
-            .expect("follow-up heartbeat should finish bounded timestamp catch-up");
-        assert_eq!(
-            authority.snapshot().max_committed_timestamp_ms(),
-            Some(follow_up_at_ms)
-        );
+    fn authority_clock_rejects_missing_initial_health_sample() {
+        assert!(matches!(
+            ControlPlaneAuthorityClock::new(Some(1_000), 1_000, None),
+            Err(ControlPlaneError::AuthorityClockSourceUnavailable)
+        ));
     }
 
     #[test]
-    fn expire_heartbeat_leases_proposal_defers_forward_timestamp_jump_without_ratchet() {
+    fn authority_clock_latches_later_health_source_failure() {
+        let mut clock = ControlPlaneAuthorityClock::new(Some(1_000), 1_000, Some(50)).unwrap();
+        assert!(matches!(
+            clock.effective_now_ms(1_100, None),
+            Err(ControlPlaneError::AuthorityClockSourceUnavailable)
+        ));
+        assert!(clock.effective_now_ms(1_101, Some(151)).is_err());
+    }
+
+    #[test]
+    fn authority_clock_invalidates_new_local_raft_leadership_term() {
+        let mut clock = ControlPlaneAuthorityClock::new(Some(1_000), 1_000, Some(50)).unwrap();
+        clock.bind_initial_raft_leadership_term(Some(7));
+        clock.validate_raft_leadership_term(7).unwrap();
+        assert_eq!(clock.effective_now_ms(1_100, Some(150)).unwrap(), 1_100);
+
+        assert!(matches!(
+            clock.validate_raft_leadership_term(8),
+            Err(ControlPlaneError::AuthorityClockLeadershipChanged {
+                established_term: Some(7),
+                current_term: 8,
+            })
+        ));
+        assert!(clock.effective_now_ms(1_101, Some(151)).is_err());
+    }
+
+    #[test]
+    fn restored_follower_clock_cannot_establish_first_local_leadership_term() {
+        let mut clock = ControlPlaneAuthorityClock::new(None, 1_000, Some(50)).unwrap();
+        clock.bind_initial_raft_leadership_term(None);
+        clock.observe_committed_timestamp_high_water(Some(1_000));
+
+        assert!(matches!(
+            clock.validate_raft_leadership_term(8),
+            Err(ControlPlaneError::AuthorityClockLeadershipChanged {
+                established_term: None,
+                current_term: 8,
+            })
+        ));
+    }
+
+    #[test]
+    fn follower_role_without_timestamp_high_water_still_requires_reestablishment() {
+        let mut clock = ControlPlaneAuthorityClock::new(None, 1_000, Some(50)).unwrap();
+        clock.bind_initial_raft_leadership_term(None);
+
+        assert!(matches!(
+            clock.validate_raft_leadership_term(1),
+            Err(ControlPlaneError::AuthorityClockLeadershipChanged {
+                established_term: None,
+                current_term: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn fresh_unbound_clock_can_bind_first_local_raft_leadership_term() {
+        let mut clock = ControlPlaneAuthorityClock::new(None, 1_000, Some(50)).unwrap();
+
+        clock.validate_raft_leadership_term(1).unwrap();
+        assert_eq!(clock.effective_now_ms(1_001, Some(51)).unwrap(), 1_001);
+    }
+
+    #[test]
+    fn authority_clock_latches_forward_step_without_timestamp_ratchet() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -21355,15 +21528,13 @@ mod tests {
         authority.expire_heartbeat_leases(1_101).unwrap();
 
         let before = authority.snapshot().clone();
-        let far_future_now_ms = 1_101 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
+        let mut clock = ControlPlaneAuthorityClock::new(Some(1_101), 1_101, Some(10)).unwrap();
+        let far_future_now_ms = 1_101 + CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 123;
         for _ in 0..3 {
-            let expiry = authority
-                .expire_heartbeat_leases(far_future_now_ms)
-                .expect("lease expiry proposal should defer far-future timestamp-only jumps");
-
-            assert!(expiry.expired_nodes().is_empty());
-            assert!(expiry.peering_pgs().is_empty());
-            assert_eq!(expiry.snapshot(), &before);
+            assert!(matches!(
+                clock.effective_now_ms(far_future_now_ms, Some(11)),
+                Err(ControlPlaneError::CommittedTimestampTooFarAhead { .. })
+            ));
             assert_eq!(authority.snapshot(), &before);
         }
     }
@@ -26782,8 +26953,13 @@ mod tests {
                             heartbeat.pg_observations =
                                 heartbeat_model_observation(authority.snapshot(), node_id, 3);
                         }
+                        let before = authority.snapshot().clone();
                         let before_epoch = authority.snapshot().cluster_epoch();
-                        let lease = authority.heartbeat(heartbeat, now_ms).unwrap();
+                        let Ok(lease) = authority.heartbeat(heartbeat, now_ms) else {
+                            prop_assert_eq!(authority.snapshot(), &before);
+                            prop_assert_eq!(store.load().unwrap().unwrap(), before);
+                            continue;
+                        };
                         prop_assert!(!lease.serving());
                         prop_assert!(lease.cluster_epoch() >= before_epoch);
                         prop_assert!(
@@ -26823,9 +26999,12 @@ mod tests {
                                 heartbeat_model_observation(&before, node_id, 4);
                         }
                         let error = authority.refresh_node_heartbeat(heartbeat, now_ms).unwrap_err();
-                        let is_future_epoch_error =
-                            matches!(error, ControlPlaneError::FutureNodeObservedEpoch { .. });
-                        prop_assert!(is_future_epoch_error);
+                        let is_fail_closed_error = matches!(
+                            error,
+                            ControlPlaneError::FutureNodeObservedEpoch { .. }
+                                | ControlPlaneError::CommittedTimestampTooFarAhead { .. }
+                        );
+                        prop_assert!(is_fail_closed_error);
                         prop_assert_eq!(authority.snapshot(), &before);
                         prop_assert_eq!(
                             store.load().unwrap().unwrap(),
@@ -27165,12 +27344,14 @@ mod tests {
             PgState::Peering,
             node_one_deadline + 1,
         );
+        let successor_fence_ms = node_one_deadline + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
+        heartbeat_with_pg_observation(&mut authority, 2, 13, PgState::Peering, successor_fence_ms);
         authority
             .complete_pg_peering(
                 PgId::new(13),
                 NodeId::new(2),
                 node_incarnation(&authority, 2),
-                node_one_deadline + 2,
+                successor_fence_ms,
             )
             .unwrap();
         heartbeat_with_pg_observation(
@@ -27178,10 +27359,10 @@ mod tests {
             2,
             13,
             PgState::Active,
-            node_one_deadline + 3,
+            successor_fence_ms + 1,
         );
         assert_eq!(
-            authority.serving_pg_primary(PgId::new(13), node_one_deadline + 3),
+            authority.serving_pg_primary(PgId::new(13), successor_fence_ms + 1),
             Some(NodeId::new(2))
         );
 
@@ -27191,9 +27372,9 @@ mod tests {
                     &authority,
                     1,
                     authority.snapshot().cluster_epoch(),
-                    node_one_deadline + 4,
+                    successor_fence_ms + 2,
                 ),
-                node_one_deadline + 4,
+                successor_fence_ms + 2,
             )
             .unwrap();
         assert!(!recovered.serving());
@@ -27202,7 +27383,7 @@ mod tests {
             PgState::Peering
         );
         assert_eq!(
-            authority.serving_pg_primary(PgId::new(13), node_one_deadline + 4),
+            authority.serving_pg_primary(PgId::new(13), successor_fence_ms + 2),
             None
         );
 
@@ -27212,9 +27393,9 @@ mod tests {
                     &authority,
                     1,
                     recovered.cluster_epoch(),
-                    node_one_deadline + 5,
+                    successor_fence_ms + 3,
                 ),
-                node_one_deadline + 5,
+                successor_fence_ms + 3,
             )
             .unwrap();
         assert!(caught_up.serving());
@@ -27228,7 +27409,7 @@ mod tests {
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
                 authority.snapshot().cluster_epoch(),
-                node_one_deadline + 6,
+                successor_fence_ms + 4,
             ),
             Err(ControlPlaneError::PgNotActive { pg_id: 13, .. })
         ));
@@ -27834,15 +28015,43 @@ mod tests {
             Err(ControlPlaneError::PgPreviousPrimaryLeaseStillActive { pg_id: 27, .. })
         ));
 
-        let ready = authority
+        assert!(authority
             .snapshot()
             .ready_pg_peering_completions(previous_lease_deadline)
+            .unwrap()
+            .is_empty());
+        heartbeat_with_pg_observation(
+            &mut authority,
+            1,
+            27,
+            PgState::Peering,
+            previous_lease_deadline,
+        );
+        heartbeat_with_pg_observation(
+            &mut authority,
+            2,
+            27,
+            PgState::Peering,
+            previous_lease_deadline + 1,
+        );
+        let successor_fence_ms = previous_lease_deadline + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
+        heartbeat_with_pg_observation(&mut authority, 1, 27, PgState::Peering, successor_fence_ms);
+        heartbeat_with_pg_observation(
+            &mut authority,
+            2,
+            27,
+            PgState::Peering,
+            successor_fence_ms + 1,
+        );
+        let ready = authority
+            .snapshot()
+            .ready_pg_peering_completions(successor_fence_ms + 1)
             .unwrap();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].primary, NodeId::new(2));
         assert_eq!(
             authority
-                .complete_ready_pg_peerings(previous_lease_deadline)
+                .complete_ready_pg_peerings(successor_fence_ms + 1)
                 .unwrap(),
             vec![PgId::new(27)]
         );
@@ -28032,20 +28241,28 @@ mod tests {
             .ready_pg_peering_completions(2_016)
             .unwrap()
             .is_empty());
-        let mut stale_node_two_peering = heartbeat_from_record(&authority, 2, peering_epoch, 2_103);
+        let mut fence_bridge = heartbeat_from_record(&authority, 2, peering_epoch, 2_103);
+        fence_bridge.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(20),
+            state: PgState::Peering,
+            metadata_proof: active_proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(fence_bridge, 2_103).unwrap();
+        let mut stale_node_two_peering = heartbeat_from_record(&authority, 2, peering_epoch, 3_103);
         stale_node_two_peering.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(20),
             state: PgState::Peering,
             metadata_proof: PgMetadataProof::empty(),
             has_pending_metadata_command: false,
         }];
-        authority.heartbeat(stale_node_two_peering, 2_103).unwrap();
+        authority.heartbeat(stale_node_two_peering, 3_103).unwrap();
         assert!(matches!(
             authority.complete_pg_peering(
                 PgId::new(20),
                 NodeId::new(2),
                 node_incarnation(&authority, 2),
-                2_103,
+                3_103,
             ),
             Err(ControlPlaneError::PgPeeringMetadataProofBelowFloor {
                 pg_id: 20,
@@ -28056,38 +28273,38 @@ mod tests {
             }) if expected == active_proof && actual == PgMetadataProof::empty()
         ));
 
-        let mut node_two_peering = heartbeat_from_record(&authority, 2, peering_epoch, 2_104);
+        let mut node_two_peering = heartbeat_from_record(&authority, 2, peering_epoch, 3_104);
         node_two_peering.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(20),
             state: PgState::Peering,
             metadata_proof: active_proof,
             has_pending_metadata_command: false,
         }];
-        authority.heartbeat(node_two_peering, 2_104).unwrap();
+        authority.heartbeat(node_two_peering, 3_104).unwrap();
         authority
             .complete_pg_peering(
                 PgId::new(20),
                 NodeId::new(2),
                 node_incarnation(&authority, 2),
-                2_104,
+                3_104,
             )
             .unwrap();
         let mut new_active_heartbeat =
-            heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 2_105);
+            heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 3_105);
         new_active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(20),
             state: PgState::Active,
             metadata_proof: active_proof,
             has_pending_metadata_command: false,
         }];
-        let new_active = authority.heartbeat(new_active_heartbeat, 2_105).unwrap();
+        let new_active = authority.heartbeat(new_active_heartbeat, 3_105).unwrap();
         let new_epoch = new_active.cluster_epoch();
         assert!(new_epoch > peering_epoch);
 
         authority
             .heartbeat(
-                heartbeat_from_record(&authority, 1, new_epoch, 2_106),
-                2_106,
+                heartbeat_from_record(&authority, 1, new_epoch, 3_106),
+                3_106,
             )
             .unwrap();
         assert!(matches!(
@@ -28097,7 +28314,7 @@ mod tests {
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
                 new_epoch,
-                2_107,
+                3_107,
             ),
             Err(ControlPlaneError::NodeNotPgPrimary {
                 pg_id: 20,
@@ -28114,7 +28331,7 @@ mod tests {
                 NodeId::new(2),
                 node_incarnation(&authority, 2),
                 new_epoch,
-                2_108,
+                3_108,
             )
             .unwrap();
         assert_eq!(new_authorization.primary_node_id(), NodeId::new(2));
@@ -28446,12 +28663,21 @@ mod tests {
             false,
             2_100,
         );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            49,
+            PgState::Peering,
+            epoch_local_proof,
+            false,
+            3_100,
+        );
         authority
             .complete_pg_peering(
                 PgId::new(49),
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
-                2_100,
+                3_100,
             )
             .unwrap();
         let pg = authority.snapshot().pg(PgId::new(49)).unwrap();
@@ -28553,12 +28779,21 @@ mod tests {
             false,
             2_100,
         );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            50,
+            PgState::Peering,
+            epoch_local_proof,
+            false,
+            3_100,
+        );
         authority
             .complete_pg_peering(
                 PgId::new(50),
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
-                2_100,
+                3_100,
             )
             .unwrap();
         let pg = authority.snapshot().pg(PgId::new(50)).unwrap();
@@ -28847,12 +29082,21 @@ mod tests {
             false,
             (2_040, 5),
         );
+        heartbeat_with_pg_proof_and_lease_duration(
+            &mut authority,
+            3,
+            pg_id.get(),
+            PgState::Peering,
+            imported_proof,
+            false,
+            (3_035, 5),
+        );
         authority
             .complete_pg_peering(
                 pg_id,
                 NodeId::new(3),
                 node_incarnation(&authority, 3),
-                2_041,
+                3_035,
             )
             .unwrap();
         let imported_active_pg = authority.snapshot().pg(pg_id).unwrap();
@@ -28880,14 +29124,14 @@ mod tests {
             PgState::Peering,
             imported_proof,
             false,
-            2_050,
+            3_050,
         );
         authority
             .complete_pg_peering(
                 pg_id,
                 NodeId::new(3),
                 node_incarnation(&authority, 3),
-                2_051,
+                3_051,
             )
             .unwrap();
         assert_eq!(
@@ -29072,12 +29316,21 @@ mod tests {
             false,
             2_003,
         );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            42,
+            PgState::Peering,
+            active_proof,
+            false,
+            3_003,
+        );
         assert!(matches!(
             authority.complete_pg_peering(
                 PgId::new(42),
                 NodeId::new(2),
                 node_incarnation(&authority, 2),
-                2_004,
+                3_003,
             ),
             Err(ControlPlaneError::PgPeeringMetadataProofBelowFloor {
                 pg_id: 42,
@@ -29098,14 +29351,14 @@ mod tests {
             PgState::Peering,
             stale_source_above_imported,
             false,
-            2_004,
+            3_004,
         );
         assert!(matches!(
             authority.complete_pg_peering(
                 PgId::new(42),
                 NodeId::new(2),
                 node_incarnation(&authority, 2),
-                2_004,
+                3_004,
             ),
             Err(ControlPlaneError::PgPeeringMetadataProofBelowFloor {
                 pg_id: 42,
@@ -29125,14 +29378,14 @@ mod tests {
             PgState::Peering,
             imported_proof,
             false,
-            2_005,
+            3_005,
         );
         authority
             .complete_pg_peering(
                 PgId::new(42),
                 NodeId::new(2),
                 node_incarnation(&authority, 2),
-                2_006,
+                3_006,
             )
             .unwrap();
         let active_pg = authority.snapshot().pg(PgId::new(42)).unwrap();
@@ -29307,7 +29560,7 @@ mod tests {
             state_digest: 13,
         };
         for (idx, pg_id) in [42, 43].into_iter().enumerate() {
-            let base_ms = 10_000 + (idx as u64 * 100);
+            let base_ms = 1_990 + (idx as u64 * 100);
             authority
                 .set_pg_acting_set(PgId::new(pg_id), vec![NodeId::new(1)])
                 .unwrap();
@@ -29346,7 +29599,7 @@ mod tests {
             PgState::Active,
             imported_activation_floor,
             false,
-            10_080,
+            2_180,
         );
         authority
             .fence_pg_for_metadata_transfer(PgId::new(42))

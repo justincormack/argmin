@@ -220,51 +220,39 @@ Confidence: confirmed. This supersedes the latest statement that `R3-1` and
 `R3-2` are fully addressed. Their exact crash-loop mechanisms are fixed, but
 the replacement does not establish a bounded lease invariant.
 
-Implementation status (2026-07-10): model-first work is in progress. The
+Implementation status (2026-07-10): the model and safety integration are in
+place, with explicit recovery and independent-host validation still open. The
 normative clock/fault assumptions and lease equations are now defined in
 [`guides/control-plane-clock-and-lease-model.md`](../guides/control-plane-clock-and-lease-model.md),
 with an executable independent-clock model in
-`crates/storage/src/control_plane_lease.rs`. Production runtime-map consumers
-still use absolute wall-clock deadlines, so this finding remains open until
-the authority bound, process-local monotonic binding, restart fence, and
-successor activation margin are wired through end to end.
+`crates/storage/src/control_plane_lease.rs`.
 
-`MAX_HEARTBEAT_LEASE_MS` is 10 seconds and
-`MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS` is one hour
-(`control_plane.rs:28-29`). On heartbeat apply:
+The authority process boundary now compares wall progress with monotonic
+elapsed time. It admits arbitrary healthy idle time, latches wall-clock steps
+beyond the 1,000 ms skew budget non-serving, and starts a restored process
+established only when wall time is within that budget of the persisted
+timestamp high-water. Replicated apply separately rejects timestamp regression
+and validates every stored lease against command time, maximum lease duration,
+and skew; it does not incorrectly treat logical high-water distance as elapsed
+real time. Raft clock authority is bound to the locally serving term and is
+invalidated when a different local leadership term appears; only the process
+that initializes fresh membership may bind its first term automatically.
+Restored and joining followers close that exception before they can become
+leader, including before any timestamp-bearing command exists. Frontend and
+storage-node runtime maps bind authority deadlines to qualified or defensively
+monitored process-local monotonic deadlines with the skew budget subtracted,
+and every serving admission revalidates process clock health. Apple uses a
+separate adjusted monotonic health source so normal frequency correction does
+not accumulate against its raw continuous lease clock. Historical metadata-
+recovery permits carry the same monotonic fence, and successor activation waits
+until the old deadline plus skew.
 
-- `bounded_committed_timestamp_step` clamps only
-  `max_committed_timestamp_ms` (`:928-933`);
-- `expected_lease_deadline_ms` is still the unbounded
-  `heartbeat_at_ms + requested_lease_duration_ms` (`:1477-1480`);
-- the stored deadline is the maximum of that value and the existing deadline
-  (`:1496-1501`), so later corrected time cannot shorten it; and
-- the state stores the unbounded heartbeat time and lease deadline while
-  recording only the clamped committed high-water (`:1568-1571`,
-  `:1620-1623`).
-
-The single-authority wrapper computes the same unbounded deadline
-(`:3786-3817`), as does the experimental Raft wrapper
-(`argmin-s3/src/main.rs:1693-1721`). The focused regression explicitly expects
-this split: the high-water advances by one hour while the node deadline remains
-`heartbeat_at_ms + 100` (`control_plane.rs:20555-20587`).
-
-Serving maps use the minimum active-primary lease deadline as their validity
-deadline (`control_plane.rs:724-728`), and storage nodes/frontends compare that
-authority-issued absolute deadline to their local wall clocks. A single
-far-future heartbeat can therefore make the route map and old primary usable
-until the far-future time. Automatic expiry cannot mark a dead node unavailable
-until that deadline. Repeated heartbeats also advance the high-water by another
-bounded step per command, so the bound is on one command, not on catch-up rate.
-The default 250 ms refresh interval makes repeated ratcheting a normal path
-(`config.rs:355-357`, `:551-561`).
-
-If the authority clock is corrected after one heartbeat, the elevated
-high-water rejects corrected timestamps while the far-future serving lease
-remains. If it stays wrong, later commands rapidly ratchet the high-water
-toward it. In both cases the safety and availability properties depend on an
-unstated clock bound. Combined with `CL1`, a deposed primary can retain a much
-longer serving window than the configured lease duration.
+This finding remains open for availability and operational closeout: add the
+explicit authenticated authority-clock re-establishment operation required
+after a discontinuity larger than the skew budget, expose its diagnostics, and
+run independent-host clock-step/restart coverage. Until that operation exists,
+a restored authority whose clock is outside the persisted high-water budget
+intentionally cannot expire leases, publish serving maps, or re-admit nodes.
 
 Required design:
 
@@ -406,8 +394,10 @@ the current tree; they are omitted from the open list below.
 
 ### Safety and authority
 
-- `CP2` and `CL4`: absolute authority deadlines are compared against unrelated
-  host wall clocks with zero skew margin. DCC-2 makes the consequence larger.
+- `CP2` and `CL4`: the zero-margin wall-clock comparison is replaced by
+  process-local monotonic binding and a symmetric successor skew fence. The
+  remaining closeout is the explicit authority clock re-establishment path and
+  independent-host validation tracked under DCC-2.
 - `RPC4`: read-handle fencing is keyed by epoch-bearing `ShardLocation`, while
   the physical shard path is keyed by shard identity without epoch. Handles
   for two epochs can alias one file without blocking deletion.

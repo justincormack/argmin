@@ -3,6 +3,8 @@
 //! The wire deadline remains an authority wall-clock timestamp. A process must bind it to
 //! its monotonic clock before serving; wall-clock changes after binding cannot extend it.
 
+use std::sync::{Mutex, OnceLock};
+
 use thiserror::Error;
 
 /// Maximum supported wall-clock offset between any two control-plane participants.
@@ -21,6 +23,12 @@ pub(crate) enum LeaseClockError {
         skew_budget_ms: u64,
     },
     #[error(
+        "process wall clock moved outside the {skew_budget_ms}ms budget relative to monotonic time"
+    )]
+    LocalClockUnhealthy { skew_budget_ms: u64 },
+    #[error("process clock-health source is unavailable")]
+    ClockHealthSourceUnavailable,
+    #[error(
         "serving deadline {serving_deadline_ms}ms exceeds effective committed time {effective_committed_now_ms}ms plus lease {max_lease_ms}ms and skew {skew_budget_ms}ms"
     )]
     ServingDeadlineOutOfBounds {
@@ -31,6 +39,95 @@ pub(crate) enum LeaseClockError {
     },
 }
 
+#[derive(Debug)]
+struct ProcessLeaseClockHealth {
+    initial_wall_ms: u64,
+    initial_clock_health_ms: u64,
+    healthy: bool,
+}
+
+impl ProcessLeaseClockHealth {
+    fn new(
+        local_wall_ms: u64,
+        local_clock_health_ms: Option<u64>,
+    ) -> Result<Self, LeaseClockError> {
+        let local_clock_health_ms =
+            local_clock_health_ms.ok_or(LeaseClockError::ClockHealthSourceUnavailable)?;
+        Ok(Self {
+            initial_wall_ms: local_wall_ms,
+            initial_clock_health_ms: local_clock_health_ms,
+            healthy: true,
+        })
+    }
+
+    fn observe(
+        &mut self,
+        local_wall_ms: u64,
+        local_clock_health_ms: Option<u64>,
+        skew_budget_ms: u64,
+    ) -> bool {
+        if !self.healthy {
+            return false;
+        }
+        let Some(local_clock_health_ms) = local_clock_health_ms else {
+            self.healthy = false;
+            return false;
+        };
+        let Some(wall_elapsed_ms) = local_wall_ms.checked_sub(self.initial_wall_ms) else {
+            self.healthy = false;
+            return false;
+        };
+        let Some(monotonic_elapsed_ms) =
+            local_clock_health_ms.checked_sub(self.initial_clock_health_ms)
+        else {
+            self.healthy = false;
+            return false;
+        };
+        self.healthy = wall_elapsed_ms.abs_diff(monotonic_elapsed_ms) <= skew_budget_ms;
+        self.healthy
+    }
+}
+
+/// Latch a process unhealthy when wall time departs from monotonic elapsed time.
+///
+/// Test clock overrides deliberately bypass this process-global monitor. Tests
+/// that exercise clock faults use the pure model below so parallel test clocks
+/// cannot poison unrelated cases.
+pub(crate) fn validate_process_lease_clock(
+    local_wall_ms: u64,
+    local_clock_health_ms: Option<u64>,
+    skew_budget_ms: u64,
+) -> Result<(), LeaseClockError> {
+    if crate::clock::override_time_millis().is_some() {
+        return Ok(());
+    }
+    static PROCESS_CLOCK_HEALTH: OnceLock<Mutex<ProcessLeaseClockHealth>> = OnceLock::new();
+    if let Some(health) = PROCESS_CLOCK_HEALTH.get() {
+        return if health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe(local_wall_ms, local_clock_health_ms, skew_budget_ms)
+        {
+            Ok(())
+        } else if local_clock_health_ms.is_none() {
+            Err(LeaseClockError::ClockHealthSourceUnavailable)
+        } else {
+            Err(LeaseClockError::LocalClockUnhealthy { skew_budget_ms })
+        };
+    }
+    let initial_health = ProcessLeaseClockHealth::new(local_wall_ms, local_clock_health_ms)?;
+    let health = PROCESS_CLOCK_HEALTH.get_or_init(|| Mutex::new(initial_health));
+    if health
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .observe(local_wall_ms, local_clock_health_ms, skew_budget_ms)
+    {
+        Ok(())
+    } else {
+        Err(LeaseClockError::LocalClockUnhealthy { skew_budget_ms })
+    }
+}
+
 /// Process-local binding of an authority deadline to a monotonic clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BoundRouteMapLease {
@@ -39,6 +136,13 @@ pub(crate) struct BoundRouteMapLease {
 }
 
 impl BoundRouteMapLease {
+    pub(crate) fn expired(authority_valid_until_ms: u64, local_monotonic_ms: u64) -> Self {
+        Self {
+            authority_valid_until_ms,
+            local_valid_until_monotonic_ms: local_monotonic_ms,
+        }
+    }
+
     /// Bind a freshly read authority deadline to a process-local monotonic clock.
     pub(crate) fn bind(
         authority_issued_at_ms: u64,
@@ -72,7 +176,8 @@ impl BoundRouteMapLease {
         })
     }
 
-    pub(crate) fn authority_valid_until_ms(self) -> u64 {
+    #[cfg(test)]
+    fn authority_valid_until_ms(self) -> u64 {
         self.authority_valid_until_ms
     }
 
@@ -530,6 +635,59 @@ mod tests {
         assert_eq!(lease.local_valid_until_monotonic_ms(), 9_500);
         assert!(lease.is_valid_at_monotonic(9_499));
         assert!(!lease.is_valid_at_monotonic(9_500));
+    }
+
+    #[test]
+    fn process_clock_health_latches_wall_rollback_until_restart() {
+        let mut health = ProcessLeaseClockHealth::new(10_000, Some(500)).unwrap();
+        assert!(health.observe(10_500, Some(1_000), 1_000));
+        assert!(!health.observe(4_000, Some(1_100), 1_000));
+        assert!(!health.observe(10_600, Some(1_100), 1_000));
+
+        let mut restarted = ProcessLeaseClockHealth::new(10_600, Some(0)).unwrap();
+        assert!(restarted.observe(10_700, Some(100), 1_000));
+    }
+
+    #[test]
+    fn process_clock_health_latches_excessive_forward_step() {
+        let mut health = ProcessLeaseClockHealth::new(10_000, Some(500)).unwrap();
+        assert!(!health.observe(12_001, Some(1_000), 1_000));
+        assert!(!health.observe(10_500, Some(1_000), 1_000));
+    }
+
+    #[test]
+    fn process_clock_health_uses_adjusted_elapsed_instead_of_raw_lease_rate() {
+        let mut health = ProcessLeaseClockHealth::new(100_000, Some(10_000)).unwrap();
+        let wall_ms = 111_500_u64;
+        let raw_lease_clock_ms = 20_000_u64;
+        let adjusted_clock_health_ms = 21_500_u64;
+
+        let wall_elapsed_ms = wall_ms - 100_000;
+        let raw_lease_elapsed_ms = raw_lease_clock_ms - 10_000;
+        assert!(
+            wall_elapsed_ms.abs_diff(raw_lease_elapsed_ms) > CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS
+        );
+        assert!(health.observe(
+            wall_ms,
+            Some(adjusted_clock_health_ms),
+            CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        ));
+    }
+
+    #[test]
+    fn process_clock_health_latches_later_source_failure() {
+        let mut health = ProcessLeaseClockHealth::new(10_000, Some(500)).unwrap();
+        assert!(health.observe(10_500, Some(1_000), 1_000));
+        assert!(!health.observe(10_600, None, 1_000));
+        assert!(!health.observe(10_700, Some(1_200), 1_000));
+    }
+
+    #[test]
+    fn process_clock_health_rejects_missing_first_sample() {
+        assert!(matches!(
+            ProcessLeaseClockHealth::new(10_000, None),
+            Err(LeaseClockError::ClockHealthSourceUnavailable)
+        ));
     }
 
     #[test]

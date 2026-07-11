@@ -11,6 +11,7 @@ test-hooks = []
 checksum = { path = "../checksum", default-features = false }
 ec = { path = "../ec", default-features = false }
 futures-util = "0.3"
+libc = "0.2"
 observability = { path = "../observability" }
 openraft = { version = "=0.10.0-alpha.26", default-features = false, features = ["tokio-rt"] }
 placement = { path = "../placement" }

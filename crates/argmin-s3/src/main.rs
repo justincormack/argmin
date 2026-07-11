@@ -31,12 +31,13 @@ use storage::control_plane::{
     read_control_plane_unix_request, write_control_plane_unix_response,
     AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
     ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneAdminAuthCredentialInput,
-    ControlPlaneError, ControlPlaneFrontendAuthCredential, ControlPlaneFrontendAuthCredentialInput,
-    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
-    ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
-    ControlPlaneStorageNodeAuthCredentialInput, ControlPlaneUnixAuthVerifier,
-    FencedPgMetadataTransferSnapshot, FileControlPlaneStore, PgMetadataProof,
-    PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
+    ControlPlaneAuthorityClock, ControlPlaneError, ControlPlaneFrontendAuthCredential,
+    ControlPlaneFrontendAuthCredentialInput, ControlPlaneHeartbeatRefresh,
+    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
+    ControlPlaneStorageNodeAuthCredential, ControlPlaneStorageNodeAuthCredentialInput,
+    ControlPlaneUnixAuthVerifier, FencedPgMetadataTransferSnapshot, FileControlPlaneStore,
+    PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane,
+    UnixControlPlaneClient,
 };
 use storage::control_plane_auth::{
     ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
@@ -1500,6 +1501,16 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to bootstrap control-plane state: {error}");
         std::process::exit(1);
     });
+    let authority_clock = ControlPlaneAuthorityClock::new(
+        authority.snapshot().max_committed_timestamp_ms(),
+        storage::clock::current_time_millis(),
+        storage::clock::clock_health_time_millis(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("failed to initialize control-plane authority clock: {error}");
+        std::process::exit(1);
+    });
+    let authority_clock = Arc::new(Mutex::new(authority_clock));
     let authority = Arc::new(Mutex::new(authority));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
     let auth_verifier = build_control_plane_unix_auth_verifier(config)
@@ -1528,6 +1539,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                     spawn_control_plane_rpc_worker(
                         stream,
                         Arc::clone(&authority),
+                        Some(Arc::clone(&authority_clock)),
                         Arc::clone(&active_rpc_workers),
                         auth_verifier.clone(),
                     );
@@ -1539,10 +1551,17 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 }
             }
         }
-        let expiry = authority
-            .lock()
-            .expect("control-plane authority mutex poisoned")
-            .expire_heartbeat_leases(storage::clock::current_time_millis());
+        let wall_ms = storage::clock::current_time_millis();
+        let expiry = {
+            let mut authority = authority
+                .lock()
+                .expect("control-plane authority mutex poisoned");
+            authority_clock
+                .lock()
+                .expect("control-plane authority clock mutex poisoned")
+                .effective_now_ms(wall_ms, storage::clock::clock_health_time_millis())
+                .and_then(|effective_now_ms| authority.expire_heartbeat_leases(effective_now_ms))
+        };
         match expiry {
             Ok(expiry) if !expiry.expired_nodes().is_empty() => {
                 process_info!(
@@ -1575,6 +1594,7 @@ struct ExperimentalRaftControlPlane {
     durable_serving_checkpoint: Mutex<Option<ExperimentalRaftServingCheckpointMarker>>,
     checkpoint_serving_reads: bool,
     resample_authority_time: bool,
+    authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
     durable_poison: Option<String>,
     durable_poison_gate: Arc<AtomicBool>,
 }
@@ -1619,12 +1639,30 @@ impl ExperimentalRaftControlPlane {
         block_on_control_plane_raft(&self.runtime, future)
     }
 
-    fn authority_now_ms(&self, supplied_now_ms: u64) -> u64 {
-        if self.resample_authority_time {
-            storage::clock::current_time_millis()
-        } else {
-            supplied_now_ms
+    fn authority_now_ms(&self, supplied_now_ms: u64) -> Result<u64, ControlPlaneError> {
+        if !self.resample_authority_time {
+            return Ok(supplied_now_ms);
         }
+        let wall_ms = storage::clock::current_time_millis();
+        let status = self.block_on(self.authority.status())?;
+        if !status.local_leader() {
+            return Err(ControlPlaneError::RpcRemote {
+                message: "local OpenRaft authority is not the serving leader".to_string(),
+            });
+        }
+        let max_committed_timestamp_ms = self.current_snapshot()?.max_committed_timestamp_ms();
+        let mut authority_clock = self
+            .authority_clock
+            .as_ref()
+            .expect("resampled authority time requires a clock gate")
+            .lock()
+            .expect("control-plane authority clock mutex poisoned");
+        authority_clock.observe_committed_timestamp_high_water(max_committed_timestamp_ms);
+        let current_term = status.current_term().ok_or(ControlPlaneError::RpcRemote {
+            message: "local OpenRaft leader has no current term".to_string(),
+        })?;
+        authority_clock.validate_raft_leadership_term(current_term)?;
+        authority_clock.effective_now_ms(wall_ms, storage::clock::clock_health_time_millis())
     }
 
     fn durable_poison_error(&self) -> Option<ControlPlaneError> {
@@ -1726,16 +1764,11 @@ impl ExperimentalRaftControlPlane {
         &mut self,
         now_ms: u64,
     ) -> Result<(ClusterEpoch, usize, usize), ControlPlaneError> {
-        let now_ms = self.authority_now_ms(now_ms);
+        let now_ms = self.authority_now_ms(now_ms)?;
         let snapshot = self.current_snapshot()?;
-        if snapshot.committed_timestamp_exceeds_forward_bound(now_ms)
-            && !snapshot.has_heartbeat_lease_expiring_at(now_ms)
-        {
-            return Ok((snapshot.cluster_epoch(), 0, 0));
-        }
-        let response = self.submit_raft_command(ControlPlaneCommand::ExpireHeartbeatLeases {
-            expire_at_ms: now_ms,
-        })?;
+        let expire_at_ms = snapshot.heartbeat_lease_expiry_timestamp(now_ms);
+        let response =
+            self.submit_raft_command(ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms })?;
         let ControlPlaneCommandResponse::ExpireHeartbeatLeases {
             expired_nodes,
             peering_pgs,
@@ -1757,7 +1790,7 @@ impl ControlPlaneRuntimeMapSource for ExperimentalRaftControlPlane {
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
-        let authority_now_ms = self.authority_now_ms(authority_now_ms);
+        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
         let snapshot = self.block_on(
             self.authority
                 .linearized_runtime_map_snapshot(authority_now_ms),
@@ -1773,23 +1806,19 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
         heartbeat: storage::control_plane::NodeHeartbeat,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
-        let authority_now_ms = self.authority_now_ms(authority_now_ms);
+        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
         let node_id = heartbeat.node_id;
         let requested_observed_epoch = heartbeat.observed_epoch;
         let requested_lease_duration_ms = heartbeat.requested_lease_duration_ms;
-        let lease_deadline_ms = authority_now_ms
-            .checked_add(requested_lease_duration_ms)
-            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
         let pre_record_snapshot = self.current_snapshot()?;
         let previous_observed_epoch = pre_record_snapshot
             .node(node_id)
             .and_then(|node| node.last_observed_epoch());
-        let lease_deadline_ms = pre_record_snapshot
-            .node(node_id)
-            .and_then(|node| node.lease_deadline_ms())
-            .map_or(lease_deadline_ms, |current_lease_deadline_ms| {
-                current_lease_deadline_ms.max(lease_deadline_ms)
-            });
+        let lease_deadline_ms = pre_record_snapshot.heartbeat_lease_deadline(
+            node_id,
+            authority_now_ms,
+            requested_lease_duration_ms,
+        )?;
         let pre_record_epoch = pre_record_snapshot.cluster_epoch();
         self.submit_raft_command(ControlPlaneCommand::RecordNodeHeartbeat {
             heartbeat,
@@ -2792,6 +2821,38 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
+    let initial_clock_snapshot =
+        block_on_control_plane_raft(&runtime, authority.current_control_plane_snapshot())
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "failed to read experimental OpenRaft control-plane clock state: {error}"
+                );
+                std::process::exit(1);
+            });
+    let initial_clock_status = block_on_control_plane_raft(&runtime, authority.status())
+        .unwrap_or_else(|error| {
+            eprintln!("failed to read experimental OpenRaft leadership state: {error}");
+            std::process::exit(1);
+        });
+    let mut initial_authority_clock = ControlPlaneAuthorityClock::new(
+        initial_clock_snapshot.max_committed_timestamp_ms(),
+        storage::clock::current_time_millis(),
+        storage::clock::clock_health_time_millis(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("failed to initialize experimental OpenRaft authority clock: {error}");
+        std::process::exit(1);
+    });
+    if initial_clock_status.local_leader() {
+        initial_authority_clock
+            .bind_initial_raft_leadership_term(initial_clock_status.current_term());
+    } else if !initialized_membership {
+        // A restored or joining follower must not use the fresh-cluster first
+        // term exception when it later becomes leader. Only the process that
+        // initialized new membership may bind that initial term lazily.
+        initial_authority_clock.bind_initial_raft_leadership_term(None);
+    }
+    let authority_clock = Arc::new(Mutex::new(initial_authority_clock));
     let mut control_plane = ExperimentalRaftControlPlane {
         runtime: runtime.clone(),
         authority: Arc::clone(&authority),
@@ -2800,6 +2861,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         durable_serving_checkpoint: Mutex::new(None),
         checkpoint_serving_reads: multi_node_raft_peer_mode,
         resample_authority_time: true,
+        authority_clock: Some(Arc::clone(&authority_clock)),
         durable_poison: None,
         durable_poison_gate: Arc::clone(&durable_poison_gate),
     };
@@ -2866,6 +2928,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                     spawn_control_plane_rpc_worker(
                         stream,
                         Arc::clone(&authority),
+                        None,
                         Arc::clone(&active_rpc_workers),
                         auth_verifier.clone(),
                     );
@@ -2952,6 +3015,8 @@ fn control_plane_lease_expiry_error_is_clock_wait(error: &ControlPlaneError) -> 
         error,
         ControlPlaneError::CommittedTimestampRegression { .. }
             | ControlPlaneError::CommittedTimestampTooFarAhead { .. }
+            | ControlPlaneError::AuthorityClockLeadershipChanged { .. }
+            | ControlPlaneError::AuthorityClockSourceUnavailable
     )
 }
 
@@ -3084,6 +3149,7 @@ fn spawn_control_plane_rpc_worker(
                 + 'static,
         >,
     >,
+    authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
     active_rpc_workers: Arc<AtomicUsize>,
     auth_verifier: Option<Arc<ControlPlaneUnixAuthVerifier>>,
 ) {
@@ -3119,42 +3185,61 @@ fn spawn_control_plane_rpc_worker(
                 return;
             }
         };
-        let response = if request.is_refresh_node_heartbeat() {
-            let prepared = {
-                let mut authority = authority
-                    .lock()
-                    .expect("control-plane authority mutex poisoned");
-                let now_ms = storage::clock::current_time_millis();
-                prepare_control_plane_heartbeat_response(
-                    &mut *authority,
-                    request,
-                    now_ms,
-                    auth_verifier.as_deref(),
-                )
-            };
-            prepared.and_then(|prepared| {
-                finish_control_plane_heartbeat_response(prepared, || {
-                    Ok(storage::clock::current_time_millis())
-                })
-            })
-        } else {
-            let mut authority = authority
-                .lock()
-                .expect("control-plane authority mutex poisoned");
-            let now_ms = storage::clock::current_time_millis();
-            match auth_verifier.as_deref() {
-                Some(auth_verifier) => {
-                    build_control_plane_unix_response_with_auth_and_response_clock(
+        let response = (|| {
+            if request.is_refresh_node_heartbeat() {
+                let prepared = {
+                    let mut authority = authority
+                        .lock()
+                        .expect("control-plane authority mutex poisoned");
+                    let wall_ms = storage::clock::current_time_millis();
+                    let now_ms = match &authority_clock {
+                        Some(authority_clock) => authority_clock
+                            .lock()
+                            .expect("control-plane authority clock mutex poisoned")
+                            .effective_now_ms(
+                                wall_ms,
+                                storage::clock::clock_health_time_millis(),
+                            )?,
+                        None => wall_ms,
+                    };
+                    prepare_control_plane_heartbeat_response(
                         &mut *authority,
                         request,
                         now_ms,
-                        Some(auth_verifier),
-                        || Ok(storage::clock::current_time_millis()),
+                        auth_verifier.as_deref(),
                     )
+                };
+                prepared.and_then(|prepared| {
+                    finish_control_plane_heartbeat_response(prepared, || {
+                        Ok(storage::clock::current_time_millis())
+                    })
+                })
+            } else {
+                let mut authority = authority
+                    .lock()
+                    .expect("control-plane authority mutex poisoned");
+                let wall_ms = storage::clock::current_time_millis();
+                let now_ms = match &authority_clock {
+                    Some(authority_clock) => authority_clock
+                        .lock()
+                        .expect("control-plane authority clock mutex poisoned")
+                        .effective_now_ms(wall_ms, storage::clock::clock_health_time_millis())?,
+                    None => wall_ms,
+                };
+                match auth_verifier.as_deref() {
+                    Some(auth_verifier) => {
+                        build_control_plane_unix_response_with_auth_and_response_clock(
+                            &mut *authority,
+                            request,
+                            now_ms,
+                            Some(auth_verifier),
+                            || Ok(storage::clock::current_time_millis()),
+                        )
+                    }
+                    None => build_control_plane_unix_response(&mut *authority, request, now_ms),
                 }
-                None => build_control_plane_unix_response(&mut *authority, request, now_ms),
             }
-        };
+        })();
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -4996,6 +5081,30 @@ mod tests {
         }
     }
 
+    fn enable_resampled_authority_time(
+        control_plane: &mut ExperimentalRaftControlPlane,
+        now_ms: u64,
+    ) {
+        let max_committed_timestamp_ms = control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read before enabling clock resampling")
+            .max_committed_timestamp_ms();
+        let status = control_plane
+            .block_on(control_plane.authority.status())
+            .expect("experimental status should read before enabling clock resampling");
+        let mut authority_clock =
+            ControlPlaneAuthorityClock::new(max_committed_timestamp_ms, now_ms, Some(now_ms))
+                .expect("test authority clock should initialize");
+        authority_clock.bind_initial_raft_leadership_term(
+            status
+                .local_leader()
+                .then(|| status.current_term())
+                .flatten(),
+        );
+        control_plane.authority_clock = Some(Arc::new(Mutex::new(authority_clock)));
+        control_plane.resample_authority_time = true;
+    }
+
     fn experimental_raft_test_harness(name: &str) -> ExperimentalRaftTestHarness {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -5031,6 +5140,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
+            authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -5143,6 +5253,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
+            authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -5216,6 +5327,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
+            authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -5249,6 +5361,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
+            authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -5443,6 +5556,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
+            authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -5503,6 +5617,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
+            authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -5740,14 +5855,13 @@ mod tests {
         config.storage_pg_ids = vec![7];
         bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
-        harness.control_plane.resample_authority_time = true;
-
         let bootstrap_epoch = harness
             .control_plane
             .current_snapshot()
             .expect("experimental snapshot should read")
             .cluster_epoch();
         let refresh = storage::clock::with_time_override(30_000, || {
+            enable_resampled_authority_time(&mut harness.control_plane, 30_000);
             harness.control_plane.refresh_node_heartbeat(
                 NodeHeartbeat {
                     node_id: NodeId::new(1),
@@ -7527,7 +7641,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_far_forward_expiry_recovers_after_long_downtime() {
+    fn experimental_raft_control_plane_elapsed_expiry_advances_timestamp() {
         let mut harness = experimental_raft_test_harness("lease-expiry-far-forward-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
@@ -7618,18 +7732,11 @@ mod tests {
             .expect("experimental raft active heartbeat should refresh");
 
         let far_future_now_ms =
-            50_201 + storage::control_plane::MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
-        let expected_expiry_timestamp = harness
-            .control_plane
-            .current_snapshot()
-            .expect("experimental pre-expiry snapshot should read")
-            .max_committed_timestamp_ms()
-            .unwrap()
-            .saturating_add(storage::control_plane::MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS);
+            50_201 + storage::control_plane::CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 123;
         let expiry = harness
             .control_plane
             .expire_heartbeat_leases(far_future_now_ms)
-            .expect("far-forward expiry with expired leases should recover through raft");
+            .expect("elapsed expiry should commit through raft");
         assert_eq!(expiry.1, 1);
         assert_eq!(expiry.2, 1);
         let expired_snapshot = harness
@@ -7638,7 +7745,7 @@ mod tests {
             .expect("experimental far-forward expired snapshot should read");
         assert_eq!(
             expired_snapshot.max_committed_timestamp_ms(),
-            Some(expected_expiry_timestamp)
+            Some(far_future_now_ms)
         );
         let expired_node = expired_snapshot
             .node(NodeId::new(1))
@@ -7779,9 +7886,8 @@ mod tests {
                 50_200,
             )
             .expect("experimental raft active heartbeat should refresh");
-        harness.control_plane.resample_authority_time = true;
-
         let expiry = storage::clock::with_time_override(50_900, || {
+            enable_resampled_authority_time(&mut harness.control_plane, 50_900);
             harness.control_plane.expire_heartbeat_leases(50_000)
         })
         .expect("deadline expiry should use resampled time");

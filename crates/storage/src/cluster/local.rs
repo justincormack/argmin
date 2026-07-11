@@ -8,6 +8,9 @@ use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
 use crate::control_plane::{ClusterRuntimeMapSnapshot, NodeRouteSnapshot, PgRouteSnapshot};
+use crate::control_plane_lease::{
+    validate_process_lease_clock, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+};
 use crate::data_dir::prepare_private_data_dir;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]
@@ -61,6 +64,23 @@ fn decode_route_map_validity(encoded: u64) -> RouteMapValidity {
     } else {
         RouteMapValidity::until_ms(encoded).unwrap()
     }
+}
+
+fn encode_unbound_route_map_lease(validity: RouteMapValidity) -> AtomicU64 {
+    AtomicU64::new(if validity == RouteMapValidity::Forever {
+        ROUTE_MAP_VALID_UNTIL_UNBOUNDED
+    } else {
+        0
+    })
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn test_process_local_route_map_deadline(validity: RouteMapValidity) -> u64 {
+    let Some(valid_until_ms) = validity.valid_until_ms() else {
+        return ROUTE_MAP_VALID_UNTIL_UNBOUNDED;
+    };
+    let remaining_ms = valid_until_ms.saturating_sub(crate::clock::current_time_millis());
+    crate::clock::monotonic_time_millis().saturating_add(remaining_ms)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1317,6 +1337,7 @@ impl LocalClusterRuntimeState {
 pub struct LocalClusterMap {
     epoch: ClusterEpoch,
     route_map_validity: AtomicU64,
+    route_map_local_valid_until_monotonic_ms: AtomicU64,
     metadata_primary_node_id: NodeId,
     nodes: BTreeMap<NodeId, LocalNodeStore>,
     pg_ids: Box<[u32]>,
@@ -1485,6 +1506,9 @@ impl LocalClusterMap {
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
             route_map_validity: encode_route_map_validity(RouteMapValidity::Forever),
+            route_map_local_valid_until_monotonic_ms: encode_unbound_route_map_lease(
+                RouteMapValidity::Forever,
+            ),
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -1573,6 +1597,9 @@ impl LocalClusterMap {
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
             route_map_validity: encode_route_map_validity(route_map_validity),
+            route_map_local_valid_until_monotonic_ms: encode_unbound_route_map_lease(
+                route_map_validity,
+            ),
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -1614,6 +1641,17 @@ impl LocalClusterMap {
             .iter()
             .map(|route| ((route.cluster_epoch(), route.pg_id()), route.clone()))
             .collect();
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        let bound_lease = runtime_map
+            .bind_process_local_lease_at(crate::clock::current_time_millis(), local_monotonic_ms)
+            .map_err(|error| ClusterBuildError::RouteMapLeaseBinding {
+                message: error.to_string(),
+            })?;
+        local_map.route_map_local_valid_until_monotonic_ms = AtomicU64::new(
+            bound_lease.map_or(ROUTE_MAP_VALID_UNTIL_UNBOUNDED, |lease| {
+                lease.local_valid_until_monotonic_ms()
+            }),
+        );
         Ok(local_map)
     }
 
@@ -1646,6 +1684,9 @@ impl LocalClusterMap {
         Ok(Self {
             epoch: cluster_epoch,
             route_map_validity: encode_route_map_validity(RouteMapValidity::Forever),
+            route_map_local_valid_until_monotonic_ms: encode_unbound_route_map_lease(
+                RouteMapValidity::Forever,
+            ),
             metadata_primary_node_id: self.metadata_primary_node_id,
             nodes: self.nodes.clone(),
             pg_ids: self.pg_ids.clone(),
@@ -1794,6 +1835,9 @@ impl LocalClusterMap {
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
             route_map_validity: encode_route_map_validity(RouteMapValidity::Forever),
+            route_map_local_valid_until_monotonic_ms: encode_unbound_route_map_lease(
+                RouteMapValidity::Forever,
+            ),
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -1810,6 +1854,30 @@ impl LocalClusterMap {
 
     pub fn route_map_validity(&self) -> RouteMapValidity {
         decode_route_map_validity(self.route_map_validity.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn route_map_local_valid_until_monotonic_ms(&self) -> Option<u64> {
+        match self
+            .route_map_local_valid_until_monotonic_ms
+            .load(Ordering::Acquire)
+        {
+            ROUTE_MAP_VALID_UNTIL_UNBOUNDED => None,
+            deadline_ms => Some(deadline_ms),
+        }
+    }
+
+    pub(crate) fn replace_process_local_route_map_lease_from(&self, candidate: &Self) {
+        self.route_map_local_valid_until_monotonic_ms.store(
+            candidate
+                .route_map_local_valid_until_monotonic_ms
+                .load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn expire_process_local_route_map_lease_at(&self, local_monotonic_ms: u64) {
+        self.route_map_local_valid_until_monotonic_ms
+            .fetch_min(local_monotonic_ms, Ordering::AcqRel);
     }
 
     pub(crate) fn extend_route_map_validity(&self, candidate: RouteMapValidity) {
@@ -1851,7 +1919,19 @@ impl LocalClusterMap {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    let local_wall_ms = crate::clock::current_time_millis();
+                    let remaining_ms = candidate
+                        .saturating_sub(
+                            crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+                        )
+                        .saturating_sub(local_wall_ms);
+                    let local_deadline_ms =
+                        crate::clock::monotonic_time_millis().saturating_add(remaining_ms);
+                    self.route_map_local_valid_until_monotonic_ms
+                        .fetch_min(local_deadline_ms, Ordering::AcqRel);
+                    return;
+                }
                 Err(observed) => current = observed,
             }
         }
@@ -1872,25 +1952,31 @@ impl LocalClusterMap {
         }
     }
 
-    fn require_route_map_valid_now(&self) -> Result<(), StoreError> {
-        self.require_route_map_valid_at(crate::clock::current_time_millis())
+    pub(crate) fn require_route_map_valid_now(&self) -> Result<(), StoreError> {
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        if !self.process_local_route_map_lease_is_valid_at(local_monotonic_ms) {
+            return Err(StoreError::RouteMapExpired {
+                cluster_epoch: self.epoch,
+                valid_until_ms: self.route_map_valid_until_ms().unwrap_or(0),
+                now_ms: crate::clock::current_time_millis(),
+            });
+        }
+        Ok(())
     }
 
     fn require_route_map_valid_now_for_placement(
         &self,
         pg_id: PgId,
     ) -> Result<(), ClusterBuildError> {
-        let now_ms = crate::clock::current_time_millis();
-        match self.route_map_valid_until_ms() {
-            Some(valid_until_ms) if valid_until_ms <= now_ms => {
-                Err(ClusterBuildError::RouteMapExpired {
-                    pg_id: pg_id.get(),
-                    cluster_epoch: self.epoch,
-                    valid_until_ms,
-                    now_ms,
-                })
-            }
-            _ => Ok(()),
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        match self.process_local_route_map_lease_is_valid_at(local_monotonic_ms) {
+            false => Err(ClusterBuildError::RouteMapExpired {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+                valid_until_ms: self.route_map_valid_until_ms().unwrap_or(0),
+                now_ms: crate::clock::current_time_millis(),
+            }),
+            true => Ok(()),
         }
     }
 
@@ -1899,19 +1985,34 @@ impl LocalClusterMap {
         pg_id: PgId,
         node_id: NodeId,
     ) -> Result<(), ShardIoError> {
-        let now_ms = crate::clock::current_time_millis();
-        match self.route_map_valid_until_ms() {
-            Some(valid_until_ms) if valid_until_ms <= now_ms => {
-                Err(ShardIoError::RouteMapExpired {
-                    node_id: node_id.as_u32(),
-                    pg_id: pg_id.get(),
-                    cluster_epoch: self.epoch,
-                    valid_until_ms,
-                    now_ms,
-                })
-            }
-            _ => Ok(()),
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        match self.process_local_route_map_lease_is_valid_at(local_monotonic_ms) {
+            false => Err(ShardIoError::RouteMapExpired {
+                node_id: node_id.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+                valid_until_ms: self.route_map_valid_until_ms().unwrap_or(0),
+                now_ms: crate::clock::current_time_millis(),
+            }),
+            true => Ok(()),
         }
+    }
+
+    fn process_local_route_map_lease_is_valid_at(&self, local_monotonic_ms: u64) -> bool {
+        let Some(deadline_ms) = self.route_map_local_valid_until_monotonic_ms() else {
+            return true;
+        };
+        if validate_process_lease_clock(
+            crate::clock::current_time_millis(),
+            crate::clock::clock_health_time_millis(),
+            CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )
+        .is_err()
+        {
+            self.expire_process_local_route_map_lease_at(local_monotonic_ms);
+            return false;
+        }
+        deadline_ms > local_monotonic_ms
     }
 
     pub fn metadata_primary_node_id(&self) -> NodeId {
@@ -2658,12 +2759,18 @@ impl LocalClusterMap {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_set_route_map_validity(&mut self, validity: RouteMapValidity) {
         self.route_map_validity = encode_route_map_validity(validity);
+        self.route_map_local_valid_until_monotonic_ms =
+            AtomicU64::new(test_process_local_route_map_deadline(validity));
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_store_route_map_validity(&self, validity: RouteMapValidity) {
         self.route_map_validity.store(
             encode_route_map_validity(validity).into_inner(),
+            Ordering::Release,
+        );
+        self.route_map_local_valid_until_monotonic_ms.store(
+            test_process_local_route_map_deadline(validity),
             Ordering::Release,
         );
     }

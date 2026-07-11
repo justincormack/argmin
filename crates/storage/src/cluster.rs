@@ -1182,6 +1182,9 @@ impl StorageClusterRuntimeMapHandle {
                             generation.extend_route_map_validity(candidate_validity);
                         }
                     }
+                    generation
+                        .local_map
+                        .replace_process_local_route_map_lease_from(&candidate.local_map);
                     true
                 } else {
                     false
@@ -1203,6 +1206,7 @@ impl StorageClusterRuntimeMapHandle {
     fn expire_same_epoch_generations(&self, now_ms: u64) {
         let current_epoch = self.current().cluster_epoch();
         let expiry = RouteMapValidity::until_ms_saturating(now_ms);
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
         let mut generations = self
             .same_epoch_generations
             .lock()
@@ -1213,6 +1217,9 @@ impl StorageClusterRuntimeMapHandle {
             };
             if generation.cluster_epoch() == current_epoch {
                 generation.cap_route_map_validity(expiry);
+                generation
+                    .local_map
+                    .expire_process_local_route_map_lease_at(local_monotonic_ms);
                 true
             } else {
                 false
@@ -4087,6 +4094,10 @@ impl StorageCluster {
 
     pub fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StoreError> {
         self.local_map.require_route_map_valid_at(now_ms)
+    }
+
+    pub(crate) fn require_route_map_valid_now(&self) -> Result<(), StoreError> {
+        self.local_map.require_route_map_valid_now()
     }
 
     fn require_current_payload_operation_epoch(&self, pg_id: u32) -> Result<(), StoreError> {

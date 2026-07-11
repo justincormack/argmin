@@ -14,10 +14,21 @@ The system has three distinct notions of time:
   deadline or a consumer binds a newly received deadline. Wall time may step
   forward or backward and is never consulted again to extend an installed
   serving lease.
-- **Process monotonic time** enforces an installed lease for the lifetime of a
-  process. A restart discards every monotonic binding. A process suspend whose
-  monotonic source cannot be proved to include suspend time is treated like a
-  restart for serving purposes.
+- **Process monotonic lease time** enforces an installed lease for the lifetime
+  of a process. A restart discards every monotonic binding. Linux, Android, and
+  OpenBSD use `CLOCK_BOOTTIME`; Apple platforms use the sleep-inclusive
+  `CLOCK_MONOTONIC_RAW`; and FreeBSD uses `CLOCK_MONOTONIC`. These are the
+  platform-qualified suspend-inclusive branches. NetBSD, DragonFly, and other
+  Unix targets retain `CLOCK_MONOTONIC` support defensively: if that source
+  pauses over suspend, admission-time clock-health validation detects the
+  wall/monotonic divergence and fails bounded leases closed. A clock read
+  failure makes bounded serving leases unusable.
+- **Process clock-health time** detects wall-clock steps. It normally uses the
+  same source as lease time. Apple instead uses adjusted `CLOCK_MONOTONIC` for
+  health while retaining raw continuous time for lease expiry. This prevents
+  normal frequency correction from accumulating as a false wall-clock step;
+  if the adjusted source pauses over suspend, the resulting divergence is a
+  fail-closed health event while the raw lease deadline still advances.
 
 ## Operational assumption
 
@@ -34,12 +45,21 @@ Large backward steps after installation cannot extend one because serving uses
 the monotonic binding.
 
 Clock health is independently latched for the authority and for every consumer.
-A consumer restart, untrusted suspend, or wall-clock drift beyond the budget
-does not extend an existing monotonic binding, but it prohibits creating a new
-binding. Re-establishment requires a healthy authority and a fresh
-within-budget comparison between that consumer and the authority. Consequently,
-a delayed old map cannot be rebound after wall-clock rollback, including after
-a successor has activated.
+A consumer restart, monotonic-source failure, suspend on an unqualified source,
+or wall-clock drift beyond the budget does not extend an existing monotonic
+binding, but it prohibits creating a new binding. Re-establishment requires a
+healthy authority and a fresh within-budget comparison between that consumer
+and the authority. Consequently, a delayed old map cannot be rebound after
+wall-clock rollback, including after a successor has activated.
+
+Production consumers compare wall-time elapsed against clock-health elapsed
+from their first bounded lease binding. A drift violation latches the process
+unhealthy until restart. They repeat this check on every serving admission, not
+only when installing a map. A qualified suspend-inclusive lease deadline
+continues to expire while the host sleeps; an unqualified source is also gated
+by the admission-time health comparison. Test clock overrides bypass this
+process-global latch; the pure independent-clock model exercises clock faults
+without contaminating parallel tests.
 
 ## Authority invariant
 
@@ -56,6 +76,20 @@ command is not time recovery. A proposal that cannot satisfy the invariant is
 non-serving and must not preserve an older deadline whose time basis has been
 declared invalid.
 
+The authority process establishes a wall/monotonic reference before issuing
+timestamp-bearing work. Healthy wall progress may advance committed time by
+the corresponding monotonic elapsed time, even when the authority has been
+idle for longer than the skew budget. A wall/monotonic divergence beyond the
+budget latches the authority clock non-serving. On restart, the clock starts
+established only when local wall time is within the skew budget of the
+persisted timestamp high-water. A larger discontinuity requires the explicit
+authority clock re-establishment procedure.
+
+Replicated apply independently rejects timestamp regression and validates that
+every serving deadline is bounded relative to the command's committed time.
+It cannot infer real elapsed time from the logical high-water; the
+process-local authority gate supplies that evidence before command proposal.
+
 ## Consumer binding
 
 For authority deadline `D`, local wall sample `W`, local monotonic sample `M`,
@@ -70,9 +104,13 @@ than that deadline. Network and processing delay only reduce the remaining
 time. The original authority deadline remains available for diagnostics and
 protocol fencing, but is not re-evaluated against wall time while serving.
 
-Restart, loss of the monotonic source, or untrusted suspend clears the binding.
-The process remains non-serving until it installs a fresh linearized runtime
-map and creates a new binding.
+Restart or loss of either monotonic source clears the binding. A qualified
+suspend-inclusive source advances the installed deadline during sleep. On an
+unqualified source, a pause beyond the skew budget is detected at the next
+admission and clears the binding; a smaller pause remains inside the same skew
+margin used by the lease equations. The process remains non-serving after
+binding loss until it installs a fresh linearized runtime map and creates a new
+binding.
 
 ## Successor activation
 
@@ -91,18 +129,21 @@ an old serving or mutation permit cannot overlap successor activation.
 ## Failure behavior
 
 - A far-future heartbeat or leader clock must not mint a far-future serving
-  deadline and must not ratchet recovery once per command.
+  deadline. The process-local clock-health latch prevents repeated commands
+  from ratcheting recovery.
 - A backward authority step must not regress replicated timestamps or revive
   an expired deadline. Recovery is based on monotonic elapsed time or an
   explicit fenced operator procedure.
 - Leader change does not transfer process-local monotonic bindings. The new
   leader re-establishes real-time authority before minting leases or passing a
-  successor fence. Authority clock health is an explicit, latched capability:
-  leader change or an out-of-budget authority step clears it, and ordinary
-  command traffic cannot restore it. Re-establishment must prove the new clock
-  is within budget of the trusted participant clocks and of the original issuer
-  of every outstanding deadline. Relabelling an old deadline with each new
-  leader would allow skew to accumulate across elections and is forbidden.
+  successor fence. Authority clock health is bound to one locally serving Raft
+  term: a new local leadership term or an out-of-budget authority step clears
+  it, and ordinary command traffic cannot restore it. A fresh cluster with no
+  committed timestamp may bind its first term. Re-establishment must prove the
+  new clock is within budget of the trusted participant clocks and of the
+  original issuer of every outstanding deadline. Relabelling an old deadline
+  with each new leader would allow skew to accumulate across elections and is
+  forbidden.
 - Frontend and storage-node wall clocks are independent. Neither may reopen a
   lease after binding.
 - Clock-bound violations are safety failures and fail closed. They require
@@ -117,5 +158,13 @@ authority, frontend, and storage-node wall clocks; independent monotonic
 clocks; forward and backward steps; restarts; leader changes; suspend events;
 heartbeat rates; and successor activation attempts.
 
-The production integration must use these rules at all runtime-map install and
-serving points before DCC-2, CP2, and CL4 can be marked fixed.
+The authority process boundary now validates wall progress against explicit
+clock-health samples and binds that authority to one local Raft term, while
+replicated apply rejects timestamp regression and bounds serving deadlines.
+Frontends and storage nodes bind fresh runtime maps to platform-qualified or
+defensively monitored monotonic lease time, reject unavailable health samples,
+revalidate clock health on serving admission, and retain the old map's
+monotonic fence on historical storage-node mutation permits. Successor
+activation waits through the skew margin. Remaining production work is the
+authenticated authority clock re-establishment operation, its operator
+diagnostics, and independent-host fault validation.

@@ -500,6 +500,9 @@ pub enum ClusterBuildError {
     #[error("cluster map must contain at least one local node")]
     EmptyCluster,
 
+    #[error("runtime route-map lease could not bind to the process clock: {message}")]
+    RouteMapLeaseBinding { message: String },
+
     #[error("duplicate local node id {id}")]
     DuplicateNodeId { id: u32 },
 

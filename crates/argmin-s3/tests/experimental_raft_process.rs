@@ -594,6 +594,34 @@ fn wait_for_runtime_map_ready_on(
     }
 }
 
+fn wait_for_runtime_map_clock_reestablishment_required(
+    bin: &Path,
+    socket: &Path,
+    test_dir: &Path,
+    children: &mut [&mut ChildGuard],
+) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for child in children.iter_mut() {
+            child.assert_running();
+        }
+        let output = run_runtime_map_ready(bin, socket);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() && stderr.contains("not current local leadership term") {
+            return output;
+        }
+        if Instant::now() >= deadline {
+            let last_failure = format_admin_failure(output.status, &output);
+            panic!(
+                "control-plane runtime map did not fail closed for an unestablished leadership clock on {}: {last_failure}\n{}",
+                socket.display(),
+                process_logs(test_dir)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_for_socket_file(path: &Path, child: &mut ChildGuard) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -673,11 +701,6 @@ fn follower_artifact_state_machine_with_wal_replay(
             .map_err(|error| error.to_string())?;
     }
     Ok(state_machine)
-}
-
-fn artifact_has_committed_vote_for_leader(path: &Path, leader_id: u64) -> Result<bool, String> {
-    let vote = artifact_persisted_vote(path)?;
-    Ok(vote.is_some_and(|vote| vote.committed && vote.node_id == leader_id && vote.term > 0))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -907,6 +930,51 @@ fn wait_for_artifact_committed_vote_at_least(
         if Instant::now() >= deadline {
             panic!(
                 "durable artifact did not checkpoint committed vote for leader {leader_id} at term >= {min_term}: {last_error}"
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_new_committed_leader(
+    test_dir: &Path,
+    possible_leader_ids: &[u64],
+    min_term: u64,
+    children: &mut [&mut ChildGuard],
+) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = String::new();
+    loop {
+        for child in children.iter_mut() {
+            child.assert_running();
+        }
+        for observer_id in possible_leader_ids {
+            match artifact_persisted_vote(&state_path(test_dir, *observer_id)) {
+                Ok(Some(vote))
+                    if vote.committed
+                        && vote.term >= min_term
+                        && possible_leader_ids.contains(&vote.node_id) =>
+                {
+                    return vote.node_id;
+                }
+                Ok(Some(vote)) => {
+                    last_error = format!(
+                        "node {observer_id} artifact has committed={} leader={} term={}",
+                        vote.committed, vote.node_id, vote.term
+                    );
+                }
+                Ok(None) => {
+                    last_error = format!("node {observer_id} artifact has no persisted vote");
+                }
+                Err(error) => {
+                    last_error = format!("node {observer_id} artifact restore failed: {error}");
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "no surviving node checkpointed a committed leader vote at term >= {min_term}: {last_error}\n{}",
+                process_logs(test_dir)
             );
         }
         thread::sleep(Duration::from_millis(50));
@@ -1801,7 +1869,7 @@ fn experimental_raft_restarted_control_plane_follower_catches_up_process_state()
 }
 
 #[test]
-fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
+fn experimental_raft_transferred_process_leader_requires_clock_reestablishment() {
     let bin = argmin_s3_bin();
     let test_dir = TestDir::new("experimental-raft-process-transferred-leader");
     let cluster_name = format!(
@@ -1888,59 +1956,31 @@ fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
         process_logs(test_dir.path())
     );
 
-    let surviving_node_ids = [102, 103];
-    let (new_leader_socket, _output) = wait_for_runtime_map_ready(
-        &bin,
-        test_dir.path(),
+    wait_for_artifact_committed_vote_at_least(
+        &state_path(test_dir.path(), 102),
+        102,
+        2,
         &mut [&mut node101, &mut node102, &mut node103],
-        &surviving_node_ids,
     );
-    let new_leader_id = if new_leader_socket == control_socket(test_dir.path(), 102) {
-        102
-    } else {
-        103
-    };
-
-    node101.stop();
-    let output = run_set_pg_acting_set_live_with_extra_env(
+    let new_leader_socket = control_socket(test_dir.path(), 102);
+    wait_for_runtime_map_clock_reestablishment_required(
         &bin,
         &new_leader_socket,
-        0,
-        &[1],
-        &admin_helper_auth_env,
-    );
-    assert!(
-        output.status.success(),
-        "post-transfer acting-set change failed: {}\n{}",
-        format_admin_failure(output.status, &output),
-        process_logs(test_dir.path())
-    );
-    let follower_id = if new_leader_id == 102 { 103 } else { 102 };
-    wait_for_follower_artifact_pg_acting_set(
-        &state_path(test_dir.path(), follower_id),
-        PgId::new(0),
-        &[NodeId::new(1)],
-        &mut [&mut node102, &mut node103],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut node103],
     );
 
-    let mut restarted101 = ChildGuard::spawn_with_extra_env(
+    node101.stop();
+    wait_for_runtime_map_clock_reestablishment_required(
         &bin,
+        &new_leader_socket,
         test_dir.path(),
-        &cluster_name,
-        101,
-        &raft_node_ids,
-        &server_auth_env,
-    );
-    wait_for_follower_artifact_pg_acting_set(
-        &state_path(test_dir.path(), 101),
-        PgId::new(0),
-        &[NodeId::new(1)],
-        &mut [&mut restarted101, &mut node102, &mut node103],
+        &mut [&mut node102, &mut node103],
     );
 }
 
 #[test]
-fn experimental_raft_triggered_process_election_survives_abrupt_leader_loss() {
+fn experimental_raft_triggered_process_election_requires_clock_reestablishment() {
     let bin = argmin_s3_bin();
     let test_dir = TestDir::new("experimental-raft-process-triggered-election");
     let cluster_name = format!(
@@ -1977,55 +2017,36 @@ fn experimental_raft_triggered_process_election_survives_abrupt_leader_loss() {
     node101.stop();
 
     let surviving_node_ids = [102, 103];
-    let (candidate_socket, _output) = wait_for_runtime_map_ready(
-        &bin,
+    let candidate_id = wait_for_new_committed_leader(
         test_dir.path(),
-        &mut [&mut node102, &mut node103],
         &surviving_node_ids,
+        2,
+        &mut [&mut node102, &mut node103],
     );
-    let candidate_id = if candidate_socket == control_socket(test_dir.path(), 102) {
-        102
-    } else {
-        103
-    };
+    let candidate_socket = control_socket(test_dir.path(), candidate_id);
     wait_for_trigger_raft_election(
         &bin,
         &candidate_socket,
         test_dir.path(),
         &mut [&mut node102, &mut node103],
     );
-    assert!(
-        artifact_has_committed_vote_for_leader(&state_path(test_dir.path(), candidate_id), candidate_id)
-            .expect("candidate durable artifact should restore after election trigger"),
-        "election trigger returned before checkpointing node {candidate_id}'s committed leader vote\n{}",
-        process_logs(test_dir.path())
+    wait_for_artifact_committed_vote_at_least(
+        &state_path(test_dir.path(), candidate_id),
+        candidate_id,
+        2,
+        &mut [&mut node102, &mut node103],
     );
 
-    wait_for_runtime_map_ready_on(
+    wait_for_runtime_map_clock_reestablishment_required(
         &bin,
         &candidate_socket,
         test_dir.path(),
         &mut [&mut node102, &mut node103],
     );
-
-    let output = run_set_pg_acting_set_live(&bin, &candidate_socket, 0, &[1]);
-    assert!(
-        output.status.success(),
-        "post-election acting-set change failed: {}\n{}",
-        format_admin_failure(output.status, &output),
-        process_logs(test_dir.path())
-    );
-    let follower_id = if candidate_id == 102 { 103 } else { 102 };
-    wait_for_follower_artifact_pg_acting_set(
-        &state_path(test_dir.path(), follower_id),
-        PgId::new(0),
-        &[NodeId::new(1)],
-        &mut [&mut node102, &mut node103],
-    );
 }
 
 #[test]
-fn experimental_raft_process_natural_election_survives_abrupt_leader_loss() {
+fn experimental_raft_process_natural_election_requires_clock_reestablishment() {
     let bin = argmin_s3_bin();
     let test_dir = TestDir::new("experimental-raft-process-natural-election");
     let cluster_name = format!(
@@ -2062,41 +2083,18 @@ fn experimental_raft_process_natural_election_survives_abrupt_leader_loss() {
     node101.stop();
 
     let surviving_node_ids = [102, 103];
-    let (new_leader_socket, _output) = wait_for_runtime_map_ready(
+    let new_leader_id = wait_for_new_committed_leader(
+        test_dir.path(),
+        &surviving_node_ids,
+        2,
+        &mut [&mut node102, &mut node103],
+    );
+    let new_leader_socket = control_socket(test_dir.path(), new_leader_id);
+    wait_for_runtime_map_clock_reestablishment_required(
         &bin,
+        &new_leader_socket,
         test_dir.path(),
         &mut [&mut node102, &mut node103],
-        &surviving_node_ids,
-    );
-    let new_leader_id = if new_leader_socket == control_socket(test_dir.path(), 102) {
-        102
-    } else {
-        103
-    };
-    assert!(
-        artifact_has_committed_vote_for_leader(
-            &state_path(test_dir.path(), new_leader_id),
-            new_leader_id,
-        )
-        .expect("new leader durable artifact should restore after natural election"),
-        "natural election served before checkpointing node {new_leader_id}'s committed leader vote\n{}",
-        process_logs(test_dir.path())
-    );
-
-    let output = run_set_pg_acting_set_live(&bin, &new_leader_socket, 0, &[1]);
-    assert!(
-        output.status.success(),
-        "post-natural-election acting-set change failed: {}\n{}",
-        format_admin_failure(output.status, &output),
-        process_logs(test_dir.path())
-    );
-    let follower_id = if new_leader_id == 102 { 103 } else { 102 };
-    let mut children = [&mut node102, &mut node103];
-    wait_for_follower_artifact_pg_acting_set(
-        &state_path(test_dir.path(), follower_id),
-        PgId::new(0),
-        &[NodeId::new(1)],
-        &mut children,
     );
 }
 

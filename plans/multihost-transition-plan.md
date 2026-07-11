@@ -10693,9 +10693,25 @@ Phase 12.4 proposed scope:
   [control-plane-clock-and-lease-model.md](../guides/control-plane-clock-and-lease-model.md):
   the current 1,000 ms maximum pairwise skew budget is subtracted when a
   frontend or storage node binds a map to its process-local monotonic clock,
-  and added before a successor passes an old-primary deadline. The pure model
-  and independent-clock property tests land before production integration;
-  DCC-2/CP2/CL4 remain open until every serving path uses the binding.
+  and added before a successor passes an old-primary deadline. The pure model,
+  independent-clock property tests, authority deadline bound,
+  frontend/storage-node monotonic bindings, historical-mutation fence, and
+  successor skew margin are now integrated. The authority process compares
+  wall progress with monotonic elapsed time, admits healthy idle time, and
+  fails closed on a discontinuity beyond the skew budget. Raft clock authority
+  is bound to one locally serving term and a later local term invalidates it;
+  only the process that initializes fresh membership may lazily bind the first
+  term, while restored and joining followers require re-establishment.
+  Consumer bindings use platform-qualified suspend-inclusive clocks or a
+  defensive pause-detection fallback and revalidate clock health on every
+  serving admission. Apple separates its raw continuous lease clock from its
+  adjusted monotonic health clock to tolerate normal frequency correction.
+  Replicated apply rejects
+  regression and bounds deadlines without treating logical high-water distance
+  as elapsed real time. Remaining work is an authenticated explicit authority-
+  clock re-establishment operation,
+  diagnostics for that blocked state, and independent-host fault validation;
+  DCC-2 remains open for that operational closeout.
 - Add the shared internal control-plane identity/auth foundation described in
   [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
   and enforce it first on the Raft control-plane peer transport. The Phase 12.3
@@ -11105,10 +11121,12 @@ Phase 12.4 progress:
      used for lease/proof validation. Phase 12.3 added a replicated
      `max_committed_timestamp_ms` high-water to the control-plane snapshot:
      timestamp-bearing apply paths reject regressions, and heartbeat apply also
-     rejects per-node lease-deadline regression. Phase 12 must still define how
-     a replicated leader chooses and bounds these timestamps across leader
-     changes, restarts, clock jumps, and stale lease-read/read-index
-     publication;
+     rejects per-node lease-deadline regression. The DCC-2 integration gates
+     command proposal on process-local wall-versus-monotonic progress and
+     bounds every serving deadline relative to its committed command time.
+     Phase 12 must still add the explicit authenticated authority-clock
+     re-establishment operation used after a larger leader/restart clock
+     discontinuity;
    - after control-plane restart or leader change, any leader-local lease state
      that is not committed must be treated as expired until re-established
      through the consensus protocol;
