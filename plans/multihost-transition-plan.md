@@ -10708,10 +10708,14 @@ Phase 12.4 proposed scope:
   adjusted monotonic health clock to tolerate normal frequency correction.
   Replicated apply rejects
   regression and bounds deadlines without treating logical high-water distance
-  as elapsed real time. Remaining work is an authenticated explicit authority-
-  clock re-establishment operation,
-  diagnostics for that blocked state, and independent-host fault validation;
-  DCC-2 remains open for that operational closeout.
+  as elapsed real time. Authenticated admin-only status and re-establishment
+  RPCs now expose the blocked reason and fence recovery by process-local clock
+  generation, committed timestamp high-water, current Raft term, local serving
+  authority readiness, health-clock availability, and wall time not preceding committed
+  time. Ambiguous response loss is confirmed through the exact next generation
+  and authority tuple. A three-process leadership-transfer regression proves
+  explicit recovery restores serving and survives old-leader loss. DCC-2 is
+  closed; independent-host clock fault runs remain pre-release validation.
 - Add the shared internal control-plane identity/auth foundation described in
   [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
   and enforce it first on the Raft control-plane peer transport. The Phase 12.3
@@ -11021,6 +11025,22 @@ Phase 12.4 progress:
   unlisted historical commands remain rejected.
   CL1 is closed by the paired control-plane fence; RPC4's cross-epoch physical
   shard alias remains separate work.
+- Closed DCC-2/CP2/CL4 operational recovery. The process-local authority clock
+  now has a monotonic generation and a typed blocked reason. Authenticated
+  admin-only status exposes generation, committed timestamp high-water, bound
+  and current Raft terms, and local serving-authority readiness. Status itself
+  observes and latches the current high-water, term, and wall/health-clock
+  sample before returning. Re-establishment requires those observed fields to
+  remain exact, rejects followers and wall time behind committed state, binds a
+  fresh wall/health-clock reference, and advances the generation. The client
+  confirms ambiguous response loss by
+  observing the exact next generation rather than retrying. Unit tests cover
+  stale generation/high-water/term requests, missing clock health, follower and
+  rollback rejection, stale replay after a second fault, and response-loss
+  confirmation. The three-process leadership-transfer test now uses status as
+  the first request to observe the blocked term fence, performs authenticated
+  recovery, resumes runtime-map service, removes the old leader, and continues
+  serving.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
@@ -11161,9 +11181,12 @@ Phase 12.4 progress:
      rejects per-node lease-deadline regression. The DCC-2 integration gates
      command proposal on process-local wall-versus-monotonic progress and
      bounds every serving deadline relative to its committed command time.
-     Phase 12 must still add the explicit authenticated authority-clock
-     re-establishment operation used after a larger leader/restart clock
-     discontinuity;
+     The explicit authenticated authority-clock re-establishment operation now
+     recovers a blocked local leader only when its clock generation, committed
+     timestamp high-water, and current Raft term still match the operator's
+     observation. It rejects followers, stale requests, unavailable health
+     clocks, and wall time behind committed time, and advances the generation
+     on success so replay cannot clear a later fault;
    - after control-plane restart or leader change, any leader-local lease state
      that is not committed must be treated as expired until re-established
      through the consensus protocol;

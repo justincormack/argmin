@@ -90,6 +90,37 @@ every serving deadline is bounded relative to the command's committed time.
 It cannot infer real elapsed time from the logical high-water; the
 process-local authority gate supplies that evidence before command proposal.
 
+### Explicit authority recovery
+
+A clock discontinuity, missing health-clock sample, or new local Raft
+leadership term latches the process-local authority clock non-serving. It does
+not recover merely because a later sample looks plausible. Operators inspect
+the authenticated `control-plane-authority-clock-status` RPC and, after the
+host clock has been corrected and cluster skew is again within policy, invoke
+`control-plane-reestablish-authority-clock` with admin credentials.
+Status is an observing operation, not a passive read of the last serving
+request. Under the process-local clock lock it first incorporates the current
+committed timestamp high-water and validates the current Raft term, wall-clock
+sample, and health-clock sample. Any newly observed fault is latched and
+reported in that same response.
+
+Recovery is fenced by the status observation. The request carries the exact
+process-local clock generation, committed timestamp high-water, and current
+Raft term. The server rejects a changed generation, timestamp, or term; a Raft
+follower or leader that is not applied through committed state; an unavailable
+health-clock sample; and wall time below the committed timestamp high-water.
+A successful recovery binds a fresh wall/health-clock reference to the current
+term and advances the generation. Replaying that request cannot clear a later
+fault, including a second fault in the same Raft term. If the response is lost,
+the client confirms the exact next generation and unchanged authority tuple;
+it does not retry the state change blindly.
+
+This operation is deliberately process-local. It does not rewrite replicated
+time or assert that logical command count represents elapsed time. Admin
+authentication proves who requested recovery; the operator remains
+responsible for establishing that the corrected host clock and peer clocks
+satisfy the deployment skew bound before invoking it.
+
 ## Consumer binding
 
 For authority deadline `D`, local wall sample `W`, local monotonic sample `M`,

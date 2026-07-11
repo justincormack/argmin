@@ -25,19 +25,20 @@ use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
 use storage::control_plane::{
-    build_control_plane_unix_response,
+    build_control_plane_authority_clock_admin_response, build_control_plane_unix_response,
     build_control_plane_unix_response_with_auth_and_response_clock,
     finish_control_plane_heartbeat_response, prepare_control_plane_heartbeat_response,
     read_control_plane_unix_request, write_control_plane_unix_response,
     AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
     ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneAdminAuthCredentialInput,
-    ControlPlaneAuthorityClock, ControlPlaneError, ControlPlaneFrontendAuthCredential,
-    ControlPlaneFrontendAuthCredentialInput, ControlPlaneHeartbeatRefresh,
-    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
-    ControlPlaneStorageNodeAuthCredential, ControlPlaneStorageNodeAuthCredentialInput,
-    ControlPlaneUnixAuthVerifier, FencedPgMetadataTransferSnapshot, FileControlPlaneStore,
-    PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane,
-    UnixControlPlaneClient,
+    ControlPlaneAuthorityClock, ControlPlaneAuthorityClockAdminSample,
+    ControlPlaneAuthorityClockContext, ControlPlaneAuthorityClockStatus, ControlPlaneError,
+    ControlPlaneFrontendAuthCredential, ControlPlaneFrontendAuthCredentialInput,
+    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
+    ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
+    ControlPlaneStorageNodeAuthCredentialInput, ControlPlaneUnixAuthVerifier,
+    FencedPgMetadataTransferSnapshot, FileControlPlaneStore, PgMetadataProof,
+    PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
 use storage::control_plane_auth::{
     ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
@@ -376,6 +377,60 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         return match control_plane_runtime_map_diagnostics(Path::new(&path)) {
             Ok(diagnostics) => {
                 println!("{diagnostics}");
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
+    if command == "control-plane-authority-clock-status" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return match control_plane_authority_clock_status(Path::new(&path)) {
+            Ok(status) => {
+                println!("{}", format_authority_clock_status(status));
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
+    if command == "control-plane-reestablish-authority-clock" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return match reestablish_control_plane_authority_clock(Path::new(&path)) {
+            Ok(status) => {
+                println!("{}", format_authority_clock_status(status));
                 Some(0)
             }
             Err(error) => {
@@ -777,6 +832,41 @@ fn trigger_control_plane_raft_election(socket_path: &Path) -> Result<(), String>
     build_admin_control_plane_client_from_command_auth_env(socket_path)?
         .trigger_raft_election()
         .map_err(|error| format!("failed to trigger control-plane Raft election: {error}"))
+}
+
+fn control_plane_authority_clock_status(
+    socket_path: &Path,
+) -> Result<ControlPlaneAuthorityClockStatus, String> {
+    build_admin_control_plane_client_from_command_auth_env(socket_path)?
+        .authority_clock_status()
+        .map_err(|error| format!("failed to read control-plane authority-clock status: {error}"))
+}
+
+fn reestablish_control_plane_authority_clock(
+    socket_path: &Path,
+) -> Result<ControlPlaneAuthorityClockStatus, String> {
+    build_admin_control_plane_client_from_command_auth_env(socket_path)?
+        .reestablish_authority_clock()
+        .map_err(|error| format!("failed to re-establish control-plane authority clock: {error}"))
+}
+
+fn format_authority_clock_status(status: ControlPlaneAuthorityClockStatus) -> String {
+    format!(
+        "generation={} established={} blocked_reason={:?} committed_timestamp_high_water_ms={} bound_raft_term={} current_raft_term={} local_raft_authority_serving={}",
+        status.generation(),
+        status.established(),
+        status.blocked_reason(),
+        status
+            .committed_timestamp_high_water_ms()
+            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        status
+            .bound_raft_leadership_term()
+            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        status
+            .current_raft_leadership_term()
+            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        status.local_raft_authority_serving(),
+    )
 }
 
 fn fence_control_plane_pg_for_metadata_transfer_live(
@@ -1540,6 +1630,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                         stream,
                         Arc::clone(&authority),
                         Some(Arc::clone(&authority_clock)),
+                        true,
                         Arc::clone(&active_rpc_workers),
                         auth_verifier.clone(),
                     );
@@ -1859,6 +1950,19 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
 }
 
 impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
+    fn authority_clock_context(
+        &self,
+    ) -> Result<ControlPlaneAuthorityClockContext, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        let status = self.block_on(self.authority.status())?;
+        let snapshot = self.current_snapshot()?;
+        Ok(ControlPlaneAuthorityClockContext::new(
+            snapshot.max_committed_timestamp_ms(),
+            status.current_term(),
+            status.linearized_authority_serving(),
+        ))
+    }
+
     fn set_pg_acting_set(
         &mut self,
         pg_id: PgId,
@@ -2928,7 +3032,8 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                     spawn_control_plane_rpc_worker(
                         stream,
                         Arc::clone(&authority),
-                        None,
+                        Some(Arc::clone(&authority_clock)),
+                        false,
                         Arc::clone(&active_rpc_workers),
                         auth_verifier.clone(),
                     );
@@ -3150,6 +3255,7 @@ fn spawn_control_plane_rpc_worker(
         >,
     >,
     authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
+    gate_request_time_with_authority_clock: bool,
     active_rpc_workers: Arc<AtomicUsize>,
     auth_verifier: Option<Arc<ControlPlaneUnixAuthVerifier>>,
 ) {
@@ -3186,21 +3292,51 @@ fn spawn_control_plane_rpc_worker(
             }
         };
         let response = (|| {
-            if request.is_refresh_node_heartbeat() {
+            if request.is_authority_clock_admin() {
+                let authority = authority
+                    .lock()
+                    .expect("control-plane authority mutex poisoned");
+                let authority_clock =
+                    authority_clock
+                        .as_ref()
+                        .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                            message:
+                                "authority-clock administration requires a process-local clock gate"
+                                    .to_owned(),
+                        })?;
+                let mut authority_clock = authority_clock
+                    .lock()
+                    .expect("control-plane authority clock mutex poisoned");
+                let wall_ms = storage::clock::current_time_millis();
+                build_control_plane_authority_clock_admin_response(
+                    &*authority,
+                    &mut authority_clock,
+                    request,
+                    auth_verifier.as_deref(),
+                    ControlPlaneAuthorityClockAdminSample::new(
+                        wall_ms,
+                        wall_ms,
+                        storage::clock::clock_health_time_millis(),
+                    ),
+                    || Ok(storage::clock::current_time_millis()),
+                )
+            } else if request.is_refresh_node_heartbeat() {
                 let prepared = {
                     let mut authority = authority
                         .lock()
                         .expect("control-plane authority mutex poisoned");
                     let wall_ms = storage::clock::current_time_millis();
                     let now_ms = match &authority_clock {
-                        Some(authority_clock) => authority_clock
-                            .lock()
-                            .expect("control-plane authority clock mutex poisoned")
-                            .effective_now_ms(
-                                wall_ms,
-                                storage::clock::clock_health_time_millis(),
-                            )?,
-                        None => wall_ms,
+                        Some(authority_clock) if gate_request_time_with_authority_clock => {
+                            authority_clock
+                                .lock()
+                                .expect("control-plane authority clock mutex poisoned")
+                                .effective_now_ms(
+                                    wall_ms,
+                                    storage::clock::clock_health_time_millis(),
+                                )?
+                        }
+                        _ => wall_ms,
                     };
                     prepare_control_plane_heartbeat_response(
                         &mut *authority,
@@ -3220,11 +3356,13 @@ fn spawn_control_plane_rpc_worker(
                     .expect("control-plane authority mutex poisoned");
                 let wall_ms = storage::clock::current_time_millis();
                 let now_ms = match &authority_clock {
-                    Some(authority_clock) => authority_clock
-                        .lock()
-                        .expect("control-plane authority clock mutex poisoned")
-                        .effective_now_ms(wall_ms, storage::clock::clock_health_time_millis())?,
-                    None => wall_ms,
+                    Some(authority_clock) if gate_request_time_with_authority_clock => {
+                        authority_clock
+                            .lock()
+                            .expect("control-plane authority clock mutex poisoned")
+                            .effective_now_ms(wall_ms, storage::clock::clock_health_time_millis())?
+                    }
+                    _ => wall_ms,
                 };
                 match auth_verifier.as_deref() {
                     Some(auth_verifier) => {
@@ -3353,6 +3491,35 @@ impl FrontendControlPlaneClient {
 }
 
 impl AdminControlPlaneClient {
+    fn authority_clock_status(
+        &self,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        match self {
+            Self::Plain(_) => Err(ControlPlaneError::RpcProtocol {
+                message: "authority-clock status requires authenticated admin credentials"
+                    .to_owned(),
+            }),
+            Self::Authenticated(client) => {
+                client.authority_clock_status(storage::clock::current_time_millis())
+            }
+        }
+    }
+
+    fn reestablish_authority_clock(
+        &self,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        match self {
+            Self::Plain(_) => Err(ControlPlaneError::RpcProtocol {
+                message:
+                    "authority-clock re-establishment requires authenticated admin credentials"
+                        .to_owned(),
+            }),
+            Self::Authenticated(client) => {
+                client.reestablish_authority_clock(storage::clock::current_time_millis())
+            }
+        }
+    }
+
     fn set_pg_acting_set_checked(
         &self,
         pg_id: PgId,

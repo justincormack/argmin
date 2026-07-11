@@ -38,6 +38,7 @@ const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 16;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
@@ -90,6 +91,104 @@ fn control_plane_lease_clock_error(error: LeaseClockError) -> ControlPlaneError 
 /// but only the command issuer can compare wall-clock progress with monotonic
 /// elapsed time. A new process starts established only when its wall clock is
 /// within the configured skew budget of the persisted timestamp high-water.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneAuthorityClockBlockedReason {
+    InitialTimestampDiscontinuity,
+    RaftLeadershipChanged,
+    ClockSourceUnavailable,
+    ClockHealthRegression,
+    WallClockRegression,
+    WallClockForwardJump,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneAuthorityClockStatus {
+    generation: u64,
+    established: bool,
+    blocked_reason: Option<ControlPlaneAuthorityClockBlockedReason>,
+    committed_timestamp_high_water_ms: Option<u64>,
+    bound_raft_leadership_term: Option<u64>,
+    current_raft_leadership_term: Option<u64>,
+    local_raft_authority_serving: bool,
+}
+
+impl ControlPlaneAuthorityClockStatus {
+    #[must_use]
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn established(self) -> bool {
+        self.established
+    }
+
+    #[must_use]
+    pub fn blocked_reason(self) -> Option<ControlPlaneAuthorityClockBlockedReason> {
+        self.blocked_reason
+    }
+
+    #[must_use]
+    pub fn committed_timestamp_high_water_ms(self) -> Option<u64> {
+        self.committed_timestamp_high_water_ms
+    }
+
+    #[must_use]
+    pub fn bound_raft_leadership_term(self) -> Option<u64> {
+        self.bound_raft_leadership_term
+    }
+
+    #[must_use]
+    pub fn current_raft_leadership_term(self) -> Option<u64> {
+        self.current_raft_leadership_term
+    }
+
+    #[must_use]
+    pub fn local_raft_authority_serving(self) -> bool {
+        self.local_raft_authority_serving
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneAuthorityClockContext {
+    committed_timestamp_high_water_ms: Option<u64>,
+    current_raft_leadership_term: Option<u64>,
+    local_raft_authority_serving: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneAuthorityClockAdminSample {
+    auth_authority_now_ms: u64,
+    wall_ms: u64,
+    clock_health_ms: Option<u64>,
+}
+
+impl ControlPlaneAuthorityClockAdminSample {
+    #[must_use]
+    pub fn new(auth_authority_now_ms: u64, wall_ms: u64, clock_health_ms: Option<u64>) -> Self {
+        Self {
+            auth_authority_now_ms,
+            wall_ms,
+            clock_health_ms,
+        }
+    }
+}
+
+impl ControlPlaneAuthorityClockContext {
+    #[must_use]
+    pub fn new(
+        committed_timestamp_high_water_ms: Option<u64>,
+        current_raft_leadership_term: Option<u64>,
+        local_raft_authority_serving: bool,
+    ) -> Self {
+        Self {
+            committed_timestamp_high_water_ms,
+            current_raft_leadership_term,
+            local_raft_authority_serving,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ControlPlaneAuthorityClock {
     reference_wall_ms: u64,
@@ -98,6 +197,8 @@ pub struct ControlPlaneAuthorityClock {
     raft_leadership_term: Option<u64>,
     initial_raft_term_binding_available: bool,
     established: bool,
+    generation: u64,
+    blocked_reason: Option<ControlPlaneAuthorityClockBlockedReason>,
 }
 
 impl ControlPlaneAuthorityClock {
@@ -111,6 +212,8 @@ impl ControlPlaneAuthorityClock {
         let established = max_committed_timestamp_ms.is_none_or(|committed_ms| {
             wall_ms.abs_diff(committed_ms) <= CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS
         });
+        let blocked_reason = (!established)
+            .then_some(ControlPlaneAuthorityClockBlockedReason::InitialTimestampDiscontinuity);
         Ok(Self {
             reference_wall_ms: wall_ms,
             reference_clock_health_ms: clock_health_ms,
@@ -118,7 +221,134 @@ impl ControlPlaneAuthorityClock {
             raft_leadership_term: None,
             initial_raft_term_binding_available: max_committed_timestamp_ms.is_none(),
             established,
+            generation: 1,
+            blocked_reason,
         })
+    }
+
+    fn advance_generation(&mut self) -> Result<(), ControlPlaneError> {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(ControlPlaneError::AuthorityClockGenerationOverflow)?;
+        Ok(())
+    }
+
+    fn latch_unhealthy(
+        &mut self,
+        reason: ControlPlaneAuthorityClockBlockedReason,
+    ) -> Result<(), ControlPlaneError> {
+        if self.established || self.blocked_reason != Some(reason) {
+            self.advance_generation()?;
+        }
+        self.established = false;
+        self.blocked_reason = Some(reason);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn status(
+        &self,
+        context: ControlPlaneAuthorityClockContext,
+    ) -> ControlPlaneAuthorityClockStatus {
+        ControlPlaneAuthorityClockStatus {
+            generation: self.generation,
+            established: self.established,
+            blocked_reason: self.blocked_reason,
+            committed_timestamp_high_water_ms: context.committed_timestamp_high_water_ms,
+            bound_raft_leadership_term: self.raft_leadership_term,
+            current_raft_leadership_term: context.current_raft_leadership_term,
+            local_raft_authority_serving: context.local_raft_authority_serving,
+        }
+    }
+
+    /// Observe current authority and clock state before reporting status.
+    pub fn observe_status(
+        &mut self,
+        context: ControlPlaneAuthorityClockContext,
+        wall_ms: u64,
+        clock_health_ms: Option<u64>,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        self.observe_committed_timestamp_high_water(context.committed_timestamp_high_water_ms);
+        if let Some(term) = context.current_raft_leadership_term {
+            if let Err(error) = self.validate_raft_leadership_term(term) {
+                return if self.established {
+                    Err(error)
+                } else {
+                    Ok(self.status(context))
+                };
+            }
+        }
+        if let Err(error) = self.effective_now_ms(wall_ms, clock_health_ms) {
+            return if self.established {
+                Err(error)
+            } else {
+                Ok(self.status(context))
+            };
+        }
+        Ok(self.status(context))
+    }
+
+    pub fn reestablish(
+        &mut self,
+        expected_generation: u64,
+        expected_committed_timestamp_high_water_ms: Option<u64>,
+        expected_raft_leadership_term: Option<u64>,
+        context: ControlPlaneAuthorityClockContext,
+        wall_ms: u64,
+        clock_health_ms: Option<u64>,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        if self.established {
+            return Err(ControlPlaneError::AuthorityClockAlreadyEstablished);
+        }
+        if expected_generation != self.generation {
+            return Err(ControlPlaneError::AuthorityClockGenerationMismatch {
+                expected_generation,
+                actual_generation: self.generation,
+            });
+        }
+        if expected_committed_timestamp_high_water_ms != context.committed_timestamp_high_water_ms {
+            return Err(
+                ControlPlaneError::AuthorityClockCommittedTimestampMismatch {
+                    expected_timestamp_ms: expected_committed_timestamp_high_water_ms,
+                    actual_timestamp_ms: context.committed_timestamp_high_water_ms,
+                },
+            );
+        }
+        if expected_raft_leadership_term != context.current_raft_leadership_term {
+            return Err(ControlPlaneError::AuthorityClockRaftTermMismatch {
+                expected_term: expected_raft_leadership_term,
+                actual_term: context.current_raft_leadership_term,
+            });
+        }
+        if context.current_raft_leadership_term.is_some() && !context.local_raft_authority_serving {
+            return Err(ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority);
+        }
+        if let Some(committed_timestamp_high_water_ms) = context.committed_timestamp_high_water_ms {
+            if wall_ms < committed_timestamp_high_water_ms {
+                return Err(
+                    ControlPlaneError::AuthorityClockWallBehindCommittedTimestamp {
+                        wall_ms,
+                        committed_timestamp_high_water_ms,
+                    },
+                );
+            }
+        }
+        let clock_health_ms =
+            clock_health_ms.ok_or(ControlPlaneError::AuthorityClockSourceUnavailable)?;
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(ControlPlaneError::AuthorityClockGenerationOverflow)?;
+        self.reference_wall_ms = wall_ms;
+        self.reference_clock_health_ms = clock_health_ms;
+        self.minimum_timestamp_ms = context.committed_timestamp_high_water_ms;
+        self.raft_leadership_term = context.current_raft_leadership_term;
+        self.initial_raft_term_binding_available = false;
+        self.established = true;
+        self.blocked_reason = None;
+        self.generation = next_generation;
+        Ok(self.status(context))
     }
 
     pub fn bind_initial_raft_leadership_term(&mut self, term: Option<u64>) {
@@ -147,7 +377,9 @@ impl ControlPlaneAuthorityClock {
                 Ok(())
             }
             established_term => {
-                self.established = false;
+                self.latch_unhealthy(
+                    ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged,
+                )?;
                 Err(ControlPlaneError::AuthorityClockLeadershipChanged {
                     established_term,
                     current_term: term,
@@ -163,7 +395,7 @@ impl ControlPlaneAuthorityClock {
         clock_health_ms: Option<u64>,
     ) -> Result<u64, ControlPlaneError> {
         let Some(clock_health_ms) = clock_health_ms else {
-            self.established = false;
+            self.latch_unhealthy(ControlPlaneAuthorityClockBlockedReason::ClockSourceUnavailable)?;
             return Err(ControlPlaneError::AuthorityClockSourceUnavailable);
         };
         let max_committed_timestamp_ms = self.minimum_timestamp_ms.unwrap_or(wall_ms);
@@ -185,7 +417,7 @@ impl ControlPlaneAuthorityClock {
         let Some(monotonic_elapsed_ms) =
             clock_health_ms.checked_sub(self.reference_clock_health_ms)
         else {
-            self.established = false;
+            self.latch_unhealthy(ControlPlaneAuthorityClockBlockedReason::ClockHealthRegression)?;
             return Err(ControlPlaneError::CommittedTimestampRegression {
                 timestamp_ms: clock_health_ms,
                 max_committed_timestamp_ms: self.reference_clock_health_ms,
@@ -196,7 +428,11 @@ impl ControlPlaneAuthorityClock {
             .checked_add(monotonic_elapsed_ms)
             .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
         if wall_ms.abs_diff(expected_wall_ms) > CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS {
-            self.established = false;
+            self.latch_unhealthy(if wall_ms < expected_wall_ms {
+                ControlPlaneAuthorityClockBlockedReason::WallClockRegression
+            } else {
+                ControlPlaneAuthorityClockBlockedReason::WallClockForwardJump
+            })?;
             return Err(if wall_ms < expected_wall_ms {
                 ControlPlaneError::CommittedTimestampRegression {
                     timestamp_ms: wall_ms,
@@ -4097,6 +4333,16 @@ impl FencedPgMetadataTransferSnapshot {
 }
 
 pub trait ControlPlaneAdmin {
+    fn authority_clock_context(
+        &self,
+    ) -> Result<ControlPlaneAuthorityClockContext, ControlPlaneError> {
+        Err(ControlPlaneError::RpcRemote {
+            message:
+                "control-plane authority clock administration is not supported by this authority"
+                    .to_owned(),
+        })
+    }
+
     fn set_pg_acting_set(
         &mut self,
         pg_id: PgId,
@@ -5034,6 +5280,16 @@ impl<S: ControlPlaneStore> ControlPlaneLinearizedRuntimeMapSource
 }
 
 impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> {
+    fn authority_clock_context(
+        &self,
+    ) -> Result<ControlPlaneAuthorityClockContext, ControlPlaneError> {
+        Ok(ControlPlaneAuthorityClockContext::new(
+            self.snapshot().max_committed_timestamp_ms(),
+            None,
+            true,
+        ))
+    }
+
     fn set_pg_acting_set(
         &mut self,
         pg_id: PgId,
@@ -6894,6 +7150,86 @@ impl AuthenticatedUnixControlPlaneClient {
         Ok(())
     }
 
+    pub fn authority_clock_status(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        let payload = self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::AuthorityClockStatus,
+            authority_now_ms,
+            Vec::new(),
+            CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let status = read_authority_clock_status(&mut reader)?;
+        reader.finish()?;
+        Ok(status)
+    }
+
+    fn reestablish_authority_clock_from_status(
+        &self,
+        expected: ControlPlaneAuthorityClockStatus,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, expected.generation());
+        write_option_u64(&mut payload, expected.committed_timestamp_high_water_ms());
+        write_option_u64(&mut payload, expected.current_raft_leadership_term());
+        let payload = self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::ReestablishAuthorityClock,
+            authority_now_ms,
+            payload,
+            CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let status = read_authority_clock_status(&mut reader)?;
+        reader.finish()?;
+        Ok(status)
+    }
+
+    pub fn reestablish_authority_clock(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
+        let expected = self.authority_clock_status(retry_clock.now_ms())?;
+        if expected.established() {
+            return Ok(expected);
+        }
+        match self.reestablish_authority_clock_from_status(expected, retry_clock.now_ms()) {
+            Ok(status) => Ok(status),
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                let observed = self.authority_clock_status(retry_clock.now_ms()).map_err(
+                    |status_error| ControlPlaneError::RpcUnconfirmed {
+                        message: format!(
+                            "authority-clock re-establishment response was lost ({error}); status confirmation failed: {status_error}"
+                        ),
+                    },
+                )?;
+                let expected_generation = expected
+                    .generation()
+                    .checked_add(1)
+                    .ok_or(ControlPlaneError::AuthorityClockGenerationOverflow)?;
+                if observed.established()
+                    && observed.generation() == expected_generation
+                    && observed.committed_timestamp_high_water_ms()
+                        == expected.committed_timestamp_high_water_ms()
+                    && observed.current_raft_leadership_term()
+                        == expected.current_raft_leadership_term()
+                {
+                    Ok(observed)
+                } else {
+                    Err(ControlPlaneError::RpcUnconfirmed {
+                        message: format!(
+                            "authority-clock re-establishment response was lost ({error}); observed status did not confirm the expected generation and authority state"
+                        ),
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn send_signed_read_only_request_with_read_timeout(
         &self,
         kind: ControlPlaneRpcKind,
@@ -8257,6 +8593,15 @@ impl ControlPlaneRpcRequest {
     pub fn is_refresh_node_heartbeat(&self) -> bool {
         self.kind == ControlPlaneRpcKind::RefreshNodeHeartbeat
     }
+
+    #[must_use]
+    pub fn is_authority_clock_admin(&self) -> bool {
+        matches!(
+            self.kind,
+            ControlPlaneRpcKind::AuthorityClockStatus
+                | ControlPlaneRpcKind::ReestablishAuthorityClock
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -8654,6 +8999,13 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::AuthorityClockStatus
+        | ControlPlaneRpcKind::ReestablishAuthorityClock => {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: "authority-clock admin RPC requires the process-local clock handler"
+                    .to_owned(),
+            });
+        }
     };
     let mut payload = encode_control_plane_rpc_response(response)?;
     if let Some((credential, target)) = admin_response_auth {
@@ -8667,6 +9019,83 @@ where
             payload,
         )?;
     }
+    Ok(ControlPlaneRpcResponse { kind, payload })
+}
+
+pub fn build_control_plane_authority_clock_admin_response<T, F>(
+    control_plane: &T,
+    authority_clock: &mut ControlPlaneAuthorityClock,
+    request: ControlPlaneRpcRequest,
+    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
+    sample: ControlPlaneAuthorityClockAdminSample,
+    mut response_authority_now_ms: F,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
+where
+    T: ControlPlaneAdmin,
+    F: FnMut() -> Result<u64, ControlPlaneError>,
+{
+    let ControlPlaneRpcRequest { kind, payload } = request;
+    if !matches!(
+        kind,
+        ControlPlaneRpcKind::AuthorityClockStatus | ControlPlaneRpcKind::ReestablishAuthorityClock
+    ) {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!("expected authority-clock admin RPC, got {kind:?}"),
+        });
+    }
+    let Some(auth_verifier) =
+        auth_verifier.filter(|auth_verifier| auth_verifier.requires_admin_control_plane_auth())
+    else {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "authority-clock administration requires configured admin authentication"
+                .to_owned(),
+        });
+    };
+    let verified = auth_verifier.verify_admin_control_plane_command_payload(
+        kind,
+        &payload,
+        sample.auth_authority_now_ms,
+    )?;
+    let context = control_plane.authority_clock_context();
+    let response = match kind {
+        ControlPlaneRpcKind::AuthorityClockStatus => context.and_then(|context| {
+            let reader = PayloadReader::new(&verified.payload);
+            reader.finish()?;
+            let mut response = Vec::new();
+            let status =
+                authority_clock.observe_status(context, sample.wall_ms, sample.clock_health_ms)?;
+            write_authority_clock_status(&mut response, status);
+            Ok(response)
+        }),
+        ControlPlaneRpcKind::ReestablishAuthorityClock => context.and_then(|context| {
+            let mut reader = PayloadReader::new(&verified.payload);
+            let expected_generation = reader.read_u64()?;
+            let expected_committed_timestamp_high_water_ms = reader.read_option_u64()?;
+            let expected_raft_leadership_term = reader.read_option_u64()?;
+            reader.finish()?;
+            let status = authority_clock.reestablish(
+                expected_generation,
+                expected_committed_timestamp_high_water_ms,
+                expected_raft_leadership_term,
+                context,
+                sample.wall_ms,
+                sample.clock_health_ms,
+            )?;
+            let mut response = Vec::new();
+            write_authority_clock_status(&mut response, status);
+            Ok(response)
+        }),
+        _ => unreachable!("authority-clock RPC kind checked above"),
+    };
+    let response_authority_now_ms = response_authority_now_ms()?;
+    let payload = sign_control_plane_response_payload(
+        kind,
+        &verified.response_credential,
+        verified.response_target,
+        ControlPlaneAuthOperation::AdminControlPlaneResponse,
+        response_authority_now_ms,
+        encode_control_plane_rpc_response(response)?,
+    )?;
     Ok(ControlPlaneRpcResponse { kind, payload })
 }
 
@@ -8723,6 +9152,8 @@ enum ControlPlaneRpcKind {
     TriggerRaftElection = 11,
     RuntimeMapStatus = 12,
     PendingMetadataCommandRecoveries = 13,
+    AuthorityClockStatus = 14,
+    ReestablishAuthorityClock = 15,
 }
 
 impl ControlPlaneRpcKind {
@@ -8744,6 +9175,8 @@ impl ControlPlaneRpcKind {
             11 => Ok(Self::TriggerRaftElection),
             12 => Ok(Self::RuntimeMapStatus),
             13 => Ok(Self::PendingMetadataCommandRecoveries),
+            14 => Ok(Self::AuthorityClockStatus),
+            15 => Ok(Self::ReestablishAuthorityClock),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),
@@ -8765,7 +9198,11 @@ impl ControlPlaneRpcKind {
             | Self::FencePgForMetadataTransferRuntimeMap
             | Self::TransferRaftLeadership
             | Self::TriggerRaftSnapshotAndPurge
-            | Self::TriggerRaftElection => ControlPlaneAuthOperation::AdminControlPlaneCommand,
+            | Self::TriggerRaftElection
+            | Self::AuthorityClockStatus
+            | Self::ReestablishAuthorityClock => {
+                ControlPlaneAuthOperation::AdminControlPlaneCommand
+            }
         }
     }
 }
@@ -9326,6 +9763,77 @@ fn read_pending_metadata_command_recovery_listing(
         ));
     }
     Ok(PendingMetadataCommandRecoveryListing::new(tasks, failures))
+}
+
+fn write_authority_clock_blocked_reason(
+    out: &mut Vec<u8>,
+    reason: Option<ControlPlaneAuthorityClockBlockedReason>,
+) {
+    write_u8(
+        out,
+        match reason {
+            None => 0,
+            Some(ControlPlaneAuthorityClockBlockedReason::InitialTimestampDiscontinuity) => 1,
+            Some(ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged) => 2,
+            Some(ControlPlaneAuthorityClockBlockedReason::ClockSourceUnavailable) => 3,
+            Some(ControlPlaneAuthorityClockBlockedReason::ClockHealthRegression) => 4,
+            Some(ControlPlaneAuthorityClockBlockedReason::WallClockRegression) => 5,
+            Some(ControlPlaneAuthorityClockBlockedReason::WallClockForwardJump) => 6,
+        },
+    );
+}
+
+fn read_authority_clock_blocked_reason(
+    reader: &mut PayloadReader<'_>,
+) -> Result<Option<ControlPlaneAuthorityClockBlockedReason>, ControlPlaneError> {
+    match reader.read_u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(
+            ControlPlaneAuthorityClockBlockedReason::InitialTimestampDiscontinuity,
+        )),
+        2 => Ok(Some(
+            ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged,
+        )),
+        3 => Ok(Some(
+            ControlPlaneAuthorityClockBlockedReason::ClockSourceUnavailable,
+        )),
+        4 => Ok(Some(
+            ControlPlaneAuthorityClockBlockedReason::ClockHealthRegression,
+        )),
+        5 => Ok(Some(
+            ControlPlaneAuthorityClockBlockedReason::WallClockRegression,
+        )),
+        6 => Ok(Some(
+            ControlPlaneAuthorityClockBlockedReason::WallClockForwardJump,
+        )),
+        tag => Err(ControlPlaneError::RpcProtocol {
+            message: format!("invalid authority-clock blocked-reason tag {tag}"),
+        }),
+    }
+}
+
+fn write_authority_clock_status(out: &mut Vec<u8>, status: ControlPlaneAuthorityClockStatus) {
+    write_u64(out, status.generation());
+    write_u8(out, u8::from(status.established()));
+    write_authority_clock_blocked_reason(out, status.blocked_reason());
+    write_option_u64(out, status.committed_timestamp_high_water_ms());
+    write_option_u64(out, status.bound_raft_leadership_term());
+    write_option_u64(out, status.current_raft_leadership_term());
+    write_u8(out, u8::from(status.local_raft_authority_serving()));
+}
+
+fn read_authority_clock_status(
+    reader: &mut PayloadReader<'_>,
+) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+    Ok(ControlPlaneAuthorityClockStatus {
+        generation: reader.read_u64()?,
+        established: reader.read_bool()?,
+        blocked_reason: read_authority_clock_blocked_reason(reader)?,
+        committed_timestamp_high_water_ms: reader.read_option_u64()?,
+        bound_raft_leadership_term: reader.read_option_u64()?,
+        current_raft_leadership_term: reader.read_option_u64()?,
+        local_raft_authority_serving: reader.read_bool()?,
+    })
 }
 
 fn write_runtime_map_snapshot(
@@ -10689,6 +11197,49 @@ pub enum ControlPlaneError {
 
     #[error("control-plane authority clock-health source is unavailable")]
     AuthorityClockSourceUnavailable,
+
+    #[error("control-plane authority clock is already established")]
+    AuthorityClockAlreadyEstablished,
+
+    #[error(
+        "control-plane authority clock generation changed: expected {expected_generation}, actual {actual_generation}"
+    )]
+    AuthorityClockGenerationMismatch {
+        expected_generation: u64,
+        actual_generation: u64,
+    },
+
+    #[error(
+        "control-plane authority clock committed timestamp changed: expected {expected_timestamp_ms:?}, actual {actual_timestamp_ms:?}"
+    )]
+    AuthorityClockCommittedTimestampMismatch {
+        expected_timestamp_ms: Option<u64>,
+        actual_timestamp_ms: Option<u64>,
+    },
+
+    #[error(
+        "control-plane authority clock Raft term changed: expected {expected_term:?}, actual {actual_term:?}"
+    )]
+    AuthorityClockRaftTermMismatch {
+        expected_term: Option<u64>,
+        actual_term: Option<u64>,
+    },
+
+    #[error(
+        "control-plane authority clock can only be re-established on the local serving Raft authority"
+    )]
+    AuthorityClockNotLocalServingRaftAuthority,
+
+    #[error(
+        "control-plane authority wall clock {wall_ms}ms is behind committed timestamp high-water {committed_timestamp_high_water_ms}ms"
+    )]
+    AuthorityClockWallBehindCommittedTimestamp {
+        wall_ms: u64,
+        committed_timestamp_high_water_ms: u64,
+    },
+
+    #[error("control-plane authority clock generation overflow")]
+    AuthorityClockGenerationOverflow,
 
     #[error(
         "node {node_id} heartbeat lease deadline {requested_lease_deadline_ms}ms regressed below current deadline {current_lease_deadline_ms}ms"
@@ -16119,6 +16670,272 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_authority_clock_admin_reestablishes_once_and_rejects_stale_replay() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let high_water = authority.snapshot().max_committed_timestamp_ms();
+        let wall_ms = high_water.unwrap() + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1;
+        let mut clock = ControlPlaneAuthorityClock::new(high_water, wall_ms, Some(50)).unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let signer = admin_auth_credential("auth-cluster", "admin-1");
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(tmp.path().join("unused.sock")),
+            signer.clone(),
+        );
+
+        let status_request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::AuthorityClockStatus,
+            &signer,
+            Vec::new(),
+            Some(wall_ms),
+            Some(wall_ms + 1_000),
+        );
+        let status_response = build_control_plane_authority_clock_admin_response(
+            &authority,
+            &mut clock,
+            status_request,
+            Some(&verifier),
+            ControlPlaneAuthorityClockAdminSample::new(wall_ms, wall_ms, Some(50)),
+            || Ok(wall_ms),
+        )
+        .unwrap();
+        let status_payload = client
+            .verify_admin_control_plane_response(
+                ControlPlaneRpcKind::AuthorityClockStatus,
+                wall_ms,
+                &status_response.payload,
+            )
+            .and_then(decode_control_plane_rpc_response)
+            .unwrap();
+        let mut reader = PayloadReader::new(&status_payload);
+        let blocked = read_authority_clock_status(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert!(!blocked.established());
+
+        let mut recovery_payload = Vec::new();
+        write_u64(&mut recovery_payload, blocked.generation());
+        write_option_u64(
+            &mut recovery_payload,
+            blocked.committed_timestamp_high_water_ms(),
+        );
+        write_option_u64(
+            &mut recovery_payload,
+            blocked.current_raft_leadership_term(),
+        );
+        let recovery_request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::ReestablishAuthorityClock,
+            &signer,
+            recovery_payload,
+            Some(wall_ms),
+            Some(wall_ms + 1_000),
+        );
+        let recovery_response = build_control_plane_authority_clock_admin_response(
+            &authority,
+            &mut clock,
+            recovery_request,
+            Some(&verifier),
+            ControlPlaneAuthorityClockAdminSample::new(wall_ms, wall_ms, Some(50)),
+            || Ok(wall_ms),
+        )
+        .unwrap();
+        let recovery_payload = client
+            .verify_admin_control_plane_response(
+                ControlPlaneRpcKind::ReestablishAuthorityClock,
+                wall_ms,
+                &recovery_response.payload,
+            )
+            .and_then(decode_control_plane_rpc_response)
+            .unwrap();
+        let mut reader = PayloadReader::new(&recovery_payload);
+        let established = read_authority_clock_status(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert!(established.established());
+        assert_eq!(established.generation(), blocked.generation() + 1);
+
+        assert!(clock.effective_now_ms(wall_ms + 1, None).is_err());
+        let mut stale_payload = Vec::new();
+        write_u64(&mut stale_payload, blocked.generation());
+        write_option_u64(
+            &mut stale_payload,
+            blocked.committed_timestamp_high_water_ms(),
+        );
+        write_option_u64(&mut stale_payload, blocked.current_raft_leadership_term());
+        let stale_request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::ReestablishAuthorityClock,
+            &signer,
+            stale_payload,
+            Some(wall_ms),
+            Some(wall_ms + 1_000),
+        );
+        let stale_response = build_control_plane_authority_clock_admin_response(
+            &authority,
+            &mut clock,
+            stale_request,
+            Some(&verifier),
+            ControlPlaneAuthorityClockAdminSample::new(wall_ms, wall_ms + 1, Some(51)),
+            || Ok(wall_ms + 1),
+        )
+        .unwrap();
+        let error = client
+            .verify_admin_control_plane_response(
+                ControlPlaneRpcKind::ReestablishAuthorityClock,
+                wall_ms + 1,
+                &stale_response.payload,
+            )
+            .and_then(decode_control_plane_rpc_response)
+            .unwrap_err();
+        assert!(matches!(error, ControlPlaneError::RpcRemote { ref message }
+            if message.contains("generation changed")));
+        assert!(!clock
+            .status(authority.authority_clock_context().unwrap())
+            .established());
+    }
+
+    #[test]
+    fn authenticated_authority_clock_status_observes_missing_health_sample() {
+        let tmp = test_util::tempdir();
+        let authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        let mut clock = ControlPlaneAuthorityClock::new(None, 1_000, Some(50)).unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let signer = admin_auth_credential("auth-cluster", "admin-1");
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(tmp.path().join("unused.sock")),
+            signer.clone(),
+        );
+        let request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::AuthorityClockStatus,
+            &signer,
+            Vec::new(),
+            Some(1_001),
+            Some(2_001),
+        );
+
+        let response = build_control_plane_authority_clock_admin_response(
+            &authority,
+            &mut clock,
+            request,
+            Some(&verifier),
+            ControlPlaneAuthorityClockAdminSample::new(1_001, 1_001, None),
+            || Ok(1_001),
+        )
+        .unwrap();
+        let payload = client
+            .verify_admin_control_plane_response(
+                ControlPlaneRpcKind::AuthorityClockStatus,
+                1_001,
+                &response.payload,
+            )
+            .and_then(decode_control_plane_rpc_response)
+            .unwrap();
+        let mut reader = PayloadReader::new(&payload);
+        let status = read_authority_clock_status(&mut reader).unwrap();
+        reader.finish().unwrap();
+
+        assert!(!status.established());
+        assert_eq!(
+            status.blocked_reason(),
+            Some(ControlPlaneAuthorityClockBlockedReason::ClockSourceUnavailable)
+        );
+    }
+
+    #[test]
+    fn authority_clock_admin_requires_configured_admin_authentication() {
+        let tmp = test_util::tempdir();
+        let authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        let mut clock = ControlPlaneAuthorityClock::new(None, 1_000, Some(50)).unwrap();
+        let request = ControlPlaneRpcRequest {
+            kind: ControlPlaneRpcKind::AuthorityClockStatus,
+            payload: Vec::new(),
+        };
+        assert!(matches!(
+            build_control_plane_authority_clock_admin_response(
+                &authority,
+                &mut clock,
+                request,
+                None,
+                ControlPlaneAuthorityClockAdminSample::new(1_000, 1_000, Some(50)),
+                || Ok(1_000),
+            ),
+            Err(ControlPlaneError::RpcProtocol { ref message })
+                if message.contains("requires configured admin authentication")
+        ));
+    }
+
+    #[test]
+    fn authenticated_authority_clock_recovery_confirms_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let high_water = authority.snapshot().max_committed_timestamp_ms();
+        let wall_ms = high_water.unwrap() + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1;
+        let mut clock = ControlPlaneAuthorityClock::new(high_water, wall_ms, Some(50)).unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            for request_number in 0..3 {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let now_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let elapsed_ms = now_ms.saturating_sub(wall_ms);
+                let response = build_control_plane_authority_clock_admin_response(
+                    &authority,
+                    &mut clock,
+                    request,
+                    Some(&verifier),
+                    ControlPlaneAuthorityClockAdminSample::new(
+                        now_ms,
+                        now_ms,
+                        Some(50u64.saturating_add(elapsed_ms)),
+                    ),
+                    || Ok(now_ms),
+                )
+                .unwrap();
+                if request_number == 1 {
+                    drop(response);
+                    drop(stream);
+                } else {
+                    write_control_plane_unix_response(&mut stream, response).unwrap();
+                }
+            }
+            clock.status(authority.authority_clock_context().unwrap())
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let status = client.reestablish_authority_clock(wall_ms).unwrap();
+        assert!(status.established());
+        let server_status = server.join().unwrap();
+        assert_eq!(status, server_status);
+    }
+
+    #[test]
     fn authenticated_control_plane_signs_admin_response_with_response_time() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -19226,6 +20043,8 @@ mod tests {
             ControlPlaneRpcKind::TransferRaftLeadership,
             ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
             ControlPlaneRpcKind::TriggerRaftElection,
+            ControlPlaneRpcKind::AuthorityClockStatus,
+            ControlPlaneRpcKind::ReestablishAuthorityClock,
         ];
         for kind in admin_kinds {
             assert_eq!(
@@ -22513,6 +23332,23 @@ mod tests {
     }
 
     #[test]
+    fn authority_clock_status_observes_new_raft_term_before_serving_request() {
+        let mut clock = ControlPlaneAuthorityClock::new(Some(1_000), 1_000, Some(50)).unwrap();
+        clock.bind_initial_raft_leadership_term(Some(7));
+        let context = ControlPlaneAuthorityClockContext::new(Some(1_000), Some(8), true);
+
+        let status = clock.observe_status(context, 1_100, Some(150)).unwrap();
+
+        assert!(!status.established());
+        assert_eq!(
+            status.blocked_reason(),
+            Some(ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged)
+        );
+        assert_eq!(status.bound_raft_leadership_term(), Some(7));
+        assert_eq!(status.current_raft_leadership_term(), Some(8));
+    }
+
+    #[test]
     fn authority_clock_invalidates_new_local_raft_leadership_term() {
         let mut clock = ControlPlaneAuthorityClock::new(Some(1_000), 1_000, Some(50)).unwrap();
         clock.bind_initial_raft_leadership_term(Some(7));
@@ -22527,6 +23363,103 @@ mod tests {
             })
         ));
         assert!(clock.effective_now_ms(1_101, Some(151)).is_err());
+    }
+
+    #[test]
+    fn authority_clock_reestablishment_is_fenced_by_generation_timestamp_and_term() {
+        let mut clock = ControlPlaneAuthorityClock::new(Some(1_000), 1_000, Some(50)).unwrap();
+        clock.bind_initial_raft_leadership_term(Some(7));
+        assert!(clock.validate_raft_leadership_term(8).is_err());
+        let context = ControlPlaneAuthorityClockContext::new(Some(1_000), Some(8), true);
+        let blocked = clock.status(context);
+        assert!(!blocked.established());
+        assert_eq!(
+            blocked.blocked_reason(),
+            Some(ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged)
+        );
+
+        assert!(matches!(
+            clock.reestablish(
+                blocked.generation(),
+                Some(999),
+                Some(8),
+                context,
+                1_100,
+                Some(150),
+            ),
+            Err(ControlPlaneError::AuthorityClockCommittedTimestampMismatch { .. })
+        ));
+        assert!(matches!(
+            clock.reestablish(
+                blocked.generation(),
+                Some(1_000),
+                Some(9),
+                context,
+                1_100,
+                Some(150),
+            ),
+            Err(ControlPlaneError::AuthorityClockRaftTermMismatch { .. })
+        ));
+
+        let established = clock
+            .reestablish(
+                blocked.generation(),
+                Some(1_000),
+                Some(8),
+                context,
+                1_100,
+                Some(150),
+            )
+            .unwrap();
+        assert!(established.established());
+        assert_eq!(established.bound_raft_leadership_term(), Some(8));
+        assert_eq!(established.generation(), blocked.generation() + 1);
+
+        assert!(clock.effective_now_ms(1_101, None).is_err());
+        assert!(matches!(
+            clock.reestablish(
+                blocked.generation(),
+                Some(1_000),
+                Some(8),
+                context,
+                1_102,
+                Some(152),
+            ),
+            Err(ControlPlaneError::AuthorityClockGenerationMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn authority_clock_reestablishment_rejects_follower_and_wall_behind_high_water() {
+        let mut clock = ControlPlaneAuthorityClock::new(Some(2_000), 4_000, Some(50)).unwrap();
+        clock.bind_initial_raft_leadership_term(Some(7));
+        assert!(clock.validate_raft_leadership_term(8).is_err());
+        let follower_context = ControlPlaneAuthorityClockContext::new(Some(2_000), Some(8), false);
+        let generation = clock.status(follower_context).generation();
+        assert!(matches!(
+            clock.reestablish(
+                generation,
+                Some(2_000),
+                Some(8),
+                follower_context,
+                4_000,
+                Some(50),
+            ),
+            Err(ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority)
+        ));
+
+        let leader_context = ControlPlaneAuthorityClockContext::new(Some(2_000), Some(8), true);
+        assert!(matches!(
+            clock.reestablish(
+                generation,
+                Some(2_000),
+                Some(8),
+                leader_context,
+                1_999,
+                Some(50),
+            ),
+            Err(ControlPlaneError::AuthorityClockWallBehindCommittedTimestamp { .. })
+        ));
     }
 
     #[test]

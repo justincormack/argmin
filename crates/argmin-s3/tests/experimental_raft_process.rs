@@ -451,6 +451,22 @@ fn run_transfer_raft_leadership_with_extra_env(
         .expect("transfer Raft leadership helper should run")
 }
 
+fn run_authority_clock_admin_with_extra_env(
+    bin: &Path,
+    socket_path: &Path,
+    command_name: &str,
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let mut command = Command::new(bin);
+    command.arg(command_name).arg(socket_path);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command
+        .output()
+        .expect("authority-clock admin helper should run")
+}
+
 fn run_trigger_raft_snapshot_purge(bin: &Path, socket_path: &Path) -> Output {
     Command::new(bin)
         .arg("control-plane-trigger-raft-snapshot-purge")
@@ -614,6 +630,44 @@ fn wait_for_runtime_map_clock_reestablishment_required(
             let last_failure = format_admin_failure(output.status, &output);
             panic!(
                 "control-plane runtime map did not fail closed for an unestablished leadership clock on {}: {last_failure}\n{}",
+                socket.display(),
+                process_logs(test_dir)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_authority_clock_leadership_fence(
+    bin: &Path,
+    socket: &Path,
+    test_dir: &Path,
+    extra_env: &[(&str, &str)],
+    children: &mut [&mut ChildGuard],
+) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for child in children.iter_mut() {
+            child.assert_running();
+        }
+        let output = run_authority_clock_admin_with_extra_env(
+            bin,
+            socket,
+            "control-plane-authority-clock-status",
+            extra_env,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if output.status.success()
+            && stdout.contains("established=false")
+            && stdout.contains("blocked_reason=Some(RaftLeadershipChanged)")
+            && stdout.contains("local_raft_authority_serving=true")
+        {
+            return output;
+        }
+        if Instant::now() >= deadline {
+            let last_failure = format_admin_failure(output.status, &output);
+            panic!(
+                "authority-clock status did not observe the new serving leadership term on {}: {last_failure}\n{}",
                 socket.display(),
                 process_logs(test_dir)
             );
@@ -1869,7 +1923,7 @@ fn experimental_raft_restarted_control_plane_follower_catches_up_process_state()
 }
 
 #[test]
-fn experimental_raft_transferred_process_leader_requires_clock_reestablishment() {
+fn experimental_raft_transferred_process_leader_requires_explicit_clock_reestablishment() {
     let bin = argmin_s3_bin();
     let test_dir = TestDir::new("experimental-raft-process-transferred-leader");
     let cluster_name = format!(
@@ -1963,7 +2017,40 @@ fn experimental_raft_transferred_process_leader_requires_clock_reestablishment()
         &mut [&mut node101, &mut node102, &mut node103],
     );
     let new_leader_socket = control_socket(test_dir.path(), 102);
-    wait_for_runtime_map_clock_reestablishment_required(
+    let status = wait_for_authority_clock_leadership_fence(
+        &bin,
+        &new_leader_socket,
+        test_dir.path(),
+        &admin_helper_auth_env,
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+    let status_stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_stdout.contains("established=false")
+            && status_stdout.contains("blocked_reason=Some(RaftLeadershipChanged)")
+            && !status_stdout.contains("current_raft_term=-"),
+        "authority-clock status should expose the leadership fence: {status_stdout}"
+    );
+
+    let recovery = run_authority_clock_admin_with_extra_env(
+        &bin,
+        &new_leader_socket,
+        "control-plane-reestablish-authority-clock",
+        &admin_helper_auth_env,
+    );
+    assert!(
+        recovery.status.success(),
+        "authority-clock re-establishment failed: {}\n{}",
+        format_admin_failure(recovery.status, &recovery),
+        process_logs(test_dir.path())
+    );
+    let recovery_stdout = String::from_utf8_lossy(&recovery.stdout);
+    assert!(
+        recovery_stdout.contains("established=true")
+            && !recovery_stdout.contains("current_raft_term=-"),
+        "authority-clock recovery should expose the new binding: {recovery_stdout}"
+    );
+    wait_for_runtime_map_ready_on(
         &bin,
         &new_leader_socket,
         test_dir.path(),
@@ -1971,7 +2058,7 @@ fn experimental_raft_transferred_process_leader_requires_clock_reestablishment()
     );
 
     node101.stop();
-    wait_for_runtime_map_clock_reestablishment_required(
+    wait_for_runtime_map_ready_on(
         &bin,
         &new_leader_socket,
         test_dir.path(),

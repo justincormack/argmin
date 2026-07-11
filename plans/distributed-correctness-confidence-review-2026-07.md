@@ -112,7 +112,7 @@ lease fence, artifact export, store import, or successor activation. Those
 tests correctly pin historical-route retry behavior, but cannot establish the
 live-transfer safety property.
 
-Required design:
+Resolved design requirements:
 
 1. Give every mutating storage RPC a `PgMutationPermit` (or equivalent) whose
    acquisition and lifetime are synchronized with route installation.
@@ -245,14 +245,14 @@ deadline, and prove background old-epoch zero-apply convergence despite both
 an unrelated full-map failure and an earlier independently failing recovery
 task.
 
-### DCC-2. HIGH - bounded timestamp catch-up still grants unbounded serving leases
+### DCC-2. RESOLVED / HIGH - bounded timestamp catch-up granted unbounded serving leases
 
 Confidence: confirmed. This supersedes the latest statement that `R3-1` and
 `R3-2` are fully addressed. Their exact crash-loop mechanisms are fixed, but
 the replacement does not establish a bounded lease invariant.
 
-Implementation status (2026-07-10): the model and safety integration are in
-place, with explicit recovery and independent-host validation still open. The
+Implementation status (2026-07-11): resolved. The model, safety integration,
+and explicit operational recovery path are in place. The
 normative clock/fault assumptions and lease equations are now defined in
 [`guides/control-plane-clock-and-lease-model.md`](../guides/control-plane-clock-and-lease-model.md),
 with an executable independent-clock model in
@@ -279,12 +279,32 @@ metadata-recovery authorization carries the current runtime map's same
 monotonic fence, and successor activation waits until the old deadline plus
 skew.
 
-This finding remains open for availability and operational closeout: add the
-explicit authenticated authority-clock re-establishment operation required
-after a discontinuity larger than the skew budget, expose its diagnostics, and
-run independent-host clock-step/restart coverage. Until that operation exists,
-a restored authority whose clock is outside the persisted high-water budget
-intentionally cannot expire leases, publish serving maps, or re-admit nodes.
+The operational closeout adds authenticated admin-only authority-clock status
+and re-establishment RPCs. Status exposes the process-local clock generation,
+established/blocked state and reason, committed timestamp high-water, bound and
+current Raft terms, and whether the local Raft authority is eligible to serve.
+Before returning, status atomically observes that high-water, term, and the
+current wall/health-clock sample under the clock lock, so it latches a new term
+or clock fault even when no serving request has yet reached the authority.
+Re-establishment is process-local rather than a replicated command and requires
+an exact match on clock generation, committed timestamp high-water, and current
+Raft term. It rejects followers, missing health-clock samples, and wall time
+behind the committed high-water. Success advances the generation, so a replay
+cannot clear a later fault in the same term. The authenticated client confirms
+an ambiguous lost response by reading back the exact next generation and
+authority tuple rather than blindly retrying.
+
+Pure tests cover generation/high-water/term mismatch, first-status term and
+health-clock observation, follower rejection, backward wall time, missing
+clock-health input, stale replay after a second fault, and response-loss
+confirmation. A real three-process test transfers leadership, uses status as
+the first request to observe the new leader blocked with a term-change reason,
+re-establishes it through authenticated admin RPC, proves runtime-map service
+resumes, removes the old leader, and verifies the recovered leader remains
+serving. The independent-clock property model continues to cover host-specific
+wall/monotonic steps, suspend, restart, delayed maps, and successor overlap.
+Multi-VM independent-host clock-step testing remains part of the pre-release
+evidence program rather than an unimplemented DCC-2 recovery mechanism.
 
 Required design:
 
@@ -302,7 +322,7 @@ Required design:
 5. Complete the `R4`/`CP2`/`CL4` monotonic lease design together. A hybrid
    logical clock alone does not bound real time or cross-host skew.
 
-Required property test:
+Implemented property test:
 
 - Generate independent authority, frontend, and storage-node wall clocks;
   monotonic clocks; forward/backward steps; restarts; leader changes; heartbeat
@@ -428,8 +448,9 @@ the current tree; they are omitted from the open list below.
 
 - `CP2` and `CL4`: the zero-margin wall-clock comparison is replaced by
   process-local monotonic binding and a symmetric successor skew fence. The
-  remaining closeout is the explicit authority clock re-establishment path and
-  independent-host validation tracked under DCC-2.
+  explicit authenticated authority-clock re-establishment path is complete;
+  independent-host validation remains pre-release evidence rather than an
+  open mechanism gap.
 - `RPC4`: read-handle fencing is keyed by epoch-bearing `ShardLocation`, while
   the physical shard path is keyed by shard identity without epoch. Handles
   for two epochs can alias one file without blocking deletion.
@@ -702,8 +723,9 @@ because the current stochastic failures can take hours to recur.
 2. **Completed:** move DCC-4's publication invariants into the release path
    with typed fail-closed errors, retain the expensive history audit for
    debug/test builds, and add a separate release-mode process gate.
-3. Replace the timestamp/lease design in DCC-2 with an explicit clock fault
-   model and multi-clock property test.
+3. **Completed:** replace the timestamp/lease design in DCC-2 with an explicit
+   clock fault model, multi-clock property test, and authenticated fenced
+   operational re-establishment path.
 4. **Completed:** fix DCC-3 with bounded global smallest-`N` selection and pin
    complete pagination plus the 100-PG/100,100-record selector boundary.
 5. Fence physical shard identity across epochs (`RPC4`).
