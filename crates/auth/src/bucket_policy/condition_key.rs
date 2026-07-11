@@ -13,8 +13,8 @@
 use super::condition_op::{self, ActualValue};
 use super::{
     BucketTagValue, ConditionMatchResult, ExistingObjectTagValue, PolicyAction,
-    PolicyConditionClause, PolicyRequest, RequestBool, RequestField, RequestObjectTagKeysValue,
-    RequestObjectTagValue,
+    PolicyConditionClause, PolicyRequest, PolicyValue, RequestBool, RequestField,
+    RequestObjectTagKeysValue, RequestObjectTagValue,
 };
 
 /// Resolved value for a condition key in a given request.
@@ -27,6 +27,13 @@ pub(super) enum ResolvedValue<'a> {
     PresentValues(Vec<&'a str>),
     SourceIp(std::net::IpAddr),
     EpochSeconds(u64),
+    Absent,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PolicyVariableResolution {
+    Value(String),
     Absent,
     Unavailable,
 }
@@ -149,6 +156,30 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         operator_support: OperatorSupport::IpOnly,
         input: Some(ConditionInput::SourceIp),
         resolve: resolve_source_ip,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:userid"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
+        resolve: resolve_userid,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:PrincipalType"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
+        resolve: resolve_principal_type,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:username"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
+        resolve: resolve_username,
         evaluable_for_action: None,
         supported_for_action: None,
     },
@@ -407,6 +438,28 @@ fn resolve_source_ip<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedV
     match request.source_ip() {
         Some(source_ip) => ResolvedValue::SourceIp(source_ip),
         None => ResolvedValue::Unavailable,
+    }
+}
+
+fn resolve_userid<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    match request.requester_principal() {
+        Some(_) => ResolvedValue::Unavailable,
+        None => ResolvedValue::Present("anonymous"),
+    }
+}
+
+fn resolve_principal_type<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    match request.requester_principal() {
+        None => ResolvedValue::Present("Anonymous"),
+        Some(_) => ResolvedValue::Unavailable,
+    }
+}
+
+fn resolve_username<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    if request.requester_principal().is_some() {
+        ResolvedValue::Unavailable
+    } else {
+        ResolvedValue::Absent
     }
 }
 
@@ -746,6 +799,7 @@ pub(super) fn clause_input(clause: &PolicyConditionClause) -> Option<ConditionIn
 pub(super) fn evaluate_clause(
     clause: &PolicyConditionClause,
     request: &PolicyRequest<'_>,
+    variables_enabled: bool,
 ) -> ConditionMatchResult {
     let Some((resolver, param)) = lookup(clause.key.as_str()) else {
         return ConditionMatchResult::Unsupported;
@@ -769,7 +823,64 @@ pub(super) fn evaluate_clause(
         ResolvedValue::Absent => ActualValue::Absent,
         ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
     };
-    (op.evaluate)(&clause.values, actual)
+    let expanded_values;
+    let values = if variables_enabled && condition_op::supports_policy_variables(op.kind) {
+        expanded_values = clause
+            .values
+            .iter()
+            .filter_map(|value| super::expand_policy_template(value, request))
+            .collect::<Vec<_>>();
+        expanded_values.as_slice()
+    } else {
+        expanded_values = clause
+            .values
+            .iter()
+            .map(|value| PolicyValue::literal(value))
+            .collect::<Vec<_>>();
+        expanded_values.as_slice()
+    };
+    (op.evaluate)(values, actual)
+}
+
+pub(super) fn resolve_policy_variable(
+    request: &PolicyRequest<'_>,
+    key: &str,
+) -> PolicyVariableResolution {
+    let Some((resolver, param)) = lookup_policy_variable_key(key) else {
+        return PolicyVariableResolution::Unavailable;
+    };
+    match (resolver.resolve)(request, param) {
+        ResolvedValue::Present(value) => PolicyVariableResolution::Value(value.to_string()),
+        ResolvedValue::SourceIp(source_ip) => {
+            PolicyVariableResolution::Value(source_ip.to_string())
+        }
+        ResolvedValue::EpochSeconds(epoch_seconds) => {
+            PolicyVariableResolution::Value(epoch_seconds.to_string())
+        }
+        ResolvedValue::PresentValues(_) => PolicyVariableResolution::Unavailable,
+        ResolvedValue::Absent => PolicyVariableResolution::Absent,
+        ResolvedValue::Unavailable => PolicyVariableResolution::Unavailable,
+    }
+}
+
+fn lookup_policy_variable_key(key: &str) -> Option<(&'static ConditionKeyResolver, &str)> {
+    lookup(key).or_else(|| {
+        CONDITION_KEYS.iter().find_map(|resolver| {
+            let param = match resolver.key {
+                KeyMatch::Exact(expected) if expected.eq_ignore_ascii_case(key) => "",
+                KeyMatch::Prefix(prefix) if key.len() >= prefix.len() => {
+                    let (candidate_prefix, param) = key.split_at(prefix.len());
+                    if candidate_prefix.eq_ignore_ascii_case(prefix) {
+                        param
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            };
+            Some((resolver, param))
+        })
+    })
 }
 
 fn operator_supported_for_key(operator: &str, support: OperatorSupport) -> bool {

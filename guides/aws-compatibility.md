@@ -503,9 +503,8 @@ evaluation is still narrower.
 Current runtime-evaluation limits include:
 
 - network/account condition keys such as `aws:PrincipalArn`, `aws:SourceVpc`,
-  `aws:SourceVpce`,
-  `aws:SourceArn`, `aws:SourceAccount`, `aws:SourceOwner`, `aws:userid`,
-  `aws:PrincipalOrgID`, `s3:DataAccessPointAccount`, and
+  `aws:SourceVpce`, `aws:SourceArn`, `aws:SourceAccount`,
+  `aws:SourceOwner`, `aws:PrincipalOrgID`, `s3:DataAccessPointAccount`, and
   `s3:DataAccessPointArn` still remain outside the current accepted/evaluable
   object-condition subset
 - S3 request-context keys that require additional HTTP/auth/transport context
@@ -592,6 +591,10 @@ specific S3 condition key that exposes multiple values.
 standard base64 and compares the resulting bytes exactly. It does not perform
 string wildcard matching.
 
+String wildcard operators treat `*` as a multi-character wildcard and `?` as
+a single-character wildcard. Policy-variable escapes such as `${*}` and `${?}`
+produce literal `*` and `?` characters instead of wildcard tokens.
+
 `aws:CurrentTime` is evaluated against a single timestamp captured for the S3
 request with date comparison operators, including fractional seconds accepted
 by AWS up to nanosecond precision. `aws:EpochTime` exposes the same timestamp
@@ -599,12 +602,17 @@ as Unix epoch seconds for numeric operators. AWS accepts malformed date
 operands in stored bucket policies; invalid operands are therefore handled at
 evaluation time rather than rejected by `PutBucketPolicy`.
 
-Policy variables are also not implemented. AWS supports variables such as
-`${aws:PrincipalTag/team}` in `Resource` ARNs and in string/ARN condition
-values. Argmin currently treats policy values literally; it does not expand
-variables from principal tags, request tags, session context, or other request
-attributes. This mostly affects reusable ABAC policies that compare object or
-bucket tags against IAM principal tags.
+Policy variables are implemented only for request-backed values that Argmin
+can model exactly. Variables are expanded in `Resource` patterns and string
+condition values, but not in numeric, date, boolean, binary, IP, or `Null`
+condition values.
+
+Authenticated identity variable details are a known gap until Argmin has STS
+and authoritative IAM identity context. `aws:userid`, `aws:PrincipalType`,
+`aws:username`, principal tags, and role/session values are not resolved for
+authenticated callers; Argmin leaves those variables unavailable rather than
+guessing from the visible principal string. ABAC policies that depend on richer
+IAM variables remain a compatibility gap.
 
 References:
 

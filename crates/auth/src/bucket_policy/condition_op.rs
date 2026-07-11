@@ -8,7 +8,10 @@
 //! that adding a new operator is a one-row table change instead of a new
 //! arm in several different match statements.
 
-use super::{wildcard_matches, ConditionMatchResult};
+use super::{
+    policy_string_equals, policy_string_equals_ignore_case, policy_value_wildcard_matches,
+    ConditionMatchResult, PolicyValue,
+};
 use std::net::IpAddr;
 
 /// Value presented to a condition operator by the evaluator.
@@ -70,7 +73,8 @@ pub(super) enum ConditionOpKind {
 pub(super) struct ConditionOpDef {
     pub(super) name: &'static str,
     pub(super) kind: ConditionOpKind,
-    pub(super) evaluate: fn(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult,
+    pub(super) evaluate:
+        fn(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult,
     /// Whether this operator is evaluated by the currently enforced
     /// object-action policy subset. Mirrors the existing
     /// `evaluable_string_condition_operator_supported` filter; derived from
@@ -510,6 +514,18 @@ pub(super) const fn is_string_condition_kind(kind: ConditionOpKind) -> bool {
     )
 }
 
+pub(super) const fn supports_policy_variables(kind: ConditionOpKind) -> bool {
+    matches!(
+        kind,
+        ConditionOpKind::StringEquals
+            | ConditionOpKind::StringEqualsIgnoreCase
+            | ConditionOpKind::StringNotEquals
+            | ConditionOpKind::StringNotEqualsIgnoreCase
+            | ConditionOpKind::StringLike
+            | ConditionOpKind::StringNotLike
+    )
+}
+
 pub(super) const fn is_binary_condition_kind(kind: ConditionOpKind) -> bool {
     matches!(kind, ConditionOpKind::BinaryEquals)
 }
@@ -553,11 +569,11 @@ pub(super) fn decode_binary_value(value: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(value).ok()
 }
 
-fn string_eq_ignore_case(expected: &str, actual: &str) -> bool {
-    expected == actual || expected.to_lowercase() == actual.to_lowercase()
+fn string_eq_ignore_case(expected: &PolicyValue, actual: &str) -> bool {
+    policy_string_equals_ignore_case(expected, actual)
 }
 
-fn binary_value_matches(operands: &[String], actual: &str) -> bool {
+fn binary_value_matches(operands: &[PolicyValue], actual: &str) -> bool {
     let Some(actual) = decode_binary_value(actual) else {
         return false;
     };
@@ -567,7 +583,7 @@ fn binary_value_matches(operands: &[String], actual: &str) -> bool {
         .any(|expected| expected == actual)
 }
 
-fn eval_binary_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_binary_equals(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if binary_value_matches(operands, actual) {
@@ -584,7 +600,7 @@ fn eval_binary_equals(operands: &[String], actual: ActualValue<'_>) -> Condition
 }
 
 fn eval_for_all_values_binary_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -611,7 +627,7 @@ fn eval_for_all_values_binary_equals(
 }
 
 fn eval_for_any_value_binary_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -638,7 +654,7 @@ fn eval_for_any_value_binary_equals(
 }
 
 fn eval_binary_equals_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -661,7 +677,7 @@ enum DateComparison {
 }
 
 fn eval_date_comparison(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
     comparison: DateComparison,
     if_exists: bool,
@@ -685,7 +701,7 @@ fn eval_date_comparison(
 }
 
 fn eval_date_operands(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual_nanos: i128,
     comparison: DateComparison,
 ) -> ConditionMatchResult {
@@ -726,66 +742,69 @@ fn eval_date_operands(
     }
 }
 
-fn eval_date_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_date_equals(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::Equals, false)
 }
 
 fn eval_date_equals_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::Equals, true)
 }
 
-fn eval_date_not_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_date_not_equals(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::NotEquals, false)
 }
 
-fn eval_date_less_than(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_date_less_than(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::LessThan, false)
 }
 
 fn eval_date_less_than_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::LessThan, true)
 }
 
 fn eval_date_less_than_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::LessThanEquals, false)
 }
 
 fn eval_date_less_than_equals_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::LessThanEquals, true)
 }
 
-fn eval_date_greater_than(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_date_greater_than(
+    operands: &[PolicyValue],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::GreaterThan, false)
 }
 
 fn eval_date_greater_than_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::GreaterThan, true)
 }
 
 fn eval_date_greater_than_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::GreaterThanEquals, false)
 }
 
 fn eval_date_greater_than_equals_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_date_comparison(operands, actual, DateComparison::GreaterThanEquals, true)
@@ -922,7 +941,7 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> Option<i64> {
     Some(i64::from(era * 146_097 + day_of_era - 719_468))
 }
 
-fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_bool(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if operands
@@ -941,13 +960,13 @@ fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResu
     }
 }
 
-fn bool_operand_matches(operands: &[String], actual: &str) -> bool {
+fn bool_operand_matches(operands: &[PolicyValue], actual: &str) -> bool {
     operands
         .iter()
         .any(|expected| expected.eq_ignore_ascii_case(actual))
 }
 
-fn eval_bool_if_exists(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_bool_if_exists(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(_) | ActualValue::PresentValues(_) => eval_bool(operands, actual),
         ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
@@ -955,7 +974,10 @@ fn eval_bool_if_exists(operands: &[String], actual: ActualValue<'_>) -> Conditio
     }
 }
 
-fn eval_for_all_values_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_for_all_values_bool(
+    operands: &[PolicyValue],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if bool_operand_matches(operands, actual) {
@@ -979,7 +1001,10 @@ fn eval_for_all_values_bool(operands: &[String], actual: ActualValue<'_>) -> Con
     }
 }
 
-fn eval_for_any_value_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_for_any_value_bool(
+    operands: &[PolicyValue],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if bool_operand_matches(operands, actual) {
@@ -1003,10 +1028,13 @@ fn eval_for_any_value_bool(operands: &[String], actual: ActualValue<'_>) -> Cond
     }
 }
 
-fn eval_string_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_string_equals(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
-            if operands.iter().any(|expected| expected == actual) {
+            if operands
+                .iter()
+                .any(|expected| policy_string_equals(expected, actual))
+            {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
@@ -1020,22 +1048,26 @@ fn eval_string_equals(operands: &[String], actual: ActualValue<'_>) -> Condition
 }
 
 fn eval_for_all_values_string_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
-            if operands.iter().any(|expected| expected == actual) {
+            if operands
+                .iter()
+                .any(|expected| policy_string_equals(expected, actual))
+            {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
             }
         }
         ActualValue::PresentValues(actuals) => {
-            if actuals
-                .iter()
-                .all(|actual| operands.iter().any(|expected| expected == actual))
-            {
+            if actuals.iter().all(|actual| {
+                operands
+                    .iter()
+                    .any(|expected| policy_string_equals(expected, actual))
+            }) {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
@@ -1047,22 +1079,26 @@ fn eval_for_all_values_string_equals(
 }
 
 fn eval_for_any_value_string_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
-            if operands.iter().any(|expected| expected == actual) {
+            if operands
+                .iter()
+                .any(|expected| policy_string_equals(expected, actual))
+            {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
             }
         }
         ActualValue::PresentValues(actuals) => {
-            if actuals
-                .iter()
-                .any(|actual| operands.iter().any(|expected| expected == actual))
-            {
+            if actuals.iter().any(|actual| {
+                operands
+                    .iter()
+                    .any(|expected| policy_string_equals(expected, actual))
+            }) {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
@@ -1074,7 +1110,7 @@ fn eval_for_any_value_string_equals(
 }
 
 fn eval_string_equals_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1087,7 +1123,7 @@ fn eval_string_equals_if_exists(
 }
 
 fn eval_string_equals_ignore_case(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1109,7 +1145,7 @@ fn eval_string_equals_ignore_case(
 }
 
 fn eval_for_all_values_string_equals_ignore_case(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1140,7 +1176,7 @@ fn eval_for_all_values_string_equals_ignore_case(
 }
 
 fn eval_for_any_value_string_equals_ignore_case(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1171,7 +1207,7 @@ fn eval_for_any_value_string_equals_ignore_case(
 }
 
 fn eval_string_equals_ignore_case_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1183,10 +1219,16 @@ fn eval_string_equals_ignore_case_if_exists(
     }
 }
 
-fn eval_string_not_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_string_not_equals(
+    operands: &[PolicyValue],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
-            if operands.iter().all(|expected| expected != actual) {
+            if operands
+                .iter()
+                .all(|expected| !policy_string_equals(expected, actual))
+            {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
@@ -1200,22 +1242,26 @@ fn eval_string_not_equals(operands: &[String], actual: ActualValue<'_>) -> Condi
 }
 
 fn eval_for_all_values_string_not_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
-            if operands.iter().all(|expected| expected != actual) {
+            if operands
+                .iter()
+                .all(|expected| !policy_string_equals(expected, actual))
+            {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
             }
         }
         ActualValue::PresentValues(actuals) => {
-            if actuals
-                .iter()
-                .all(|actual| operands.iter().all(|expected| expected != actual))
-            {
+            if actuals.iter().all(|actual| {
+                operands
+                    .iter()
+                    .all(|expected| !policy_string_equals(expected, actual))
+            }) {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
@@ -1227,22 +1273,26 @@ fn eval_for_all_values_string_not_equals(
 }
 
 fn eval_for_any_value_string_not_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
-            if operands.iter().all(|expected| expected != actual) {
+            if operands
+                .iter()
+                .all(|expected| !policy_string_equals(expected, actual))
+            {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
             }
         }
         ActualValue::PresentValues(actuals) => {
-            if actuals
-                .iter()
-                .any(|actual| operands.iter().all(|expected| expected != actual))
-            {
+            if actuals.iter().any(|actual| {
+                operands
+                    .iter()
+                    .all(|expected| !policy_string_equals(expected, actual))
+            }) {
                 ConditionMatchResult::Matches
             } else {
                 ConditionMatchResult::NoMatch
@@ -1254,7 +1304,7 @@ fn eval_for_any_value_string_not_equals(
 }
 
 fn eval_string_not_equals_ignore_case(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1276,7 +1326,7 @@ fn eval_string_not_equals_ignore_case(
 }
 
 fn eval_for_all_values_string_not_equals_ignore_case(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1307,7 +1357,7 @@ fn eval_for_all_values_string_not_equals_ignore_case(
 }
 
 fn eval_for_any_value_string_not_equals_ignore_case(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1337,12 +1387,12 @@ fn eval_for_any_value_string_not_equals_ignore_case(
     }
 }
 
-fn eval_string_like(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_string_like(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .any(|expected| wildcard_matches(expected, actual))
+                .any(|expected| policy_value_wildcard_matches(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -1357,14 +1407,14 @@ fn eval_string_like(operands: &[String], actual: ActualValue<'_>) -> ConditionMa
 }
 
 fn eval_for_all_values_string_like(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .any(|expected| wildcard_matches(expected, actual))
+                .any(|expected| policy_value_wildcard_matches(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -1375,7 +1425,7 @@ fn eval_for_all_values_string_like(
             if actuals.iter().all(|actual| {
                 operands
                     .iter()
-                    .any(|expected| wildcard_matches(expected, actual))
+                    .any(|expected| policy_value_wildcard_matches(expected, actual))
             }) {
                 ConditionMatchResult::Matches
             } else {
@@ -1388,14 +1438,14 @@ fn eval_for_all_values_string_like(
 }
 
 fn eval_for_any_value_string_like(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .any(|expected| wildcard_matches(expected, actual))
+                .any(|expected| policy_value_wildcard_matches(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -1406,7 +1456,7 @@ fn eval_for_any_value_string_like(
             if actuals.iter().any(|actual| {
                 operands
                     .iter()
-                    .any(|expected| wildcard_matches(expected, actual))
+                    .any(|expected| policy_value_wildcard_matches(expected, actual))
             }) {
                 ConditionMatchResult::Matches
             } else {
@@ -1419,7 +1469,7 @@ fn eval_for_any_value_string_like(
 }
 
 fn eval_string_like_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1431,12 +1481,12 @@ fn eval_string_like_if_exists(
     }
 }
 
-fn eval_string_not_like(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_string_not_like(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .all(|expected| !wildcard_matches(expected, actual))
+                .all(|expected| !policy_value_wildcard_matches(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -1451,14 +1501,14 @@ fn eval_string_not_like(operands: &[String], actual: ActualValue<'_>) -> Conditi
 }
 
 fn eval_for_all_values_string_not_like(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .all(|expected| !wildcard_matches(expected, actual))
+                .all(|expected| !policy_value_wildcard_matches(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -1469,7 +1519,7 @@ fn eval_for_all_values_string_not_like(
             if actuals.iter().all(|actual| {
                 operands
                     .iter()
-                    .all(|expected| !wildcard_matches(expected, actual))
+                    .all(|expected| !policy_value_wildcard_matches(expected, actual))
             }) {
                 ConditionMatchResult::Matches
             } else {
@@ -1482,14 +1532,14 @@ fn eval_for_all_values_string_not_like(
 }
 
 fn eval_for_any_value_string_not_like(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(actual) => {
             if operands
                 .iter()
-                .all(|expected| !wildcard_matches(expected, actual))
+                .all(|expected| !policy_value_wildcard_matches(expected, actual))
             {
                 ConditionMatchResult::Matches
             } else {
@@ -1500,7 +1550,7 @@ fn eval_for_any_value_string_not_like(
             if actuals.iter().any(|actual| {
                 operands
                     .iter()
-                    .all(|expected| !wildcard_matches(expected, actual))
+                    .all(|expected| !policy_value_wildcard_matches(expected, actual))
             }) {
                 ConditionMatchResult::Matches
             } else {
@@ -1523,7 +1573,7 @@ enum NumericComparison {
 }
 
 fn eval_numeric_comparison(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
     comparison: NumericComparison,
     if_exists: bool,
@@ -1547,7 +1597,7 @@ fn eval_numeric_comparison(
 }
 
 fn eval_numeric_operands(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: f64,
     comparison: NumericComparison,
 ) -> ConditionMatchResult {
@@ -1588,59 +1638,68 @@ fn eval_numeric_operands(
     }
 }
 
-fn eval_numeric_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_numeric_equals(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::Equals, false)
 }
 
 fn eval_numeric_equals_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::Equals, true)
 }
 
-fn eval_numeric_not_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_numeric_not_equals(
+    operands: &[PolicyValue],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::NotEquals, false)
 }
 
-fn eval_numeric_less_than(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_numeric_less_than(
+    operands: &[PolicyValue],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::LessThan, false)
 }
 
 fn eval_numeric_less_than_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::LessThan, true)
 }
 
 fn eval_numeric_less_than_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::LessThanEquals, false)
 }
 
 fn eval_numeric_less_than_equals_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::LessThanEquals, true)
 }
 
-fn eval_numeric_greater_than(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_numeric_greater_than(
+    operands: &[PolicyValue],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::GreaterThan, false)
 }
 
 fn eval_numeric_greater_than_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::GreaterThan, true)
 }
 
 fn eval_numeric_greater_than_equals(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_numeric_comparison(
@@ -1652,7 +1711,7 @@ fn eval_numeric_greater_than_equals(
 }
 
 fn eval_numeric_greater_than_equals_if_exists(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     eval_numeric_comparison(operands, actual, NumericComparison::GreaterThanEquals, true)
@@ -1663,12 +1722,12 @@ fn parse_numeric(value: &str) -> Option<f64> {
     parsed.is_finite().then_some(parsed)
 }
 
-fn eval_ip_address(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_ip_address(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     eval_ip_address_comparison(operands, actual, IpComparison::Equals, false)
 }
 
 fn eval_for_all_values_ip_address(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1678,7 +1737,7 @@ fn eval_for_all_values_ip_address(
 }
 
 fn eval_for_any_value_ip_address(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1687,16 +1746,19 @@ fn eval_for_any_value_ip_address(
     }
 }
 
-fn eval_ip_address_if_exists(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_ip_address_if_exists(
+    operands: &[PolicyValue],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
     eval_ip_address_comparison(operands, actual, IpComparison::Equals, true)
 }
 
-fn eval_not_ip_address(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_not_ip_address(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     eval_ip_address_comparison(operands, actual, IpComparison::NotEquals, false)
 }
 
 fn eval_for_all_values_not_ip_address(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1706,7 +1768,7 @@ fn eval_for_all_values_not_ip_address(
 }
 
 fn eval_for_any_value_not_ip_address(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
 ) -> ConditionMatchResult {
     match actual {
@@ -1722,7 +1784,7 @@ enum IpComparison {
 }
 
 fn eval_ip_address_comparison(
-    operands: &[String],
+    operands: &[PolicyValue],
     actual: ActualValue<'_>,
     comparison: IpComparison,
     if_exists: bool,
@@ -1783,7 +1845,7 @@ fn prefix_bits_v6(value: u128, prefix: u8) -> u128 {
     }
 }
 
-fn eval_null(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+fn eval_null(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     let is_null = matches!(actual, ActualValue::Absent);
     if operands.iter().any(|expected| match expected.as_str() {
         "true" => is_null,
@@ -1816,8 +1878,11 @@ mod tests {
         ActualValue::EpochSeconds(value)
     }
 
-    fn operands(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
+    fn operands(values: &[&str]) -> Vec<PolicyValue> {
+        values
+            .iter()
+            .map(|value| PolicyValue::literal(value))
+            .collect()
     }
 
     #[test]

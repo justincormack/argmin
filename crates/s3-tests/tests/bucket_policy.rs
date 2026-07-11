@@ -13,7 +13,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
     disable_bucket_public_access_block, err_status, object_url, put_bucket_lifecycle_with_md5,
-    raw_bucket, send_signed_request, send_signed_request_with_credentials,
+    raw_anonymous, raw_bucket, send_signed_request, send_signed_request_with_credentials,
     shape::{
         assert_shape, error_response_headers, escape_literal, expected_error, id_headers, shape,
     },
@@ -8555,6 +8555,547 @@ fn test_bucket_policy_list_bucket_prefix_string_not_equals_does_not_wildcard_mat
         assert_s3_err_code(&denied, "AccessDenied");
 
         cleanup(&bucket, &["pub*/one", "public/one"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_prefix_string_like_question_mark_matches_one_character() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        for key in ["question-a/one", "question-ab/one"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "StringLike": {
+                        "s3:prefix": "question-?/"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListBucket with StringLike question-mark wildcard prefix",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("question-a/")
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.contents().len(), 1);
+
+        eventually_access_denied(
+            "ListBucket denied when StringLike question mark would need two characters",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("question-ab/")
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["question-a/one", "question-ab/one"]).await;
+    });
+}
+
+fn assert_anonymous_list_status(
+    bucket: &str,
+    encoded_prefix: &str,
+    expected_status: u16,
+) -> String {
+    let response = raw_anonymous(
+        "GET",
+        bucket,
+        "",
+        Some(&format!("list-type=2&prefix={encoded_prefix}")),
+    );
+    assert_eq!(
+        response.status, expected_status,
+        "unexpected anonymous ListBucket status for prefix {encoded_prefix}: body={}",
+        response.body
+    );
+    response.body
+}
+
+fn assert_anonymous_list_ok_contains(bucket: &str, encoded_prefix: &str, expected_key: &str) {
+    let body = assert_anonymous_list_status(bucket, encoded_prefix, 200);
+    assert!(
+        body.contains(&format!("<Key>{expected_key}</Key>")),
+        "expected ListBucket body to include {expected_key}: {body}"
+    );
+}
+
+fn assert_anonymous_list_access_denied(bucket: &str, encoded_prefix: &str) {
+    let body = assert_anonymous_list_status(bucket, encoded_prefix, 403);
+    assert!(
+        body.contains("<Code>AccessDenied</Code>"),
+        "expected AccessDenied body: {body}"
+    );
+}
+
+#[test]
+fn test_bucket_policy_variables_anonymous_principal_values_defaults_and_special_literals() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let keys = [
+            "anonymous/one",
+            "anonymous/resource",
+            "fallback/one",
+            "star-*/one",
+            "question-?/one",
+            "dollar-$/one",
+            "private/resource",
+            "star-public/one",
+            "question-a/one",
+        ];
+        for key in keys {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:ListBucket",
+                    "Resource": bucket_resource(&bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalType": "Anonymous",
+                            "s3:prefix": "${AWS:UserId}"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:ListBucket",
+                    "Resource": bucket_resource(&bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:prefix": "${aws:username, 'fallback'}"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:ListBucket",
+                    "Resource": bucket_resource(&bucket),
+                    "Condition": {
+                        "StringLike": {
+                            "s3:prefix": "star-${*}"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:ListBucket",
+                    "Resource": bucket_resource(&bucket),
+                    "Condition": {
+                        "StringLike": {
+                            "s3:prefix": "question-${?}"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:ListBucket",
+                    "Resource": bucket_resource(&bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:prefix": "dollar-${$}"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": format!("arn:aws:s3:::{bucket}/${{aws:userid}}/*"),
+                    "Condition": {
+                        "StringEquals": {
+                            "aws:PrincipalType": "Anonymous"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_anonymous_list_ok_contains(&bucket, "anonymous", "anonymous/one");
+        assert_anonymous_list_ok_contains(&bucket, "fallback", "fallback/one");
+        assert_anonymous_list_ok_contains(&bucket, "star-%2A", "star-*/one");
+        assert_anonymous_list_ok_contains(&bucket, "question-%3F", "question-?/one");
+        assert_anonymous_list_ok_contains(&bucket, "dollar-%24", "dollar-$/one");
+        assert_anonymous_list_access_denied(&bucket, "star-public");
+        assert_anonymous_list_access_denied(&bucket, "question-a");
+        assert_eq!(
+            raw_anonymous("GET", &bucket, "anonymous/resource", None).status,
+            200
+        );
+        let private_resource = raw_anonymous("GET", &bucket, "private/resource", None);
+        assert_eq!(
+            private_resource.status, 403,
+            "expected Resource variable to deny private object: {}",
+            private_resource.body
+        );
+        assert!(
+            private_resource.body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied body: {}",
+            private_resource.body
+        );
+
+        cleanup(&bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_variables_authenticated_identity_defaults_do_not_apply() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let keys = ["control/one", "fallback/one"];
+        for key in keys {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:prefix": "control"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:prefix": "${aws:userid, 'fallback'}"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectsV2 authenticated variable control prefix",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("control")
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            listed
+                .contents()
+                .first()
+                .and_then(|object| object.key())
+                .unwrap_or_default(),
+            "control/one"
+        );
+
+        eventually_access_denied(
+            "ListObjectsV2 authenticated variable default fallback prefix",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("fallback")
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_variables_multivalued_context_defaults_do_not_apply() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let keys = ["control", "fallback"];
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:PutObject",
+                            "Resource": format!("arn:aws:s3:::{bucket}/control")
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:PutObject",
+                            "Resource": format!("arn:aws:s3:::{bucket}/${{s3:RequestObjectTagKeys, 'fallback'}}")
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok("PutObject policy variable multivalue control", || {
+            alt_client
+                .put_object()
+                .bucket(&bucket)
+                .key("control")
+                .body(ByteStream::from_static(b"control"))
+                .send()
+        })
+        .await;
+
+        eventually_access_denied("PutObject denied for multivalue variable default", || {
+            alt_client
+                .put_object()
+                .bucket(&bucket)
+                .key("fallback")
+                .tagging("public=1&shared=2")
+                .body(ByteStream::from_static(b"fallback"))
+                .send()
+        })
+        .await;
+
+        cleanup(&bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_variables_require_2012_policy_version() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let keys = ["${*}/one", "*/one"];
+        for key in keys {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2008-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:prefix": "${*}"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_anonymous_list_ok_contains(&bucket, "%24%7B%2A%7D", "${*}/one");
+        assert_anonymous_list_access_denied(&bucket, "%2A");
+
+        let policy = json!({
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:prefix": "${*}"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_anonymous_list_ok_contains(&bucket, "%24%7B%2A%7D", "${*}/one");
+        assert_anonymous_list_access_denied(&bucket, "%2A");
+
+        cleanup(&bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_variables_do_not_expand_for_numeric_operators() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let keys = ["allowed/one", "denied/one"];
+        for key in keys {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:ListBucket",
+                    "Resource": bucket_resource(&bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:prefix": "allowed"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:ListBucket",
+                    "Resource": bucket_resource(&bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:prefix": "denied"
+                        },
+                        "NumericEquals": {
+                            "s3:max-keys": "${aws:username, '2'}"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert_anonymous_list_ok_contains(&bucket, "allowed", "allowed/one");
+        let response = raw_anonymous(
+            "GET",
+            &bucket,
+            "",
+            Some("list-type=2&prefix=denied&max-keys=2"),
+        );
+        assert_eq!(
+            response.status, 403,
+            "expected NumericEquals variable-looking operand not to expand: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied body: {}",
+            response.body
+        );
+
+        cleanup(&bucket, &keys).await;
     });
 }
 
@@ -17390,6 +17931,18 @@ fn test_put_bucket_policy_malformed_response_shapes() {
             "PutBucketPolicy missing Statement",
             &raw_put_policy(&bucket, "{\"Version\":\"2012-10-17\"}"),
             expected_error::malformed_policy("Missing required field Statement"),
+        );
+        assert_malformed(
+            "PutBucketPolicy unsupported Version value",
+            &raw_put_policy(
+                &bucket,
+                &format!(
+                    "{{\"Version\":\"2026-07-11\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                     \"Principal\":\"*\",\"Action\":\"s3:ListBucket\",\
+                     \"Resource\":\"arn:aws:s3:::{bucket}\"}}]}}"
+                ),
+            ),
+            expected_error::malformed_policy("The policy must contain a valid version string"),
         );
         assert_malformed(
             "PutBucketPolicy empty Statement",

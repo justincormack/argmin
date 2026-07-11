@@ -13,6 +13,37 @@ pub struct BucketPolicy {
     statements: Vec<PolicyStatement>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PolicyValue {
+    value: String,
+    escaped_wildcards: Vec<usize>,
+}
+
+impl PolicyValue {
+    fn literal(value: &str) -> Self {
+        Self {
+            value: value.to_string(),
+            escaped_wildcards: Vec::new(),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    fn wildcard_is_escaped(&self, char_index: usize) -> bool {
+        self.escaped_wildcards.binary_search(&char_index).is_ok()
+    }
+}
+
+impl std::ops::Deref for PolicyValue {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
 impl BucketPolicy {
     #[must_use]
     pub fn version(&self) -> Option<PolicyVersion> {
@@ -94,9 +125,12 @@ impl BucketPolicy {
         let action = request.action.as_str();
         let resource = request.resource_arn();
         let mut saw_allow = false;
+        let variables_enabled = self.version == Some(PolicyVersion::V2012_10_17);
 
         for statement in &self.statements {
-            let Some(effect) = statement.request_effect(request, action, &resource) else {
+            let Some(effect) =
+                statement.request_effect(request, action, &resource, variables_enabled)
+            else {
                 continue;
             };
 
@@ -823,15 +857,16 @@ impl PolicyStatement {
         request: &PolicyRequest<'_>,
         action: &str,
         resource: &str,
+        variables_enabled: bool,
     ) -> Option<PolicyEffect> {
         if !self.matches_principal(request)
             || !self.matches_action(action)
-            || !self.matches_resource(resource)
+            || !self.matches_resource(request, resource, variables_enabled)
         {
             return None;
         }
 
-        match self.condition_match_result(request) {
+        match self.condition_match_result(request, variables_enabled) {
             ConditionMatchResult::Matches => Some(self.effect),
             ConditionMatchResult::NoMatch => None,
             ConditionMatchResult::AcceptedButNotEvaluable => None,
@@ -852,10 +887,23 @@ impl PolicyStatement {
             .any(|pattern| action_pattern_matches(pattern, action))
     }
 
-    fn matches_resource(&self, resource: &str) -> bool {
-        self.resources
-            .iter()
-            .any(|pattern| wildcard_matches(pattern, resource))
+    fn matches_resource(
+        &self,
+        request: &PolicyRequest<'_>,
+        resource: &str,
+        variables_enabled: bool,
+    ) -> bool {
+        self.resources.iter().any(|pattern| {
+            let pattern = if variables_enabled {
+                let Some(pattern) = expand_policy_template(pattern, request) else {
+                    return false;
+                };
+                pattern
+            } else {
+                PolicyValue::literal(pattern)
+            };
+            policy_value_wildcard_matches(&pattern, resource)
+        })
     }
 
     fn references_bucket_tag_condition(&self) -> bool {
@@ -891,12 +939,16 @@ impl PolicyStatement {
             })
     }
 
-    fn condition_match_result(&self, request: &PolicyRequest<'_>) -> ConditionMatchResult {
+    fn condition_match_result(
+        &self,
+        request: &PolicyRequest<'_>,
+        variables_enabled: bool,
+    ) -> ConditionMatchResult {
         let mut saw_unsupported = false;
         let mut saw_accepted_but_not_evaluable = false;
         let mut saw_input_unavailable = false;
         for clause in &self.conditions {
-            match condition_clause_matches_request(clause, request) {
+            match condition_clause_matches_request(clause, request, variables_enabled) {
                 ConditionMatchResult::Matches => {}
                 ConditionMatchResult::NoMatch => return ConditionMatchResult::NoMatch,
                 ConditionMatchResult::AcceptedButNotEvaluable => {
@@ -1277,7 +1329,9 @@ fn parse_version(version: &str) -> Result<PolicyVersion, BucketPolicyError> {
     match version {
         "2008-10-17" => Ok(PolicyVersion::V2008_10_17),
         "2012-10-17" => Ok(PolicyVersion::V2012_10_17),
-        _ => Err(BucketPolicyError::malformed("unsupported Version value")),
+        _ => Err(BucketPolicyError::malformed(
+            "The policy must contain a valid version string",
+        )),
     }
 }
 
@@ -1677,8 +1731,104 @@ fn conditions_constrain_public_principal(conditions: &[PolicyConditionClause]) -
 fn condition_clause_matches_request(
     clause: &PolicyConditionClause,
     request: &PolicyRequest<'_>,
+    variables_enabled: bool,
 ) -> ConditionMatchResult {
-    condition_key::evaluate_clause(clause, request)
+    condition_key::evaluate_clause(clause, request, variables_enabled)
+}
+
+fn expand_policy_template(template: &str, request: &PolicyRequest<'_>) -> Option<PolicyValue> {
+    let mut cursor = 0;
+    let mut expanded: Option<PolicyValue> = None;
+
+    while let Some(relative_start) = template[cursor..].find("${") {
+        let start = cursor + relative_start;
+        let content_start = start + 2;
+        let Some(relative_end) = template[content_start..].find('}') else {
+            break;
+        };
+        let end = content_start + relative_end;
+        let output = expanded.get_or_insert_with(|| PolicyValue::literal(""));
+        push_policy_literal(output, &template[cursor..start]);
+        push_policy_variable(
+            output,
+            &resolve_policy_template_variable(&template[content_start..end], request)?,
+        );
+        cursor = end + 1;
+    }
+
+    match expanded {
+        Some(mut output) => {
+            push_policy_literal(&mut output, &template[cursor..]);
+            Some(output)
+        }
+        None => Some(PolicyValue::literal(template)),
+    }
+}
+
+enum PolicyVariableValue {
+    Text(String),
+    LiteralWildcard(char),
+}
+
+fn push_policy_literal(output: &mut PolicyValue, value: &str) {
+    output.value.push_str(value);
+}
+
+fn push_policy_variable(output: &mut PolicyValue, value: &PolicyVariableValue) {
+    match value {
+        PolicyVariableValue::Text(value) => output.value.push_str(value),
+        PolicyVariableValue::LiteralWildcard(value @ ('*' | '?')) => {
+            let index = output.value.chars().count();
+            output.value.push(*value);
+            output.escaped_wildcards.push(index);
+        }
+        PolicyVariableValue::LiteralWildcard(value) => output.value.push(*value),
+    }
+}
+
+fn resolve_policy_template_variable(
+    content: &str,
+    request: &PolicyRequest<'_>,
+) -> Option<PolicyVariableValue> {
+    match content {
+        "*" => return Some(PolicyVariableValue::LiteralWildcard('*')),
+        "?" => return Some(PolicyVariableValue::LiteralWildcard('?')),
+        "$" => return Some(PolicyVariableValue::Text("$".to_string())),
+        _ => {}
+    }
+
+    let (key, default) = parse_policy_variable_default(content);
+    match condition_key::resolve_policy_variable(request, key) {
+        condition_key::PolicyVariableResolution::Value(value) => {
+            Some(PolicyVariableValue::Text(value))
+        }
+        condition_key::PolicyVariableResolution::Absent => {
+            default.map(|value| PolicyVariableValue::Text(value.to_string()))
+        }
+        condition_key::PolicyVariableResolution::Unavailable => None,
+    }
+}
+
+fn parse_policy_variable_default(content: &str) -> (&str, Option<&str>) {
+    let Some((key, default)) = content.split_once(',') else {
+        return (content.trim(), None);
+    };
+    let default = default.trim();
+    let Some(default) = default
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    else {
+        return (content.trim(), None);
+    };
+    (key.trim(), Some(default))
+}
+
+fn policy_string_equals(expected: &PolicyValue, actual: &str) -> bool {
+    expected.as_str() == actual
+}
+
+fn policy_string_equals_ignore_case(expected: &PolicyValue, actual: &str) -> bool {
+    expected.as_str() == actual || expected.as_str().to_lowercase() == actual.to_lowercase()
 }
 
 #[doc(hidden)]
@@ -1701,50 +1851,39 @@ fn action_pattern_matches(pattern: &str, action: &str) -> bool {
 }
 
 fn wildcard_matches(pattern: &str, value: &str) -> bool {
-    if !pattern.contains('*') {
-        return pattern == value;
-    }
+    policy_value_wildcard_matches(&PolicyValue::literal(pattern), value)
+}
 
-    let segments: Vec<&str> = pattern.split('*').collect();
-    if segments.iter().all(|segment| segment.is_empty()) {
-        return true;
-    }
+fn policy_value_wildcard_matches(pattern: &PolicyValue, value: &str) -> bool {
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let value: Vec<char> = value.chars().collect();
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
 
-    let mut search_start = 0;
-    let mut start_index = 0;
-
-    if !pattern.starts_with('*') {
-        let first = segments
-            .first()
-            .expect("split always yields a first segment");
-        let Some(_remaining) = value.strip_prefix(first) else {
-            return false;
-        };
-        search_start = first.len();
-        start_index = 1;
-    }
-
-    let end_index = if pattern.ends_with('*') {
-        segments.len()
-    } else {
-        segments.len().saturating_sub(1)
-    };
-    for segment in &segments[start_index..end_index] {
-        if segment.is_empty() {
-            continue;
+    for (pattern_index, pattern_ch) in pattern_chars.into_iter().enumerate() {
+        let mut current = vec![false; value.len() + 1];
+        match pattern_ch {
+            '*' if !pattern.wildcard_is_escaped(pattern_index) => {
+                current[0] = previous[0];
+                for index in 1..=value.len() {
+                    current[index] = previous[index] || current[index - 1];
+                }
+            }
+            '?' if !pattern.wildcard_is_escaped(pattern_index) => {
+                current[1..(value.len() + 1)].copy_from_slice(&previous[..value.len()]);
+            }
+            _ => {
+                for (index, actual) in value.iter().enumerate() {
+                    if *actual == pattern_ch && previous[index] {
+                        current[index + 1] = true;
+                    }
+                }
+            }
         }
-        let Some(found) = value[search_start..].find(segment) else {
-            return false;
-        };
-        search_start += found + segment.len();
+        previous = current;
     }
 
-    if pattern.ends_with('*') {
-        true
-    } else {
-        let last = segments.last().expect("split always yields a last segment");
-        value[search_start..].ends_with(last)
-    }
+    previous[value.len()]
 }
 
 fn aws_principal_matches_request(requester_principal: &str, policy_value: &str) -> bool {
@@ -2003,6 +2142,218 @@ mod tests {
         assert_eq!(
             err,
             BucketPolicyError::malformed("Could not parse the policy: Statement is empty!")
+        );
+    }
+
+    #[test]
+    fn parse_unsupported_policy_version_uses_aws_message() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2026-07-11","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            BucketPolicyError::malformed("The policy must contain a valid version string")
+        );
+    }
+
+    #[test]
+    fn wildcard_question_mark_matches_exactly_one_character() {
+        assert!(wildcard_matches("question-?/", "question-a/"));
+        assert!(wildcard_matches("question-?/", "question-*/"));
+        assert!(!wildcard_matches("question-?/", "question-ab/"));
+        assert!(!wildcard_matches("question-?/", "question-/"));
+    }
+
+    #[test]
+    fn policy_variable_special_forms_escape_wildcard_characters() {
+        let request = bucket_request(PolicyAction::ListBucket, "bucket", None);
+        let literal_star =
+            expand_policy_template("star-${*}", &request).expect("special form expands");
+        let literal_question =
+            expand_policy_template("question-${?}", &request).expect("special form expands");
+        let literal_dollar =
+            expand_policy_template("dollar-${$}", &request).expect("special form expands");
+
+        assert!(policy_value_wildcard_matches(&literal_star, "star-*"));
+        assert!(!policy_value_wildcard_matches(&literal_star, "star-public"));
+        assert!(policy_value_wildcard_matches(
+            &literal_question,
+            "question-?"
+        ));
+        assert!(!policy_value_wildcard_matches(
+            &literal_question,
+            "question-a"
+        ));
+        assert!(policy_string_equals(&literal_dollar, "dollar-$"));
+        assert!(!policy_string_equals(&literal_dollar, "dollar-x"));
+    }
+
+    #[test]
+    fn literal_private_use_unicode_is_not_an_escape_marker() {
+        let literal_star_marker = PolicyValue::literal("star-\u{E000}");
+        let literal_question_marker = PolicyValue::literal("question-\u{E001}");
+
+        assert!(policy_value_wildcard_matches(
+            &literal_star_marker,
+            "star-\u{E000}"
+        ));
+        assert!(!policy_value_wildcard_matches(
+            &literal_star_marker,
+            "star-*"
+        ));
+        assert!(policy_value_wildcard_matches(
+            &literal_question_marker,
+            "question-\u{E001}"
+        ));
+        assert!(!policy_value_wildcard_matches(
+            &literal_question_marker,
+            "question-?"
+        ));
+    }
+
+    #[test]
+    fn policy_template_unclosed_variable_is_literal_text() {
+        let request = bucket_request(PolicyAction::ListBucket, "bucket", None);
+        let expanded = expand_policy_template("prefix-${aws:userid}-${unterminated", &request)
+            .expect("anonymous userid resolves");
+
+        assert_eq!(expanded.as_str(), "prefix-anonymous-${unterminated");
+    }
+
+    #[test]
+    fn policy_variables_expand_only_for_2012_version() {
+        let expanding = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:prefix":"${AWS:UserId}"}}}]}"#,
+        )
+        .unwrap();
+        let literal_2008 = parse_bucket_policy(
+            r#"{"Version":"2008-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:prefix":"${aws:userid}"}}}]}"#,
+        )
+        .unwrap();
+        let literal_default = parse_bucket_policy(
+            r#"{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:prefix":"${aws:userid}"}}}]}"#,
+        )
+        .unwrap();
+        let expanded_request =
+            bucket_request(PolicyAction::ListBucket, "bucket", None).with_prefix(Some("anonymous"));
+        let literal_request = bucket_request(PolicyAction::ListBucket, "bucket", None)
+            .with_prefix(Some("${aws:userid}"));
+
+        assert_eq!(
+            expanding.evaluate(&expanded_request),
+            PolicyEvaluation::ExplicitAllow
+        );
+        assert_eq!(
+            expanding.evaluate(&literal_request),
+            PolicyEvaluation::NoMatch
+        );
+        assert_eq!(
+            literal_2008.evaluate(&expanded_request),
+            PolicyEvaluation::NoMatch
+        );
+        assert_eq!(
+            literal_2008.evaluate(&literal_request),
+            PolicyEvaluation::ExplicitAllow
+        );
+        assert_eq!(
+            literal_default.evaluate(&expanded_request),
+            PolicyEvaluation::NoMatch
+        );
+        assert_eq!(
+            literal_default.evaluate(&literal_request),
+            PolicyEvaluation::ExplicitAllow
+        );
+    }
+
+    #[test]
+    fn policy_variables_expand_in_resource_patterns() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/${aws:userid}/*"}]}"#,
+        )
+        .unwrap();
+        let allowed = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "anonymous/object",
+            None,
+            &[],
+        );
+        let denied = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "private/object",
+            None,
+            &[],
+        );
+
+        assert_eq!(policy.evaluate(&allowed), PolicyEvaluation::ExplicitAllow);
+        assert_eq!(policy.evaluate(&denied), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn authenticated_identity_policy_variables_are_unavailable_until_iam_context_exists() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:prefix":"${aws:userid}"}}}]}"#,
+        )
+        .unwrap();
+        let guessed_request = bucket_request(
+            PolicyAction::ListBucket,
+            "bucket",
+            Some("arn:aws:iam::123456789012:user/alice"),
+        )
+        .with_prefix(Some("arn:aws:iam::123456789012:user/alice"));
+
+        assert_eq!(policy.evaluate(&guessed_request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn authenticated_identity_policy_variable_defaults_do_not_apply_to_unavailable_context() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:prefix":"${aws:userid, 'fallback'}"}}}]}"#,
+        )
+        .unwrap();
+        let fallback_request = bucket_request(
+            PolicyAction::ListBucket,
+            "bucket",
+            Some("arn:aws:iam::123456789012:user/alice"),
+        )
+        .with_prefix(Some("fallback"));
+
+        assert_eq!(
+            policy.evaluate(&fallback_request),
+            PolicyEvaluation::NoMatch
+        );
+    }
+
+    #[test]
+    fn multivalued_policy_variable_defaults_do_not_apply_to_present_context() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/${s3:RequestObjectTagKeys, 'fallback'}"}]}"#,
+        )
+        .unwrap();
+        let request_tags = [
+            PolicyTag {
+                key: "public",
+                value: "1",
+            },
+            PolicyTag {
+                key: "shared",
+                value: "2",
+            },
+        ];
+        let fallback_request = request(
+            PolicyAction::PutObject,
+            "bucket",
+            "fallback",
+            Some("arn:aws:iam::123456789012:user/alice"),
+            &[],
+        )
+        .with_request_object_tags(&request_tags);
+
+        assert_eq!(
+            policy.evaluate(&fallback_request),
+            PolicyEvaluation::NoMatch
         );
     }
 
@@ -2393,11 +2744,11 @@ mod tests {
         );
 
         assert_eq!(
-            policy.statements[0].condition_match_result(&unavailable_request),
+            policy.statements[0].condition_match_result(&unavailable_request, false),
             ConditionMatchResult::InputUnavailable
         );
         assert_eq!(
-            policy.statements[0].condition_match_result(&available_request),
+            policy.statements[0].condition_match_result(&available_request, false),
             ConditionMatchResult::NoMatch
         );
     }
@@ -2684,19 +3035,19 @@ mod tests {
         .with_request_object_tags(&no_request_tags);
 
         assert_eq!(
-            policy.statements[0].condition_match_result(&unavailable_request),
+            policy.statements[0].condition_match_result(&unavailable_request, false),
             ConditionMatchResult::InputUnavailable
         );
         assert_eq!(
-            policy.statements[1].condition_match_result(&unavailable_request),
+            policy.statements[1].condition_match_result(&unavailable_request, false),
             ConditionMatchResult::InputUnavailable
         );
         assert_eq!(
-            policy.statements[0].condition_match_result(&empty_request),
+            policy.statements[0].condition_match_result(&empty_request, false),
             ConditionMatchResult::Matches
         );
         assert_eq!(
-            policy.statements[1].condition_match_result(&empty_request),
+            policy.statements[1].condition_match_result(&empty_request, false),
             ConditionMatchResult::Matches
         );
     }
@@ -3183,11 +3534,11 @@ mod tests {
         .with_server_side_encryption(None);
 
         assert_eq!(
-            policy.statements[0].condition_match_result(&unavailable_request),
+            policy.statements[0].condition_match_result(&unavailable_request, false),
             ConditionMatchResult::InputUnavailable
         );
         assert_eq!(
-            policy.statements[0].condition_match_result(&missing_header_request),
+            policy.statements[0].condition_match_result(&missing_header_request, false),
             ConditionMatchResult::Matches
         );
     }
@@ -3217,11 +3568,11 @@ mod tests {
         .with_object_creation_operation(None);
 
         assert_eq!(
-            policy.statements[0].condition_match_result(&unavailable_request),
+            policy.statements[0].condition_match_result(&unavailable_request, false),
             ConditionMatchResult::InputUnavailable
         );
         assert_eq!(
-            policy.statements[0].condition_match_result(&absent_request),
+            policy.statements[0].condition_match_result(&absent_request, false),
             ConditionMatchResult::NoMatch
         );
     }
