@@ -4736,12 +4736,23 @@ pub fn s3_response_to_hyper(
         if abort_on_500 {
             use std::io::Write as _;
 
+            static ABORT_DIAGNOSTIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _guard = ABORT_DIAGNOSTIC_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut stderr = std::io::stderr().lock();
             let _ = writeln!(stderr, "{message}");
             let _ = stderr.flush();
+            drop(stderr);
+            if should_dump_panic_on_500_flight_recorder() {
+                observability::dump_flight_recorder_to_stderr("abort-on-500");
+            }
             std::process::abort();
         }
         if panic_on_500 {
+            if should_dump_panic_on_500_flight_recorder() {
+                observability::dump_flight_recorder_to_stderr("panic-on-500");
+            }
             panic!("{message}");
         }
     }
@@ -4772,13 +4783,6 @@ pub fn s3_response_to_hyper(
             trace.emit_error_diagnostic(diagnostic);
         }
         if panic_on_500 || abort_on_500 {
-            if should_dump_panic_on_500_flight_recorder() {
-                observability::dump_flight_recorder_to_stderr(if abort_on_500 {
-                    "abort-on-500"
-                } else {
-                    "panic-on-500"
-                });
-            }
             fail_on_500_diagnostic(diagnostic_message, panic_on_500, abort_on_500);
         }
         let inflight_requests_guard = permit
@@ -4871,13 +4875,6 @@ pub fn s3_response_to_hyper(
                     server_detail,
                 );
             }
-        }
-        if (panic_on_500 || abort_on_500) && should_dump_panic_on_500_flight_recorder() {
-            observability::dump_flight_recorder_to_stderr(if abort_on_500 {
-                "abort-on-500"
-            } else {
-                "panic-on-500"
-            });
         }
         fail_on_500_diagnostic(
             format!(

@@ -296,6 +296,20 @@ if [[ "$smoke" == "cleanup-versioned-stress" ]]; then
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
     export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
 fi
+if [[ "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" ]]; then
+    control_plane_storage_auth_credentials=""
+    for ((node_id = 0; node_id < ARGMIN_LOCAL_NODE_COUNT; node_id++)); do
+        [[ -z "$control_plane_storage_auth_credentials" ]] ||
+            control_plane_storage_auth_credentials+=","
+        control_plane_storage_auth_credentials+="$node_id=uat-storage-$node_id:1:uat-storage-secret-$node_id"
+    done
+    export ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID="uat-control-plane"
+    export ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS="$control_plane_storage_auth_credentials"
+    export ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID="uat-frontend"
+    export ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS="uat-frontend=uat-frontend:1:uat-frontend-secret"
+    export ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID="uat-admin"
+    export ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS="uat-admin=uat-admin:1:uat-admin-secret"
+fi
 if [[ "$smoke" == "storage-node-kill-fails-closed" || "$smoke" == "storage-node-primary-kill-fails-closed" ]]; then
     export ARGMIN_ABORT_ON_500=0
 fi
@@ -615,6 +629,20 @@ restart_control_plane() {
     kill_control_plane
     start_control_plane
     wait_for_control_plane_socket
+    reestablish_control_plane_authority_clock_after_restart
+}
+
+reestablish_control_plane_authority_clock_after_restart() {
+    local status
+    status="$("${server_cmd[@]}" control-plane-authority-clock-status "$control_plane_socket_path")" ||
+        die "failed to read control-plane authority-clock status after restart"
+    echo "== argmin-s3 UAT control-plane authority clock after restart: $status =="
+
+    if [[ "$status" == *"established=false"* ]]; then
+        print_command "${server_cmd[@]}" control-plane-reestablish-authority-clock "$control_plane_socket_path"
+        "${server_cmd[@]}" control-plane-reestablish-authority-clock "$control_plane_socket_path" ||
+            die "failed to re-establish control-plane authority clock after restart"
+    fi
 }
 
 set_pg_acting_set() {

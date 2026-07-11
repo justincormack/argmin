@@ -48,7 +48,7 @@ const CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT: Duration = Duration::from_secs
 const CONTROL_PLANE_RPC_LIVENESS_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS: u64 = 5_000;
-const CONTROL_PLANE_RPC_RESPONSE_AUTH_FUTURE_SKEW_MS: u64 = 10;
+const CONTROL_PLANE_RPC_RESPONSE_AUTH_FUTURE_SKEW_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 1 + 4 + 1;
@@ -17256,6 +17256,49 @@ mod tests {
                             message: "test admin response clock exhausted".to_owned(),
                         })
                 },
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        let mut reader = PayloadReader::new(&response);
+        assert!(ClusterEpoch::new(reader.read_u64().unwrap()).is_some());
+        reader.finish().unwrap();
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_accepts_admin_response_with_supported_clock_skew() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000 + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let mut payload = Vec::new();
+        write_pg_acting_set_request(&mut payload, PgId::new(7), &[NodeId::new(1)]).unwrap();
+        let response = client
+            .send_admin_request_with_read_timeout_and_clock(
+                ControlPlaneRpcKind::SetPgActingSet,
+                payload,
+                CONTROL_PLANE_RPC_IO_TIMEOUT,
+                || Ok(2_000),
             )
             .unwrap();
 
