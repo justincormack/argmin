@@ -1,0 +1,254 @@
+Partial history can satisfy later full floor requests
+Link: https://chatgpt.com/codex/cloud/security/findings/9a486bdd43648191a5bd5d3a2ec10790?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 908108d
+Author: justin@specialbusservice.com
+Created: 12/07/2026, 17:04:44
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the commit changed history retention from whole-epoch protection to per-route pruning, but did not update floor validation or runtime-map generation to distinguish complete history records from partial route-only records.
+The new pruner keeps only exact protected `(epoch, PG)` routes in old, non-floor-protected history records. Once unrelated PG routes are removed, the code has no marker that the history record is partial. A later storage-node heartbeat can set a `cluster_map_history_floor_epoch` covering that same epoch. The validation path accepts the request because `cluster_map_at_epoch(required_epoch).is_some()` only proves the epoch exists, not that all PG routes are present. The refresh response then iterates only the remaining `history.pgs()` entries, silently omitting pruned routes that the floor request expected to be available. An authenticated or faulty storage node can therefore cause incomplete historical runtime maps, potentially breaking placement/backfill/recovery decisions and causing availability or data-integrity issues.
+
+# Resolution
+The finding was valid at commit `908108d2`, but was fixed by the subsequent exact-route retention and sparse-history work:
+
+- [`d479b4c0`](https://github.com/justincormack/argmin/commit/d479b4c0fa12089173d7cb2f97a47878a02b9f1e) replaces the storage node's aggregate history-floor retention input with durable exact `(kind, epoch, PG)` route references.
+- [`940da076`](https://github.com/justincormack/argmin/commit/940da07692279691b773efcf24e90b1cbdf39ef0) retains each exact referenced route and its metadata-transfer dependency closure and reconstructs exact routes for filtered storage-node refresh responses.
+- [`cedad691`](https://github.com/justincormack/argmin/commit/cedad6916728a4996d749625df8f4cdf85c75593) makes sparse history unambiguous by encoding reverse PG-route deltas, explicit PG-introduction absence boundaries, and a canonical retained-epoch list in runtime-map RPC v6.
+
+Heartbeat validation now reconstructs every exact referenced route and rejects a reference that is unavailable. Persisted-state validation applies the same per-route requirement. Runtime-map refresh starts from those exact references, follows transfer dependencies, and reconstructs the required routes rather than treating the oldest reference as a request for every PG route in every later epoch. A route therefore need not be physically repeated in an epoch record, but it must remain reconstructible from the reverse deltas and absence boundaries.
+
+`cluster_map_history_floor_epoch()` remains as an aggregate diagnostic derived from the exact references. It is not used as the history-retention capability and does not permit a later request for complete history from that epoch.
+
+Verified on the fixed implementation with:
+
+- `cluster_map_history_pruning_preserves_only_exact_storage_node_route`
+- `storage_node_refresh_filters_unrelated_history_around_exact_old_route`
+- `heartbeat_persists_exact_cluster_map_history_route_references`
+- `exact_old_route_retains_later_pg_introduction_boundary`
+
+All four focused tests passed.
+
+# Validation
+## Rubric
+- [x] Confirm the changed pruner can mutate complete history records into partial per-route records without a completeness marker.
+- [x] Demonstrate a retained history range can contain every required epoch while records are missing unrelated PG routes.
+- [x] Demonstrate storage-node heartbeat floor validation accepts that partial range because it checks only epoch existence.
+- [x] Demonstrate persisted/publication validation also accepts the partial range for the same reason.
+- [x] Demonstrate runtime-map refresh/reconstruction exposes the impact: missing PG routes are not restored or reported as a floor-validation error, and refresh output silently omits them.
+## Report
+Validated the finding with a targeted Rust unit-test PoC added to `crates/storage/src/control_plane.rs` and archived as a patch. Relevant code evidence: `prune_cluster_map_history` mutates retained records by `record.pgs.retain(...)` with exact `(epoch, pg)` route keys and does not mark records partial (`crates/storage/src/control_plane.rs:14965-14999`). Heartbeat floor validation only checks `snapshot.cluster_map_at_epoch(required_epoch).is_some()` (`crates/storage/src/control_plane.rs:14256-14279`). Persisted/publication validation likewise builds a set of retained epochs and checks only epoch membership (`crates/storage/src/control_plane.rs:13283-13326`). Runtime-map refresh iterates only `history.pgs()` and therefore cannot notice PGs pruned out of a partial record (`crates/storage/src/control_plane.rs:1635-1655`).
+
+The PoC test `poc_partial_route_history_satisfies_floor_and_omits_pg_routes` constructs 257 complete records with PG1 and PG2, invokes the real `prune_cluster_map_history` with exact-route protection for PG1 only for epochs 1..256, and proves the resulting 256 retained records are continuous but all missing PG2. It then sets a node floor to epoch 1. Both `validate_storage_cluster_map_history_floor(...).unwrap()` and `validate_required_cluster_map_history(...).unwrap()` succeed, even though `reconstructed_pg_route_at_epoch(pg2, floor_epoch)` returns `UnknownPg`. Finally, `runtime_map_for_storage_node_refresh(...)` succeeds and the returned historical routes contain PG1 but no PG2, demonstrating silent omission.
+
+Command output: `cargo test -p storage poc_partial_route_history_satisfies_floor_and_omits_pg_routes -- --nocapture` => `test control_plane::tests::poc_partial_route_history_satisfies_floor_and_omits_pg_routes ... ok` and `1 passed; 0 failed`. Valgrind was attempted but unavailable (`bash: command not found: valgrind`). ASan was attempted via `RUSTFLAGS='-Z sanitizer=address'` but stable rustc rejected nightly `-Z`. gdb was unavailable, but lldb was run non-interactively with a regex breakpoint and produced a stack trace reaching the PoC test.
+
+# Evidence
+crates/storage/src/control_plane.rs (L13283 to 13326)
+  Note: Persisted/publication validation uses the same epoch-existence test for node history floors, so partial records can satisfy full-floor retention invariants.
+```
+fn validate_required_cluster_map_history(
+    history: &[ClusterMapHistoryRecord],
+    pgs: &BTreeMap<PgId, PgControlRecord>,
+    nodes: &BTreeMap<NodeId, NodeControlRecord>,
+    current_epoch: ClusterEpoch,
+) -> Result<(), ControlPlaneError> {
+    let retained_epochs: BTreeSet<_> = history
+        .iter()
+        .map(ClusterMapHistoryRecord::cluster_epoch)
+        .collect();
+    for pg in pgs.values() {
+        let Some(source_route_epoch) = pg.peering_metadata_transfer_source_route_epoch else {
+            continue;
+        };
+        if source_route_epoch >= current_epoch {
+            continue;
+        }
+        if !retained_epochs.contains(&source_route_epoch) {
+            return Err(parse_error(
+                0,
+                "metadata transfer source route epoch is not retained in cluster-map history",
+            ));
+        }
+    }
+    for node in nodes.values() {
+        let Some(floor_epoch) = node.cluster_map_history_floor_epoch else {
+            continue;
+        };
+        if floor_epoch >= current_epoch {
+            continue;
+        }
+        for raw_epoch in floor_epoch.get()..current_epoch.get() {
+            let required_epoch =
+                ClusterEpoch::new(raw_epoch).expect("retained history epoch is non-zero");
+            if retained_epochs.contains(&required_epoch) {
+                continue;
+            }
+            return Err(parse_error(
+                0,
+                "storage cluster-map history floor epoch is not retained in cluster-map history",
+            ));
+        }
+    }
+    Ok(())
+```
+
+crates/storage/src/control_plane.rs (L14256 to 14279)
+  Note: Heartbeat floor validation accepts a required epoch when any history record for that epoch exists; it does not verify that the record still contains all PG routes after per-route pruning.
+```
+    let Some(floor_epoch) = heartbeat
+        .cluster_map_history_reference_summary
+        .oldest_required_epoch()
+    else {
+        return Ok(());
+    };
+    if floor_epoch >= snapshot.cluster_epoch {
+        return Ok(());
+    }
+    for raw_epoch in floor_epoch.get()..snapshot.cluster_epoch.get() {
+        let required_epoch =
+            ClusterEpoch::new(raw_epoch).expect("retained history epoch is non-zero");
+        if snapshot.cluster_map_at_epoch(required_epoch).is_some() {
+            continue;
+        }
+        return Err(
+            ControlPlaneError::StorageClusterMapHistoryFloorNotRetained {
+                node_id: heartbeat.node_id.as_u32(),
+                floor_epoch,
+                cluster_epoch: snapshot.cluster_epoch,
+            },
+        );
+    }
+    Ok(())
+```
+
+crates/storage/src/control_plane.rs (L14965 to 14999)
+  Note: The new pruning logic mutates old history records by retaining only PG routes whose `(record_epoch, pg_id)` is in the exact-route set, turning formerly complete epoch records into partial records.
+```
+fn prune_cluster_map_history(
+    history: &mut Vec<ClusterMapHistoryRecord>,
+    protection: &ClusterMapHistoryProtection,
+) {
+    history.sort_by_key(ClusterMapHistoryRecord::cluster_epoch);
+    while history.len() > CLUSTER_MAP_HISTORY_LIMIT {
+        let mut exact_routes = protection.exact_routes.clone();
+        exact_routes.extend(
+            history
+                .iter()
+                .flat_map(ClusterMapHistoryRecord::pgs)
+                .filter_map(|pg| {
+                    pg.peering_metadata_transfer_source_route_epoch
+                        .map(|epoch| (epoch, pg.pg_id))
+                }),
+        );
+        let mut remove_index = None;
+        for (index, record) in history.iter_mut().enumerate() {
+            if cluster_map_history_record_is_floor_protected(record, protection) {
+                continue;
+            }
+            let record_epoch = record.cluster_epoch();
+            record
+                .pgs
+                .retain(|pg| exact_routes.contains(&(record_epoch, pg.pg_id)));
+            if record.pgs.is_empty() {
+                remove_index = Some(index);
+                break;
+            }
+        }
+        let Some(index) = remove_index else {
+            break;
+        };
+        history.remove(index);
+    }
+```
+
+crates/storage/src/control_plane.rs (L15002 to 15009)
+  Note: Only records at or above the current aggregate floor are protected as complete. A record pruned before a later floor request is not marked partial and cannot be restored.
+```
+fn cluster_map_history_record_is_floor_protected(
+    record: &ClusterMapHistoryRecord,
+    protection: &ClusterMapHistoryProtection,
+) -> bool {
+    protection
+        .retain_from_epoch
+        .is_some_and(|floor| record.cluster_epoch() >= floor)
+}
+```
+
+crates/storage/src/control_plane.rs (L1635 to 1655)
+  Note: Runtime-map refresh generation iterates only the PGs still present in each history record; routes pruned from a partial record are silently omitted from the historical route response.
+```
+        for history in &self.history {
+            if response_floor.is_some_and(|floor| history.cluster_epoch() >= floor) {
+                for pg in history.pgs() {
+                    let route = history.reconstructed_pg_route(pg.pg_id())?;
+                    if !storage_node_refresh_needs_historical_route(&route, refreshing_node_id) {
+                        previous_routes.insert(pg.pg_id(), route);
+                        continue;
+                    }
+                    let route_changed = previous_routes
+                        .get(&pg.pg_id())
+                        .is_none_or(|previous| !pg_route_configuration_eq(previous, &route));
+                    if route_changed {
+                        add_required_historical_route_key(
+                            &mut required_keys,
+                            &mut pending_keys,
+                            history.cluster_epoch(),
+                            pg.pg_id(),
+                        );
+                    }
+                    previous_routes.insert(pg.pg_id(), route);
+                }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at medium. Static evidence and the prior executable unit-test PoC support that the bug is real: route-level pruning can create partial records, validation only checks epoch existence, and refresh generation omits missing PGs. The issue is in product runtime code used by control-plane/storage-node roles, but exposure is internal/private Unix RPC with optional scoped credentials and registered node checks, not the public S3 HTTP API. The likely impact is availability and possible storage recovery/backfill integrity problems rather than direct data exfiltration, auth bypass, RCE, or credential compromise.
+## Likelihood
+low - The vulnerable input is not public HTTP; it is an internal control-plane heartbeat over a private Unix socket and normally from a registered/authenticated storage node. Triggering also requires specific history-pruning state. A malicious or compromised storage node could plausibly influence the heartbeat floor, but broad external exploitation is unlikely.
+## Impact
+medium - A partial historical cluster map can be accepted as satisfying a full floor and then produce incomplete runtime maps for storage-node refresh. This can mislead placement/backfill/recovery logic, causing availability issues and possible data-integrity risk, but it does not directly expose S3 credentials, bypass SigV4, or provide code execution.
+## Assumptions
+- The affected distributed control-plane/storage-node roles are deployed or tested, not only the default legacy-local S3 mode.
+- A realistic attacker is a compromised, malicious, or faulty registered storage node, or a local process with access to the private control-plane Unix socket.
+- Cluster-map history grows past CLUSTER_MAP_HISTORY_LIMIT and prior exact-route protection leaves at least one old history epoch partially pruned before a later heartbeat asks for a full floor covering that epoch.
+- control-plane/storage-node deployment path using ARGMIN_CONTROL_PLANE_SOCKET_PATH
+- registered storage-node node_id/incarnation or local Unix-socket access
+- history length above CLUSTER_MAP_HISTORY_LIMIT
+- partial per-route-pruned history record remains for an epoch later covered by a storage-node history floor
+## Path
+storage node/local client -> RefreshNodeHeartbeat -> epoch-only floor validation
+                         ^                         |
+                         |                         v
+              partial pruned history --------> runtime map omits PG routes -> recovery/backfill risk
+## Path evidence
+- `crates/storage/src/control_plane.rs:14965-14999` - Pruner mutates retained history records with record.pgs.retain(...) based on exact (epoch, PG) route keys, which can leave an epoch record present but partial.
+- `crates/storage/src/control_plane.rs:15002-15009` - Only records at or above the current floor are protected as full records; there is no partial marker for records pruned before a later floor request.
+- `crates/storage/src/control_plane.rs:14256-14279` - Storage-node heartbeat floor validation accepts an epoch when snapshot.cluster_map_at_epoch(required_epoch).is_some(), without checking route completeness.
+- `crates/storage/src/control_plane.rs:13283-13326` - Persisted/publication validation builds a set of retained epochs and checks epoch membership only for node history floors.
+- `crates/storage/src/control_plane.rs:1635-1655` - Runtime-map refresh iterates history.pgs(); PGs pruned out of a partial epoch are not detected or emitted.
+- `crates/storage/src/control_plane.rs:4512-4521` - NodeHeartbeat carries attacker-influenced/internal-node fields including node_id, observed_epoch, requested lease duration, and cluster_map_history_reference_summary.
+- `crates/argmin-s3/src/main.rs:1641-1650` - argmin-s3 control-plane process binds and serves the configured control-plane Unix socket, making this part of the application runtime.
+- `crates/argmin-s3/src/main.rs:4176-4235` - Control-plane RPC exposure is a private Unix socket; the parent directory is created with 0700 and validated as private, limiting reachability.
+- `crates/storage/src/control_plane.rs:8974-9091` - Optional storage-node heartbeat auth verifies a scoped authenticated envelope bound to node identity/incarnation, showing the intended internal authenticated surface.
+- `crates/argmin-s3/src/config.rs:331-360` - Configuration documents control-plane socket path and storage-node/control-plane auth credentials as runtime environment configuration.
+## Narrative
+The finding is a real control-plane integrity bug. The new pruner can turn an old complete history epoch into a partial epoch by retaining only exact protected PG routes. Later, storage-node heartbeat and persisted snapshot validation accept a requested floor because they test only whether a history record for each epoch exists, not whether all PG routes are still present. Runtime-map refresh then iterates only the remaining history.pgs() entries and silently omits pruned routes. The issue is internal and authenticated/private rather than public S3 HTTP reachable, so medium severity is appropriate: impact can affect availability and possibly data-integrity of recovery/backfill decisions, but exploitation requires a storage-node/control-plane context and specific history state.
+## Controls
+- private Unix-domain control-plane socket directory validation
+- optional scoped control-plane storage-node heartbeat authentication
+- registered node membership/incarnation checks before heartbeat mutation
+- control-plane RPC worker limit and 1s read/write timeout
+- non-root process rejection in argmin-s3
+## Blindspots
+- Static-only review did not run a full multi-process control-plane/storage-node deployment over the Unix socket.
+- No deployment manifests were present to determine whether the distributed control-plane role is commonly enabled in production.
+- The exact trust model for compromised/faulty storage nodes is not fully specified by the repository threat model.
+- The prior PoC exercised real Rust functions in a unit test, but did not demonstrate a complete end-to-end attack through a live authenticated Unix RPC client.
