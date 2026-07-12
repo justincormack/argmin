@@ -23,7 +23,8 @@ use crate::control_plane_command::{
 };
 use crate::control_plane_lease::{
     bounded_renewal_deadline, successor_activation_fence_satisfied, validate_process_lease_clock,
-    validate_serving_deadline_bound, BoundRouteMapLease, LeaseClockError,
+    validate_serving_deadline_bound, BoundRouteMapLease, CommittedLeaseGrantHorizon,
+    LeaseClockError, LeaseHorizonAuthorityBinding, LeaseHorizonError,
     CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
 };
 use crate::{
@@ -36,6 +37,7 @@ use crate::{
 // snapshots that scanner references can still reconstruct historical routes.
 const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
+pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_VERSION: u16 = 6;
@@ -44,7 +46,7 @@ const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 21;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 22;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -95,6 +97,26 @@ fn control_plane_lease_clock_error(error: LeaseClockError) -> ControlPlaneError 
         | LeaseClockError::LocalClockUnhealthy { .. }
         | LeaseClockError::ClockHealthSourceUnavailable => {
             unreachable!("authority clock comparison is only used by runtime-map consumers")
+        }
+    }
+}
+
+fn control_plane_lease_horizon_error(error: LeaseHorizonError) -> ControlPlaneError {
+    match error {
+        LeaseHorizonError::TimestampOverflow { field } => {
+            ControlPlaneError::LeaseGrantHorizonTimestampOverflow { field }
+        }
+        LeaseHorizonError::PreviousHorizonStillActive {
+            authority_now_ms,
+            fenced_until_ms,
+        } => ControlPlaneError::PreviousLeaseGrantHorizonStillActive {
+            authority_now_ms,
+            fenced_until_ms,
+        },
+        #[cfg(test)]
+        LeaseHorizonError::AuthorityMismatch { .. }
+        | LeaseHorizonError::DeadlineBeyondHorizon { .. } => {
+            unreachable!("horizon establishment cannot validate a volatile grant")
         }
     }
 }
@@ -1033,6 +1055,7 @@ pub struct ClusterControlSnapshot {
     authority_incarnation: AuthorityIncarnation,
     cluster_epoch: ClusterEpoch,
     max_committed_timestamp_ms: Option<u64>,
+    lease_grant_horizon: Option<CommittedLeaseGrantHorizon>,
     nodes: BTreeMap<NodeId, NodeControlRecord>,
     pgs: BTreeMap<PgId, PgControlRecord>,
     history: Vec<ClusterMapHistoryRecord>,
@@ -1044,6 +1067,7 @@ impl ClusterControlSnapshot {
             authority_incarnation: AuthorityIncarnation::INITIAL,
             cluster_epoch: ClusterEpoch::INITIAL,
             max_committed_timestamp_ms: None,
+            lease_grant_horizon: None,
             nodes: BTreeMap::new(),
             pgs: BTreeMap::new(),
             history: Vec::new(),
@@ -1072,6 +1096,20 @@ impl ClusterControlSnapshot {
         snapshot
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_invalid_lease_grant_horizon(
+        max_committed_timestamp_ms: Option<u64>,
+        grant_not_after_ms: u64,
+    ) -> Self {
+        let mut snapshot = Self::empty();
+        snapshot.max_committed_timestamp_ms = max_committed_timestamp_ms;
+        snapshot.lease_grant_horizon = Some(CommittedLeaseGrantHorizon::from_parts(
+            LeaseHorizonAuthorityBinding::new(1, None),
+            grant_not_after_ms,
+        ));
+        snapshot
+    }
+
     #[must_use]
     pub fn authority_incarnation(&self) -> AuthorityIncarnation {
         self.authority_incarnation
@@ -1085,6 +1123,12 @@ impl ClusterControlSnapshot {
     #[must_use]
     pub fn max_committed_timestamp_ms(&self) -> Option<u64> {
         self.max_committed_timestamp_ms
+    }
+
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn lease_grant_horizon(&self) -> Option<CommittedLeaseGrantHorizon> {
+        self.lease_grant_horizon
     }
 
     #[must_use]
@@ -1895,6 +1939,7 @@ impl ClusterControlSnapshot {
     }
 
     fn validate_current_state_invariants(&self) -> Result<(), String> {
+        self.validate_lease_grant_horizon_invariant()?;
         for pg in self.pgs.values() {
             if pg.acting_set.is_empty() {
                 return Err(format!("PG {} has an empty acting set", pg.pg_id.get()));
@@ -2193,6 +2238,31 @@ impl ClusterControlSnapshot {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_lease_grant_horizon_invariant(&self) -> Result<(), String> {
+        let Some(horizon) = self.lease_grant_horizon else {
+            return Ok(());
+        };
+        if horizon.grant_not_after_ms() == 0 {
+            return Err("lease grant horizon deadline must be nonzero".to_owned());
+        }
+        let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms else {
+            return Err("lease grant horizon requires a committed timestamp high-water".to_owned());
+        };
+        let future_capacity_ms = horizon
+            .grant_not_after_ms()
+            .saturating_sub(max_committed_timestamp_ms);
+        if future_capacity_ms > MAX_LEASE_GRANT_HORIZON_MS {
+            return Err(format!(
+                "lease grant horizon deadline {} exceeds committed timestamp high-water {} by {}ms, greater than maximum {}ms",
+                horizon.grant_not_after_ms(),
+                max_committed_timestamp_ms,
+                future_capacity_ms,
+                MAX_LEASE_GRANT_HORIZON_MS
+            ));
+        }
         Ok(())
     }
 
@@ -2528,6 +2598,37 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     next_snapshot,
                     ControlPlaneCommandResponse::MarkNodeAvailability,
                     changed,
+                ))
+            }
+            ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority,
+                authority_now_ms,
+                horizon_duration_ms,
+            } => {
+                if horizon_duration_ms == 0 || horizon_duration_ms > MAX_LEASE_GRANT_HORIZON_MS {
+                    return Err(ControlPlaneError::InvalidLeaseGrantHorizonDuration {
+                        duration_ms: horizon_duration_ms,
+                        max_ms: MAX_LEASE_GRANT_HORIZON_MS,
+                    });
+                }
+                self.validate_serving_timestamp(authority_now_ms)?;
+                let horizon = CommittedLeaseGrantHorizon::establish(
+                    self.lease_grant_horizon,
+                    authority,
+                    authority_now_ms,
+                    horizon_duration_ms,
+                    CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+                )
+                .map_err(control_plane_lease_horizon_error)?;
+                let mut next_snapshot = self.clone();
+                let horizon_changed = next_snapshot.lease_grant_horizon != Some(horizon);
+                next_snapshot.lease_grant_horizon = Some(horizon);
+                let timestamp_changed = next_snapshot.record_committed_timestamp(authority_now_ms);
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::EstablishLeaseGrantHorizon,
+                    horizon_changed || timestamp_changed,
                 ))
             }
             ControlPlaneCommand::RecordNodeHeartbeat {
@@ -12791,6 +12892,22 @@ pub enum ControlPlaneError {
     #[error("heartbeat lease duration {requested_ms}ms exceeds maximum {max_ms}ms")]
     LeaseDurationTooLong { requested_ms: u64, max_ms: u64 },
 
+    #[error(
+        "lease grant horizon duration {duration_ms}ms must be positive and no greater than {max_ms}ms"
+    )]
+    InvalidLeaseGrantHorizonDuration { duration_ms: u64, max_ms: u64 },
+
+    #[error("{field} timestamp arithmetic overflowed")]
+    LeaseGrantHorizonTimestampOverflow { field: &'static str },
+
+    #[error(
+        "previous lease grant horizon remains fenced through {fenced_until_ms}ms at accepted authority time {authority_now_ms}ms"
+    )]
+    PreviousLeaseGrantHorizonStillActive {
+        authority_now_ms: u64,
+        fenced_until_ms: u64,
+    },
+
     #[error("heartbeat lease deadline overflow")]
     LeaseDeadlineOverflow,
 
@@ -12987,6 +13104,10 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
         "max_committed_timestamp_ms={}\n",
         option_u64(snapshot.max_committed_timestamp_ms)
     ));
+    out.push_str(&format!(
+        "lease_grant_horizon={}\n",
+        format_lease_grant_horizon(snapshot.lease_grant_horizon)
+    ));
     let mut history_records = snapshot.history.clone();
     let protection =
         required_cluster_map_history_protection(snapshot.pgs.values(), snapshot.nodes.values());
@@ -13041,6 +13162,18 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
         out.push_str(&format!("pg={}\n", format_pg_record(record)));
     }
     out
+}
+
+fn format_lease_grant_horizon(horizon: Option<CommittedLeaseGrantHorizon>) -> String {
+    let Some(horizon) = horizon else {
+        return "-".to_owned();
+    };
+    format!(
+        "{},{},{}",
+        horizon.authority().clock_generation(),
+        option_u64(horizon.authority().raft_term()),
+        horizon.grant_not_after_ms()
+    )
 }
 
 fn format_historical_pg_route_record(record: &HistoricalPgRouteRecord) -> String {
@@ -13287,6 +13420,8 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
     let mut cluster_epoch = None;
     let mut max_committed_timestamp_ms = None;
     let mut max_committed_timestamp_seen = false;
+    let mut lease_grant_horizon = None;
+    let mut lease_grant_horizon_seen = false;
     let mut nodes = BTreeMap::new();
     let mut pgs = BTreeMap::new();
     let mut pg_lines = BTreeMap::new();
@@ -13338,6 +13473,12 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
             }
             max_committed_timestamp_ms =
                 parse_option_u64(line_number, value, "max committed timestamp")?;
+        } else if let Some(value) = line.strip_prefix("lease_grant_horizon=") {
+            if lease_grant_horizon_seen {
+                return Err(parse_error(line_number, "duplicate lease grant horizon"));
+            }
+            lease_grant_horizon_seen = true;
+            lease_grant_horizon = parse_lease_grant_horizon(line_number, value)?;
         } else if let Some(value) = line.strip_prefix("history=") {
             let record = parse_history_record(line_number, value)?;
             if history
@@ -13457,6 +13598,9 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
     if !max_committed_timestamp_seen {
         return Err(parse_error(0, "missing max committed timestamp"));
     }
+    if !lease_grant_horizon_seen {
+        return Err(parse_error(0, "missing lease grant horizon"));
+    }
     let cluster_epoch = cluster_epoch.ok_or_else(|| parse_error(0, "missing cluster epoch"))?;
     validate_current_pgs(&pgs, &pg_lines, &nodes, cluster_epoch)?;
     validate_current_pg_observations(&nodes, &node_pg_lines, &pgs, cluster_epoch)?;
@@ -13485,8 +13629,12 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
         nodes,
         pgs,
         max_committed_timestamp_ms,
+        lease_grant_horizon,
         history,
     };
+    snapshot
+        .validate_lease_grant_horizon_invariant()
+        .map_err(|message| parse_error(0, &message))?;
     if format_snapshot(&snapshot) != contents {
         return Err(parse_error(
             0,
@@ -14531,6 +14679,42 @@ fn option_u64(value: Option<u64>) -> String {
 
 fn option_u32(value: Option<u32>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
+fn parse_lease_grant_horizon(
+    line: usize,
+    value: &str,
+) -> Result<Option<CommittedLeaseGrantHorizon>, ControlPlaneError> {
+    if value == "-" {
+        return Ok(None);
+    }
+    let fields: Vec<&str> = value.split(',').collect();
+    if fields.len() != 3 {
+        return Err(parse_error(
+            line,
+            "lease grant horizon must contain clock generation, Raft term, and deadline",
+        ));
+    }
+    let clock_generation = parse_u64(line, fields[0], "lease horizon clock generation")?;
+    let raft_term = parse_option_u64(line, fields[1], "lease horizon Raft term")?;
+    let authority = LeaseHorizonAuthorityBinding::checked_new(clock_generation, raft_term)
+        .ok_or_else(|| {
+            parse_error(
+                line,
+                "lease horizon clock generation and present Raft term must be nonzero",
+            )
+        })?;
+    let grant_not_after_ms = parse_u64(line, fields[2], "lease horizon deadline")?;
+    if grant_not_after_ms == 0 {
+        return Err(parse_error(
+            line,
+            "lease grant horizon deadline must be nonzero",
+        ));
+    }
+    Ok(Some(CommittedLeaseGrantHorizon::from_parts(
+        authority,
+        grant_not_after_ms,
+    )))
 }
 
 fn parse_option_u64(
@@ -23707,7 +23891,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=21\nauthority_incarnation=1\ncluster_epoch=1\n",
+            "version=22\nauthority_incarnation=1\ncluster_epoch=1\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -24993,8 +25177,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=1\n",
                 "pg=7,peering,1:1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
@@ -25016,8 +25200,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
@@ -25040,8 +25224,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
@@ -25065,8 +25249,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
@@ -25108,8 +25292,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "history=2,1\n",
@@ -25131,8 +25315,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "history=2,1\n",
@@ -25156,8 +25340,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "history=2,1\n",
@@ -25186,8 +25370,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
                 "history=2,1\n",
@@ -25222,7 +25406,7 @@ mod tests {
             let tmp = test_util::tempdir();
             let path = tmp.path().join(format!("control-plane-{index}.state"));
             let contents = format!(
-                "version=21\nmax_committed_timestamp_ms=-\nauthority_incarnation=1\ncluster_epoch=3\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
+                "version=22\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
             );
             std::fs::write(&path, contents).unwrap();
 
@@ -25290,7 +25474,7 @@ mod tests {
             let tmp = test_util::tempdir();
             let path = tmp.path().join(format!("control-plane-{name}.state"));
             let contents = format!(
-                "version=21\nmax_committed_timestamp_ms=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}"
+                "version=22\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}"
             );
             std::fs::write(&path, contents).unwrap();
 
@@ -25358,7 +25542,7 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "version=21\nmax_committed_timestamp_ms=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}{current_node}{current_pg}"
+                    "version=22\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}{current_node}{current_pg}"
                 ),
             )
             .unwrap();
@@ -25382,8 +25566,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "history=1,1\n",
@@ -25434,8 +25618,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
@@ -25460,8 +25644,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "node=1,active,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
@@ -25485,8 +25669,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
@@ -25511,10 +25695,10 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
+                "version=22\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "max_committed_timestamp_ms=100\n",
+                "max_committed_timestamp_ms=100\nlease_grant_horizon=-\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,10,20,30,-,-,-\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0\n",
@@ -25540,8 +25724,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=21\n",
-                "max_committed_timestamp_ms=-\n",
+                "version=22\n",
+                "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
@@ -26022,6 +26206,165 @@ mod tests {
             ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 7).unwrap()
         );
         assert_eq!(replayed.cluster_map_history().len(), 7);
+    }
+
+    #[test]
+    fn lease_grant_horizon_command_replays_and_fences_authority_rebinding() {
+        let initial_authority = LeaseHorizonAuthorityBinding::new(7, Some(11));
+        let replacement_authority = LeaseHorizonAuthorityBinding::new(8, Some(12));
+        let initial = ClusterControlSnapshot::empty()
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: initial_authority,
+                authority_now_ms: 10_000,
+                horizon_duration_ms: 30_000,
+            })
+            .unwrap();
+        assert!(initial.changed());
+        assert_eq!(
+            initial.response(),
+            &ControlPlaneCommandResponse::EstablishLeaseGrantHorizon
+        );
+        let initial = initial.into_snapshot();
+        assert_eq!(initial.max_committed_timestamp_ms(), Some(10_000));
+        let horizon = initial.lease_grant_horizon().unwrap();
+        assert_eq!(horizon.authority(), initial_authority);
+        assert_eq!(horizon.grant_not_after_ms(), 40_000);
+
+        let replay = initial
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: initial_authority,
+                authority_now_ms: 10_000,
+                horizon_duration_ms: 30_000,
+            })
+            .unwrap();
+        assert!(!replay.changed());
+        assert_eq!(replay.snapshot(), &initial);
+
+        let error = initial
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: replacement_authority,
+                authority_now_ms: 40_999,
+                horizon_duration_ms: 30_000,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::PreviousLeaseGrantHorizonStillActive {
+                authority_now_ms: 40_999,
+                fenced_until_ms: 41_000,
+            }
+        ));
+
+        let replacement = initial
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: replacement_authority,
+                authority_now_ms: 41_000,
+                horizon_duration_ms: 30_000,
+            })
+            .unwrap()
+            .into_snapshot();
+        let horizon = replacement.lease_grant_horizon().unwrap();
+        assert_eq!(horizon.authority(), replacement_authority);
+        assert_eq!(horizon.grant_not_after_ms(), 71_000);
+        assert_eq!(replacement.max_committed_timestamp_ms(), Some(41_000));
+    }
+
+    #[test]
+    fn lease_grant_horizon_command_rejects_invalid_duration_and_timestamp() {
+        let authority = LeaseHorizonAuthorityBinding::new(1, None);
+        let baseline = ClusterControlSnapshot::empty();
+        for duration_ms in [0, MAX_LEASE_GRANT_HORIZON_MS + 1] {
+            assert!(matches!(
+                baseline.apply_control_plane_command(
+                    ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                        authority,
+                        authority_now_ms: 1_000,
+                        horizon_duration_ms: duration_ms,
+                    }
+                ),
+                Err(ControlPlaneError::InvalidLeaseGrantHorizonDuration { .. })
+            ));
+        }
+        assert!(matches!(
+            baseline.apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority,
+                authority_now_ms: u64::MAX,
+                horizon_duration_ms: 1,
+            }),
+            Err(ControlPlaneError::LeaseGrantHorizonTimestampOverflow { .. })
+        ));
+
+        let established = baseline
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority,
+                authority_now_ms: 1_000,
+                horizon_duration_ms: 10_000,
+            })
+            .unwrap()
+            .into_snapshot();
+        assert!(matches!(
+            established.apply_control_plane_command(
+                ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                    authority,
+                    authority_now_ms: 999,
+                    horizon_duration_ms: 10_000,
+                }
+            ),
+            Err(ControlPlaneError::CommittedTimestampRegression { .. })
+        ));
+    }
+
+    #[test]
+    fn lease_grant_horizon_round_trips_canonical_snapshot_state() {
+        let snapshot = ClusterControlSnapshot::empty()
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: LeaseHorizonAuthorityBinding::new(9, Some(13)),
+                authority_now_ms: 5_000,
+                horizon_duration_ms: 30_000,
+            })
+            .unwrap()
+            .into_snapshot();
+        let encoded = format_snapshot(&snapshot);
+        assert!(encoded.contains("lease_grant_horizon=9,13,35000\n"));
+        assert_eq!(parse_snapshot(&encoded).unwrap(), snapshot);
+
+        for invalid in [
+            encoded.replace("9,13,35000", "0,13,35000"),
+            encoded.replace("9,13,35000", "9,0,35000"),
+            encoded.replace("9,13,35000", "9,13,0"),
+            encoded.replace(
+                "max_committed_timestamp_ms=5000",
+                "max_committed_timestamp_ms=-",
+            ),
+            encoded.replace("9,13,35000", "9,13,65001"),
+        ] {
+            assert!(parse_snapshot(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn replicated_snapshot_install_rejects_impossible_lease_grant_horizon() {
+        for invalid_snapshot in [
+            ClusterControlSnapshot::test_invalid_lease_grant_horizon(None, 30_000),
+            ClusterControlSnapshot::test_invalid_lease_grant_horizon(
+                Some(5_000),
+                5_000 + MAX_LEASE_GRANT_HORIZON_MS + 1,
+            ),
+        ] {
+            let payload =
+                crate::control_plane_command::encode_control_plane_snapshot(&invalid_snapshot)
+                    .unwrap();
+            let mut state_machine =
+                crate::control_plane_command::ReplicatedControlPlaneStateMachine::empty();
+            let before = state_machine.clone();
+
+            assert!(state_machine
+                .install_snapshot_artifact(
+                    crate::control_plane_command::ControlPlaneSnapshotArtifact::new(None, payload)
+                )
+                .is_err());
+            assert_eq!(state_machine, before);
+        }
     }
 
     #[test]

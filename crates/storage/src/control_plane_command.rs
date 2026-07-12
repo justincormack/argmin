@@ -4,6 +4,7 @@ use crate::control_plane::{
     NodeMembershipState, NodePgHeartbeatObservation, PendingMetadataCommandObservation,
     PgMetadataProof, PgMetadataTransferProof, RuntimeMapFreshnessProof,
 };
+pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::types::{PgId, PgState};
 use crate::{
     ClusterEpoch, PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
@@ -13,7 +14,7 @@ use placement::NodeId;
 use std::num::NonZeroU64;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 5;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 6;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -46,6 +47,11 @@ pub enum ControlPlaneCommand {
     },
     ExpireHeartbeatLeases {
         expire_at_ms: u64,
+    },
+    EstablishLeaseGrantHorizon {
+        authority: LeaseHorizonAuthorityBinding,
+        authority_now_ms: u64,
+        horizon_duration_ms: u64,
     },
     SetPgActingSet {
         pg_id: PgId,
@@ -116,6 +122,18 @@ impl std::fmt::Display for ControlPlaneCommand {
             ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms } => {
                 write!(f, "expire-heartbeat-leases(expire_at_ms={expire_at_ms})")
             }
+            ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority,
+                authority_now_ms,
+                horizon_duration_ms,
+            } => write!(
+                f,
+                "establish-lease-grant-horizon(clock_generation={},raft_term={:?},authority_now_ms={},duration_ms={})",
+                authority.clock_generation(),
+                authority.raft_term(),
+                authority_now_ms,
+                horizon_duration_ms
+            ),
             ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => write!(
                 f,
                 "set-pg-acting-set(pg={},nodes={})",
@@ -269,6 +287,23 @@ pub fn encode_control_plane_command(
                 write_u64(&mut out, completion.active_metadata_proof_epoch.get());
             }
         }
+        ControlPlaneCommand::EstablishLeaseGrantHorizon {
+            authority,
+            authority_now_ms,
+            horizon_duration_ms,
+        } => {
+            write_u16(&mut out, 12);
+            write_u64(&mut out, authority.clock_generation());
+            match authority.raft_term() {
+                Some(term) => {
+                    write_u8(&mut out, 1);
+                    write_u64(&mut out, term);
+                }
+                None => write_u8(&mut out, 0),
+            }
+            write_u64(&mut out, *authority_now_ms);
+            write_u64(&mut out, *horizon_duration_ms);
+        }
     }
     append_control_plane_command_checksum(&mut out);
     Ok(out)
@@ -395,6 +430,29 @@ pub fn decode_control_plane_command(
             }
             ControlPlaneCommand::CompleteReadyPgPeerings { ready_at_ms, ready }
         }
+        12 => {
+            let clock_generation = reader.read_u64()?;
+            let raft_term = match reader.read_u8()? {
+                0 => None,
+                1 => Some(reader.read_u64()?),
+                tag => {
+                    return Err(command_protocol_error(format!(
+                        "invalid lease horizon Raft term option tag {tag}"
+                    )));
+                }
+            };
+            let authority = LeaseHorizonAuthorityBinding::checked_new(clock_generation, raft_term)
+                .ok_or_else(|| {
+                    command_protocol_error(
+                        "lease horizon clock generation and present Raft term must be nonzero",
+                    )
+                })?;
+            ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority,
+                authority_now_ms: reader.read_u64()?,
+                horizon_duration_ms: reader.read_u64()?,
+            }
+        }
         tag => {
             return Err(command_protocol_error(format!(
                 "unknown control-plane command tag {tag}"
@@ -494,6 +552,7 @@ pub enum ControlPlaneCommandResponse {
     SetNodeMembership,
     MarkNodeAvailability,
     RecordNodeHeartbeat,
+    EstablishLeaseGrantHorizon,
     ExpireHeartbeatLeases {
         expired_nodes: Vec<NodeId>,
         peering_pgs: Vec<PgId>,
@@ -1451,6 +1510,11 @@ mod tests {
             ControlPlaneCommand::ExpireHeartbeatLeases {
                 expire_at_ms: 2_000,
             },
+            ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: LeaseHorizonAuthorityBinding::new(7, Some(11)),
+                authority_now_ms: 2_100,
+                horizon_duration_ms: 30_000,
+            },
             ControlPlaneCommand::SetPgActingSet {
                 pg_id: PgId::new(3),
                 acting_set: vec![NodeId::new(1), NodeId::new(2)],
@@ -1509,6 +1573,11 @@ mod tests {
                 },
                 heartbeat_at_ms: u64::MAX,
                 lease_deadline_ms: u64::MAX,
+            },
+            ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: LeaseHorizonAuthorityBinding::new(u64::MAX, Some(u64::MAX)),
+                authority_now_ms: u64::MAX,
+                horizon_duration_ms: u64::MAX,
             },
             ControlPlaneCommand::SetPgActingSet {
                 pg_id: PgId::new(u32::MAX),
@@ -1692,8 +1761,31 @@ mod tests {
 
     #[test]
     fn control_plane_command_codec_rejects_semantic_decode_errors() {
-        let unknown_tag = command_frame(12, |_| {});
-        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 12");
+        let unknown_tag = command_frame(13, |_| {});
+        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 13");
+
+        let zero_horizon_generation = command_frame(12, |body| {
+            write_u64(body, 0);
+            write_u8(body, 0);
+            write_u64(body, 1_000);
+            write_u64(body, 10_000);
+        });
+        assert_decode_error_contains(
+            &zero_horizon_generation,
+            "lease horizon clock generation and present Raft term must be nonzero",
+        );
+
+        let zero_horizon_raft_term = command_frame(12, |body| {
+            write_u64(body, 1);
+            write_u8(body, 1);
+            write_u64(body, 0);
+            write_u64(body, 1_000);
+            write_u64(body, 10_000);
+        });
+        assert_decode_error_contains(
+            &zero_horizon_raft_term,
+            "lease horizon clock generation and present Raft term must be nonzero",
+        );
 
         let invalid_membership = command_frame(2, |body| {
             write_u32(body, 7);
@@ -1808,7 +1900,14 @@ mod tests {
 
     #[test]
     fn control_plane_snapshot_codec_round_trips_and_continues_replay() {
-        let snapshot = sample_snapshot();
+        let snapshot = sample_snapshot()
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: LeaseHorizonAuthorityBinding::new(4, Some(6)),
+                authority_now_ms: 2_000,
+                horizon_duration_ms: 30_000,
+            })
+            .unwrap()
+            .into_snapshot();
         let encoded = encode_control_plane_snapshot(&snapshot).unwrap();
         let decoded = decode_control_plane_snapshot(&encoded).unwrap();
         assert_eq!(decoded, snapshot);

@@ -39,7 +39,6 @@ pub(crate) enum LeaseClockError {
     },
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub(crate) enum LeaseHorizonError {
     #[error("{field} timestamp arithmetic overflowed")]
@@ -47,6 +46,7 @@ pub(crate) enum LeaseHorizonError {
     #[error(
         "lease horizon belongs to clock generation {horizon_clock_generation} and Raft term {horizon_raft_term:?}, not generation {requested_clock_generation} and term {requested_raft_term:?}"
     )]
+    #[cfg(test)]
     AuthorityMismatch {
         horizon_clock_generation: u64,
         horizon_raft_term: Option<u64>,
@@ -56,6 +56,7 @@ pub(crate) enum LeaseHorizonError {
     #[error(
         "lease deadline {lease_deadline_ms}ms exceeds committed grant horizon {grant_not_after_ms}ms"
     )]
+    #[cfg(test)]
     DeadlineBeyondHorizon {
         lease_deadline_ms: u64,
         grant_not_after_ms: u64,
@@ -281,41 +282,56 @@ pub(crate) fn successor_activation_fence_satisfied(
 }
 
 /// Authority identity under which a durable lease-grant horizon was established.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LeaseHorizonAuthorityBinding {
+pub struct LeaseHorizonAuthorityBinding {
     clock_generation: u64,
     raft_term: Option<u64>,
 }
 
-#[cfg(test)]
 impl LeaseHorizonAuthorityBinding {
+    #[cfg(test)]
     pub(crate) fn new(clock_generation: u64, raft_term: Option<u64>) -> Self {
-        Self {
-            clock_generation,
-            raft_term,
-        }
+        Self::checked_new(clock_generation, raft_term)
+            .expect("test lease horizon authority binding must be valid")
     }
 
-    fn clock_generation(self) -> u64 {
+    pub fn checked_new(clock_generation: u64, raft_term: Option<u64>) -> Option<Self> {
+        if clock_generation == 0 || raft_term == Some(0) {
+            return None;
+        }
+        Some(Self {
+            clock_generation,
+            raft_term,
+        })
+    }
+
+    pub fn clock_generation(self) -> u64 {
         self.clock_generation
     }
 
-    fn raft_term(self) -> Option<u64> {
+    pub fn raft_term(self) -> Option<u64> {
         self.raft_term
     }
 }
 
 /// Durable upper bound for leases acknowledged without another durable command.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CommittedLeaseGrantHorizon {
     authority: LeaseHorizonAuthorityBinding,
     grant_not_after_ms: u64,
 }
 
-#[cfg(test)]
 impl CommittedLeaseGrantHorizon {
+    pub(crate) fn from_parts(
+        authority: LeaseHorizonAuthorityBinding,
+        grant_not_after_ms: u64,
+    ) -> Self {
+        Self {
+            authority,
+            grant_not_after_ms,
+        }
+    }
+
     /// Establish or extend a horizon for one authority generation/term.
     ///
     /// Rebinding to a new authority is deliberately conservative: the previous
@@ -364,6 +380,7 @@ impl CommittedLeaseGrantHorizon {
     }
 
     /// Validate a volatile heartbeat lease against the durable horizon.
+    #[cfg(test)]
     pub(crate) fn validate_grant(
         self,
         authority: LeaseHorizonAuthorityBinding,
@@ -386,6 +403,7 @@ impl CommittedLeaseGrantHorizon {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn successor_fence_satisfied(
         self,
         successor_authority_now_ms: u64,

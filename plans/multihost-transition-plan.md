@@ -10983,12 +10983,27 @@ Required production shape and implementation order:
    extension loss before durability, durable extension with response loss,
    process/leader changes, consumer refresh, and successor activation; an
    activated successor never overlaps a still-valid acknowledged consumer
-   lease. These types remain test-scoped in this slice so production RPC/error
-   semantics are not implied prematurely. The next slice must promote the
-   capability into the replicated snapshot and command codec, bind proposals
-   to the accepted authority-clock generation/current serving Raft term, and
-   retain per-heartbeat persistence until snapshot/restart and apply parity
-   are proved.
+   lease. State format version 22 and durable command codec version 6 now
+   promote the capability into replicated state.
+   `EstablishLeaseGrantHorizon` commits the accepted authority timestamp, a
+   positive duration bounded to 60 seconds, the nonzero authority-clock
+   generation, and an optional nonzero serving Raft term. Deterministic apply
+   derives the deadline without consulting a replay-time clock, advances the
+   committed timestamp high-water, extends a same-authority horizon
+   monotonically, and rejects authority rebinding until the previous horizon
+   plus symmetric skew has elapsed. The canonical state parser and command
+   decoder fail closed on zero identities, malformed option tags, zero
+   deadlines, a horizon without a committed timestamp high-water, capacity
+   more than 60 seconds beyond that high-water, incompatible versions,
+   overflow, timestamp regression, and premature rebinding. The same horizon
+   checks are always-on publication/install invariants. Command,
+   snapshot-codec, canonical-state, install, and no-op replay tests pin those
+   rules. This is durable schema/apply groundwork only:
+   production proposal paths do not yet establish or grant from the horizon,
+   and every accepted heartbeat remains durable. The next slice must validate
+   proposals against the currently accepted authority-clock generation and
+   current serving Raft term, prove restart/install parity, and only then
+   introduce volatile heartbeat renewal beneath the committed bound.
 4. Persist logical durable commands incrementally. The single-authority
    compatibility path must either append versioned/checksummed durable deltas
    to an fsync'd, identity-bound journal and replay them over the latest
