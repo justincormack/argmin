@@ -10671,6 +10671,241 @@ Phase 12.3 closeout:
   evolution, cut production traffic over from the single-authority path, and
   remove or replace `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
+Critical production blocker: control-plane write amplification and history size
+
+- The current durability and refresh shape is not usable in production, even
+  on fast local SSDs. Retained route-change soak artifacts with 116 PGs and the
+  nominal 256-epoch history limit produced 6.17 MB and 7.96 MB canonical
+  control-plane snapshots. More than 99.5% of those bytes were retained
+  history: every historical epoch copied every PG record, every node record,
+  and the nodes' per-PG observations. The two artifacts contained 29,696
+  `history_pg` rows (`256 * 116`) plus 31,385 and 46,721 duplicated
+  `history_node_pg` rows. This is the unresolved durable-history half of CP5 in
+  [distributed-correctness-review-2026-07.md](distributed-correctness-review-2026-07.md).
+- Every accepted single-authority `RecordNodeHeartbeat` currently changes the
+  committed timestamp, heartbeat time, lease deadline, history floor, and PG
+  observations, then formats, atomically rewrites, and syncs the entire state
+  file while holding the authority mutex. The soak uses a 100 ms refresh
+  interval for three nodes, so the retained artifacts imply approximately
+  185-239 MB/s of attempted logical state rewriting before filesystem or SSD
+  write amplification. The production defaults of a 250 ms refresh and 1,000
+  ms lease still imply approximately 74-96 MB/s for three nodes at those state
+  sizes. Node count and control-plane state size multiply this cost.
+- The retained soak directories are on tmpfs, so those failures do not include
+  physical `fsync` latency. They still expose snapshot cloning/formatting,
+  memory bandwidth, authority-lock hold time, RPC worker contention, and
+  timeout pressure. A real SSD would add durable-write and directory-sync cost;
+  benchmarking all local test nodes on one shared disk would overstate
+  cross-node contention and must not substitute for a per-control-plane-node
+  durability benchmark.
+- Frontend refresh has a second amplification path. In the retained runs, the
+  full frontend runtime map encoded to approximately 0.96-0.98 MB and was
+  requested every 100 ms even when the cluster epoch was unchanged. The same
+  configuration value currently drives storage-node heartbeat renewal and
+  frontend map polling, despite their different correctness and convergence
+  requirements.
+- Treat this as a release blocker, not a later performance optimization. No
+  control-plane mode may be described as production-ready while an unchanged-
+  topology heartbeat rewrites/fsyncs a full snapshot, while ordinary Raft peer
+  responses require a full restart-artifact checkpoint, or while a frontend
+  repeatedly downloads and rebuilds an unchanged full history map at the
+  heartbeat cadence. Increasing RPC timeouts, raising the 8 MB frame limit, or
+  merely slowing the soak does not resolve the blocker.
+
+Required production shape and implementation order:
+
+1. Instrument the current amplification before changing it. Expose bounded
+   counters/histograms for command bytes appended, checkpoint bytes written,
+   checkpoint count, file and directory sync count/duration, authority commit
+   queue/lock wait, runtime-map encoded bytes, runtime-map build duration, and
+   frontend refresh outcome. Keep the new persistent/redacted frontend refresh
+   failure classification so soak failures identify timeout, disconnect,
+   protocol, clock, or state rejection without exposing object identifiers.
+2. Classify heartbeat fields by recovery requirement before changing the write
+   path. Durable state includes membership, node/process identity changes,
+   endpoints used as authority, PG topology/state, committed peering or
+   metadata-transfer proofs/fences, history-pruning barriers, and any lease or
+   timestamp horizon needed to fence pre-crash authority. Reconstructible state
+   should normally include last-heartbeat time, lease-observed health, observed
+   epoch, and raw per-PG heartbeat observations: after restart/failover these
+   can be cleared and rebuilt from authenticated node reports. Before making
+   that split, replace the current overloaded `NodeAvailabilityState` with two
+   explicit concepts: durable desired/admin availability, including an
+   operator `Unavailable` fence that survives restart/failover, and volatile
+   observed lease health derived from current-term heartbeats. Serving requires
+   both durable administrative permission and healthy observed liveness.
+   Heartbeats may update only the volatile half unless they carry a separate
+   committed identity/topology transition; they must never erase or implicitly
+   persist an administrative fence. A derived observation becomes durable only
+   when a committed transition consumes it; the committed
+   transition/certificate must then carry the safety-relevant result. History
+   floors and active-proof progress need an explicit analysis: either persist a
+   compact barrier/floor when it changes, or suspend pruning/activation until
+   all required reporters have re-established them. Do not preserve fields
+   merely because the current snapshot happens to contain them.
+3. Define the crash/failover fence that permits ordinary heartbeat renewal to
+   remain volatile. A preferred first design is a committed global or coarse
+   per-node `lease_grant_not_after` horizon. The leader may acknowledge
+   high-frequency heartbeats without a new durable write only when the granted
+   deadline is no later than that already committed horizon. Extending the
+   horizon is a bounded, infrequent durable/Raft command independent of
+   heartbeat frequency and ideally independent of storage-node count. The
+   horizon is normatively a nondecreasing authority wall-clock deadline derived
+   from an accepted authority-clock sample. Extension must be checked for
+   arithmetic overflow, remain within the existing committed-timestamp
+   forward bound, advance the committed timestamp high-water consistently, and
+   bind the horizon to the authority clock generation and, for Raft, the local
+   serving leadership term under which it was established. A leader may extend
+   or grant from the horizon only while that exact clock generation/term is
+   healthy and established. The ordinary forward bound must not deadlock a
+   healthy authority after idle time or downtime longer than that bound. Define
+   a distinct, one-shot `ReestablishLeaseHorizon` transition for a proven
+   recovery episode. An episode may begin after a new authority clock
+   generation/serving Raft term, or in the same healthy generation/term after
+   the previous committed horizon has expired and no lease can remain valid.
+   The transition may atomically rebase the committed timestamp high-water to
+   one accepted current wall sample and establish a new horizon only when
+   either (a) the identity-bound durable restart-clock checkpoint or the
+   continuously observed in-process health clock proves elapsed wall/health
+   progress since the previous horizon, or (b) a full
+   `MAX_HEARTBEAT_LEASE_MS + symmetric skew` grace has elapsed since a new
+   recovery fence was established, measured by the healthy suspend-inclusive
+   lease/health clocks. If checkpoint/continuous evidence is missing or
+   invalid, only the full-grace path is automatic; it must not infer elapsed
+   time from the stale committed high-water. The replicated command carries the
+   accepted timestamp, generation/term, previous horizon/high-water identity,
+   monotonic recovery sequence, evidence mode, and grace start/end samples
+   needed for deterministic shape/replay checks, while clock/checkpoint
+   validation remains outside apply. State records that this recovery episode
+   has been consumed. The same expired horizon, recovery fence, or evidence
+   token cannot be reused to advance the high-water repeatedly; after recovery,
+   all extensions again use the ordinary forward bound until a later genuine
+   expiry/idle or authority-change episode is established. After restart or
+   leadership change, successor evaluation requires healthy, explicitly
+   re-established clock authority and
+   applies the existing symmetric skew fence to the committed horizon; a stale
+   generation/term or unavailable clock fails closed. Conflicting successor
+   activation and other operations that rely on old-lease expiry remain blocked
+   until that evaluation succeeds. A simpler initial authority mode may always
+   use the full
+   `MAX_HEARTBEAT_LEASE_MS + skew` quiescence window; this costs failover
+   availability but is safe and removes per-heartbeat durability while the
+   horizon optimization is proved. Old frontend/storage runtime maps and old
+   primary processes are external authority tokens that survive the crash, so
+   one of these fences is mandatory even though exact heartbeat recovery is
+   not.
+4. Persist logical durable commands incrementally. The single-authority
+   compatibility path must either append versioned/checksummed durable deltas
+   to an fsync'd, identity-bound journal and replay them over the latest
+   checkpoint, or be explicitly reduced to a test-only mode before production
+   cutover. Ordinary unchanged heartbeats inside an existing committed lease
+   horizon must not append journal records. Commands that change durable
+   topology, identity, proof/fence, pruning, or horizon state are acknowledged
+   only after their journal record is durable. Partial/ambiguous journal writes
+   poison the authority or fail-stop; they must not return an ordinary
+   retryable error while memory and restart state may diverge.
+5. Make full snapshots periodic compacted products, not the per-command write
+   path. Checkpoint after bounded journal bytes/commands/time, atomically rotate
+   the journal, and prove artifact-plus-journal replay reconstructs identical
+   state. Snapshot serialization and file/directory sync must not hold the
+   read-serving authority mutex for their full I/O duration. Checkpointing must
+   capture one consistent immutable committed view and its exact applied/journal
+   boundary. Reads continue from the latest immutable committed state,
+   including durable commands after the previous checkpoint, while that
+   captured view is serialized and synced. Recovery reconstructs the same
+   state from checkpoint plus its durable journal suffix; the checkpoint base
+   alone is never treated as the current read state.
+6. Apply the same rule to OpenRaft durability. The current
+   checkpoint-before-ordinary-peer-response path is a conservative Phase 12.4
+   correctness step, not the production endpoint. Before cutover, the
+   vote/log/commit WAL and retained log must be sufficient for acknowledged
+   Raft recovery, state-machine replay, and bounded suffix retention without a
+   full restart-artifact checkpoint for every peer RPC. Periodic snapshot and
+   WAL compaction remain required, with the existing poison/fault-injection
+   semantics preserved.
+7. Replace full-copy epoch history with a compact deterministic history model.
+   Store route/topology deltas or minimal reconstruction records, plus bounded
+   periodic bases where needed. Do not copy current heartbeat times, lease
+   deadlines, or all node PG observations into every historical epoch unless a
+   specific recovery invariant requires that field. Protected transfer,
+   pending-command, backfill, and storage-floor epochs must remain
+   reconstructible, but protection needs explicit count and byte bounds and a
+   typed fail-closed response before an RPC frame cliff.
+8. Split refresh policy by role. Storage-node heartbeat cadence should be
+   derived from the granted lease (with safety margin and jitter), not share a
+   frontend polling knob. Frontends may poll a compact authenticated
+   epoch/authority/status response frequently, but fetch/rebuild a full map only
+   when the epoch or authority changes or when the installed map's bounded
+   lease needs renewal. A same-epoch lease extension should use a compact,
+   explicitly authenticated renewal contract if it can safely avoid resending
+   unchanged routes.
+9. Make the lease-horizon/restart-fence contract executable before removing
+   per-heartbeat persistence. Model and property-test leader changes, process
+   crashes, clock rollback/forward jump, delayed old maps, delayed old-primary
+   writes, horizon extension lost before acknowledgement, horizon extension
+   durable before response loss, restart while the horizon is active, and first
+   horizon establishment after downtime longer than the ordinary committed-
+   timestamp forward bound. Cover valid restart-checkpoint rebase, missing or
+   corrupt checkpoint followed by full grace, same-term recovery after a long
+   healthy idle, attempted rebase before grace, stale generation/term or
+   previous-horizon evidence, and immediate reuse of a consumed recovery
+   episode. The invariant is that no successor or conflicting topology can
+   serve while any acknowledged pre-crash lease may remain valid, while a
+   healthy authority can recover after arbitrarily long idle/downtime without
+   timestamp ratcheting. This proof, rather than exact recovery of every
+   liveness sample, is the durability requirement.
+10. Run separate load gates. Tmpfs soak covers CPU, allocation, locking, and RPC
+   convergence. Durable-write tests use one dedicated backing device per
+   control-plane process (or separately measured devices), include real
+   `fsync`, and report bytes/s, sync latency, command latency, and frontend read
+   latency. A shared-disk all-in-one test remains useful as an overload test but
+   is not the production capacity model.
+
+Production exit gates for this blocker:
+
+- At the 116-PG/256-retained-epoch reference workload with three storage
+  nodes, steady-state unchanged-topology heartbeats inside an already committed
+  lease horizon produce zero durable writes. Bounded horizon extension and
+  periodic checkpoint amortization together produce less than 1 MiB/s of
+  logical durable writes on each control-plane node and do not scale with raw
+  heartbeat frequency. Record the measured command and checkpoint byte rates
+  in the test output; do not infer them from source constants.
+- An unchanged-topology heartbeat never serializes or rewrites the full
+  retained-history snapshot and an ordinary Raft append/vote/commit response
+  never requires a full state-machine artifact rewrite.
+- Restart/failover tests prove that reconstructible liveness state may be lost
+  without losing topology or safety: nodes re-report health/observations, old
+  maps and old-primary authority remain fenced through the committed horizon or
+  full restart grace, pruning waits for required floors, and peering completion
+  cannot consume pre-crash observations that were never committed.
+- Administrative availability fences survive restart/failover independently
+  of volatile heartbeat health, and a healthy heartbeat cannot clear an
+  operator-disabled node without a distinct committed admin command.
+- Horizon extension, restart, leadership change, and successor tests cover
+  clock generation/term mismatch, unhealthy or unavailable clock sources,
+  wall-clock regression/forward jump, committed timestamp bounds, arithmetic
+  overflow, and the symmetric skew fence. A deterministic restart test leaves
+  the authority down for longer than the ordinary forward-jump bound, then
+  proves a new horizon can be established through valid restart evidence or
+  only after full grace when that evidence is unavailable. A separate
+  same-term test idles beyond the bound and recovers from the genuinely expired
+  previous horizon. Every invalid or immediately repeated rebase case fails
+  closed.
+- Full checkpoint frequency and maximum uncompacted journal/WAL bytes are
+  explicitly bounded and covered by crash-at-each-boundary replay tests.
+- Retained-history storage and runtime-map encoding scale with changed/protected
+  routes rather than `retained epochs * all PGs * all node observations`, and
+  supported maximum topology/history configuration remains comfortably below
+  RPC frame limits with a documented safety factor.
+- Under continuous heartbeat renewal and periodic checkpointing, compact
+  runtime-map status reads and required full-map reads complete within their
+  configured deadline without authority-lock starvation. The release test must
+  fail on any frontend refresh timeout or control-plane response-side broken
+  pipe.
+- A long-running route-change/control-plane-restart soak passes on tmpfs and on
+  the dedicated durable-write profile while exporting zero unclassified
+  refresh failures and bounded write/checkpoint metrics.
+
 Phase 12.4 proposed scope:
 
 - Move the experimental multi-process OpenRaft control-plane path from
@@ -10681,7 +10916,10 @@ Phase 12.4 proposed scope:
   as the compacted checkpoint/snapshot product. Recovery must reconstruct the
   same OpenRaft vote, retained log, committed/purged watermarks, membership,
   cached snapshot, and Argmin state-machine snapshot from WAL plus the latest
-  artifact.
+  artifact. This scope is incomplete for production until it also satisfies
+  the critical write-amplification blocker above: checkpoint-before-response is
+  retained only as an intermediate correctness boundary, not as the final
+  acknowledgement path.
 - Close the monotonic-clock and lease-read design for the replicated authority.
   Define the authority clock source, restart high-water behavior, skew budget,
   and relationship between committed command timestamps, heartbeat lease
@@ -10784,9 +11022,16 @@ Phase 12.4 exit criteria:
   vote, last durable committed and applied log ids, last durable authority
   timestamp high-water, peer-auth failures, retry-confirmation outcomes, and
   poison reasons.
+- Phase 12.4 may close as a correctness phase with checkpoint-before-response,
+  but production cutover remains blocked until the incremental acknowledgement,
+  compact-history, split-refresh, and quantitative write/load gates above pass.
 
 Post-12.4 sequencing for TCP transport and production-shaped config:
 
+- Resolve the critical control-plane write-amplification and history-size
+  blocker above before production cutover. TCP/auth/config work may proceed in
+  parallel, but it must not cause the expensive checkpoint/heartbeat shape to
+  become the production default by accident.
 - Add shared authenticated test helpers first, in
   [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
   so process and UAT tests can opt into authenticated Unix sockets without
