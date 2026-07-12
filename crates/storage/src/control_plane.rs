@@ -14933,7 +14933,7 @@ fn validate_pg_primary_active_observation(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClusterMapHistoryProtection {
-    exact_epochs: BTreeSet<ClusterEpoch>,
+    exact_routes: BTreeSet<(ClusterEpoch, PgId)>,
     retain_from_epoch: Option<ClusterEpoch>,
 }
 
@@ -14941,9 +14941,12 @@ fn required_cluster_map_history_protection<'a, 'b>(
     pgs: impl IntoIterator<Item = &'a PgControlRecord>,
     nodes: impl IntoIterator<Item = &'b NodeControlRecord>,
 ) -> ClusterMapHistoryProtection {
-    let mut exact_epochs: BTreeSet<_> = pgs
+    let exact_routes: BTreeSet<_> = pgs
         .into_iter()
-        .filter_map(PgControlRecord::peering_metadata_transfer_source_route_epoch)
+        .filter_map(|pg| {
+            pg.peering_metadata_transfer_source_route_epoch()
+                .map(|epoch| (epoch, pg.pg_id()))
+        })
         .collect();
     let mut retain_from_epoch: Option<ClusterEpoch> = None;
     for node in nodes {
@@ -14952,14 +14955,9 @@ fn required_cluster_map_history_protection<'a, 'b>(
             (None, Some(candidate)) => Some(candidate),
             (current, None) => current,
         };
-        exact_epochs.extend(node.pg_observations().filter_map(|observation| {
-            observation
-                .pending_metadata_command()
-                .map(PendingMetadataCommandObservation::cluster_epoch)
-        }));
     }
     ClusterMapHistoryProtection {
-        exact_epochs,
+        exact_routes,
         retain_from_epoch,
     }
 }
@@ -14970,29 +14968,44 @@ fn prune_cluster_map_history(
 ) {
     history.sort_by_key(ClusterMapHistoryRecord::cluster_epoch);
     while history.len() > CLUSTER_MAP_HISTORY_LIMIT {
-        let referenced_source_epochs: BTreeSet<_> = history
-            .iter()
-            .flat_map(ClusterMapHistoryRecord::pgs)
-            .filter_map(|pg| pg.peering_metadata_transfer_source_route_epoch)
-            .collect();
-        let Some(index) = history.iter().position(|record| {
-            !cluster_map_history_record_is_protected(record, protection)
-                && !referenced_source_epochs.contains(&record.cluster_epoch())
-        }) else {
+        let mut exact_routes = protection.exact_routes.clone();
+        exact_routes.extend(
+            history
+                .iter()
+                .flat_map(ClusterMapHistoryRecord::pgs)
+                .filter_map(|pg| {
+                    pg.peering_metadata_transfer_source_route_epoch
+                        .map(|epoch| (epoch, pg.pg_id))
+                }),
+        );
+        let mut remove_index = None;
+        for (index, record) in history.iter_mut().enumerate() {
+            if cluster_map_history_record_is_floor_protected(record, protection) {
+                continue;
+            }
+            let record_epoch = record.cluster_epoch();
+            record
+                .pgs
+                .retain(|pg| exact_routes.contains(&(record_epoch, pg.pg_id)));
+            if record.pgs.is_empty() {
+                remove_index = Some(index);
+                break;
+            }
+        }
+        let Some(index) = remove_index else {
             break;
         };
         history.remove(index);
     }
 }
 
-fn cluster_map_history_record_is_protected(
+fn cluster_map_history_record_is_floor_protected(
     record: &ClusterMapHistoryRecord,
     protection: &ClusterMapHistoryProtection,
 ) -> bool {
-    protection.exact_epochs.contains(&record.cluster_epoch())
-        || protection
-            .retain_from_epoch
-            .is_some_and(|floor| record.cluster_epoch() >= floor)
+    protection
+        .retain_from_epoch
+        .is_some_and(|floor| record.cluster_epoch() >= floor)
 }
 
 fn active_primary_lease(
@@ -23148,6 +23161,9 @@ mod tests {
         authority
             .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
             .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
+            .unwrap();
         heartbeat_with_pg_proof(
             &mut authority,
             1,
@@ -23201,6 +23217,13 @@ mod tests {
             .snapshot()
             .cluster_map_at_epoch(source_epoch)
             .is_some());
+        let protected_source = authority
+            .snapshot()
+            .cluster_map_at_epoch(source_epoch)
+            .unwrap();
+        assert!(protected_source.pg(PgId::new(42)).is_some());
+        assert!(protected_source.pg(PgId::new(43)).is_none());
+        assert_eq!(protected_source.pgs().len(), 1);
         assert!(authority
             .snapshot()
             .cluster_map_at_epoch(initial_epoch)

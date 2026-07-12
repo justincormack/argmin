@@ -10830,6 +10830,17 @@ Required production shape and implementation order:
    in-memory historical PG routes after its reporters had advanced to epochs
    579/584, while restart pruned the persisted state to the normal 29,696-route
    limit. This fixes that delayed release but does not replace scalar retention.
+   Metadata-transfer source routes now protect exact `(epoch, PG)` keys inside
+   the history pruner. If an old protected record would otherwise block bounded
+   eviction, unrelated PG routes in that record are removed and only the
+   required route is retained; transfer-source dependencies are tracked with
+   the same key shape. Scalar live-payload, backfill, and pending-command
+   minima still protect complete epoch ranges until the exact heartbeat report
+   replaces the committed aggregate floor. In particular, current node PG
+   observations identify pending commands exactly but cannot narrow retention
+   while their minimum is also folded into that aggregate floor. Transfer
+   evidence no longer forces a full 116-PG historical record to survive beyond
+   the normal history window.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge
