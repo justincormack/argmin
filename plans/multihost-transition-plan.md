@@ -10874,6 +10874,28 @@ Required production shape and implementation order:
    PG in the same old epoch, an exact old route remains available across state
    restart and storage refresh, missing/future exact routes fail before
    mutation, and unretained intermediate epochs are not required.
+   State format version 21 now replaces full PG-map copies at every epoch with
+   sparse reverse deltas. An epoch stores only PG routes that differ from the
+   next state, plus explicit PG-absence markers for introductions. Historical
+   routes are reconstructed by scanning forward to the first route delta or
+   absence marker and otherwise using current state. Runtime maps preserve the
+   same semantics without restoring epoch-by-PG expansion: they carry sparse
+   deltas, one baseline per PG at its earliest retained epoch, and a separate
+   canonical retained-epoch list in RPC version 6. The explicit epoch list
+   preserves epochs from before the first PG existed without inventing a route;
+   filtered storage refreshes advertise only epochs represented in that
+   response. Pruning
+   retains absence boundaries needed by older exact references and follows
+   metadata-transfer dependencies from the unmodified delta graph before
+   deletion. Parsing and snapshot audit reject non-canonically ordered or
+   conflicting presence/absence markers and broken transfer chains. A
+   regression matching the soak startup
+   sequence configures 216 PGs one command at a time and proves this creates no
+   copied historical PG routes, exactly 216 introduction markers, a bounded
+   runtime-map history, and a canonical state file below 128 KiB. This closes
+   the dense-history cause of the retained 2.50 MB startup artifact with 48,384
+   `history_pg` rows; heartbeat durability and unchanged-map polling remain
+   separate blocker slices below.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge
