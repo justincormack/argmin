@@ -90,6 +90,27 @@ impl BucketPolicy {
         self.requires_condition_input_for_action(action, condition_key::ConditionInput::CurrentTime)
     }
 
+    #[must_use]
+    pub fn requires_secure_transport_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(
+            action,
+            condition_key::ConditionInput::SecureTransport,
+        )
+    }
+
+    #[must_use]
+    pub fn requires_requested_region_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(
+            action,
+            condition_key::ConditionInput::RequestedRegion,
+        )
+    }
+
+    #[must_use]
+    pub fn requires_referer_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(action, condition_key::ConditionInput::Referer)
+    }
+
     fn requires_condition_input_for_action(
         &self,
         action: PolicyAction,
@@ -367,6 +388,9 @@ pub struct PolicyRequest<'a> {
     version_id: RequestField<'a>,
     source_ip: Option<IpAddr>,
     current_time_epoch_seconds: Option<u64>,
+    secure_transport: RequestBool,
+    requested_region: RequestField<'a>,
+    referer: RequestField<'a>,
 }
 
 impl<'a> PolicyRequest<'a> {
@@ -409,6 +433,9 @@ impl<'a> PolicyRequest<'a> {
             version_id: RequestField::Unavailable,
             source_ip: None,
             current_time_epoch_seconds: None,
+            secure_transport: RequestBool::Unavailable,
+            requested_region: RequestField::Unavailable,
+            referer: RequestField::Unavailable,
         }
     }
 
@@ -450,6 +477,9 @@ impl<'a> PolicyRequest<'a> {
             version_id: RequestField::Unavailable,
             source_ip: None,
             current_time_epoch_seconds: None,
+            secure_transport: RequestBool::Unavailable,
+            requested_region: RequestField::Unavailable,
+            referer: RequestField::Unavailable,
         }
     }
 
@@ -486,9 +516,14 @@ impl<'a> PolicyRequest<'a> {
     fn existing_object_tag_value(&self, key: &str) -> ExistingObjectTagValue<'a> {
         match self.existing_object_tags {
             ExistingObjectTags::Unavailable => ExistingObjectTagValue::Unavailable,
-            ExistingObjectTags::Available(tags) => ExistingObjectTagValue::Available(
-                tags.iter().find(|tag| tag.key == key).map(|tag| tag.value),
-            ),
+            ExistingObjectTags::Available(tags) => {
+                let value = tags
+                    .iter()
+                    .find(|tag| tag.key == key)
+                    .or_else(|| tags.iter().find(|tag| tag.key.eq_ignore_ascii_case(key)))
+                    .map(|tag| tag.value);
+                ExistingObjectTagValue::Available(value)
+            }
         }
     }
 
@@ -496,9 +531,30 @@ impl<'a> PolicyRequest<'a> {
     fn bucket_tag_value(&self, key: &str) -> BucketTagValue<'a> {
         match self.bucket_tags {
             BucketTags::Unavailable => BucketTagValue::Unavailable,
-            BucketTags::Available(tags) => BucketTagValue::Available(
-                tags.iter().find(|tag| tag.key == key).map(|tag| tag.value),
-            ),
+            BucketTags::Available(tags) => {
+                let value = tags
+                    .iter()
+                    .find(|tag| tag.key == key)
+                    .or_else(|| tags.iter().find(|tag| tag.key.eq_ignore_ascii_case(key)))
+                    .map(|tag| tag.value);
+                BucketTagValue::Available(value)
+            }
+        }
+    }
+
+    #[must_use]
+    fn resource_tag_value(&self, key: &str) -> BucketTagValue<'a> {
+        match self.bucket_tags {
+            BucketTags::Unavailable => BucketTagValue::Unavailable,
+            BucketTags::Available(tags) => {
+                let lowercase_key = key.to_ascii_lowercase();
+                let value = tags
+                    .iter()
+                    .find(|tag| tag.key == lowercase_key)
+                    .or_else(|| tags.iter().find(|tag| tag.key.eq_ignore_ascii_case(key)))
+                    .map(|tag| tag.value);
+                BucketTagValue::Available(value)
+            }
         }
     }
 
@@ -676,6 +732,24 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub const fn with_secure_transport(mut self, secure_transport: Option<bool>) -> Self {
+        self.secure_transport = RequestBool::Available(secure_transport);
+        self
+    }
+
+    #[must_use]
+    pub fn with_requested_region(mut self, requested_region: Option<&'a str>) -> Self {
+        self.requested_region = RequestField::Available(requested_region);
+        self
+    }
+
+    #[must_use]
+    pub fn with_referer(mut self, referer: Option<&'a str>) -> Self {
+        self.referer = RequestField::Available(referer);
+        self
+    }
+
+    #[must_use]
     fn copy_source(&self) -> RequestField<'a> {
         self.copy_source
     }
@@ -705,7 +779,10 @@ impl<'a> PolicyRequest<'a> {
         match self.request_object_tags {
             RequestObjectTags::Unavailable => RequestObjectTagValue::Unavailable,
             RequestObjectTags::Available(tags) => RequestObjectTagValue::Available(
-                tags.iter().find(|tag| tag.key == key).map(|tag| tag.value),
+                tags.iter()
+                    .filter(|tag| tag.key.eq_ignore_ascii_case(key))
+                    .map(|tag| tag.value)
+                    .collect(),
             ),
         }
     }
@@ -783,6 +860,21 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn current_time_epoch_seconds(&self) -> Option<u64> {
         self.current_time_epoch_seconds
+    }
+
+    #[must_use]
+    fn secure_transport(&self) -> RequestBool {
+        self.secure_transport
+    }
+
+    #[must_use]
+    fn requested_region(&self) -> RequestField<'a> {
+        self.requested_region
+    }
+
+    #[must_use]
+    fn referer(&self) -> RequestField<'a> {
+        self.referer
     }
 }
 
@@ -1035,10 +1127,10 @@ enum RequestObjectTagKeysValue<'a> {
     Available(Vec<&'a str>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RequestObjectTagValue<'a> {
     Unavailable,
-    Available(Option<&'a str>),
+    Available(Vec<&'a str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1905,32 +1997,40 @@ fn root_account_principal_account_id(value: &str) -> Option<&str> {
 }
 
 fn is_non_public_condition_clause(clause: &PolicyConditionClause) -> bool {
-    match clause.key.as_str() {
-        "aws:PrincipalOrgID"
-        | "aws:SourceVpce"
-        | "aws:SourceOwner"
-        | "aws:SourceAccount"
-        | "aws:userid"
-        | "s3:DataAccessPointAccount" => {
-            matches!(
-                clause.operator.as_str(),
-                "StringEquals" | "StringEqualsIgnoreCase" | "StringLike"
-            ) && clause.values.iter().all(|value| is_fixed_value(value))
-        }
-        "aws:SourceArn" | "s3:DataAccessPointArn" => {
-            matches!(
-                clause.operator.as_str(),
-                "ArnEquals" | "ArnLike" | "StringEquals" | "StringEqualsIgnoreCase" | "StringLike"
-            ) && clause.values.iter().all(|value| is_fixed_value(value))
-        }
-        "aws:SourceIp" => {
-            matches!(
-                clause.operator.as_str(),
-                "IpAddress" | "ForAnyValue:IpAddress"
-            ) && clause.values.iter().all(|value| is_fixed_source_ip(value))
-        }
-        _ => false,
+    if condition_key_matches_any(
+        &clause.key,
+        &[
+            "aws:PrincipalOrgID",
+            "aws:SourceVpce",
+            "aws:SourceOwner",
+            "aws:SourceAccount",
+            "aws:userid",
+            "s3:DataAccessPointAccount",
+        ],
+    ) {
+        matches!(
+            clause.operator.as_str(),
+            "StringEquals" | "StringEqualsIgnoreCase" | "StringLike"
+        ) && clause.values.iter().all(|value| is_fixed_value(value))
+    } else if condition_key_matches_any(&clause.key, &["aws:SourceArn", "s3:DataAccessPointArn"]) {
+        matches!(
+            clause.operator.as_str(),
+            "ArnEquals" | "ArnLike" | "StringEquals" | "StringEqualsIgnoreCase" | "StringLike"
+        ) && clause.values.iter().all(|value| is_fixed_value(value))
+    } else if clause.key.eq_ignore_ascii_case("aws:SourceIp") {
+        matches!(
+            clause.operator.as_str(),
+            "IpAddress" | "ForAnyValue:IpAddress"
+        ) && clause.values.iter().all(|value| is_fixed_source_ip(value))
+    } else {
+        false
     }
+}
+
+fn condition_key_matches_any(key: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| key.eq_ignore_ascii_case(candidate))
 }
 
 fn is_fixed_value(value: &str) -> bool {
@@ -2445,6 +2545,15 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_source_ip_cidr_constrains_wildcard_principal() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"AWS:SourceIP":"10.0.0.0/8"}}}]}"#,
+        )
+        .unwrap();
+        assert!(!policy.is_public());
+    }
+
+    #[test]
     fn for_any_value_source_ip_cidr_constrains_wildcard_principal() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"ForAnyValue:IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}]}"#,
@@ -2877,6 +2986,245 @@ mod tests {
             ExistingObjectTags::Unavailable,
         )
         .with_request_object_tags(&request_tags);
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn request_object_tag_condition_key_is_case_insensitive_and_matches_any_same_key_case_value() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"S3:RequestObjectTag/Classification":"public"}}}]}"#,
+        )
+        .unwrap();
+        let request_tags = [PolicyTag::new("classification", "public")];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&request_tags);
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request_tags = [
+            PolicyTag::new("Classification", "private"),
+            PolicyTag::new("classification", "public"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&request_tags);
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request_tags = [
+            PolicyTag::new("classification", "public"),
+            PolicyTag::new("Classification", "private"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&request_tags);
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn request_object_tag_case_equivalent_values_preserve_forall_forany_semantics() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/all-*","Condition":{"ForAllValues:StringEquals":{"S3:RequestObjectTag/Classification":"public"}}},{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/any-*","Condition":{"ForAnyValue:StringEquals":{"S3:RequestObjectTag/Classification":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        let all_match_tags = [
+            PolicyTag::new("Classification", "public"),
+            PolicyTag::new("classification", "public"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "all-match",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&all_match_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let one_mismatch_tags = [
+            PolicyTag::new("Classification", "public"),
+            PolicyTag::new("classification", "private"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "all-mismatch",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&one_mismatch_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "any-match",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&one_mismatch_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let no_match_tags = [
+            PolicyTag::new("Classification", "private"),
+            PolicyTag::new("classification", "internal"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "any-mismatch",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&no_match_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn request_object_tag_case_equivalent_values_preserve_binary_equals_semantics() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/binary-*","Condition":{"BinaryEquals":{"S3:RequestObjectTag/Classification":"cHVibGlj"}}},{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/all-*","Condition":{"ForAllValues:BinaryEquals":{"S3:RequestObjectTag/Classification":"cHVibGlj"}}},{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/any-*","Condition":{"ForAnyValue:BinaryEquals":{"S3:RequestObjectTag/Classification":"cHVibGlj"}}}]}"#,
+        )
+        .unwrap();
+
+        let one_match_tags = [
+            PolicyTag::new("Classification", "cHJpdmF0ZQ=="),
+            PolicyTag::new("classification", "cHVibGlj"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "binary-match",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&one_match_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let no_match_tags = [
+            PolicyTag::new("Classification", "cHJpdmF0ZQ=="),
+            PolicyTag::new("classification", "aW50ZXJuYWw="),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "binary-mismatch",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&no_match_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+
+        let all_match_tags = [
+            PolicyTag::new("Classification", "cHVibGlj"),
+            PolicyTag::new("classification", "cHVibGlj"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "all-match",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&all_match_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "all-mismatch",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&one_match_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "any-match",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&one_match_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "any-mismatch",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&no_match_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn existing_object_tag_condition_key_is_case_insensitive_with_exact_case_precedence() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"S3:ExistingObjectTag/Classification":"public"}}}]}"#,
+        )
+        .unwrap();
+        let existing_tags = [
+            PolicyTag::new("Classification", "private"),
+            PolicyTag::new("classification", "public"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Available(&existing_tags),
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+
+        let existing_tags = [
+            PolicyTag::new("Classification", "public"),
+            PolicyTag::new("classification", "private"),
+        ];
+        let request = PolicyRequest::for_object(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Available(&existing_tags),
+        );
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
     }
@@ -4248,6 +4596,116 @@ mod tests {
             &private,
         );
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn bucket_tag_condition_keys_are_case_insensitive_with_exact_case_precedence() {
+        for (condition_key, resource_tag_lowercase_precedence) in [
+            ("S3:BucketTag/Classification", false),
+            ("AWS:ResourceTag/Classification", true),
+        ] {
+            let policy = parse_bucket_policy(&format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket","Condition":{{"StringEquals":{{"{condition_key}":"public"}}}}}}]}}"#
+            ))
+            .unwrap();
+
+            let fallback_tags = [PolicyTag::new("classification", "public")];
+            let request = bucket_request_with_tags(
+                PolicyAction::GetBucketTagging,
+                "bucket",
+                Some("caller"),
+                &fallback_tags,
+            );
+            assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+            let denied_tags = [
+                PolicyTag::new("Classification", "private"),
+                PolicyTag::new("classification", "public"),
+            ];
+            let request = bucket_request_with_tags(
+                PolicyAction::GetBucketTagging,
+                "bucket",
+                Some("caller"),
+                &denied_tags,
+            );
+            assert_eq!(
+                policy.evaluate(&request),
+                if resource_tag_lowercase_precedence {
+                    PolicyEvaluation::ExplicitAllow
+                } else {
+                    PolicyEvaluation::NoMatch
+                }
+            );
+
+            let allowed_tags = [
+                PolicyTag::new("Classification", "public"),
+                PolicyTag::new("classification", "private"),
+            ];
+            let request = bucket_request_with_tags(
+                PolicyAction::GetBucketTagging,
+                "bucket",
+                Some("caller"),
+                &allowed_tags,
+            );
+            assert_eq!(
+                policy.evaluate(&request),
+                if resource_tag_lowercase_precedence {
+                    PolicyEvaluation::NoMatch
+                } else {
+                    PolicyEvaluation::ExplicitAllow
+                }
+            );
+
+            let reversed_allowed_tags = [
+                PolicyTag::new("classification", "private"),
+                PolicyTag::new("Classification", "public"),
+            ];
+            let request = bucket_request_with_tags(
+                PolicyAction::GetBucketTagging,
+                "bucket",
+                Some("caller"),
+                &reversed_allowed_tags,
+            );
+            assert_eq!(
+                policy.evaluate(&request),
+                if resource_tag_lowercase_precedence {
+                    PolicyEvaluation::NoMatch
+                } else {
+                    PolicyEvaluation::ExplicitAllow
+                }
+            );
+
+            let reversed_denied_tags = [
+                PolicyTag::new("classification", "public"),
+                PolicyTag::new("Classification", "private"),
+            ];
+            let request = bucket_request_with_tags(
+                PolicyAction::GetBucketTagging,
+                "bucket",
+                Some("caller"),
+                &reversed_denied_tags,
+            );
+            assert_eq!(
+                policy.evaluate(&request),
+                if resource_tag_lowercase_precedence {
+                    PolicyEvaluation::ExplicitAllow
+                } else {
+                    PolicyEvaluation::NoMatch
+                }
+            );
+
+            let no_match_tags = [
+                PolicyTag::new("Classification", "private"),
+                PolicyTag::new("classification", "internal"),
+            ];
+            let request = bucket_request_with_tags(
+                PolicyAction::GetBucketTagging,
+                "bucket",
+                Some("caller"),
+                &no_match_tags,
+            );
+            assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+        }
     }
 
     #[test]

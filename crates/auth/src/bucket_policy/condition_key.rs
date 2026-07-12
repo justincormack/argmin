@@ -10,7 +10,7 @@
 //! The existing evaluator continues to use its hand-rolled dispatch until
 //! the migration commits route through [`CONDITION_KEYS`].
 
-use super::condition_op::{self, ActualValue};
+use super::condition_op::{self, ActualValue, ConditionSetQualifier};
 use super::{
     BucketTagValue, ConditionMatchResult, ExistingObjectTagValue, PolicyAction,
     PolicyConditionClause, PolicyRequest, PolicyValue, RequestBool, RequestField,
@@ -24,6 +24,7 @@ use super::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ResolvedValue<'a> {
     Present(&'a str),
+    PresentScalarValues(Vec<&'a str>),
     PresentValues(Vec<&'a str>),
     SourceIp(std::net::IpAddr),
     EpochSeconds(u64),
@@ -57,8 +58,9 @@ pub(super) enum OperatorSupport {
 
 /// How the resolver matches a request condition key.
 ///
-/// Exact keys compare equal; prefix keys accept anything that starts with
-/// the prefix string and pass the remainder to `resolve` as the parameter.
+/// Exact and prefix keys compare case-insensitively, matching AWS IAM context
+/// key semantics. Prefix keys pass the original-cased remainder to `resolve`
+/// as the parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KeyMatch {
     Exact(&'static str),
@@ -68,8 +70,14 @@ pub(super) enum KeyMatch {
 impl KeyMatch {
     fn match_key<'a>(&self, key: &'a str) -> Option<&'a str> {
         match self {
-            Self::Exact(name) => (key == *name).then_some(""),
-            Self::Prefix(prefix) => key.strip_prefix(prefix),
+            Self::Exact(name) => key.eq_ignore_ascii_case(name).then_some(""),
+            Self::Prefix(prefix) if key.len() >= prefix.len() => {
+                let (candidate_prefix, param) = key.split_at(prefix.len());
+                candidate_prefix
+                    .eq_ignore_ascii_case(prefix)
+                    .then_some(param)
+            }
+            Self::Prefix(_) => None,
         }
     }
 }
@@ -89,6 +97,9 @@ pub(super) enum ConditionInput {
     Bucket,
     SourceIp,
     CurrentTime,
+    SecureTransport,
+    RequestedRegion,
+    Referer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,7 +158,7 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         key: KeyMatch::Prefix("aws:ResourceTag/"),
         operator_support: OperatorSupport::AnyEvaluable,
         input: Some(ConditionInput::Bucket),
-        resolve: resolve_bucket_tag,
+        resolve: resolve_resource_tag,
         evaluable_for_action: None,
         supported_for_action: Some(bucket_tag_supported_for_action),
     },
@@ -196,6 +207,30 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         operator_support: OperatorSupport::NumericOnly,
         input: Some(ConditionInput::CurrentTime),
         resolve: resolve_current_time,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:SecureTransport"),
+        operator_support: OperatorSupport::BoolOnly,
+        input: Some(ConditionInput::SecureTransport),
+        resolve: resolve_secure_transport,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:RequestedRegion"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::RequestedRegion),
+        resolve: resolve_requested_region,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:referer"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Referer),
+        resolve: resolve_referer,
         evaluable_for_action: None,
         supported_for_action: None,
     },
@@ -413,8 +448,11 @@ fn resolve_existing_object_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> 
 fn resolve_request_object_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
     match request.request_object_tag_value(param) {
         RequestObjectTagValue::Unavailable => ResolvedValue::Unavailable,
-        RequestObjectTagValue::Available(Some(value)) => ResolvedValue::Present(value),
-        RequestObjectTagValue::Available(None) => ResolvedValue::Absent,
+        RequestObjectTagValue::Available(values) if values.is_empty() => ResolvedValue::Absent,
+        RequestObjectTagValue::Available(values) if values.len() == 1 => {
+            ResolvedValue::Present(values[0])
+        }
+        RequestObjectTagValue::Available(values) => ResolvedValue::PresentScalarValues(values),
     }
 }
 
@@ -428,6 +466,14 @@ fn resolve_request_tag_keys<'a>(request: &PolicyRequest<'a>, _param: &str) -> Re
 
 fn resolve_bucket_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
     match request.bucket_tag_value(param) {
+        BucketTagValue::Unavailable => ResolvedValue::Unavailable,
+        BucketTagValue::Available(Some(value)) => ResolvedValue::Present(value),
+        BucketTagValue::Available(None) => ResolvedValue::Absent,
+    }
+}
+
+fn resolve_resource_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
+    match request.resource_tag_value(param) {
         BucketTagValue::Unavailable => ResolvedValue::Unavailable,
         BucketTagValue::Available(Some(value)) => ResolvedValue::Present(value),
         BucketTagValue::Available(None) => ResolvedValue::Absent,
@@ -468,6 +514,23 @@ fn resolve_current_time<'a>(request: &PolicyRequest<'a>, _param: &str) -> Resolv
         Some(epoch_seconds) => ResolvedValue::EpochSeconds(epoch_seconds),
         None => ResolvedValue::Unavailable,
     }
+}
+
+fn resolve_secure_transport<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    match request.secure_transport() {
+        RequestBool::Unavailable => ResolvedValue::Unavailable,
+        RequestBool::Available(Some(true)) => ResolvedValue::Present("true"),
+        RequestBool::Available(Some(false)) => ResolvedValue::Present("false"),
+        RequestBool::Available(None) => ResolvedValue::Absent,
+    }
+}
+
+fn resolve_requested_region<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.requested_region())
+}
+
+fn resolve_referer<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.referer())
 }
 
 fn resolve_copy_source<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
@@ -815,14 +878,7 @@ pub(super) fn evaluate_clause(
     if !operator_supported_for_key(op.name, resolver.operator_support) {
         return ConditionMatchResult::Unsupported;
     }
-    let actual = match (resolver.resolve)(request, param) {
-        ResolvedValue::Present(value) => ActualValue::Present(value),
-        ResolvedValue::PresentValues(values) => ActualValue::PresentValues(values),
-        ResolvedValue::SourceIp(source_ip) => ActualValue::SourceIp(source_ip),
-        ResolvedValue::EpochSeconds(epoch_seconds) => ActualValue::EpochSeconds(epoch_seconds),
-        ResolvedValue::Absent => ActualValue::Absent,
-        ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
-    };
+    let resolved = (resolver.resolve)(request, param);
     let expanded_values;
     let values = if variables_enabled && condition_op::supports_policy_variables(op.kind) {
         expanded_values = clause
@@ -839,7 +895,62 @@ pub(super) fn evaluate_clause(
             .collect::<Vec<_>>();
         expanded_values.as_slice()
     };
+    let actual = match resolved {
+        ResolvedValue::Present(value) => ActualValue::Present(value),
+        ResolvedValue::PresentScalarValues(actuals) => {
+            return evaluate_scalar_values(*op, values, &actuals);
+        }
+        ResolvedValue::PresentValues(values) => ActualValue::PresentValues(values),
+        ResolvedValue::SourceIp(source_ip) => ActualValue::SourceIp(source_ip),
+        ResolvedValue::EpochSeconds(epoch_seconds) => ActualValue::EpochSeconds(epoch_seconds),
+        ResolvedValue::Absent => ActualValue::Absent,
+        ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
+    };
     (op.evaluate)(values, actual)
+}
+
+fn evaluate_scalar_values(
+    op: condition_op::ConditionOpDef,
+    operands: &[PolicyValue],
+    actuals: &[&str],
+) -> ConditionMatchResult {
+    let actual_matches = |actual: &&str| {
+        (op.evaluate)(operands, ActualValue::Present(actual)) == ConditionMatchResult::Matches
+    };
+    let matches = match op.set_qualifier {
+        ConditionSetQualifier::ForAllValues => actuals.iter().all(actual_matches),
+        ConditionSetQualifier::ForAnyValue => actuals.iter().any(actual_matches),
+        ConditionSetQualifier::None => match op.kind {
+            condition_op::ConditionOpKind::BinaryEquals
+            | condition_op::ConditionOpKind::StringEquals
+            | condition_op::ConditionOpKind::StringEqualsIgnoreCase
+            | condition_op::ConditionOpKind::StringLike => actuals.iter().any(actual_matches),
+            condition_op::ConditionOpKind::StringNotEquals
+            | condition_op::ConditionOpKind::StringNotEqualsIgnoreCase
+            | condition_op::ConditionOpKind::StringNotLike => actuals.iter().all(actual_matches),
+            condition_op::ConditionOpKind::Bool
+            | condition_op::ConditionOpKind::DateEquals
+            | condition_op::ConditionOpKind::DateNotEquals
+            | condition_op::ConditionOpKind::DateLessThan
+            | condition_op::ConditionOpKind::DateLessThanEquals
+            | condition_op::ConditionOpKind::DateGreaterThan
+            | condition_op::ConditionOpKind::DateGreaterThanEquals
+            | condition_op::ConditionOpKind::NumericEquals
+            | condition_op::ConditionOpKind::NumericNotEquals
+            | condition_op::ConditionOpKind::NumericLessThan
+            | condition_op::ConditionOpKind::NumericLessThanEquals
+            | condition_op::ConditionOpKind::NumericGreaterThan
+            | condition_op::ConditionOpKind::NumericGreaterThanEquals
+            | condition_op::ConditionOpKind::IpAddress
+            | condition_op::ConditionOpKind::NotIpAddress
+            | condition_op::ConditionOpKind::Null => false,
+        },
+    };
+    if matches {
+        ConditionMatchResult::Matches
+    } else {
+        ConditionMatchResult::NoMatch
+    }
 }
 
 pub(super) fn resolve_policy_variable(
@@ -857,7 +968,9 @@ pub(super) fn resolve_policy_variable(
         ResolvedValue::EpochSeconds(epoch_seconds) => {
             PolicyVariableResolution::Value(epoch_seconds.to_string())
         }
-        ResolvedValue::PresentValues(_) => PolicyVariableResolution::Unavailable,
+        ResolvedValue::PresentScalarValues(_) | ResolvedValue::PresentValues(_) => {
+            PolicyVariableResolution::Unavailable
+        }
         ResolvedValue::Absent => PolicyVariableResolution::Absent,
         ResolvedValue::Unavailable => PolicyVariableResolution::Unavailable,
     }
@@ -1063,6 +1176,101 @@ mod tests {
         assert_eq!(param, "");
         assert_eq!(epoch_time.operator_support, OperatorSupport::NumericOnly);
         assert_eq!(epoch_time.input, Some(ConditionInput::CurrentTime));
+    }
+
+    #[test]
+    fn lookup_condition_keys_is_case_insensitive() {
+        let (source_ip, param) = lookup("AWS:SourceIP").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(source_ip.input, Some(ConditionInput::SourceIp));
+
+        let (secure_transport, param) = lookup("aws:securetransport").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(
+            secure_transport.input,
+            Some(ConditionInput::SecureTransport)
+        );
+
+        let (requested_region, param) = lookup("AWS:RequestedRegion").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(
+            requested_region.input,
+            Some(ConditionInput::RequestedRegion)
+        );
+
+        let (referer, param) = lookup("AWS:Referer").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(referer.input, Some(ConditionInput::Referer));
+    }
+
+    #[test]
+    fn lookup_prefix_condition_keys_is_case_insensitive() {
+        let (resolver, param) = lookup("S3:ExistingObjectTag/Classification").unwrap();
+        assert_eq!(param, "Classification");
+        assert_eq!(resolver.input, Some(ConditionInput::ExistingObject));
+
+        let (resolver, param) = lookup("AWS:RequestTag/Classification").unwrap();
+        assert_eq!(param, "Classification");
+        assert_eq!(resolver.input, Some(ConditionInput::Request));
+    }
+
+    #[test]
+    fn lookup_request_property_keys_returns_exact_resolvers() {
+        let (secure_transport, param) = lookup("aws:SecureTransport").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(secure_transport.operator_support, OperatorSupport::BoolOnly);
+        assert_eq!(
+            secure_transport.input,
+            Some(ConditionInput::SecureTransport)
+        );
+
+        let (requested_region, param) = lookup("aws:RequestedRegion").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(
+            requested_region.operator_support,
+            OperatorSupport::AnyEvaluable
+        );
+        assert_eq!(
+            requested_region.input,
+            Some(ConditionInput::RequestedRegion)
+        );
+
+        let (referer, param) = lookup("aws:referer").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(referer.operator_support, OperatorSupport::AnyEvaluable);
+        assert_eq!(referer.input, Some(ConditionInput::Referer));
+    }
+
+    #[test]
+    fn request_property_keys_accept_expected_operator_families() {
+        let secure_clause = PolicyConditionClause {
+            operator: "Bool".to_string(),
+            key: "aws:SecureTransport".to_string(),
+            values: vec!["true".to_string()],
+        };
+        assert!(supports_clause_for_action(
+            &secure_clause,
+            PolicyAction::GetObject
+        ));
+
+        let secure_string_clause = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "aws:SecureTransport".to_string(),
+            values: vec!["true".to_string()],
+        };
+        assert!(!supports_clause_for_action(
+            &secure_string_clause,
+            PolicyAction::GetObject
+        ));
+
+        for key in ["aws:RequestedRegion", "aws:referer"] {
+            let clause = PolicyConditionClause {
+                operator: "StringLike".to_string(),
+                key: key.to_string(),
+                values: vec!["*".to_string()],
+            };
+            assert!(supports_clause_for_action(&clause, PolicyAction::GetObject));
+        }
     }
 
     #[test]
@@ -1272,6 +1480,33 @@ mod tests {
             clause_input(&time_clause),
             Some(ConditionInput::CurrentTime)
         );
+
+        let secure_transport_clause = PolicyConditionClause {
+            operator: "Bool".to_string(),
+            key: "aws:SecureTransport".to_string(),
+            values: vec!["true".to_string()],
+        };
+        assert_eq!(
+            clause_input(&secure_transport_clause),
+            Some(ConditionInput::SecureTransport)
+        );
+
+        let requested_region_clause = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "aws:RequestedRegion".to_string(),
+            values: vec!["us-east-1".to_string()],
+        };
+        assert_eq!(
+            clause_input(&requested_region_clause),
+            Some(ConditionInput::RequestedRegion)
+        );
+
+        let referer_clause = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            key: "aws:referer".to_string(),
+            values: vec!["https://example.com".to_string()],
+        };
+        assert_eq!(clause_input(&referer_clause), Some(ConditionInput::Referer));
 
         let header_clause = PolicyConditionClause {
             operator: "StringEquals".to_string(),

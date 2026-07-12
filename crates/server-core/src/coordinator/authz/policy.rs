@@ -132,32 +132,9 @@ pub(super) fn object_policy_request<'a>(
         "bucket policy request for {:?} requires existing object tags",
         input.action
     );
-    let source_ip_required = input.policy.requires_source_ip_for_action(input.action);
-    if source_ip_required && input.requester.source_ip().is_none() {
-        return Err(required_policy_input_unavailable_error(
-            input.action,
-            "source IP",
-        ));
-    }
-    debug_assert!(
-        !(source_ip_required && input.requester.source_ip().is_none()),
-        "bucket policy request for {:?} requires source IP",
-        input.action
-    );
-    let current_time_required = input.policy.requires_current_time_for_action(input.action);
-    if current_time_required && input.requester.request_epoch_seconds().is_none() {
-        return Err(required_policy_input_unavailable_error(
-            input.action,
-            "request time",
-        ));
-    }
-    debug_assert!(
-        !(current_time_required && input.requester.request_epoch_seconds().is_none()),
-        "bucket policy request for {:?} requires request time",
-        input.action
-    );
+    validate_common_policy_request_inputs(input.policy, input.action, input.requester)?;
 
-    Ok(auth::PolicyRequest::for_object(
+    let mut request = auth::PolicyRequest::for_object(
         input.action,
         input.bucket_name,
         input.key,
@@ -167,6 +144,8 @@ pub(super) fn object_policy_request<'a>(
     )
     .with_source_ip(input.requester.source_ip())
     .with_current_time_epoch_seconds(input.requester.request_epoch_seconds())
+    .with_secure_transport(input.requester.secure_transport())
+    .with_requested_region(input.requester.requested_region())
     .with_bucket_tags(bucket_tag_input_for_policy_action(
         input.bucket_abac_enabled,
         input.policy,
@@ -192,7 +171,12 @@ pub(super) fn object_policy_request<'a>(
     .with_if_match(input.policy_context.if_match)
     .with_if_none_match(input.policy_context.if_none_match)
     .with_object_creation_operation(input.policy_context.object_creation_operation)
-    .with_version_id(input.version_id))
+    .with_version_id(input.version_id);
+    if let Some(referer) = input.requester.referer() {
+        request = request.with_referer(referer);
+    }
+
+    Ok(request)
 }
 
 fn bucket_policy_request<'a>(
@@ -230,30 +214,7 @@ fn bucket_policy_request<'a>(
         "bucket policy request for {:?} requires request tags",
         input.action
     );
-    let source_ip_required = input.policy.requires_source_ip_for_action(input.action);
-    if source_ip_required && input.requester.source_ip().is_none() {
-        return Err(required_policy_input_unavailable_error(
-            input.action,
-            "source IP",
-        ));
-    }
-    debug_assert!(
-        !(source_ip_required && input.requester.source_ip().is_none()),
-        "bucket policy request for {:?} requires source IP",
-        input.action
-    );
-    let current_time_required = input.policy.requires_current_time_for_action(input.action);
-    if current_time_required && input.requester.request_epoch_seconds().is_none() {
-        return Err(required_policy_input_unavailable_error(
-            input.action,
-            "request time",
-        ));
-    }
-    debug_assert!(
-        !(current_time_required && input.requester.request_epoch_seconds().is_none()),
-        "bucket policy request for {:?} requires request time",
-        input.action
-    );
+    validate_common_policy_request_inputs(input.policy, input.action, input.requester)?;
 
     let mut request = auth::PolicyRequest::for_bucket(
         input.action,
@@ -264,8 +225,13 @@ fn bucket_policy_request<'a>(
     )
     .with_source_ip(input.requester.source_ip())
     .with_current_time_epoch_seconds(input.requester.request_epoch_seconds())
+    .with_secure_transport(input.requester.secure_transport())
+    .with_requested_region(input.requester.requested_region())
     .with_absent_request_headers()
     .with_absent_list_parameters();
+    if let Some(referer) = input.requester.referer() {
+        request = request.with_referer(referer);
+    }
 
     if let Some(request_tags) = input.request_tags {
         request = request.with_request_object_tags(request_tags);
@@ -286,6 +252,59 @@ fn bucket_policy_request<'a>(
     }
 
     Ok(request)
+}
+
+fn validate_common_policy_request_inputs(
+    policy: &auth::BucketPolicy,
+    action: auth::PolicyAction,
+    requester: &Requester,
+) -> Result<(), ServerError> {
+    validate_required_policy_input(
+        action,
+        "source IP",
+        policy.requires_source_ip_for_action(action),
+        requester.source_ip().is_none(),
+    )?;
+    validate_required_policy_input(
+        action,
+        "request time",
+        policy.requires_current_time_for_action(action),
+        requester.request_epoch_seconds().is_none(),
+    )?;
+    validate_required_policy_input(
+        action,
+        "secure transport",
+        policy.requires_secure_transport_for_action(action),
+        requester.secure_transport().is_none(),
+    )?;
+    validate_required_policy_input(
+        action,
+        "requested region",
+        policy.requires_requested_region_for_action(action),
+        requester.requested_region().is_none(),
+    )?;
+    validate_required_policy_input(
+        action,
+        "referer",
+        policy.requires_referer_for_action(action),
+        requester.referer().is_none(),
+    )
+}
+
+fn validate_required_policy_input(
+    action: auth::PolicyAction,
+    input: &str,
+    required: bool,
+    unavailable: bool,
+) -> Result<(), ServerError> {
+    if required && unavailable {
+        return Err(required_policy_input_unavailable_error(action, input));
+    }
+    debug_assert!(
+        !(required && unavailable),
+        "bucket policy request for {action:?} requires {input}"
+    );
+    Ok(())
 }
 
 fn required_policy_input_unavailable_error(action: auth::PolicyAction, input: &str) -> ServerError {
@@ -1058,6 +1077,106 @@ mod tests {
     }
 
     #[test]
+    fn object_policy_request_rejects_missing_required_request_properties() {
+        for (policy_body, input) in [
+            (
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Bool":{"aws:SecureTransport":"true"}}}]}"#,
+                "secure transport",
+            ),
+            (
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:RequestedRegion":"us-east-1"}}}]}"#,
+                "requested region",
+            ),
+            (
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:referer":"https://example.com/"}}}]}"#,
+                "referer",
+            ),
+        ] {
+            let requester = requester();
+            let policy = parse_policy(policy_body);
+
+            let error = object_policy_request(ObjectPolicyRequestInput {
+                requester: &requester,
+                bucket_name: "bucket",
+                bucket_abac_enabled: false,
+                key: "key",
+                action: auth::PolicyAction::GetObject,
+                policy_context: PutObjectPolicyContext::default(),
+                policy: &policy,
+                existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+                existing_object_tags_not_evaluable: false,
+                bucket_tags: &[],
+                request_object_tags: &[],
+                version_id: None,
+            })
+            .unwrap_err();
+
+            assert_required_input_error(error, input, auth::PolicyAction::GetObject);
+        }
+    }
+
+    #[test]
+    fn object_policy_request_propagates_request_properties() {
+        let requester = requester()
+            .with_secure_transport(Some(true))
+            .with_requested_region(Some("us-east-1".to_string()))
+            .with_referer(Some("https://example.com/".to_string()));
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Bool":{"aws:SecureTransport":"true"},"StringEquals":{"aws:RequestedRegion":"us-east-1","aws:referer":"https://example.com/"}}}]}"#,
+        );
+
+        let request = object_policy_request(ObjectPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            key: "key",
+            action: auth::PolicyAction::GetObject,
+            policy_context: PutObjectPolicyContext::default(),
+            policy: &policy,
+            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+            existing_object_tags_not_evaluable: false,
+            bucket_tags: &[],
+            request_object_tags: &[],
+            version_id: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            policy.evaluate(&request),
+            auth::PolicyEvaluation::ExplicitAllow
+        );
+    }
+
+    #[test]
+    fn object_policy_request_propagates_absent_referer() {
+        let requester = requester().with_referer(None);
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"aws:referer":"true"}}}]}"#,
+        );
+
+        let request = object_policy_request(ObjectPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            key: "key",
+            action: auth::PolicyAction::GetObject,
+            policy_context: PutObjectPolicyContext::default(),
+            policy: &policy,
+            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+            existing_object_tags_not_evaluable: false,
+            bucket_tags: &[],
+            request_object_tags: &[],
+            version_id: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            policy.evaluate(&request),
+            auth::PolicyEvaluation::ExplicitAllow
+        );
+    }
+
+    #[test]
     fn bucket_policy_request_rejects_missing_required_bucket_tags_when_abac_enabled() {
         let requester = requester();
         let policy = parse_policy(
@@ -1203,6 +1322,35 @@ mod tests {
         let requester = requester().with_request_epoch_seconds(Some(1_704_067_200));
         let policy = parse_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"DateEquals":{"aws:CurrentTime":"2024-01-01T00:00:00Z"}}}]}"#,
+        );
+
+        let request = bucket_policy_request(BucketPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            action: auth::PolicyAction::ListBucket,
+            policy: &policy,
+            bucket_tags: auth::bucket_policy::BucketTags::Unavailable,
+            request_tags: None,
+            policy_context: None,
+            requested_max_keys: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            policy.evaluate(&request),
+            auth::PolicyEvaluation::ExplicitAllow
+        );
+    }
+
+    #[test]
+    fn bucket_policy_request_propagates_request_properties() {
+        let requester = requester()
+            .with_secure_transport(Some(false))
+            .with_requested_region(Some("us-west-2".to_string()))
+            .with_referer(Some("https://example.com/list".to_string()));
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"Bool":{"aws:SecureTransport":"false"},"StringEquals":{"aws:RequestedRegion":"us-west-2","aws:referer":"https://example.com/list"}}}]}"#,
         );
 
         let request = bucket_policy_request(BucketPolicyRequestInput {

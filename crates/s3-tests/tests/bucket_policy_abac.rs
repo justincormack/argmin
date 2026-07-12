@@ -270,11 +270,37 @@ fn simple_cors_configuration(origin: &str, method: &str) -> CorsConfiguration {
         .unwrap()
 }
 
+fn bucket_tagging(tags: &[(&str, &str)]) -> Tagging {
+    let mut builder = Tagging::builder();
+    for (key, value) in tags {
+        builder = builder.tag_set(Tag::builder().key(*key).value(*value).build().unwrap());
+    }
+    builder.build().unwrap()
+}
+
 fn simple_bucket_tagging(key: &str, value: &str) -> Tagging {
-    Tagging::builder()
-        .tag_set(Tag::builder().key(key).value(value).build().unwrap())
-        .build()
-        .unwrap()
+    bucket_tagging(&[(key, value)])
+}
+
+async fn enable_bucket_abac_with_tags(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    tags: &[(&str, &str)],
+) {
+    client
+        .put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(bucket_tagging(tags))
+        .send_retrying_operation_aborted("put ABAC bucket tags")
+        .await
+        .unwrap();
+    client
+        .put_bucket_abac()
+        .bucket(bucket)
+        .abac_status(enabled_abac_status())
+        .send_retrying_operation_aborted("enable bucket ABAC")
+        .await
+        .unwrap();
 }
 
 fn enabled_abac_status() -> AbacStatus {
@@ -288,20 +314,7 @@ async fn enable_bucket_abac_with_security_tag(
     bucket: &str,
     value: &str,
 ) {
-    client
-        .put_bucket_tagging()
-        .bucket(bucket)
-        .tagging(simple_bucket_tagging("security", value))
-        .send_retrying_operation_aborted("put ABAC security bucket tag")
-        .await
-        .unwrap();
-    client
-        .put_bucket_abac()
-        .bucket(bucket)
-        .abac_status(enabled_abac_status())
-        .send_retrying_operation_aborted("enable bucket ABAC")
-        .await
-        .unwrap();
+    enable_bucket_abac_with_tags(client, bucket, &[("security", value)]).await;
 }
 
 async fn put_bucket_tag_condition_policy_for_alt(
@@ -1102,6 +1115,118 @@ fn test_bucket_policy_get_bucket_tagging_resource_tag_condition_when_abac_enable
         .await;
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+async fn assert_bucket_abac_tag_prefix_key_suffix_case_behavior(
+    condition_key: &str,
+    description: &str,
+    resource_tag_lowercase_precedence: bool,
+) {
+    let principal = alt_policy_principal();
+    let client = CTX.client();
+    let alt_client = CTX.alt_client();
+    let mut cases = vec![
+        ("exact-case", vec![("Classification", "public")], true),
+        ("fallback-case", vec![("classification", "public")], true),
+        (
+            "conflicting-denied",
+            vec![("Classification", "private"), ("classification", "public")],
+            resource_tag_lowercase_precedence,
+        ),
+        (
+            "conflicting-allowed",
+            vec![("Classification", "public"), ("classification", "private")],
+            !resource_tag_lowercase_precedence,
+        ),
+        (
+            "conflicting-reversed-allowed",
+            vec![("classification", "private"), ("Classification", "public")],
+            !resource_tag_lowercase_precedence,
+        ),
+        (
+            "conflicting-reversed-denied",
+            vec![("classification", "public"), ("Classification", "private")],
+            resource_tag_lowercase_precedence,
+        ),
+    ];
+    cases.push((
+        "conflicting-no-match",
+        vec![
+            ("Classification", "private"),
+            ("classification", "internal"),
+        ],
+        false,
+    ));
+
+    for (name, tags, should_allow) in cases {
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        enable_bucket_abac_with_tags(client, &bucket, &tags).await;
+
+        let mut condition = serde_json::Map::new();
+        condition.insert(condition_key.to_string(), json!("public"));
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetBucketTagging",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": serde_json::Value::Object(condition)
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        if should_allow {
+            let response = eventually_ok(
+                &format!("{description} GetBucketTagging allowed for {name}"),
+                || alt_client.get_bucket_tagging().bucket(&bucket).send(),
+            )
+            .await;
+            assert_eq!(response.tag_set().len(), tags.len());
+        } else {
+            eventually_access_denied(
+                &format!("{description} GetBucketTagging denied for {name}"),
+                || alt_client.get_bucket_tagging().bucket(&bucket).send(),
+            )
+            .await;
+        }
+
+        cleanup(&bucket, &[]).await;
+    }
+}
+
+#[test]
+fn test_bucket_policy_bucket_tag_prefix_key_is_case_insensitive_when_abac_enabled() {
+    s3_tests::run(async {
+        assert_bucket_abac_tag_prefix_key_suffix_case_behavior(
+            "S3:BucketTag/Classification",
+            "s3:BucketTag",
+            false,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_resource_tag_prefix_key_is_case_insensitive_when_abac_enabled() {
+    s3_tests::run(async {
+        assert_bucket_abac_tag_prefix_key_suffix_case_behavior(
+            "AWS:ResourceTag/Classification",
+            "aws:ResourceTag",
+            true,
+        )
+        .await;
     });
 }
 

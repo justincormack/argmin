@@ -13,12 +13,13 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
     disable_bucket_public_access_block, err_status, object_url, put_bucket_lifecycle_with_md5,
-    raw_anonymous, raw_bucket, send_signed_request, send_signed_request_with_credentials,
+    raw_alt_object_request, raw_anonymous, raw_bucket, send_signed_request,
+    send_signed_request_with_credentials,
     shape::{
         assert_shape, error_response_headers, escape_literal, expected_error, id_headers, shape,
     },
-    sse_c_header_values, test_sse_c_key, unique_bucket, SendRetryingOperationAborted,
-    SignedRequestCredentials, CTX,
+    sse_c_header_values, test_sse_c_key, unique_bucket, RawAltObjectRequest,
+    SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -345,7 +346,11 @@ async fn eventually_result_matches<T, E, F, Fut, P>(
             tokio::time::sleep(delay).await;
             continue;
         }
-        panic!("{description} did not converge");
+        let last_result = match &result {
+            Ok(_) => "Ok".to_string(),
+            Err(err) => format!("Err({err:?})"),
+        };
+        panic!("{description} did not converge: {}", last_result);
     }
 
     unreachable!()
@@ -488,6 +493,36 @@ fn raw_alt_credentials() -> SignedRequestCredentials<'static> {
         region: CTX.region(),
         tls_ca_pem: CTX.tls_ca_pem(),
     }
+}
+
+async fn raw_alt_object_status_eventually(
+    description: &str,
+    request: RawAltObjectRequest<'_>,
+    expected_status: u16,
+) -> s3_tests::RawResponse {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    loop {
+        let response = raw_alt_object_request(request);
+        if response.status == expected_status {
+            return response;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            panic!("{description} did not converge to {expected_status}: {response:?}");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+fn assert_raw_access_denied(operation: &str, response: &s3_tests::RawResponse) {
+    assert_eq!(response.status, 403, "{operation}: {response:?}");
+    assert!(
+        response.body.contains("<Code>AccessDenied</Code>"),
+        "{operation}: expected AccessDenied body: {}",
+        response.body
+    );
 }
 
 fn simple_lifecycle_configuration(prefix: &str, days: i32) -> BucketLifecycleConfiguration {
@@ -9420,6 +9455,914 @@ fn test_bucket_policy_epoch_time_numeric_conditions() {
 
         let cleanup_keys = [&allowed_keys[..], &denied_keys[..]].concat();
         cleanup(&bucket, &cleanup_keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_secure_transport_bool_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_key = "secure-transport-matches";
+        let denied_key = "secure-transport-does-not-match";
+        let secure_value = endpoint_is_https().to_string();
+        let opposite_value = (!endpoint_is_https()).to_string();
+
+        for key in [allowed_key, denied_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(key.as_bytes()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, allowed_key),
+                    "Condition": {"Bool": {"aws:SecureTransport": secure_value}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, denied_key),
+                    "Condition": {"Bool": {"aws:SecureTransport": opposite_value}}
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let allowed = raw_alt_object_status_eventually(
+            "GetObject allowed by aws:SecureTransport",
+            RawAltObjectRequest::new("GET", &bucket, allowed_key),
+            200,
+        )
+        .await;
+        assert_eq!(allowed.body, allowed_key);
+
+        let denied = raw_alt_object_status_eventually(
+            "GetObject denied by aws:SecureTransport mismatch",
+            RawAltObjectRequest::new("GET", &bucket, denied_key),
+            403,
+        )
+        .await;
+        assert_raw_access_denied("GetObject denied by aws:SecureTransport", &denied);
+
+        cleanup(&bucket, &[allowed_key, denied_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_requested_region_string_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_key = "requested-region-matches";
+        let denied_key = "requested-region-does-not-match";
+        let expected_region = CTX.region();
+        let wrong_region = if expected_region == "us-east-1" {
+            "us-west-2"
+        } else {
+            "us-east-1"
+        };
+
+        for key in [allowed_key, denied_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(key.as_bytes()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, allowed_key),
+                    "Condition": {"StringEquals": {"aws:RequestedRegion": expected_region}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, denied_key),
+                    "Condition": {"StringEquals": {"aws:RequestedRegion": wrong_region}}
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let allowed = raw_alt_object_status_eventually(
+            "GetObject allowed by aws:RequestedRegion",
+            RawAltObjectRequest::new("GET", &bucket, allowed_key),
+            200,
+        )
+        .await;
+        assert_eq!(allowed.body, allowed_key);
+
+        let denied = raw_alt_object_status_eventually(
+            "GetObject denied by aws:RequestedRegion mismatch",
+            RawAltObjectRequest::new("GET", &bucket, denied_key),
+            403,
+        )
+        .await;
+        assert_raw_access_denied("GetObject denied by aws:RequestedRegion", &denied);
+
+        cleanup(&bucket, &[allowed_key, denied_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_referer_string_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_key = "referer-matches";
+        let missing_key = "referer-missing";
+        let allowed_referer = "https://example.com/allowed";
+        let wrong_referer = "https://example.com/denied";
+
+        for key in [allowed_key, missing_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(key.as_bytes()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:GetObject",
+                "Resource": [
+                    object_resource(&bucket, allowed_key),
+                    object_resource(&bucket, missing_key)
+                ],
+                "Condition": {"StringEquals": {"aws:referer": allowed_referer}}
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let allowed_headers = [("referer", allowed_referer)];
+        let allowed = raw_alt_object_status_eventually(
+            "GetObject allowed by aws:referer",
+            RawAltObjectRequest::new("GET", &bucket, allowed_key).extra_headers(&allowed_headers),
+            200,
+        )
+        .await;
+        assert_eq!(allowed.body, allowed_key);
+
+        let wrong_headers = [("referer", wrong_referer)];
+        let wrong = raw_alt_object_status_eventually(
+            "GetObject denied by aws:referer mismatch",
+            RawAltObjectRequest::new("GET", &bucket, allowed_key).extra_headers(&wrong_headers),
+            403,
+        )
+        .await;
+        assert_raw_access_denied("GetObject denied by aws:referer mismatch", &wrong);
+
+        let missing = raw_alt_object_status_eventually(
+            "GetObject denied by absent aws:referer",
+            RawAltObjectRequest::new("GET", &bucket, missing_key),
+            403,
+        )
+        .await;
+        assert_raw_access_denied("GetObject denied by absent aws:referer", &missing);
+
+        cleanup(&bucket, &[allowed_key, missing_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_condition_key_names_are_case_insensitive() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let secure_key = "mixed-case-secure-transport";
+        let region_key = "mixed-case-requested-region";
+        let referer_key = "mixed-case-referer";
+        let secure_value = endpoint_is_https().to_string();
+        let referer = "https://example.com/mixed-case";
+
+        for key in [secure_key, region_key, referer_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(key.as_bytes()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, secure_key),
+                    "Condition": {"Bool": {"aws:securetransport": secure_value}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, region_key),
+                    "Condition": {"StringEquals": {"AWS:RequestedRegion": CTX.region()}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, referer_key),
+                    "Condition": {"StringEquals": {"AWS:Referer": referer}}
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let secure = raw_alt_object_status_eventually(
+            "GetObject allowed by mixed-case aws:SecureTransport",
+            RawAltObjectRequest::new("GET", &bucket, secure_key),
+            200,
+        )
+        .await;
+        assert_eq!(secure.body, secure_key);
+
+        let region = raw_alt_object_status_eventually(
+            "GetObject allowed by mixed-case aws:RequestedRegion",
+            RawAltObjectRequest::new("GET", &bucket, region_key),
+            200,
+        )
+        .await;
+        assert_eq!(region.body, region_key);
+
+        let referer_headers = [("referer", referer)];
+        let referer_response = raw_alt_object_status_eventually(
+            "GetObject allowed by mixed-case aws:referer",
+            RawAltObjectRequest::new("GET", &bucket, referer_key).extra_headers(&referer_headers),
+            200,
+        )
+        .await;
+        assert_eq!(referer_response.body, referer_key);
+
+        cleanup(&bucket, &[secure_key, region_key, referer_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_existing_object_tag_prefix_key_is_case_insensitive() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let matching_key = "mixed-case-existing-tag-matches";
+        let differently_cased_key = "mixed-case-existing-tag-different-case";
+        let conflicting_denied_key = "mixed-case-existing-tag-conflicting-denied";
+        let conflicting_allowed_key = "mixed-case-existing-tag-conflicting-allowed";
+
+        for key in [
+            matching_key,
+            differently_cased_key,
+            conflicting_denied_key,
+            conflicting_allowed_key,
+        ] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(key.as_bytes()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(matching_key)
+            .tagging(simple_bucket_tagging("Classification", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(differently_cased_key)
+            .tagging(simple_bucket_tagging("classification", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(conflicting_denied_key)
+            .tagging(
+                Tagging::builder()
+                    .tag_set(
+                        Tag::builder()
+                            .key("Classification")
+                            .value("private")
+                            .build()
+                            .unwrap(),
+                    )
+                    .tag_set(
+                        Tag::builder()
+                            .key("classification")
+                            .value("public")
+                            .build()
+                            .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(conflicting_allowed_key)
+            .tagging(
+                Tagging::builder()
+                    .tag_set(
+                        Tag::builder()
+                            .key("Classification")
+                            .value("public")
+                            .build()
+                            .unwrap(),
+                    )
+                    .tag_set(
+                        Tag::builder()
+                            .key("classification")
+                            .value("private")
+                            .build()
+                            .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:GetObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "S3:ExistingObjectTag/Classification": "public"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let allowed = eventually_ok(
+            "GetObject with mixed-case ExistingObjectTag condition key prefix and exact tag case",
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(matching_key)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            allowed.body.collect().await.unwrap().into_bytes().as_ref(),
+            matching_key.as_bytes()
+        );
+
+        let allowed = eventually_ok(
+            "GetObject with mixed-case ExistingObjectTag condition key prefix and different tag case",
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(differently_cased_key)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            allowed.body.collect().await.unwrap().into_bytes().as_ref(),
+            differently_cased_key.as_bytes()
+        );
+
+        eventually_access_denied(
+            "GetObject with mixed-case ExistingObjectTag condition key prefix and conflicting denied tag cases",
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(conflicting_denied_key)
+                    .send()
+            },
+        )
+        .await;
+
+        let allowed = eventually_ok(
+            "GetObject with mixed-case ExistingObjectTag condition key prefix and conflicting allowed tag cases",
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(conflicting_allowed_key)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            allowed.body.collect().await.unwrap().into_bytes().as_ref(),
+            conflicting_allowed_key.as_bytes()
+        );
+
+        cleanup(
+            &bucket,
+            &[
+                matching_key,
+                differently_cased_key,
+                conflicting_denied_key,
+                conflicting_allowed_key,
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_prefix_key_is_case_insensitive() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let matching_key = "mixed-case-request-tag-matches";
+        let differently_cased_key = "mixed-case-request-tag-different-case";
+        let conflicting_allowed_key = "mixed-case-request-tag-conflicting-allowed";
+        let conflicting_reversed_key = "mixed-case-request-tag-conflicting-reversed";
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "S3:RequestObjectTag/Classification": "public"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject with mixed-case RequestObjectTag condition key prefix and exact tag case",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(matching_key)
+                    .tagging("Classification=public")
+                    .body(ByteStream::from_static(matching_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok(
+            "PutObject with mixed-case RequestObjectTag condition key prefix and different tag case",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(differently_cased_key)
+                    .tagging("classification=public")
+                    .body(ByteStream::from_static(differently_cased_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with mixed-case RequestObjectTag condition key prefix and conflicting tag cases",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(conflicting_allowed_key)
+                    .tagging("Classification=private&classification=public")
+                    .body(ByteStream::from_static(conflicting_allowed_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with mixed-case RequestObjectTag condition key prefix and reversed conflicting tag cases",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(conflicting_reversed_key)
+                    .tagging("classification=public&Classification=private")
+                    .body(ByteStream::from_static(conflicting_reversed_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(
+            &bucket,
+            &[
+                matching_key,
+                differently_cased_key,
+                conflicting_allowed_key,
+                conflicting_reversed_key,
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_case_equivalent_values_preserve_set_operators() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let for_all_allowed_key = "request-tag-for-all-case-equivalent-allowed";
+        let for_all_denied_key = "request-tag-for-all-case-equivalent-denied";
+        let for_any_allowed_key = "request-tag-for-any-case-equivalent-allowed";
+        let for_any_denied_key = "request-tag-for-any-case-equivalent-denied";
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                    "Resource": [
+                        object_resource(&bucket, for_all_allowed_key),
+                        object_resource(&bucket, for_all_denied_key)
+                    ],
+                    "Condition": {
+                        "ForAllValues:StringEquals": {
+                            "S3:RequestObjectTag/Classification": "public"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                    "Resource": [
+                        object_resource(&bucket, for_any_allowed_key),
+                        object_resource(&bucket, for_any_denied_key)
+                    ],
+                    "Condition": {
+                        "ForAnyValue:StringEquals": {
+                            "S3:RequestObjectTag/Classification": "public"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObject with ForAllValues:StringEquals and all case-equivalent request tag values matching",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(for_all_allowed_key)
+                    .tagging("Classification=public&classification=public")
+                    .body(ByteStream::from_static(for_all_allowed_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutObject denied by ForAllValues:StringEquals when one case-equivalent request tag differs",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(for_all_denied_key)
+                    .tagging("Classification=public&classification=private")
+                    .body(ByteStream::from_static(for_all_denied_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with ForAnyValue:StringEquals and one case-equivalent request tag matching",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(for_any_allowed_key)
+                    .tagging("Classification=private&classification=public")
+                    .body(ByteStream::from_static(for_any_allowed_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutObject denied by ForAnyValue:StringEquals when no case-equivalent request tag matches",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(for_any_denied_key)
+                    .tagging("Classification=private&classification=internal")
+                    .body(ByteStream::from_static(for_any_denied_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(
+            &bucket,
+            &[
+                for_all_allowed_key,
+                for_all_denied_key,
+                for_any_allowed_key,
+                for_any_denied_key,
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_case_equivalent_values_preserve_binary_equals() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let binary_allowed_key = "request-tag-binary-case-equivalent-allowed";
+        let binary_denied_key = "request-tag-binary-case-equivalent-denied";
+        let for_all_allowed_key = "request-tag-binary-for-all-case-equivalent-allowed";
+        let for_all_denied_key = "request-tag-binary-for-all-case-equivalent-denied";
+        let for_any_allowed_key = "request-tag-binary-for-any-case-equivalent-allowed";
+        let for_any_denied_key = "request-tag-binary-for-any-case-equivalent-denied";
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                    "Resource": [
+                        object_resource(&bucket, binary_allowed_key),
+                        object_resource(&bucket, binary_denied_key)
+                    ],
+                    "Condition": {
+                        "BinaryEquals": {
+                            "S3:RequestObjectTag/Classification": "cHVibGlj"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                    "Resource": [
+                        object_resource(&bucket, for_all_allowed_key),
+                        object_resource(&bucket, for_all_denied_key)
+                    ],
+                    "Condition": {
+                        "ForAllValues:BinaryEquals": {
+                            "S3:RequestObjectTag/Classification": "cHVibGlj"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                    "Resource": [
+                        object_resource(&bucket, for_any_allowed_key),
+                        object_resource(&bucket, for_any_denied_key)
+                    ],
+                    "Condition": {
+                        "ForAnyValue:BinaryEquals": {
+                            "S3:RequestObjectTag/Classification": "cHVibGlj"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObject with BinaryEquals and one case-equivalent request tag value matching",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(binary_allowed_key)
+                    .tagging("Classification=cHJpdmF0ZQ==&classification=cHVibGlj")
+                    .body(ByteStream::from_static(binary_allowed_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutObject denied by BinaryEquals when no case-equivalent request tag value matches",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(binary_denied_key)
+                    .tagging("Classification=cHJpdmF0ZQ==&classification=aW50ZXJuYWw=")
+                    .body(ByteStream::from_static(binary_denied_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with ForAllValues:BinaryEquals and all case-equivalent request tag values matching",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(for_all_allowed_key)
+                    .tagging("Classification=cHVibGlj&classification=cHVibGlj")
+                    .body(ByteStream::from_static(for_all_allowed_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutObject denied by ForAllValues:BinaryEquals when one case-equivalent request tag differs",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(for_all_denied_key)
+                    .tagging("Classification=cHVibGlj&classification=cHJpdmF0ZQ==")
+                    .body(ByteStream::from_static(for_all_denied_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with ForAnyValue:BinaryEquals and one case-equivalent request tag matching",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(for_any_allowed_key)
+                    .tagging("Classification=cHJpdmF0ZQ==&classification=cHVibGlj")
+                    .body(ByteStream::from_static(for_any_allowed_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutObject denied by ForAnyValue:BinaryEquals when no case-equivalent request tag matches",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(for_any_denied_key)
+                    .tagging("Classification=cHJpdmF0ZQ==&classification=aW50ZXJuYWw=")
+                    .body(ByteStream::from_static(for_any_denied_key.as_bytes()))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(
+            &bucket,
+            &[
+                binary_allowed_key,
+                binary_denied_key,
+                for_all_allowed_key,
+                for_all_denied_key,
+                for_any_allowed_key,
+                for_any_denied_key,
+            ],
+        )
+        .await;
     });
 }
 

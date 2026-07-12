@@ -531,6 +531,9 @@ The current implemented evaluator is strongest on:
 - `aws:SourceIp`
 - `aws:CurrentTime`
 - `aws:EpochTime`
+- `aws:SecureTransport`
+- `aws:RequestedRegion`
+- `aws:referer`
 - the supported `s3:x-amz-*` request condition keys already threaded through
   `PolicyRequest`
 
@@ -601,6 +604,10 @@ by AWS up to nanosecond precision. `aws:EpochTime` exposes the same timestamp
 as Unix epoch seconds for numeric operators. AWS accepts malformed date
 operands in stored bucket policies; invalid operands are therefore handled at
 evaluation time rather than rejected by `PutBucketPolicy`.
+
+`aws:SecureTransport` is derived from the actual listener transport,
+`aws:RequestedRegion` is the configured S3 endpoint region, and `aws:referer`
+uses the request `Referer` header with normal absent-key condition semantics.
 
 Policy variables are implemented only for request-backed values that Argmin
 can model exactly. Variables are expanded in `Resource` patterns and string

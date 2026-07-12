@@ -417,6 +417,9 @@ pub struct Requester {
     pub(super) authorization_profile: auth::AuthorizationProfile,
     pub(super) source_ip: Option<std::net::IpAddr>,
     pub(super) request_epoch_seconds: Option<u64>,
+    pub(super) secure_transport: Option<bool>,
+    pub(super) requested_region: Option<String>,
+    pub(super) referer: Option<Option<String>>,
 }
 
 /// Parsed x-amz-acl value relevant to PutObject authorization rules.
@@ -1197,6 +1200,9 @@ impl Requester {
             authorization_profile: auth.authorization_profile,
             source_ip: None,
             request_epoch_seconds: None,
+            secure_transport: None,
+            requested_region: None,
+            referer: None,
         }
     }
 
@@ -1208,6 +1214,9 @@ impl Requester {
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
             request_epoch_seconds: None,
+            secure_transport: None,
+            requested_region: None,
+            referer: None,
         }
     }
 
@@ -1219,6 +1228,9 @@ impl Requester {
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
             request_epoch_seconds: None,
+            secure_transport: None,
+            requested_region: None,
+            referer: None,
         }
     }
 
@@ -1230,6 +1242,9 @@ impl Requester {
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
             request_epoch_seconds: None,
+            secure_transport: None,
+            requested_region: None,
+            referer: None,
         }
     }
 
@@ -1241,6 +1256,9 @@ impl Requester {
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
             source_ip: None,
             request_epoch_seconds: None,
+            secure_transport: None,
+            requested_region: None,
+            referer: None,
         }
     }
 
@@ -1267,6 +1285,39 @@ impl Requester {
     }
 
     #[must_use]
+    pub const fn with_secure_transport(mut self, secure_transport: Option<bool>) -> Self {
+        self.secure_transport = secure_transport;
+        self
+    }
+
+    #[must_use]
+    pub const fn secure_transport(&self) -> Option<bool> {
+        self.secure_transport
+    }
+
+    #[must_use]
+    pub fn with_requested_region(mut self, requested_region: Option<String>) -> Self {
+        self.requested_region = requested_region;
+        self
+    }
+
+    #[must_use]
+    pub fn requested_region(&self) -> Option<&str> {
+        self.requested_region.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_referer(mut self, referer: Option<String>) -> Self {
+        self.referer = Some(referer);
+        self
+    }
+
+    #[must_use]
+    pub fn referer(&self) -> Option<Option<&str>> {
+        self.referer.as_ref().map(|referer| referer.as_deref())
+    }
+
+    #[must_use]
     #[cfg(any(test, feature = "test-utils"))]
     pub fn from_account_owner_account_admin(account: Option<&AccountIdentity>) -> Self {
         Self {
@@ -1274,6 +1325,9 @@ impl Requester {
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
             source_ip: None,
             request_epoch_seconds: None,
+            secure_transport: None,
+            requested_region: None,
+            referer: None,
         }
     }
 
@@ -1288,6 +1342,9 @@ impl Requester {
             authorization_profile,
             source_ip: None,
             request_epoch_seconds: None,
+            secure_transport: None,
+            requested_region: None,
+            referer: None,
         }
     }
 
@@ -1302,6 +1359,9 @@ impl Requester {
             authorization_profile,
             source_ip: None,
             request_epoch_seconds: None,
+            secure_transport: None,
+            requested_region: None,
+            referer: None,
         }
     }
 
