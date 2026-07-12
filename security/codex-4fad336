@@ -1,0 +1,163 @@
+UTF-8 boundary panic in bucket policy condition key lookup
+Link: https://chatgpt.com/codex/cloud/security/findings/f21346c6ead8819187ca8a9f95bbc659?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 4fad336
+Author: justin@specialbusservice.com
+Created: 12/07/2026, 11:07:44
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced. The previous `strip_prefix`-based matching was UTF-8 safe; the commit replaced it with manual `split_at(prefix.len())` prefix extraction without verifying that `prefix.len()` is a character boundary in the attacker-controlled condition key.
+The new case-insensitive prefix matching implementation calls `key.split_at(prefix.len())` after checking only the byte length of the policy condition key. Rust string slicing requires the split index to be a valid UTF-8 character boundary. A bucket policy containing a non-ASCII condition key whose bytes cross the prefix-length offset can therefore panic during condition-key lookup. This lookup is reached while validating a PutBucketPolicy request via `validate_evaluable_object_conditions()`, so an authenticated principal with permission to set a bucket policy can make the request handler panic instead of receiving a normal MalformedPolicy error. Under the default Rust unwinding behavior this is likely limited to the connection/task handling the request, but it is still an attacker-triggerable crash path and could become process-wide if built with panic=abort.
+
+# Resolution
+Fixed by `1ffb04c7` (`Fix UTF-8 condition key policy validation`). Prefix
+condition-key matching now uses UTF-8 boundary-aware `str::get` instead of
+slicing with `split_at(prefix.len())`, so policy-controlled non-ASCII keys
+whose byte offset crosses a multibyte character simply do not match a prefix
+resolver. The duplicate policy-variable key matcher was also removed so policy
+variables use the same safe lookup path.
+
+The `PutBucketPolicy` validation path now distinguishes unknown condition keys
+from known keys that are unsupported for an action. Unknown keys return the
+AWS-pinned `MalformedPolicy` response with message
+`Policy has an invalid condition key` and `<Detail>` echoing the offending key.
+
+Validation:
+
+- `./scripts/aws-tests --test bucket_policy test_put_bucket_policy_malformed_response_shapes -- --nocapture`
+- `cargo nextest run -p s3-tests --test bucket_policy test_put_bucket_policy_malformed_response_shapes`
+- `cargo nextest run -p auth key_match_prefix_rejects_non_boundary_prefix_length`
+
+# Validation
+## Rubric
+- [x] Confirm the changed matcher slices policy-controlled UTF-8 using a byte index from `prefix.len()` after only a byte-length check.
+- [x] Identify an actual prefix resolver whose ASCII prefix length can be targeted; first prefix is `s3:ExistingObjectTag/` with length 21.
+- [x] Construct a valid JSON bucket policy whose condition key length is >= 21 and whose byte offset 21 is not a UTF-8 character boundary.
+- [x] Exercise the real parse and validation path (`parse_bucket_policy` then `validate_evaluable_object_conditions`) rather than a standalone copy of the matcher.
+- [x] Produce direct crash evidence and attempt secondary validation with debugger/valgrind; LLDB confirmed the vulnerable frame and valgrind was unavailable.
+## Report
+Validated the suspected panic with a targeted Rust integration-test PoC. Code review of the touched path shows `KeyMatch::match_key` checks only `key.len() >= prefix.len()` and then calls `key.split_at(prefix.len())` at `crates/auth/src/bucket_policy/condition_key.rs:74-75`. The condition-key table begins with the ASCII prefix `s3:ExistingObjectTag/` at `condition_key.rs:142`; its length is 21 bytes. Lookup iterates policy-supplied condition keys through `resolver.key.match_key(key)` at `condition_key.rs:431-433`, and policy validation reaches this via `clause_action_status()` at `condition_key.rs:793-797` from `BucketPolicy::validate_evaluable_object_conditions()` at `crates/auth/src/bucket_policy.rs:133-135` and `conditions_supported_for_policy_actions()` at `bucket_policy.rs:1027-1030`. The PutBucketPolicy path parses attacker-supplied JSON and then calls this validator at `crates/server-core/src/coordinator/authz/bucket.rs:536-549`.
+
+The PoC test creates a valid JSON bucket policy with condition key `aaaaaaaaaaaaaaaaaaaaé` where byte index 21 falls inside the two-byte UTF-8 `é`. Running `RUST_BACKTRACE=1 cargo test -p auth --test utf8_condition_panic -- --nocapture` exits 101 and panics: `end byte index 21 is not a char boundary; it is inside 'é' (bytes 20..22) of `aaaaaaaaaaaaaaaaaaaaé``. The stack includes `core::str::<impl str>::split_at`, `auth::bucket_policy::condition_key::KeyMatch::match_key` at `condition_key.rs:75:53`, `lookup` at `condition_key.rs:433:43`, `clause_action_status` at `condition_key.rs:797:36`, and `BucketPolicy::validate_evaluable_object_conditions` at `bucket_policy.rs:135:27`.
+
+Debugger validation was also attempted with LLDB. A breakpoint at `condition_key.rs:75` stopped with `key=(data_ptr = "aaaaaaaaaaaaaaaaaaaaé", length = 22)` immediately before `split_at(prefix.len())`; the LLDB backtrace confirmed the same call chain from `validate_evaluable_object_conditions()` to `match_key()`. Valgrind was attempted but unavailable in the container (`bash: command not found: valgrind`).
+
+# Evidence
+crates/auth/src/bucket_policy/condition_key.rs (L431 to 436)
+  Note: Condition-key lookup iterates through all resolvers and calls the vulnerable matcher for policy-supplied condition keys.
+```
+pub(super) fn lookup(key: &str) -> Option<(&'static ConditionKeyResolver, &str)> {
+    for resolver in CONDITION_KEYS {
+        if let Some(param) = resolver.key.match_key(key) {
+            return Some((resolver, param));
+        }
+    }
+```
+
+crates/auth/src/bucket_policy/condition_key.rs (L70 to 78)
+  Note: The introduced prefix matcher slices the attacker-controlled UTF-8 condition key at `prefix.len()` bytes. If that byte offset lands inside a multibyte character, `split_at` panics.
+```
+impl KeyMatch {
+    fn match_key<'a>(&self, key: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Exact(name) => key.eq_ignore_ascii_case(name).then_some(""),
+            Self::Prefix(prefix) if key.len() >= prefix.len() => {
+                let (candidate_prefix, param) = key.split_at(prefix.len());
+                candidate_prefix
+                    .eq_ignore_ascii_case(prefix)
+                    .then_some(param)
+```
+
+crates/auth/src/bucket_policy/condition_key.rs (L793 to 799)
+  Note: Bucket policy validation reaches condition-key lookup through `clause_action_status`, so malformed non-ASCII condition keys can panic during policy validation.
+```
+pub(super) fn clause_action_status(
+    clause: &PolicyConditionClause,
+    action: PolicyAction,
+) -> ConditionActionStatus {
+    let Some((resolver, _param)) = lookup(clause.key.as_str()) else {
+        return ConditionActionStatus::Unsupported;
+    };
+```
+
+crates/server-core/src/coordinator/authz/bucket.rs (L536 to 550)
+  Note: PutBucketPolicy parses attacker-supplied policy JSON and then calls `validate_evaluable_object_conditions`, exposing the panic to authenticated bucket-policy writers.
+```
+            auth::parse_bucket_policy(req.config).map_err(|e| ServerError::MalformedPolicy {
+                reason: e.reason().to_string(),
+                detail: e.detail().map(str::to_string),
+            })?;
+        if let Some(resource) =
+            parsed_policy.first_resource_not_scoped_to_bucket(req.bucket.name.as_str())
+        {
+            return Err(ServerError::MalformedPolicy {
+                reason: "Policy has invalid resource".to_string(),
+                detail: Some(resource.to_string()),
+            });
+        }
+        parsed_policy
+            .validate_evaluable_object_conditions()
+            .map_err(|e| ServerError::MalformedPolicy {
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Severity is kept at low. The vulnerability is real and in-scope: production HTTP PutBucketPolicy handling parses attacker-supplied policy JSON and reaches the unsafe split_at(prefix.len()) condition-key lookup. However, probability and impact are both constrained. Reachability requires SigV4 authentication and authorization for s3:PutBucketPolicy, an admin-like bucket policy privilege evidenced in coordinator authorization. The default listener is 127.0.0.1:9000 and typical deployments are local/internal, with no repository ingress or load balancer manifests indicating public exposure. The proven impact is availability only: a panic in the request validation path, likely scoped to the request/connection task under default unwinding because connections are handled in spawned Tokio tasks and the workspace does not configure panic=abort. Process-wide crash is conditional on non-default build/runtime choices. There is no demonstrated confidentiality, integrity, identity, cross-tenant, or code-execution impact, so medium/high/critical would overstate the risk.
+## Likelihood
+high - The input is easy to craft and the path is real, but exploitation requires valid authenticated credentials with s3:PutBucketPolicy on a bucket, which is an administrative capability. Default exposure is loopback/internal rather than public internet. This makes opportunistic exploitation unlikely, though plausible by a malicious or compromised bucket administrator. | Remote network vector
+## Impact
+low - The demonstrated effect is a Rust panic during bucket policy validation. Under default unwind behavior this is likely limited to the request/connection Tokio task, causing a failed request and log noise. Repeated use by a privileged actor can degrade availability, and panic=abort could make it process-wide, but the repository does not set panic=abort and there is no data disclosure, data corruption, auth bypass, or code execution.
+## Assumptions
+- Static-only review of repository artifacts; no cloud APIs or live deployment inspection were used.
+- Production builds use Rust's default unwinding panic strategy unless an operator or build system sets panic=abort outside the repository.
+- The default deployment binds to 127.0.0.1:9000, but operators can expose ARGMIN_LISTEN_ADDR on a remote interface.
+- A realistic attacker for this path is an authenticated S3 principal that can perform s3:PutBucketPolicy on the target bucket.
+- argmin-s3 frontend reachable over HTTP/HTTPS
+- valid SigV4-authenticated credentials
+- authorization to call PutBucketPolicy on an existing bucket
+- bucket policy JSON containing a non-ASCII condition key where a known ASCII prefix length falls inside a multibyte UTF-8 code point
+## Path
+Authenticated admin client -> PUT /bucket?policy -> parse policy JSON -> validate_evaluable_object_conditions -> condition_key::lookup -> key.split_at(prefix.len()) on malformed UTF-8 boundary -> panic -> request/connection task crash
+## Path evidence
+- `crates/auth/src/bucket_policy/condition_key.rs:70-78` - Vulnerable matcher checks key.len() against prefix.len() and then calls key.split_at(prefix.len()) on attacker-controlled UTF-8 without verifying a character boundary.
+- `crates/auth/src/bucket_policy/condition_key.rs:140-146` - Condition-key table contains prefix matchers, including s3:ExistingObjectTag/, whose ASCII byte length can be targeted by a non-ASCII key.
+- `crates/auth/src/bucket_policy/condition_key.rs:431-437` - lookup() iterates all condition-key resolvers and calls the vulnerable matcher for the policy-supplied condition key.
+- `crates/auth/src/bucket_policy/condition_key.rs:793-799` - Bucket policy clause validation reaches lookup(clause.key.as_str()).
+- `crates/auth/src/bucket_policy.rs:133-136` - validate_evaluable_object_conditions() is part of bucket policy validation and returns MalformedPolicy-style errors for unsupported conditions, but the panic occurs before normal error handling.
+- `crates/auth/src/bucket_policy.rs:1027-1030` - Validation checks all policy condition clauses through condition_key::supports_clause_for_action(), completing the path to the vulnerable condition-key lookup.
+- `crates/server-http/src/http/router.rs:439-441` - The production HTTP router maps PUT requests with a policy query parameter to S3Operation::PutBucketPolicy.
+- `crates/server-http/src/http/mod.rs:2583-2605` - PutBucketPolicy handling treats the HTTP body as UTF-8 policy JSON, builds a PutBucketPolicyRequest, and dispatches it to the coordinator.
+- `crates/server-core/src/coordinator/authz/bucket.rs:529-549` - The coordinator first authorizes s3:PutBucketPolicy, then parses the attacker-supplied policy and calls validate_evaluable_object_conditions(), making the panic reachable to authorized policy writers.
+- `crates/server-core/src/coordinator/authz.rs:471-478` - Default authorization for bucket-owner-account admin is strong and limits reachability to high-privilege principals unless policy grants exist.
+- `crates/argmin-s3/src/config.rs:327-369` - Configuration documents required S3 credentials, default listen address, TLS options, max connections/in-flight requests, and diagnostic panic/abort modes.
+- `crates/argmin-s3/src/config.rs:429` - Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000, reducing default exposure unless operators bind to a remote interface.
+- `crates/argmin-s3/src/main.rs:4814-4895` - The argmin-s3 binary binds the configured TCP listener and starts the HTTP or HTTPS frontend service.
+- `crates/server-http/src/http/serve.rs:185-194` - panic_on_500 and abort_on_500 are diagnostic modes; aborting behavior is not the default request-error path.
+- `crates/server-http/src/http/serve.rs:597-634` - Each accepted connection is handled in a spawned Tokio task, supporting the assessment that default unwinding is likely task/connection-scoped rather than a guaranteed process-wide crash.
+- `README.md:35-49` - Operational documentation states the service must run as non-root and shows default localhost listen address and required credential-related environment variables.
+- `guides/threat_model.md:6-20` - Threat model identifies argmin-s3 as the production S3-compatible HTTP server and includes bucket policy paths.
+- `guides/threat_model.md:37-48` - Threat model places HTTP request components and authentication at security boundaries and excludes developer/test utilities, confirming this path is in-scope production runtime.
+- `guides/threat_model.md:125-129` - Threat model explicitly includes authenticated malicious clients causing availability exhaustion, matching the relevant attacker class.
+## Narrative
+The finding is a real, validated security-relevant availability bug in the production S3 bucket policy path. A PUT /bucket?policy request body is attacker-controlled after SigV4 authentication and PutBucketPolicy authorization. The parsed policy is validated with validate_evaluable_object_conditions(), which reaches condition_key::lookup() and calls KeyMatch::match_key() for policy-supplied condition keys. For prefix resolvers such as s3:ExistingObjectTag/, match_key() checks only byte length and then slices the attacker-controlled Rust str at prefix.len(); if that byte offset is inside a multibyte character, Rust panics. The provided validation PoC exercised the real parse and validation path and produced a split_at UTF-8 boundary panic. Severity remains low because exploitation requires high bucket-policy privileges and primarily crashes the current request/connection task under default unwinding; there is no demonstrated confidentiality, integrity, auth bypass, or cross-boundary impact.
+## Controls
+- SigV4 authentication for non-anonymous S3 requests
+- PutBucketPolicy authorization requires bucket owner/admin or an existing policy decision allowing s3:PutBucketPolicy
+- Default listener is 127.0.0.1:9000
+- Optional direct TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Max connections and max in-flight request limits
+- Process refuses to run as root
+- Secrets in config Debug output are redacted
+- panic_on_500 and abort_on_500 default to false
+## Blindspots
+- No deployment manifests, service units, container files, Kubernetes ingress, or load balancer configuration were present in the inspected repository, so real-world public exposure cannot be determined statically.
+- Static review cannot prove every production build uses unwind panic strategy; external build flags could set panic=abort and raise availability impact.
+- No live service was exercised during attack-path review; runtime behavior relies on prior validation evidence and static code paths.
+- Repository supports configurable TLS and listen address, but the actual operator configuration is unknown.
