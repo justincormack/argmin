@@ -1,0 +1,173 @@
+POST uploads bypass website redirect policy condition
+Link: https://chatgpt.com/codex/cloud/security/findings/5c6e2c613db88191b50c012f2edc39da?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: bb65ecc
+Author: justin@specialbusservice.com
+Created: 12/07/2026, 13:49:03
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced bug: POST Object request policy context omits the accepted website redirect form field, causing the newly supported s3:x-amz-website-redirect-location condition key to be evaluated against None/Absent for POST uploads.
+The new condition key is registered and object authorization resolves it from PutObjectPolicyContext.website_redirect_location. Normal PUT paths populate that field from the x-amz-website-redirect-location header, but the POST Object path only copies the form field into metadata and then builds a PutObjectPolicyContext without calling with_website_redirect_location(field(...)). As a result, bucket-policy Deny statements such as StringEquals/StringLike on s3:x-amz-website-redirect-location see the value as absent for POST Object and do not match. A client that otherwise has PutObject permission, including a public-write or delegated POST upload flow, can upload an object with redirect metadata that the bucket policy was intended to forbid. The equivalent PUT request is correctly evaluated, so this is an introduced authorization gap in the new condition-key support.
+
+# Resolution
+Fixed in commit [be278936a5bf2fb2a61188ce650ee5b5fddf2b48](https://github.com/justincormack/argmin/commit/be278936a5bf2fb2a61188ce650ee5b5fddf2b48).
+
+The fix adds AWS-facing coverage proving that `s3:x-amz-website-redirect-location`
+is evaluated for POST Object form fields: a broad `PutObject` allow remains
+successful for a nonmatching redirect value, while an explicit Deny on
+`/docs/blocked.html` rejects the matching POST form field with `AccessDenied`.
+
+The local POST Object path now passes the accepted
+`x-amz-website-redirect-location` form field into `PutObjectPolicyContext` via
+`with_website_redirect_location(field(WEBSITE_REDIRECT_LOCATION_HEADER_NAME))`,
+matching the existing PUT path and preventing redirect metadata from bypassing
+bucket-policy Deny conditions.
+
+Validated after the fix:
+
+- `./scripts/aws-tests --test bucket_policy test_bucket_policy_auth_request_context_condition_keys -- --nocapture`
+- `cargo nextest run -p s3-tests --test bucket_policy test_bucket_policy_auth_request_context_condition_keys`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `git diff --check`
+
+# Validation
+## Rubric
+- [x] Confirm the new s3:x-amz-website-redirect-location key is registered and policy evaluation reads it from PutObjectPolicyContext.
+- [x] Confirm POST Object accepts x-amz-website-redirect-location as a form field/metadata value.
+- [x] Confirm POST Object omits that accepted form field when building PutObjectPolicyContext.
+- [x] Dynamically compare same bucket-policy Deny against PUT versus POST: PUT must be denied, vulnerable POST must be allowed.
+- [x] Confirm the minimal one-line propagation fix causes the PoC regression test to pass.
+## Report
+Validated the finding with a targeted Rust unit-test PoC. The registered condition key is present at crates/auth/src/bucket_policy/condition_key.rs:355-361 and resolves via request.website_redirect_location() at condition_key.rs:640-645. Object authorization copies only input.policy_context.website_redirect_location into policy evaluation at crates/server-core/src/coordinator/authz/policy.rs:155-160. POST Object accepts the x-amz-website-redirect-location form field into parsed metadata at crates/server-http/src/http/mod.rs:3630-3647, but the POST authorization context built at http/mod.rs:3680-3692 does not call with_website_redirect_location(...). By contrast, the PUT path supplies req.header(WEBSITE_REDIRECT_LOCATION_HEADER_NAME) at http/mod.rs:4044-4052. I added a PoC test that installs a bucket-policy Deny for s3:x-amz-website-redirect-location == /blocked.html, confirms an equivalent signed PUT is denied, then submits a signed POST Object form with x-amz-website-redirect-location=/blocked.html. On the vulnerable commit, prepare_streaming_post_object returns Ok, so the PoC panics with BUG_REPRODUCED. Command output: `test http::tests::poc_post_object_website_redirect_policy_bypass ... FAILED` and panic message `POST Object ... bypassed the bucket-policy Deny that blocks the same PUT header`. I also verified the proposed one-line fix `.with_website_redirect_location(field(WEBSITE_REDIRECT_LOCATION_HEADER_NAME))` makes the same test pass. Valgrind and gdb were unavailable in the container; lldb was available and stopped at the PoC panic line with a backtrace showing POST reached the unexpected Ok branch.
+
+# Evidence
+crates/auth/src/bucket_policy/condition_key.rs (L355 to 361)
+  Note: The commit registers s3:x-amz-website-redirect-location as a supported, evaluable bucket-policy condition key for non-GET actions.
+```
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-website-redirect-location"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
+        resolve: resolve_website_redirect_location,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+```
+
+crates/server-core/src/coordinator/authz/policy.rs (L155 to 160)
+  Note: Object policy evaluation reads the website redirect condition value exclusively from input.policy_context.website_redirect_location.
+```
+    .with_request_object_tags(input.request_object_tags)
+    .with_copy_source(input.policy_context.copy_source)
+    .with_metadata_directive(input.policy_context.metadata_directive)
+    .with_canned_acl(input.policy_context.canned_acl)
+    .with_website_redirect_location(input.policy_context.website_redirect_location)
+    .with_server_side_encryption(
+```
+
+crates/server-http/src/http/mod.rs (L3630 to 3647)
+  Note: POST Object accepts the x-amz-website-redirect-location form field and includes it in parsed system metadata, so the uploaded object can persist the redirect value.
+```
+        // Also pass cache-control, content-disposition, etc.
+        for name in &[
+            "cache-control",
+            "content-disposition",
+            "content-encoding",
+            "content-language",
+            "expires",
+            WEBSITE_REDIRECT_LOCATION_HEADER_NAME,
+        ] {
+            if let Some(val) = field(name) {
+                header_pairs.push((name.to_string(), val.to_string()));
+            }
+        }
+        let hp_refs: Vec<(&str, &str)> = header_pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (metadata_blob, system_metadata) = parse_request_metadata(hp_refs.iter().copied())?;
+```
+
+crates/server-http/src/http/mod.rs (L3680 to 3692)
+  Note: The POST Object authorization context is built without passing the accepted website redirect form field, so bucket policy conditions see it as absent.
+```
+                acl: acl.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::new(
+                    None,
+                    None,
+                    acl.policy_condition_value(),
+                )
+                .with_if_match(req.header("if-match"))
+                .with_if_none_match(cond.if_none_match_policy_value())
+                .with_managed_encryption(managed_encryption)
+                .with_sse_customer_algorithm(
+                    sse_customer_request.as_ref().map(|req| req.algorithm()),
+                )
+                .with_request_object_tags_xml(tags_xml.as_deref()),
+```
+
+crates/server-http/src/http/mod.rs (L4043 to 4052)
+  Note: By contrast, the streaming PUT path correctly supplies website_redirect_location to the policy context, showing the omission is specific to POST Object.
+```
+                    policy_context: put_object_policy_context_from_request_fields(
+                        PutObjectPolicyContextFields {
+                            tags_xml: inline_tags_xml.as_deref(),
+                            copy_source: None,
+                            metadata_directive: None,
+                            canned_acl: parse_put_object_acl(req.header("x-amz-acl"))
+                                .policy_condition_value(),
+                            website_redirect_location: req
+                                .header(WEBSITE_REDIRECT_LOCATION_HEADER_NAME),
+                            managed_encryption,
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Severity remains medium. Static evidence and the prior executable PoC support that the finding is real and reachable through the production POST Object path. The policy condition key is registered, POST accepts and persists x-amz-website-redirect-location, and POST authorization omits the condition value while PUT includes it. However, the attacker must already have a PutObject-capable path and the demonstrated impact is limited to bypassing a narrow metadata restriction, not broad authentication bypass, data exfiltration, destructive write access beyond existing permission, RCE, or secret compromise. This supports medium rather than high/critical.
+## Likelihood
+high - The vulnerable path is a normal HTTP POST Object API path and the attacker controls multipart form fields. Exploitation is low complexity once the preconditions exist, but it requires a specific bucket policy using this newly supported condition and an already-authorized, delegated, or public-write upload path. | Remote network vector
+## Impact
+medium - The bug lets a PutObject-capable uploader bypass a specific bucket-policy condition and persist redirect metadata the bucket owner intended to forbid. This is an integrity and authorization-control failure, but it does not grant general PutObject permission, bypass SigV4 globally, read private data, delete objects, execute code, or expose credentials. Repository evidence shows the metadata is returned as an S3 header; no stronger executable sink was identified.
+## Assumptions
+- Assessment is limited to repository artifacts in /workspace/argmin; no cloud APIs or deployed bucket configuration were inspected.
+- Exploitability requires a deployment where the argmin-s3 HTTP frontend is reachable by the attacker and a bucket grants the attacker a PutObject-capable path.
+- The affected policy condition matters only where operators rely on bucket-policy Deny/Allow logic involving s3:x-amz-website-redirect-location for POST Object uploads.
+- argmin-s3 HTTP frontend reachable on its configured listener
+- target bucket grants attacker PutObject through authenticated credentials, signed POST form, delegated upload, or public-write ACL/policy
+- bucket policy uses s3:x-amz-website-redirect-location to restrict redirect metadata
+- attacker submits multipart POST Object with x-amz-website-redirect-location form field before the file part
+## Path
+client -> HTTP POST /bucket -> streaming POST Object -> redirect form field parsed as metadata -> policy context missing redirect value -> bucket policy condition sees absent value -> object written
+## Path evidence
+- `crates/argmin-s3/src/main.rs:4902-4978` - The main product binary binds a TCP listener and starts the server-http service, making this a runtime HTTP API issue rather than test-only code.
+- `crates/server-http/src/http/router.rs:580-592` - POST /{bucket} without ?delete routes to S3Operation::PostObject.
+- `crates/server-http/src/http/serve.rs:1993-2006` - The streaming server path identifies PostObject requests from normal HTTP request parts.
+- `crates/server-http/src/http/serve.rs:2700-2750` - Multipart form fields are attacker-controlled and are passed to prepare_streaming_post_object before the file body is accepted.
+- `crates/auth/src/bucket_policy/condition_key.rs:355-361` - The s3:x-amz-website-redirect-location bucket-policy condition key is supported and evaluable for non-GET actions.
+- `crates/auth/src/bucket_policy/condition_key.rs:640-645` - The condition resolver reads the value from PolicyRequest.website_redirect_location.
+- `crates/server-core/src/coordinator/authz/policy.rs:155-160` - Object authorization supplies the policy request value exclusively from input.policy_context.website_redirect_location.
+- `crates/server-http/src/http/mod.rs:3630-3647` - POST Object accepts x-amz-website-redirect-location as a form field and includes it in parsed request metadata.
+- `crates/server-http/src/http/mod.rs:3680-3692` - The vulnerable POST Object policy context omits with_website_redirect_location, so bucket-policy conditions see the value as absent.
+- `crates/server-http/src/http/mod.rs:4043-4052` - The equivalent PUT path does populate website_redirect_location from the request header, demonstrating the gap is specific to POST Object.
+- `crates/server-http/src/http/response.rs:1277-1279` - Persisted redirect metadata is observable on object responses as x-amz-website-redirect-location.
+- `crates/argmin-s3/src/config.rs:327-334` - Configuration documents default listener 127.0.0.1:9000 and TLS-related options; no deployment ingress was present in repository artifacts.
+- `crates/argmin-s3/src/config.rs:248-264` - SecretConfigValue redacts secret values in Debug output, relevant to secrets-handling review.
+## Narrative
+This is a real, reachable authorization-policy bypass in the runtime S3 service. The condition key s3:x-amz-website-redirect-location is registered and resolved from PolicyRequest.website_redirect_location. Object authorization copies only PutObjectPolicyContext.website_redirect_location into policy evaluation. The normal PUT path populates that field from the request header, but the streaming POST Object path accepts the x-amz-website-redirect-location form field into parsed system metadata and then omits it when constructing PutObjectPolicyContext. Therefore a bucket-policy Deny that depends on this condition can fail to match for POST while matching the equivalent PUT. The impact is limited because the attacker already needs a PutObject-capable route and the proven effect is unauthorized object metadata integrity, not data disclosure, credential compromise, or code execution.
+## Controls
+- AWS SigV4 request authentication and SigV4 POST form authentication
+- Optional anonymous access only through public bucket ACL/policy configuration
+- Bucket policy authorization in server-core
+- POST policy validation for signed form uploads
+- Website redirect value parsing validates prefix/header bytes before persistence
+- TCP listener has configurable max connection and in-flight request controls
+## Blindspots
+- No deployment manifests, load balancers, firewall rules, or production bucket policies were present in the inspected repository artifacts, so real-world public exposure and policy usage could not be confirmed.
+- Static review cannot determine whether any deployed consumers treat x-amz-website-redirect-location as a security-sensitive redirect beyond the server returning it as metadata.
+- The assessment relies partly on earlier validation evidence for the executable PoC; this attack-path stage did not rerun the PoC.
