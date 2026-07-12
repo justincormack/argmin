@@ -3689,6 +3689,7 @@ impl HttpFrontend {
                 .with_sse_customer_algorithm(
                     sse_customer_request.as_ref().map(|req| req.algorithm()),
                 )
+                .with_website_redirect_location(field(WEBSITE_REDIRECT_LOCATION_HEADER_NAME))
                 .with_request_object_tags_xml(tags_xml.as_deref()),
                 object_lock: ObjectLockState::default(),
                 tags: tags_xml.as_deref(),

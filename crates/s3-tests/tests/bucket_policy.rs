@@ -10023,6 +10023,8 @@ fn test_bucket_policy_auth_request_context_condition_keys() {
             "content-sha256-denied",
             "website-redirect-allowed",
             "website-redirect-denied",
+            "website-redirect-post-allowed",
+            "website-redirect-post-denied",
         ];
 
         for key in keys {
@@ -10152,6 +10154,22 @@ fn test_bucket_policy_auth_request_context_condition_keys() {
                     "Action": "s3:PutObject",
                     "Resource": object_resource(&bucket, "website-redirect-denied"),
                     "Condition": {"StringEquals": {"s3:x-amz-website-redirect-location": "/docs/allowed.html"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": [
+                        object_resource(&bucket, "website-redirect-post-allowed"),
+                        object_resource(&bucket, "website-redirect-post-denied")
+                    ]
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": object_resource(&bucket, "website-redirect-post-denied"),
+                    "Condition": {"StringEquals": {"s3:x-amz-website-redirect-location": "/docs/blocked.html"}}
                 }
             ],
         })
@@ -10399,6 +10417,57 @@ fn test_bucket_policy_auth_request_context_condition_keys() {
         assert_raw_access_denied(
             "PutObject denied by s3:x-amz-website-redirect-location mismatch",
             &website_redirect_denied,
+        );
+
+        let mut post_redirect_allowed_fields = sigv4_post_fields_for_credentials(
+            post_credentials.access_key,
+            post_credentials.secret_key,
+            post_credentials.region,
+            &bucket,
+            "website-redirect-post-allowed",
+            &[serde_json::json!({
+                "x-amz-website-redirect-location": "/docs/open.html"
+            })],
+        );
+        post_redirect_allowed_fields.push((
+            "x-amz-website-redirect-location".to_string(),
+            "/docs/open.html".to_string(),
+        ));
+        let post_redirect_allowed = raw_alt_post_object_status_eventually(
+            "PostObject allowed by nonmatching s3:x-amz-website-redirect-location Deny",
+            &bucket,
+            "website-redirect-post-allowed",
+            post_redirect_allowed_fields,
+            204,
+        )
+        .await;
+        assert_eq!(post_redirect_allowed.body, "");
+
+        let mut post_redirect_denied_fields = sigv4_post_fields_for_credentials(
+            post_credentials.access_key,
+            post_credentials.secret_key,
+            post_credentials.region,
+            &bucket,
+            "website-redirect-post-denied",
+            &[serde_json::json!({
+                "x-amz-website-redirect-location": "/docs/blocked.html"
+            })],
+        );
+        post_redirect_denied_fields.push((
+            "x-amz-website-redirect-location".to_string(),
+            "/docs/blocked.html".to_string(),
+        ));
+        let post_redirect_denied = raw_alt_post_object_status_eventually(
+            "PostObject denied by s3:x-amz-website-redirect-location Deny",
+            &bucket,
+            "website-redirect-post-denied",
+            post_redirect_denied_fields,
+            403,
+        )
+        .await;
+        assert_raw_access_denied(
+            "PostObject denied by s3:x-amz-website-redirect-location Deny",
+            &post_redirect_denied,
         );
 
         cleanup(&bucket, &keys).await;
