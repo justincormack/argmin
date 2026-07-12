@@ -19729,6 +19729,24 @@ fn test_put_bucket_policy_malformed_response_shapes() {
             ),
             expected_error::malformed_policy("Invalid Base64 value for binary condition"),
         );
+        let unsupported_non_ascii_condition_key = raw_put_policy(
+            &bucket,
+            &format!(
+                "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                 \"Resource\":\"arn:aws:s3:::{bucket}/*\",\
+                 \"Condition\":{{\"StringEquals\":{{\"aaaaaaaaaaaaaaaaaaaaé\":\
+                 \"value\"}}}}}}]}}"
+            ),
+        );
+        assert_malformed(
+            "PutBucketPolicy unsupported non-ASCII condition key",
+            &unsupported_non_ascii_condition_key,
+            expected_error::malformed_policy_with_detail(
+                "Policy has an invalid condition key",
+                "aaaaaaaaaaaaaaaaaaaaé",
+            ),
+        );
         assert_malformed(
             "PutBucketPolicy invalid principal",
             &raw_put_policy(

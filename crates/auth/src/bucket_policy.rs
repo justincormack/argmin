@@ -166,10 +166,8 @@ impl BucketPolicy {
 
     pub fn validate_evaluable_object_conditions(&self) -> Result<(), BucketPolicyError> {
         for statement in &self.statements {
-            if !statement.conditions_supported_for_policy_actions() {
-                return Err(BucketPolicyError::malformed(
-                    "unsupported Condition for currently enforced bucket policy action",
-                ));
+            if let Some(err) = statement.condition_validation_error_for_policy_actions() {
+                return Err(err);
             }
         }
         Ok(())
@@ -1135,7 +1133,7 @@ impl PolicyStatement {
             .any(|clause| condition_key::clause_requires_input_for_action(clause, action, input))
     }
 
-    fn conditions_supported_for_policy_actions(&self) -> bool {
+    fn condition_validation_error_for_policy_actions(&self) -> Option<BucketPolicyError> {
         SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS
             .iter()
             .chain(SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS.iter())
@@ -1145,10 +1143,22 @@ impl PolicyStatement {
                     .iter()
                     .any(|pattern| action_pattern_matches(pattern, action.as_str()))
             })
-            .all(|action| {
-                self.conditions
-                    .iter()
-                    .all(|clause| condition_key::supports_clause_for_action(clause, action))
+            .find_map(|action| {
+                self.conditions.iter().find_map(|clause| {
+                    if condition_key::lookup(clause.key.as_str()).is_none() {
+                        return Some(BucketPolicyError::malformed_with_detail(
+                            "Policy has an invalid condition key",
+                            clause.key.clone(),
+                        ));
+                    }
+                    if condition_key::supports_clause_for_action(clause, action) {
+                        None
+                    } else {
+                        Some(BucketPolicyError::malformed(
+                            "unsupported Condition for currently enforced bucket policy action",
+                        ))
+                    }
+                })
             })
     }
 
@@ -1473,6 +1483,14 @@ impl BucketPolicyError {
         Self::Malformed {
             reason,
             detail: None,
+        }
+    }
+
+    #[must_use]
+    pub fn malformed_with_detail(reason: &'static str, detail: impl Into<String>) -> Self {
+        Self::Malformed {
+            reason,
+            detail: Some(detail.into()),
         }
     }
 

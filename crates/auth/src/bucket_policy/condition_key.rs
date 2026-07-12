@@ -73,7 +73,8 @@ impl KeyMatch {
         match self {
             Self::Exact(name) => key.eq_ignore_ascii_case(name).then_some(""),
             Self::Prefix(prefix) if key.len() >= prefix.len() => {
-                let (candidate_prefix, param) = key.split_at(prefix.len());
+                let (candidate_prefix, param) =
+                    (key.get(..prefix.len())?, key.get(prefix.len()..)?);
                 candidate_prefix
                     .eq_ignore_ascii_case(prefix)
                     .then_some(param)
@@ -1064,23 +1065,7 @@ pub(super) fn resolve_policy_variable(
 }
 
 fn lookup_policy_variable_key(key: &str) -> Option<(&'static ConditionKeyResolver, &str)> {
-    lookup(key).or_else(|| {
-        CONDITION_KEYS.iter().find_map(|resolver| {
-            let param = match resolver.key {
-                KeyMatch::Exact(expected) if expected.eq_ignore_ascii_case(key) => "",
-                KeyMatch::Prefix(prefix) if key.len() >= prefix.len() => {
-                    let (candidate_prefix, param) = key.split_at(prefix.len());
-                    if candidate_prefix.eq_ignore_ascii_case(prefix) {
-                        param
-                    } else {
-                        return None;
-                    }
-                }
-                _ => return None,
-            };
-            Some((resolver, param))
-        })
-    })
+    lookup(key)
 }
 
 fn operator_supported_for_key(operator: &str, support: OperatorSupport) -> bool {
@@ -1137,6 +1122,12 @@ mod tests {
         );
         assert_eq!(key.match_key("s3:ExistingObjectTag/"), Some(""));
         assert_eq!(key.match_key("s3:RequestObjectTag/x"), None);
+    }
+
+    #[test]
+    fn key_match_prefix_rejects_non_boundary_prefix_length() {
+        let key = KeyMatch::Prefix("s3:ExistingObjectTag/");
+        assert_eq!(key.match_key("aaaaaaaaaaaaaaaaaaaaé"), None);
     }
 
     #[test]
