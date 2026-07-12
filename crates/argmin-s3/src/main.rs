@@ -1522,6 +1522,7 @@ fn format_control_plane_runtime_map_diagnostics(
         diagnostics.runtime_map(),
         diagnostics.rpc_metrics(),
         diagnostics.snapshot_metrics(),
+        diagnostics.history_reference_samples(),
     )
 }
 
@@ -1529,6 +1530,7 @@ fn format_control_plane_runtime_map_diagnostics_parts(
     runtime_map: &ClusterRuntimeMapSnapshot,
     rpc_metrics: &[observability::ControlPlaneRpcMetricSample],
     snapshot: observability::ControlPlaneSnapshotMetricSnapshot,
+    history_reference_samples: &[observability::ControlPlaneHistoryReferenceSample],
 ) -> String {
     let active_serving_pg_routes = runtime_map
         .pg_routes()
@@ -1558,13 +1560,29 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         format_optional_epoch(oldest_floor),
     );
     for node in runtime_map.nodes() {
+        let history_references = history_reference_samples
+            .iter()
+            .find(|sample| sample.node_id == node.node_id().as_u32());
         output.push('\n');
         output.push_str(&format!(
-            "node_id={} incarnation={} endpoint={} storage_history_floor_epoch={}",
+            "node_id={} incarnation={} endpoint={} storage_history_floor_epoch={} history_report_observed_epoch={} history_report_validation_epoch={} history_report_accepted_at_ms={} history_live_payload_epoch={} history_durable_backfill_epoch={} history_pending_metadata_command_epoch={}",
             node.node_id().as_u32(),
             node.node_incarnation(),
             node.endpoint(),
             format_optional_epoch(node.cluster_map_history_floor_epoch()),
+            format_optional_u64(history_references.map(|sample| sample.observed_epoch)),
+            format_optional_u64(history_references.map(|sample| sample.validation_epoch)),
+            format_optional_u64(history_references.map(|sample| sample.observed_at_ms)),
+            format_optional_u64(
+                history_references.and_then(|sample| sample.oldest_live_placement_epoch)
+            ),
+            format_optional_u64(
+                history_references.and_then(|sample| sample.oldest_durable_backfill_epoch)
+            ),
+            format_optional_u64(
+                history_references
+                    .and_then(|sample| sample.oldest_pending_metadata_command_epoch)
+            ),
         ));
     }
     for metric in rpc_metrics {
@@ -1605,6 +1623,10 @@ fn format_optional_epoch(epoch: Option<ClusterEpoch>) -> String {
     epoch
         .map(|epoch| epoch.get().to_string())
         .unwrap_or_else(|| "-".to_owned())
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
 }
 
 fn run_control_plane_process(config: &ServerConfig) -> ! {
@@ -2014,7 +2036,11 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
         let runtime_map = self
             .current_snapshot()?
             .runtime_map_for_storage_node_refresh(authority_now_ms, node_id, observed_epoch)?;
-        Ok(ControlPlaneHeartbeatRefresh::new(lease, runtime_map))
+        Ok(ControlPlaneHeartbeatRefresh::new(
+            lease,
+            runtime_map,
+            pre_record_epoch,
+        ))
     }
 }
 
@@ -9969,6 +9995,15 @@ mod tests {
                 bytes_last: 1234,
                 ..observability::ControlPlaneSnapshotMetricSnapshot::default()
             },
+            &[observability::ControlPlaneHistoryReferenceSample {
+                node_id: 2,
+                observed_epoch: floor_epoch.get(),
+                validation_epoch: floor_epoch.get(),
+                observed_at_ms: 1_000,
+                oldest_live_placement_epoch: Some(floor_epoch.get()),
+                oldest_durable_backfill_epoch: Some(floor_epoch.get() + 1),
+                oldest_pending_metadata_command_epoch: None,
+            }],
         );
 
         assert!(diagnostics.contains("nodes=1"), "{diagnostics}");
@@ -9990,6 +10025,16 @@ mod tests {
             "{diagnostics}"
         );
         assert!(diagnostics.contains("bytes_last=1234"), "{diagnostics}");
+        assert!(
+            diagnostics.contains(&format!(
+                "history_report_observed_epoch={} history_report_validation_epoch={} history_report_accepted_at_ms=1000 history_live_payload_epoch={} history_durable_backfill_epoch={} history_pending_metadata_command_epoch=-",
+                floor_epoch.get(),
+                floor_epoch.get(),
+                floor_epoch.get(),
+                floor_epoch.get() + 1
+            )),
+            "{diagnostics}"
+        );
         assert!(
             diagnostics.contains(&format!(
                 "node_id=2 incarnation=7 endpoint=node-2.sock storage_history_floor_epoch={}",

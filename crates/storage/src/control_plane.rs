@@ -34,7 +34,7 @@ const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 3;
+const CONTROL_PLANE_RPC_VERSION: u16 = 4;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -4604,12 +4604,21 @@ pub trait ControlPlaneHeartbeatSink {
 pub struct ControlPlaneHeartbeatRefresh {
     lease: HeartbeatLease,
     runtime_map: ClusterRuntimeMapSnapshot,
+    history_reference_validation_epoch: ClusterEpoch,
 }
 
 impl ControlPlaneHeartbeatRefresh {
     #[must_use]
-    pub fn new(lease: HeartbeatLease, runtime_map: ClusterRuntimeMapSnapshot) -> Self {
-        Self { lease, runtime_map }
+    pub fn new(
+        lease: HeartbeatLease,
+        runtime_map: ClusterRuntimeMapSnapshot,
+        history_reference_validation_epoch: ClusterEpoch,
+    ) -> Self {
+        Self {
+            lease,
+            runtime_map,
+            history_reference_validation_epoch,
+        }
     }
 
     #[must_use]
@@ -4836,6 +4845,7 @@ pub struct ControlPlaneRuntimeMapDiagnostics {
     runtime_map: ClusterRuntimeMapSnapshot,
     rpc_metrics: Vec<observability::ControlPlaneRpcMetricSample>,
     snapshot_metrics: observability::ControlPlaneSnapshotMetricSnapshot,
+    history_reference_samples: Vec<observability::ControlPlaneHistoryReferenceSample>,
 }
 
 impl ControlPlaneRuntimeMapDiagnostics {
@@ -4852,6 +4862,13 @@ impl ControlPlaneRuntimeMapDiagnostics {
     #[must_use]
     pub fn snapshot_metrics(&self) -> observability::ControlPlaneSnapshotMetricSnapshot {
         self.snapshot_metrics
+    }
+
+    #[must_use]
+    pub fn history_reference_samples(
+        &self,
+    ) -> &[observability::ControlPlaneHistoryReferenceSample] {
+        &self.history_reference_samples
     }
 }
 
@@ -6116,6 +6133,7 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
         heartbeat: NodeHeartbeat,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        let history_reference_validation_epoch = self.snapshot.cluster_epoch();
         let node_id = heartbeat.node_id;
         let requested_observed_epoch = heartbeat.observed_epoch;
         let previous_observed_epoch = self
@@ -6142,7 +6160,11 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
             node_id,
             observed_epoch,
         )?;
-        Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
+        Ok(ControlPlaneHeartbeatRefresh {
+            lease,
+            runtime_map,
+            history_reference_validation_epoch,
+        })
     }
 }
 
@@ -9438,7 +9460,12 @@ impl ControlPlaneHeartbeatRuntimeMapSource for UnixControlPlaneClient {
         let lease = read_heartbeat_lease_summary(&mut reader)?;
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
         reader.finish()?;
-        Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
+        let history_reference_validation_epoch = runtime_map.cluster_epoch();
+        Ok(ControlPlaneHeartbeatRefresh {
+            lease,
+            runtime_map,
+            history_reference_validation_epoch,
+        })
     }
 }
 
@@ -9507,7 +9534,12 @@ impl AuthenticatedUnixControlPlaneClient {
         let lease = read_heartbeat_lease_summary(&mut reader)?;
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
         reader.finish()?;
-        Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
+        let history_reference_validation_epoch = runtime_map.cluster_epoch();
+        Ok(ControlPlaneHeartbeatRefresh {
+            lease,
+            runtime_map,
+            history_reference_validation_epoch,
+        })
     }
 }
 
@@ -10275,7 +10307,30 @@ where
     let mut reader = PayloadReader::new(&payload);
     let heartbeat = read_node_heartbeat(&mut reader)?;
     reader.finish()?;
+    let mut history_reference_sample = observability::ControlPlaneHistoryReferenceSample {
+        node_id: heartbeat.node_id.as_u32(),
+        observed_epoch: heartbeat.observed_epoch.get(),
+        validation_epoch: heartbeat.observed_epoch.get(),
+        observed_at_ms: authority_now_ms,
+        oldest_live_placement_epoch: heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_live_placement_epoch
+            .map(ClusterEpoch::get),
+        oldest_durable_backfill_epoch: heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_durable_backfill_epoch
+            .map(ClusterEpoch::get),
+        oldest_pending_metadata_command_epoch: heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_pending_metadata_command_epoch
+            .map(ClusterEpoch::get),
+    };
     let refresh = control_plane.refresh_node_heartbeat(heartbeat, authority_now_ms);
+    if let Ok(refresh) = &refresh {
+        history_reference_sample.validation_epoch =
+            refresh.history_reference_validation_epoch.get();
+        observability::record_control_plane_history_reference_sample(history_reference_sample);
+    }
     Ok(PreparedControlPlaneHeartbeatResponse {
         refresh,
         response_auth,
@@ -10748,6 +10803,31 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, snapshot.bytes_total);
     write_u64(out, snapshot.bytes_last);
     write_u64(out, snapshot.bytes_max);
+    let runtime_node_ids = runtime_map
+        .nodes()
+        .iter()
+        .map(|node| node.node_id().as_u32())
+        .collect::<BTreeSet<_>>();
+    let history_reference_samples = observability::control_plane_history_reference_samples()
+        .into_iter()
+        .filter(|sample| runtime_node_ids.contains(&sample.node_id))
+        .collect::<Vec<_>>();
+    write_u32(
+        out,
+        len_as_u32(
+            history_reference_samples.len(),
+            "control-plane history reference samples",
+        )?,
+    );
+    for sample in history_reference_samples {
+        write_u32(out, sample.node_id);
+        write_u64(out, sample.observed_epoch);
+        write_u64(out, sample.validation_epoch);
+        write_u64(out, sample.observed_at_ms);
+        write_option_u64(out, sample.oldest_live_placement_epoch);
+        write_option_u64(out, sample.oldest_durable_backfill_epoch);
+        write_option_u64(out, sample.oldest_pending_metadata_command_epoch);
+    }
     Ok(())
 }
 
@@ -10796,10 +10876,98 @@ fn read_control_plane_runtime_map_diagnostics(
         bytes_last: reader.read_u64()?,
         bytes_max: reader.read_u64()?,
     };
+    let history_reference_count =
+        reader.read_collection_len("control-plane history reference samples", 31)?;
+    if history_reference_count > runtime_map.nodes().len() {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!(
+                "control-plane history reference sample count {history_reference_count} exceeds runtime node count {}",
+                runtime_map.nodes().len()
+            ),
+        });
+    }
+    let runtime_node_ids = runtime_map
+        .nodes()
+        .iter()
+        .map(|node| node.node_id().as_u32())
+        .collect::<BTreeSet<_>>();
+    let mut history_reference_samples = Vec::with_capacity(history_reference_count);
+    let mut seen_nodes = BTreeSet::new();
+    for _ in 0..history_reference_count {
+        let node_id = reader.read_u32()?;
+        if !runtime_node_ids.contains(&node_id) {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane history reference sample names unknown node {node_id}"
+                ),
+            });
+        }
+        if !seen_nodes.insert(node_id) {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "duplicate control-plane history reference sample for node {node_id}"
+                ),
+            });
+        }
+        let observed_epoch = read_cluster_epoch(reader, "history reference observed epoch")?;
+        let validation_epoch = read_cluster_epoch(reader, "history reference validation epoch")?;
+        let observed_at_ms = reader.read_u64()?;
+        let oldest_live_placement_epoch =
+            read_option_cluster_epoch(reader, "history reference live placement epoch")?;
+        let oldest_durable_backfill_epoch =
+            read_option_cluster_epoch(reader, "history reference durable backfill epoch")?;
+        let oldest_pending_metadata_command_epoch =
+            read_option_cluster_epoch(reader, "history reference pending metadata command epoch")?;
+        if observed_epoch > validation_epoch {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "history reference sample for node {node_id} observed epoch {observed_epoch} beyond validation epoch {validation_epoch}"
+                ),
+            });
+        }
+        if validation_epoch > runtime_map.cluster_epoch() {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "history reference sample for node {node_id} has future validation epoch {validation_epoch} beyond runtime-map epoch {}",
+                    runtime_map.cluster_epoch()
+                ),
+            });
+        }
+        for (field, component_epoch) in [
+            ("live placement", oldest_live_placement_epoch),
+            ("durable backfill", oldest_durable_backfill_epoch),
+            (
+                "pending metadata command",
+                oldest_pending_metadata_command_epoch,
+            ),
+        ] {
+            let Some(component_epoch) = component_epoch else {
+                continue;
+            };
+            if component_epoch > validation_epoch {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "history reference sample for node {node_id} has future {field} epoch {component_epoch} beyond validation epoch {validation_epoch}"
+                    ),
+                });
+            }
+        }
+        history_reference_samples.push(observability::ControlPlaneHistoryReferenceSample {
+            node_id,
+            observed_epoch: observed_epoch.get(),
+            validation_epoch: validation_epoch.get(),
+            observed_at_ms,
+            oldest_live_placement_epoch: oldest_live_placement_epoch.map(ClusterEpoch::get),
+            oldest_durable_backfill_epoch: oldest_durable_backfill_epoch.map(ClusterEpoch::get),
+            oldest_pending_metadata_command_epoch: oldest_pending_metadata_command_epoch
+                .map(ClusterEpoch::get),
+        });
+    }
     Ok(ControlPlaneRuntimeMapDiagnostics {
         runtime_map,
         rpc_metrics,
         snapshot_metrics,
+        history_reference_samples,
     })
 }
 
@@ -14064,19 +14232,34 @@ fn validate_storage_cluster_map_history_floor_at_epoch(
     heartbeat: &NodeHeartbeat,
     max_floor_epoch: ClusterEpoch,
 ) -> Result<(), ControlPlaneError> {
+    for component_epoch in [
+        heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_live_placement_epoch,
+        heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_durable_backfill_epoch,
+        heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_pending_metadata_command_epoch,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if component_epoch > max_floor_epoch {
+            return Err(ControlPlaneError::StorageClusterMapHistoryFloorInFuture {
+                node_id: heartbeat.node_id.as_u32(),
+                floor_epoch: component_epoch,
+                observed_epoch: max_floor_epoch,
+            });
+        }
+    }
     let Some(floor_epoch) = heartbeat
         .cluster_map_history_reference_summary
         .oldest_required_epoch()
     else {
         return Ok(());
     };
-    if floor_epoch > max_floor_epoch {
-        return Err(ControlPlaneError::StorageClusterMapHistoryFloorInFuture {
-            node_id: heartbeat.node_id.as_u32(),
-            floor_epoch,
-            observed_epoch: max_floor_epoch,
-        });
-    }
     if floor_epoch >= snapshot.cluster_epoch {
         return Ok(());
     }
@@ -21818,18 +22001,187 @@ mod tests {
 
     #[test]
     fn runtime_map_diagnostics_reports_rpc_and_snapshot_metrics() {
+        const DIAGNOSTIC_NODE_ID: u32 = 4_000_000_001;
+
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
         authority
-            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .set_node_membership(NodeId::new(DIAGNOSTIC_NODE_ID), NodeMembershipState::Active)
             .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(1), vec![NodeId::new(DIAGNOSTIC_NODE_ID)])
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, DIAGNOSTIC_NODE_ID, 1_000).serving());
+        let history_epoch = authority.snapshot().cluster_epoch();
+        let mut heartbeat =
+            heartbeat_from_record(&authority, DIAGNOSTIC_NODE_ID, history_epoch, 2_000);
+        heartbeat.cluster_map_history_reference_summary = PgClusterMapHistoryReferenceSummary {
+            oldest_live_placement_epoch: Some(history_epoch),
+            oldest_durable_backfill_epoch: None,
+            oldest_pending_metadata_command_epoch: Some(history_epoch),
+        };
+        let mut heartbeat_payload = Vec::new();
+        write_node_heartbeat(&mut heartbeat_payload, &heartbeat).unwrap();
+        let prepared = prepare_control_plane_heartbeat_response(
+            &mut authority,
+            ControlPlaneRpcRequest {
+                kind: ControlPlaneRpcKind::RefreshNodeHeartbeat,
+                payload: heartbeat_payload,
+            },
+            2_000,
+            None,
+        )
+        .unwrap();
+        let heartbeat_response =
+            finish_control_plane_heartbeat_response(prepared, || Ok(2_001)).unwrap();
+        decode_control_plane_rpc_response(heartbeat_response.payload).unwrap();
+        let expected_sample = observability::ControlPlaneHistoryReferenceSample {
+            node_id: DIAGNOSTIC_NODE_ID,
+            observed_epoch: history_epoch.get(),
+            validation_epoch: history_epoch.get(),
+            observed_at_ms: 2_000,
+            oldest_live_placement_epoch: Some(history_epoch.get()),
+            oldest_durable_backfill_epoch: None,
+            oldest_pending_metadata_command_epoch: Some(history_epoch.get()),
+        };
+        assert_eq!(
+            observability::control_plane_history_reference_samples()
+                .into_iter()
+                .find(|sample| sample.node_id == DIAGNOSTIC_NODE_ID),
+            Some(expected_sample)
+        );
+        let rejected_observed_epoch = authority.snapshot().cluster_epoch();
+        let mut rejected_heartbeat = heartbeat_from_record(
+            &authority,
+            DIAGNOSTIC_NODE_ID,
+            rejected_observed_epoch,
+            2_002,
+        );
+        rejected_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(history_epoch),
+                oldest_durable_backfill_epoch: Some(
+                    ClusterEpoch::new(rejected_observed_epoch.get() + 1).unwrap(),
+                ),
+                oldest_pending_metadata_command_epoch: None,
+            };
+        let mut rejected_payload = Vec::new();
+        write_node_heartbeat(&mut rejected_payload, &rejected_heartbeat).unwrap();
+        let rejected = prepare_control_plane_heartbeat_response(
+            &mut authority,
+            ControlPlaneRpcRequest {
+                kind: ControlPlaneRpcKind::RefreshNodeHeartbeat,
+                payload: rejected_payload,
+            },
+            2_002,
+            None,
+        )
+        .unwrap();
+        let rejected_response =
+            finish_control_plane_heartbeat_response(rejected, || Ok(2_003)).unwrap();
+        assert!(decode_control_plane_rpc_response(rejected_response.payload).is_err());
+        assert_eq!(
+            observability::control_plane_history_reference_samples()
+                .into_iter()
+                .find(|sample| sample.node_id == DIAGNOSTIC_NODE_ID),
+            Some(expected_sample),
+            "a rejected heartbeat must not replace the last accepted history report"
+        );
+        authority
+            .set_node_membership(
+                NodeId::new(DIAGNOSTIC_NODE_ID),
+                NodeMembershipState::Draining,
+            )
+            .unwrap();
+        let current_epoch = authority.snapshot().cluster_epoch();
+        assert!(current_epoch > history_epoch);
+        let mut stale_heartbeat =
+            heartbeat_from_record(&authority, DIAGNOSTIC_NODE_ID, history_epoch, 2_004);
+        stale_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(history_epoch),
+                oldest_durable_backfill_epoch: Some(current_epoch),
+                oldest_pending_metadata_command_epoch: Some(history_epoch),
+            };
+        let mut stale_payload = Vec::new();
+        write_node_heartbeat(&mut stale_payload, &stale_heartbeat).unwrap();
+        let stale_prepared = prepare_control_plane_heartbeat_response(
+            &mut authority,
+            ControlPlaneRpcRequest {
+                kind: ControlPlaneRpcKind::RefreshNodeHeartbeat,
+                payload: stale_payload,
+            },
+            2_004,
+            None,
+        )
+        .unwrap();
+        let stale_response =
+            finish_control_plane_heartbeat_response(stale_prepared, || Ok(2_005)).unwrap();
+        decode_control_plane_rpc_response(stale_response.payload).unwrap();
+        let expected_stale_sample = observability::ControlPlaneHistoryReferenceSample {
+            validation_epoch: current_epoch.get(),
+            observed_at_ms: 2_004,
+            oldest_durable_backfill_epoch: Some(current_epoch.get()),
+            ..expected_sample
+        };
+        assert_eq!(
+            observability::control_plane_history_reference_samples()
+                .into_iter()
+                .find(|sample| sample.node_id == DIAGNOSTIC_NODE_ID),
+            Some(expected_stale_sample),
+            "an accepted stale report should replace the diagnostic sample"
+        );
+
+        let mut inconsistent_stale_heartbeat =
+            heartbeat_from_record(&authority, DIAGNOSTIC_NODE_ID, history_epoch, 2_006);
+        inconsistent_stale_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(history_epoch),
+                oldest_durable_backfill_epoch: Some(
+                    ClusterEpoch::new(current_epoch.get() + 1).unwrap(),
+                ),
+                oldest_pending_metadata_command_epoch: None,
+            };
+        let mut inconsistent_stale_payload = Vec::new();
+        write_node_heartbeat(
+            &mut inconsistent_stale_payload,
+            &inconsistent_stale_heartbeat,
+        )
+        .unwrap();
+        let inconsistent_stale = prepare_control_plane_heartbeat_response(
+            &mut authority,
+            ControlPlaneRpcRequest {
+                kind: ControlPlaneRpcKind::RefreshNodeHeartbeat,
+                payload: inconsistent_stale_payload,
+            },
+            2_006,
+            None,
+        )
+        .unwrap();
+        let inconsistent_stale_response =
+            finish_control_plane_heartbeat_response(inconsistent_stale, || Ok(2_007)).unwrap();
+        assert!(decode_control_plane_rpc_response(inconsistent_stale_response.payload).is_err());
+        assert_eq!(
+            observability::control_plane_history_reference_samples()
+                .into_iter()
+                .find(|sample| sample.node_id == DIAGNOSTIC_NODE_ID),
+            Some(expected_stale_sample),
+            "an inconsistent stale report must not replace the last accepted sample"
+        );
+        assert!(authority
+            .snapshot()
+            .runtime_map(2_008)
+            .unwrap()
+            .nodes()
+            .iter()
+            .any(|node| node.node_id() == NodeId::new(DIAGNOSTIC_NODE_ID)));
         let request = ControlPlaneRpcRequest {
             kind: ControlPlaneRpcKind::RuntimeMapDiagnostics,
             payload: Vec::new(),
         };
 
-        let response = build_control_plane_unix_response(&mut authority, request, 2_000).unwrap();
+        let response = build_control_plane_unix_response(&mut authority, request, 2_008).unwrap();
 
         assert_eq!(response.kind, ControlPlaneRpcKind::RuntimeMapDiagnostics);
         let response_payload = decode_control_plane_rpc_response(response.payload).unwrap();
@@ -21843,6 +22195,39 @@ mod tests {
             "the preceding durable mutation should be measured"
         );
         assert!(diagnostics.snapshot_metrics().bytes_last > 0);
+        assert_eq!(
+            diagnostics.history_reference_samples(),
+            &[expected_stale_sample]
+        );
+
+        observability::record_control_plane_history_reference_sample(
+            observability::ControlPlaneHistoryReferenceSample {
+                oldest_durable_backfill_epoch: Some(current_epoch.get() + 1),
+                ..expected_stale_sample
+            },
+        );
+        let malformed_response = build_control_plane_unix_response(
+            &mut authority,
+            ControlPlaneRpcRequest {
+                kind: ControlPlaneRpcKind::RuntimeMapDiagnostics,
+                payload: Vec::new(),
+            },
+            2_008,
+        )
+        .unwrap();
+        let malformed_payload =
+            decode_control_plane_rpc_response(malformed_response.payload).unwrap();
+        let malformed_error =
+            read_control_plane_runtime_map_diagnostics(&mut PayloadReader::new(&malformed_payload))
+                .unwrap_err();
+        assert!(
+            matches!(
+                &malformed_error,
+                ControlPlaneError::RpcProtocol { message }
+                    if message.contains("future durable backfill epoch")
+            ),
+            "unexpected malformed diagnostics error: {malformed_error}"
+        );
     }
 
     #[test]
@@ -23289,7 +23674,7 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_rejects_future_storage_history_floor_before_persisting() {
+    fn heartbeat_rejects_future_storage_history_component_before_persisting() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
@@ -23303,7 +23688,7 @@ mod tests {
             heartbeat_from_record(&authority, 1, current_epoch, 11_000);
         future_floor_heartbeat.cluster_map_history_reference_summary =
             PgClusterMapHistoryReferenceSummary {
-                oldest_live_placement_epoch: None,
+                oldest_live_placement_epoch: Some(current_epoch),
                 oldest_durable_backfill_epoch: Some(future_epoch),
                 oldest_pending_metadata_command_epoch: None,
             };

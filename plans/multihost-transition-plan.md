@@ -10775,6 +10775,39 @@ Required production shape and implementation order:
    snapshot audit validate each retained transfer against an older retained
    source route for the same PG and matching source primary; pruning protects
    those source epochs while a retained transfer route depends on them.
+   Retained soak state also demonstrates that the current scalar history-floor
+   summary is itself a production blocker, independently of the record format.
+   A single live payload placed through route `(epoch 126, PG 0)` caused each
+   reporting node to retain every route for all 116 PGs from epoch 126 onward:
+   44,196 historical routes for only 163 distinct live `(placement epoch, data
+   PG)` references. Replace the three global minimum epochs in
+   `PgClusterMapHistoryReferenceSummary` with a bounded exact route-reference
+   representation (or an equivalently precise per-PG floor). Retention must
+   preserve each exact live-payload route, durable-backfill source and desired
+   route, pending-metadata-command route, metadata-transfer dependency closure,
+   and any predecessor needed to reconstruct a current route; one old route
+   must not retain unrelated PGs or every intervening route for the same PG.
+   Heartbeat encoding, control-plane validation, durable pruning barriers,
+   storage-node runtime-map pruning, restart reconstruction, and snapshot audit
+   must share this definition. Collection bounds are part of the safety
+   contract: reporters and the authority fail closed with bounded diagnostics
+   when exact references exceed the configured limit rather than falling back
+   to a global floor or silently dropping references. Tests must cover sparse
+   old placements across many epochs, source/desired backfill pairs, pending
+   command and metadata-transfer closure, restart from checkpoint plus journal
+   suffix, and a bounded-state assertion showing retained route count scales
+   with referenced route keys and dependency closure rather than
+   `retained_epochs * total_pgs`.
+   Runtime-map diagnostics now expose each node's latest accepted report time,
+   observed cluster epoch, accepted history-validation epoch, and live-payload,
+   durable-backfill, and pending-command minima. The separate validation epoch
+   is required for restart heartbeats: they deliberately report an older
+   observed epoch while durable local metadata can reference routes validated
+   against the authority's retained current epoch. Rejected heartbeats do not
+   replace the last accepted sample. This lets retained soak failures
+   distinguish a current report that is legitimately pinned by old durable
+   data from a reporter that stopped advancing while the exact-reference
+   redesign is implemented.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -243,12 +243,16 @@ static CONTROL_PLANE_SNAPSHOT_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_SNAPSHOT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_SNAPSHOT_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_SNAPSHOT_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_HISTORY_REFERENCE_SAMPLES: OnceLock<
+    Mutex<BTreeMap<u32, ControlPlaneHistoryReferenceSample>>,
+> = OnceLock::new();
 
 const TRACE_FILE_QUEUE_CAPACITY: usize = 16_384;
 const TRACE_FILE_IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const FLIGHT_RECORDER_CAPACITY: usize = 512;
 const FLIGHT_RECORD_MAX_DETAIL_BYTES: usize = 1_024;
 const METADATA_COMMAND_DIMENSION_CAPACITY: usize = 512;
+const CONTROL_PLANE_HISTORY_REFERENCE_SAMPLE_CAPACITY: usize = 4_096;
 const STORAGE_RPC_LONG_RUNNING_THRESHOLD: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -500,6 +504,43 @@ pub struct ControlPlaneSnapshotMetricSnapshot {
     pub bytes_total: u64,
     pub bytes_last: u64,
     pub bytes_max: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneHistoryReferenceSample {
+    pub node_id: u32,
+    pub observed_epoch: u64,
+    pub validation_epoch: u64,
+    pub observed_at_ms: u64,
+    pub oldest_live_placement_epoch: Option<u64>,
+    pub oldest_durable_backfill_epoch: Option<u64>,
+    pub oldest_pending_metadata_command_epoch: Option<u64>,
+}
+
+pub fn record_control_plane_history_reference_sample(sample: ControlPlaneHistoryReferenceSample) {
+    let mut samples = CONTROL_PLANE_HISTORY_REFERENCE_SAMPLES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if samples.len() >= CONTROL_PLANE_HISTORY_REFERENCE_SAMPLE_CAPACITY
+        && !samples.contains_key(&sample.node_id)
+    {
+        if let Some(first_node_id) = samples.keys().next().copied() {
+            samples.remove(&first_node_id);
+        }
+    }
+    samples.insert(sample.node_id, sample);
+}
+
+#[must_use]
+pub fn control_plane_history_reference_samples() -> Vec<ControlPlaneHistoryReferenceSample> {
+    CONTROL_PLANE_HISTORY_REFERENCE_SAMPLES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .values()
+        .copied()
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
