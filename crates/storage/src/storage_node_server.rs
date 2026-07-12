@@ -11711,6 +11711,10 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
             code: StorageRpcErrorCode::MetadataCommandContention,
             message: format!("metadata command contention during {context}"),
         },
+        error @ StoreError::RouteMapExpired { .. } => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::StaleShardLocation,
+            message: error.to_string(),
+        },
         error @ (StoreError::IntegrityError { .. } | StoreError::ShardAckMismatch { .. }) => {
             StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::ShardIntegrity,
@@ -15251,6 +15255,20 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn expired_store_route_maps_are_retryable_stale_locations() {
+        let error = StoreError::RouteMapExpired {
+            cluster_epoch: ClusterEpoch::new(7).unwrap(),
+            valid_until_ms: 10,
+            now_ms: 11,
+        };
+
+        let response = store_error_response(error);
+
+        assert_eq!(response.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(response.message.contains("cluster epoch 7"));
     }
 
     #[test]

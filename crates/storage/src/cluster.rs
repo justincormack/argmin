@@ -1056,6 +1056,54 @@ pub enum StorageClusterRuntimeMapRefreshError {
     },
 }
 
+impl StorageClusterRuntimeMapRefreshError {
+    fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::ControlPlane(error) => control_plane_refresh_error_diagnostic_kind(error),
+            Self::Build(_) => "cluster_build",
+            Self::EpochDowngrade { .. } => "epoch_downgrade",
+            Self::UnboundedRouteMapValidity { .. } => "unbounded_route_map_validity",
+            Self::RefreshLoopZeroInterval => "refresh_loop_zero_interval",
+            Self::RefreshLoopSpawn { .. } => "refresh_loop_spawn",
+        }
+    }
+}
+
+fn control_plane_refresh_error_diagnostic_kind(error: &ControlPlaneError) -> &'static str {
+    match error {
+        ControlPlaneError::Io { source, .. } => match source.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => "control_plane_io_timeout",
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => {
+                "control_plane_unavailable"
+            }
+            io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof => "control_plane_disconnected",
+            _ => "control_plane_io",
+        },
+        ControlPlaneError::RpcProtocol { .. } => "control_plane_protocol",
+        ControlPlaneError::RpcRemote { .. } => "control_plane_remote",
+        ControlPlaneError::RpcUnconfirmed { .. } => "control_plane_unconfirmed",
+        ControlPlaneError::AuthorityClockCheckpoint { .. }
+        | ControlPlaneError::CommittedTimestampRegression { .. }
+        | ControlPlaneError::CommittedTimestampTooFarAhead { .. }
+        | ControlPlaneError::AuthorityClockLeadershipChanged { .. }
+        | ControlPlaneError::AuthorityClockSourceUnavailable
+        | ControlPlaneError::AuthorityClockNotEstablished { .. }
+        | ControlPlaneError::AuthorityClockSampleWindowTooWide { .. }
+        | ControlPlaneError::AuthorityClockAlreadyEstablished
+        | ControlPlaneError::AuthorityClockGenerationMismatch { .. }
+        | ControlPlaneError::AuthorityClockCommittedTimestampMismatch { .. }
+        | ControlPlaneError::AuthorityClockRaftTermMismatch { .. }
+        | ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority
+        | ControlPlaneError::AuthorityClockWallBehindCommittedTimestamp { .. }
+        | ControlPlaneError::AuthorityClockGenerationOverflow => "control_plane_clock",
+        ControlPlaneError::PgPeeringPendingMetadataCommand { .. } => "pending_metadata_command",
+        _ => "control_plane_state",
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum PendingMetadataCommandRefreshRecoveryError {
     #[error("load PG-scoped runtime map: {0}")]
@@ -1114,6 +1162,22 @@ enum PendingMetadataCommandRefreshRecoveryError {
     },
 }
 
+impl PendingMetadataCommandRefreshRecoveryError {
+    fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::ControlPlane(error) => control_plane_refresh_error_diagnostic_kind(error),
+            Self::Build(_) => "pending_recovery_build",
+            Self::Store(_) => "pending_recovery_store",
+            Self::Recover(_) => "pending_recovery_command",
+            Self::DiscoveryFailure { .. } => "pending_recovery_discovery",
+            Self::AuthorizationChanged { .. } => "pending_recovery_authorization_changed",
+            Self::ReportingNodeNotHistoricalPrimary { .. } => "pending_recovery_reporter_changed",
+            Self::HistoricalRouteNotActive { .. } => "pending_recovery_route_not_active",
+            Self::IdentityChanged { .. } => "pending_recovery_identity_changed",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StorageCluster {
     local_map: Arc<LocalClusterMap>,
@@ -1134,12 +1198,19 @@ pub struct StorageClusterRuntimeMapRefreshLoopSuccess {
     pub route_map_validity: RouteMapValidity,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageClusterRuntimeMapRefreshLoopFailure {
+    pub attempt: u64,
+    pub kind: &'static str,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StorageClusterRuntimeMapRefreshLoopStatus {
     pub attempts: u64,
     pub successes: u64,
     pub failures: u64,
     pub last_success: Option<StorageClusterRuntimeMapRefreshLoopSuccess>,
+    pub last_failure: Option<StorageClusterRuntimeMapRefreshLoopFailure>,
     pub last_error: Option<String>,
 }
 
@@ -1149,12 +1220,31 @@ pub struct StorageClusterRuntimeMapRefreshLoop {
     handle: Option<JoinHandle<()>>,
 }
 
-impl StorageClusterRuntimeMapRefreshLoop {
+#[derive(Clone)]
+pub struct StorageClusterRuntimeMapRefreshLoopStatusHandle {
+    status: Arc<Mutex<StorageClusterRuntimeMapRefreshLoopStatus>>,
+}
+
+impl StorageClusterRuntimeMapRefreshLoopStatusHandle {
+    #[must_use]
     pub fn status(&self) -> StorageClusterRuntimeMapRefreshLoopStatus {
         self.status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+}
+
+impl StorageClusterRuntimeMapRefreshLoop {
+    #[must_use]
+    pub fn status_handle(&self) -> StorageClusterRuntimeMapRefreshLoopStatusHandle {
+        StorageClusterRuntimeMapRefreshLoopStatusHandle {
+            status: Arc::clone(&self.status),
+        }
+    }
+
+    pub fn status(&self) -> StorageClusterRuntimeMapRefreshLoopStatus {
+        self.status_handle().status()
     }
 
     pub fn stop(&mut self) {
@@ -1434,11 +1524,30 @@ impl StorageClusterRuntimeMapHandle {
                         }
                     },
                 };
+                let failure_kind = result
+                    .as_ref()
+                    .err()
+                    .map(StorageClusterRuntimeMapRefreshError::diagnostic_kind)
+                    .or_else(|| {
+                        recovery_result.as_ref().and_then(|result| {
+                            result
+                                .as_ref()
+                                .err()
+                                .map(PendingMetadataCommandRefreshRecoveryError::diagnostic_kind)
+                        })
+                    });
                 {
                     let mut status = worker_status
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     status.attempts += 1;
+                    if let Some(kind) = failure_kind {
+                        status.last_failure =
+                            Some(StorageClusterRuntimeMapRefreshLoopFailure {
+                                attempt: status.attempts,
+                                kind,
+                            });
+                    }
                     match result {
                         Ok(cluster) => {
                             status.successes += 1;

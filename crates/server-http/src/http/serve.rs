@@ -199,6 +199,9 @@ pub struct ServeConfig {
     /// trigger; they do not return request headers, payload bytes, keys, or
     /// recorder details over HTTP.
     pub local_debug_endpoint: bool,
+    /// Status source for frontend control-plane runtime-map refresh diagnostics.
+    pub frontend_runtime_map_refresh_status:
+        Option<storage::StorageClusterRuntimeMapRefreshLoopStatusHandle>,
 }
 
 impl Default for ServeConfig {
@@ -211,6 +214,7 @@ impl Default for ServeConfig {
             panic_on_500: false,
             abort_on_500: false,
             local_debug_endpoint: false,
+            frontend_runtime_map_refresh_status: None,
         }
     }
 }
@@ -1583,6 +1587,9 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
         .max()
         .unwrap_or(0);
     let mut body = format!("frontend_storage_cluster_epoch {frontend_storage_cluster_epoch}\n");
+    if let Some(status_handle) = &state.config.frontend_runtime_map_refresh_status {
+        write_frontend_runtime_map_refresh_status(&mut body, &status_handle.status());
+    }
     for (name, value) in snapshot.iter_named() {
         let _ = writeln!(body, "{name} {value}");
     }
@@ -1726,6 +1733,61 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
         );
     }
     body
+}
+
+#[cfg(any(test, feature = "local-debug-endpoints"))]
+fn write_frontend_runtime_map_refresh_status(
+    body: &mut String,
+    status: &storage::StorageClusterRuntimeMapRefreshLoopStatus,
+) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(
+        body,
+        "frontend_runtime_map_refresh_attempt_total {}",
+        status.attempts
+    );
+    let _ = writeln!(
+        body,
+        "frontend_runtime_map_refresh_success_total {}",
+        status.successes
+    );
+    let _ = writeln!(
+        body,
+        "frontend_runtime_map_refresh_failure_total {}",
+        status.failures
+    );
+    let _ = writeln!(
+        body,
+        "frontend_runtime_map_refresh_last_success_epoch {}",
+        status
+            .last_success
+            .map_or(0, |success| success.cluster_epoch.get())
+    );
+    let _ = writeln!(
+        body,
+        "frontend_runtime_map_refresh_last_success_valid_until_ms {}",
+        status.last_success.map_or(0, |success| {
+            success.route_map_validity.valid_until_ms().unwrap_or(0)
+        })
+    );
+    let _ = writeln!(
+        body,
+        "frontend_runtime_map_refresh_last_failure_present {}",
+        u8::from(status.last_failure.is_some())
+    );
+    if let Some(failure) = status.last_failure {
+        let _ = writeln!(
+            body,
+            "frontend_runtime_map_refresh_last_failure_attempt {}",
+            failure.attempt
+        );
+        let _ = writeln!(
+            body,
+            "frontend_runtime_map_refresh_last_failure_info{{kind=\"{}\"}} 1",
+            failure.kind
+        );
+    }
 }
 
 #[cfg(any(test, feature = "local-debug-endpoints"))]
@@ -5318,6 +5380,49 @@ mod tests {
             fixed_metrics.contains_key("frontend_storage_cluster_epoch"),
             "{response}"
         );
+    }
+
+    #[test]
+    fn frontend_runtime_map_refresh_diagnostics_redact_and_retain_last_failure() {
+        let sentinel = "sentinel-bucket/sentinel-object/sentinel-upload-id";
+        let status = storage::StorageClusterRuntimeMapRefreshLoopStatus {
+            attempts: 9,
+            successes: 4,
+            failures: 5,
+            last_success: Some(storage::StorageClusterRuntimeMapRefreshLoopSuccess {
+                cluster_epoch: storage::ClusterEpoch::new(17).unwrap(),
+                route_map_validity: storage::RouteMapValidity::until_ms(42_000).unwrap(),
+            }),
+            last_failure: Some(storage::StorageClusterRuntimeMapRefreshLoopFailure {
+                attempt: 7,
+                kind: "control_plane_io_timeout",
+            }),
+            last_error: None,
+        };
+        let mut body = String::new();
+
+        write_frontend_runtime_map_refresh_status(&mut body, &status);
+
+        assert!(body.contains("frontend_runtime_map_refresh_attempt_total 9\n"));
+        assert!(body.contains("frontend_runtime_map_refresh_success_total 4\n"));
+        assert!(body.contains("frontend_runtime_map_refresh_failure_total 5\n"));
+        assert!(body.contains("frontend_runtime_map_refresh_last_success_epoch 17\n"));
+        assert!(body.contains("frontend_runtime_map_refresh_last_success_valid_until_ms 42000\n"));
+        assert!(body.contains("frontend_runtime_map_refresh_last_failure_present 1\n"));
+        assert!(body.contains("frontend_runtime_map_refresh_last_failure_attempt 7\n"));
+        assert!(body.contains(
+            "frontend_runtime_map_refresh_last_failure_info{kind=\"control_plane_io_timeout\"} 1\n"
+        ));
+
+        let mut status_with_sensitive_current_error = status;
+        status_with_sensitive_current_error.last_error =
+            Some(format!("failed metadata recovery for {sentinel}"));
+        let mut sensitive_body = String::new();
+        write_frontend_runtime_map_refresh_status(
+            &mut sensitive_body,
+            &status_with_sensitive_current_error,
+        );
+        assert!(!sensitive_body.contains(sentinel));
     }
 
     #[tokio::test(flavor = "multi_thread")]

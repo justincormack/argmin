@@ -4783,8 +4783,11 @@ async fn run_frontend_server(
             });
 
     let storage_cluster_handle = StorageClusterRuntimeMapHandle::new(storage_cluster);
-    let _frontend_runtime_map_refresh_loop =
+    let frontend_runtime_map_refresh_loop =
         maybe_spawn_frontend_control_plane_refresh_loop(storage_cluster_handle.clone(), &config);
+    let frontend_runtime_map_refresh_status = frontend_runtime_map_refresh_loop
+        .as_ref()
+        .map(storage::StorageClusterRuntimeMapRefreshLoop::status_handle);
 
     // Build frontend pool sharing the same storage cluster handle.
     let mut frontends = Vec::with_capacity(config.workers as usize);
@@ -4868,6 +4871,7 @@ async fn run_frontend_server(
         panic_on_500: config.panic_on_500,
         abort_on_500: config.abort_on_500,
         local_debug_endpoint: config.local_debug_endpoint,
+        frontend_runtime_map_refresh_status,
         ..server_http::http::serve::ServeConfig::default()
     };
     match tls_acceptor {

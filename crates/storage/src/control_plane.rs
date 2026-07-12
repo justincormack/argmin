@@ -27154,6 +27154,97 @@ mod tests {
     }
 
     #[test]
+    fn storage_cluster_runtime_map_refresh_loop_retains_transient_failure_classification() {
+        struct FailOnceRuntimeMapSource {
+            snapshot: ClusterControlSnapshot,
+            failures_remaining: AtomicU64,
+        }
+
+        impl ControlPlaneRuntimeMapSource for FailOnceRuntimeMapSource {
+            fn runtime_map_snapshot(
+                &self,
+                authority_now_ms: u64,
+            ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+                if self
+                    .failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(ControlPlaneError::Io {
+                        context: "sentinel runtime-map read",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "sentinel-bucket/sentinel-object/sentinel-upload-id",
+                        ),
+                    });
+                }
+                self.snapshot.runtime_map(authority_now_ms)
+            }
+
+            fn pending_metadata_command_recoveries(
+                &self,
+                _authority_now_ms: u64,
+            ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+                Ok(PendingMetadataCommandRecoveryListing::new(
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        }
+
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 1_001);
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &runtime_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let handle = crate::StorageClusterRuntimeMapHandle::new(cluster);
+        let source = FailOnceRuntimeMapSource {
+            snapshot: authority.snapshot().clone(),
+            failures_remaining: AtomicU64::new(1),
+        };
+        let mut refresh_loop = handle
+            .spawn_control_plane_refresh_loop(source, Duration::from_millis(5), || 1_002)
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let status = refresh_loop.status();
+            if status.failures == 1 && status.successes > 0 {
+                assert_eq!(status.last_error, None);
+                assert_eq!(
+                    status.last_failure,
+                    Some(crate::StorageClusterRuntimeMapRefreshLoopFailure {
+                        attempt: 1,
+                        kind: "control_plane_io_timeout",
+                    })
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "refresh loop did not fail then recover: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        refresh_loop.stop();
+    }
+
+    #[test]
     fn storage_cluster_runtime_map_refresh_loop_rejects_zero_interval() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
