@@ -1,0 +1,330 @@
+Unresolved policy variables make Not conditions match all
+Link: https://chatgpt.com/codex/cloud/security/findings/047df2648d3481918213390be169c4e3?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: high (attack path: high)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 52e4864
+Author: justin@specialbusservice.com
+Created: 11/07/2026, 21:41:23
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced. The new policy-variable expansion path uses filter_map to discard failed expansions, but the existing negative string condition evaluators treat an empty operand list as a successful non-equality/non-like match.
+When policy variables are enabled, condition values are expanded with filter_map. If a variable is absent and has no default, or is unavailable in the current request context, expand_policy_template returns None and the operand is removed. Negative string operators then call Iterator::all() over the remaining operands. If all operands were removed, all() returns true, causing StringNotEquals, StringNotEqualsIgnoreCase, StringNotLike, and related ForAll/ForAny variants to match any present actual value. A 2012-version bucket policy that uses an unresolved variable inside a negative string condition on an Allow statement can therefore grant unintended read/list/write access to matching principals, including anonymous users if the policy principal is public.
+
+# Resolution
+Invalid as an Argmin security finding: the reported operand-dropping behavior
+matches live AWS S3 bucket-policy semantics.
+
+AWS-facing coverage added in
+`crates/s3-tests/tests/bucket_policy.rs` pins that, for a 2012 bucket policy,
+an unresolved string policy variable is omitted from the condition operand list.
+The test covers anonymous `ListBucket` with:
+
+- `StringNotEquals` using only `${aws:username}`: AWS allows the request once
+  the operand list is empty.
+- `StringNotLike` using only `${aws:username}`: AWS allows the request once the
+  operand list is empty.
+- `StringNotEquals` using `notequals-${aws:username}` and an actual
+  `notequals-${aws:username}` prefix: AWS allows the request, proving the
+  unresolved embedded operand is omitted rather than compared literally.
+- `StringNotLike` using `notlike-${aws:username}` and an actual
+  `notlike-${aws:username}` prefix: AWS allows the request, proving the same
+  omission behavior for the negative wildcard operator.
+- `StringEquals` using `["mixed-literal", "mixed-${aws:username}"]`: AWS
+  allows `mixed-literal` but denies an actual `mixed-${aws:username}` prefix,
+  proving the unresolved embedded operand is omitted while the literal operand
+  is preserved.
+- `StringNotEquals` using `${aws:username, 'default-blocked'}`: defaults still
+  apply, and the matching default value remains denied.
+
+Validation:
+
+- `./scripts/aws-tests --test bucket_policy test_bucket_policy_variables_omit_unresolved_string_operands -- --nocapture`
+- `cargo nextest run -p s3-tests --test bucket_policy test_bucket_policy_variables_omit_unresolved_string_operands`
+
+No auth implementation change is appropriate because the generated fail-closed
+patch would diverge from AWS.
+
+# Validation
+## Rubric
+- [x] Confirm policy variables are enabled for 2012 bucket policies and for negative string operator kinds, including variants sharing those kinds.
+- [x] Confirm unresolved/absent variables can return None and condition_key::evaluate_clause uses filter_map so a non-empty policy value list can become empty.
+- [x] Confirm StringNotEquals/StringNotLike negative evaluators use Iterator::all() over operands without rejecting an empty slice.
+- [x] Demonstrate with the public API that an Allow policy using an unresolved variable in a negative string condition returns ExplicitAllow for a present actual value, while positive/default controls return NoMatch.
+- [x] Capture debugger evidence showing the actual vulnerable call chain reaches eval_string_not_equals with operands.length = 0.
+## Report
+Validated the finding as a logic/authorization bug. Direct PoC execution did not crash, which is expected for this class of issue; valgrind was attempted but is not installed; lldb was then used successfully to trace the vulnerable path. Code evidence: bucket policies with Version 2012-10-17 enable variables at crates/auth/src/bucket_policy.rs:128. The affected negative string operator families are marked as supporting variables at crates/auth/src/bucket_policy/condition_op.rs:517-526, and ForAll/ForAny/IfExists variants share the same negative kinds/evaluators at condition_op.rs:257-305 and 333-355. In condition evaluation, variable-enabled operands are built with filter_map at crates/auth/src/bucket_policy/condition_key.rs:827-833, so an expansion returning None removes the operand. Unavailable/absent variable behavior is visible at bucket_policy.rs:1800-1808 and condition_key.rs:444-447 / 458-463 / 852-862. The negative evaluators then use operands.iter().all(...) with no empty-slice guard at condition_op.rs:1227-1232 for StringNotEquals and 1486-1491 for StringNotLike; all() is true for an empty iterator. The PoC uses public Allow ListBucket policies over s3:prefix. Output showed: StringEquals unavailable variable => NoMatch; StringNotEquals unavailable variable => ExplicitAllow; StringNotLike unavailable variable => ExplicitAllow; StringNotEquals absent variable with default, prefix=blocked => NoMatch; StringNotEquals absent variable without default, prefix=blocked => ExplicitAllow. lldb broke at auth::bucket_policy::condition_op::eval_string_not_equals and showed the call chain evaluate_clause -> eval_string_not_equals with operands.length = 0 while variables_enabled=true, confirming that filter_map dropped the only operand before the vacuous all() match.
+
+# Evidence
+crates/auth/src/bucket_policy.rs (L1800 to 1808)
+  Note: Variables that are absent without a default or unavailable resolve to None, feeding the operand-dropping behavior.
+```
+    let (key, default) = parse_policy_variable_default(content);
+    match condition_key::resolve_policy_variable(request, key) {
+        condition_key::PolicyVariableResolution::Value(value) => {
+            Some(PolicyVariableValue::Text(value))
+        }
+        condition_key::PolicyVariableResolution::Absent => {
+            default.map(|value| PolicyVariableValue::Text(value.to_string()))
+        }
+        condition_key::PolicyVariableResolution::Unavailable => None,
+```
+
+crates/auth/src/bucket_policy/condition_key.rs (L827 to 833)
+  Note: Unresolvable variable expansions are discarded with filter_map, which can turn a non-empty policy operand list into an empty slice.
+```
+    let values = if variables_enabled && condition_op::supports_policy_variables(op.kind) {
+        expanded_values = clause
+            .values
+            .iter()
+            .filter_map(|value| super::expand_policy_template(value, request))
+            .collect::<Vec<_>>();
+        expanded_values.as_slice()
+```
+
+crates/auth/src/bucket_policy/condition_op.rs (L1227 to 1232)
+  Note: StringNotEquals uses all(); with an empty operands slice this condition evaluates to true for any present actual value.
+```
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !policy_string_equals(expected, actual))
+            {
+                ConditionMatchResult::Matches
+```
+
+crates/auth/src/bucket_policy/condition_op.rs (L1486 to 1491)
+  Note: StringNotLike has the same vacuous all() behavior, so removing all operands also makes it match any present actual value.
+```
+        ActualValue::Present(actual) => {
+            if operands
+                .iter()
+                .all(|expected| !policy_value_wildcard_matches(expected, actual))
+            {
+                ConditionMatchResult::Matches
+```
+
+crates/auth/src/bucket_policy/condition_op.rs (L517 to 526)
+  Note: Policy-variable expansion is enabled for the negative string operator families as well as positive string operators.
+```
+pub(super) const fn supports_policy_variables(kind: ConditionOpKind) -> bool {
+    matches!(
+        kind,
+        ConditionOpKind::StringEquals
+            | ConditionOpKind::StringEqualsIgnoreCase
+            | ConditionOpKind::StringNotEquals
+            | ConditionOpKind::StringNotEqualsIgnoreCase
+            | ConditionOpKind::StringLike
+            | ConditionOpKind::StringNotLike
+    )
+```
+
+Proposed patch:
+diff --git a/crates/auth/src/bucket_policy.rs b/crates/auth/src/bucket_policy.rs
+index bd2b6980c1fdea63649b294a4d587c92cf1bdd61..c76756139cbd32c3e5f940292c4d82c8a58562e7 100644
+--- a/crates/auth/src/bucket_policy.rs
++++ b/crates/auth/src/bucket_policy.rs
+@@ -2285,50 +2285,82 @@ mod tests {
+             "private/object",
+             None,
+             &[],
+         );
+ 
+         assert_eq!(policy.evaluate(&allowed), PolicyEvaluation::ExplicitAllow);
+         assert_eq!(policy.evaluate(&denied), PolicyEvaluation::NoMatch);
+     }
+ 
+     #[test]
+     fn authenticated_identity_policy_variables_are_unavailable_until_iam_context_exists() {
+         let policy = parse_bucket_policy(
+             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:prefix":"${aws:userid}"}}}]}"#,
+         )
+         .unwrap();
+         let guessed_request = bucket_request(
+             PolicyAction::ListBucket,
+             "bucket",
+             Some("arn:aws:iam::123456789012:user/alice"),
+         )
+         .with_prefix(Some("arn:aws:iam::123456789012:user/alice"));
+ 
+         assert_eq!(policy.evaluate(&guessed_request), PolicyEvaluation::NoMatch);
+     }
+ 
++    #[test]
++    fn unresolved_policy_variables_do_not_make_negative_string_conditions_match() {
++        let not_equals = parse_bucket_policy(
++            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringNotEquals":{"s3:prefix":"${aws:username}"}}}]}"#,
++        )
++        .unwrap();
++        let not_like = parse_bucket_policy(
++            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringNotLike":{"s3:prefix":"${aws:username}"}}}]}"#,
++        )
++        .unwrap();
++        let request =
++            bucket_request(PolicyAction::ListBucket, "bucket", None).with_prefix(Some("public"));
++
++        assert_eq!(not_equals.evaluate(&request), PolicyEvaluation::NoMatch);
++        assert_eq!(not_like.evaluate(&request), PolicyEvaluation::NoMatch);
++    }
++
++    #[test]
++    fn policy_variable_defaults_still_apply_to_negative_string_conditions() {
++        let policy = parse_bucket_policy(
++            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringNotEquals":{"s3:prefix":"${aws:username, 'blocked'}"}}}]}"#,
++        )
++        .unwrap();
++        let blocked =
++            bucket_request(PolicyAction::ListBucket, "bucket", None).with_prefix(Some("blocked"));
++        let public =
++            bucket_request(PolicyAction::ListBucket, "bucket", None).with_prefix(Some("public"));
++
++        assert_eq!(policy.evaluate(&blocked), PolicyEvaluation::NoMatch);
++        assert_eq!(policy.evaluate(&public), PolicyEvaluation::ExplicitAllow);
++    }
++
+     #[test]
+     fn authenticated_identity_policy_variable_defaults_do_not_apply_to_unavailable_context() {
+         let policy = parse_bucket_policy(
+             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:prefix":"${aws:userid, 'fallback'}"}}}]}"#,
+         )
+         .unwrap();
+         let fallback_request = bucket_request(
+             PolicyAction::ListBucket,
+             "bucket",
+             Some("arn:aws:iam::123456789012:user/alice"),
+         )
+         .with_prefix(Some("fallback"));
+ 
+         assert_eq!(
+             policy.evaluate(&fallback_request),
+             PolicyEvaluation::NoMatch
+         );
+     }
+ 
+     #[test]
+     fn multivalued_policy_variable_defaults_do_not_apply_to_present_context() {
+         let policy = parse_bucket_policy(
+             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/${s3:RequestObjectTagKeys, 'fallback'}"}]}"#,
+         )
+         .unwrap();
+
+
+diff --git a/crates/auth/src/bucket_policy/condition_key.rs b/crates/auth/src/bucket_policy/condition_key.rs
+index 0d86f165f1ffba368d167ceef005d32fa3f942cb..d88b9d387c67fdda1ac38c7d30165edf059c2a6d 100644
+--- a/crates/auth/src/bucket_policy/condition_key.rs
++++ b/crates/auth/src/bucket_policy/condition_key.rs
+@@ -803,55 +803,59 @@ pub(super) fn evaluate_clause(
+ ) -> ConditionMatchResult {
+     let Some((resolver, param)) = lookup(clause.key.as_str()) else {
+         return ConditionMatchResult::Unsupported;
+     };
+     if let Some(evaluable) = resolver.evaluable_for_action {
+         if !evaluable(request.action()) {
+             return ConditionMatchResult::AcceptedButNotEvaluable;
+         }
+     }
+     let Some(op) = condition_op::lookup(clause.operator.as_str()) else {
+         return ConditionMatchResult::Unsupported;
+     };
+     if !operator_supported_for_key(op.name, resolver.operator_support) {
+         return ConditionMatchResult::Unsupported;
+     }
+     let actual = match (resolver.resolve)(request, param) {
+         ResolvedValue::Present(value) => ActualValue::Present(value),
+         ResolvedValue::PresentValues(values) => ActualValue::PresentValues(values),
+         ResolvedValue::SourceIp(source_ip) => ActualValue::SourceIp(source_ip),
+         ResolvedValue::EpochSeconds(epoch_seconds) => ActualValue::EpochSeconds(epoch_seconds),
+         ResolvedValue::Absent => ActualValue::Absent,
+         ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
+     };
+     let expanded_values;
+     let values = if variables_enabled && condition_op::supports_policy_variables(op.kind) {
+-        expanded_values = clause
++        let Some(values) = clause
+             .values
+             .iter()
+-            .filter_map(|value| super::expand_policy_template(value, request))
+-            .collect::<Vec<_>>();
++            .map(|value| super::expand_policy_template(value, request))
++            .collect::<Option<Vec<_>>>()
++        else {
++            return ConditionMatchResult::NoMatch;
++        };
++        expanded_values = values;
+         expanded_values.as_slice()
+     } else {
+         expanded_values = clause
+             .values
+             .iter()
+             .map(|value| PolicyValue::literal(value))
+             .collect::<Vec<_>>();
+         expanded_values.as_slice()
+     };
+     (op.evaluate)(values, actual)
+ }
+ 
+ pub(super) fn resolve_policy_variable(
+     request: &PolicyRequest<'_>,
+     key: &str,
+ ) -> PolicyVariableResolution {
+     let Some((resolver, param)) = lookup_policy_variable_key(key) else {
+         return PolicyVariableResolution::Unavailable;
+     };
+     match (resolver.resolve)(request, param) {
+         ResolvedValue::Present(value) => PolicyVariableResolution::Value(value.to_string()),
+         ResolvedValue::SourceIp(source_ip) => {
+             PolicyVariableResolution::Value(source_ip.to_string())
+         }
+         ResolvedValue::EpochSeconds(epoch_seconds) => {
+
+# Attack-path analysis
+Final: high | Decider: model_decided | Matrix severity: high | Policy adjusted: high
+## Rationale
+Severity remains high, not critical. Static evidence shows the finding is real in production authorization code: variable expansion is enabled for 2012 policies, unresolved variables are dropped, and negative string evaluators match empty operands. The HTTP frontend and coordinator make this reachable through normal S3 operations, including anonymous public-policy access. The potential impact is unauthorized access to or modification of bucket/object data, which is high-value in the project threat model. It is not raised to critical because exploitation requires a vulnerable bucket policy configuration and public anonymous impact additionally depends on public-principal statements and public-access-block settings.
+## Likelihood
+high - The bug is remotely reachable through normal S3 HTTP requests once an affected policy exists, and exploitation requires no credentials for public-principal policies. However, it depends on a specific policy pattern using unresolved variables in negative string conditions, and repository artifacts do not prove public internet deployment. | Remote network vector
+## Impact
+high - An affected Allow statement can become materially broader than intended. For public principals this can allow anonymous bucket listing or object access; for write actions it can permit unauthorized modifications. Object data and bucket listings are core protected assets in the threat model.
+## Assumptions
+- Operators may expose argmin-s3 beyond the default loopback listener by setting ARGMIN_LISTEN_ADDR or by placing it behind a proxy; no deployment manifests were present to prove public internet exposure.
+- Exploitation requires a bucket policy with Version 2012-10-17, an Allow statement, an affected negative string condition operator, and at least one policy variable that resolves to Absent without a default or Unavailable.
+- Anonymous exploitation requires the affected statement principal to include public/anonymous users and public-access-block settings not to block or restrict that public policy allow.
+- argmin-s3 frontend serving S3-compatible HTTP requests
+- bucket owner/admin has installed an affected bucket policy
+- policy variables are enabled by Version 2012-10-17
+- condition uses StringNotEquals, StringNotEqualsIgnoreCase, StringNotLike, or related variants with an unresolved variable
+- requested action supplies a present actual condition value such as s3:prefix for ListBucket
+## Path
+HTTP client -> route/auth requester -> bucket policy evaluate -> unresolved variable dropped -> StringNot* all([])=true -> ExplicitAllow -> list/read/write data
+## Path evidence
+- `crates/auth/src/bucket_policy.rs:124-129` - Bucket-policy evaluation enables policy variables when policy Version is 2012-10-17.
+- `crates/auth/src/bucket_policy/condition_op.rs:517-526` - Negative string operator kinds, including StringNotEquals and StringNotLike, are marked as supporting policy variables.
+- `crates/auth/src/bucket_policy/condition_key.rs:827-833` - Variable-enabled condition values are expanded with filter_map, so failed expansions are silently removed from the operand list.
+- `crates/auth/src/bucket_policy.rs:1800-1808` - Absent variables without defaults and unavailable variables return None, feeding the operand-dropping behavior.
+- `crates/auth/src/bucket_policy/condition_op.rs:1227-1232` - StringNotEquals evaluates operands.iter().all(...) without rejecting an empty operands slice, so an empty list matches vacuously.
+- `crates/auth/src/bucket_policy/condition_op.rs:1486-1491` - StringNotLike has the same empty-slice all() behavior.
+- `crates/server-http/src/http/mod.rs:3148-3175` - Production HTTP authentication calls authenticate_request and converts MissingAuth into an anonymous AuthContext, making public-principal bucket-policy paths reachable without credentials.
+- `crates/server-http/src/http/mod.rs:1417-1444` - ListObjectsV1 uses attacker-controlled query parameters such as prefix and dispatches to coordinator.list_objects_v2.
+- `crates/server-core/src/coordinator/authz/bucket.rs:949-973` - ListObjects authorization evaluates the bucket policy for ListBucket with request context and allows the operation when bucket_policy_allows_with_fallback accepts the decision.
+- `crates/server-core/src/coordinator/authz/policy.rs:623-640` - ExplicitAllow from bucket-policy evaluation grants access when not suppressed by RestrictPublicBuckets; NoMatch falls back to ACL/default authorization.
+- `crates/argmin-s3/src/config.rs:331-332` - The service is an HTTP(S) listener; default listen address is loopback 127.0.0.1:9000 and TLS is optional/configured by environment.
+- `crates/argmin-s3/src/config.rs:429-431` - ARGMIN_LISTEN_ADDR controls runtime exposure and defaults to 127.0.0.1:9000; TLS cert/key paths are optional.
+## Narrative
+This is a real in-scope authorization vulnerability. Bucket policies with Version 2012-10-17 enable variable expansion. The code marks negative string operators as variable-supporting, expands operands with filter_map, and returns None for absent-without-default or unavailable variables. If every operand is dropped, StringNotEquals and StringNotLike call Iterator::all() over an empty slice, which returns true, causing the condition to match any present actual value. The production HTTP path accepts S3 requests, maps MissingAuth to anonymous, dispatches ListObjects and other operations to server-core, and server-core grants access on ExplicitAllow when public-access-block does not suppress it. Severity remains high because the impact can be unauthorized bucket/object data access or writes, but it is not critical because exploitation requires a specific vulnerable bucket policy and, for anonymous impact, public-principal policy configuration.
+## Controls
+- SigV4 authentication for authenticated requests
+- MissingAuth maps to anonymous requester for public policy evaluation
+- bucket-policy parser and resource scoping validation
+- PublicAccessBlock BlockPublicPolicy can reject public policies
+- PublicAccessBlock RestrictPublicBuckets can suppress public-policy ExplicitAllow for non-owner requesters
+- default listener is 127.0.0.1:9000
+- TLS is optional via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+## Blindspots
+- No Kubernetes, Terraform, Docker Compose, or cloud load-balancer manifests were found in the supplied evidence, so actual public exposure cannot be proven from repository artifacts.
+- Static analysis cannot enumerate real deployed bucket policies; likelihood depends heavily on operator policy usage.
+- The strongest provided dynamic validation demonstrates ListBucket behavior; read/write impact follows from the same shared policy evaluator and action dispatch but was not independently re-run in this static pass.
+- AWS-compatibility expectations for unresolved variables may require careful specification before choosing exact remediation behavior.

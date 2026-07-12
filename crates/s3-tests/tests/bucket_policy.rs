@@ -8812,6 +8812,39 @@ fn assert_anonymous_list_ok_contains(bucket: &str, encoded_prefix: &str, expecte
     );
 }
 
+async fn anonymous_list_ok_contains_eventually(
+    description: &str,
+    bucket: &str,
+    encoded_prefix: &str,
+    expected_key: &str,
+) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let response = raw_anonymous(
+            "GET",
+            bucket,
+            "",
+            Some(&format!("list-type=2&prefix={encoded_prefix}")),
+        );
+        if response.status == 200
+            && response
+                .body
+                .contains(&format!("<Key>{expected_key}</Key>"))
+        {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge: status={} body={}",
+            response.status, response.body
+        );
+    }
+}
+
 fn assert_anonymous_list_access_denied(bucket: &str, encoded_prefix: &str) {
     let body = assert_anonymous_list_status(bucket, encoded_prefix, 403);
     assert!(
@@ -9041,6 +9074,173 @@ fn test_bucket_policy_variables_authenticated_identity_defaults_do_not_apply() {
             },
         )
         .await;
+
+        cleanup(&bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_variables_omit_unresolved_string_operands() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let keys = [
+            "control/one",
+            "default-public/one",
+            "unresolved-public/one",
+            "unresolved-like/one",
+            "notequals-${aws:username}/one",
+            "notlike-${aws:username}/one",
+            "mixed-literal/one",
+            "mixed-${aws:username}/one",
+        ];
+        for key in keys {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:prefix": "control"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringNotEquals": {
+                                    "s3:prefix": "notequals-${aws:username}"
+                                },
+                                "StringLike": {
+                                    "s3:prefix": "notequals-*username*"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringNotLike": {
+                                    "s3:prefix": "notlike-${aws:username}"
+                                },
+                                "StringLike": {
+                                    "s3:prefix": "notlike-*username*"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringNotLike": {
+                                    "s3:prefix": "${aws:username}"
+                                },
+                                "StringLike": {
+                                    "s3:prefix": "unresolved-like"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringNotEquals": {
+                                    "s3:prefix": "${aws:username, 'default-blocked'}"
+                                },
+                                "StringLike": {
+                                    "s3:prefix": "default-*"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringNotEquals": {
+                                    "s3:prefix": "${aws:username}"
+                                },
+                                "StringLike": {
+                                    "s3:prefix": "unresolved-*"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": "*",
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:prefix": [
+                                        "mixed-literal",
+                                        "mixed-${aws:username}"
+                                    ]
+                                },
+                                "StringLike": {
+                                    "s3:prefix": "mixed-*"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        anonymous_list_ok_contains_eventually(
+            "ListBucket policy variable convergence control",
+            &bucket,
+            "control",
+            "control/one",
+        )
+        .await;
+        assert_anonymous_list_ok_contains(&bucket, "default-public", "default-public/one");
+        assert_anonymous_list_access_denied(&bucket, "default-blocked");
+        assert_anonymous_list_ok_contains(&bucket, "unresolved-public", "unresolved-public/one");
+        assert_anonymous_list_ok_contains(&bucket, "unresolved-like", "unresolved-like/one");
+        assert_anonymous_list_ok_contains(
+            &bucket,
+            "notequals-%24%7Baws%3Ausername%7D",
+            "notequals-${aws:username}/one",
+        );
+        assert_anonymous_list_ok_contains(
+            &bucket,
+            "notlike-%24%7Baws%3Ausername%7D",
+            "notlike-${aws:username}/one",
+        );
+        assert_anonymous_list_ok_contains(&bucket, "mixed-literal", "mixed-literal/one");
+        assert_anonymous_list_access_denied(&bucket, "mixed-%24%7Baws%3Ausername%7D");
 
         cleanup(&bucket, &keys).await;
     });
