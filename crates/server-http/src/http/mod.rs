@@ -1160,6 +1160,44 @@ impl HttpFrontend {
         }
     }
 
+    fn authenticated_account(
+        auth: &AuthContext,
+    ) -> Result<&s3_types::AccountIdentity, ServerError> {
+        auth.account.as_ref().ok_or(ServerError::AccessDenied)
+    }
+}
+
+fn auth_type_condition_value(mode: AuthMode) -> Option<&'static str> {
+    match mode {
+        AuthMode::HeaderSigV4 => Some("REST-HEADER"),
+        AuthMode::PresignedSigV4 => Some("REST-QUERY-STRING"),
+        AuthMode::PostSigV4 => Some("POST"),
+        AuthMode::Anonymous => None,
+    }
+}
+
+fn signature_version_condition_value(mode: AuthMode) -> Option<&'static str> {
+    match mode {
+        AuthMode::HeaderSigV4 | AuthMode::PresignedSigV4 | AuthMode::PostSigV4 => {
+            Some("AWS4-HMAC-SHA256")
+        }
+        AuthMode::Anonymous => None,
+    }
+}
+
+fn signature_age_millis(auth: &AuthContext, req: &S3Request) -> Option<u64> {
+    if !matches!(auth.mode, AuthMode::PresignedSigV4 | AuthMode::PostSigV4) {
+        return None;
+    }
+    let signed_epoch_seconds = auth.request_epoch_secs?;
+    Some(
+        req.request_epoch_seconds()
+            .saturating_sub(signed_epoch_seconds)
+            .saturating_mul(1000),
+    )
+}
+
+impl HttpFrontend {
     fn requester_from_auth(
         &self,
         auth: &AuthContext,
@@ -1171,12 +1209,14 @@ impl HttpFrontend {
             .with_secure_transport(Some(req.transport_security.is_secure()))
             .with_requested_region(Some(self.coordinator.region().to_string()))
             .with_referer(req.header("referer").map(str::to_string))
-    }
-
-    fn authenticated_account(
-        auth: &AuthContext,
-    ) -> Result<&s3_types::AccountIdentity, ServerError> {
-        auth.account.as_ref().ok_or(ServerError::AccessDenied)
+            .with_auth_type(auth_type_condition_value(auth.mode))
+            .with_signature_version(signature_version_condition_value(auth.mode))
+            .with_signature_age_millis(signature_age_millis(auth, req))
+            .with_tls_version(
+                req.tls_version
+                    .map(|version| version.policy_value().to_string()),
+            )
+            .with_content_sha256(req.header("x-amz-content-sha256").map(str::to_string))
     }
 
     fn acl_owner_display_name(
@@ -4007,6 +4047,8 @@ impl HttpFrontend {
                             metadata_directive: None,
                             canned_acl: parse_put_object_acl(req.header("x-amz-acl"))
                                 .policy_condition_value(),
+                            website_redirect_location: req
+                                .header(WEBSITE_REDIRECT_LOCATION_HEADER_NAME),
                             managed_encryption,
                             sse_customer_algorithm: sse_customer_request
                                 .as_ref()
@@ -5946,6 +5988,7 @@ fn put_object_policy_context_from_request<'a>(
         copy_source,
         metadata_directive,
         canned_acl,
+        website_redirect_location: req.header(WEBSITE_REDIRECT_LOCATION_HEADER_NAME),
         managed_encryption,
         sse_customer_algorithm: req.header(SSE_C_ALGORITHM_HEADER),
         grants: PutObjectGrantHeaders {
@@ -5990,6 +6033,7 @@ struct PutObjectPolicyContextFields<'a> {
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
+    website_redirect_location: Option<&'a str>,
     managed_encryption: Option<ManagedEncryptionAlgorithm>,
     sse_customer_algorithm: Option<&'a str>,
     grants: PutObjectGrantHeaders<'a>,
@@ -6004,6 +6048,7 @@ fn put_object_policy_context_from_request_fields<'a>(
         fields.metadata_directive,
         fields.canned_acl,
     )
+    .with_website_redirect_location(fields.website_redirect_location)
     .with_managed_encryption(fields.managed_encryption)
     .with_sse_customer_algorithm(fields.sse_customer_algorithm)
     .with_request_object_tags_xml(fields.tags_xml)

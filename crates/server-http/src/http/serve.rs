@@ -21,7 +21,8 @@ use tokio_rustls::TlsAcceptor;
 #[cfg(any(test, feature = "local-debug-endpoints"))]
 use super::request::percent_decode_strict;
 use super::request::{
-    parse_upload_part_query, S3Request, TransportSecurity, MAX_BUFFERED_CONTROL_BODY_SIZE,
+    parse_upload_part_query, S3Request, TlsProtocolVersion, TransportSecurity,
+    MAX_BUFFERED_CONTROL_BODY_SIZE,
 };
 use super::response::{S3Response, WireResponseIds};
 use super::router::{route, S3Operation};
@@ -604,11 +605,17 @@ async fn serve_plain_or_tls(
                 Some(acceptor) => {
                     match tokio::time::timeout(header_read_timeout, acceptor.accept(stream)).await {
                         Ok(Ok(tls_stream)) => {
+                            let tls_version = tls_stream
+                                .get_ref()
+                                .1
+                                .protocol_version()
+                                .and_then(tls_protocol_version);
                             serve_connection(
                                 Arc::clone(&state),
                                 TokioIo::new(tls_stream),
                                 header_read_timeout,
                                 TransportSecurity::Tls,
+                                tls_version,
                                 source_ip,
                             )
                             .await;
@@ -630,6 +637,7 @@ async fn serve_plain_or_tls(
                         TokioIo::new(stream),
                         header_read_timeout,
                         TransportSecurity::InsecureHttp,
+                        None,
                         source_ip,
                     )
                     .await;
@@ -649,11 +657,22 @@ fn canonical_source_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+fn tls_protocol_version(
+    version: tokio_rustls::rustls::ProtocolVersion,
+) -> Option<TlsProtocolVersion> {
+    match version {
+        tokio_rustls::rustls::ProtocolVersion::TLSv1_2 => Some(TlsProtocolVersion::Tls12),
+        tokio_rustls::rustls::ProtocolVersion::TLSv1_3 => Some(TlsProtocolVersion::Tls13),
+        _ => None,
+    }
+}
+
 async fn serve_connection<IO>(
     state: Arc<ServerState>,
     io: TokioIo<IO>,
     header_read_timeout: Duration,
     transport_security: TransportSecurity,
+    tls_version: Option<TlsProtocolVersion>,
     source_ip: Option<IpAddr>,
 ) where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -665,7 +684,7 @@ async fn serve_connection<IO>(
             io,
             service_fn(move |req: Request<Incoming>| {
                 let state = Arc::clone(&state);
-                async move { handle(state, req, transport_security, source_ip).await }
+                async move { handle(state, req, transport_security, tls_version, source_ip).await }
             }),
         );
     // Lingering close: take the IO back from hyper instead of letting it
@@ -713,6 +732,7 @@ async fn handle(
     state: Arc<ServerState>,
     req: Request<Incoming>,
     transport_security: TransportSecurity,
+    tls_version: Option<TlsProtocolVersion>,
     source_ip: Option<IpAddr>,
 ) -> Result<http::Response<S3HyperBody>, Infallible> {
     let trace = crate::http::new_request_trace_context();
@@ -849,7 +869,9 @@ async fn handle(
             transport_security,
             source_ip,
             request_epoch_seconds,
-        ) {
+        )
+        .map(|req| req.with_tls_version(tls_version))
+        {
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
@@ -948,7 +970,9 @@ async fn handle(
             transport_security,
             source_ip,
             request_epoch_seconds,
-        ) {
+        )
+        .map(|req| req.with_tls_version(tls_version))
+        {
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
@@ -997,7 +1021,9 @@ async fn handle(
             transport_security,
             source_ip,
             request_epoch_seconds,
-        ) {
+        )
+        .map(|req| req.with_tls_version(tls_version))
+        {
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
@@ -1052,7 +1078,9 @@ async fn handle(
         transport_security,
         source_ip,
         request_epoch_seconds,
-    ) {
+    )
+    .map(|req| req.with_tls_version(tls_version))
+    {
         Ok(req) => req,
         Err(err) => {
             return Ok(s3_response_to_hyper(
@@ -5165,6 +5193,7 @@ mod tests {
                         TokioIo::new(stream),
                         header_read_timeout,
                         TransportSecurity::InsecureHttp,
+                        None,
                         Some(canonical_source_ip(addr.ip())),
                     )
                     .await;

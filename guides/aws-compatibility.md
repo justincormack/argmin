@@ -507,10 +507,8 @@ Current runtime-evaluation limits include:
   `aws:SourceOwner`, `aws:PrincipalOrgID`, `s3:DataAccessPointAccount`, and
   `s3:DataAccessPointArn` still remain outside the current accepted/evaluable
   object-condition subset
-- S3 request-context keys that require additional HTTP/auth/transport context
-  are still deferred, including `s3:authType`, `s3:ResourceAccount`,
-  `s3:signatureAge`, `s3:signatureversion`, `s3:TlsVersion`, and
-  `s3:x-amz-content-sha256`
+- S3 request-context keys that require resource-owner account context, such as
+  `s3:ResourceAccount`, are still deferred
 - S3 object-lock condition keys such as `s3:object-lock-mode`,
   `s3:object-lock-legal-hold`, `s3:object-lock-retain-until-date`, and
   `s3:object-lock-remaining-retention-days` are not yet runtime-evaluable
@@ -534,6 +532,12 @@ The current implemented evaluator is strongest on:
 - `aws:SecureTransport`
 - `aws:RequestedRegion`
 - `aws:referer`
+- `s3:authType`
+- `s3:signatureversion`
+- `s3:signatureAge` for presigned query and POST requests
+- `s3:TlsVersion` when the request is served over TLS
+- `s3:x-amz-content-sha256`
+- `s3:x-amz-website-redirect-location`
 - the supported `s3:x-amz-*` request condition keys already threaded through
   `PolicyRequest`
 
@@ -608,6 +612,10 @@ evaluation time rather than rejected by `PutBucketPolicy`.
 `aws:SecureTransport` is derived from the actual listener transport,
 `aws:RequestedRegion` is the configured S3 endpoint region, and `aws:referer`
 uses the request `Referer` header with normal absent-key condition semantics.
+`s3:authType`, `s3:signatureversion`, `s3:signatureAge`, `s3:TlsVersion`, and
+`s3:x-amz-content-sha256` are evaluated from the authenticated request context.
+AWS exposes `s3:signatureAge` for presigned query and POST authentication;
+header-auth requests treat that key as absent.
 
 Policy variables are implemented only for request-backed values that Argmin
 can model exactly. Variables are expanded in `Resource` patterns and string

@@ -12,13 +12,15 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
-    disable_bucket_public_access_block, err_status, object_url, put_bucket_lifecycle_with_md5,
-    raw_alt_object_request, raw_anonymous, raw_bucket, send_signed_request,
-    send_signed_request_with_credentials,
+    disable_bucket_public_access_block, err_status, object_url,
+    post_object_raw_to_test_endpoint_with_headers, presign_url_with_credentials,
+    put_bucket_lifecycle_with_md5, raw_alt_object_request, raw_anonymous, raw_bucket,
+    raw_fetch_url, send_signed_request, send_signed_request_with_credentials,
     shape::{
         assert_shape, error_response_headers, escape_literal, expected_error, id_headers, shape,
     },
-    sse_c_header_values, test_sse_c_key, unique_bucket, RawAltObjectRequest,
+    sigv4_post_fields_for_credentials, sigv4_post_fields_for_credentials_at_epoch,
+    sse_c_header_values, test_sse_c_key, unique_bucket, RawAltObjectRequest, RawResponse,
     SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 use serde_json::json;
@@ -504,6 +506,58 @@ async fn raw_alt_object_status_eventually(
 
     loop {
         let response = raw_alt_object_request(request);
+        if response.status == expected_status {
+            return response;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            panic!("{description} did not converge to {expected_status}: {response:?}");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+async fn raw_presigned_status_eventually(
+    description: &str,
+    url: &str,
+    expected_status: u16,
+) -> s3_tests::RawResponse {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    loop {
+        let response = raw_fetch_url(url, &[]);
+        if response.status == expected_status {
+            return response;
+        }
+
+        if std::time::Instant::now() >= deadline {
+            panic!("{description} did not converge to {expected_status}: {response:?}");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+async fn raw_alt_post_object_status_eventually(
+    description: &str,
+    bucket: &str,
+    key: &str,
+    fields: Vec<(String, String)>,
+    expected_status: u16,
+) -> RawResponse {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    loop {
+        let response = post_object_raw_to_test_endpoint_with_headers(
+            CTX.endpoint(),
+            CTX.tls_ca_pem(),
+            bucket,
+            &fields,
+            key.as_bytes(),
+            "policy-post.txt",
+            &[],
+        );
         if response.status == expected_status {
             return response;
         }
@@ -9673,6 +9727,413 @@ fn test_bucket_policy_referer_string_condition() {
         assert_raw_access_denied("GetObject denied by absent aws:referer", &missing);
 
         cleanup(&bucket, &[allowed_key, missing_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_auth_request_context_condition_keys() {
+    s3_tests::run(async {
+        require_https_endpoint();
+
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let keys = [
+            "auth-type-header",
+            "auth-type-presigned",
+            "auth-type-post",
+            "auth-type-post-denied",
+            "auth-type-denied",
+            "signature-version",
+            "signature-age-presigned-allowed",
+            "signature-age-presigned-denied",
+            "signature-age-post-fresh-allowed",
+            "signature-age-post-old-denied",
+            "tls-version-allowed",
+            "tls-version-denied",
+            "content-sha256-allowed",
+            "content-sha256-denied",
+            "website-redirect-allowed",
+            "website-redirect-denied",
+        ];
+
+        for key in keys {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(key.as_bytes()))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let empty_payload_sha256 =
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "auth-type-header"),
+                    "Condition": {"StringEquals": {"s3:authType": "REST-HEADER"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "auth-type-presigned"),
+                    "Condition": {"StringEquals": {"s3:authType": "REST-QUERY-STRING"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": object_resource(&bucket, "auth-type-post"),
+                    "Condition": {"StringEquals": {"s3:authType": "POST"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": object_resource(&bucket, "auth-type-post-denied"),
+                    "Condition": {"StringEquals": {"s3:authType": "REST-POST"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "auth-type-denied"),
+                    "Condition": {"StringEquals": {"s3:authType": "REST-QUERY-STRING"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "signature-version"),
+                    "Condition": {"StringEquals": {"s3:signatureversion": "AWS4-HMAC-SHA256"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "signature-age-presigned-allowed"),
+                    "Condition": {"NumericLessThan": {"s3:signatureAge": "600000"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "signature-age-presigned-denied"),
+                    "Condition": {"NumericGreaterThan": {"s3:signatureAge": "604800000"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": object_resource(&bucket, "signature-age-post-fresh-allowed"),
+                    "Condition": {"NumericLessThan": {"s3:signatureAge": "600000"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": object_resource(&bucket, "signature-age-post-old-denied"),
+                    "Condition": {"NumericLessThan": {"s3:signatureAge": "600000"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "tls-version-allowed"),
+                    "Condition": {"NumericGreaterThanEquals": {"s3:TlsVersion": "1.2"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "tls-version-denied"),
+                    "Condition": {"NumericLessThan": {"s3:TlsVersion": "1.2"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "content-sha256-allowed"),
+                    "Condition": {"StringEquals": {"s3:x-amz-content-sha256": empty_payload_sha256}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "content-sha256-denied"),
+                    "Condition": {"StringEquals": {"s3:x-amz-content-sha256": "0000000000000000000000000000000000000000000000000000000000000000"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": object_resource(&bucket, "website-redirect-allowed"),
+                    "Condition": {"StringEquals": {"s3:x-amz-website-redirect-location": "/docs/allowed.html"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": object_resource(&bucket, "website-redirect-denied"),
+                    "Condition": {"StringEquals": {"s3:x-amz-website-redirect-location": "/docs/allowed.html"}}
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let header_auth = raw_alt_object_status_eventually(
+            "GetObject allowed by s3:authType REST-HEADER",
+            RawAltObjectRequest::new("GET", &bucket, "auth-type-header"),
+            200,
+        )
+        .await;
+        assert_eq!(header_auth.body, "auth-type-header");
+
+        let presigned = presign_url_with_credentials(
+            "GET",
+            &object_url(CTX.endpoint(), &bucket, "auth-type-presigned", None),
+            std::time::Duration::from_secs(300),
+            std::iter::empty::<(&str, &str)>(),
+            None,
+            raw_alt_credentials(),
+        );
+        let presigned_auth = raw_presigned_status_eventually(
+            "GetObject allowed by s3:authType REST-QUERY-STRING",
+            presigned.uri(),
+            200,
+        )
+        .await;
+        assert_eq!(presigned_auth.body, "auth-type-presigned");
+
+        let post_credentials = raw_alt_credentials();
+        let post_auth_type_fields = sigv4_post_fields_for_credentials(
+            post_credentials.access_key,
+            post_credentials.secret_key,
+            post_credentials.region,
+            &bucket,
+            "auth-type-post",
+            &[],
+        );
+        let post_auth_type = raw_alt_post_object_status_eventually(
+            "PostObject allowed by s3:authType POST",
+            &bucket,
+            "auth-type-post",
+            post_auth_type_fields,
+            204,
+        )
+        .await;
+        assert_eq!(post_auth_type.body, "");
+
+        let post_auth_type_denied_fields = sigv4_post_fields_for_credentials(
+            post_credentials.access_key,
+            post_credentials.secret_key,
+            post_credentials.region,
+            &bucket,
+            "auth-type-post-denied",
+            &[],
+        );
+        let post_auth_type_denied = raw_alt_post_object_status_eventually(
+            "PostObject denied by s3:authType REST-POST mismatch",
+            &bucket,
+            "auth-type-post-denied",
+            post_auth_type_denied_fields,
+            403,
+        )
+        .await;
+        assert_raw_access_denied(
+            "PostObject denied by s3:authType REST-POST mismatch",
+            &post_auth_type_denied,
+        );
+
+        let denied_auth_type = raw_alt_object_status_eventually(
+            "GetObject denied by s3:authType mismatch",
+            RawAltObjectRequest::new("GET", &bucket, "auth-type-denied"),
+            403,
+        )
+        .await;
+        assert_raw_access_denied(
+            "GetObject denied by s3:authType mismatch",
+            &denied_auth_type,
+        );
+
+        let signature_version = raw_alt_object_status_eventually(
+            "GetObject allowed by s3:signatureversion",
+            RawAltObjectRequest::new("GET", &bucket, "signature-version"),
+            200,
+        )
+        .await;
+        assert_eq!(signature_version.body, "signature-version");
+
+        let signature_age_allowed_url = presign_url_with_credentials(
+            "GET",
+            &object_url(
+                CTX.endpoint(),
+                &bucket,
+                "signature-age-presigned-allowed",
+                None,
+            ),
+            std::time::Duration::from_secs(300),
+            std::iter::empty::<(&str, &str)>(),
+            None,
+            raw_alt_credentials(),
+        );
+        let signature_age_allowed = raw_presigned_status_eventually(
+            "GetObject allowed by s3:signatureAge",
+            signature_age_allowed_url.uri(),
+            200,
+        )
+        .await;
+        assert_eq!(
+            signature_age_allowed.body,
+            "signature-age-presigned-allowed"
+        );
+
+        let signature_age_denied_url = presign_url_with_credentials(
+            "GET",
+            &object_url(
+                CTX.endpoint(),
+                &bucket,
+                "signature-age-presigned-denied",
+                None,
+            ),
+            std::time::Duration::from_secs(300),
+            std::iter::empty::<(&str, &str)>(),
+            None,
+            raw_alt_credentials(),
+        );
+        let signature_age_denied = raw_presigned_status_eventually(
+            "GetObject denied by s3:signatureAge mismatch",
+            signature_age_denied_url.uri(),
+            403,
+        )
+        .await;
+        assert_raw_access_denied(
+            "GetObject denied by s3:signatureAge mismatch",
+            &signature_age_denied,
+        );
+
+        let signature_age_post_allowed_fields = sigv4_post_fields_for_credentials(
+            post_credentials.access_key,
+            post_credentials.secret_key,
+            post_credentials.region,
+            &bucket,
+            "signature-age-post-fresh-allowed",
+            &[],
+        );
+        let signature_age_post_allowed = raw_alt_post_object_status_eventually(
+            "PostObject allowed by fresh s3:signatureAge",
+            &bucket,
+            "signature-age-post-fresh-allowed",
+            signature_age_post_allowed_fields,
+            204,
+        )
+        .await;
+        assert_eq!(signature_age_post_allowed.body, "");
+
+        let old_post_signing_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_secs()
+            .saturating_sub(660);
+        let signature_age_post_denied_fields = sigv4_post_fields_for_credentials_at_epoch(
+            post_credentials.access_key,
+            post_credentials.secret_key,
+            post_credentials.region,
+            &bucket,
+            "signature-age-post-old-denied",
+            old_post_signing_epoch,
+            &[],
+        );
+        let signature_age_post_denied = raw_alt_post_object_status_eventually(
+            "PostObject denied by old s3:signatureAge",
+            &bucket,
+            "signature-age-post-old-denied",
+            signature_age_post_denied_fields,
+            403,
+        )
+        .await;
+        assert_raw_access_denied(
+            "PostObject denied by old s3:signatureAge",
+            &signature_age_post_denied,
+        );
+
+        let tls_version_allowed = raw_alt_object_status_eventually(
+            "GetObject allowed by s3:TlsVersion",
+            RawAltObjectRequest::new("GET", &bucket, "tls-version-allowed"),
+            200,
+        )
+        .await;
+        assert_eq!(tls_version_allowed.body, "tls-version-allowed");
+
+        let tls_version_denied = raw_alt_object_status_eventually(
+            "GetObject denied by s3:TlsVersion mismatch",
+            RawAltObjectRequest::new("GET", &bucket, "tls-version-denied"),
+            403,
+        )
+        .await;
+        assert_raw_access_denied(
+            "GetObject denied by s3:TlsVersion mismatch",
+            &tls_version_denied,
+        );
+
+        let content_sha256_allowed = raw_alt_object_status_eventually(
+            "GetObject allowed by s3:x-amz-content-sha256",
+            RawAltObjectRequest::new("GET", &bucket, "content-sha256-allowed"),
+            200,
+        )
+        .await;
+        assert_eq!(content_sha256_allowed.body, "content-sha256-allowed");
+
+        let content_sha256_denied = raw_alt_object_status_eventually(
+            "GetObject denied by s3:x-amz-content-sha256 mismatch",
+            RawAltObjectRequest::new("GET", &bucket, "content-sha256-denied"),
+            403,
+        )
+        .await;
+        assert_raw_access_denied(
+            "GetObject denied by s3:x-amz-content-sha256 mismatch",
+            &content_sha256_denied,
+        );
+
+        let redirect_allowed_headers = [("x-amz-website-redirect-location", "/docs/allowed.html")];
+        let website_redirect_allowed = raw_alt_object_status_eventually(
+            "PutObject allowed by s3:x-amz-website-redirect-location",
+            RawAltObjectRequest::new("PUT", &bucket, "website-redirect-allowed")
+                .extra_headers(&redirect_allowed_headers),
+            200,
+        )
+        .await;
+        assert_eq!(website_redirect_allowed.body, "");
+
+        let redirect_denied_headers = [("x-amz-website-redirect-location", "/docs/denied.html")];
+        let website_redirect_denied = raw_alt_object_status_eventually(
+            "PutObject denied by s3:x-amz-website-redirect-location mismatch",
+            RawAltObjectRequest::new("PUT", &bucket, "website-redirect-denied")
+                .extra_headers(&redirect_denied_headers),
+            403,
+        )
+        .await;
+        assert_raw_access_denied(
+            "PutObject denied by s3:x-amz-website-redirect-location mismatch",
+            &website_redirect_denied,
+        );
+
+        cleanup(&bucket, &keys).await;
     });
 }
 

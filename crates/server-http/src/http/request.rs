@@ -41,12 +41,29 @@ impl TransportSecurity {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsProtocolVersion {
+    Tls12,
+    Tls13,
+}
+
+impl TlsProtocolVersion {
+    #[must_use]
+    pub const fn policy_value(self) -> &'static str {
+        match self {
+            Self::Tls12 => "1.2",
+            Self::Tls13 => "1.3",
+        }
+    }
+}
+
 pub struct S3Request {
     pub method: http::Method,
     pub uri: http::Uri,
     pub headers: http::HeaderMap,
     pub body: Vec<u8>,
     pub transport_security: TransportSecurity,
+    pub tls_version: Option<TlsProtocolVersion>,
     pub source_ip: Option<IpAddr>,
     pub request_epoch_seconds: u64,
 }
@@ -151,6 +168,7 @@ impl S3Request {
             headers,
             body,
             transport_security,
+            tls_version: None,
             source_ip,
             request_epoch_seconds,
         })
@@ -187,6 +205,12 @@ impl S3Request {
             source_ip,
             request_epoch_seconds,
         )
+    }
+
+    #[must_use]
+    pub const fn with_tls_version(mut self, tls_version: Option<TlsProtocolVersion>) -> Self {
+        self.tls_version = tls_version;
+        self
     }
 
     /// Get a header value by lowercase name.
@@ -284,6 +308,7 @@ impl S3Request {
             headers,
             body,
             transport_security: self.transport_security,
+            tls_version: self.tls_version,
             source_ip: self.source_ip,
             request_epoch_seconds: self.request_epoch_seconds,
         }
@@ -355,6 +380,7 @@ impl S3Request {
             headers,
             body,
             transport_security,
+            tls_version: None,
             source_ip: None,
             request_epoch_seconds,
         }

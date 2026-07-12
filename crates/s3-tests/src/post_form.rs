@@ -110,6 +110,10 @@ fn current_dates() -> (String, String) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    dates_for_epoch(epoch)
+}
+
+fn dates_for_epoch(epoch: u64) -> (String, String) {
     let iso = epoch_to_iso8601(epoch);
     let short = iso[..10].replace('-', "");
     let full = format!("{}T{}Z", short, iso[11..19].replace(':', ""));
@@ -159,17 +163,59 @@ pub fn sigv4_post_fields_for_credentials(
     extra_conditions: &[serde_json::Value],
 ) -> Vec<(String, String)> {
     let (short_date, full_date) = current_dates();
+    sigv4_post_fields_for_credentials_with_dates(
+        access_key,
+        secret,
+        region,
+        bucket,
+        key,
+        (&short_date, &full_date),
+        extra_conditions,
+    )
+}
+
+pub fn sigv4_post_fields_for_credentials_at_epoch(
+    access_key: &str,
+    secret: &str,
+    region: &str,
+    bucket: &str,
+    key: &str,
+    signing_epoch_secs: u64,
+    extra_conditions: &[serde_json::Value],
+) -> Vec<(String, String)> {
+    let (short_date, full_date) = dates_for_epoch(signing_epoch_secs);
+    sigv4_post_fields_for_credentials_with_dates(
+        access_key,
+        secret,
+        region,
+        bucket,
+        key,
+        (&short_date, &full_date),
+        extra_conditions,
+    )
+}
+
+fn sigv4_post_fields_for_credentials_with_dates(
+    access_key: &str,
+    secret: &str,
+    region: &str,
+    bucket: &str,
+    key: &str,
+    dates: (&str, &str),
+    extra_conditions: &[serde_json::Value],
+) -> Vec<(String, String)> {
+    let (short_date, full_date) = dates;
     let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
 
     let mut all_conditions = vec![
         serde_json::json!({"x-amz-algorithm": "AWS4-HMAC-SHA256"}),
         serde_json::json!({"x-amz-credential": &credential}),
-        serde_json::json!({"x-amz-date": &full_date}),
+        serde_json::json!({"x-amz-date": full_date}),
     ];
     all_conditions.extend_from_slice(extra_conditions);
 
     let policy_b64 = make_policy(bucket, key, 3600, &all_conditions);
-    let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
+    let signature = sign_policy_v4(&policy_b64, secret, short_date, region);
 
     vec![
         ("key".to_string(), key.to_string()),
@@ -178,7 +224,7 @@ pub fn sigv4_post_fields_for_credentials(
             "AWS4-HMAC-SHA256".to_string(),
         ),
         ("x-amz-credential".to_string(), credential),
-        ("x-amz-date".to_string(), full_date),
+        ("x-amz-date".to_string(), full_date.to_string()),
         ("policy".to_string(), policy_b64),
         ("x-amz-signature".to_string(), signature),
     ]

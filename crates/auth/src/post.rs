@@ -109,6 +109,8 @@ pub fn authenticate_post_sigv4(
     if !crate::canonical::amz_date_matches_date_stamp(request.date, credential.date) {
         return Err(AuthError::MalformedAuth);
     }
+    let request_epoch_secs =
+        crate::canonical::parse_amz_date(request.date).ok_or(AuthError::MalformedAuth)?;
 
     // Look up the secret key
     let record = store
@@ -147,7 +149,7 @@ pub fn authenticate_post_sigv4(
         access_key_id: Some(credential.access_key_id.to_string()),
         account: Some(record.account.clone()),
         authorization_profile: record.authorization_profile,
-        request_epoch_secs: None,
+        request_epoch_secs: Some(request_epoch_secs),
         signing_region: Some(credential.region.to_string()),
         streaming: None,
     })

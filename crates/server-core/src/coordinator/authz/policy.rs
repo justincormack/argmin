@@ -156,6 +156,7 @@ pub(super) fn object_policy_request<'a>(
     .with_copy_source(input.policy_context.copy_source)
     .with_metadata_directive(input.policy_context.metadata_directive)
     .with_canned_acl(input.policy_context.canned_acl)
+    .with_website_redirect_location(input.policy_context.website_redirect_location)
     .with_server_side_encryption(
         input
             .policy_context
@@ -174,6 +175,21 @@ pub(super) fn object_policy_request<'a>(
     .with_version_id(input.version_id);
     if let Some(referer) = input.requester.referer() {
         request = request.with_referer(referer);
+    }
+    if let Some(auth_type) = input.requester.auth_type() {
+        request = request.with_auth_type(auth_type);
+    }
+    if let Some(signature_version) = input.requester.signature_version() {
+        request = request.with_signature_version(signature_version);
+    }
+    if let Some(signature_age_millis) = input.requester.signature_age_millis() {
+        request = request.with_signature_age_millis(signature_age_millis);
+    }
+    if let Some(tls_version) = input.requester.tls_version() {
+        request = request.with_tls_version(tls_version);
+    }
+    if let Some(content_sha256) = input.requester.content_sha256() {
+        request = request.with_content_sha256(content_sha256);
     }
 
     Ok(request)
@@ -232,6 +248,21 @@ fn bucket_policy_request<'a>(
     if let Some(referer) = input.requester.referer() {
         request = request.with_referer(referer);
     }
+    if let Some(auth_type) = input.requester.auth_type() {
+        request = request.with_auth_type(auth_type);
+    }
+    if let Some(signature_version) = input.requester.signature_version() {
+        request = request.with_signature_version(signature_version);
+    }
+    if let Some(signature_age_millis) = input.requester.signature_age_millis() {
+        request = request.with_signature_age_millis(signature_age_millis);
+    }
+    if let Some(tls_version) = input.requester.tls_version() {
+        request = request.with_tls_version(tls_version);
+    }
+    if let Some(content_sha256) = input.requester.content_sha256() {
+        request = request.with_content_sha256(content_sha256);
+    }
 
     if let Some(request_tags) = input.request_tags {
         request = request.with_request_object_tags(request_tags);
@@ -288,6 +319,36 @@ fn validate_common_policy_request_inputs(
         "referer",
         policy.requires_referer_for_action(action),
         requester.referer().is_none(),
+    )?;
+    validate_required_policy_input(
+        action,
+        "auth type",
+        policy.requires_auth_type_for_action(action),
+        requester.auth_type().is_none(),
+    )?;
+    validate_required_policy_input(
+        action,
+        "signature version",
+        policy.requires_signature_version_for_action(action),
+        requester.signature_version().is_none(),
+    )?;
+    validate_required_policy_input(
+        action,
+        "signature age",
+        policy.requires_signature_age_for_action(action),
+        requester.signature_age_millis().is_none(),
+    )?;
+    validate_required_policy_input(
+        action,
+        "TLS version",
+        policy.requires_tls_version_for_action(action),
+        requester.tls_version().is_none(),
+    )?;
+    validate_required_policy_input(
+        action,
+        "x-amz-content-sha256",
+        policy.requires_content_sha256_for_action(action),
+        requester.content_sha256().is_none(),
     )
 }
 

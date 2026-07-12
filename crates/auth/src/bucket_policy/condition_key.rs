@@ -27,6 +27,7 @@ pub(super) enum ResolvedValue<'a> {
     PresentScalarValues(Vec<&'a str>),
     PresentValues(Vec<&'a str>),
     SourceIp(std::net::IpAddr),
+    Numeric(u64),
     EpochSeconds(u64),
     Absent,
     Unavailable,
@@ -100,6 +101,11 @@ pub(super) enum ConditionInput {
     SecureTransport,
     RequestedRegion,
     Referer,
+    AuthType,
+    SignatureVersion,
+    SignatureAge,
+    TlsVersion,
+    ContentSha256,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +241,46 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         supported_for_action: None,
     },
     ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:authType"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::AuthType),
+        resolve: resolve_auth_type,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:signatureversion"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::SignatureVersion),
+        resolve: resolve_signature_version,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:signatureAge"),
+        operator_support: OperatorSupport::NumericOnly,
+        input: Some(ConditionInput::SignatureAge),
+        resolve: resolve_signature_age,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:TlsVersion"),
+        operator_support: OperatorSupport::NumericOnly,
+        input: Some(ConditionInput::TlsVersion),
+        resolve: resolve_tls_version,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-content-sha256"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::ContentSha256),
+        resolve: resolve_content_sha256,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
         key: KeyMatch::Prefix("s3:RequestObjectTag/"),
         operator_support: OperatorSupport::AnyEvaluable,
         input: Some(ConditionInput::Request),
@@ -303,6 +349,14 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         operator_support: OperatorSupport::AnyEvaluable,
         input: None,
         resolve: resolve_sse_customer_algorithm,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-website-redirect-location"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
+        resolve: resolve_website_redirect_location,
         evaluable_for_action: None,
         supported_for_action: Some(request_header_supported_for_action_non_get),
     },
@@ -533,6 +587,30 @@ fn resolve_referer<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedVal
     request_field_to_resolved(request.referer())
 }
 
+fn resolve_auth_type<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.auth_type())
+}
+
+fn resolve_signature_version<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.signature_version())
+}
+
+fn resolve_signature_age<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    match request.signature_age_millis() {
+        Some(Some(signature_age_millis)) => ResolvedValue::Numeric(signature_age_millis),
+        Some(None) => ResolvedValue::Absent,
+        None => ResolvedValue::Unavailable,
+    }
+}
+
+fn resolve_tls_version<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.tls_version())
+}
+
+fn resolve_content_sha256<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.content_sha256())
+}
+
 fn resolve_copy_source<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
     request_field_to_resolved(request.copy_source())
 }
@@ -557,6 +635,13 @@ fn resolve_sse_customer_algorithm<'a>(
     _param: &str,
 ) -> ResolvedValue<'a> {
     request_field_to_resolved(request.sse_customer_algorithm())
+}
+
+fn resolve_website_redirect_location<'a>(
+    request: &PolicyRequest<'a>,
+    _param: &str,
+) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.website_redirect_location())
 }
 
 fn resolve_grant_read<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
@@ -902,6 +987,7 @@ pub(super) fn evaluate_clause(
         }
         ResolvedValue::PresentValues(values) => ActualValue::PresentValues(values),
         ResolvedValue::SourceIp(source_ip) => ActualValue::SourceIp(source_ip),
+        ResolvedValue::Numeric(value) => ActualValue::Numeric(value),
         ResolvedValue::EpochSeconds(epoch_seconds) => ActualValue::EpochSeconds(epoch_seconds),
         ResolvedValue::Absent => ActualValue::Absent,
         ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
@@ -965,6 +1051,7 @@ pub(super) fn resolve_policy_variable(
         ResolvedValue::SourceIp(source_ip) => {
             PolicyVariableResolution::Value(source_ip.to_string())
         }
+        ResolvedValue::Numeric(value) => PolicyVariableResolution::Value(value.to_string()),
         ResolvedValue::EpochSeconds(epoch_seconds) => {
             PolicyVariableResolution::Value(epoch_seconds.to_string())
         }

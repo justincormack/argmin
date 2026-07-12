@@ -111,6 +111,40 @@ impl BucketPolicy {
         self.requires_condition_input_for_action(action, condition_key::ConditionInput::Referer)
     }
 
+    #[must_use]
+    pub fn requires_auth_type_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(action, condition_key::ConditionInput::AuthType)
+    }
+
+    #[must_use]
+    pub fn requires_signature_version_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(
+            action,
+            condition_key::ConditionInput::SignatureVersion,
+        )
+    }
+
+    #[must_use]
+    pub fn requires_signature_age_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(
+            action,
+            condition_key::ConditionInput::SignatureAge,
+        )
+    }
+
+    #[must_use]
+    pub fn requires_tls_version_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(action, condition_key::ConditionInput::TlsVersion)
+    }
+
+    #[must_use]
+    pub fn requires_content_sha256_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(
+            action,
+            condition_key::ConditionInput::ContentSha256,
+        )
+    }
+
     fn requires_condition_input_for_action(
         &self,
         action: PolicyAction,
@@ -391,6 +425,12 @@ pub struct PolicyRequest<'a> {
     secure_transport: RequestBool,
     requested_region: RequestField<'a>,
     referer: RequestField<'a>,
+    auth_type: RequestField<'a>,
+    signature_version: RequestField<'a>,
+    signature_age_millis: Option<Option<u64>>,
+    tls_version: RequestField<'a>,
+    content_sha256: RequestField<'a>,
+    website_redirect_location: RequestField<'a>,
 }
 
 impl<'a> PolicyRequest<'a> {
@@ -436,6 +476,12 @@ impl<'a> PolicyRequest<'a> {
             secure_transport: RequestBool::Unavailable,
             requested_region: RequestField::Unavailable,
             referer: RequestField::Unavailable,
+            auth_type: RequestField::Unavailable,
+            signature_version: RequestField::Unavailable,
+            signature_age_millis: None,
+            tls_version: RequestField::Unavailable,
+            content_sha256: RequestField::Unavailable,
+            website_redirect_location: RequestField::Unavailable,
         }
     }
 
@@ -480,6 +526,12 @@ impl<'a> PolicyRequest<'a> {
             secure_transport: RequestBool::Unavailable,
             requested_region: RequestField::Unavailable,
             referer: RequestField::Unavailable,
+            auth_type: RequestField::Unavailable,
+            signature_version: RequestField::Unavailable,
+            signature_age_millis: None,
+            tls_version: RequestField::Unavailable,
+            content_sha256: RequestField::Unavailable,
+            website_redirect_location: RequestField::Unavailable,
         }
     }
 
@@ -750,6 +802,45 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_auth_type(mut self, auth_type: Option<&'a str>) -> Self {
+        self.auth_type = RequestField::Available(auth_type);
+        self
+    }
+
+    #[must_use]
+    pub fn with_signature_version(mut self, signature_version: Option<&'a str>) -> Self {
+        self.signature_version = RequestField::Available(signature_version);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_signature_age_millis(mut self, signature_age_millis: Option<u64>) -> Self {
+        self.signature_age_millis = Some(signature_age_millis);
+        self
+    }
+
+    #[must_use]
+    pub fn with_tls_version(mut self, tls_version: Option<&'a str>) -> Self {
+        self.tls_version = RequestField::Available(tls_version);
+        self
+    }
+
+    #[must_use]
+    pub fn with_content_sha256(mut self, content_sha256: Option<&'a str>) -> Self {
+        self.content_sha256 = RequestField::Available(content_sha256);
+        self
+    }
+
+    #[must_use]
+    pub fn with_website_redirect_location(
+        mut self,
+        website_redirect_location: Option<&'a str>,
+    ) -> Self {
+        self.website_redirect_location = RequestField::Available(website_redirect_location);
+        self
+    }
+
+    #[must_use]
     fn copy_source(&self) -> RequestField<'a> {
         self.copy_source
     }
@@ -875,6 +966,36 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn referer(&self) -> RequestField<'a> {
         self.referer
+    }
+
+    #[must_use]
+    fn auth_type(&self) -> RequestField<'a> {
+        self.auth_type
+    }
+
+    #[must_use]
+    fn signature_version(&self) -> RequestField<'a> {
+        self.signature_version
+    }
+
+    #[must_use]
+    fn signature_age_millis(&self) -> Option<Option<u64>> {
+        self.signature_age_millis
+    }
+
+    #[must_use]
+    fn tls_version(&self) -> RequestField<'a> {
+        self.tls_version
+    }
+
+    #[must_use]
+    fn content_sha256(&self) -> RequestField<'a> {
+        self.content_sha256
+    }
+
+    #[must_use]
+    fn website_redirect_location(&self) -> RequestField<'a> {
+        self.website_redirect_location
     }
 }
 

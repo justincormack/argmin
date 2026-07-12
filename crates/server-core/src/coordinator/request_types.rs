@@ -62,6 +62,7 @@ pub struct PutObjectPolicyContext<'a> {
     pub copy_source: Option<&'a str>,
     pub metadata_directive: Option<&'a str>,
     pub canned_acl: Option<&'a str>,
+    pub website_redirect_location: Option<&'a str>,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_customer_algorithm: Option<&'a str>,
     pub grant_read: Option<&'a str>,
@@ -92,6 +93,7 @@ impl<'a> PutObjectPolicyContext<'a> {
             copy_source,
             metadata_directive,
             canned_acl,
+            website_redirect_location: None,
             managed_encryption: None,
             sse_customer_algorithm: None,
             grant_read: None,
@@ -110,6 +112,15 @@ impl<'a> PutObjectPolicyContext<'a> {
             object_ownership: None,
             version_id: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_website_redirect_location(
+        mut self,
+        website_redirect_location: Option<&'a str>,
+    ) -> Self {
+        self.website_redirect_location = website_redirect_location;
+        self
     }
 
     #[must_use]
@@ -420,6 +431,11 @@ pub struct Requester {
     pub(super) secure_transport: Option<bool>,
     pub(super) requested_region: Option<String>,
     pub(super) referer: Option<Option<String>>,
+    pub(super) auth_type: Option<Option<&'static str>>,
+    pub(super) signature_version: Option<Option<&'static str>>,
+    pub(super) signature_age_millis: Option<Option<u64>>,
+    pub(super) tls_version: Option<Option<String>>,
+    pub(super) content_sha256: Option<Option<String>>,
 }
 
 /// Parsed x-amz-acl value relevant to PutObject authorization rules.
@@ -1203,6 +1219,11 @@ impl Requester {
             secure_transport: None,
             requested_region: None,
             referer: None,
+            auth_type: None,
+            signature_version: None,
+            signature_age_millis: None,
+            tls_version: None,
+            content_sha256: None,
         }
     }
 
@@ -1217,6 +1238,11 @@ impl Requester {
             secure_transport: None,
             requested_region: None,
             referer: None,
+            auth_type: None,
+            signature_version: None,
+            signature_age_millis: None,
+            tls_version: None,
+            content_sha256: None,
         }
     }
 
@@ -1231,6 +1257,11 @@ impl Requester {
             secure_transport: None,
             requested_region: None,
             referer: None,
+            auth_type: None,
+            signature_version: None,
+            signature_age_millis: None,
+            tls_version: None,
+            content_sha256: None,
         }
     }
 
@@ -1245,6 +1276,11 @@ impl Requester {
             secure_transport: None,
             requested_region: None,
             referer: None,
+            auth_type: None,
+            signature_version: None,
+            signature_age_millis: None,
+            tls_version: None,
+            content_sha256: None,
         }
     }
 
@@ -1259,6 +1295,11 @@ impl Requester {
             secure_transport: None,
             requested_region: None,
             referer: None,
+            auth_type: None,
+            signature_version: None,
+            signature_age_millis: None,
+            tls_version: None,
+            content_sha256: None,
         }
     }
 
@@ -1318,6 +1359,65 @@ impl Requester {
     }
 
     #[must_use]
+    pub const fn with_auth_type(mut self, auth_type: Option<&'static str>) -> Self {
+        self.auth_type = Some(auth_type);
+        self
+    }
+
+    #[must_use]
+    pub const fn auth_type(&self) -> Option<Option<&'static str>> {
+        self.auth_type
+    }
+
+    #[must_use]
+    pub const fn with_signature_version(mut self, signature_version: Option<&'static str>) -> Self {
+        self.signature_version = Some(signature_version);
+        self
+    }
+
+    #[must_use]
+    pub const fn signature_version(&self) -> Option<Option<&'static str>> {
+        self.signature_version
+    }
+
+    #[must_use]
+    pub const fn with_signature_age_millis(mut self, signature_age_millis: Option<u64>) -> Self {
+        self.signature_age_millis = Some(signature_age_millis);
+        self
+    }
+
+    #[must_use]
+    pub const fn signature_age_millis(&self) -> Option<Option<u64>> {
+        self.signature_age_millis
+    }
+
+    #[must_use]
+    pub fn with_tls_version(mut self, tls_version: Option<String>) -> Self {
+        self.tls_version = Some(tls_version);
+        self
+    }
+
+    #[must_use]
+    pub fn tls_version(&self) -> Option<Option<&str>> {
+        self.tls_version
+            .as_ref()
+            .map(|tls_version| tls_version.as_deref())
+    }
+
+    #[must_use]
+    pub fn with_content_sha256(mut self, content_sha256: Option<String>) -> Self {
+        self.content_sha256 = Some(content_sha256);
+        self
+    }
+
+    #[must_use]
+    pub fn content_sha256(&self) -> Option<Option<&str>> {
+        self.content_sha256
+            .as_ref()
+            .map(|content_sha256| content_sha256.as_deref())
+    }
+
+    #[must_use]
     #[cfg(any(test, feature = "test-utils"))]
     pub fn from_account_owner_account_admin(account: Option<&AccountIdentity>) -> Self {
         Self {
@@ -1328,6 +1428,11 @@ impl Requester {
             secure_transport: None,
             requested_region: None,
             referer: None,
+            auth_type: None,
+            signature_version: None,
+            signature_age_millis: None,
+            tls_version: None,
+            content_sha256: None,
         }
     }
 
@@ -1345,6 +1450,11 @@ impl Requester {
             secure_transport: None,
             requested_region: None,
             referer: None,
+            auth_type: None,
+            signature_version: None,
+            signature_age_millis: None,
+            tls_version: None,
+            content_sha256: None,
         }
     }
 
@@ -1362,6 +1472,11 @@ impl Requester {
             secure_transport: None,
             requested_region: None,
             referer: None,
+            auth_type: None,
+            signature_version: None,
+            signature_age_millis: None,
+            tls_version: None,
+            content_sha256: None,
         }
     }
 

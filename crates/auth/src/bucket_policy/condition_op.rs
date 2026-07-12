@@ -28,6 +28,7 @@ pub(super) enum ActualValue<'a> {
     Present(&'a str),
     PresentValues(Vec<&'a str>),
     SourceIp(IpAddr),
+    Numeric(u64),
     EpochSeconds(u64),
     Absent,
 }
@@ -665,9 +666,10 @@ fn eval_binary_equals(operands: &[PolicyValue], actual: ActualValue<'_>) -> Cond
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
-            ConditionMatchResult::NoMatch
-        }
+        ActualValue::PresentValues(_)
+        | ActualValue::SourceIp(_)
+        | ActualValue::Numeric(_)
+        | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -694,7 +696,9 @@ fn eval_for_all_values_binary_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -721,7 +725,9 @@ fn eval_for_any_value_binary_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -734,7 +740,9 @@ fn eval_binary_equals_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_binary_equals(operands, actual)
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -766,9 +774,10 @@ fn eval_date_comparison(
         ActualValue::Absent if if_exists || matches!(comparison, DateComparison::NotEquals) => {
             return ConditionMatchResult::Matches;
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::Absent => {
-            return ConditionMatchResult::NoMatch;
-        }
+        ActualValue::PresentValues(_)
+        | ActualValue::SourceIp(_)
+        | ActualValue::Numeric(_)
+        | ActualValue::Absent => return ConditionMatchResult::NoMatch,
     };
     eval_date_operands(operands, actual_nanos, comparison)
 }
@@ -1026,9 +1035,10 @@ fn eval_bool(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatc
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
-            ConditionMatchResult::NoMatch
-        }
+        ActualValue::PresentValues(_)
+        | ActualValue::SourceIp(_)
+        | ActualValue::Numeric(_)
+        | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1042,7 +1052,9 @@ fn bool_operand_matches(operands: &[PolicyValue], actual: &str) -> bool {
 fn eval_bool_if_exists(operands: &[PolicyValue], actual: ActualValue<'_>) -> ConditionMatchResult {
     match actual {
         ActualValue::Present(_) | ActualValue::PresentValues(_) => eval_bool(operands, actual),
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1069,7 +1081,9 @@ fn eval_for_all_values_bool(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1096,7 +1110,9 @@ fn eval_for_any_value_bool(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1113,9 +1129,10 @@ fn eval_string_equals(operands: &[PolicyValue], actual: ActualValue<'_>) -> Cond
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
-            ConditionMatchResult::NoMatch
-        }
+        ActualValue::PresentValues(_)
+        | ActualValue::SourceIp(_)
+        | ActualValue::Numeric(_)
+        | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1146,7 +1163,9 @@ fn eval_for_all_values_string_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1177,7 +1196,9 @@ fn eval_for_any_value_string_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1190,7 +1211,9 @@ fn eval_string_equals_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_string_equals(operands, actual)
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1210,9 +1233,10 @@ fn eval_string_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
-            ConditionMatchResult::NoMatch
-        }
+        ActualValue::PresentValues(_)
+        | ActualValue::SourceIp(_)
+        | ActualValue::Numeric(_)
+        | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1243,7 +1267,9 @@ fn eval_for_all_values_string_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1274,7 +1300,9 @@ fn eval_for_any_value_string_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1287,7 +1315,9 @@ fn eval_string_equals_ignore_case_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_string_equals_ignore_case(operands, actual)
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1307,9 +1337,10 @@ fn eval_string_not_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
-            ConditionMatchResult::NoMatch
-        }
+        ActualValue::PresentValues(_)
+        | ActualValue::SourceIp(_)
+        | ActualValue::Numeric(_)
+        | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1340,7 +1371,9 @@ fn eval_for_all_values_string_not_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1371,7 +1404,9 @@ fn eval_for_any_value_string_not_equals(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1391,9 +1426,10 @@ fn eval_string_not_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
-            ConditionMatchResult::NoMatch
-        }
+        ActualValue::PresentValues(_)
+        | ActualValue::SourceIp(_)
+        | ActualValue::Numeric(_)
+        | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1424,7 +1460,9 @@ fn eval_for_all_values_string_not_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1455,7 +1493,9 @@ fn eval_for_any_value_string_not_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1472,9 +1512,10 @@ fn eval_string_like(operands: &[PolicyValue], actual: ActualValue<'_>) -> Condit
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
-            ConditionMatchResult::NoMatch
-        }
+        ActualValue::PresentValues(_)
+        | ActualValue::SourceIp(_)
+        | ActualValue::Numeric(_)
+        | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1505,7 +1546,9 @@ fn eval_for_all_values_string_like(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1536,7 +1579,9 @@ fn eval_for_any_value_string_like(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1549,7 +1594,9 @@ fn eval_string_like_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_string_like(operands, actual)
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1566,9 +1613,10 @@ fn eval_string_not_like(operands: &[PolicyValue], actual: ActualValue<'_>) -> Co
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => {
-            ConditionMatchResult::NoMatch
-        }
+        ActualValue::PresentValues(_)
+        | ActualValue::SourceIp(_)
+        | ActualValue::Numeric(_)
+        | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1599,7 +1647,9 @@ fn eval_for_all_values_string_not_like(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -1630,7 +1680,9 @@ fn eval_for_any_value_string_not_like(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::SourceIp(_) | ActualValue::EpochSeconds(_) => ConditionMatchResult::NoMatch,
+        ActualValue::SourceIp(_) | ActualValue::Numeric(_) | ActualValue::EpochSeconds(_) => {
+            ConditionMatchResult::NoMatch
+        }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -1658,7 +1710,7 @@ fn eval_numeric_comparison(
             };
             eval_numeric_operands(operands, actual, comparison)
         }
-        ActualValue::EpochSeconds(actual) => {
+        ActualValue::Numeric(actual) | ActualValue::EpochSeconds(actual) => {
             eval_numeric_operands(operands, actual as f64, comparison)
         }
         ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
@@ -1872,6 +1924,7 @@ fn eval_ip_address_comparison(
         }
         ActualValue::Present(_)
         | ActualValue::PresentValues(_)
+        | ActualValue::Numeric(_)
         | ActualValue::EpochSeconds(_)
         | ActualValue::Absent => false,
     };
