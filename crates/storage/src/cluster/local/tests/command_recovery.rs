@@ -270,6 +270,7 @@ fn heartbeat_authority_with_pending<S: crate::control_plane::ControlPlaneStore>(
                 endpoint: record.endpoint().to_owned(),
                 observed_epoch: authority.snapshot().cluster_epoch(),
                 requested_lease_duration_ms: 10_000,
+                cluster_map_history_route_references: Default::default(),
                 cluster_map_history_reference_summary:
                     crate::PgClusterMapHistoryReferenceSummary::default(),
                 pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
@@ -5817,6 +5818,7 @@ fn heartbeat_authority_node<S: crate::control_plane::ControlPlaneStore>(
         endpoint: record.endpoint().to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_references: Default::default(),
         cluster_map_history_reference_summary: crate::PgClusterMapHistoryReferenceSummary::default(
         ),
         pg_observations: Vec::new(),
@@ -5846,6 +5848,7 @@ fn heartbeat_authority_with_local_pg_proof<S: crate::control_plane::ControlPlane
         endpoint: record.endpoint().to_owned(),
         observed_epoch: authority.snapshot().cluster_epoch(),
         requested_lease_duration_ms: 100,
+        cluster_map_history_route_references: Default::default(),
         cluster_map_history_reference_summary: crate::PgClusterMapHistoryReferenceSummary::default(
         ),
         pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {

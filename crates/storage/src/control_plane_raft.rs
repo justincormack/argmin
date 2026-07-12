@@ -14980,6 +14980,7 @@ mod tests {
                         endpoint: "node-1".to_string(),
                         observed_epoch: bootstrap_epoch,
                         requested_lease_duration_ms: 345,
+                        cluster_map_history_route_references: Default::default(),
                         cluster_map_history_reference_summary:
                             PgClusterMapHistoryReferenceSummary {
                                 oldest_live_placement_epoch: None,

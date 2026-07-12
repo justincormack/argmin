@@ -5391,6 +5391,7 @@ mod tests {
             endpoint: "/tmp/argmin-node-2.sock".to_string(),
             observed_epoch: ClusterEpoch::INITIAL,
             requested_lease_duration_ms: 100,
+            cluster_map_history_route_references: Default::default(),
             cluster_map_history_reference_summary:
                 storage::PgClusterMapHistoryReferenceSummary::default(),
             pg_observations: Vec::new(),
@@ -6331,6 +6332,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -6357,6 +6359,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -6396,6 +6399,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -6442,6 +6446,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -6482,6 +6487,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -6505,6 +6511,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: refreshed_epoch,
                     requested_lease_duration_ms: 100,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -6553,6 +6560,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -6593,6 +6601,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary: protected_floor,
                     pg_observations: Vec::new(),
                 },
@@ -6606,6 +6615,7 @@ mod tests {
             endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
             observed_epoch: ClusterEpoch::INITIAL,
             requested_lease_duration_ms: 1_000,
+            cluster_map_history_route_references: Default::default(),
             cluster_map_history_reference_summary: protected_floor,
             pg_observations: Vec::new(),
         };
@@ -7976,6 +7986,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -8003,6 +8014,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -8034,6 +8046,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -8107,6 +8120,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -8133,6 +8147,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -8159,6 +8174,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -8240,6 +8256,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -8266,6 +8283,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -8292,6 +8310,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -8340,6 +8359,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: expired_snapshot.cluster_epoch(),
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -8396,6 +8416,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -8422,6 +8443,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -8448,6 +8470,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -8513,6 +8536,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -8545,6 +8569,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -8599,6 +8624,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-99.sock".to_string(),
                     observed_epoch: before.cluster_epoch(),
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -9035,6 +9061,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -9061,6 +9088,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -9087,6 +9115,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -9210,6 +9239,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -9236,6 +9266,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -9269,6 +9300,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -9393,6 +9425,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -9419,6 +9452,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -9445,6 +9479,7 @@ mod tests {
                     endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -9635,6 +9670,7 @@ mod tests {
                             .to_string(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 10_000,
+                        cluster_map_history_route_references: Default::default(),
                         cluster_map_history_reference_summary:
                             storage::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
@@ -9655,6 +9691,7 @@ mod tests {
                     endpoint: tmp.join("node-1.sock").display().to_string(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 10_000,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -9680,6 +9717,7 @@ mod tests {
                     endpoint: tmp.join("node-1.sock").display().to_string(),
                     observed_epoch: source_epoch,
                     requested_lease_duration_ms: 10_000,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -9964,6 +10002,7 @@ mod tests {
                     endpoint: "node-2.sock".to_owned(),
                     observed_epoch: floor_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary {
                             oldest_live_placement_epoch: Some(floor_epoch),
@@ -10329,6 +10368,7 @@ mod tests {
                             endpoint: endpoint.clone(),
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
+                            cluster_map_history_route_references: Default::default(),
                             cluster_map_history_reference_summary:
                                 storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: pg_observations.clone(),
@@ -10353,6 +10393,7 @@ mod tests {
                             endpoint: endpoint.clone(),
                             observed_epoch: authority.snapshot().cluster_epoch(),
                             requested_lease_duration_ms: 1_000,
+                            cluster_map_history_route_references: Default::default(),
                             cluster_map_history_reference_summary:
                                 storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: vec![NodePgHeartbeatObservation {
@@ -10407,6 +10448,7 @@ mod tests {
                             endpoint: endpoint.clone(),
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
+                            cluster_map_history_route_references: Default::default(),
                             cluster_map_history_reference_summary:
                                 storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: vec![NodePgHeartbeatObservation {
@@ -10440,6 +10482,7 @@ mod tests {
                             endpoint: format!("{endpoint}.unserved"),
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
+                            cluster_map_history_route_references: Default::default(),
                             cluster_map_history_reference_summary:
                                 storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: vec![NodePgHeartbeatObservation {
@@ -10471,6 +10514,7 @@ mod tests {
                         endpoint,
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
                         cluster_map_history_reference_summary:
                             storage::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: vec![NodePgHeartbeatObservation {
@@ -10607,6 +10651,7 @@ mod tests {
                             endpoint: endpoint.clone(),
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
+                            cluster_map_history_route_references: Default::default(),
                             cluster_map_history_reference_summary:
                                 storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: vec![peering_observation],
@@ -10631,6 +10676,7 @@ mod tests {
                         endpoint,
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
                         cluster_map_history_reference_summary:
                             storage::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: vec![NodePgHeartbeatObservation {
@@ -10828,6 +10874,7 @@ mod tests {
                     endpoint: endpoint.display().to_string(),
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -10849,6 +10896,7 @@ mod tests {
                     endpoint: endpoint.display().to_string(),
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
@@ -10875,6 +10923,7 @@ mod tests {
                     endpoint: endpoint.display().to_string(),
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {

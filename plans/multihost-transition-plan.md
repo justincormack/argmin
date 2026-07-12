@@ -10841,6 +10841,17 @@ Required production shape and implementation order:
    while their minimum is also folded into that aggregate floor. Transfer
    evidence no longer forces a full 116-PG historical record to survive beyond
    the normal history window.
+   Heartbeats and replicated `RecordNodeHeartbeat` commands now also carry the
+   canonical bounded exact-reference set produced by the storage node. The
+   authority validates every `(epoch, PG)` key against the accepted heartbeat
+   validation epoch and retained route, persists the set per node in state
+   format version 19, restores it across restart, and includes those keys in
+   history protection. Both heartbeat codecs fail closed on oversized,
+   unknown-kind, duplicate, or non-canonically ordered reference collections.
+   The scalar summary remains persisted and authoritative for compatibility in
+   this slice, so exact keys do not yet reduce live-payload/backfill/pending
+   retention. The next slice removes that aggregate protection only after the
+   exact-set restart and sparse-pruning invariants are exercised end to end.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge

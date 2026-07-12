@@ -5,12 +5,16 @@ use crate::control_plane::{
     PgMetadataProof, PgMetadataTransferProof, RuntimeMapFreshnessProof,
 };
 use crate::types::{PgId, PgState};
-use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary};
+use crate::{
+    ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
+    PgClusterMapHistoryRouteReferenceKind, PgClusterMapHistoryRouteReferences,
+    MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+};
 use placement::NodeId;
 use std::num::NonZeroU64;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 3;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 4;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -19,6 +23,7 @@ const CONTROL_PLANE_COMMAND_BOOTSTRAP_NODE_MIN_LEN: usize = 8;
 const CONTROL_PLANE_COMMAND_ACTING_SET_NODE_MIN_LEN: usize = 4;
 const CONTROL_PLANE_COMMAND_PG_MIN_LEN: usize = 4;
 const CONTROL_PLANE_COMMAND_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 30;
+const CONTROL_PLANE_COMMAND_HISTORY_ROUTE_REFERENCE_MIN_LEN: usize = 13;
 const CONTROL_PLANE_COMMAND_READY_PG_MIN_LEN: usize = 48;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -933,6 +938,10 @@ fn write_node_heartbeat(
             .cluster_map_history_reference_summary
             .oldest_pending_metadata_command_epoch,
     );
+    write_cluster_map_history_route_references(
+        out,
+        &heartbeat.cluster_map_history_route_references,
+    )?;
     write_u32(
         out,
         len_as_u32(heartbeat.pg_observations.len(), "PG observations")?,
@@ -958,6 +967,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         read_option_cluster_epoch(reader, "heartbeat oldest durable backfill epoch")?;
     let oldest_pending_metadata_command_epoch =
         read_option_cluster_epoch(reader, "heartbeat oldest pending command epoch")?;
+    let cluster_map_history_route_references = read_cluster_map_history_route_references(reader)?;
     let observation_count = reader.read_collection_len(
         "PG observations",
         CONTROL_PLANE_COMMAND_HEARTBEAT_OBSERVATION_MIN_LEN,
@@ -977,6 +987,7 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         endpoint,
         observed_epoch,
         requested_lease_duration_ms,
+        cluster_map_history_route_references,
         cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
             oldest_live_placement_epoch,
             oldest_durable_backfill_epoch,
@@ -984,6 +995,89 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         },
         pg_observations,
     })
+}
+
+fn write_cluster_map_history_route_references(
+    out: &mut Vec<u8>,
+    references: &PgClusterMapHistoryRouteReferences,
+) -> Result<(), ControlPlaneError> {
+    write_u32(
+        out,
+        len_as_u32(references.len(), "cluster-map history route references")?,
+    );
+    for reference in references.iter() {
+        write_u8(
+            out,
+            cluster_map_history_route_reference_kind_code(reference.kind()),
+        );
+        write_u64(out, reference.cluster_epoch().get());
+        write_u32(out, reference.pg_id().get());
+    }
+    Ok(())
+}
+
+fn read_cluster_map_history_route_references(
+    reader: &mut PayloadReader<'_>,
+) -> Result<PgClusterMapHistoryRouteReferences, ControlPlaneError> {
+    let count = reader.read_collection_len(
+        "cluster-map history route references",
+        CONTROL_PLANE_COMMAND_HISTORY_ROUTE_REFERENCE_MIN_LEN,
+    )?;
+    if count > MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES {
+        return Err(ControlPlaneError::CommandDecode {
+            message: format!(
+                "cluster-map history route reference count {count} exceeds {}",
+                MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES
+            ),
+        });
+    }
+    let mut decoded = Vec::with_capacity(count);
+    let mut previous = None;
+    for _ in 0..count {
+        let reference = PgClusterMapHistoryRouteReference::new(
+            read_cluster_map_history_route_reference_kind(reader)?,
+            read_cluster_epoch(reader, "cluster-map history route reference epoch")?,
+            PgId::new(reader.read_u32()?),
+        );
+        if previous.is_some_and(|previous| reference <= previous) {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "cluster-map history route references are not in canonical order"
+                    .to_owned(),
+            });
+        }
+        previous = Some(reference);
+        decoded.push(reference);
+    }
+    PgClusterMapHistoryRouteReferences::try_from_iter(decoded).map_err(|error| {
+        ControlPlaneError::CommandDecode {
+            message: format!("invalid cluster-map history route references: {error}"),
+        }
+    })
+}
+
+const fn cluster_map_history_route_reference_kind_code(
+    kind: PgClusterMapHistoryRouteReferenceKind,
+) -> u8 {
+    match kind {
+        PgClusterMapHistoryRouteReferenceKind::LivePlacement => 1,
+        PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource => 2,
+        PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => 3,
+        PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => 4,
+    }
+}
+
+fn read_cluster_map_history_route_reference_kind(
+    reader: &mut PayloadReader<'_>,
+) -> Result<PgClusterMapHistoryRouteReferenceKind, ControlPlaneError> {
+    match reader.read_u8()? {
+        1 => Ok(PgClusterMapHistoryRouteReferenceKind::LivePlacement),
+        2 => Ok(PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource),
+        3 => Ok(PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired),
+        4 => Ok(PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand),
+        value => Err(ControlPlaneError::CommandDecode {
+            message: format!("invalid cluster-map history route reference kind {value}"),
+        }),
+    }
 }
 
 fn write_pg_acting_set(
@@ -1379,6 +1473,30 @@ mod tests {
                     endpoint: "/tmp/node-1b.sock".to_owned(),
                     observed_epoch: ClusterEpoch::new(13).unwrap(),
                     requested_lease_duration_ms: 100,
+                    cluster_map_history_route_references:
+                        PgClusterMapHistoryRouteReferences::try_from_iter([
+                            PgClusterMapHistoryRouteReference::new(
+                                PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+                                ClusterEpoch::new(12).unwrap(),
+                                PgId::new(3),
+                            ),
+                            PgClusterMapHistoryRouteReference::new(
+                                PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+                                ClusterEpoch::new(10).unwrap(),
+                                PgId::new(4),
+                            ),
+                            PgClusterMapHistoryRouteReference::new(
+                                PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
+                                ClusterEpoch::new(13).unwrap(),
+                                PgId::new(4),
+                            ),
+                            PgClusterMapHistoryRouteReference::new(
+                                PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+                                ClusterEpoch::new(11).unwrap(),
+                                PgId::new(3),
+                            ),
+                        ])
+                        .unwrap(),
                     cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
                         oldest_live_placement_epoch: Some(ClusterEpoch::new(12).unwrap()),
                         oldest_durable_backfill_epoch: Some(ClusterEpoch::new(10).unwrap()),
@@ -1454,6 +1572,7 @@ mod tests {
                     endpoint: String::new(),
                     observed_epoch: ClusterEpoch::new(u64::MAX).unwrap(),
                     requested_lease_duration_ms: u64::MAX,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -1539,6 +1658,7 @@ mod tests {
                     endpoint: "/tmp/node-1.sock".to_owned(),
                     observed_epoch: ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 1).unwrap(),
                     requested_lease_duration_ms: 100,
+                    cluster_map_history_route_references: Default::default(),
                     cluster_map_history_reference_summary:
                         PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
@@ -1673,6 +1793,7 @@ mod tests {
             write_u8(body, 0);
             write_u8(body, 0);
             write_u8(body, 0);
+            write_u32(body, 0);
             write_u32(body, 1);
             write_u32(body, 7);
             write_pg_state(body, PgState::Peering);
@@ -1696,6 +1817,38 @@ mod tests {
             write_u8(body, 2);
         });
         assert_decode_error_contains(&invalid_option, "invalid optional u64 tag 2");
+
+        let invalid_history_route_kind = command_frame(4, |body| {
+            write_minimal_heartbeat_prefix(body);
+            write_u8(body, 0);
+            write_u8(body, 0);
+            write_u8(body, 0);
+            write_u32(body, 1);
+            write_u8(body, 99);
+            write_u64(body, 1);
+            write_u32(body, 7);
+        });
+        assert_decode_error_contains(
+            &invalid_history_route_kind,
+            "invalid cluster-map history route reference kind 99",
+        );
+
+        let noncanonical_history_routes = command_frame(4, |body| {
+            write_minimal_heartbeat_prefix(body);
+            write_u8(body, 0);
+            write_u8(body, 0);
+            write_u8(body, 0);
+            write_u32(body, 2);
+            for epoch in [2, 1] {
+                write_u8(body, 1);
+                write_u64(body, epoch);
+                write_u32(body, 7);
+            }
+        });
+        assert_decode_error_contains(
+            &noncanonical_history_routes,
+            "cluster-map history route references are not in canonical order",
+        );
 
         let zero_epoch = command_frame(4, |body| {
             write_u32(body, 7);

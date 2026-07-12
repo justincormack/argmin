@@ -1238,13 +1238,16 @@ impl SharedStorageNode {
             .into_iter()
             .map(|(pg_id, state)| self.pg_heartbeat_observation(node_id, pg_id, state))
             .collect::<Result<Vec<_>, _>>()?;
+        let cluster_map_history_route_references = self.cluster_map_history_route_references()?;
+        let cluster_map_history_reference_summary = cluster_map_history_route_references.summary();
         Ok(NodeHeartbeat {
             node_id,
             node_incarnation,
             endpoint: endpoint.into(),
             observed_epoch,
             requested_lease_duration_ms,
-            cluster_map_history_reference_summary: self.cluster_map_history_reference_summary()?,
+            cluster_map_history_route_references,
+            cluster_map_history_reference_summary,
             pg_observations,
         })
     }
@@ -2395,6 +2398,10 @@ mod tests {
         assert_eq!(
             heartbeat.cluster_map_history_reference_summary,
             node.cluster_map_history_reference_summary().unwrap()
+        );
+        assert_eq!(
+            heartbeat.cluster_map_history_route_references,
+            node.cluster_map_history_route_references().unwrap()
         );
         assert_eq!(heartbeat.pg_observations.len(), 2);
         assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));

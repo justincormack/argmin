@@ -583,6 +583,7 @@ fn send_authenticated_storage_heartbeat(
                 endpoint: endpoint.display().to_string(),
                 observed_epoch,
                 requested_lease_duration_ms: 10_000,
+                cluster_map_history_route_references: Default::default(),
                 cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary::default(
                 ),
                 pg_observations: Vec::new(),
