@@ -1145,7 +1145,7 @@ impl PolicyStatement {
             })
             .find_map(|action| {
                 self.conditions.iter().find_map(|clause| {
-                    if condition_key::lookup(clause.key.as_str()).is_none() {
+                    if !condition_key::is_known_condition_key(clause.key.as_str()) {
                         return Some(BucketPolicyError::malformed_with_detail(
                             "Policy has an invalid condition key",
                             clause.key.clone(),
@@ -4201,6 +4201,184 @@ mod tests {
             policy.validate_evaluable_object_conditions(),
             Err(BucketPolicyError::malformed(
                 "unsupported Condition for currently enforced bucket policy action"
+            ))
+        );
+    }
+
+    #[test]
+    fn resource_account_condition_is_rejected_as_known_deferred_key() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ResourceAccount":"123456789012"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
+        );
+    }
+
+    #[test]
+    fn global_condition_examples_are_rejected_as_known_deferred_keys() {
+        for (operator, key, value) in [
+            ("StringEquals", "aws:PrincipalAccount", "123456789012"),
+            ("Bool", "aws:PrincipalIsAWSService", "false"),
+            ("IpAddress", "aws:VpcSourceIp", "10.0.0.0/8"),
+            ("StringEquals", "aws:ResourceAccount", "123456789012"),
+        ] {
+            let policy = parse_bucket_policy(&format!(
+                "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                 \"Resource\":\"arn:aws:s3:::bucket/*\",\
+                 \"Condition\":{{\"{operator}\":{{\"{key}\":\"{value}\"}}}}}}]}}"
+            ))
+            .unwrap();
+
+            assert_eq!(
+                policy.validate_evaluable_object_conditions(),
+                Err(BucketPolicyError::malformed(
+                    "unsupported Condition for currently enforced bucket policy action"
+                )),
+                "{key} should be recognized but deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn access_grants_conditions_are_rejected_as_known_deferred_keys() {
+        for key in [
+            "s3:AccessGrantScope",
+            "s3:AccessGrantsInstanceArn",
+            "s3:AccessGrantsLocationScope",
+        ] {
+            let policy = parse_bucket_policy(&format!(
+                "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                 \"Resource\":\"arn:aws:s3:::bucket/*\",\
+                 \"Condition\":{{\"StringEquals\":{{\"{key}\":\"value\"}}}}}}]}}"
+            ))
+            .unwrap();
+
+            assert_eq!(
+                policy.validate_evaluable_object_conditions(),
+                Err(BucketPolicyError::malformed(
+                    "unsupported Condition for currently enforced bucket policy action"
+                )),
+                "{key} should be recognized but deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn access_point_conditions_are_rejected_as_known_deferred_keys() {
+        for key in [
+            "s3:AccessPointNetworkOrigin",
+            "s3:AccessPointTag/environment",
+        ] {
+            let policy = parse_bucket_policy(&format!(
+                "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                 \"Resource\":\"arn:aws:s3:::bucket/*\",\
+                 \"Condition\":{{\"StringEquals\":{{\"{key}\":\"value\"}}}}}}]}}"
+            ))
+            .unwrap();
+
+            assert_eq!(
+                policy.validate_evaluable_object_conditions(),
+                Err(BucketPolicyError::malformed(
+                    "unsupported Condition for currently enforced bucket policy action"
+                )),
+                "{key} should be recognized but deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn object_lock_conditions_are_rejected_as_known_deferred_keys() {
+        for key in [
+            "s3:object-lock-mode",
+            "s3:object-lock-legal-hold",
+            "s3:object-lock-retain-until-date",
+            "s3:object-lock-remaining-retention-days",
+        ] {
+            let policy = parse_bucket_policy(&format!(
+                "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                 \"Resource\":\"arn:aws:s3:::bucket/*\",\
+                 \"Condition\":{{\"StringEquals\":{{\"{key}\":\"value\"}}}}}}]}}"
+            ))
+            .unwrap();
+
+            assert_eq!(
+                policy.validate_evaluable_object_conditions(),
+                Err(BucketPolicyError::malformed(
+                    "unsupported Condition for currently enforced bucket policy action"
+                )),
+                "{key} should be recognized but deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_conditions_are_rejected_as_known_deferred_keys() {
+        for key in [
+            "s3:annotation-prefix",
+            "s3:max-annotation-results",
+            "s3:x-amz-object-annotation-directive",
+        ] {
+            let policy = parse_bucket_policy(&format!(
+                "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:PutObject\",\
+                 \"Resource\":\"arn:aws:s3:::bucket/*\",\
+                 \"Condition\":{{\"StringEquals\":{{\"{key}\":\"value\"}}}}}}]}}"
+            ))
+            .unwrap();
+
+            assert_eq!(
+                policy.validate_evaluable_object_conditions(),
+                Err(BucketPolicyError::malformed(
+                    "unsupported Condition for currently enforced bucket policy action"
+                )),
+                "{key} should be recognized but deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_and_object_if_match_conditions_are_rejected_as_known_deferred_keys() {
+        for key in ["s3:x-amz-bucket-namespace", "s3:x-amz-object-if-match"] {
+            let policy = parse_bucket_policy(&format!(
+                "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:PutObject\",\
+                 \"Resource\":\"arn:aws:s3:::bucket/*\",\
+                 \"Condition\":{{\"StringEquals\":{{\"{key}\":\"value\"}}}}}}]}}"
+            ))
+            .unwrap();
+
+            assert_eq!(
+                policy.validate_evaluable_object_conditions(),
+                Err(BucketPolicyError::malformed(
+                    "unsupported Condition for currently enforced bucket policy action"
+                )),
+                "{key} should be recognized but deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_condition_key_is_rejected_with_detail() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aaaaaaaaaaaaaaaaaaaaé":"value"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::malformed_with_detail(
+                "Policy has an invalid condition key",
+                "aaaaaaaaaaaaaaaaaaaaé"
             ))
         );
     }

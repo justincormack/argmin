@@ -72,14 +72,7 @@ impl KeyMatch {
     fn match_key<'a>(&self, key: &'a str) -> Option<&'a str> {
         match self {
             Self::Exact(name) => key.eq_ignore_ascii_case(name).then_some(""),
-            Self::Prefix(prefix) if key.len() >= prefix.len() => {
-                let (candidate_prefix, param) =
-                    (key.get(..prefix.len())?, key.get(prefix.len()..)?);
-                candidate_prefix
-                    .eq_ignore_ascii_case(prefix)
-                    .then_some(param)
-            }
-            Self::Prefix(_) => None,
+            Self::Prefix(prefix) => match_key_prefix(key, prefix),
         }
     }
 }
@@ -490,6 +483,115 @@ pub(super) fn lookup(key: &str) -> Option<(&'static ConditionKeyResolver, &str)>
         }
     }
     None
+}
+
+/// Whether `key` is an AWS-recognized S3 bucket-policy condition key.
+///
+/// This includes keys that Argmin recognizes but intentionally rejects at
+/// policy-upload time until they are runtime-evaluable. Unknown keys are
+/// rejected with AWS's `Policy has an invalid condition key` error, while
+/// recognized-but-deferred keys continue down the explicit unsupported path.
+pub(super) fn is_known_condition_key(key: &str) -> bool {
+    lookup(key).is_some()
+        || KNOWN_DEFERRED_EXACT_CONDITION_KEYS
+            .iter()
+            .any(|known| key.eq_ignore_ascii_case(known))
+        || KNOWN_DEFERRED_PREFIX_CONDITION_KEYS
+            .iter()
+            .any(|prefix| match_key_prefix(key, prefix).is_some())
+}
+
+const KNOWN_DEFERRED_EXACT_CONDITION_KEYS: &[&str] = &[
+    "aws:AssumedRoot",
+    "aws:CalledVia",
+    "aws:CalledViaAWSMCP",
+    "aws:CalledViaFirst",
+    "aws:CalledViaLast",
+    "aws:ChatbotSourceArn",
+    "aws:Ec2InstanceSourcePrivateIPv4",
+    "aws:Ec2InstanceSourceVpc",
+    "aws:FederatedProvider",
+    "aws:IsMcpServiceAction",
+    "aws:MultiFactorAuthAge",
+    "aws:MultiFactorAuthPresent",
+    "aws:PrincipalAccount",
+    "aws:PrincipalArn",
+    "aws:PrincipalIsAWSService",
+    "aws:PrincipalOrgID",
+    "aws:PrincipalOrgPaths",
+    "aws:PrincipalServiceName",
+    "aws:PrincipalServiceNamesList",
+    "aws:ResourceAccount",
+    "aws:ResourceOrgID",
+    "aws:ResourceOrgPaths",
+    "aws:SourceAccount",
+    "aws:SourceArn",
+    "aws:SourceIdentity",
+    "aws:SourceOrgID",
+    "aws:SourceOrgPaths",
+    "aws:SourceOwner",
+    "aws:SourceVpc",
+    "aws:SourceVpcArn",
+    "aws:SourceVpce",
+    "aws:TokenIssueTime",
+    "aws:UserAgent",
+    "aws:ViaAWSMCPService",
+    "aws:ViaAWSService",
+    "aws:VpcSourceIp",
+    "aws:VpceAccount",
+    "aws:VpceOrgID",
+    "aws:VpceOrgPaths",
+    "codebuild:BuildArn",
+    "codebuild:ProjectArn",
+    "ec2:RoleDelivery",
+    "ec2:SourceInstanceArn",
+    "glue:CredentialIssuingService",
+    "glue:RoleAssumedBy",
+    "identitystore:UserId",
+    "lambda:SourceFunctionArn",
+    "ssm:SourceInstanceArn",
+    "s3:DataAccessPointAccount",
+    "s3:DataAccessPointArn",
+    "s3:AccessGrantScope",
+    "s3:AccessGrantsInstanceArn",
+    "s3:AccessGrantsLocationScope",
+    "s3:AccessPointNetworkOrigin",
+    "s3:ExistingJobOperation",
+    "s3:ExistingJobPriority",
+    "s3:annotation-prefix",
+    "s3:deliverySourceArn",
+    "s3:destinationRegion",
+    "s3:InventoryAccessibleOptionalFields",
+    "s3:InventoryField",
+    "s3:isReplicationPauseRequest",
+    "s3:JobSuspendedCause",
+    "s3:logType",
+    "s3:max-annotation-results",
+    "s3:RequestJobOperation",
+    "s3:RequestJobPriority",
+    "s3:ResourceAccount",
+    "s3:resourceArnBeingAuthorized",
+    "s3:object-lock-mode",
+    "s3:object-lock-legal-hold",
+    "s3:object-lock-retain-until-date",
+    "s3:object-lock-remaining-retention-days",
+    "s3:x-amz-bucket-namespace",
+    "s3:x-amz-object-annotation-directive",
+    "s3:x-amz-object-if-match",
+    "s3:x-amz-server-side-encryption-aws-kms-key-id",
+    "s3:x-amz-storage-class",
+];
+
+const KNOWN_DEFERRED_PREFIX_CONDITION_KEYS: &[&str] = &["aws:PrincipalTag/", "s3:AccessPointTag/"];
+
+fn match_key_prefix<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
+    if key.len() < prefix.len() {
+        return None;
+    }
+    let (candidate_prefix, param) = (key.get(..prefix.len())?, key.get(prefix.len()..)?);
+    candidate_prefix
+        .eq_ignore_ascii_case(prefix)
+        .then_some(param)
 }
 
 fn resolve_existing_object_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
@@ -1409,6 +1511,160 @@ mod tests {
     fn lookup_unknown_key_returns_none() {
         assert!(lookup("aws:SourceVpc").is_none());
         assert!(lookup("").is_none());
+    }
+
+    // Snapshot of AWS S3 service-specific condition keys and AWS global
+    // condition keys that are documented as S3-relevant, verified
+    // 2026-07-12 against:
+    // - https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3.html#amazons3-policy-keys
+    // - https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html
+    // - https://docs.aws.amazon.com/AmazonS3/latest/userguide/amazon-s3-policy-keys.html
+    const DOCUMENTED_S3_AND_GLOBAL_CONDITION_KEY_INVENTORY: &[&str] = &[
+        "aws:AssumedRoot",
+        "aws:CalledVia",
+        "aws:CalledViaAWSMCP",
+        "aws:CalledViaFirst",
+        "aws:CalledViaLast",
+        "aws:ChatbotSourceArn",
+        "aws:CurrentTime",
+        "aws:Ec2InstanceSourcePrivateIPv4",
+        "aws:Ec2InstanceSourceVpc",
+        "aws:EpochTime",
+        "aws:FederatedProvider",
+        "aws:IsMcpServiceAction",
+        "aws:MultiFactorAuthAge",
+        "aws:MultiFactorAuthPresent",
+        "aws:PrincipalAccount",
+        "aws:PrincipalArn",
+        "aws:PrincipalIsAWSService",
+        "aws:PrincipalOrgID",
+        "aws:PrincipalOrgPaths",
+        "aws:PrincipalServiceName",
+        "aws:PrincipalServiceNamesList",
+        "aws:PrincipalTag/department",
+        "aws:PrincipalType",
+        "aws:RequestedRegion",
+        "aws:RequestTag/department",
+        "aws:ResourceAccount",
+        "aws:ResourceOrgID",
+        "aws:ResourceOrgPaths",
+        "aws:ResourceTag/department",
+        "aws:SecureTransport",
+        "aws:SourceAccount",
+        "aws:SourceArn",
+        "aws:SourceIdentity",
+        "aws:SourceIp",
+        "aws:SourceOrgID",
+        "aws:SourceOrgPaths",
+        "aws:SourceOwner",
+        "aws:SourceVpc",
+        "aws:SourceVpcArn",
+        "aws:SourceVpce",
+        "aws:TagKeys",
+        "aws:TokenIssueTime",
+        "aws:UserAgent",
+        "aws:ViaAWSMCPService",
+        "aws:ViaAWSService",
+        "aws:VpcSourceIp",
+        "aws:VpceAccount",
+        "aws:VpceOrgID",
+        "aws:VpceOrgPaths",
+        "aws:referer",
+        "aws:userid",
+        "aws:username",
+        "codebuild:BuildArn",
+        "codebuild:ProjectArn",
+        "ec2:RoleDelivery",
+        "ec2:SourceInstanceArn",
+        "glue:CredentialIssuingService",
+        "glue:RoleAssumedBy",
+        "identitystore:UserId",
+        "lambda:SourceFunctionArn",
+        "s3:AccessGrantScope",
+        "s3:AccessGrantsInstanceArn",
+        "s3:AccessGrantsLocationScope",
+        "s3:AccessPointNetworkOrigin",
+        "s3:AccessPointTag/environment",
+        "s3:BucketTag/department",
+        "s3:DataAccessPointAccount",
+        "s3:DataAccessPointArn",
+        "s3:ExistingJobOperation",
+        "s3:ExistingJobPriority",
+        "s3:ExistingObjectTag/department",
+        "s3:InventoryAccessibleOptionalFields",
+        "s3:InventoryField",
+        "s3:JobSuspendedCause",
+        "s3:ObjectCreationOperation",
+        "s3:RequestJobOperation",
+        "s3:RequestJobPriority",
+        "s3:RequestObjectTag/department",
+        "s3:RequestObjectTagKeys",
+        "s3:ResourceAccount",
+        "s3:TlsVersion",
+        "s3:annotation-prefix",
+        "s3:authType",
+        "s3:delimiter",
+        "s3:deliverySourceArn",
+        "s3:destinationRegion",
+        "s3:if-match",
+        "s3:if-none-match",
+        "s3:isReplicationPauseRequest",
+        "s3:locationconstraint",
+        "s3:logType",
+        "s3:max-annotation-results",
+        "s3:max-keys",
+        "s3:object-lock-legal-hold",
+        "s3:object-lock-mode",
+        "s3:object-lock-remaining-retention-days",
+        "s3:object-lock-retain-until-date",
+        "s3:prefix",
+        "s3:resourceArnBeingAuthorized",
+        "s3:signatureAge",
+        "s3:signatureversion",
+        "s3:versionid",
+        "s3:x-amz-acl",
+        "s3:x-amz-bucket-namespace",
+        "s3:x-amz-content-sha256",
+        "s3:x-amz-copy-source",
+        "s3:x-amz-grant-full-control",
+        "s3:x-amz-grant-read",
+        "s3:x-amz-grant-read-acp",
+        "s3:x-amz-grant-write",
+        "s3:x-amz-grant-write-acp",
+        "s3:x-amz-metadata-directive",
+        "s3:x-amz-object-annotation-directive",
+        "s3:x-amz-object-if-match",
+        "s3:x-amz-object-ownership",
+        "s3:x-amz-server-side-encryption",
+        "s3:x-amz-server-side-encryption-aws-kms-key-id",
+        "s3:x-amz-server-side-encryption-customer-algorithm",
+        "s3:x-amz-storage-class",
+        "s3:x-amz-website-redirect-location",
+        "ssm:SourceInstanceArn",
+    ];
+
+    #[test]
+    fn documented_s3_and_global_condition_keys_are_classified() {
+        for key in DOCUMENTED_S3_AND_GLOBAL_CONDITION_KEY_INVENTORY {
+            assert!(is_known_condition_key(key), "{key} should be classified");
+        }
+    }
+
+    #[test]
+    fn known_condition_key_includes_deferred_aws_keys() {
+        for key in KNOWN_DEFERRED_EXACT_CONDITION_KEYS {
+            assert!(is_known_condition_key(key), "{key} should be recognized");
+        }
+        for prefix in KNOWN_DEFERRED_PREFIX_CONDITION_KEYS {
+            let key = format!("{prefix}environment");
+            assert!(is_known_condition_key(&key), "{key} should be recognized");
+        }
+
+        assert!(is_known_condition_key(
+            "S3:Object-Lock-Remaining-Retention-Days"
+        ));
+        assert!(is_known_condition_key("s3:AccessPointTag/environment"));
+        assert!(!is_known_condition_key("aaaaaaaaaaaaaaaaaaaaé"));
     }
 
     #[test]

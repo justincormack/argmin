@@ -481,10 +481,12 @@ be treated as unsupported apart from this narrow bucket-ABAC tagging subset.
 
 ### 12. Bucket-policy condition support is broad but still partial
 
-Argmin's compatibility target is to accept the same bucket-policy condition
-keys that AWS accepts on the implemented S3 surface, even when the current
-runtime does not yet have enough request context to make every condition
-equally useful.
+Argmin recognizes AWS-documented bucket-policy condition keys on the
+implemented S3 surface, but deliberately rejects keys that are not yet
+runtime-evaluable locally. This is an intentional AWS divergence: AWS may store
+some policies that Argmin rejects with `MalformedPolicy`, because silently
+storing a policy that cannot be enforced exactly would make users think it is
+working.
 
 The important split is between condition operators and condition keys. The AWS
 IAM operator reference groups operators into string, numeric, date/time,
@@ -504,9 +506,10 @@ Current runtime-evaluation limits include:
 
 - network/account condition keys such as `aws:PrincipalArn`, `aws:SourceVpc`,
   `aws:SourceVpce`, `aws:SourceArn`, `aws:SourceAccount`,
-  `aws:SourceOwner`, `aws:PrincipalOrgID`, `s3:DataAccessPointAccount`, and
-  `s3:DataAccessPointArn` still remain outside the current accepted/evaluable
-  object-condition subset
+  `aws:SourceOwner`, `aws:PrincipalOrgID`, `aws:PrincipalAccount`,
+  `aws:PrincipalIsAWSService`, `aws:VpcSourceIp`, `aws:ResourceAccount`,
+  `s3:DataAccessPointAccount`, and `s3:DataAccessPointArn` still remain
+  outside the current accepted/evaluable object-condition subset
 - S3 request-context keys that require resource-owner account context, such as
   `s3:ResourceAccount`, are still deferred
 - S3 object-lock condition keys such as `s3:object-lock-mode`,
@@ -633,15 +636,18 @@ References:
 
 - AWS IAM condition operators:
   <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_condition_operators.html>
+- AWS IAM global condition keys:
+  <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html>
 - AWS S3 condition keys:
   <https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3.html#amazons3-policy-keys>
 - AWS IAM policy variables:
   <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_variables.html>
 
-So a bucket policy may now be AWS-accepted and storable even if some condition
-clauses are still not runtime-evaluable locally. That is the correct direction
-for upload-time conformance, but it remains a known compatibility gap until
-those request attributes are modeled directly.
+The local condition-key inventory is a dated documentation snapshot, not a
+claim that AWS will never add keys. Future AWS additions should be treated as
+snapshot drift: classify the new key explicitly, then either implement exact
+runtime evaluation or reject it as recognized-but-unsupported until the
+necessary request/resource context is modeled.
 
 Related plan:
 
