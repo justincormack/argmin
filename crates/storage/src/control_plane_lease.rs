@@ -39,6 +39,36 @@ pub(crate) enum LeaseClockError {
     },
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum LeaseHorizonError {
+    #[error("{field} timestamp arithmetic overflowed")]
+    TimestampOverflow { field: &'static str },
+    #[error(
+        "lease horizon belongs to clock generation {horizon_clock_generation} and Raft term {horizon_raft_term:?}, not generation {requested_clock_generation} and term {requested_raft_term:?}"
+    )]
+    AuthorityMismatch {
+        horizon_clock_generation: u64,
+        horizon_raft_term: Option<u64>,
+        requested_clock_generation: u64,
+        requested_raft_term: Option<u64>,
+    },
+    #[error(
+        "lease deadline {lease_deadline_ms}ms exceeds committed grant horizon {grant_not_after_ms}ms"
+    )]
+    DeadlineBeyondHorizon {
+        lease_deadline_ms: u64,
+        grant_not_after_ms: u64,
+    },
+    #[error(
+        "previous lease horizon remains fenced through {fenced_until_ms}ms at accepted authority time {authority_now_ms}ms"
+    )]
+    PreviousHorizonStillActive {
+        authority_now_ms: u64,
+        fenced_until_ms: u64,
+    },
+}
+
 #[derive(Debug)]
 struct ProcessLeaseClockHealth {
     initial_wall_ms: u64,
@@ -248,6 +278,133 @@ pub(crate) fn successor_activation_fence_satisfied(
     previous_primary_deadline_ms
         .checked_add(skew_budget_ms)
         .is_some_and(|fenced_until_ms| successor_authority_now_ms >= fenced_until_ms)
+}
+
+/// Authority identity under which a durable lease-grant horizon was established.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeaseHorizonAuthorityBinding {
+    clock_generation: u64,
+    raft_term: Option<u64>,
+}
+
+#[cfg(test)]
+impl LeaseHorizonAuthorityBinding {
+    pub(crate) fn new(clock_generation: u64, raft_term: Option<u64>) -> Self {
+        Self {
+            clock_generation,
+            raft_term,
+        }
+    }
+
+    fn clock_generation(self) -> u64 {
+        self.clock_generation
+    }
+
+    fn raft_term(self) -> Option<u64> {
+        self.raft_term
+    }
+}
+
+/// Durable upper bound for leases acknowledged without another durable command.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommittedLeaseGrantHorizon {
+    authority: LeaseHorizonAuthorityBinding,
+    grant_not_after_ms: u64,
+}
+
+#[cfg(test)]
+impl CommittedLeaseGrantHorizon {
+    /// Establish or extend a horizon for one authority generation/term.
+    ///
+    /// Rebinding to a new authority is deliberately conservative: the previous
+    /// horizon plus symmetric skew must have elapsed first. A later optimized
+    /// handoff may replace this only with an equally strong committed proof.
+    pub(crate) fn establish(
+        previous: Option<Self>,
+        authority: LeaseHorizonAuthorityBinding,
+        authority_now_ms: u64,
+        horizon_duration_ms: u64,
+        skew_budget_ms: u64,
+    ) -> Result<Self, LeaseHorizonError> {
+        let proposed_grant_not_after_ms = authority_now_ms.checked_add(horizon_duration_ms).ok_or(
+            LeaseHorizonError::TimestampOverflow {
+                field: "lease grant horizon",
+            },
+        )?;
+        let Some(previous) = previous else {
+            return Ok(Self {
+                authority,
+                grant_not_after_ms: proposed_grant_not_after_ms,
+            });
+        };
+        if previous.authority == authority {
+            return Ok(Self {
+                authority,
+                grant_not_after_ms: previous.grant_not_after_ms.max(proposed_grant_not_after_ms),
+            });
+        }
+        let fenced_until_ms = previous
+            .grant_not_after_ms
+            .checked_add(skew_budget_ms)
+            .ok_or(LeaseHorizonError::TimestampOverflow {
+                field: "previous lease horizon fence",
+            })?;
+        if authority_now_ms < fenced_until_ms {
+            return Err(LeaseHorizonError::PreviousHorizonStillActive {
+                authority_now_ms,
+                fenced_until_ms,
+            });
+        }
+        Ok(Self {
+            authority,
+            grant_not_after_ms: proposed_grant_not_after_ms,
+        })
+    }
+
+    /// Validate a volatile heartbeat lease against the durable horizon.
+    pub(crate) fn validate_grant(
+        self,
+        authority: LeaseHorizonAuthorityBinding,
+        lease_deadline_ms: u64,
+    ) -> Result<(), LeaseHorizonError> {
+        if self.authority != authority {
+            return Err(LeaseHorizonError::AuthorityMismatch {
+                horizon_clock_generation: self.authority.clock_generation,
+                horizon_raft_term: self.authority.raft_term,
+                requested_clock_generation: authority.clock_generation,
+                requested_raft_term: authority.raft_term,
+            });
+        }
+        if lease_deadline_ms > self.grant_not_after_ms {
+            return Err(LeaseHorizonError::DeadlineBeyondHorizon {
+                lease_deadline_ms,
+                grant_not_after_ms: self.grant_not_after_ms,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn successor_fence_satisfied(
+        self,
+        successor_authority_now_ms: u64,
+        skew_budget_ms: u64,
+    ) -> bool {
+        successor_activation_fence_satisfied(
+            successor_authority_now_ms,
+            self.grant_not_after_ms,
+            skew_budget_ms,
+        )
+    }
+
+    pub(crate) fn grant_not_after_ms(self) -> u64 {
+        self.grant_not_after_ms
+    }
+
+    pub(crate) fn authority(self) -> LeaseHorizonAuthorityBinding {
+        self.authority
+    }
 }
 
 #[cfg(test)]
@@ -789,6 +946,287 @@ mod tests {
     }
 
     #[test]
+    fn committed_horizon_allows_many_volatile_renewals_without_advancing() {
+        let authority = LeaseHorizonAuthorityBinding::new(7, Some(11));
+        let horizon = CommittedLeaseGrantHorizon::establish(
+            None,
+            authority,
+            10_000,
+            60_000,
+            CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )
+        .unwrap();
+
+        for heartbeat_now_ms in (10_000..60_000).step_by(250) {
+            let lease_deadline_ms = heartbeat_now_ms + 1_000;
+            horizon
+                .validate_grant(authority, lease_deadline_ms)
+                .unwrap();
+        }
+        assert_eq!(horizon.grant_not_after_ms(), 70_000);
+        assert_eq!(horizon.authority().clock_generation(), 7);
+        assert_eq!(horizon.authority().raft_term(), Some(11));
+    }
+
+    #[test]
+    fn committed_horizon_rejects_deadline_or_authority_outside_capability() {
+        let authority = LeaseHorizonAuthorityBinding::new(3, Some(5));
+        let horizon =
+            CommittedLeaseGrantHorizon::establish(None, authority, 10_000, 5_000, 1_000).unwrap();
+
+        assert!(matches!(
+            horizon.validate_grant(authority, 15_001),
+            Err(LeaseHorizonError::DeadlineBeyondHorizon { .. })
+        ));
+        assert!(matches!(
+            horizon.validate_grant(LeaseHorizonAuthorityBinding::new(4, Some(5)), 14_000),
+            Err(LeaseHorizonError::AuthorityMismatch { .. })
+        ));
+        assert!(matches!(
+            horizon.validate_grant(LeaseHorizonAuthorityBinding::new(3, Some(6)), 14_000),
+            Err(LeaseHorizonError::AuthorityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn replacement_authority_waits_for_previous_horizon_and_skew() {
+        let old_authority = LeaseHorizonAuthorityBinding::new(3, Some(5));
+        let new_authority = LeaseHorizonAuthorityBinding::new(4, Some(6));
+        let horizon =
+            CommittedLeaseGrantHorizon::establish(None, old_authority, 10_000, 5_000, 1_000)
+                .unwrap();
+
+        assert!(!horizon.successor_fence_satisfied(15_999, 1_000));
+        assert!(matches!(
+            CommittedLeaseGrantHorizon::establish(
+                Some(horizon),
+                new_authority,
+                15_999,
+                5_000,
+                1_000,
+            ),
+            Err(LeaseHorizonError::PreviousHorizonStillActive { .. })
+        ));
+        let replacement = CommittedLeaseGrantHorizon::establish(
+            Some(horizon),
+            new_authority,
+            16_000,
+            5_000,
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(replacement.grant_not_after_ms(), 21_000);
+    }
+
+    #[test]
+    fn committed_horizon_extension_lost_response_extends_successor_fence() {
+        let authority = LeaseHorizonAuthorityBinding::new(1, Some(1));
+        let initial =
+            CommittedLeaseGrantHorizon::establish(None, authority, 10_000, 5_000, 1_000).unwrap();
+        // The response is lost after durability, so recovery observes the
+        // extended horizon even though no caller saw an acknowledgement.
+        let recovered =
+            CommittedLeaseGrantHorizon::establish(Some(initial), authority, 12_000, 10_000, 1_000)
+                .unwrap();
+
+        assert!(!recovered.successor_fence_satisfied(22_999, 1_000));
+        assert!(recovered.successor_fence_satisfied(23_000, 1_000));
+    }
+
+    #[test]
+    fn committed_horizon_arithmetic_overflow_fails_closed() {
+        let authority = LeaseHorizonAuthorityBinding::new(1, None);
+        assert!(matches!(
+            CommittedLeaseGrantHorizon::establish(None, authority, u64::MAX, 1, 1_000),
+            Err(LeaseHorizonError::TimestampOverflow { .. })
+        ));
+        let horizon =
+            CommittedLeaseGrantHorizon::establish(None, authority, u64::MAX - 2_000, 1_500, 1_000)
+                .unwrap();
+        assert!(!horizon.successor_fence_satisfied(u64::MAX, 1_000));
+        assert!(matches!(
+            CommittedLeaseGrantHorizon::establish(
+                Some(horizon),
+                LeaseHorizonAuthorityBinding::new(2, None),
+                u64::MAX,
+                0,
+                1_000,
+            ),
+            Err(LeaseHorizonError::TimestampOverflow { .. })
+        ));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum HorizonModelEvent {
+        Advance(u16),
+        Extend(u16),
+        ExtendDurableResponseLost(u16),
+        ExtendLostBeforeDurable(u16),
+        IssueLease(u16),
+        RefreshConsumer,
+        ChangeAuthority,
+        ReestablishClock,
+        TryActivateSuccessor,
+    }
+
+    fn horizon_model_event_strategy() -> impl Strategy<Value = HorizonModelEvent> {
+        prop_oneof![
+            8 => (0_u16..2_000).prop_map(HorizonModelEvent::Advance),
+            3 => (1_u16..30_000).prop_map(HorizonModelEvent::Extend),
+            2 => (1_u16..30_000).prop_map(HorizonModelEvent::ExtendDurableResponseLost),
+            2 => (1_u16..30_000).prop_map(HorizonModelEvent::ExtendLostBeforeDurable),
+            8 => (1_u16..=10_000).prop_map(HorizonModelEvent::IssueLease),
+            5 => Just(HorizonModelEvent::RefreshConsumer),
+            2 => Just(HorizonModelEvent::ChangeAuthority),
+            2 => Just(HorizonModelEvent::ReestablishClock),
+            3 => Just(HorizonModelEvent::TryActivateSuccessor),
+        ]
+    }
+
+    #[derive(Debug)]
+    struct LeaseHorizonModel {
+        authority_now_ms: u64,
+        consumer_monotonic_ms: u64,
+        authority: LeaseHorizonAuthorityBinding,
+        authority_clock_healthy: bool,
+        durable_horizon: Option<CommittedLeaseGrantHorizon>,
+        acknowledged_issued_at_ms: Option<u64>,
+        acknowledged_deadline_ms: Option<u64>,
+        consumer_lease: Option<BoundRouteMapLease>,
+        successor_active: bool,
+    }
+
+    impl LeaseHorizonModel {
+        fn new() -> Self {
+            Self {
+                authority_now_ms: 100_000,
+                consumer_monotonic_ms: 10_000,
+                authority: LeaseHorizonAuthorityBinding::new(1, Some(1)),
+                authority_clock_healthy: true,
+                durable_horizon: None,
+                acknowledged_issued_at_ms: None,
+                acknowledged_deadline_ms: None,
+                consumer_lease: None,
+                successor_active: false,
+            }
+        }
+
+        fn extend(&mut self, duration_ms: u64) {
+            if !self.authority_clock_healthy {
+                return;
+            }
+            let Ok(horizon) = CommittedLeaseGrantHorizon::establish(
+                self.durable_horizon,
+                self.authority,
+                self.authority_now_ms,
+                duration_ms,
+                CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+            ) else {
+                return;
+            };
+            self.durable_horizon = Some(horizon);
+        }
+
+        fn issue_lease(&mut self, requested_ms: u64) {
+            if !self.authority_clock_healthy {
+                return;
+            }
+            let Some(horizon) = self.durable_horizon else {
+                return;
+            };
+            let Some(deadline_ms) = self.authority_now_ms.checked_add(requested_ms) else {
+                return;
+            };
+            if horizon.validate_grant(self.authority, deadline_ms).is_err() {
+                return;
+            }
+            self.acknowledged_issued_at_ms = Some(self.authority_now_ms);
+            self.acknowledged_deadline_ms = Some(deadline_ms);
+            self.successor_active = false;
+        }
+
+        fn refresh_consumer(&mut self) {
+            let (Some(issued_at_ms), Some(deadline_ms)) = (
+                self.acknowledged_issued_at_ms,
+                self.acknowledged_deadline_ms,
+            ) else {
+                return;
+            };
+            self.consumer_lease = BoundRouteMapLease::bind(
+                issued_at_ms,
+                deadline_ms,
+                self.authority_now_ms,
+                self.consumer_monotonic_ms,
+                CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+            )
+            .ok();
+        }
+
+        fn consumer_serving(&self) -> bool {
+            self.consumer_lease
+                .is_some_and(|lease| lease.is_valid_at_monotonic(self.consumer_monotonic_ms))
+        }
+
+        fn apply(&mut self, event: HorizonModelEvent) {
+            match event {
+                HorizonModelEvent::Advance(elapsed_ms) => {
+                    self.authority_now_ms =
+                        self.authority_now_ms.saturating_add(u64::from(elapsed_ms));
+                    self.consumer_monotonic_ms = self
+                        .consumer_monotonic_ms
+                        .saturating_add(u64::from(elapsed_ms));
+                }
+                HorizonModelEvent::Extend(duration_ms)
+                | HorizonModelEvent::ExtendDurableResponseLost(duration_ms) => {
+                    self.extend(u64::from(duration_ms));
+                }
+                HorizonModelEvent::ExtendLostBeforeDurable(_duration_ms) => {}
+                HorizonModelEvent::IssueLease(requested_ms) => {
+                    self.issue_lease(u64::from(requested_ms));
+                }
+                HorizonModelEvent::RefreshConsumer => self.refresh_consumer(),
+                HorizonModelEvent::ChangeAuthority => {
+                    self.authority = LeaseHorizonAuthorityBinding::new(
+                        self.authority.clock_generation().saturating_add(1),
+                        self.authority
+                            .raft_term()
+                            .map(|term| term.saturating_add(1)),
+                    );
+                    self.authority_clock_healthy = false;
+                    self.acknowledged_issued_at_ms = None;
+                    self.acknowledged_deadline_ms = None;
+                    self.successor_active = false;
+                }
+                HorizonModelEvent::ReestablishClock => {
+                    self.authority_clock_healthy = true;
+                }
+                HorizonModelEvent::TryActivateSuccessor => {
+                    self.successor_active = self.authority_clock_healthy
+                        && self.durable_horizon.is_none_or(|horizon| {
+                            horizon.successor_fence_satisfied(
+                                self.authority_now_ms,
+                                CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+                            )
+                        });
+                }
+            }
+        }
+
+        fn assert_invariants(&self) -> Result<(), TestCaseError> {
+            if let Some(deadline_ms) = self.acknowledged_deadline_ms {
+                let horizon = self
+                    .durable_horizon
+                    .expect("acknowledged lease requires durable horizon");
+                prop_assert!(horizon.validate_grant(self.authority, deadline_ms).is_ok());
+            }
+            if self.successor_active {
+                prop_assert!(!self.consumer_serving());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
     fn corrected_clock_recovers_with_one_fresh_binding() {
         assert!(BoundRouteMapLease::bind(20_000, 30_000, 10_000, 500, 1_000).is_err());
 
@@ -804,6 +1242,17 @@ mod tests {
             storage_node_count in 1_usize..8,
         ) {
             let mut model = LeaseModel::new(storage_node_count);
+            for event in events {
+                model.apply(event);
+                model.assert_invariants()?;
+            }
+        }
+
+        #[test]
+        fn committed_horizon_events_preserve_volatile_lease_and_successor_fences(
+            events in proptest::collection::vec(horizon_model_event_strategy(), 1..192),
+        ) {
+            let mut model = LeaseHorizonModel::new();
             for event in events {
                 model.apply(event);
                 model.assert_invariants()?;

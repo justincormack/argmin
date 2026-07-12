@@ -10947,6 +10947,24 @@ Required production shape and implementation order:
    primary processes are external authority tokens that survive the crash, so
    one of these fences is mandatory even though exact heartbeat recovery is
    not.
+   The first executable horizon slice now lives in `control_plane_lease.rs` as
+   a pure model. A committed horizon is an upper-bound capability tied to one
+   authority clock generation and optional Raft term. Any volatile heartbeat
+   deadline must be at or below that bound and carry the exact same authority
+   binding. Rebinding after a generation/term change uses the conservative
+   rule above: the previous horizon plus symmetric skew must have elapsed.
+   Deterministic tests cover repeated volatile renewals without horizon
+   mutation, binding/deadline mismatch, response loss after durable extension,
+   leadership replacement, and arithmetic overflow. A property model covers
+   extension loss before durability, durable extension with response loss,
+   process/leader changes, consumer refresh, and successor activation; an
+   activated successor never overlaps a still-valid acknowledged consumer
+   lease. These types remain test-scoped in this slice so production RPC/error
+   semantics are not implied prematurely. The next slice must promote the
+   capability into the replicated snapshot and command codec, bind proposals
+   to the accepted authority-clock generation/current serving Raft term, and
+   retain per-heartbeat persistence until snapshot/restart and apply parity
+   are proved.
 4. Persist logical durable commands incrementally. The single-authority
    compatibility path must either append versioned/checksummed durable deltas
    to an fsync'd, identity-bound journal and replay them over the latest
