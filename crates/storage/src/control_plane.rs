@@ -6916,6 +6916,8 @@ struct VerifiedAdminRuntimeMapRead {
 struct AuthenticatedAdminRetryClock {
     authority_now_ms: u64,
     start: Instant,
+    #[cfg(test)]
+    elapsed_override_ms: Option<&'static std::sync::atomic::AtomicU64>,
 }
 
 impl AuthenticatedAdminRetryClock {
@@ -6923,12 +6925,33 @@ impl AuthenticatedAdminRetryClock {
         Self {
             authority_now_ms,
             start: Instant::now(),
+            #[cfg(test)]
+            elapsed_override_ms: None,
         }
     }
 
     fn now_ms(self) -> u64 {
+        #[cfg(test)]
+        let elapsed_ms = self.elapsed_override_ms.map_or_else(
+            || u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            |elapsed_ms| elapsed_ms.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        #[cfg(not(test))]
         let elapsed_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.authority_now_ms.saturating_add(elapsed_ms)
+    }
+
+    #[cfg(test)]
+    fn with_elapsed_source(authority_now_ms: u64) -> (Self, &'static std::sync::atomic::AtomicU64) {
+        let elapsed_override_ms = Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+        (
+            Self {
+                authority_now_ms,
+                start: Instant::now(),
+                elapsed_override_ms: Some(elapsed_override_ms),
+            },
+            elapsed_override_ms,
+        )
     }
 }
 
@@ -8170,6 +8193,15 @@ impl AuthenticatedUnixControlPlaneClient {
         authority_now_ms: u64,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
         let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
+        self.set_pg_acting_set_checked_with_retry_clock(pg_id, acting_set, retry_clock)
+    }
+
+    fn set_pg_acting_set_checked_with_retry_clock(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        retry_clock: AuthenticatedAdminRetryClock,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
         let pre_update_epoch = self
             .admin_pg_runtime_map_snapshot_with_read_timeout(
                 pg_id,
@@ -8184,7 +8216,7 @@ impl AuthenticatedUnixControlPlaneClient {
                     .find(|route| route.pg_id() == pg_id)
                     .map(|route| route.cluster_epoch())
             });
-        match self.set_pg_acting_set(pg_id, acting_set.clone(), authority_now_ms) {
+        match self.set_pg_acting_set(pg_id, acting_set.clone(), retry_clock.now_ms()) {
             Ok(cluster_epoch) => Ok(cluster_epoch),
             Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
                 .retry_set_pg_acting_set_after_response_loss(
@@ -19447,6 +19479,82 @@ mod tests {
             2
         );
         assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_admin_pg_update_resamples_after_slow_preflight() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let (retry_clock, elapsed_ms) = AuthenticatedAdminRetryClock::with_elapsed_source(2_000);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap()
+            .header()
+            .issued_at_ms()
+            .unwrap();
+            assert_eq!(issued_at_ms, 2_000);
+            elapsed_ms.store(6_000, std::sync::atomic::Ordering::SeqCst);
+            let response = build_control_plane_unix_response_with_auth_and_response_clock(
+                &mut authority,
+                request,
+                issued_at_ms,
+                Some(&verifier),
+                || Ok(8_000),
+            )
+            .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::SetPgActingSet);
+            let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap()
+            .header()
+            .issued_at_ms()
+            .unwrap();
+            assert_eq!(issued_at_ms, 8_000);
+            let response = build_control_plane_unix_response_with_auth_and_response_clock(
+                &mut authority,
+                request,
+                issued_at_ms,
+                Some(&verifier),
+                || Ok(issued_at_ms),
+            )
+            .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let cluster_epoch = crate::clock::with_time_override(9_000, || {
+            client.set_pg_acting_set_checked_with_retry_clock(
+                PgId::new(7),
+                vec![NodeId::new(1)],
+                retry_clock,
+            )
+        })
+        .unwrap();
+
+        server.join().unwrap();
+        assert!(cluster_epoch.get() >= 2);
     }
 
     #[test]

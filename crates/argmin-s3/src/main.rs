@@ -3222,7 +3222,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                     "experimental OpenRaft control-plane lease expiry deferred because a coherent clock sample was unavailable: {error}"
                 );
             }
-            Err(error) if experimental_raft_error_is_forward_to_leader(&error) => {}
+            Err(error) if experimental_raft_error_is_non_local_leader(&error) => {}
             Err(error) if control_plane_lease_expiry_error_is_clock_wait(&error) => {
                 eprintln!(
                     "experimental OpenRaft control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
@@ -3248,12 +3248,13 @@ fn control_plane_lease_expiry_error_is_clock_wait(error: &ControlPlaneError) -> 
     )
 }
 
-fn experimental_raft_error_is_forward_to_leader(error: &ControlPlaneError) -> bool {
+fn experimental_raft_error_is_non_local_leader(error: &ControlPlaneError) -> bool {
     matches!(
         error,
         ControlPlaneError::RpcRemote { message }
-            if message.contains("OpenRaft client-write failed")
-                && message.contains("has to forward request to")
+            if message == "local OpenRaft authority is not the serving leader"
+                || (message.contains("OpenRaft client-write failed")
+                    && message.contains("has to forward request to"))
     )
 }
 
@@ -3328,7 +3329,7 @@ fn experimental_raft_bootstrap_submit_error_can_be_concurrent_success(
     error: &ControlPlaneError,
 ) -> bool {
     matches!(error, ControlPlaneError::BootstrapRequiresEmptyState)
-        || experimental_raft_error_is_forward_to_leader(error)
+        || experimental_raft_error_is_non_local_leader(error)
 }
 
 fn bootstrap_empty_control_plane(
@@ -5615,6 +5616,26 @@ mod tests {
         ));
         assert!(!control_plane_lease_expiry_error_is_clock_wait(
             &ControlPlaneError::InvalidLeaseDuration
+        ));
+    }
+
+    #[test]
+    fn raft_non_leader_classifier_covers_status_submission_race() {
+        assert!(experimental_raft_error_is_non_local_leader(
+            &ControlPlaneError::RpcRemote {
+                message: "local OpenRaft authority is not the serving leader".to_string(),
+            }
+        ));
+        assert!(experimental_raft_error_is_non_local_leader(
+            &ControlPlaneError::RpcRemote {
+                message: "OpenRaft client-write failed: has to forward request to: Some(102)"
+                    .to_string(),
+            }
+        ));
+        assert!(!experimental_raft_error_is_non_local_leader(
+            &ControlPlaneError::RpcRemote {
+                message: "unrelated control-plane failure".to_string(),
+            }
         ));
     }
 
