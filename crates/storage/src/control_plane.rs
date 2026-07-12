@@ -40,7 +40,7 @@ const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 16;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 17;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -2129,6 +2129,16 @@ impl ClusterControlSnapshot {
                     history.cluster_epoch
                 ));
             }
+            if history
+                .nodes
+                .iter()
+                .any(|node| !node.pg_observations.is_empty())
+            {
+                return Err(format!(
+                    "cluster-map history epoch {} retains reconstructible node PG observations",
+                    history.cluster_epoch
+                ));
+            }
 
             let nodes: BTreeMap<_, _> = history
                 .nodes
@@ -3758,10 +3768,22 @@ pub struct ClusterMapHistoryRecord {
 
 impl ClusterMapHistoryRecord {
     fn from_snapshot(snapshot: &ClusterControlSnapshot) -> Self {
+        // Route reconstruction needs durable PG topology and the node identity
+        // set. Heartbeat observations are current-epoch peering evidence and
+        // become invalid as soon as this snapshot moves into history.
+        let nodes = snapshot
+            .nodes
+            .values()
+            .cloned()
+            .map(|mut node| {
+                node.pg_observations.clear();
+                node
+            })
+            .collect();
         Self {
             authority_incarnation: snapshot.authority_incarnation,
             cluster_epoch: snapshot.cluster_epoch,
-            nodes: snapshot.nodes.values().cloned().collect(),
+            nodes,
             pgs: snapshot.pgs.values().cloned().collect(),
         }
     }
@@ -12303,13 +12325,6 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
                 history.cluster_epoch.get(),
                 format_node_record(record)
             ));
-            for observation in record.pg_observations.values() {
-                out.push_str(&format!(
-                    "history_node_pg={},{}\n",
-                    history.cluster_epoch.get(),
-                    format_node_pg_record(record.node_id, observation)
-                ));
-            }
         }
         for record in &history.pgs {
             out.push_str(&format!(
@@ -12585,35 +12600,6 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
             } else {
                 return Err(parse_error(line_number, "duplicate history node record"));
             }
-        } else if let Some(value) = line.strip_prefix("history_node_pg=") {
-            version.ok_or_else(|| {
-                parse_error(line_number, "version must precede PG observation records")
-            })?;
-            let (epoch, node_id, observation) = parse_history_node_pg_record(line_number, value)?;
-            let history_record = history.get_mut(&epoch).ok_or_else(|| {
-                parse_error(line_number, "history node PG references unknown epoch")
-            })?;
-            let node = history_record
-                .record
-                .nodes
-                .iter_mut()
-                .find(|record| record.node_id == node_id)
-                .ok_or_else(|| {
-                    parse_error(line_number, "history node PG references unknown node")
-                })?;
-            if node
-                .pg_observations
-                .insert(observation.pg_id, observation)
-                .is_some()
-            {
-                return Err(parse_error(
-                    line_number,
-                    "duplicate history node PG observation",
-                ));
-            }
-            history_record
-                .node_pg_lines
-                .insert((node_id, observation.pg_id), line_number);
         } else if let Some(value) = line.strip_prefix("history_pg=") {
             version.ok_or_else(|| {
                 parse_error(line_number, "version must precede history PG records")
@@ -12706,7 +12692,6 @@ struct ParsedHistoryRecord {
     node_ids: BTreeSet<NodeId>,
     pg_ids: BTreeSet<PgId>,
     pg_lines: BTreeMap<PgId, usize>,
-    node_pg_lines: BTreeMap<(NodeId, PgId), usize>,
 }
 
 impl ParsedHistoryRecord {
@@ -12717,7 +12702,6 @@ impl ParsedHistoryRecord {
             node_ids: BTreeSet::new(),
             pg_ids: BTreeSet::new(),
             pg_lines: BTreeMap::new(),
-            node_pg_lines: BTreeMap::new(),
         }
     }
 }
@@ -12843,35 +12827,6 @@ fn validate_parsed_history(
             }
             validate_persisted_metadata_transfer_epoch(line, pg, *epoch)?;
         }
-        for node in &record.record.nodes {
-            for observation in node.pg_observations.values() {
-                let line = record
-                    .node_pg_lines
-                    .get(&(node.node_id, observation.pg_id))
-                    .copied()
-                    .unwrap_or(record.line);
-                if observation.observed_epoch != *epoch {
-                    return Err(parse_error(
-                        line,
-                        "history node PG observation epoch must match history epoch",
-                    ));
-                }
-                let pg = record
-                    .record
-                    .pgs
-                    .iter()
-                    .find(|pg| pg.pg_id == observation.pg_id)
-                    .ok_or_else(|| {
-                        parse_error(line, "history node PG observation references unknown PG")
-                    })?;
-                if !pg.acting_set.contains(&node.node_id) {
-                    return Err(parse_error(
-                        line,
-                        "history node PG observation references PG outside node acting set",
-                    ));
-                }
-            }
-        }
     }
     Ok(())
 }
@@ -12977,19 +12932,6 @@ fn parse_history_node_record(
     let epoch = ClusterEpoch::new(parse_u64(line, epoch, "history node epoch")?)
         .ok_or_else(|| parse_error(line, "history node epoch must be nonzero"))?;
     Ok((epoch, parse_node_record(line, record)?))
-}
-
-fn parse_history_node_pg_record(
-    line: usize,
-    value: &str,
-) -> Result<(ClusterEpoch, NodeId, NodePgObservationRecord), ControlPlaneError> {
-    let (epoch, record) = value
-        .split_once(',')
-        .ok_or_else(|| parse_error(line, "history node PG record must start with epoch"))?;
-    let epoch = ClusterEpoch::new(parse_u64(line, epoch, "history node PG epoch")?)
-        .ok_or_else(|| parse_error(line, "history node PG epoch must be nonzero"))?;
-    let (node_id, record) = parse_node_pg_record(line, record)?;
-    Ok((epoch, node_id, record))
 }
 
 fn parse_history_pg_record(
@@ -22310,7 +22252,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=16\nauthority_incarnation=1\ncluster_epoch=1\n",
+            "version=17\nauthority_incarnation=1\ncluster_epoch=1\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -23113,7 +23055,6 @@ mod tests {
         let source_history_prefixes = [
             format!("history={},", source_epoch.get()),
             format!("history_node={},", source_epoch.get()),
-            format!("history_node_pg={},", source_epoch.get()),
             format!("history_pg={},", source_epoch.get()),
         ];
         let state = std::fs::read_to_string(&state_path).unwrap();
@@ -23190,7 +23131,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=1\n",
@@ -23213,7 +23154,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23237,7 +23178,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23262,7 +23203,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23305,7 +23246,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23328,7 +23269,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -23347,13 +23288,43 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_authority_rejects_reconstructible_observations_in_history() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=17\n",
+                "max_committed_timestamp_ms=-\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=3\n",
+                "history=2,1\n",
+                "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
+                "history_node_pg=2,1,7,peering,2,100,0,0,0,-,-,-\n",
+                "history_pg=2,7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
+                "node=1,active,healthy,11,3,100,200,-,6e6f64652d312e736f636b\n",
+                "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
+            ),
+        )
+        .unwrap();
+
+        let error = FileControlPlaneStore::new(path).load().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::Parse { message, .. }
+                if message == "unknown control-plane state line"
+        ));
+    }
+
+    #[test]
     fn file_backed_authority_rejects_history_pg_future_metadata_transfer_epoch() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
@@ -23404,7 +23375,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23430,7 +23401,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -23455,7 +23426,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23481,7 +23452,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "max_committed_timestamp_ms=100\n",
@@ -23493,24 +23464,23 @@ mod tests {
         .unwrap();
         let store = FileControlPlaneStore::new(path);
         let authority = SingleAuthorityControlPlane::open(store).unwrap();
-        let historical_node = authority
+        let history = authority
             .snapshot()
             .cluster_map_at_epoch(ClusterEpoch::new(2).unwrap())
-            .unwrap()
+            .unwrap();
+        let historical_node = history
             .nodes()
             .iter()
             .find(|record| record.node_id() == NodeId::new(1))
             .unwrap();
+        assert!(historical_node.pg_observation(PgId::new(7)).is_none());
         assert_eq!(
-            historical_node
-                .pg_observation(PgId::new(7))
-                .unwrap()
-                .metadata_proof(),
-            PgMetadataProof {
-                applied_log_index: 10,
-                applied_log_hash: 20,
-                state_digest: 30,
-            }
+            history.pg(PgId::new(7)).unwrap().active_metadata_proof(),
+            Some(PgMetadataProof {
+                applied_log_index: 9,
+                applied_log_hash: 10,
+                state_digest: 11,
+            })
         );
     }
 
@@ -23521,7 +23491,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=16\n",
+                "version=17\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -29870,7 +29840,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_change_clears_current_pg_observations_and_preserves_history() {
+    fn epoch_change_drops_reconstructible_pg_observations_from_history() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -29915,17 +29885,12 @@ mod tests {
             .iter()
             .find(|record| record.node_id() == NodeId::new(1))
             .unwrap();
-        assert_eq!(
-            historical_node
-                .pg_observation(PgId::new(18))
-                .unwrap()
-                .observed_epoch(),
-            observation_epoch
-        );
+        assert!(historical_node.pg_observation(PgId::new(18)).is_none());
+        assert!(history.pg(PgId::new(18)).is_some());
     }
 
     #[test]
-    fn restart_epoch_bump_clears_current_pg_observations_and_preserves_history() {
+    fn restart_epoch_bump_drops_reconstructible_pg_observations_from_history() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
@@ -29973,9 +29938,9 @@ mod tests {
             .iter()
             .find(|record| record.node_id() == NodeId::new(1))
             .unwrap();
-        let historical_observation = historical_node.pg_observation(PgId::new(18)).unwrap();
-        assert_eq!(historical_observation.observed_epoch(), observation_epoch);
-        assert_eq!(historical_observation.metadata_proof(), metadata_proof);
+        assert!(historical_node.pg_observation(PgId::new(18)).is_none());
+        let persisted_text = std::fs::read_to_string(store.path()).unwrap();
+        assert!(!persisted_text.contains("history_node_pg="));
 
         let persisted = store.load().unwrap().unwrap();
         assert!(persisted

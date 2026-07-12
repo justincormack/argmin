@@ -10753,6 +10753,16 @@ Required production shape and implementation order:
    compact barrier/floor when it changes, or suspend pruning/activation until
    all required reporters have re-established them. Do not preserve fields
    merely because the current snapshot happens to contain them.
+   The first history reduction now removes raw node-PG heartbeat observations
+   from retained epochs in state format version 17. Historical route
+   reconstruction consumes the durable PG record and historical node identity
+   set, never the copied observation evidence; current-epoch observations stay
+   available for peering and active-proof validation. Applied to retained soak
+   artifacts, this removes 2,496,409 bytes/30,270 rows (41.24%) from the
+   6,053,285-byte `N2vfUG` snapshot and 3,112,956 bytes/37,712 rows (44.97%)
+   from the 6,922,064-byte `3jRrzq` snapshot. The estimated remaining snapshots
+   are still 3.56 MB and 3.81 MB, so full per-epoch PG records, volatile node
+   fields, and heartbeat-triggered full rewrites remain release blockers.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge
