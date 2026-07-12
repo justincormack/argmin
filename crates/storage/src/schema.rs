@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS shards (
     created_at      INTEGER NOT NULL,
     last_verified   INTEGER,
     status          INTEGER NOT NULL DEFAULT 0
-)";
+) STRICT";
 
 /// Per-data-PG audit observations for apparent physical shard orphans.
 ///
@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS shard_scavenger_observations (
     last_error          TEXT,
     resolved_at         INTEGER CHECK (resolved_at IS NULL OR resolved_at >= 0),
     PRIMARY KEY (node_id, data_pg_id, shard_index, shard_key)
-)";
+) STRICT";
 
 /// Durable repair queue for placed segment shards observed missing or corrupt.
 const CREATE_PLACED_SEGMENT_SHARD_REPAIRS_TABLE: &str = "\
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS placed_segment_shard_repairs (
         (claim_id IS NOT NULL AND owner_token IS NOT NULL AND cluster_epoch IS NOT NULL AND claimed_at IS NOT NULL AND lease_deadline IS NOT NULL)
     ),
     PRIMARY KEY (segment_okh, segment_vid, shard_index)
-)";
+) STRICT";
 
 /// Durable backfill queue for segment shard sets whose desired PG placement
 /// differs from the historical placement used by existing segment metadata.
@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS placed_segment_shard_backfills (
         (claim_id IS NOT NULL AND owner_token IS NOT NULL AND cluster_epoch IS NOT NULL AND claimed_at IS NOT NULL AND lease_deadline IS NOT NULL)
     ),
     PRIMARY KEY (data_pg_id, segment_okh, segment_vid, source_cluster_epoch, desired_cluster_epoch)
-)";
+) STRICT";
 
 /// Per-PG object metadata table.
 const CREATE_OBJECTS_TABLE: &str = "\
@@ -154,7 +154,7 @@ CREATE TABLE IF NOT EXISTS objects (
          AND object_lock_legal_hold = 0 AND became_noncurrent_at IS NULL)
     ),
     PRIMARY KEY (bucket, key, version_id)
-)";
+) STRICT";
 
 /// Per-object-key durable version allocator.
 const CREATE_OBJECT_VERSION_COUNTERS_TABLE: &str = "\
@@ -163,7 +163,7 @@ CREATE TABLE IF NOT EXISTS object_version_counters (
     key             TEXT NOT NULL,
     next_version_id INTEGER NOT NULL CHECK (next_version_id > 0),
     PRIMARY KEY (bucket, key)
-)";
+) STRICT";
 
 /// Per-object-key durable write-order fence.
 const CREATE_OBJECT_WRITE_COUNTERS_TABLE: &str = "\
@@ -173,7 +173,7 @@ CREATE TABLE IF NOT EXISTS object_write_counters (
     next_write_sequence       INTEGER NOT NULL CHECK (next_write_sequence > 0),
     max_committed_generation  INTEGER CHECK (max_committed_generation IS NULL OR max_committed_generation > 0),
     PRIMARY KEY (bucket, key)
-)";
+) STRICT";
 
 /// In-progress multipart upload tracking table.
 const CREATE_MULTIPART_UPLOADS_TABLE: &str = "\
@@ -202,7 +202,7 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
         object_lock_retain_until IS NULL OR object_lock_retain_until > 0
     ),
     object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2))
-)";
+) STRICT";
 
 /// Completed multipart uploads retained for AbortMultipartUpload semantics.
 const CREATE_COMPLETED_MULTIPART_UPLOADS_TABLE: &str = "\
@@ -216,7 +216,7 @@ CREATE TABLE IF NOT EXISTS completed_multipart_uploads (
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
     initiator_principal TEXT NOT NULL CHECK (length(initiator_principal) BETWEEN 1 AND 256),
     initiator_canonical_id TEXT NOT NULL CHECK (length(initiator_canonical_id) IN (32, 64))
-)";
+) STRICT";
 
 /// Index for pruning old completed multipart tombstones per bucket.
 const CREATE_COMPLETED_MULTIPART_UPLOADS_BUCKET_ORDER_INDEX: &str = "\
@@ -246,7 +246,7 @@ CREATE TABLE IF NOT EXISTS multipart_parts (
     last_modified    INTEGER NOT NULL,
     PRIMARY KEY (upload_id, part_number),
     FOREIGN KEY (upload_id) REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE
-)";
+) STRICT";
 
 /// Committed multipart manifest table for completed objects.
 const CREATE_OBJECT_PARTS_TABLE: &str = "\
@@ -267,7 +267,7 @@ CREATE TABLE IF NOT EXISTS object_parts (
     ec_m             INTEGER NOT NULL,
     data_pg_id      INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, version_id, part_number)
-)";
+) STRICT";
 
 const CREATE_OBJECT_PARTS_OFFSET_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_object_parts_offset \
@@ -323,7 +323,7 @@ CREATE TABLE IF NOT EXISTS stream_uploads (
         (op_kind = 0 AND upload_id IS NULL AND part_number IS NULL) OR
         (op_kind = 1 AND upload_id IS NOT NULL AND part_number BETWEEN 1 AND 10000)
     )
-)";
+) STRICT";
 
 /// Staging segment records for in-progress streaming sessions.
 const CREATE_STREAM_UPLOAD_SEGMENTS_TABLE: &str = "\
@@ -341,7 +341,7 @@ CREATE TABLE IF NOT EXISTS stream_upload_segments (
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (session_id, segment_index),
     FOREIGN KEY (session_id) REFERENCES stream_uploads(session_id) ON DELETE CASCADE
-)";
+) STRICT";
 
 /// Committed object segments for normal PutObject.
 const CREATE_STREAM_OBJECT_CHUNKS_TABLE: &str = "\
@@ -359,7 +359,7 @@ CREATE TABLE IF NOT EXISTS object_segments (
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, version_id, segment_index)
-)";
+) STRICT";
 
 /// Durable reclaim queue for standard segmented payload generations.
 const CREATE_CHUNK_MANIFEST_RECLAIMS_TABLE: &str = "\
@@ -369,7 +369,7 @@ CREATE TABLE IF NOT EXISTS object_segments_reclaims (
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
     created_at    INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, generation_id)
-)";
+) STRICT";
 
 /// Child segment rows for standard segmented reclaim generations.
 const CREATE_CHUNK_MANIFEST_RECLAIM_CHUNKS_TABLE: &str = "\
@@ -387,7 +387,7 @@ CREATE TABLE IF NOT EXISTS object_segment_reclaim_segments (
     FOREIGN KEY (bucket, key, generation_id)
         REFERENCES object_segments_reclaims(bucket, key, generation_id)
         ON DELETE CASCADE
-)";
+) STRICT";
 
 /// Durable object payload generation reservations for in-flight PutObject writes.
 const CREATE_OBJECT_GENERATION_RESERVATIONS_TABLE: &str = "\
@@ -398,7 +398,7 @@ CREATE TABLE IF NOT EXISTS object_generation_reservations (
     generation_id  INTEGER NOT NULL CHECK (generation_id > 0),
     created_at     INTEGER NOT NULL,
     UNIQUE (bucket, key, generation_id)
-)";
+) STRICT";
 
 /// Durable reclaim queue for multipart payload generations.
 const CREATE_MULTIPART_RECLAIMS_TABLE: &str = "\
@@ -408,7 +408,7 @@ CREATE TABLE IF NOT EXISTS multipart_reclaims (
     generation_id INTEGER NOT NULL CHECK (generation_id > 0),
     created_at    INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, generation_id)
-)";
+) STRICT";
 
 /// Per-part reclaim rows for multipart payload generations.
 const CREATE_MULTIPART_RECLAIM_PARTS_TABLE: &str = "\
@@ -431,7 +431,7 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_parts (
         (storage_kind = 0 AND part_okh IS NOT NULL AND part_vid IS NOT NULL AND data_pg_id IS NOT NULL AND ec_k IS NOT NULL AND ec_m IS NOT NULL) OR
         (storage_kind = 1 AND part_okh IS NULL AND part_vid IS NULL AND data_pg_id IS NULL AND ec_k IS NULL AND ec_m IS NULL)
     )
-)";
+) STRICT";
 
 /// Child segment rows for streamed multipart part reclaim generations.
 const CREATE_MULTIPART_RECLAIM_PART_CHUNKS_TABLE: &str = "\
@@ -450,7 +450,7 @@ CREATE TABLE IF NOT EXISTS multipart_reclaim_part_segments (
     FOREIGN KEY (bucket, key, generation_id, part_number)
         REFERENCES multipart_reclaim_parts(bucket, key, generation_id, part_number)
         ON DELETE CASCADE
-)";
+) STRICT";
 
 /// Durable object payload reclaim worker claim.
 const CREATE_OBJECT_PAYLOAD_RECLAIM_CLAIMS_TABLE: &str = "\
@@ -469,7 +469,7 @@ CREATE TABLE IF NOT EXISTS object_payload_reclaim_claims (
     lease_deadline  INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
     attempt_count   INTEGER NOT NULL CHECK (attempt_count >= 0),
     last_error      TEXT
-)";
+) STRICT";
 
 /// Durable bucket delete finalizer worker claim.
 const CREATE_BUCKET_DELETE_FINALIZE_CLAIMS_TABLE: &str = "\
@@ -486,7 +486,7 @@ CREATE TABLE IF NOT EXISTS bucket_delete_finalize_claims (
     attempt_count   INTEGER NOT NULL CHECK (attempt_count >= 0),
     last_error      TEXT,
     FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
-)";
+) STRICT";
 
 /// Durable lifecycle sweep worker claims, keyed by bucket incarnation.
 const CREATE_LIFECYCLE_SWEEP_CLAIMS_TABLE: &str = "\
@@ -504,7 +504,7 @@ CREATE TABLE IF NOT EXISTS lifecycle_sweep_claims (
     last_error      TEXT,
     PRIMARY KEY (bucket, bucket_incarnation_generation),
     FOREIGN KEY (bucket) REFERENCES buckets(name) ON DELETE CASCADE
-)";
+) STRICT";
 
 /// Committed multipart part segments.
 const CREATE_MULTIPART_PART_CHUNKS_TABLE: &str = "\
@@ -524,7 +524,7 @@ CREATE TABLE IF NOT EXISTS multipart_part_segments (
     ec_k          INTEGER NOT NULL,
     ec_m          INTEGER NOT NULL,
     PRIMARY KEY (bucket, key, upload_id, part_number, segment_index)
-)";
+) STRICT";
 
 /// Index for reading multipart part segments by version_id after completion.
 const CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX: &str = "\
@@ -585,7 +585,7 @@ CREATE TABLE IF NOT EXISTS buckets (
         object_lock_default_years IS NULL OR object_lock_default_years > 0
     ),
     CHECK (object_lock_enabled = 0 OR versioning = 1)
-)";
+) STRICT";
 
 /// Durable bucket write reservation records.
 const CREATE_BUCKET_WRITE_RESERVATIONS_TABLE: &str = "\
@@ -602,7 +602,7 @@ CREATE TABLE IF NOT EXISTS bucket_write_reservations (
     target_context   TEXT,
     PRIMARY KEY (bucket_name, reservation_id),
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
-)";
+) STRICT";
 
 /// Durable bucket delete write-drain records.
 const CREATE_BUCKET_WRITE_DRAINS_TABLE: &str = "\
@@ -616,7 +616,7 @@ CREATE TABLE IF NOT EXISTS bucket_write_drains (
     created_at       INTEGER NOT NULL CHECK (created_at >= 0),
     lease_deadline   INTEGER NOT NULL CHECK (lease_deadline >= 0),
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
-)";
+) STRICT";
 
 /// Last durable DeleteBucket attempt outcome per bucket.
 const CREATE_BUCKET_DELETE_ATTEMPT_OUTCOMES_TABLE: &str = "\
@@ -633,7 +633,7 @@ CREATE TABLE IF NOT EXISTS bucket_delete_attempt_outcomes (
     ),
     updated_at       INTEGER NOT NULL CHECK (updated_at >= 0),
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
-)";
+) STRICT";
 
 /// Index for bucket listing by owner and bucket name.
 const CREATE_BUCKETS_OWNER_LIST_INDEX: &str = "\
@@ -644,7 +644,7 @@ const CREATE_PG_COUNTERS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS pg_counters (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
     next_bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (next_bucket_execution_generation >= 0)
-)";
+) STRICT";
 
 /// Per-PG metadata command log entries accepted by this replica.
 const CREATE_METADATA_COMMAND_LOG_TABLE: &str = "\
@@ -660,7 +660,7 @@ CREATE TABLE IF NOT EXISTS metadata_command_log (
     pre_state_digest INTEGER,
     post_state_digest INTEGER,
     PRIMARY KEY (cluster_epoch, pg_id, log_index)
-)";
+) STRICT";
 
 /// Per-PG unresolved metadata command slot.
 ///
@@ -676,7 +676,7 @@ CREATE TABLE IF NOT EXISTS metadata_command_pending_slot (
     command_checksum INTEGER NOT NULL,
     command_bytes    BLOB NOT NULL,
     scope_bucket     TEXT
-)";
+) STRICT";
 
 /// Per-PG durable metadata command replay state for this replica.
 const CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE: &str = "\
@@ -686,7 +686,7 @@ CREATE TABLE IF NOT EXISTS metadata_command_replica_state (
     applied_log_index INTEGER NOT NULL DEFAULT 0 CHECK (applied_log_index >= 0),
     applied_log_hash  INTEGER NOT NULL DEFAULT 0,
     state_digest      INTEGER NOT NULL DEFAULT 0
-)";
+) STRICT";
 
 /// Durable verified metadata checkpoint candidates for future transfer and
 /// compaction paths. The payload is a self-verifying canonical checkpoint
@@ -701,7 +701,7 @@ CREATE TABLE IF NOT EXISTS metadata_command_checkpoints (
     checkpoint_crc64  INTEGER NOT NULL,
     checkpoint_bytes  BLOB NOT NULL,
     PRIMARY KEY (cluster_epoch, pg_id, applied_log_index, applied_log_hash, state_digest)
-)";
+) STRICT";
 
 const CREATE_METADATA_COMMAND_CHECKPOINTS_SELECT_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_metadata_command_checkpoints_select \
@@ -717,7 +717,7 @@ CREATE TABLE IF NOT EXISTS metadata_table_digests (
     row_count    INTEGER NOT NULL DEFAULT 0 CHECK (row_count >= 0),
     row_hash_xor INTEGER NOT NULL DEFAULT 0,
     row_hash_sum INTEGER NOT NULL DEFAULT 0
-)";
+) STRICT";
 
 /// Durable cross-connection revision for the metadata digest cache. Digest
 /// triggers bump this whenever command-owned metadata changes, allowing an open
@@ -727,7 +727,7 @@ const CREATE_METADATA_DIGEST_REVISION_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS metadata_digest_revision (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
     revision  INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)
-)";
+) STRICT";
 
 /// Durable marker proving metadata digest triggers and cache stats were
 /// bootstrapped atomically. Missing marker forces a one-time full refresh on
@@ -736,7 +736,7 @@ const CREATE_METADATA_DIGEST_BOOTSTRAP_STATE_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS metadata_digest_bootstrap_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 0),
     completed INTEGER NOT NULL CHECK (completed IN (0, 1))
-)";
+) STRICT";
 
 /// Bucket-scoped opaque subresource storage.
 const CREATE_BUCKET_SUBRESOURCES_TABLE: &str = "\
@@ -749,7 +749,7 @@ CREATE TABLE IF NOT EXISTS bucket_subresources (
     PRIMARY KEY (bucket_name, kind),
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE,
     CHECK (aux_int_1 IS NULL OR aux_int_1 IN (0, 1))
-)";
+) STRICT";
 
 /// Index for scanning buckets by subresource kind without touching tombstones.
 const CREATE_BUCKET_SUBRESOURCES_KIND_BUCKET_INDEX: &str = "\
@@ -1254,4 +1254,76 @@ fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error>
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn in_memory_schema() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_pg_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn init_pg_schema_creates_only_strict_user_tables() {
+        let conn = in_memory_schema();
+        let table_count: u32 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_list \
+                 WHERE schema = 'main' AND type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_count > 0, "schema should create user tables");
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM pragma_table_list \
+                 WHERE schema = 'main' \
+                   AND type = 'table' \
+                   AND name NOT LIKE 'sqlite_%' \
+                   AND strict = 0 \
+                 ORDER BY name",
+            )
+            .unwrap();
+        let non_strict_tables = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            non_strict_tables.is_empty(),
+            "all schema tables should be STRICT; non-strict tables: {non_strict_tables:?}"
+        );
+    }
+
+    #[test]
+    fn strict_schema_rejects_wrong_storage_class() {
+        let conn = in_memory_schema();
+        let err = conn
+            .execute(
+                "INSERT INTO pg_counters (singleton, next_bucket_execution_generation) \
+                 VALUES (1, 'not-an-integer')",
+                [],
+            )
+            .expect_err("STRICT table should reject text in INTEGER column");
+
+        assert!(
+            matches!(
+                err,
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ffi::ErrorCode::ConstraintViolation,
+                        ..
+                    },
+                    _
+                )
+            ),
+            "expected SQLite constraint failure, got: {err:?}"
+        );
+    }
 }
