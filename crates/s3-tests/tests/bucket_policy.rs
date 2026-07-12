@@ -8451,6 +8451,74 @@ fn test_bucket_policy_request_object_tag_binary_equals_matches_base64_value() {
 }
 
 #[test]
+fn test_bucket_policy_request_object_tag_binary_equals_deny_uses_base64_request_value() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        "BinaryEquals": {
+                            "s3:RequestObjectTag/security": "cHVibGlj"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                    "Resource": bucket_wildcard_resource(&bucket)
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject with raw non-base64 tag bypasses BinaryEquals Deny",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("binary-deny-raw")
+                    .tagging("security=public")
+                    .body(ByteStream::from_static(b"binary-deny-raw"))
+                    .send()
+            },
+        )
+        .await;
+
+        let encoded = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("binary-deny-encoded")
+            .tagging("security=cHVibGlj")
+            .body(ByteStream::from_static(b"binary-deny-encoded"))
+            .send()
+            .await;
+        assert_eq!(err_status(&encoded), 403);
+        assert_s3_err_code(&encoded, "AccessDenied");
+
+        cleanup(&bucket, &["binary-deny-encoded", "binary-deny-raw"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_request_object_tag_binary_equals_does_not_wildcard_match() {
     s3_tests::run(async {
         let principal = alt_policy_principal();

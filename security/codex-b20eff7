@@ -1,0 +1,179 @@
+BinaryEquals decodes request values, weakening policy denies
+Link: https://chatgpt.com/codex/cloud/security/findings/890a5e9566fc819184f9e708a83e92da?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: invalid
+
+# Resolution
+Reviewed against live AWS on 12/07/2026. The reported behavior is
+AWS-compatible, so the finding is invalid for this repository's S3-compatibility
+security model.
+
+AWS evaluates `BinaryEquals` against base64-encoded request-context values for
+`s3:RequestObjectTag/*`: an explicit Deny on
+`BinaryEquals {"s3:RequestObjectTag/security":"cHVibGlj"}` denies a request tag
+`security=cHVibGlj`, but it does not deny a raw request tag `security=public`
+when a later Allow otherwise authorizes the request. Local behavior matches.
+
+Regression coverage was added in
+`test_bucket_policy_request_object_tag_binary_equals_deny_uses_base64_request_value`.
+Validated with:
+
+- `./scripts/aws-tests --test bucket_policy request_object_tag_binary_equals_deny_uses_base64_request_value -- --nocapture`
+- `cargo nextest run -p s3-tests --test bucket_policy request_object_tag_binary_equals_deny_uses_base64_request_value`
+
+Changing local policy evaluation to treat base64 policy operands as matching
+raw request values would make Argmin diverge from AWS. Policies that intend to
+reject raw tag strings should use AWS-compatible string conditions for those raw
+values, or use `BinaryEquals` only with base64-encoded request values.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: b20eff7
+Author: justin@specialbusservice.com
+Created: 11/07/2026, 17:45:03
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: BinaryEquals support is enabled for user-controlled S3 condition keys, but the matching routine incorrectly Base64-decodes the actual request value and treats non-Base64 actual values as NoMatch. This can weaken newly accepted BinaryEquals-based Deny policies.
+The commit enables BinaryEquals for general evaluable condition keys, including attacker-controlled request tag keys such as s3:RequestObjectTag/* and s3:RequestObjectTagKeys. The evaluator then calls decode_binary_value(actual) on the request-context value and returns NoMatch if that value is not valid Base64. A bucket policy author using BinaryEquals with an explicit Deny to block a raw value represented by a Base64 policy operand can therefore be bypassed by sending the raw value. For example, a Deny on BinaryEquals {"s3:RequestObjectTag/security":"cHVibGlj"} intended to match the bytes/string "public" will not match a request tag security=public, because the implementation tries to Base64-decode "public" and treats the condition as NoMatch. If some other ACL, identity policy, or bucket policy statement otherwise permits the operation, the explicit Deny will not be enforced.
+
+# Validation
+## Rubric
+- [x] Confirm BinaryEquals is accepted for attacker-controlled request tag condition keys. Evidence: AnyEvaluable request tag resolvers at condition_key.rs:151-174 and binary acceptance at condition_key.rs:747-753. - [x] Confirm the request context supplies raw S3 tag strings, not pre-decoded binary. Evidence: resolve_request_object_tag returns tag.value at condition_key.rs:362-366 and bucket_policy.rs:653-658. - [x] Confirm BinaryEquals decodes the actual request value as Base64 and treats decode failure as NoMatch. Evidence: condition_op.rs:428-455. - [x] Dynamically reproduce Deny bypass with a minimal policy containing explicit BinaryEquals Deny plus unconditional Allow. Evidence: PoC test failed with ExplicitAllow for raw security=public and passed ExplicitDeny for encoded security=cHVibGlj. - [x] Obtain runtime trace of the vulnerable path or document unavailable dynamic tooling. Evidence: rust-lldb breakpoint at binary_value_matches showed operands [cHVibGlj] and actual public; valgrind/gdb/ASan were attempted or checked but unavailable in this container.
+## Report
+Validated the finding against commit b20eff76e003b66cf260dca14730fde9294a3359. Code review showed that request tag condition keys are registered as OperatorSupport::AnyEvaluable at crates/auth/src/bucket_policy/condition_key.rs:151-174, and AnyEvaluable now accepts binary operators at condition_key.rs:747-753. The request tag resolver returns the raw PolicyTag value: condition_key.rs:362-366 calls request_object_tag_value, which reads tag.value directly at bucket_policy.rs:653-658. The BinaryEquals path decodes the actual request value as Base64: condition_op.rs:428-431 defines decode_binary_value, condition_op.rs:438-445 calls it on actual and returns false on decode failure, and condition_op.rs:448-455 converts that to ConditionMatchResult::NoMatch. For a Deny statement, NoMatch makes request_effect return None at bucket_policy.rs:812-815, after which a later Allow can win via bucket_policy.rs:98-105. I added a targeted integration PoC at crates/auth/tests/binary_equals_deny_bypass_poc.rs. It creates a policy with an explicit Deny on BinaryEquals {s3:RequestObjectTag/security: cHVibGlj} followed by an unconditional Allow. Running `cargo test -p auth --test binary_equals_deny_bypass_poc -- --nocapture` produced: encoded_actual_value_is_explicitly_denied ... ok; raw_public_value_bypasses_binaryequals_deny panicked with assertion left: ExplicitAllow right: ExplicitDeny. This demonstrates that security=public bypasses the intended Deny while security=cHVibGlj is denied. I also ran rust-lldb non-interactively on the failing test; the breakpoint at condition_op.rs:439 showed binary_value_matches(operands=["cHVibGlj"], actual="public") with a stack through eval_binary_equals -> condition_key::evaluate_clause -> PolicyStatement::request_effect -> BucketPolicy::evaluate -> the PoC test. gdb/rust-gdb was unavailable because gdb is not installed; valgrind is not installed; Rust ASan required nightly and nightly sync failed due network restrictions.
+
+# Evidence
+crates/auth/src/bucket_policy/condition_key.rs (L151 to 174)
+  Note: Request object tag condition keys are attacker-controlled request-context strings and use OperatorSupport::AnyEvaluable, making them eligible for the newly added BinaryEquals support.
+```
+    ConditionKeyResolver {
+        key: KeyMatch::Prefix("s3:RequestObjectTag/"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Request),
+        resolve: resolve_request_object_tag,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_object_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Prefix("aws:RequestTag/"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Request),
+        resolve: resolve_request_object_tag,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:RequestObjectTagKeys"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: Some(ConditionInput::Request),
+        resolve: resolve_request_tag_keys,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_object_tag_supported_for_action),
+    },
+```
+
+crates/auth/src/bucket_policy/condition_key.rs (L747 to 753)
+  Note: The commit broadens AnyEvaluable keys to accept binary condition operators, exposing BinaryEquals to string-based S3 condition keys.
+```
+fn operator_supported_for_key(operator: &str, support: OperatorSupport) -> bool {
+    match support {
+        OperatorSupport::AnyEvaluable => condition_op::lookup(operator).is_some_and(|op| {
+            op.evaluable_on_evaluable_object_actions
+                && (condition_op::is_string_condition_kind(op.kind)
+                    || condition_op::is_binary_condition_kind(op.kind))
+        }),
+```
+
+crates/auth/src/bucket_policy/condition_op.rs (L428 to 445)
+  Note: binary_value_matches decodes the attacker-controlled actual request-context value as Base64 and returns false if it is not Base64, instead of comparing decoded policy bytes against the actual value bytes.
+```
+pub(super) fn decode_binary_value(value: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+
+    base64::engine::general_purpose::STANDARD.decode(value).ok()
+}
+
+fn string_eq_ignore_case(expected: &str, actual: &str) -> bool {
+    expected == actual || expected.to_lowercase() == actual.to_lowercase()
+}
+
+fn binary_value_matches(operands: &[String], actual: &str) -> bool {
+    let Some(actual) = decode_binary_value(actual) else {
+        return false;
+    };
+    operands
+        .iter()
+        .filter_map(|expected| decode_binary_value(expected))
+        .any(|expected| expected == actual)
+```
+
+crates/auth/src/bucket_policy/condition_op.rs (L448 to 459)
+  Note: BinaryEquals converts the failed actual-value decode into NoMatch, so explicit Deny statements using BinaryEquals do not apply to raw non-Base64 request values.
+```
+fn eval_binary_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if binary_value_matches(operands, actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Severity remains medium. The finding is real and in scope: production bucket policy evaluation accepts BinaryEquals for attacker-controlled request tag keys and decodes the actual raw request value as Base64, causing a Deny NoMatch and allowing another Allow to win. The validation PoC demonstrated the effect. It is not high or critical because it is not a universal auth bypass, requires a bucket policy specifically using BinaryEquals for request tags, and still requires the action to be otherwise permitted. The consequence is a meaningful but configuration-dependent authorization Deny bypass affecting data integrity.
+## Likelihood
+high - The vulnerable code is reachable through normal S3 API requests in the main service, and request tag values are attacker-controlled. However, exploitation requires a relatively specific policy pattern and an independent Allow/ACL/identity permission path, so real-world likelihood is constrained. | Remote network vector
+## Impact
+medium - The bug can bypass an explicit authorization Deny and permit object write/tagging operations that the bucket policy author intended to block. This can undermine data integrity and tag-based access-control invariants, but it is limited to buckets using BinaryEquals on these condition keys and does not by itself grant credentials or bypass all authentication.
+## Assumptions
+- The bucket owner has configured a bucket policy using BinaryEquals on attacker-supplied request tag condition keys, for example s3:RequestObjectTag/security.
+- The request would otherwise be allowed by another bucket policy Allow, ACL, public-write setting, or identity credential.
+- The service is deployed with the S3 HTTP frontend reachable by the attacker; the repository default listen address is loopback but it is configurable.
+- No cloud APIs were called and no runtime deployment state was inspected.
+- argmin-s3 HTTP S3 frontend running
+- bucket policy accepts BinaryEquals condition on request tag keys
+- explicit Deny intended to block a raw value represented by a Base64 policy operand
+- attacker can send a normal S3 object/tagging request carrying request tags
+- some other authorization path permits the action if the Deny does not match
+## Path
+Remote S3 client -> raw request tag -> BinaryEquals on s3:RequestObjectTag/* -> decode_binary_value(actual) fails -> Deny NoMatch -> later Allow/ACL/identity permits -> unauthorized write/tag operation
+## Path evidence
+- `crates/auth/src/bucket_policy/condition_key.rs:151-174` - s3:RequestObjectTag/*, aws:RequestTag/*, and s3:RequestObjectTagKeys are request-supplied condition keys configured as OperatorSupport::AnyEvaluable.
+- `crates/auth/src/bucket_policy/condition_key.rs:362-366` - The request object tag resolver returns the raw request tag value into the policy evaluator.
+- `crates/auth/src/bucket_policy/condition_key.rs:747-753` - AnyEvaluable condition keys accept binary condition operators, making BinaryEquals available for attacker-controlled request tag keys.
+- `crates/auth/src/bucket_policy/condition_op.rs:428-445` - Binary comparison decodes both expected operands and the actual request value as Base64; non-Base64 actual values return false.
+- `crates/auth/src/bucket_policy/condition_op.rs:448-459` - BinaryEquals converts failed binary_value_matches into ConditionMatchResult::NoMatch.
+- `crates/auth/src/bucket_policy.rs:94-105` - BucketPolicy evaluation gives Deny precedence only when a Deny effect is returned; otherwise later Allow statements can produce ExplicitAllow.
+- `crates/auth/src/bucket_policy.rs:812-815` - A statement whose condition evaluates to NoMatch returns None, so an explicit Deny statement with the bypassed condition is not enforced.
+- `crates/server-core/src/coordinator/authz/policy.rs:332-343` - Object authorization path parses request object tags from the normal request policy context and passes them into policy evaluation.
+- `crates/server-core/src/coordinator/authz/policy.rs:526-550` - Another object policy path parses request tag XML and includes it in the PolicyRequest used by BucketPolicy::evaluate.
+- `crates/server-http/src/http/mod.rs:2577-2599` - Bucket policies are configured through the production S3 HTTP PutBucketPolicy operation.
+- `crates/server-http/src/http/mod.rs:3148-3168` - The HTTP frontend authenticates S3 requests with the configured credential store before dispatching to core authorization.
+- `crates/argmin-s3/src/main.rs:4708-4727` - The main product binds a TCP listener and serves the S3 HTTP frontend, optionally with TLS.
+- `crates/argmin-s3/src/config.rs:327-333` - Configuration documents default ARGMIN_LISTEN_ADDR as 127.0.0.1:9000 and TLS paths as optional.
+- `crates/argmin-s3/src/config.rs:398-410` - Primary account, access key, secret access key, and SSE wrapping key are loaded from environment variables.
+- `crates/argmin-s3/src/config.rs:260-263` - SecretConfigValue Debug output is redacted, reducing accidental secret disclosure from debug formatting.
+## Narrative
+This is a real in-scope authorization vulnerability in the main argmin-s3 runtime, not a test-only issue. Request tag condition keys are marked AnyEvaluable, and AnyEvaluable now accepts binary condition operators. The resolver returns raw request tag values from the PolicyRequest. BinaryEquals then Base64-decodes the actual attacker-controlled value and treats decode failure as NoMatch. For an explicit Deny, NoMatch causes request_effect to return None, allowing a later Allow to authorize the operation. The provided validation PoC exercised this through the auth policy path and showed security=public bypassing a Deny intended to match cHVibGlj while security=cHVibGlj was denied. The impact is meaningful integrity/authorization bypass for buckets using this policy pattern, but severity remains medium because exploitation depends on a specific BinaryEquals Deny configuration plus an otherwise permitted action; it is not a general authentication bypass.
+## Controls
+- SigV4 authentication for normal S3 requests
+- Bucket policy evaluation with explicit Deny precedence when Deny matches
+- Optional public bucket ACL/policy behavior
+- Default loopback listen address 127.0.0.1:9000
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Process refuses to run as root
+- Max connections, max in-flight requests, and HTTP read/body timeouts
+## Blindspots
+- Static repository review found no deployment manifests, load balancers, or container/IaC files to prove public exposure; default listen address is loopback but operators can configure ARGMIN_LISTEN_ADDR.
+- No live deployment configuration was inspected, so prevalence of BinaryEquals bucket policies is unknown.
+- Attack impact depends on how operators use request tags for access control and whether public or authenticated Allows exist.
+- No cloud APIs were called; identity and network exposure conclusions are based only on repository artifacts.
