@@ -6,15 +6,14 @@ use crate::control_plane::{
 };
 use crate::types::{PgId, PgState};
 use crate::{
-    ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
-    PgClusterMapHistoryRouteReferenceKind, PgClusterMapHistoryRouteReferences,
-    MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+    ClusterEpoch, PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
+    PgClusterMapHistoryRouteReferences, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
 };
 use placement::NodeId;
 use std::num::NonZeroU64;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 4;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 5;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -920,24 +919,6 @@ fn write_node_heartbeat(
     write_string(out, &heartbeat.endpoint)?;
     write_u64(out, heartbeat.observed_epoch.get());
     write_u64(out, heartbeat.requested_lease_duration_ms);
-    write_option_cluster_epoch(
-        out,
-        heartbeat
-            .cluster_map_history_reference_summary
-            .oldest_live_placement_epoch,
-    );
-    write_option_cluster_epoch(
-        out,
-        heartbeat
-            .cluster_map_history_reference_summary
-            .oldest_durable_backfill_epoch,
-    );
-    write_option_cluster_epoch(
-        out,
-        heartbeat
-            .cluster_map_history_reference_summary
-            .oldest_pending_metadata_command_epoch,
-    );
     write_cluster_map_history_route_references(
         out,
         &heartbeat.cluster_map_history_route_references,
@@ -961,12 +942,6 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
     let endpoint = reader.read_string()?.to_owned();
     let observed_epoch = read_cluster_epoch(reader, "heartbeat observed epoch")?;
     let requested_lease_duration_ms = reader.read_u64()?;
-    let oldest_live_placement_epoch =
-        read_option_cluster_epoch(reader, "heartbeat oldest live placement epoch")?;
-    let oldest_durable_backfill_epoch =
-        read_option_cluster_epoch(reader, "heartbeat oldest durable backfill epoch")?;
-    let oldest_pending_metadata_command_epoch =
-        read_option_cluster_epoch(reader, "heartbeat oldest pending command epoch")?;
     let cluster_map_history_route_references = read_cluster_map_history_route_references(reader)?;
     let observation_count = reader.read_collection_len(
         "PG observations",
@@ -988,11 +963,6 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         observed_epoch,
         requested_lease_duration_ms,
         cluster_map_history_route_references,
-        cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
-            oldest_live_placement_epoch,
-            oldest_durable_backfill_epoch,
-            oldest_pending_metadata_command_epoch,
-        },
         pg_observations,
     })
 }
@@ -1266,29 +1236,6 @@ fn read_cluster_epoch(
         .ok_or_else(|| command_protocol_error(format!("{field} must be nonzero")))
 }
 
-fn write_option_cluster_epoch(out: &mut Vec<u8>, value: Option<ClusterEpoch>) {
-    match value {
-        Some(value) => {
-            write_u8(out, 1);
-            write_u64(out, value.get());
-        }
-        None => write_u8(out, 0),
-    }
-}
-
-fn read_option_cluster_epoch(
-    reader: &mut PayloadReader<'_>,
-    field: &'static str,
-) -> Result<Option<ClusterEpoch>, ControlPlaneError> {
-    reader
-        .read_option_u64()?
-        .map(|epoch| {
-            ClusterEpoch::new(epoch)
-                .ok_or_else(|| command_protocol_error(format!("{field} must be nonzero")))
-        })
-        .transpose()
-}
-
 fn write_string(out: &mut Vec<u8>, value: &str) -> Result<(), ControlPlaneError> {
     write_u32(out, len_as_u32(value.len(), "string")?);
     out.extend_from_slice(value.as_bytes());
@@ -1380,16 +1327,6 @@ impl<'a> PayloadReader<'a> {
         Ok(u64::from_be_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
-    }
-
-    fn read_option_u64(&mut self) -> Result<Option<u64>, ControlPlaneError> {
-        match self.read_u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(self.read_u64()?)),
-            value => Err(command_protocol_error(format!(
-                "invalid optional u64 tag {value}"
-            ))),
-        }
     }
 
     fn read_len(&mut self, field: &'static str) -> Result<usize, ControlPlaneError> {
@@ -1497,11 +1434,6 @@ mod tests {
                             ),
                         ])
                         .unwrap(),
-                    cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
-                        oldest_live_placement_epoch: Some(ClusterEpoch::new(12).unwrap()),
-                        oldest_durable_backfill_epoch: Some(ClusterEpoch::new(10).unwrap()),
-                        oldest_pending_metadata_command_epoch: Some(ClusterEpoch::new(11).unwrap()),
-                    },
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(3),
                         state: PgState::Peering,
@@ -1573,8 +1505,6 @@ mod tests {
                     observed_epoch: ClusterEpoch::new(u64::MAX).unwrap(),
                     requested_lease_duration_ms: u64::MAX,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 heartbeat_at_ms: u64::MAX,
@@ -1659,8 +1589,6 @@ mod tests {
                     observed_epoch: ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 1).unwrap(),
                     requested_lease_duration_ms: 100,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 heartbeat_at_ms: 1_000,
@@ -1790,9 +1718,6 @@ mod tests {
 
         let invalid_pending_presence = command_frame(4, |body| {
             write_minimal_heartbeat_prefix(body);
-            write_u8(body, 0);
-            write_u8(body, 0);
-            write_u8(body, 0);
             write_u32(body, 0);
             write_u32(body, 1);
             write_u32(body, 7);
@@ -1812,17 +1737,8 @@ mod tests {
             "invalid pending metadata command presence code 2",
         );
 
-        let invalid_option = command_frame(4, |body| {
-            write_minimal_heartbeat_prefix(body);
-            write_u8(body, 2);
-        });
-        assert_decode_error_contains(&invalid_option, "invalid optional u64 tag 2");
-
         let invalid_history_route_kind = command_frame(4, |body| {
             write_minimal_heartbeat_prefix(body);
-            write_u8(body, 0);
-            write_u8(body, 0);
-            write_u8(body, 0);
             write_u32(body, 1);
             write_u8(body, 99);
             write_u64(body, 1);
@@ -1835,9 +1751,6 @@ mod tests {
 
         let noncanonical_history_routes = command_frame(4, |body| {
             write_minimal_heartbeat_prefix(body);
-            write_u8(body, 0);
-            write_u8(body, 0);
-            write_u8(body, 0);
             write_u32(body, 2);
             for epoch in [2, 1] {
                 write_u8(body, 1);

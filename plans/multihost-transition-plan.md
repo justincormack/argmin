@@ -10852,6 +10852,28 @@ Required production shape and implementation order:
    this slice, so exact keys do not yet reduce live-payload/backfill/pending
    retention. The next slice removes that aggregate protection only after the
    exact-set restart and sparse-pruning invariants are exercised end to end.
+   That cutover is now complete in state format version 20, heartbeat RPC
+   version 5, and replicated command version 5. Heartbeats and committed node
+   records carry only the bounded exact typed reference set; scalar minima are
+   derived from that set only for diagnostics and the existing runtime-map node
+   summary. Authority pruning preserves exact `(epoch, PG)` keys plus transfer
+   dependency closure and no longer has an epoch-wide node floor. Storage-node
+   refresh seeds its historical response from those exact keys, then adds only
+   route changes needed since the node's last accepted observed epoch and the
+   pending-command/transfer closure required by current routes. Same-epoch
+   heartbeat changes also normalize sparse records older than the ordinary
+   256-epoch sliding window, so clearing or advancing an exact reference
+   releases the old route immediately rather than waiting for another epoch
+   bump. Each sparse-pruning pass computes metadata-transfer dependency closure
+   from exact references and ordinary-window routes against the unmodified
+   history before deleting anything. An exact old transfer route therefore
+   cannot survive while its older source route is removed, while clearing that
+   exact reference removes both the now-unreachable transfer and source routes
+   in the same update rather than retaining an orphan until serialization.
+   Regressions prove that one referenced PG does not retain an unrelated
+   PG in the same old epoch, an exact old route remains available across state
+   restart and storage refresh, missing/future exact routes fail before
+   mutation, and unretained intermediate epochs are not required.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge

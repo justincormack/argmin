@@ -9064,7 +9064,6 @@ mod tests {
     };
     use crate::control_plane_auth::ControlPlaneScopedCredentialInput;
     use crate::types::PgId;
-    use crate::PgClusterMapHistoryReferenceSummary;
 
     type ControlPlaneOpenRaftLogSuite = OpenRaftLogSuite<
         ControlPlaneRaftTypeConfig,
@@ -14981,12 +14980,6 @@ mod tests {
                         observed_epoch: bootstrap_epoch,
                         requested_lease_duration_ms: 345,
                         cluster_map_history_route_references: Default::default(),
-                        cluster_map_history_reference_summary:
-                            PgClusterMapHistoryReferenceSummary {
-                                oldest_live_placement_epoch: None,
-                                oldest_durable_backfill_epoch: None,
-                                oldest_pending_metadata_command_epoch: None,
-                            },
                         pg_observations: Vec::new(),
                     },
                     heartbeat_at_ms: 12_000,

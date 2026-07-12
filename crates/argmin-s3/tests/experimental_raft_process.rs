@@ -28,7 +28,7 @@ use storage::control_plane_raft::{
     ControlPlaneRaftPeerRpcRequest, ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile,
     ControlPlaneRaftWalFileConfig, ControlPlaneRaftWalRecord,
 };
-use storage::{ClusterEpoch, NodeId, PgClusterMapHistoryReferenceSummary, PgId};
+use storage::{ClusterEpoch, NodeId, PgId};
 
 struct TestDir {
     path: PathBuf,
@@ -584,8 +584,6 @@ fn send_authenticated_storage_heartbeat(
                 observed_epoch,
                 requested_lease_duration_ms: 10_000,
                 cluster_map_history_route_references: Default::default(),
-                cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary::default(
-                ),
                 pg_observations: Vec::new(),
             },
             storage::clock::current_time_millis(),

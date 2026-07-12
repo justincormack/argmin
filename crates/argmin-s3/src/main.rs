@@ -5392,8 +5392,6 @@ mod tests {
             observed_epoch: ClusterEpoch::INITIAL,
             requested_lease_duration_ms: 100,
             cluster_map_history_route_references: Default::default(),
-            cluster_map_history_reference_summary:
-                storage::PgClusterMapHistoryReferenceSummary::default(),
             pg_observations: Vec::new(),
         };
         let refresh = client.refresh_node_heartbeat(heartbeat, 2_000).unwrap();
@@ -6333,8 +6331,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 20_000,
@@ -6360,8 +6356,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(7),
                         state: PgState::Peering,
@@ -6400,8 +6394,6 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(7),
                         state: PgState::Active,
@@ -6447,8 +6439,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 20_000,
@@ -6488,8 +6478,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 40_000,
@@ -6512,8 +6500,6 @@ mod tests {
                     observed_epoch: refreshed_epoch,
                     requested_lease_duration_ms: 100,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 40_100,
@@ -6561,8 +6547,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 60_000,
@@ -6573,11 +6557,6 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read after startup")
             .cluster_epoch();
-        let protected_floor = storage::PgClusterMapHistoryReferenceSummary {
-            oldest_live_placement_epoch: Some(protected_epoch),
-            oldest_durable_backfill_epoch: None,
-            oldest_pending_metadata_command_epoch: None,
-        };
         for node_id in 10..18 {
             harness
                 .control_plane
@@ -6602,7 +6581,6 @@ mod tests {
                     observed_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary: protected_floor,
                     pg_observations: Vec::new(),
                 },
                 61_000,
@@ -6616,7 +6594,6 @@ mod tests {
             observed_epoch: ClusterEpoch::INITIAL,
             requested_lease_duration_ms: 1_000,
             cluster_map_history_route_references: Default::default(),
-            cluster_map_history_reference_summary: protected_floor,
             pg_observations: Vec::new(),
         };
         harness
@@ -7987,8 +7964,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 20_000,
@@ -8015,8 +7990,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(7),
                         state: PgState::Peering,
@@ -8047,8 +8020,6 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(7),
                         state: PgState::Active,
@@ -8121,8 +8092,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 50_000,
@@ -8148,8 +8117,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(17),
                         state: PgState::Peering,
@@ -8175,8 +8142,6 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(17),
                         state: PgState::Active,
@@ -8257,8 +8222,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 50_000,
@@ -8284,8 +8247,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(17),
                         state: PgState::Peering,
@@ -8311,8 +8272,6 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(17),
                         state: PgState::Active,
@@ -8360,8 +8319,6 @@ mod tests {
                     observed_epoch: expired_snapshot.cluster_epoch(),
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 recovery_now_ms,
@@ -8417,8 +8374,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 50_000,
@@ -8444,8 +8399,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(17),
                         state: PgState::Peering,
@@ -8471,8 +8424,6 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(17),
                         state: PgState::Active,
@@ -8537,8 +8488,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 0,
@@ -8570,8 +8519,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(9),
                         state: PgState::Peering,
@@ -8625,8 +8572,6 @@ mod tests {
                     observed_epoch: before.cluster_epoch(),
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 0,
@@ -9062,8 +9007,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 40_000,
@@ -9089,8 +9032,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(13),
                         state: PgState::Peering,
@@ -9116,8 +9057,6 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(13),
                         state: PgState::Active,
@@ -9240,8 +9179,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 40_000,
@@ -9267,8 +9204,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(13),
                         state: PgState::Peering,
@@ -9301,8 +9236,6 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(13),
                         state: PgState::Active,
@@ -9426,8 +9359,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 500,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 41_000,
@@ -9453,8 +9384,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 600,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(14),
                         state: PgState::Peering,
@@ -9480,8 +9409,6 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 700,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(14),
                         state: PgState::Active,
@@ -9671,8 +9598,6 @@ mod tests {
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 10_000,
                         cluster_map_history_route_references: Default::default(),
-                        cluster_map_history_reference_summary:
-                            storage::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
                     },
                     now_ms,
@@ -9692,8 +9617,6 @@ mod tests {
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 10_000,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id,
                         state: PgState::Peering,
@@ -9718,8 +9641,6 @@ mod tests {
                     observed_epoch: source_epoch,
                     requested_lease_duration_ms: 10_000,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id,
                         state: PgState::Active,
@@ -10002,13 +9923,15 @@ mod tests {
                     endpoint: "node-2.sock".to_owned(),
                     observed_epoch: floor_epoch,
                     requested_lease_duration_ms: 1_000,
-                    cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary {
-                            oldest_live_placement_epoch: Some(floor_epoch),
-                            oldest_durable_backfill_epoch: None,
-                            oldest_pending_metadata_command_epoch: None,
-                        },
+                    cluster_map_history_route_references:
+                        storage::PgClusterMapHistoryRouteReferences::try_from_iter([
+                            storage::PgClusterMapHistoryRouteReference::new(
+                                storage::PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+                                floor_epoch,
+                                PgId::new(3),
+                            ),
+                        ])
+                        .unwrap(),
                     pg_observations: Vec::new(),
                 },
                 1_000,
@@ -10369,8 +10292,6 @@ mod tests {
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
                             cluster_map_history_route_references: Default::default(),
-                            cluster_map_history_reference_summary:
-                                storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: pg_observations.clone(),
                         },
                         now_ms,
@@ -10394,8 +10315,6 @@ mod tests {
                             observed_epoch: authority.snapshot().cluster_epoch(),
                             requested_lease_duration_ms: 1_000,
                             cluster_map_history_route_references: Default::default(),
-                            cluster_map_history_reference_summary:
-                                storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: vec![NodePgHeartbeatObservation {
                                 pg_id: PgId::new(0),
                                 state: PgState::Active,
@@ -10449,8 +10368,6 @@ mod tests {
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
                             cluster_map_history_route_references: Default::default(),
-                            cluster_map_history_reference_summary:
-                                storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: vec![NodePgHeartbeatObservation {
                                 pg_id: PgId::new(0),
                                 state: PgState::Peering,
@@ -10483,8 +10400,6 @@ mod tests {
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
                             cluster_map_history_route_references: Default::default(),
-                            cluster_map_history_reference_summary:
-                                storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: vec![NodePgHeartbeatObservation {
                                 pg_id: PgId::new(1),
                                 state: PgState::Peering,
@@ -10515,8 +10430,6 @@ mod tests {
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
                         cluster_map_history_route_references: Default::default(),
-                        cluster_map_history_reference_summary:
-                            storage::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: vec![NodePgHeartbeatObservation {
                             pg_id: PgId::new(0),
                             state: PgState::Active,
@@ -10652,8 +10565,6 @@ mod tests {
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
                             cluster_map_history_route_references: Default::default(),
-                            cluster_map_history_reference_summary:
-                                storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: vec![peering_observation],
                         },
                         now_ms,
@@ -10677,8 +10588,6 @@ mod tests {
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
                         cluster_map_history_route_references: Default::default(),
-                        cluster_map_history_reference_summary:
-                            storage::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: vec![NodePgHeartbeatObservation {
                             pg_id: PgId::new(0),
                             state: PgState::Active,
@@ -10875,8 +10784,6 @@ mod tests {
                     observed_epoch: bootstrap_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 61_000,
@@ -10897,8 +10804,6 @@ mod tests {
                     observed_epoch: peering_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(0),
                         state: PgState::Peering,
@@ -10924,8 +10829,6 @@ mod tests {
                     observed_epoch: active_epoch,
                     requested_lease_duration_ms: 1_000,
                     cluster_map_history_route_references: Default::default(),
-                    cluster_map_history_reference_summary:
-                        storage::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: vec![NodePgHeartbeatObservation {
                         pg_id: PgId::new(0),
                         state: PgState::Active,
