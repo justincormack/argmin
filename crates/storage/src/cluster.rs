@@ -1465,15 +1465,15 @@ impl StorageClusterRuntimeMapHandle {
         let handle = thread::Builder::new()
             .name("argmin-storage-cluster-control-plane-refresh".to_string())
             .spawn(move || loop {
-                let now_ms = authority_now_ms();
+                let discovery_now_ms = authority_now_ms();
                 let discovered_recovery_result = match control_plane
-                    .pending_metadata_command_recoveries(now_ms)
+                    .pending_metadata_command_recoveries(discovery_now_ms)
                 {
                     Ok(listing)
                         if !listing.tasks().is_empty() || !listing.failures().is_empty() => Some(
                         self.recover_authorized_pending_metadata_commands(
                             &control_plane,
-                            now_ms,
+                            &authority_now_ms,
                             admission_settings,
                             listing,
                         ),
@@ -1483,44 +1483,47 @@ impl StorageClusterRuntimeMapHandle {
                         PendingMetadataCommandRefreshRecoveryError::ControlPlane(error),
                     )),
                 };
+                let refresh_now_ms = authority_now_ms();
                 let result = match admission_settings {
                     Some(admission_settings) => self
                         .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
                             &control_plane,
-                            now_ms,
+                            refresh_now_ms,
                             admission_settings,
                         ),
-                    None => self.refresh_from_control_plane_runtime_map(&control_plane, now_ms),
+                    None => {
+                        self.refresh_from_control_plane_runtime_map(&control_plane, refresh_now_ms)
+                    }
                 };
                 let recovery_result = match discovered_recovery_result {
                     Some(result) => Some(result),
                     None => match &result {
                         Ok(_) => None,
                         Err(error) => {
-                        if runtime_map_refresh_error_requires_current_map_invalidation(error) {
-                            self.expire_same_epoch_generations(now_ms);
-                        }
-                        Some(match error {
-                        StorageClusterRuntimeMapRefreshError::ControlPlane(
-                            ControlPlaneError::PgPeeringPendingMetadataCommand {
-                                pg_id,
-                                node_id,
-                                pending,
-                                ..
-                            },
-                        ) => self.recover_reported_pending_metadata_command(
-                            &control_plane,
-                            now_ms,
-                            admission_settings,
-                            PgId::new(*pg_id),
-                            NodeId::new(*node_id),
-                            *pending,
-                        ),
-                        _ => self
-                            .current()
-                            .drain_pending_metadata_commands_for_current_map()
-                            .map_err(PendingMetadataCommandRefreshRecoveryError::Recover),
-                        })
+                            if runtime_map_refresh_error_requires_current_map_invalidation(error) {
+                                self.expire_same_epoch_generations(refresh_now_ms);
+                            }
+                            Some(match error {
+                                StorageClusterRuntimeMapRefreshError::ControlPlane(
+                                    ControlPlaneError::PgPeeringPendingMetadataCommand {
+                                        pg_id,
+                                        node_id,
+                                        pending,
+                                        ..
+                                    },
+                                ) => self.recover_reported_pending_metadata_command(
+                                    &control_plane,
+                                    authority_now_ms(),
+                                    admission_settings,
+                                    PgId::new(*pg_id),
+                                    NodeId::new(*node_id),
+                                    *pending,
+                                ),
+                                _ => self
+                                    .current()
+                                    .drain_pending_metadata_commands_for_current_map()
+                                    .map_err(PendingMetadataCommandRefreshRecoveryError::Recover),
+                            })
                         }
                     },
                 };
@@ -1708,13 +1711,16 @@ impl StorageClusterRuntimeMapHandle {
         Ok(1)
     }
 
-    fn recover_authorized_pending_metadata_commands(
+    fn recover_authorized_pending_metadata_commands<F>(
         &self,
         control_plane: &impl ControlPlaneRuntimeMapSource,
-        authority_now_ms: u64,
+        authority_now_ms: &F,
         admission_settings: Option<LocalUnixStorageNodeClientAdmissionSettings>,
         listing: crate::control_plane::PendingMetadataCommandRecoveryListing,
-    ) -> Result<usize, PendingMetadataCommandRefreshRecoveryError> {
+    ) -> Result<usize, PendingMetadataCommandRefreshRecoveryError>
+    where
+        F: Fn() -> u64,
+    {
         let mut recovered = 0;
         let mut first_error = None;
         let (recoveries, discovery_failures) = listing.into_parts();
@@ -1722,7 +1728,7 @@ impl StorageClusterRuntimeMapHandle {
             let recovery = task.recovery();
             match self.recover_reported_pending_metadata_command(
                 control_plane,
-                authority_now_ms,
+                authority_now_ms(),
                 admission_settings,
                 task.pg_id(),
                 recovery.reporting_node_id(),

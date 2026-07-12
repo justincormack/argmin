@@ -15728,7 +15728,7 @@ mod tests {
     use std::cell::Cell;
     use std::sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     };
     use std::time::{Duration, Instant};
 
@@ -29467,6 +29467,130 @@ mod tests {
         let attempts_after_stop = refresh_loop.status().attempts;
         std::thread::sleep(Duration::from_millis(15));
         assert_eq!(refresh_loop.status().attempts, attempts_after_stop);
+    }
+
+    #[test]
+    fn storage_cluster_runtime_map_refresh_loop_resamples_time_after_discovery() {
+        struct TimestampRecordingRuntimeMapSource {
+            snapshot: ClusterControlSnapshot,
+            discovery_now_ms: Arc<AtomicU64>,
+            recovery_now_ms: Arc<Mutex<Vec<u64>>>,
+            refresh_now_ms: Arc<AtomicU64>,
+        }
+
+        impl ControlPlaneRuntimeMapSource for TimestampRecordingRuntimeMapSource {
+            fn runtime_map_snapshot(
+                &self,
+                authority_now_ms: u64,
+            ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+                let _ = self.refresh_now_ms.compare_exchange(
+                    u64::MAX,
+                    authority_now_ms,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                self.snapshot.runtime_map(authority_now_ms)
+            }
+
+            fn pending_metadata_command_recoveries(
+                &self,
+                authority_now_ms: u64,
+            ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+                let _ = self.discovery_now_ms.compare_exchange(
+                    u64::MAX,
+                    authority_now_ms,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                Ok(PendingMetadataCommandRecoveryListing::new(
+                    [31, 32]
+                        .into_iter()
+                        .map(|pg_id| {
+                            PendingMetadataCommandRecoveryTask::new(
+                                PgId::new(pg_id),
+                                PendingMetadataCommandRecovery::new(
+                                    NodeId::new(1),
+                                    PendingMetadataCommandObservation::new(
+                                        ClusterEpoch::INITIAL,
+                                        NonZeroU64::MIN,
+                                        u64::from(pg_id),
+                                    ),
+                                ),
+                            )
+                        })
+                        .collect(),
+                    Vec::new(),
+                ))
+            }
+
+            fn pg_runtime_map_snapshot(
+                &self,
+                pg_id: PgId,
+                authority_now_ms: u64,
+            ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+                self.recovery_now_ms
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(authority_now_ms);
+                Err(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
+            }
+        }
+
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 2_000);
+        let initial_map = authority.snapshot().runtime_map(2_001).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &initial_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let handle = crate::StorageClusterRuntimeMapHandle::new(cluster);
+        let discovery_now_ms = Arc::new(AtomicU64::new(u64::MAX));
+        let recovery_now_ms = Arc::new(Mutex::new(Vec::new()));
+        let refresh_now_ms = Arc::new(AtomicU64::new(u64::MAX));
+        let source = TimestampRecordingRuntimeMapSource {
+            snapshot: authority.snapshot().clone(),
+            discovery_now_ms: Arc::clone(&discovery_now_ms),
+            recovery_now_ms: Arc::clone(&recovery_now_ms),
+            refresh_now_ms: Arc::clone(&refresh_now_ms),
+        };
+        let clock = Arc::new(AtomicU64::new(2_001));
+        let loop_clock = Arc::clone(&clock);
+        let mut refresh_loop = handle
+            .spawn_control_plane_refresh_loop(source, Duration::from_secs(1), move || {
+                loop_clock.fetch_add(6_000, Ordering::SeqCst)
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while refresh_loop.status().successes == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "refresh loop did not complete: {:?}",
+                refresh_loop.status()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        refresh_loop.stop();
+
+        assert_eq!(discovery_now_ms.load(Ordering::SeqCst), 2_001);
+        assert_eq!(
+            *recovery_now_ms
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![8_001, 14_001]
+        );
+        assert_eq!(refresh_now_ms.load(Ordering::SeqCst), 20_001);
     }
 
     #[test]

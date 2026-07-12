@@ -10896,6 +10896,30 @@ Required production shape and implementation order:
    the dense-history cause of the retained 2.50 MB startup artifact with 48,384
    `history_pg` rows; heartbeat durability and unchanged-map polling remain
    separate blocker slices below.
+   A later 216-PG route-change soak retained at
+   `/tmp/argmin-s3-uat.ix5xon` confirms both sides of that boundary. Its state
+   file was 654,676 bytes rather than multiple megabytes, but the last
+   control-plane process still serialized/saved 130 full snapshots totaling
+   84,755,327 logical bytes. Seventy-seven heartbeat handlers accumulated
+   22,162,767 us inside the authority operation (575,239 us maximum), while
+   runtime-map and pending-recovery reads waited up to 1,130,168 us and
+   1,332,007 us for the same lock. The frontend timed out waiting to install
+   epoch 337 while the authority and all storage nodes had reached it. This is
+   direct evidence that compact history alone does not close heartbeat write
+   amplification or lock starvation.
+   The same failure exposed an authentication sequencing bug in the frontend
+   refresh loop. It sampled one wall timestamp, then used it for both a
+   retryable pending-recovery read and the later full-map read. When the first
+   operation consumed its retry budget under lock pressure, the second request
+   was re-signed relative to an already stale base and failed replay freshness.
+   Discovery, each discovered pending-command recovery task, full-map refresh,
+   and failure recovery now sample the injected authority clock independently.
+   A deterministic regression returns two recovery tasks, advances the clock
+   by more than the five-second auth window before every authenticated
+   operation, and proves both PG-map reads and the final full-map fetch receive
+   fresh timestamps. This prevents
+   contention in one operation from manufacturing a stale credential for the
+   next operation; it does not reduce the underlying lock/write pressure.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge
