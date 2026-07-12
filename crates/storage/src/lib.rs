@@ -82,7 +82,9 @@ pub use pg_store::{
     MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
     MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandCheckpointValidationError,
     MetadataCommandLogCompactionStatus, MetadataCommandLogStats,
-    PgClusterMapHistoryReferenceSummary, PgStore,
+    PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
+    PgClusterMapHistoryRouteReferenceKind, PgClusterMapHistoryRouteReferences, PgStore,
+    MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
 };
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;

@@ -686,7 +686,8 @@ impl ServerError {
 
 fn store_error_is_resource_exhausted(error: &StoreError) -> bool {
     match error {
-        StoreError::StorageRpcResourceExhausted { .. } => true,
+        StoreError::StorageRpcResourceExhausted { .. }
+        | StoreError::ClusterMapHistoryReferenceLimitExceeded { .. } => true,
         StoreError::ShardStore { source, .. } => store_error_is_resource_exhausted(source),
         _ => false,
     }
@@ -698,6 +699,9 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         StoreError::IntegrityError { .. } => "store_integrity_error",
         StoreError::ShardAckMismatch { .. } => "shard_ack_mismatch",
         StoreError::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+        StoreError::ClusterMapHistoryReferenceLimitExceeded { .. } => {
+            "cluster_map_history_reference_limit_exceeded"
+        }
         StoreError::PgNotFound { .. } => "pg_not_found",
         StoreError::InvalidPgTopology { .. } => "invalid_pg_topology",
         StoreError::ClusterPgNotFound { .. } => "cluster_pg_not_found",

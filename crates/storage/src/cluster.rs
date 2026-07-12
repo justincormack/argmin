@@ -11658,6 +11658,9 @@ fn metadata_command_checkpoint_record_error_kind(error: &StoreError) -> &'static
         StoreError::IntegrityError { .. } => "integrity_error",
         StoreError::ShardAckMismatch { .. } => "shard_ack_mismatch",
         StoreError::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+        StoreError::ClusterMapHistoryReferenceLimitExceeded { .. } => {
+            "cluster_map_history_reference_limit_exceeded"
+        }
         StoreError::PgNotFound { .. } => "pg_not_found",
         StoreError::InvalidPgTopology { .. } => "invalid_pg_topology",
         StoreError::ClusterPgNotFound { .. } => "cluster_pg_not_found",

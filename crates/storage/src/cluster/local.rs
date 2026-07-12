@@ -2070,14 +2070,20 @@ impl LocalClusterMap {
     pub fn cluster_map_history_reference_summary(
         &self,
     ) -> Result<PgClusterMapHistoryReferenceSummary, StoreError> {
-        let mut summary = PgClusterMapHistoryReferenceSummary::default();
+        Ok(self.cluster_map_history_route_references()?.summary())
+    }
+
+    pub fn cluster_map_history_route_references(
+        &self,
+    ) -> Result<crate::PgClusterMapHistoryRouteReferences, StoreError> {
+        let mut references = crate::PgClusterMapHistoryRouteReferences::default();
         for node in self.nodes.values() {
-            summary.merge(
+            references.merge(
                 node.shard_scavenger_client()
-                    .cluster_map_history_reference_summary()?,
-            );
+                    .cluster_map_history_route_references()?,
+            )?;
         }
-        Ok(summary)
+        Ok(references)
     }
 
     pub fn install_unix_shard_clients(

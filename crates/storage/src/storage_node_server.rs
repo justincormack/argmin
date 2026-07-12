@@ -10285,10 +10285,10 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_node_epoch(request.node_id, request.cluster_epoch) {
             return encode_storage_rpc_error_response(&error);
         }
-        let response = match self.node.cluster_map_history_reference_summary() {
-            Ok(summary) => {
+        let response = match self.node.cluster_map_history_route_references() {
+            Ok(references) => {
                 let payload = encode_cluster_map_history_reference_summary_response(
-                    &StorageRpcClusterMapHistoryReferenceSummaryResponse { summary },
+                    &StorageRpcClusterMapHistoryReferenceSummaryResponse { references },
                 );
                 encode_storage_rpc_success_response(&payload)
             }
@@ -11711,6 +11711,12 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
             code: StorageRpcErrorCode::MetadataCommandContention,
             message: format!("metadata command contention during {context}"),
         },
+        error @ StoreError::ClusterMapHistoryReferenceLimitExceeded { .. } => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::ResourceExhausted,
+                message: error.to_string(),
+            }
+        }
         error @ StoreError::RouteMapExpired { .. } => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::StaleShardLocation,
             message: error.to_string(),

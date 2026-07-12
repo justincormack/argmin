@@ -253,7 +253,9 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
         config.socket_path.clone(),
     );
 
-    let summary = client.cluster_map_history_reference_summary().unwrap();
+    let references = client.cluster_map_history_route_references().unwrap();
+    let summary = references.summary();
+    assert_eq!(references.len(), 3);
     assert_eq!(
         summary.oldest_live_placement_epoch,
         Some(ClusterEpoch::new(6).unwrap())

@@ -3,6 +3,7 @@ use crate::metadata_command::{
     MetadataCommandId, MetadataCommandLogIndex, MetadataTransferCommand,
 };
 use crate::traits::PgMetadataStore;
+use crate::PgTopology;
 
 fn test_owner() -> OwnerIdentity {
     OwnerIdentity::from_principal("owner")
@@ -1623,7 +1624,6 @@ fn bucket_delete_finalize_claim_clears_expired_non_deleting_different_bucket() {
             params![BucketState::Active as u8, &bucket_b],
         )
         .unwrap();
-
     let claimed_a = store
         .acquire_bucket_delete_finalize_claim(
             &bucket_a,
@@ -4290,6 +4290,44 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
                 [0x22_u8; 16].as_slice(),
                 [0x33_u8; 16].as_slice(),
                 4_i64,
+             ],
+        )
+        .unwrap();
+
+    let multipart_upload_id = "u".repeat(128);
+    store
+        .connection()
+        .execute(
+            "INSERT INTO multipart_uploads \
+             (upload_id, bucket, key, initiated_at, state, metadata_blob, system_metadata_blob, \
+              owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
+              acl_grants, public_read, object_generation_id, object_lock_legal_hold, encryption_type) \
+             VALUES (?1, ?2, ?3, 10, 0, ?4, ?5, ?6, ?7, ?8, ?9, '', 0, 22, 0, 0)",
+            rusqlite::params![
+                multipart_upload_id,
+                "history-floor-bucket",
+                "direct-multipart-object",
+                b"".as_slice(),
+                b"".as_slice(),
+                "owner",
+                "c".repeat(32),
+                "owner",
+                "c".repeat(32),
+            ],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO multipart_parts \
+             (upload_id, part_number, generation, size, payload_crc64, etag, etag_kind, \
+              part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, last_modified) \
+             VALUES (?1, 2, 0, 4096, ?2, ?3, 0, ?4, 12, 5, 4, 2, 11)",
+            rusqlite::params![
+                "u".repeat(128),
+                0x9abc_i64,
+                b"etag".as_slice(),
+                [0x44_u8; 16].as_slice(),
             ],
         )
         .unwrap();
@@ -4342,6 +4380,76 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
         summary.oldest_required_epoch(),
         Some(ClusterEpoch::new(2).unwrap())
     );
+
+    let topology = PgTopology::new(&[7, 8, 9]).unwrap();
+    let routed_multipart_pg = topology
+        .object_generation_multipart_part_data_pg(
+            &trusted_bucket_name("history-floor-bucket"),
+            &trusted_object_key("direct-multipart-object"),
+            GenerationId::new(22).unwrap(),
+            2,
+        )
+        .get();
+    let references = store
+        .cluster_map_history_route_references(&topology)
+        .unwrap();
+    let mut expected = vec![
+        PgClusterMapHistoryRouteReference::new(
+            PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+            ClusterEpoch::new(4).unwrap(),
+            PgId::new(7),
+        ),
+        PgClusterMapHistoryRouteReference::new(
+            PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+            ClusterEpoch::new(6).unwrap(),
+            PgId::new(7),
+        ),
+        PgClusterMapHistoryRouteReference::new(
+            PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+            ClusterEpoch::new(3).unwrap(),
+            PgId::new(7),
+        ),
+        PgClusterMapHistoryRouteReference::new(
+            PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
+            ClusterEpoch::new(9).unwrap(),
+            PgId::new(7),
+        ),
+        PgClusterMapHistoryRouteReference::new(
+            PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+            ClusterEpoch::new(2).unwrap(),
+            PgId::new(7),
+        ),
+        PgClusterMapHistoryRouteReference::new(
+            PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+            ClusterEpoch::new(5).unwrap(),
+            PgId::new(routed_multipart_pg),
+        ),
+    ];
+    expected.sort_unstable();
+    assert_eq!(references.iter().collect::<Vec<_>>(), expected);
+    assert_eq!(references.summary(), summary);
+}
+
+#[test]
+fn cluster_map_history_route_references_fail_closed_at_collection_bound() {
+    let epoch = ClusterEpoch::INITIAL;
+    let error = PgClusterMapHistoryRouteReferences::try_from_iter(
+        (0..=MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES).map(|pg_id| {
+            PgClusterMapHistoryRouteReference::new(
+                PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+                epoch,
+                PgId::new(pg_id as u32),
+            )
+        }),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::ClusterMapHistoryReferenceLimitExceeded {
+            count,
+            max: MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+        } if count == MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES + 1
+    ));
 }
 
 #[test]

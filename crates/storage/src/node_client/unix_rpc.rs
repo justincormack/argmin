@@ -372,9 +372,9 @@ impl UnixStorageNodeClient {
         }
     }
 
-    pub(crate) fn cluster_map_history_reference_summary(
+    pub(crate) fn cluster_map_history_route_references(
         &self,
-    ) -> Result<crate::PgClusterMapHistoryReferenceSummary, StoreError> {
+    ) -> Result<crate::PgClusterMapHistoryRouteReferences, StoreError> {
         let request = StorageRpcClusterMapHistoryReferenceSummaryRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
@@ -385,7 +385,7 @@ impl UnixStorageNodeClient {
             payload,
         )?;
         decode_cluster_map_history_reference_summary_response(&response)
-            .map(|response| response.summary)
+            .map(|response| response.references)
             .map_err(|error| {
                 self.rpc_payload_error(
                     "decode cluster map history reference summary response",
@@ -1198,10 +1198,10 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 }
 
 impl ShardScavengerNodeClient for UnixStorageNodeClient {
-    fn cluster_map_history_reference_summary(
+    fn cluster_map_history_route_references(
         &self,
-    ) -> Result<crate::PgClusterMapHistoryReferenceSummary, StoreError> {
-        UnixStorageNodeClient::cluster_map_history_reference_summary(self)
+    ) -> Result<crate::PgClusterMapHistoryRouteReferences, StoreError> {
+        UnixStorageNodeClient::cluster_map_history_route_references(self)
     }
 
     fn list_scavenger_shard_files(

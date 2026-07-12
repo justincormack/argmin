@@ -11,8 +11,9 @@ use crate::{
     pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
         MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
-        PgClusterMapHistoryReferenceSummary, ScavengerShardFile, ScavengerShardFileScan,
-        ScavengerShardRow,
+        PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
+        PgClusterMapHistoryRouteReferences, ScavengerShardFile, ScavengerShardFileScan,
+        ScavengerShardRow, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
     },
     types::{
         AbortMultipartUploadCleanup, BucketAclSummary, BucketDeleteAttemptOutcomeKind,
@@ -1265,6 +1266,8 @@ pub(crate) enum StorageRpcPayloadError {
     InvalidShardAckBatchRequest(&'static str),
     #[error("invalid durable claim token: {0}")]
     InvalidDurableClaimToken(&'static str),
+    #[error("invalid cluster-map history route reference: {0}")]
+    InvalidClusterMapHistoryRouteReference(&'static str),
     #[error("invalid bucket write reservation proof: {0}")]
     InvalidBucketWriteReservationProof(&'static str),
     #[error("invalid UTF-8 string")]
@@ -2894,7 +2897,7 @@ pub(crate) struct StorageRpcClusterMapHistoryReferenceSummaryRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcClusterMapHistoryReferenceSummaryResponse {
-    pub(crate) summary: PgClusterMapHistoryReferenceSummary,
+    pub(crate) references: PgClusterMapHistoryRouteReferences,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9171,27 +9174,21 @@ pub(crate) fn encode_cluster_map_history_reference_summary_response(
     response: &StorageRpcClusterMapHistoryReferenceSummaryResponse,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    put_optional_u64(
+    put_u32(
         &mut out,
-        response
-            .summary
-            .oldest_live_placement_epoch
-            .map(ClusterEpoch::get),
+        u32::try_from(response.references.len())
+            .expect("bounded history route reference count fits u32"),
     );
-    put_optional_u64(
-        &mut out,
-        response
-            .summary
-            .oldest_durable_backfill_epoch
-            .map(ClusterEpoch::get),
-    );
-    put_optional_u64(
-        &mut out,
-        response
-            .summary
-            .oldest_pending_metadata_command_epoch
-            .map(ClusterEpoch::get),
-    );
+    for reference in response.references.iter() {
+        out.push(match reference.kind() {
+            PgClusterMapHistoryRouteReferenceKind::LivePlacement => 1,
+            PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource => 2,
+            PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => 3,
+            PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => 4,
+        });
+        put_u64(&mut out, reference.cluster_epoch().get());
+        put_u32(&mut out, reference.pg_id().get());
+    }
     out
 }
 
@@ -9199,19 +9196,58 @@ pub(crate) fn decode_cluster_map_history_reference_summary_response(
     bytes: &[u8],
 ) -> Result<StorageRpcClusterMapHistoryReferenceSummaryResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let oldest_live_placement_epoch = decode_optional_cluster_epoch(decoder.read_optional_u64()?)?;
-    let oldest_durable_backfill_epoch =
-        decode_optional_cluster_epoch(decoder.read_optional_u64()?)?;
-    let oldest_pending_metadata_command_epoch =
-        decode_optional_cluster_epoch(decoder.read_optional_u64()?)?;
+    let count = decoder.read_u32()? as usize;
+    if count > MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES {
+        return Err(StorageRpcPayloadError::InvalidCount {
+            field: "cluster-map history route references",
+            count: count as u64,
+            max: MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES as u64,
+        });
+    }
+    let mut references = PgClusterMapHistoryRouteReferences::default();
+    let mut previous_reference = None;
+    for _ in 0..count {
+        let kind = match decoder.read_u8()? {
+            1 => PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+            2 => PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+            3 => PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
+            4 => PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+            _ => {
+                return Err(
+                    StorageRpcPayloadError::InvalidClusterMapHistoryRouteReference(
+                        "unknown reference kind",
+                    ),
+                )
+            }
+        };
+        let cluster_epoch = ClusterEpoch::new(decoder.read_u64()?).ok_or(
+            StorageRpcPayloadError::InvalidClusterMapHistoryRouteReference(
+                "cluster epoch must not be zero",
+            ),
+        )?;
+        let reference = PgClusterMapHistoryRouteReference::new(
+            kind,
+            cluster_epoch,
+            PgId::new(decoder.read_u32()?),
+        );
+        if previous_reference.is_some_and(|previous| reference <= previous) {
+            return Err(
+                StorageRpcPayloadError::InvalidClusterMapHistoryRouteReference(
+                    "references are not strictly ordered",
+                ),
+            );
+        }
+        references
+            .insert(reference)
+            .map_err(|_| StorageRpcPayloadError::InvalidCount {
+                field: "cluster-map history route references",
+                count: (references.len() + 1) as u64,
+                max: MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES as u64,
+            })?;
+        previous_reference = Some(reference);
+    }
     decoder.finish()?;
-    Ok(StorageRpcClusterMapHistoryReferenceSummaryResponse {
-        summary: PgClusterMapHistoryReferenceSummary {
-            oldest_live_placement_epoch,
-            oldest_durable_backfill_epoch,
-            oldest_pending_metadata_command_epoch,
-        },
-    })
+    Ok(StorageRpcClusterMapHistoryReferenceSummaryResponse { references })
 }
 
 fn decode_optional_cluster_epoch(
@@ -17564,22 +17600,100 @@ mod tests {
         assert_eq!(decoded, history_request);
 
         let history_response = StorageRpcClusterMapHistoryReferenceSummaryResponse {
-            summary: PgClusterMapHistoryReferenceSummary {
-                oldest_live_placement_epoch: Some(ClusterEpoch::new(2).unwrap()),
-                oldest_durable_backfill_epoch: Some(ClusterEpoch::new(5).unwrap()),
-                oldest_pending_metadata_command_epoch: Some(ClusterEpoch::new(3).unwrap()),
-            },
+            references: PgClusterMapHistoryRouteReferences::try_from_iter([
+                PgClusterMapHistoryRouteReference::new(
+                    PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+                    ClusterEpoch::new(2).unwrap(),
+                    PgId::new(7),
+                ),
+                PgClusterMapHistoryRouteReference::new(
+                    PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+                    ClusterEpoch::new(5).unwrap(),
+                    PgId::new(8),
+                ),
+                PgClusterMapHistoryRouteReference::new(
+                    PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
+                    ClusterEpoch::new(6).unwrap(),
+                    PgId::new(8),
+                ),
+                PgClusterMapHistoryRouteReference::new(
+                    PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+                    ClusterEpoch::new(3).unwrap(),
+                    PgId::new(9),
+                ),
+            ])
+            .unwrap(),
         };
         let bytes = encode_cluster_map_history_reference_summary_response(&history_response);
         let decoded = decode_cluster_map_history_reference_summary_response(&bytes).unwrap();
         assert_eq!(decoded, history_response);
 
         let empty_history_response = StorageRpcClusterMapHistoryReferenceSummaryResponse {
-            summary: PgClusterMapHistoryReferenceSummary::default(),
+            references: PgClusterMapHistoryRouteReferences::default(),
         };
         let bytes = encode_cluster_map_history_reference_summary_response(&empty_history_response);
         let decoded = decode_cluster_map_history_reference_summary_response(&bytes).unwrap();
         assert_eq!(decoded, empty_history_response);
+
+        let mut oversized_history_response = Vec::new();
+        put_u32(
+            &mut oversized_history_response,
+            (MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES + 1) as u32,
+        );
+        assert!(matches!(
+            decode_cluster_map_history_reference_summary_response(&oversized_history_response),
+            Err(StorageRpcPayloadError::InvalidCount {
+                field: "cluster-map history route references",
+                ..
+            })
+        ));
+
+        let mut duplicate_history_response = Vec::new();
+        put_u32(&mut duplicate_history_response, 2);
+        for _ in 0..2 {
+            duplicate_history_response.push(1);
+            put_u64(&mut duplicate_history_response, 2);
+            put_u32(&mut duplicate_history_response, 7);
+        }
+        assert!(matches!(
+            decode_cluster_map_history_reference_summary_response(&duplicate_history_response),
+            Err(
+                StorageRpcPayloadError::InvalidClusterMapHistoryRouteReference(
+                    "references are not strictly ordered"
+                )
+            )
+        ));
+
+        let mut reversed_history_response = Vec::new();
+        put_u32(&mut reversed_history_response, 2);
+        reversed_history_response.push(1);
+        put_u64(&mut reversed_history_response, 3);
+        put_u32(&mut reversed_history_response, 7);
+        reversed_history_response.push(1);
+        put_u64(&mut reversed_history_response, 2);
+        put_u32(&mut reversed_history_response, 7);
+        assert!(matches!(
+            decode_cluster_map_history_reference_summary_response(&reversed_history_response),
+            Err(
+                StorageRpcPayloadError::InvalidClusterMapHistoryRouteReference(
+                    "references are not strictly ordered"
+                )
+            )
+        ));
+
+        let mut unknown_kind_history_response = Vec::new();
+        put_u32(&mut unknown_kind_history_response, 1);
+        unknown_kind_history_response.push(99);
+        put_u64(&mut unknown_kind_history_response, 2);
+        put_u32(&mut unknown_kind_history_response, 7);
+        assert!(matches!(
+            decode_cluster_map_history_reference_summary_response(&unknown_kind_history_response),
+            Err(
+                StorageRpcPayloadError::InvalidClusterMapHistoryRouteReference(
+                    "unknown reference kind"
+                )
+            )
+        ));
 
         assert!(matches!(
             decode_metadata_command_log_compact_response(&[99]),

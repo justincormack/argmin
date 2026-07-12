@@ -29,7 +29,8 @@ use crate::metadata_command::{
     MetadataCommandPayload,
 };
 use crate::pg_store::{
-    PgClusterMapHistoryReferenceSummary, PgStore, PgStoreRecoveryContext, ScavengerShardFileScan,
+    PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReferences, PgStore,
+    PgStoreRecoveryContext, ScavengerShardFileScan,
 };
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
@@ -581,12 +582,18 @@ impl SharedStorageNode {
     pub fn cluster_map_history_reference_summary(
         &self,
     ) -> Result<PgClusterMapHistoryReferenceSummary, StoreError> {
-        let mut summary = PgClusterMapHistoryReferenceSummary::default();
+        Ok(self.cluster_map_history_route_references()?.summary())
+    }
+
+    pub fn cluster_map_history_route_references(
+        &self,
+    ) -> Result<PgClusterMapHistoryRouteReferences, StoreError> {
+        let mut references = PgClusterMapHistoryRouteReferences::default();
         for pg in self.stores.values() {
             let pg = pg.lock().unwrap_or_else(|e| e.into_inner());
-            summary.merge(pg.cluster_map_history_reference_summary()?);
+            references.merge(pg.cluster_map_history_route_references(&self.pg_topology)?)?;
         }
-        Ok(summary)
+        Ok(references)
     }
 
     /// Recover every opened PG store on this node after open, before the node

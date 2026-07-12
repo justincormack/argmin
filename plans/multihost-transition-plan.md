@@ -10808,6 +10808,20 @@ Required production shape and implementation order:
    distinguish a current report that is legitimately pinned by old durable
    data from a reporter that stopped advancing while the exact-reference
    redesign is implemented.
+   The storage-owned source boundary now also computes a canonical bounded set
+   of typed `(kind, epoch, data/metadata PG)` route references instead of
+   discarding identity into minima. Direct object/segment rows use their
+   persisted data PG; legacy direct multipart parts are resolved from their
+   durable bucket/key/generation/part identity through `PgTopology`; durable
+   backfill reports source and desired routes separately; and pending metadata
+   commands report their metadata PG route. Node aggregation and the Unix
+   storage RPC preserve this exact set, deduplicate it deterministically, and
+   fail closed above 4,096 references or on non-canonical wire input. The
+   existing heartbeat still derives the three scalar minima from this exact
+   report for compatibility. The next slice must carry the bounded set through
+   the heartbeat/committed node record and replace epoch-wide protection with
+   route-key protection before the scalar fields can be removed; this source
+   boundary alone does not yet reduce authority history retention.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge

@@ -27,6 +27,9 @@ pub enum StoreError {
     #[error("payload shard set mismatch: {reason}")]
     PayloadShardSetMismatch { reason: String },
 
+    #[error("cluster-map history route reference count {count} exceeds maximum {max}")]
+    ClusterMapHistoryReferenceLimitExceeded { count: usize, max: usize },
+
     #[error("PG {pg_id} not found on this node")]
     PgNotFound { pg_id: u32 },
 

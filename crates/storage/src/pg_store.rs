@@ -10,7 +10,7 @@
 ///   shards/<hex_prefix>/<shard_key_hex>
 ///   tmp/
 /// ```
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -107,6 +107,135 @@ pub struct PgClusterMapHistoryReferenceSummary {
     pub oldest_live_placement_epoch: Option<ClusterEpoch>,
     pub oldest_durable_backfill_epoch: Option<ClusterEpoch>,
     pub oldest_pending_metadata_command_epoch: Option<ClusterEpoch>,
+}
+
+pub const MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PgClusterMapHistoryRouteReferenceKind {
+    LivePlacement,
+    DurableBackfillSource,
+    DurableBackfillDesired,
+    PendingMetadataCommand,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PgClusterMapHistoryRouteReference {
+    kind: PgClusterMapHistoryRouteReferenceKind,
+    cluster_epoch: ClusterEpoch,
+    pg_id: PgId,
+}
+
+impl PgClusterMapHistoryRouteReference {
+    #[must_use]
+    pub const fn new(
+        kind: PgClusterMapHistoryRouteReferenceKind,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Self {
+        Self {
+            kind,
+            cluster_epoch,
+            pg_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(self) -> PgClusterMapHistoryRouteReferenceKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn cluster_epoch(self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub const fn pg_id(self) -> PgId {
+        self.pg_id
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PgClusterMapHistoryRouteReferences {
+    references: BTreeSet<PgClusterMapHistoryRouteReference>,
+}
+
+impl PgClusterMapHistoryRouteReferences {
+    pub fn try_from_iter(
+        references: impl IntoIterator<Item = PgClusterMapHistoryRouteReference>,
+    ) -> Result<Self, StoreError> {
+        let mut result = Self::default();
+        result.extend(references)?;
+        Ok(result)
+    }
+
+    pub fn insert(
+        &mut self,
+        reference: PgClusterMapHistoryRouteReference,
+    ) -> Result<(), StoreError> {
+        if self.references.contains(&reference) {
+            return Ok(());
+        }
+        let count = self.references.len() + 1;
+        if count > MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES {
+            return Err(StoreError::ClusterMapHistoryReferenceLimitExceeded {
+                count,
+                max: MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+            });
+        }
+        self.references.insert(reference);
+        Ok(())
+    }
+
+    pub fn extend(
+        &mut self,
+        references: impl IntoIterator<Item = PgClusterMapHistoryRouteReference>,
+    ) -> Result<(), StoreError> {
+        for reference in references {
+            self.insert(reference)?;
+        }
+        Ok(())
+    }
+
+    pub fn merge(&mut self, other: Self) -> Result<(), StoreError> {
+        self.extend(other.references)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = PgClusterMapHistoryRouteReference> + '_ {
+        self.references.iter().copied()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.references.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.references.is_empty()
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> PgClusterMapHistoryReferenceSummary {
+        let mut summary = PgClusterMapHistoryReferenceSummary::default();
+        for reference in self.iter() {
+            let target = match reference.kind() {
+                PgClusterMapHistoryRouteReferenceKind::LivePlacement => {
+                    &mut summary.oldest_live_placement_epoch
+                }
+                PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource
+                | PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired => {
+                    &mut summary.oldest_durable_backfill_epoch
+                }
+                PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand => {
+                    &mut summary.oldest_pending_metadata_command_epoch
+                }
+            };
+            *target = min_optional_epoch(*target, Some(reference.cluster_epoch()));
+        }
+        summary
+    }
 }
 
 impl PgClusterMapHistoryReferenceSummary {
@@ -549,6 +678,120 @@ impl PgStore {
             oldest_durable_backfill_epoch: self.oldest_durable_backfill_epoch()?,
             oldest_pending_metadata_command_epoch: self.oldest_pending_metadata_command_epoch()?,
         })
+    }
+
+    pub fn cluster_map_history_route_references(
+        &self,
+        pg_topology: &crate::pg_topology::PgTopology,
+    ) -> Result<PgClusterMapHistoryRouteReferences, StoreError> {
+        let mut references = PgClusterMapHistoryRouteReferences::default();
+        self.extend_direct_cluster_map_history_route_references(
+            &mut references,
+            "SELECT DISTINCT data_pg_id, placement_cluster_epoch FROM ( \
+                 SELECT data_pg_id, placement_cluster_epoch FROM object_segments \
+                 UNION ALL SELECT data_pg_id, placement_cluster_epoch FROM object_parts \
+                 UNION ALL SELECT data_pg_id, placement_cluster_epoch FROM multipart_part_segments \
+                 UNION ALL SELECT data_pg_id, placement_cluster_epoch FROM stream_upload_segments \
+             )",
+            PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+            "list live payload cluster-map history route references",
+        )?;
+        self.extend_routed_multipart_history_route_references(&mut references, pg_topology)?;
+        self.extend_direct_cluster_map_history_route_references(
+            &mut references,
+            "SELECT DISTINCT data_pg_id, source_cluster_epoch \
+             FROM placed_segment_shard_backfills",
+            PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+            "list durable backfill source cluster-map history route references",
+        )?;
+        self.extend_direct_cluster_map_history_route_references(
+            &mut references,
+            "SELECT DISTINCT data_pg_id, desired_cluster_epoch \
+             FROM placed_segment_shard_backfills",
+            PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
+            "list durable backfill desired cluster-map history route references",
+        )?;
+        self.extend_direct_cluster_map_history_route_references(
+            &mut references,
+            "SELECT DISTINCT pg_id, cluster_epoch FROM metadata_command_pending_slot",
+            PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+            "list pending metadata command cluster-map history route references",
+        )?;
+        Ok(references)
+    }
+
+    fn extend_direct_cluster_map_history_route_references(
+        &self,
+        references: &mut PgClusterMapHistoryRouteReferences,
+        sql: &str,
+        kind: PgClusterMapHistoryRouteReferenceKind,
+        context: &'static str,
+    ) -> Result<(), StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(sql)
+            .map_err(|source| StoreError::Db { context, source })?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))
+            .map_err(|source| StoreError::Db { context, source })?;
+        for row in rows {
+            let (pg_id, raw_epoch) = row.map_err(|source| StoreError::Db { context, source })?;
+            references.insert(PgClusterMapHistoryRouteReference::new(
+                kind,
+                Self::parse_cluster_epoch(raw_epoch, 1, "cluster-map history route epoch")
+                    .map_err(|source| StoreError::Db { context, source })?,
+                PgId::new(pg_id),
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn extend_routed_multipart_history_route_references(
+        &self,
+        references: &mut PgClusterMapHistoryRouteReferences,
+        pg_topology: &crate::pg_topology::PgTopology,
+    ) -> Result<(), StoreError> {
+        let context = "list routed multipart cluster-map history route references";
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT DISTINCT u.bucket, u.key, u.object_generation_id, p.part_number, \
+                 p.placement_cluster_epoch \
+                 FROM multipart_parts p \
+                 JOIN multipart_uploads u ON u.upload_id = p.upload_id \
+                 WHERE p.part_okh != zeroblob(16)",
+            )
+            .map_err(|source| StoreError::Db { context, source })?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, BucketName>(0)?,
+                    row.get::<_, ObjectKey>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|source| StoreError::Db { context, source })?;
+        for row in rows {
+            let (bucket, key, raw_generation, part_number, raw_epoch) =
+                row.map_err(|source| StoreError::Db { context, source })?;
+            let generation_id =
+                Self::parse_generation_id(raw_generation, 2, "multipart upload object generation")
+                    .map_err(|source| StoreError::Db { context, source })?;
+            let cluster_epoch =
+                Self::parse_cluster_epoch(raw_epoch, 4, "cluster-map history route epoch")
+                    .map_err(|source| StoreError::Db { context, source })?;
+            let pg_id = pg_topology
+                .object_generation_multipart_part_data_pg(&bucket, &key, generation_id, part_number)
+                .get();
+            references.insert(PgClusterMapHistoryRouteReference::new(
+                PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+                cluster_epoch,
+                PgId::new(pg_id),
+            ))?;
+        }
+        Ok(())
     }
 
     fn oldest_live_payload_placement_epoch(&self) -> Result<Option<ClusterEpoch>, StoreError> {
