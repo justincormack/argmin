@@ -2170,13 +2170,12 @@ impl ClusterControlSnapshot {
     }
 
     fn record_history_from(&mut self, previous: &Self) {
-        if previous.cluster_epoch == self.cluster_epoch {
-            return;
+        if previous.cluster_epoch != self.cluster_epoch {
+            self.history
+                .retain(|record| record.cluster_epoch != previous.cluster_epoch);
+            self.history
+                .push(ClusterMapHistoryRecord::from_snapshot(previous));
         }
-        self.history
-            .retain(|record| record.cluster_epoch != previous.cluster_epoch);
-        self.history
-            .push(ClusterMapHistoryRecord::from_snapshot(previous));
         let protection =
             required_cluster_map_history_protection(self.pgs.values(), self.nodes.values());
         prune_cluster_map_history(&mut self.history, &protection);
@@ -23253,7 +23252,8 @@ mod tests {
             .snapshot()
             .cluster_map_at_epoch(protected_epoch)
             .is_some());
-        let advanced_floor = ClusterEpoch::new(protected_epoch.get() + 1).unwrap();
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let advanced_floor = ClusterEpoch::new(current_epoch.get() - 10).unwrap();
         assert!(authority
             .snapshot()
             .cluster_map_at_epoch(advanced_floor)
@@ -23266,7 +23266,17 @@ mod tests {
                 .cluster_map_history_floor_epoch(),
             Some(protected_epoch)
         );
-        let current_epoch = authority.snapshot().cluster_epoch();
+        let retained_before_floor_advance = authority.snapshot().cluster_map_history().len();
+        assert!(retained_before_floor_advance > CLUSTER_MAP_HISTORY_LIMIT);
+        assert_eq!(
+            authority
+                .snapshot()
+                .runtime_map(10_999)
+                .unwrap()
+                .historical_pg_routes()
+                .len(),
+            retained_before_floor_advance
+        );
         let mut advanced_floor_heartbeat =
             heartbeat_from_record(&authority, 1, current_epoch, 11_000);
         advanced_floor_heartbeat.cluster_map_history_reference_summary =
@@ -23287,6 +23297,23 @@ mod tests {
                 .cluster_map_history_floor_epoch(),
             Some(advanced_floor)
         );
+        assert_eq!(
+            authority.snapshot().cluster_map_history().len(),
+            CLUSTER_MAP_HISTORY_LIMIT
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .runtime_map(11_000)
+                .unwrap()
+                .historical_pg_routes()
+                .len(),
+            CLUSTER_MAP_HISTORY_LIMIT
+        );
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(protected_epoch)
+            .is_none());
         let persisted = SingleAuthorityControlPlane::open(store).unwrap();
         assert!(persisted
             .snapshot()

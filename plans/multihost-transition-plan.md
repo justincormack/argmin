@@ -10822,6 +10822,14 @@ Required production shape and implementation order:
    the heartbeat/committed node record and replace epoch-wide protection with
    route-key protection before the scalar fields can be removed; this source
    boundary alone does not yet reduce authority history retention.
+   Same-epoch committed updates now always re-evaluate history protection even
+   though they do not append a history record. In particular, a heartbeat that
+   advances or clears a scalar floor immediately prunes newly unprotected
+   history and reduces the next runtime-map response; it no longer waits for a
+   later epoch change or process restart. A retained soak had exposed 53,708
+   in-memory historical PG routes after its reporters had advanced to epochs
+   579/584, while restart pruned the persisted state to the normal 29,696-route
+   limit. This fixes that delayed release but does not replace scalar retention.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge
