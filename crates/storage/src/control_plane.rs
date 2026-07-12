@@ -40,7 +40,7 @@ const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 17;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 18;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -2129,60 +2129,43 @@ impl ClusterControlSnapshot {
                     history.cluster_epoch
                 ));
             }
-            if history
-                .nodes
-                .iter()
-                .any(|node| !node.pg_observations.is_empty())
-            {
-                return Err(format!(
-                    "cluster-map history epoch {} retains reconstructible node PG observations",
-                    history.cluster_epoch
-                ));
-            }
-
-            let nodes: BTreeMap<_, _> = history
-                .nodes
-                .iter()
-                .cloned()
-                .map(|node| (node.node_id, node))
-                .collect();
+            let nodes: BTreeSet<_> = history.nodes.iter().copied().collect();
             if nodes.len() != history.nodes.len() {
                 return Err(format!(
                     "cluster-map history epoch {} repeats a node record",
                     history.cluster_epoch
                 ));
             }
-            let pgs: BTreeMap<_, _> = history
-                .pgs
-                .iter()
-                .cloned()
-                .map(|pg| (pg.pg_id, pg))
-                .collect();
+            let pgs: BTreeMap<_, _> = history.pgs.iter().map(|pg| (pg.pg_id, pg)).collect();
             if pgs.len() != history.pgs.len() {
                 return Err(format!(
                     "cluster-map history epoch {} repeats a PG record",
                     history.cluster_epoch
                 ));
             }
-            ClusterControlSnapshot {
-                authority_incarnation: history.authority_incarnation,
-                cluster_epoch: history.cluster_epoch,
-                // History records predate the timestamp high-water field. The
-                // current high-water is monotonic and therefore a conservative
-                // upper bound for validating retained historical leases.
-                max_committed_timestamp_ms: self.max_committed_timestamp_ms,
-                nodes,
-                pgs,
-                history: Vec::new(),
+            for pg in history.pgs() {
+                validate_historical_pg_route_record(pg, history.cluster_epoch, |node_id| {
+                    nodes.contains(&node_id)
+                })
+                .map_err(|message| {
+                    format!(
+                        "cluster-map history epoch {} is invalid: {message}",
+                        history.cluster_epoch
+                    )
+                })?;
             }
-            .validate_current_state_invariants()
-            .map_err(|message| {
-                format!(
-                    "cluster-map history epoch {} is invalid: {message}",
-                    history.cluster_epoch
-                )
-            })?;
         }
+        validate_metadata_transfer_route_references(
+            &self.history,
+            self.cluster_epoch,
+            self.pgs.values().map(|pg| {
+                (
+                    pg.pg_id,
+                    pg.peering_metadata_transfer_source_route_epoch,
+                    pg.peering_metadata_transfer_source_node_id,
+                )
+            }),
+        )?;
         Ok(())
     }
 
@@ -3762,29 +3745,21 @@ impl ClusterRuntimeMapSnapshot {
 pub struct ClusterMapHistoryRecord {
     authority_incarnation: AuthorityIncarnation,
     cluster_epoch: ClusterEpoch,
-    nodes: Vec<NodeControlRecord>,
-    pgs: Vec<PgControlRecord>,
+    nodes: Vec<NodeId>,
+    pgs: Vec<HistoricalPgRouteRecord>,
 }
 
 impl ClusterMapHistoryRecord {
     fn from_snapshot(snapshot: &ClusterControlSnapshot) -> Self {
-        // Route reconstruction needs durable PG topology and the node identity
-        // set. Heartbeat observations are current-epoch peering evidence and
-        // become invalid as soon as this snapshot moves into history.
-        let nodes = snapshot
-            .nodes
-            .values()
-            .cloned()
-            .map(|mut node| {
-                node.pg_observations.clear();
-                node
-            })
-            .collect();
         Self {
             authority_incarnation: snapshot.authority_incarnation,
             cluster_epoch: snapshot.cluster_epoch,
-            nodes,
-            pgs: snapshot.pgs.values().cloned().collect(),
+            nodes: snapshot.nodes.keys().copied().collect(),
+            pgs: snapshot
+                .pgs
+                .values()
+                .map(HistoricalPgRouteRecord::from)
+                .collect(),
         }
     }
 
@@ -3799,17 +3774,17 @@ impl ClusterMapHistoryRecord {
     }
 
     #[must_use]
-    pub fn nodes(&self) -> &[NodeControlRecord] {
+    pub fn nodes(&self) -> &[NodeId] {
         &self.nodes
     }
 
     #[must_use]
-    pub fn pgs(&self) -> &[PgControlRecord] {
+    pub fn pgs(&self) -> &[HistoricalPgRouteRecord] {
         &self.pgs
     }
 
     #[must_use]
-    pub fn pg(&self, pg_id: PgId) -> Option<&PgControlRecord> {
+    pub fn pg(&self, pg_id: PgId) -> Option<&HistoricalPgRouteRecord> {
         self.pgs.iter().find(|record| record.pg_id == pg_id)
     }
 
@@ -3820,10 +3795,259 @@ impl ClusterMapHistoryRecord {
         let record = self
             .pg(pg_id)
             .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-        reconstruct_pg_route_from_record(self.cluster_epoch, pg_id, record, |node_id| {
-            self.nodes.iter().any(|node| node.node_id() == node_id)
+        reconstruct_historical_pg_route(self.cluster_epoch, record, |node_id| {
+            self.nodes.contains(&node_id)
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalPgRouteRecord {
+    pg_id: PgId,
+    state: PgState,
+    acting_set: Vec<NodeId>,
+    active_primary: Option<NodeId>,
+    peering_metadata_transfer: Option<PgMetadataTransferProof>,
+    peering_metadata_transfer_source_route_epoch: Option<ClusterEpoch>,
+    peering_metadata_transfer_source_node_id: Option<NodeId>,
+}
+
+impl From<&PgControlRecord> for HistoricalPgRouteRecord {
+    fn from(record: &PgControlRecord) -> Self {
+        Self {
+            pg_id: record.pg_id,
+            state: record.state,
+            acting_set: record.acting_set.clone(),
+            active_primary: record.active_primary,
+            peering_metadata_transfer: record.peering_metadata_transfer,
+            peering_metadata_transfer_source_route_epoch: record
+                .peering_metadata_transfer_source_route_epoch,
+            peering_metadata_transfer_source_node_id: record
+                .peering_metadata_transfer_source_node_id,
+        }
+    }
+}
+
+impl HistoricalPgRouteRecord {
+    #[must_use]
+    pub fn pg_id(&self) -> PgId {
+        self.pg_id
+    }
+
+    #[must_use]
+    pub fn state(&self) -> PgState {
+        self.state
+    }
+
+    #[must_use]
+    pub fn acting_set(&self) -> &[NodeId] {
+        &self.acting_set
+    }
+}
+
+fn reconstruct_historical_pg_route(
+    cluster_epoch: ClusterEpoch,
+    record: &HistoricalPgRouteRecord,
+    mut contains_node: impl FnMut(NodeId) -> bool,
+) -> Result<PgRouteSnapshot, ControlPlaneError> {
+    let primary = match record.state {
+        PgState::Active => record
+            .active_primary
+            .filter(|primary| record.acting_set.contains(primary))
+            .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: record.pg_id.get(),
+                cluster_epoch,
+            })?,
+        _ => record
+            .acting_set
+            .first()
+            .copied()
+            .ok_or(ControlPlaneError::EmptyActingSet {
+                pg_id: record.pg_id.get(),
+            })?,
+    };
+    for &node_id in &record.acting_set {
+        if !contains_node(node_id) {
+            return Err(ControlPlaneError::UnknownActingSetNode {
+                pg_id: record.pg_id.get(),
+                node_id: node_id.as_u32(),
+            });
+        }
+    }
+    Ok(PgRouteSnapshot {
+        cluster_epoch,
+        pg_id: record.pg_id,
+        primary_node_id: primary,
+        acting_set: record.acting_set.clone(),
+        state: record.state,
+        primary_lease_deadline_ms: None,
+        peering_metadata_transfer: record.peering_metadata_transfer,
+        peering_metadata_transfer_source_route_epoch: record
+            .peering_metadata_transfer_source_route_epoch,
+        peering_metadata_transfer_source_node_id: record.peering_metadata_transfer_source_node_id,
+        pending_metadata_command_recovery: None,
+    })
+}
+
+fn validate_historical_pg_route_record(
+    record: &HistoricalPgRouteRecord,
+    cluster_epoch: ClusterEpoch,
+    mut contains_node: impl FnMut(NodeId) -> bool,
+) -> Result<(), String> {
+    if record.acting_set.is_empty() {
+        return Err(format!("PG {} has an empty acting set", record.pg_id.get()));
+    }
+    let mut acting_nodes = BTreeSet::new();
+    for node_id in &record.acting_set {
+        if !acting_nodes.insert(*node_id) {
+            return Err(format!(
+                "PG {} acting set repeats node {}",
+                record.pg_id.get(),
+                node_id.as_u32()
+            ));
+        }
+        if !contains_node(*node_id) {
+            return Err(format!(
+                "PG {} acting set references unknown node {}",
+                record.pg_id.get(),
+                node_id.as_u32()
+            ));
+        }
+    }
+    match record.state {
+        PgState::Active => {
+            let Some(primary) = record.active_primary else {
+                return Err(format!("active PG {} has no primary", record.pg_id.get()));
+            };
+            if !record.acting_set.contains(&primary) {
+                return Err(format!(
+                    "active PG {} primary {} is outside the acting set",
+                    record.pg_id.get(),
+                    primary.as_u32()
+                ));
+            }
+        }
+        _ if record.active_primary.is_some() => {
+            return Err(format!(
+                "non-active PG {} carries an active primary",
+                record.pg_id.get()
+            ));
+        }
+        _ => {}
+    }
+    match (
+        record.peering_metadata_transfer,
+        record.peering_metadata_transfer_source_route_epoch,
+        record.peering_metadata_transfer_source_node_id,
+    ) {
+        (None, None, None) => {}
+        (Some(transfer), Some(source_route_epoch), Some(source_node_id)) => {
+            if record.state != PgState::Peering {
+                return Err(format!(
+                    "non-peering PG {} carries metadata transfer route state",
+                    record.pg_id.get()
+                ));
+            }
+            if transfer.source_epoch() > cluster_epoch {
+                return Err(format!(
+                    "PG {} metadata transfer source epoch is newer than route epoch",
+                    record.pg_id.get()
+                ));
+            }
+            if source_route_epoch >= cluster_epoch {
+                return Err(format!(
+                    "PG {} metadata transfer source route epoch is not older than route epoch",
+                    record.pg_id.get()
+                ));
+            }
+            if !contains_node(source_node_id) {
+                return Err(format!(
+                    "PG {} metadata transfer source references unknown node {}",
+                    record.pg_id.get(),
+                    source_node_id.as_u32()
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "PG {} has incomplete metadata transfer route state",
+                record.pg_id.get()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_metadata_transfer_route_references(
+    history: &[ClusterMapHistoryRecord],
+    current_epoch: ClusterEpoch,
+    current_pgs: impl Iterator<Item = (PgId, Option<ClusterEpoch>, Option<NodeId>)>,
+) -> Result<(), String> {
+    let validate_reference = |route_epoch: ClusterEpoch,
+                              pg_id: PgId,
+                              source_route_epoch: ClusterEpoch,
+                              source_node_id: NodeId|
+     -> Result<(), String> {
+        if source_route_epoch >= route_epoch {
+            return Err(format!(
+                "PG {} metadata transfer source route epoch {} is not older than route epoch {}",
+                pg_id.get(),
+                source_route_epoch.get(),
+                route_epoch.get()
+            ));
+        }
+        let source_history = history
+            .iter()
+            .find(|record| record.cluster_epoch == source_route_epoch)
+            .ok_or_else(|| {
+                format!(
+                    "PG {} references missing metadata transfer source route epoch {}",
+                    pg_id.get(),
+                    source_route_epoch.get()
+                )
+            })?;
+        let source_route = source_history.reconstructed_pg_route(pg_id).map_err(|_| {
+            format!(
+                "PG {} references missing metadata transfer source PG at epoch {}",
+                pg_id.get(),
+                source_route_epoch.get()
+            )
+        })?;
+        if source_route.primary_node_id() != source_node_id {
+            return Err(format!(
+                    "PG {} metadata transfer source node {} does not match source route primary {} at epoch {}",
+                    pg_id.get(),
+                    source_node_id.as_u32(),
+                    source_route.primary_node_id().as_u32(),
+                    source_route_epoch.get()
+                ));
+        }
+        Ok(())
+    };
+
+    for record in history {
+        for pg in record.pgs() {
+            if let (Some(source_route_epoch), Some(source_node_id)) = (
+                pg.peering_metadata_transfer_source_route_epoch,
+                pg.peering_metadata_transfer_source_node_id,
+            ) {
+                validate_reference(
+                    record.cluster_epoch,
+                    pg.pg_id,
+                    source_route_epoch,
+                    source_node_id,
+                )?;
+            }
+        }
+    }
+    for (pg_id, source_route_epoch, source_node_id) in current_pgs {
+        if let (Some(source_route_epoch), Some(source_node_id)) =
+            (source_route_epoch, source_node_id)
+        {
+            validate_reference(current_epoch, pg_id, source_route_epoch, source_node_id)?;
+        }
+    }
+    Ok(())
 }
 
 fn reconstruct_pg_route_from_record(
@@ -12323,14 +12547,14 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
             out.push_str(&format!(
                 "history_node={},{}\n",
                 history.cluster_epoch.get(),
-                format_node_record(record)
+                record.as_u32()
             ));
         }
         for record in &history.pgs {
             out.push_str(&format!(
                 "history_pg={},{}\n",
                 history.cluster_epoch.get(),
-                format_pg_record(record)
+                format_historical_pg_route_record(record)
             ));
         }
     }
@@ -12347,6 +12571,65 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
         out.push_str(&format!("pg={}\n", format_pg_record(record)));
     }
     out
+}
+
+fn format_historical_pg_route_record(record: &HistoricalPgRouteRecord) -> String {
+    let (
+        transfer_source_epoch,
+        transfer_source_log_index,
+        transfer_source_log_hash,
+        transfer_source_state_digest,
+        transfer_imported_log_index,
+        transfer_imported_log_hash,
+        transfer_imported_state_digest,
+    ) = match record.peering_metadata_transfer {
+        Some(transfer) => {
+            let source = transfer.source_metadata_proof();
+            let imported = transfer.metadata_proof();
+            (
+                transfer.source_epoch().get().to_string(),
+                source.applied_log_index.to_string(),
+                source.applied_log_hash.to_string(),
+                source.state_digest.to_string(),
+                imported.applied_log_index.to_string(),
+                imported.applied_log_hash.to_string(),
+                imported.state_digest.to_string(),
+            )
+        }
+        None => (
+            "-".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+        ),
+    };
+    format!(
+        "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        record.pg_id.get(),
+        pg_state_as_str(record.state),
+        format_node_list(&record.acting_set),
+        option_u32(record.active_primary.map(NodeId::as_u32)),
+        transfer_source_epoch,
+        transfer_source_log_index,
+        transfer_source_log_hash,
+        transfer_source_state_digest,
+        transfer_imported_log_index,
+        transfer_imported_log_hash,
+        transfer_imported_state_digest,
+        option_u64(
+            record
+                .peering_metadata_transfer_source_route_epoch
+                .map(ClusterEpoch::get)
+        ),
+        option_u32(
+            record
+                .peering_metadata_transfer_source_node_id
+                .map(NodeId::as_u32)
+        )
+    )
 }
 
 fn format_node_record(record: &NodeControlRecord) -> String {
@@ -12591,12 +12874,12 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
                 return Err(parse_error(line_number, "duplicate history record"));
             }
         } else if let Some(value) = line.strip_prefix("history_node=") {
-            let (epoch, record) = parse_history_node_record(line_number, value)?;
+            let (epoch, node_id) = parse_history_node_record(line_number, value)?;
             let history_record = history
                 .get_mut(&epoch)
                 .ok_or_else(|| parse_error(line_number, "history node references unknown epoch"))?;
-            if history_record.node_ids.insert(record.node_id) {
-                history_record.record.nodes.push(record);
+            if history_record.node_ids.insert(node_id) {
+                history_record.record.nodes.push(node_id);
             } else {
                 return Err(parse_error(line_number, "duplicate history node record"));
             }
@@ -12667,6 +12950,18 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
         history.into_values().map(|record| record.record).collect();
     let protection = required_cluster_map_history_protection(pgs.values(), nodes.values());
     prune_cluster_map_history(&mut history, &protection);
+    validate_metadata_transfer_route_references(
+        &history,
+        cluster_epoch,
+        pgs.values().map(|pg| {
+            (
+                pg.pg_id,
+                pg.peering_metadata_transfer_source_route_epoch,
+                pg.peering_metadata_transfer_source_node_id,
+            )
+        }),
+    )
+    .map_err(|message| parse_error(0, &message))?;
     validate_required_cluster_map_history(&history, &pgs, &nodes, cluster_epoch)?;
     let snapshot = ClusterControlSnapshot {
         authority_incarnation: authority_incarnation
@@ -12809,23 +13104,10 @@ fn validate_parsed_history(
                 .get(&pg.pg_id)
                 .copied()
                 .unwrap_or(record.line);
-            for node_id in &pg.acting_set {
-                if !record.node_ids.contains(node_id) {
-                    return Err(parse_error(
-                        line,
-                        "history PG acting set references node absent from history map",
-                    ));
-                }
-            }
-            if let Some(previous) = &pg.previous_primary_lease {
-                if !record.node_ids.contains(&previous.node_id) {
-                    return Err(parse_error(
-                        line,
-                        "history PG previous primary references node absent from history map",
-                    ));
-                }
-            }
-            validate_persisted_metadata_transfer_epoch(line, pg, *epoch)?;
+            validate_historical_pg_route_record(pg, *epoch, |node_id| {
+                record.node_ids.contains(&node_id)
+            })
+            .map_err(|message| parse_error(line, &message))?;
         }
     }
     Ok(())
@@ -12925,25 +13207,118 @@ fn parse_history_record(
 fn parse_history_node_record(
     line: usize,
     value: &str,
-) -> Result<(ClusterEpoch, NodeControlRecord), ControlPlaneError> {
-    let (epoch, record) = value
+) -> Result<(ClusterEpoch, NodeId), ControlPlaneError> {
+    let (epoch, node_id) = value
         .split_once(',')
         .ok_or_else(|| parse_error(line, "history node record must start with epoch"))?;
     let epoch = ClusterEpoch::new(parse_u64(line, epoch, "history node epoch")?)
         .ok_or_else(|| parse_error(line, "history node epoch must be nonzero"))?;
-    Ok((epoch, parse_node_record(line, record)?))
+    Ok((
+        epoch,
+        NodeId::new(parse_u32(line, node_id, "history node id")?),
+    ))
 }
 
 fn parse_history_pg_record(
     line: usize,
     value: &str,
-) -> Result<(ClusterEpoch, PgControlRecord), ControlPlaneError> {
+) -> Result<(ClusterEpoch, HistoricalPgRouteRecord), ControlPlaneError> {
     let (epoch, record) = value
         .split_once(',')
         .ok_or_else(|| parse_error(line, "history PG record must start with epoch"))?;
     let epoch = ClusterEpoch::new(parse_u64(line, epoch, "history PG epoch")?)
         .ok_or_else(|| parse_error(line, "history PG epoch must be nonzero"))?;
-    Ok((epoch, parse_pg_record(line, record)?))
+    Ok((epoch, parse_historical_pg_route_record(line, record)?))
+}
+
+fn parse_historical_pg_route_record(
+    line: usize,
+    value: &str,
+) -> Result<HistoricalPgRouteRecord, ControlPlaneError> {
+    let fields: Vec<&str> = value.split(',').collect();
+    if fields.len() != 13 {
+        return Err(parse_error(
+            line,
+            "historical PG route record must have thirteen fields",
+        ));
+    }
+    let pg_id = PgId::new(parse_u32(line, fields[0], "historical PG id")?);
+    let state = pg_state_from_str(fields[1])?;
+    let acting_set = parse_node_list(line, fields[2])?;
+    let active_primary =
+        parse_option_u32(line, fields[3], "historical active primary")?.map(NodeId::new);
+    let source_epoch =
+        parse_option_cluster_epoch(line, fields[4], "historical transfer source epoch")?;
+    let source_log_index =
+        parse_option_u64(line, fields[5], "historical transfer source log index")?;
+    let source_log_hash = parse_option_u64(line, fields[6], "historical transfer source log hash")?;
+    let source_state_digest =
+        parse_option_u64(line, fields[7], "historical transfer source state digest")?;
+    let imported_log_index =
+        parse_option_u64(line, fields[8], "historical transfer imported log index")?;
+    let imported_log_hash =
+        parse_option_u64(line, fields[9], "historical transfer imported log hash")?;
+    let imported_state_digest = parse_option_u64(
+        line,
+        fields[10],
+        "historical transfer imported state digest",
+    )?;
+    let peering_metadata_transfer = match (
+        source_epoch,
+        source_log_index,
+        source_log_hash,
+        source_state_digest,
+        imported_log_index,
+        imported_log_hash,
+        imported_state_digest,
+    ) {
+        (
+            Some(source_epoch),
+            Some(source_log_index),
+            Some(source_log_hash),
+            Some(source_state_digest),
+            Some(imported_log_index),
+            Some(imported_log_hash),
+            Some(imported_state_digest),
+        ) => Some(PgMetadataTransferProof::new_with_imported_metadata_proof(
+            source_epoch,
+            PgMetadataProof {
+                applied_log_index: source_log_index,
+                applied_log_hash: source_log_hash,
+                state_digest: source_state_digest,
+            },
+            PgMetadataProof {
+                applied_log_index: imported_log_index,
+                applied_log_hash: imported_log_hash,
+                state_digest: imported_state_digest,
+            },
+        )),
+        (None, None, None, None, None, None, None) => None,
+        _ => {
+            return Err(parse_error(
+                line,
+                "historical metadata transfer proof fields must all be present or absent",
+            ));
+        }
+    };
+    Ok(HistoricalPgRouteRecord {
+        pg_id,
+        state,
+        acting_set,
+        active_primary,
+        peering_metadata_transfer,
+        peering_metadata_transfer_source_route_epoch: parse_option_cluster_epoch(
+            line,
+            fields[11],
+            "historical transfer source route epoch",
+        )?,
+        peering_metadata_transfer_source_node_id: parse_option_u32(
+            line,
+            fields[12],
+            "historical transfer source node",
+        )?
+        .map(NodeId::new),
+    })
 }
 
 fn parse_node_pg_record(
@@ -14413,10 +14788,15 @@ fn prune_cluster_map_history(
 ) {
     history.sort_by_key(ClusterMapHistoryRecord::cluster_epoch);
     while history.len() > CLUSTER_MAP_HISTORY_LIMIT {
-        let Some(index) = history
+        let referenced_source_epochs: BTreeSet<_> = history
             .iter()
-            .position(|record| !cluster_map_history_record_is_protected(record, protection))
-        else {
+            .flat_map(ClusterMapHistoryRecord::pgs)
+            .filter_map(|pg| pg.peering_metadata_transfer_source_route_epoch)
+            .collect();
+        let Some(index) = history.iter().position(|record| {
+            !cluster_map_history_record_is_protected(record, protection)
+                && !referenced_source_epochs.contains(&record.cluster_epoch())
+        }) else {
             break;
         };
         history.remove(index);
@@ -16515,6 +16895,55 @@ mod tests {
         let error = snapshot.validate_audit_invariants().unwrap_err();
         assert!(
             error.contains("history epoch 1 is not older than current epoch 1"),
+            "unexpected audit error: {error}"
+        );
+    }
+
+    #[test]
+    fn retained_history_transfer_chain_remains_a_debug_audit() {
+        let pg_id = PgId::new(7);
+        let mut snapshot = ClusterControlSnapshot::empty();
+        snapshot.cluster_epoch = ClusterEpoch::new(3).unwrap();
+        snapshot.history = vec![
+            ClusterMapHistoryRecord {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                nodes: vec![NodeId::new(1), NodeId::new(2)],
+                pgs: vec![HistoricalPgRouteRecord {
+                    pg_id,
+                    state: PgState::Active,
+                    acting_set: vec![NodeId::new(2)],
+                    active_primary: Some(NodeId::new(2)),
+                    peering_metadata_transfer: None,
+                    peering_metadata_transfer_source_route_epoch: None,
+                    peering_metadata_transfer_source_node_id: None,
+                }],
+            },
+            ClusterMapHistoryRecord {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+                cluster_epoch: ClusterEpoch::new(2).unwrap(),
+                nodes: vec![NodeId::new(1), NodeId::new(2)],
+                pgs: vec![HistoricalPgRouteRecord {
+                    pg_id,
+                    state: PgState::Peering,
+                    acting_set: vec![NodeId::new(1)],
+                    active_primary: None,
+                    peering_metadata_transfer: Some(PgMetadataTransferProof::new(
+                        ClusterEpoch::INITIAL,
+                        PgMetadataProof::empty(),
+                    )),
+                    peering_metadata_transfer_source_route_epoch: Some(ClusterEpoch::INITIAL),
+                    peering_metadata_transfer_source_node_id: Some(NodeId::new(1)),
+                }],
+            },
+        ];
+
+        let error = snapshot.validate_audit_invariants().unwrap_err();
+
+        assert!(
+            error.contains(
+                "metadata transfer source node 1 does not match source route primary 2 at epoch 1"
+            ),
             "unexpected audit error: {error}"
         );
     }
@@ -22252,7 +22681,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=17\nauthority_incarnation=1\ncluster_epoch=1\n",
+            "version=18\nauthority_incarnation=1\ncluster_epoch=1\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -23075,7 +23504,7 @@ mod tests {
             err,
             ControlPlaneError::Parse { message, .. }
                 if message.contains(
-                    "metadata transfer source route epoch is not retained in cluster-map history"
+                    "references missing metadata transfer source route epoch"
                 )
         ));
     }
@@ -23131,7 +23560,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=1\n",
@@ -23154,7 +23583,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23178,7 +23607,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23203,7 +23632,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23246,7 +23675,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23269,13 +23698,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "history=2,1\n",
-                "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "history_pg=2,7,peering,1:2,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
+                "history_node=2,1\n",
+                "history_pg=2,7,peering,1:2,-,-,-,-,-,-,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -23283,7 +23712,7 @@ mod tests {
         assert!(matches!(
             SingleAuthorityControlPlane::open(store),
             Err(ControlPlaneError::Parse { message, .. })
-                if message == "history PG acting set references node absent from history map"
+                if message == "PG 7 acting set references unknown node 2"
         ));
     }
 
@@ -23294,14 +23723,14 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "history=2,1\n",
-                "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
+                "history_node=2,1\n",
                 "history_node_pg=2,1,7,peering,2,100,0,0,0,-,-,-\n",
-                "history_pg=2,7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
+                "history_pg=2,7,peering,1,-,-,-,-,-,-,-,-,-,-\n",
                 "node=1,active,healthy,11,3,100,200,-,6e6f64652d312e736f636b\n",
                 "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
             ),
@@ -23324,13 +23753,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
                 "history=2,1\n",
-                "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "history_pg=2,7,peering,1,-,-,-,-,9,10,11,3,9,10,11,-,-,-,2,1,0,0,-,0,-,-,0,-,-,-,-,0\n",
+                "history_node=2,1\n",
+                "history_pg=2,7,peering,1,-,3,9,10,11,9,10,11,2,1\n",
                 "node=1,active,healthy,11,4,100,200,-,6e6f64652d312e736f636b\n",
             ),
         )
@@ -23340,8 +23769,101 @@ mod tests {
             SingleAuthorityControlPlane::open(store),
             Err(ControlPlaneError::Parse { message, .. })
                 if message
-                    == "metadata transfer source epoch must not be newer than PG record epoch"
+                    == "PG 7 metadata transfer source epoch is newer than route epoch"
         ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_incomplete_compact_history_routes() {
+        let cases = [
+            (
+                "history_pg=2,7,active,1,-,-,-,-,-,-,-,-,-,-\n",
+                "active PG 7 has no primary",
+            ),
+            (
+                "history_pg=2,7,peering,1,-,2,9,10,11,9,10,11,-,-\n",
+                "PG 7 has incomplete metadata transfer route state",
+            ),
+        ];
+        for (index, (history_pg, expected)) in cases.into_iter().enumerate() {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join(format!("control-plane-{index}.state"));
+            let contents = format!(
+                "version=18\nmax_committed_timestamp_ms=-\nauthority_incarnation=1\ncluster_epoch=3\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
+            );
+            std::fs::write(&path, contents).unwrap();
+
+            let error = FileControlPlaneStore::new(path).load().unwrap_err();
+
+            assert!(matches!(
+                error,
+                ControlPlaneError::Parse { message, .. } if message == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_broken_compact_history_transfer_chains() {
+        let cases = [
+            (
+                "self-reference",
+                concat!(
+                    "history=2,1\n",
+                    "history_node=2,1\n",
+                    "history_pg=2,7,peering,1,-,1,9,10,11,9,10,11,2,1\n",
+                ),
+                "PG 7 metadata transfer source route epoch is not older than route epoch",
+            ),
+            (
+                "missing-source-epoch",
+                concat!(
+                    "history=2,1\n",
+                    "history_node=2,1\n",
+                    "history_pg=2,7,peering,1,-,1,9,10,11,9,10,11,1,1\n",
+                ),
+                "PG 7 references missing metadata transfer source route epoch 1",
+            ),
+            (
+                "missing-source-pg",
+                concat!(
+                    "history=1,1\n",
+                    "history_node=1,1\n",
+                    "history=2,1\n",
+                    "history_node=2,1\n",
+                    "history_pg=2,7,peering,1,-,1,9,10,11,9,10,11,1,1\n",
+                ),
+                "PG 7 references missing metadata transfer source PG at epoch 1",
+            ),
+            (
+                "mismatched-source-primary",
+                concat!(
+                    "history=1,1\n",
+                    "history_node=1,1\n",
+                    "history_node=1,2\n",
+                    "history_pg=1,7,active,2,2,-,-,-,-,-,-,-,-,-\n",
+                    "history=2,1\n",
+                    "history_node=2,1\n",
+                    "history_node=2,2\n",
+                    "history_pg=2,7,peering,1,-,1,9,10,11,9,10,11,1,1\n",
+                ),
+                "PG 7 metadata transfer source node 1 does not match source route primary 2 at epoch 1",
+            ),
+        ];
+        for (name, history, expected) in cases {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join(format!("control-plane-{name}.state"));
+            let contents = format!(
+                "version=18\nmax_committed_timestamp_ms=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}"
+            );
+            std::fs::write(&path, contents).unwrap();
+
+            let error = FileControlPlaneStore::new(path).load().unwrap_err();
+
+            assert!(matches!(
+                error,
+                ControlPlaneError::Parse { message, .. } if message == expected
+            ));
+        }
     }
 
     #[test]
@@ -23375,7 +23897,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23401,7 +23923,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -23426,7 +23948,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -23452,7 +23974,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "max_committed_timestamp_ms=100\n",
@@ -23468,20 +23990,10 @@ mod tests {
             .snapshot()
             .cluster_map_at_epoch(ClusterEpoch::new(2).unwrap())
             .unwrap();
-        let historical_node = history
-            .nodes()
-            .iter()
-            .find(|record| record.node_id() == NodeId::new(1))
-            .unwrap();
-        assert!(historical_node.pg_observation(PgId::new(7)).is_none());
-        assert_eq!(
-            history.pg(PgId::new(7)).unwrap().active_metadata_proof(),
-            Some(PgMetadataProof {
-                applied_log_index: 9,
-                applied_log_hash: 10,
-                state_digest: 11,
-            })
-        );
+        assert!(history.nodes().contains(&NodeId::new(1)));
+        let historical_pg = history.pg(PgId::new(7)).unwrap();
+        assert_eq!(historical_pg.state(), PgState::Active);
+        assert_eq!(historical_pg.active_primary, Some(NodeId::new(1)));
     }
 
     #[test]
@@ -23491,7 +24003,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=17\n",
+                "version=18\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -29880,12 +30392,7 @@ mod tests {
             .snapshot()
             .cluster_map_at_epoch(observation_epoch)
             .unwrap();
-        let historical_node = history
-            .nodes()
-            .iter()
-            .find(|record| record.node_id() == NodeId::new(1))
-            .unwrap();
-        assert!(historical_node.pg_observation(PgId::new(18)).is_none());
+        assert!(history.nodes().contains(&NodeId::new(1)));
         assert!(history.pg(PgId::new(18)).is_some());
     }
 
@@ -29930,17 +30437,20 @@ mod tests {
             .unwrap()
             .pg_observation(PgId::new(18))
             .is_none());
-        let historical_node = restarted
+        assert!(restarted
             .snapshot()
             .cluster_map_at_epoch(observation_epoch)
             .unwrap()
             .nodes()
-            .iter()
-            .find(|record| record.node_id() == NodeId::new(1))
-            .unwrap();
-        assert!(historical_node.pg_observation(PgId::new(18)).is_none());
+            .contains(&NodeId::new(1)));
         let persisted_text = std::fs::read_to_string(store.path()).unwrap();
         assert!(!persisted_text.contains("history_node_pg="));
+        assert!(persisted_text
+            .lines()
+            .any(|line| { line.starts_with("history_node=") && line.split(',').count() == 2 }));
+        assert!(persisted_text
+            .lines()
+            .any(|line| { line.starts_with("history_pg=") && line.split(',').count() == 14 }));
 
         let persisted = store.load().unwrap().unwrap();
         assert!(persisted
@@ -30020,11 +30530,7 @@ mod tests {
             .find(|record| record.pg_id() == PgId::new(26))
             .unwrap();
         assert_eq!(historical_pg.state(), PgState::Active);
-        assert_eq!(historical_pg.active_primary(), Some(NodeId::new(1)));
-        assert_eq!(
-            historical_pg.active_metadata_proof(),
-            Some(active_metadata_proof)
-        );
+        assert_eq!(historical_pg.active_primary, Some(NodeId::new(1)));
         let historical_route = restarted
             .snapshot()
             .reconstructed_pg_route_at_epoch(PgId::new(26), active_epoch)

@@ -10763,6 +10763,18 @@ Required production shape and implementation order:
    from the 6,922,064-byte `3jRrzq` snapshot. The estimated remaining snapshots
    are still 3.56 MB and 3.81 MB, so full per-epoch PG records, volatile node
    fields, and heartbeat-triggered full rewrites remain release blockers.
+   State format version 18 now replaces those retained live records with node
+   identities and dedicated historical PG route records. The compact route
+   keeps only state, acting set, Active primary, and complete metadata-transfer
+   route/proof fields; it omits current-only metadata floors, lease/fence state,
+   availability, endpoints, and heartbeat timestamps. Re-encoding the same
+   retained soak artifacts estimates 1,522,383 bytes for `N2vfUG` and 1,516,955
+   bytes for `3jRrzq`, a cumulative 74.85% and 78.08% reduction. Snapshot size
+   is no longer dominated by copied live records, but heartbeat-triggered
+   synchronous full-state rewrites remain a production blocker. The parser and
+   snapshot audit validate each retained transfer against an older retained
+   source route for the same PG and matching source primary; pruning protects
+   those source epochs while a retained transfer route depends on them.
 3. Define the crash/failover fence that permits ordinary heartbeat renewal to
    remain volatile. A preferred first design is a committed global or coarse
    per-node `lease_grant_not_after` horizon. The leader may acknowledge
