@@ -1509,13 +1509,27 @@ fn control_plane_runtime_map_ready(
 
 fn control_plane_runtime_map_diagnostics(socket_path: &Path) -> Result<String, String> {
     let control_plane = build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)?;
-    let runtime_map = control_plane
-        .runtime_map_snapshot(storage::clock::current_time_millis())
+    let diagnostics = control_plane
+        .runtime_map_diagnostics()
         .map_err(|error| format!("control-plane runtime map is not ready: {error}"))?;
-    Ok(format_control_plane_runtime_map_diagnostics(&runtime_map))
+    Ok(format_control_plane_runtime_map_diagnostics(&diagnostics))
 }
 
-fn format_control_plane_runtime_map_diagnostics(runtime_map: &ClusterRuntimeMapSnapshot) -> String {
+fn format_control_plane_runtime_map_diagnostics(
+    diagnostics: &storage::control_plane::ControlPlaneRuntimeMapDiagnostics,
+) -> String {
+    format_control_plane_runtime_map_diagnostics_parts(
+        diagnostics.runtime_map(),
+        diagnostics.rpc_metrics(),
+        diagnostics.snapshot_metrics(),
+    )
+}
+
+fn format_control_plane_runtime_map_diagnostics_parts(
+    runtime_map: &ClusterRuntimeMapSnapshot,
+    rpc_metrics: &[observability::ControlPlaneRpcMetricSample],
+    snapshot: observability::ControlPlaneSnapshotMetricSnapshot,
+) -> String {
     let active_serving_pg_routes = runtime_map
         .pg_routes()
         .iter()
@@ -1533,7 +1547,7 @@ fn format_control_plane_runtime_map_diagnostics(runtime_map: &ClusterRuntimeMapS
         .iter()
         .filter_map(|node| node.cluster_map_history_floor_epoch())
         .min();
-    let mut diagnostics = format!(
+    let mut output = format!(
         "epoch={} nodes={} pg_routes={} active_serving_pg_routes={} historical_pg_routes={} storage_history_floor_nodes={} oldest_storage_history_floor_epoch={}",
         runtime_map.cluster_epoch().get(),
         runtime_map.nodes().len(),
@@ -1544,8 +1558,8 @@ fn format_control_plane_runtime_map_diagnostics(runtime_map: &ClusterRuntimeMapS
         format_optional_epoch(oldest_floor),
     );
     for node in runtime_map.nodes() {
-        diagnostics.push('\n');
-        diagnostics.push_str(&format!(
+        output.push('\n');
+        output.push_str(&format!(
             "node_id={} incarnation={} endpoint={} storage_history_floor_epoch={}",
             node.node_id().as_u32(),
             node.node_incarnation(),
@@ -1553,7 +1567,38 @@ fn format_control_plane_runtime_map_diagnostics(runtime_map: &ClusterRuntimeMapS
             format_optional_epoch(node.cluster_map_history_floor_epoch()),
         ));
     }
-    diagnostics
+    for metric in rpc_metrics {
+        output.push('\n');
+        output.push_str(&format!(
+            "control_plane_rpc kind={} total={} lock_wait_us_total={} lock_wait_us_max={} operation_us_total={} operation_us_max={} response_write_us_total={} response_write_us_max={}",
+            metric.kind.as_str(),
+            metric.total,
+            metric.lock_wait_us_total,
+            metric.lock_wait_us_max,
+            metric.operation_us_total,
+            metric.operation_us_max,
+            metric.response_write_us_total,
+            metric.response_write_us_max,
+        ));
+    }
+    output.push('\n');
+    output.push_str(&format!(
+        "control_plane_snapshot serialize_total={} serialize_us_total={} serialize_us_max={} save_total={} save_error_total={} save_us_total={} save_us_max={} sync_total={} sync_us_total={} sync_us_max={} bytes_total={} bytes_last={} bytes_max={}",
+        snapshot.serialize_total,
+        snapshot.serialize_us_total,
+        snapshot.serialize_us_max,
+        snapshot.save_total,
+        snapshot.save_error_total,
+        snapshot.save_us_total,
+        snapshot.save_us_max,
+        snapshot.sync_total,
+        snapshot.sync_us_total,
+        snapshot.sync_us_max,
+        snapshot.bytes_total,
+        snapshot.bytes_last,
+        snapshot.bytes_max,
+    ));
+    output
 }
 
 fn format_optional_epoch(epoch: Option<ClusterEpoch>) -> String {
@@ -3344,11 +3389,19 @@ fn spawn_control_plane_rpc_worker(
                 return;
             }
         };
+        let metrics_kind = request.metrics_kind();
         let response = (|| {
             if request.is_authority_clock_admin() {
+                let lock_started = Instant::now();
                 let authority = authority
                     .lock()
                     .expect("control-plane authority mutex poisoned");
+                observability::record_control_plane_rpc_lock_wait(
+                    metrics_kind,
+                    lock_started.elapsed(),
+                );
+                let _operation_timer =
+                    observability::control_plane_rpc_operation_timer(metrics_kind);
                 let authority_clock =
                     authority_clock
                         .as_ref()
@@ -3377,9 +3430,16 @@ fn spawn_control_plane_rpc_worker(
                 )
             } else if request.is_refresh_node_heartbeat() {
                 let prepared = {
+                    let lock_started = Instant::now();
                     let mut authority = authority
                         .lock()
                         .expect("control-plane authority mutex poisoned");
+                    observability::record_control_plane_rpc_lock_wait(
+                        metrics_kind,
+                        lock_started.elapsed(),
+                    );
+                    let _operation_timer =
+                        observability::control_plane_rpc_operation_timer(metrics_kind);
                     let now_ms = match &authority_clock {
                         Some(authority_clock) if gate_request_time_with_authority_clock => {
                             authority_clock
@@ -3402,9 +3462,16 @@ fn spawn_control_plane_rpc_worker(
                     })
                 })
             } else {
+                let lock_started = Instant::now();
                 let mut authority = authority
                     .lock()
                     .expect("control-plane authority mutex poisoned");
+                observability::record_control_plane_rpc_lock_wait(
+                    metrics_kind,
+                    lock_started.elapsed(),
+                );
+                let _operation_timer =
+                    observability::control_plane_rpc_operation_timer(metrics_kind);
                 let now_ms = match &authority_clock {
                     Some(authority_clock) if gate_request_time_with_authority_clock => {
                         authority_clock
@@ -3435,7 +3502,13 @@ fn spawn_control_plane_rpc_worker(
                 return;
             }
         };
-        if let Err(error) = write_control_plane_unix_response(&mut stream, response) {
+        let response_write_started = Instant::now();
+        let response_result = write_control_plane_unix_response(&mut stream, response);
+        observability::record_control_plane_rpc_response_write(
+            metrics_kind,
+            response_write_started.elapsed(),
+        );
+        if let Err(error) = response_result {
             eprintln!("control-plane RPC response failed: {error}");
         }
     });
@@ -3579,6 +3652,17 @@ impl ControlPlaneRuntimeMapSource for FrontendControlPlaneClient {
 }
 
 impl FrontendControlPlaneClient {
+    fn runtime_map_diagnostics(
+        &self,
+    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapDiagnostics, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.runtime_map_diagnostics(),
+            Self::Authenticated(client) => {
+                client.runtime_map_diagnostics(storage::clock::current_time_millis())
+            }
+        }
+    }
+
     fn runtime_map_status_with_check_applied_timeout(
         &self,
     ) -> Result<storage::control_plane::ControlPlaneRuntimeMapStatus, ControlPlaneError> {
@@ -9867,7 +9951,25 @@ mod tests {
             .unwrap();
         let runtime_map = authority.snapshot().runtime_map(1_000).unwrap();
 
-        let diagnostics = format_control_plane_runtime_map_diagnostics(&runtime_map);
+        let rpc_metrics = [observability::ControlPlaneRpcMetricSample {
+            kind: observability::ControlPlaneRpcMetricKind::RefreshNodeHeartbeat,
+            total: 9,
+            lock_wait_us_total: 10,
+            lock_wait_us_max: 11,
+            operation_us_total: 12,
+            operation_us_max: 13,
+            response_write_us_total: 14,
+            response_write_us_max: 15,
+        }];
+        let diagnostics = format_control_plane_runtime_map_diagnostics_parts(
+            &runtime_map,
+            &rpc_metrics,
+            observability::ControlPlaneSnapshotMetricSnapshot {
+                save_total: 7,
+                bytes_last: 1234,
+                ..observability::ControlPlaneSnapshotMetricSnapshot::default()
+            },
+        );
 
         assert!(diagnostics.contains("nodes=1"), "{diagnostics}");
         assert!(
@@ -9877,6 +9979,17 @@ mod tests {
             )),
             "{diagnostics}"
         );
+        assert!(
+            diagnostics.contains(
+                "control_plane_rpc kind=refresh_node_heartbeat total=9 lock_wait_us_total=10 lock_wait_us_max=11 operation_us_total=12 operation_us_max=13 response_write_us_total=14 response_write_us_max=15"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("control_plane_snapshot serialize_total=0 serialize_us_total=0 serialize_us_max=0 save_total=7"),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("bytes_last=1234"), "{diagnostics}");
         assert!(
             diagnostics.contains(&format!(
                 "node_id=2 incarnation=7 endpoint=node-2.sock storage_history_floor_epoch={}",

@@ -4585,6 +4585,30 @@ pub struct ControlPlaneRuntimeMapStatus {
     active_serving_pg_routes: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRuntimeMapDiagnostics {
+    runtime_map: ClusterRuntimeMapSnapshot,
+    rpc_metrics: Vec<observability::ControlPlaneRpcMetricSample>,
+    snapshot_metrics: observability::ControlPlaneSnapshotMetricSnapshot,
+}
+
+impl ControlPlaneRuntimeMapDiagnostics {
+    #[must_use]
+    pub fn runtime_map(&self) -> &ClusterRuntimeMapSnapshot {
+        &self.runtime_map
+    }
+
+    #[must_use]
+    pub fn rpc_metrics(&self) -> &[observability::ControlPlaneRpcMetricSample] {
+        &self.rpc_metrics
+    }
+
+    #[must_use]
+    pub fn snapshot_metrics(&self) -> observability::ControlPlaneSnapshotMetricSnapshot {
+        self.snapshot_metrics
+    }
+}
+
 impl ControlPlaneRuntimeMapStatus {
     #[must_use]
     pub fn new(
@@ -5202,6 +5226,15 @@ impl ControlPlaneStore for FileControlPlaneStore {
     }
 
     fn save(&self, snapshot: &ClusterControlSnapshot) -> Result<(), ControlPlaneError> {
+        let save_started = Instant::now();
+        let result = self.save_snapshot(snapshot);
+        observability::record_control_plane_snapshot_save(save_started.elapsed(), result.is_ok());
+        result
+    }
+}
+
+impl FileControlPlaneStore {
+    fn save_snapshot(&self, snapshot: &ClusterControlSnapshot) -> Result<(), ControlPlaneError> {
         let state_existed = self.path.exists();
         if let Some(parent) = state_parent(&self.path) {
             std::fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
@@ -5222,6 +5255,12 @@ impl ControlPlaneStore for FileControlPlaneStore {
                 )?;
             }
         }
+        let serialize_started = Instant::now();
+        let formatted_snapshot = format_snapshot(snapshot);
+        observability::record_control_plane_snapshot_serialization(
+            serialize_started.elapsed(),
+            formatted_snapshot.len(),
+        );
         let tmp_path = self.path.with_extension("tmp");
         {
             let mut tmp_file =
@@ -5230,29 +5269,32 @@ impl ControlPlaneStore for FileControlPlaneStore {
                     source,
                 })?;
             tmp_file
-                .write_all(format_snapshot(snapshot).as_bytes())
+                .write_all(formatted_snapshot.as_bytes())
                 .map_err(|source| ControlPlaneError::Io {
                     context: "write control-plane state",
                     source,
                 })?;
-            tmp_file
-                .sync_all()
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "sync control-plane state",
-                    source,
-                })?;
+            let sync_started = Instant::now();
+            let sync_result = tmp_file.sync_all();
+            observability::record_control_plane_snapshot_sync(sync_started.elapsed());
+            sync_result.map_err(|source| ControlPlaneError::Io {
+                context: "sync control-plane state",
+                source,
+            })?;
         }
         std::fs::rename(&tmp_path, &self.path).map_err(|source| ControlPlaneError::Io {
             context: "commit control-plane state",
             source,
         })?;
         if let Some(parent) = state_parent(&self.path) {
-            std::fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "sync control-plane state directory",
-                    source,
-                })?;
+            let sync_started = Instant::now();
+            let sync_result =
+                std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+            observability::record_control_plane_snapshot_sync(sync_started.elapsed());
+            sync_result.map_err(|source| ControlPlaneError::Io {
+                context: "sync control-plane state directory",
+                source,
+            })?;
         }
         Ok(())
     }
@@ -6516,6 +6558,7 @@ impl UnixControlPlaneClient {
         debug_assert!(matches!(
             kind,
             ControlPlaneRpcKind::RuntimeMapSnapshot
+                | ControlPlaneRpcKind::RuntimeMapDiagnostics
                 | ControlPlaneRpcKind::PgRuntimeMapSnapshot
                 | ControlPlaneRpcKind::RuntimeMapStatus
                 | ControlPlaneRpcKind::PendingMetadataCommandRecoveries
@@ -6548,6 +6591,7 @@ impl UnixControlPlaneClient {
         debug_assert!(matches!(
             kind,
             ControlPlaneRpcKind::RuntimeMapSnapshot
+                | ControlPlaneRpcKind::RuntimeMapDiagnostics
                 | ControlPlaneRpcKind::PgRuntimeMapSnapshot
                 | ControlPlaneRpcKind::RuntimeMapStatus
                 | ControlPlaneRpcKind::PendingMetadataCommandRecoveries
@@ -7158,6 +7202,22 @@ impl UnixControlPlaneClient {
 }
 
 impl AuthenticatedUnixControlPlaneClient {
+    pub fn runtime_map_diagnostics(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneRuntimeMapDiagnostics, ControlPlaneError> {
+        let payload = self.send_signed_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::RuntimeMapDiagnostics,
+            authority_now_ms,
+            Vec::new(),
+            CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let diagnostics = read_control_plane_runtime_map_diagnostics(&mut reader)?;
+        reader.finish()?;
+        Ok(diagnostics)
+    }
+
     #[must_use]
     pub fn new(inner: UnixControlPlaneClient, credential: ControlPlaneScopedCredential) -> Self {
         Self { inner, credential }
@@ -9007,6 +9067,20 @@ impl AuthenticatedUnixControlPlaneClient {
 }
 
 impl UnixControlPlaneClient {
+    pub fn runtime_map_diagnostics(
+        &self,
+    ) -> Result<ControlPlaneRuntimeMapDiagnostics, ControlPlaneError> {
+        let payload = self.send_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::RuntimeMapDiagnostics,
+            &[],
+            CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let diagnostics = read_control_plane_runtime_map_diagnostics(&mut reader)?;
+        reader.finish()?;
+        Ok(diagnostics)
+    }
+
     fn runtime_map_snapshot_with_read_timeout(
         &self,
         read_timeout: Duration,
@@ -9231,6 +9305,11 @@ pub struct ControlPlaneRpcRequest {
 
 impl ControlPlaneRpcRequest {
     #[must_use]
+    pub fn metrics_kind(&self) -> observability::ControlPlaneRpcMetricKind {
+        self.kind.metrics_kind()
+    }
+
+    #[must_use]
     pub fn is_refresh_node_heartbeat(&self) -> bool {
         self.kind == ControlPlaneRpcKind::RefreshNodeHeartbeat
     }
@@ -9344,6 +9423,39 @@ where
                 Ok(snapshot) => {
                     let mut response = Vec::new();
                     write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            };
+            let response_authority_now_ms = response_authority_now_ms()?;
+            return build_runtime_map_rpc_response(
+                kind,
+                response,
+                response_auth,
+                response_authority_now_ms,
+            );
+        }
+        ControlPlaneRpcKind::RuntimeMapDiagnostics => {
+            let (payload, response_auth) = match auth_verifier {
+                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
+                    let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    (
+                        verified.payload,
+                        Some((verified.response_credential, verified.response_target)),
+                    )
+                }
+                _ => (payload, None),
+            };
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            let response = match control_plane.runtime_map_snapshot(authority_now_ms) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_control_plane_runtime_map_diagnostics(&mut response, &snapshot)?;
                     Ok(response)
                 }
                 Err(error) => Err(error),
@@ -9800,6 +9912,7 @@ enum ControlPlaneRpcKind {
     PendingMetadataCommandRecoveries = 13,
     AuthorityClockStatus = 14,
     ReestablishAuthorityClock = 15,
+    RuntimeMapDiagnostics = 16,
 }
 
 impl ControlPlaneRpcKind {
@@ -9823,6 +9936,7 @@ impl ControlPlaneRpcKind {
             13 => Ok(Self::PendingMetadataCommandRecoveries),
             14 => Ok(Self::AuthorityClockStatus),
             15 => Ok(Self::ReestablishAuthorityClock),
+            16 => Ok(Self::RuntimeMapDiagnostics),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),
@@ -9834,6 +9948,7 @@ impl ControlPlaneRpcKind {
             Self::RuntimeMapSnapshot
             | Self::PgRuntimeMapSnapshot
             | Self::RuntimeMapStatus
+            | Self::RuntimeMapDiagnostics
             | Self::PendingMetadataCommandRecoveries => {
                 ControlPlaneAuthOperation::FrontendRuntimeMapRead
             }
@@ -9849,6 +9964,34 @@ impl ControlPlaneRpcKind {
             | Self::ReestablishAuthorityClock => {
                 ControlPlaneAuthOperation::AdminControlPlaneCommand
             }
+        }
+    }
+
+    fn metrics_kind(self) -> observability::ControlPlaneRpcMetricKind {
+        use observability::ControlPlaneRpcMetricKind as MetricKind;
+
+        match self {
+            Self::RuntimeMapSnapshot => MetricKind::RuntimeMapSnapshot,
+            Self::RefreshNodeHeartbeat => MetricKind::RefreshNodeHeartbeat,
+            Self::SetPgActingSet => MetricKind::SetPgActingSet,
+            Self::SetPgActingSetWithMetadataTransfer => {
+                MetricKind::SetPgActingSetWithMetadataTransfer
+            }
+            Self::SetPgActingSetWithMetadataTransferRuntimeMap => {
+                MetricKind::SetPgActingSetWithMetadataTransferRuntimeMap
+            }
+            Self::FencePgForMetadataTransferRuntimeMap => {
+                MetricKind::FencePgForMetadataTransferRuntimeMap
+            }
+            Self::TransferRaftLeadership => MetricKind::TransferRaftLeadership,
+            Self::PgRuntimeMapSnapshot => MetricKind::PgRuntimeMapSnapshot,
+            Self::TriggerRaftSnapshotAndPurge => MetricKind::TriggerRaftSnapshotAndPurge,
+            Self::TriggerRaftElection => MetricKind::TriggerRaftElection,
+            Self::RuntimeMapStatus => MetricKind::RuntimeMapStatus,
+            Self::PendingMetadataCommandRecoveries => MetricKind::PendingMetadataCommandRecoveries,
+            Self::AuthorityClockStatus => MetricKind::AuthorityClockStatus,
+            Self::ReestablishAuthorityClock => MetricKind::ReestablishAuthorityClock,
+            Self::RuntimeMapDiagnostics => MetricKind::RuntimeMapDiagnostics,
         }
     }
 }
@@ -10323,6 +10466,144 @@ fn read_runtime_map_status(
         reader.read_u32()? as usize,
         reader.read_u32()? as usize,
     ))
+}
+
+fn write_control_plane_runtime_map_diagnostics(
+    out: &mut Vec<u8>,
+    runtime_map: &ClusterRuntimeMapSnapshot,
+) -> Result<(), ControlPlaneError> {
+    write_runtime_map_snapshot(out, runtime_map)?;
+    let rpc_metrics = observability::control_plane_rpc_metrics_snapshot();
+    write_u32(
+        out,
+        len_as_u32(rpc_metrics.len(), "control-plane RPC metric samples")?,
+    );
+    for sample in rpc_metrics {
+        write_u8(out, control_plane_rpc_metric_kind_code(sample.kind));
+        write_u64(out, sample.total);
+        write_u64(out, sample.lock_wait_us_total);
+        write_u64(out, sample.lock_wait_us_max);
+        write_u64(out, sample.operation_us_total);
+        write_u64(out, sample.operation_us_max);
+        write_u64(out, sample.response_write_us_total);
+        write_u64(out, sample.response_write_us_max);
+    }
+    let snapshot = observability::control_plane_snapshot_metrics_snapshot();
+    write_u64(out, snapshot.serialize_total);
+    write_u64(out, snapshot.serialize_us_total);
+    write_u64(out, snapshot.serialize_us_max);
+    write_u64(out, snapshot.save_total);
+    write_u64(out, snapshot.save_error_total);
+    write_u64(out, snapshot.save_us_total);
+    write_u64(out, snapshot.save_us_max);
+    write_u64(out, snapshot.sync_total);
+    write_u64(out, snapshot.sync_us_total);
+    write_u64(out, snapshot.sync_us_max);
+    write_u64(out, snapshot.bytes_total);
+    write_u64(out, snapshot.bytes_last);
+    write_u64(out, snapshot.bytes_max);
+    Ok(())
+}
+
+fn read_control_plane_runtime_map_diagnostics(
+    reader: &mut PayloadReader<'_>,
+) -> Result<ControlPlaneRuntimeMapDiagnostics, ControlPlaneError> {
+    let runtime_map = read_runtime_map_snapshot(reader)?;
+    let metric_count = reader.read_collection_len("control-plane RPC metrics", 57)?;
+    if metric_count > 16 {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!("control-plane RPC metric count {metric_count} exceeds 16"),
+        });
+    }
+    let mut rpc_metrics = Vec::with_capacity(metric_count);
+    let mut seen = BTreeSet::new();
+    for _ in 0..metric_count {
+        let kind = read_control_plane_rpc_metric_kind(reader.read_u8()?)?;
+        if !seen.insert(control_plane_rpc_metric_kind_code(kind)) {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!("duplicate control-plane RPC metric kind {}", kind.as_str()),
+            });
+        }
+        rpc_metrics.push(observability::ControlPlaneRpcMetricSample {
+            kind,
+            total: reader.read_u64()?,
+            lock_wait_us_total: reader.read_u64()?,
+            lock_wait_us_max: reader.read_u64()?,
+            operation_us_total: reader.read_u64()?,
+            operation_us_max: reader.read_u64()?,
+            response_write_us_total: reader.read_u64()?,
+            response_write_us_max: reader.read_u64()?,
+        });
+    }
+    let snapshot_metrics = observability::ControlPlaneSnapshotMetricSnapshot {
+        serialize_total: reader.read_u64()?,
+        serialize_us_total: reader.read_u64()?,
+        serialize_us_max: reader.read_u64()?,
+        save_total: reader.read_u64()?,
+        save_error_total: reader.read_u64()?,
+        save_us_total: reader.read_u64()?,
+        save_us_max: reader.read_u64()?,
+        sync_total: reader.read_u64()?,
+        sync_us_total: reader.read_u64()?,
+        sync_us_max: reader.read_u64()?,
+        bytes_total: reader.read_u64()?,
+        bytes_last: reader.read_u64()?,
+        bytes_max: reader.read_u64()?,
+    };
+    Ok(ControlPlaneRuntimeMapDiagnostics {
+        runtime_map,
+        rpc_metrics,
+        snapshot_metrics,
+    })
+}
+
+fn control_plane_rpc_metric_kind_code(kind: observability::ControlPlaneRpcMetricKind) -> u8 {
+    use observability::ControlPlaneRpcMetricKind as Kind;
+    match kind {
+        Kind::RuntimeMapSnapshot => 1,
+        Kind::RefreshNodeHeartbeat => 2,
+        Kind::SetPgActingSet => 3,
+        Kind::SetPgActingSetWithMetadataTransfer => 4,
+        Kind::SetPgActingSetWithMetadataTransferRuntimeMap => 5,
+        Kind::FencePgForMetadataTransferRuntimeMap => 6,
+        Kind::TransferRaftLeadership => 7,
+        Kind::PgRuntimeMapSnapshot => 8,
+        Kind::TriggerRaftSnapshotAndPurge => 9,
+        Kind::TriggerRaftElection => 10,
+        Kind::RuntimeMapStatus => 11,
+        Kind::PendingMetadataCommandRecoveries => 12,
+        Kind::AuthorityClockStatus => 13,
+        Kind::ReestablishAuthorityClock => 14,
+        Kind::RuntimeMapDiagnostics => 15,
+        Kind::Unknown => 16,
+    }
+}
+
+fn read_control_plane_rpc_metric_kind(
+    code: u8,
+) -> Result<observability::ControlPlaneRpcMetricKind, ControlPlaneError> {
+    use observability::ControlPlaneRpcMetricKind as Kind;
+    match code {
+        1 => Ok(Kind::RuntimeMapSnapshot),
+        2 => Ok(Kind::RefreshNodeHeartbeat),
+        3 => Ok(Kind::SetPgActingSet),
+        4 => Ok(Kind::SetPgActingSetWithMetadataTransfer),
+        5 => Ok(Kind::SetPgActingSetWithMetadataTransferRuntimeMap),
+        6 => Ok(Kind::FencePgForMetadataTransferRuntimeMap),
+        7 => Ok(Kind::TransferRaftLeadership),
+        8 => Ok(Kind::PgRuntimeMapSnapshot),
+        9 => Ok(Kind::TriggerRaftSnapshotAndPurge),
+        10 => Ok(Kind::TriggerRaftElection),
+        11 => Ok(Kind::RuntimeMapStatus),
+        12 => Ok(Kind::PendingMetadataCommandRecoveries),
+        13 => Ok(Kind::AuthorityClockStatus),
+        14 => Ok(Kind::ReestablishAuthorityClock),
+        15 => Ok(Kind::RuntimeMapDiagnostics),
+        16 => Ok(Kind::Unknown),
+        _ => Err(ControlPlaneError::RpcProtocol {
+            message: format!("invalid control-plane RPC metric kind {code}"),
+        }),
+    }
 }
 
 fn write_pending_metadata_command_recovery_listing(
@@ -20937,8 +21218,10 @@ mod tests {
     fn control_plane_rpc_kinds_have_explicit_auth_operations() {
         let frontend_read_kinds = [
             ControlPlaneRpcKind::RuntimeMapSnapshot,
+            ControlPlaneRpcKind::RuntimeMapDiagnostics,
             ControlPlaneRpcKind::PgRuntimeMapSnapshot,
             ControlPlaneRpcKind::RuntimeMapStatus,
+            ControlPlaneRpcKind::PendingMetadataCommandRecoveries,
         ];
         for kind in frontend_read_kinds {
             assert_eq!(
@@ -21160,6 +21443,35 @@ mod tests {
         reader.finish().unwrap();
         assert_eq!(lease.node_id(), NodeId::new(1));
         assert_eq!(lease.cluster_epoch(), runtime_map.cluster_epoch());
+    }
+
+    #[test]
+    fn runtime_map_diagnostics_reports_rpc_and_snapshot_metrics() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let request = ControlPlaneRpcRequest {
+            kind: ControlPlaneRpcKind::RuntimeMapDiagnostics,
+            payload: Vec::new(),
+        };
+
+        let response = build_control_plane_unix_response(&mut authority, request, 2_000).unwrap();
+
+        assert_eq!(response.kind, ControlPlaneRpcKind::RuntimeMapDiagnostics);
+        let response_payload = decode_control_plane_rpc_response(response.payload).unwrap();
+        let mut reader = PayloadReader::new(&response_payload);
+        let diagnostics = read_control_plane_runtime_map_diagnostics(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert!(diagnostics.runtime_map().cluster_epoch() > ClusterEpoch::INITIAL);
+        assert_eq!(diagnostics.rpc_metrics().len(), 16);
+        assert!(
+            diagnostics.snapshot_metrics().save_total >= 1,
+            "the preceding durable mutation should be measured"
+        );
+        assert!(diagnostics.snapshot_metrics().bytes_last > 0);
     }
 
     #[test]

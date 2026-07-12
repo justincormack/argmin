@@ -1735,9 +1735,7 @@ cleanup_server() {
             echo "frontend flight recorder dump request failed" >&2
         fi
     fi
-    if ((status != 0)); then
-        print_control_plane_runtime_map_diagnostics
-    fi
+    print_control_plane_runtime_map_diagnostics
     for pid in "${server_pids[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true

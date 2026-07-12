@@ -10721,6 +10721,16 @@ Required production shape and implementation order:
    frontend refresh outcome. Keep the new persistent/redacted frontend refresh
    failure classification so soak failures identify timeout, disconnect,
    protocol, clock, or state rejection without exposing object identifiers.
+   Initial single-authority instrumentation now reports, by bounded RPC kind,
+   request count plus authority-lock wait, lock-held operation, and response-
+   write cumulative/max microseconds. File-backed snapshots report
+   serialization/save/sync count, cumulative/max duration, errors, and
+   cumulative/last/max encoded bytes. The authenticated
+   `control-plane-runtime-map-diagnostics` command exports these process-local
+   counters, and UAT prints them on successful and failed cleanup so subsequent
+   slices have comparable soak baselines. Command/journal bytes and the Raft
+   checkpoint path still need their corresponding counters when those paths
+   replace the single-authority full-snapshot write.
 2. Classify heartbeat fields by recovery requirement before changing the write
    path. Durable state includes membership, node/process identity changes,
    endpoints used as authority, PG topology/state, committed peering or

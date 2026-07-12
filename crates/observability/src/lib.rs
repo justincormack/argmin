@@ -229,6 +229,20 @@ static STREAM_UPLOAD_FINALIZE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLIGHT_RECORDER: OnceLock<Mutex<FlightRecorder>> = OnceLock::new();
 static PANIC_FLIGHT_RECORDER_HOOK: Once = Once::new();
 static FLIGHT_RECORD_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static CONTROL_PLANE_RPC_METRICS: OnceLock<[ControlPlaneRpcMetricCounters; 16]> = OnceLock::new();
+static CONTROL_PLANE_SNAPSHOT_SERIALIZE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_SERIALIZE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_SERIALIZE_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_SAVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_SAVE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_SAVE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_SAVE_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_SNAPSHOT_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
 
 const TRACE_FILE_QUEUE_CAPACITY: usize = 16_384;
 const TRACE_FILE_IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
@@ -236,6 +250,257 @@ const FLIGHT_RECORDER_CAPACITY: usize = 512;
 const FLIGHT_RECORD_MAX_DETAIL_BYTES: usize = 1_024;
 const METADATA_COMMAND_DIMENSION_CAPACITY: usize = 512;
 const STORAGE_RPC_LONG_RUNNING_THRESHOLD: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ControlPlaneRpcMetricKind {
+    RuntimeMapSnapshot,
+    RefreshNodeHeartbeat,
+    SetPgActingSet,
+    SetPgActingSetWithMetadataTransfer,
+    SetPgActingSetWithMetadataTransferRuntimeMap,
+    FencePgForMetadataTransferRuntimeMap,
+    TransferRaftLeadership,
+    PgRuntimeMapSnapshot,
+    TriggerRaftSnapshotAndPurge,
+    TriggerRaftElection,
+    RuntimeMapStatus,
+    PendingMetadataCommandRecoveries,
+    AuthorityClockStatus,
+    ReestablishAuthorityClock,
+    RuntimeMapDiagnostics,
+    #[default]
+    Unknown,
+}
+
+impl ControlPlaneRpcMetricKind {
+    const ALL: [Self; 16] = [
+        Self::RuntimeMapSnapshot,
+        Self::RefreshNodeHeartbeat,
+        Self::SetPgActingSet,
+        Self::SetPgActingSetWithMetadataTransfer,
+        Self::SetPgActingSetWithMetadataTransferRuntimeMap,
+        Self::FencePgForMetadataTransferRuntimeMap,
+        Self::TransferRaftLeadership,
+        Self::PgRuntimeMapSnapshot,
+        Self::TriggerRaftSnapshotAndPurge,
+        Self::TriggerRaftElection,
+        Self::RuntimeMapStatus,
+        Self::PendingMetadataCommandRecoveries,
+        Self::AuthorityClockStatus,
+        Self::ReestablishAuthorityClock,
+        Self::RuntimeMapDiagnostics,
+        Self::Unknown,
+    ];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeMapSnapshot => "runtime_map_snapshot",
+            Self::RefreshNodeHeartbeat => "refresh_node_heartbeat",
+            Self::SetPgActingSet => "set_pg_acting_set",
+            Self::SetPgActingSetWithMetadataTransfer => "set_pg_acting_set_with_metadata_transfer",
+            Self::SetPgActingSetWithMetadataTransferRuntimeMap => {
+                "set_pg_acting_set_with_metadata_transfer_runtime_map"
+            }
+            Self::FencePgForMetadataTransferRuntimeMap => {
+                "fence_pg_for_metadata_transfer_runtime_map"
+            }
+            Self::TransferRaftLeadership => "transfer_raft_leadership",
+            Self::PgRuntimeMapSnapshot => "pg_runtime_map_snapshot",
+            Self::TriggerRaftSnapshotAndPurge => "trigger_raft_snapshot_and_purge",
+            Self::TriggerRaftElection => "trigger_raft_election",
+            Self::RuntimeMapStatus => "runtime_map_status",
+            Self::PendingMetadataCommandRecoveries => "pending_metadata_command_recoveries",
+            Self::AuthorityClockStatus => "authority_clock_status",
+            Self::ReestablishAuthorityClock => "reestablish_authority_clock",
+            Self::RuntimeMapDiagnostics => "runtime_map_diagnostics",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+struct ControlPlaneRpcMetricCounters {
+    total: AtomicU64,
+    lock_wait_us_total: AtomicU64,
+    lock_wait_us_max: AtomicU64,
+    operation_us_total: AtomicU64,
+    operation_us_max: AtomicU64,
+    response_write_us_total: AtomicU64,
+    response_write_us_max: AtomicU64,
+}
+
+fn control_plane_rpc_metrics() -> &'static [ControlPlaneRpcMetricCounters; 16] {
+    CONTROL_PLANE_RPC_METRICS
+        .get_or_init(|| std::array::from_fn(|_| ControlPlaneRpcMetricCounters::new()))
+}
+
+fn elapsed_us(elapsed: Duration) -> u64 {
+    saturating_u128_to_u64(elapsed.as_micros())
+}
+
+pub fn record_control_plane_rpc_lock_wait(kind: ControlPlaneRpcMetricKind, elapsed: Duration) {
+    let counters = &control_plane_rpc_metrics()[kind.index()];
+    let elapsed_us = elapsed_us(elapsed);
+    counters.total.fetch_add(1, Ordering::Relaxed);
+    counters
+        .lock_wait_us_total
+        .fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&counters.lock_wait_us_max, elapsed_us);
+}
+
+pub fn record_control_plane_rpc_operation(kind: ControlPlaneRpcMetricKind, elapsed: Duration) {
+    let counters = &control_plane_rpc_metrics()[kind.index()];
+    let elapsed_us = elapsed_us(elapsed);
+    counters
+        .operation_us_total
+        .fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&counters.operation_us_max, elapsed_us);
+}
+
+pub struct ControlPlaneRpcOperationTimer {
+    kind: ControlPlaneRpcMetricKind,
+    started_at: Instant,
+}
+
+impl Drop for ControlPlaneRpcOperationTimer {
+    fn drop(&mut self) {
+        record_control_plane_rpc_operation(self.kind, self.started_at.elapsed());
+    }
+}
+
+#[must_use]
+pub fn control_plane_rpc_operation_timer(
+    kind: ControlPlaneRpcMetricKind,
+) -> ControlPlaneRpcOperationTimer {
+    ControlPlaneRpcOperationTimer {
+        kind,
+        started_at: Instant::now(),
+    }
+}
+
+pub fn record_control_plane_rpc_response_write(kind: ControlPlaneRpcMetricKind, elapsed: Duration) {
+    let counters = &control_plane_rpc_metrics()[kind.index()];
+    let elapsed_us = elapsed_us(elapsed);
+    counters
+        .response_write_us_total
+        .fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&counters.response_write_us_max, elapsed_us);
+}
+
+#[must_use]
+pub fn control_plane_rpc_metrics_snapshot() -> Vec<ControlPlaneRpcMetricSample> {
+    let counters = control_plane_rpc_metrics();
+    ControlPlaneRpcMetricKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let counters = &counters[kind.index()];
+            ControlPlaneRpcMetricSample {
+                kind,
+                total: counters.total.load(Ordering::Relaxed),
+                lock_wait_us_total: counters.lock_wait_us_total.load(Ordering::Relaxed),
+                lock_wait_us_max: counters.lock_wait_us_max.load(Ordering::Relaxed),
+                operation_us_total: counters.operation_us_total.load(Ordering::Relaxed),
+                operation_us_max: counters.operation_us_max.load(Ordering::Relaxed),
+                response_write_us_total: counters.response_write_us_total.load(Ordering::Relaxed),
+                response_write_us_max: counters.response_write_us_max.load(Ordering::Relaxed),
+            }
+        })
+        .collect()
+}
+
+pub fn record_control_plane_snapshot_serialization(elapsed: Duration, bytes: usize) {
+    let elapsed_us = elapsed_us(elapsed);
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    CONTROL_PLANE_SNAPSHOT_SERIALIZE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_SNAPSHOT_SERIALIZE_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_SNAPSHOT_SERIALIZE_US_MAX, elapsed_us);
+    CONTROL_PLANE_SNAPSHOT_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    CONTROL_PLANE_SNAPSHOT_BYTES_LAST.store(bytes, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_SNAPSHOT_BYTES_MAX, bytes);
+}
+
+pub fn record_control_plane_snapshot_sync(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_SNAPSHOT_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_SNAPSHOT_SYNC_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_SNAPSHOT_SYNC_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_snapshot_save(elapsed: Duration, succeeded: bool) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_SNAPSHOT_SAVE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !succeeded {
+        CONTROL_PLANE_SNAPSHOT_SAVE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    CONTROL_PLANE_SNAPSHOT_SAVE_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_SNAPSHOT_SAVE_US_MAX, elapsed_us);
+}
+
+#[must_use]
+pub fn control_plane_snapshot_metrics_snapshot() -> ControlPlaneSnapshotMetricSnapshot {
+    ControlPlaneSnapshotMetricSnapshot {
+        serialize_total: CONTROL_PLANE_SNAPSHOT_SERIALIZE_TOTAL.load(Ordering::Relaxed),
+        serialize_us_total: CONTROL_PLANE_SNAPSHOT_SERIALIZE_US_TOTAL.load(Ordering::Relaxed),
+        serialize_us_max: CONTROL_PLANE_SNAPSHOT_SERIALIZE_US_MAX.load(Ordering::Relaxed),
+        save_total: CONTROL_PLANE_SNAPSHOT_SAVE_TOTAL.load(Ordering::Relaxed),
+        save_error_total: CONTROL_PLANE_SNAPSHOT_SAVE_ERROR_TOTAL.load(Ordering::Relaxed),
+        save_us_total: CONTROL_PLANE_SNAPSHOT_SAVE_US_TOTAL.load(Ordering::Relaxed),
+        save_us_max: CONTROL_PLANE_SNAPSHOT_SAVE_US_MAX.load(Ordering::Relaxed),
+        sync_total: CONTROL_PLANE_SNAPSHOT_SYNC_TOTAL.load(Ordering::Relaxed),
+        sync_us_total: CONTROL_PLANE_SNAPSHOT_SYNC_US_TOTAL.load(Ordering::Relaxed),
+        sync_us_max: CONTROL_PLANE_SNAPSHOT_SYNC_US_MAX.load(Ordering::Relaxed),
+        bytes_total: CONTROL_PLANE_SNAPSHOT_BYTES_TOTAL.load(Ordering::Relaxed),
+        bytes_last: CONTROL_PLANE_SNAPSHOT_BYTES_LAST.load(Ordering::Relaxed),
+        bytes_max: CONTROL_PLANE_SNAPSHOT_BYTES_MAX.load(Ordering::Relaxed),
+    }
+}
+
+impl ControlPlaneRpcMetricCounters {
+    fn new() -> Self {
+        Self {
+            total: AtomicU64::new(0),
+            lock_wait_us_total: AtomicU64::new(0),
+            lock_wait_us_max: AtomicU64::new(0),
+            operation_us_total: AtomicU64::new(0),
+            operation_us_max: AtomicU64::new(0),
+            response_write_us_total: AtomicU64::new(0),
+            response_write_us_max: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneRpcMetricSample {
+    pub kind: ControlPlaneRpcMetricKind,
+    pub total: u64,
+    pub lock_wait_us_total: u64,
+    pub lock_wait_us_max: u64,
+    pub operation_us_total: u64,
+    pub operation_us_max: u64,
+    pub response_write_us_total: u64,
+    pub response_write_us_max: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneSnapshotMetricSnapshot {
+    pub serialize_total: u64,
+    pub serialize_us_total: u64,
+    pub serialize_us_max: u64,
+    pub save_total: u64,
+    pub save_error_total: u64,
+    pub save_us_total: u64,
+    pub save_us_max: u64,
+    pub sync_total: u64,
+    pub sync_us_total: u64,
+    pub sync_us_max: u64,
+    pub bytes_total: u64,
+    pub bytes_last: u64,
+    pub bytes_max: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlightRecord {
