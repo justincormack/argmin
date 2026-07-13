@@ -10987,6 +10987,24 @@ Required production shape and implementation order:
    deadline must be at or below that bound and carry the exact same authority
    binding. Rebinding after a generation/term change uses the conservative
    rule above: the previous horizon plus symmetric skew must have elapsed.
+   A validated single-authority restart is a continuation rather than a
+   successor: while holding the exclusive durable-state lock, an established
+   clock restored from the identity-bound restart checkpoint may resume the
+   persisted no-term horizon generation once. Checkpoint format version 2
+   persists the exact nonzero authority-clock generation, and continuation
+   requires equality between that generation, the restored clock generation,
+   and the persisted horizon binding; continuation never assigns an older
+   generation. Missing/corrupt checkpoint evidence, generation mismatch, and
+   every Raft-term-bound horizon still advance the generation and retain the
+   conservative rebinding fence. A clock fault consumes in-process
+   continuation evidence and durably removes the checkpoint before the process
+   continues. Authenticated recovery first removes and directory-syncs the old
+   checkpoint, then persists its newly advanced generation before
+   acknowledgement. A crash or replacement failure between those phases
+   therefore leaves no stale continuation evidence. This avoids the
+   invalid 20-second heartbeat blackout observed when a 10-second node lease
+   was forced to wait behind its own restored horizon after every process
+   restart.
    Deterministic tests cover repeated volatile renewals without horizon
    mutation, binding/deadline mismatch, response loss after durable extension,
    leadership replacement, and arithmetic overflow. A property model covers

@@ -27,8 +27,8 @@ use server_core::sse::{
 use storage::control_plane::{
     build_control_plane_authority_clock_admin_response, build_control_plane_unix_response,
     build_control_plane_unix_response_with_auth_and_response_clock,
-    finish_control_plane_heartbeat_response, load_authority_clock_restart_checkpoint,
-    prepare_control_plane_heartbeat_response,
+    finish_control_plane_heartbeat_response, invalidate_authority_clock_restart_checkpoint,
+    load_authority_clock_restart_checkpoint, prepare_control_plane_heartbeat_response,
     prepare_control_plane_heartbeat_response_with_lease_horizon_authority,
     read_control_plane_unix_request, store_authority_clock_restart_checkpoint,
     store_validated_authority_clock_restart_checkpoint, write_control_plane_unix_response,
@@ -1685,13 +1685,25 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
             eprintln!("failed to initialize control-plane authority clock: {error}");
             std::process::exit(1);
         });
-    if let Some(previous_authority) = authority.snapshot().lease_grant_horizon_authority() {
-        authority_clock
-            .advance_generation_past_lease_horizon(previous_authority)
-            .unwrap_or_else(|error| {
-                eprintln!("failed to advance restarted control-plane clock generation: {error}");
+    if !authority_clock.is_established() {
+        invalidate_authority_clock_restart_checkpoint(Path::new(state_path)).unwrap_or_else(
+            |error| {
+                eprintln!("failed to invalidate blocked authority clock checkpoint: {error}");
                 std::process::exit(1);
-            });
+            },
+        );
+    }
+    if let Some(previous_authority) = authority.snapshot().lease_grant_horizon_authority() {
+        if !authority_clock.resume_single_authority_lease_horizon_generation(previous_authority) {
+            authority_clock
+                .advance_generation_past_lease_horizon(previous_authority)
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "failed to advance restarted control-plane clock generation: {error}"
+                    );
+                    std::process::exit(1);
+                });
+        }
     }
     let authority_clock = Arc::new(Mutex::new(authority_clock));
     let authority_clock_checkpoint_target = Arc::new(AuthorityClockCheckpointTarget {
@@ -1740,16 +1752,20 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 }
             }
         }
-        let expiry = {
+        let expiry = (|| {
             let mut authority = authority
                 .lock()
                 .expect("control-plane authority mutex poisoned");
-            authority_clock
+            let mut authority_clock = authority_clock
                 .lock()
-                .expect("control-plane authority clock mutex poisoned")
-                .effective_process_now_ms()
-                .and_then(|effective_now_ms| authority.expire_heartbeat_leases(effective_now_ms))
-        };
+                .expect("control-plane authority clock mutex poisoned");
+            let effective_now_ms = authority_clock.effective_process_now_ms();
+            invalidate_blocked_authority_clock_checkpoint(
+                &authority_clock,
+                Some(&authority_clock_checkpoint_target),
+            )?;
+            authority.expire_heartbeat_leases(effective_now_ms?)
+        })();
         match expiry {
             Ok(expiry) if !expiry.expired_nodes().is_empty() => {
                 process_info!(
@@ -2950,7 +2966,12 @@ fn store_experimental_raft_durable_restart_artifact(
         block_on_control_plane_raft(runtime, authority.store_durable_restart_artifact(path))?;
     let binding = authority.authority_clock_checkpoint_binding();
     if !artifact_existed && load_authority_clock_restart_checkpoint(path, binding)?.is_none() {
-        store_authority_clock_restart_checkpoint(path, binding, committed_timestamp_high_water_ms)?;
+        store_authority_clock_restart_checkpoint(
+            path,
+            binding,
+            1,
+            committed_timestamp_high_water_ms,
+        )?;
     }
     Ok(())
 }
@@ -3134,6 +3155,16 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             eprintln!("failed to initialize experimental OpenRaft authority clock: {error}");
             std::process::exit(1);
         });
+    if !initial_authority_clock.is_established() {
+        invalidate_authority_clock_restart_checkpoint(Path::new(state_path)).unwrap_or_else(
+            |error| {
+                eprintln!(
+                    "failed to invalidate blocked experimental OpenRaft authority clock checkpoint: {error}"
+                );
+                std::process::exit(1);
+            },
+        );
+    }
     if let Some(previous_authority) = initial_clock_snapshot.lease_grant_horizon_authority() {
         initial_authority_clock
             .advance_generation_past_lease_horizon(previous_authority)
@@ -3294,6 +3325,21 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         } else {
             Ok((ClusterEpoch::INITIAL, 0, 0))
         };
+        {
+            let authority_clock = authority_clock
+                .lock()
+                .expect("control-plane authority clock mutex poisoned");
+            invalidate_blocked_authority_clock_checkpoint(
+                &authority_clock,
+                Some(&authority_clock_checkpoint_target),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "failed to invalidate blocked experimental OpenRaft authority clock checkpoint: {error}"
+                );
+                std::process::exit(1);
+            });
+        }
         match expiry {
             Ok((cluster_epoch, expired_nodes, peering_pgs)) if expired_nodes > 0 => {
                 process_info!(
@@ -3527,7 +3573,7 @@ fn spawn_control_plane_rpc_worker(
                 let mut authority_clock = authority_clock
                     .lock()
                     .expect("control-plane authority clock mutex poisoned");
-                build_control_plane_authority_clock_admin_response(
+                let response = build_control_plane_authority_clock_admin_response(
                     &*authority,
                     &mut authority_clock,
                     request,
@@ -3541,7 +3587,12 @@ fn spawn_control_plane_rpc_worker(
                         )
                     },
                     || Ok(storage::clock::current_time_millis()),
-                )
+                );
+                invalidate_blocked_authority_clock_checkpoint(
+                    &authority_clock,
+                    authority_clock_checkpoint_target.as_deref(),
+                )?;
+                response
             } else if request.is_refresh_node_heartbeat() {
                 let prepared = {
                     let lock_started = Instant::now();
@@ -3559,7 +3610,12 @@ fn spawn_control_plane_rpc_worker(
                             let mut authority_clock = authority_clock
                                 .lock()
                                 .expect("control-plane authority clock mutex poisoned");
-                            let now_ms = authority_clock.effective_process_now_ms()?;
+                            let now_ms = authority_clock.effective_process_now_ms();
+                            invalidate_blocked_authority_clock_checkpoint(
+                                &authority_clock,
+                                authority_clock_checkpoint_target.as_deref(),
+                            )?;
+                            let now_ms = now_ms?;
                             let lease_horizon_authority =
                                 authority_clock.lease_horizon_authority_binding(None)?;
                             (now_ms, Some(lease_horizon_authority))
@@ -3602,10 +3658,15 @@ fn spawn_control_plane_rpc_worker(
                     observability::control_plane_rpc_operation_timer(metrics_kind);
                 let now_ms = match &authority_clock {
                     Some(authority_clock) if gate_request_time_with_authority_clock => {
-                        authority_clock
+                        let mut authority_clock = authority_clock
                             .lock()
-                            .expect("control-plane authority clock mutex poisoned")
-                            .effective_process_now_ms()?
+                            .expect("control-plane authority clock mutex poisoned");
+                        let now_ms = authority_clock.effective_process_now_ms();
+                        invalidate_blocked_authority_clock_checkpoint(
+                            &authority_clock,
+                            authority_clock_checkpoint_target.as_deref(),
+                        )?;
+                        now_ms?
                     }
                     _ => storage::clock::current_time_millis(),
                 };
@@ -3623,6 +3684,20 @@ fn spawn_control_plane_rpc_worker(
                 }
             }
         })();
+        if let Some(authority_clock) = &authority_clock {
+            let authority_clock = authority_clock
+                .lock()
+                .expect("control-plane authority clock mutex poisoned");
+            if let Err(error) = invalidate_blocked_authority_clock_checkpoint(
+                &authority_clock,
+                authority_clock_checkpoint_target.as_deref(),
+            ) {
+                eprintln!(
+                    "failed to invalidate blocked control-plane authority clock checkpoint: {error}"
+                );
+                std::process::exit(1);
+            }
+        }
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -3660,18 +3735,36 @@ fn persist_established_authority_clock_checkpoint(
     let checkpoint_target = checkpoint_target.ok_or_else(|| ControlPlaneError::RpcProtocol {
         message: "authority-clock administration requires a durable checkpoint path".to_owned(),
     })?;
-    if let Err(error) = store_validated_authority_clock_restart_checkpoint(
-        &checkpoint_target.path,
-        checkpoint_target.binding,
-        context.committed_timestamp_high_water_ms(),
-        authority_clock,
-    ) {
+    let persistence_result = (|| {
+        invalidate_authority_clock_restart_checkpoint(&checkpoint_target.path)?;
+        store_validated_authority_clock_restart_checkpoint(
+            &checkpoint_target.path,
+            checkpoint_target.binding,
+            context.committed_timestamp_high_water_ms(),
+            authority_clock,
+        )?;
+        Ok::<(), ControlPlaneError>(())
+    })();
+    if let Err(error) = persistence_result {
         if authority_clock.status(context).established() {
             authority_clock.fail_closed_after_checkpoint_persistence_failure()?;
         }
         return Err(error);
     }
     Ok(())
+}
+
+fn invalidate_blocked_authority_clock_checkpoint(
+    authority_clock: &ControlPlaneAuthorityClock,
+    checkpoint_target: Option<&AuthorityClockCheckpointTarget>,
+) -> Result<(), ControlPlaneError> {
+    if authority_clock.is_established() {
+        return Ok(());
+    }
+    let checkpoint_target = checkpoint_target.ok_or_else(|| ControlPlaneError::RpcProtocol {
+        message: "blocked authority clock requires a durable checkpoint path".to_owned(),
+    })?;
+    invalidate_authority_clock_restart_checkpoint(&checkpoint_target.path)
 }
 
 fn load_process_authority_clock_restart_checkpoint(
@@ -5231,6 +5324,7 @@ mod tests {
         let checkpoint = load_authority_clock_restart_checkpoint(&state_path, binding)
             .expect("checkpoint should load")
             .expect("checkpoint should exist");
+        assert_eq!(checkpoint.authority_generation(), 2);
         assert_eq!(checkpoint.committed_timestamp_high_water_ms(), Some(1_000));
         assert_eq!(checkpoint.wall_time_ms(), 5_000);
         assert_eq!(checkpoint.health_time_ms(), 5_000);
@@ -5248,7 +5342,7 @@ mod tests {
         let state_path = tmp.join("control-plane.state");
         let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft("test-cluster", 1);
         storage::clock::with_time_override(1_000, || {
-            store_authority_clock_restart_checkpoint(&state_path, binding, Some(999)).unwrap();
+            store_authority_clock_restart_checkpoint(&state_path, binding, 1, Some(999)).unwrap();
         });
         let mut checkpoint_path = state_path.as_os_str().to_os_string();
         checkpoint_path.push(".clock");
@@ -5319,6 +5413,113 @@ mod tests {
                 storage::control_plane::ControlPlaneAuthorityClockBlockedReason::CheckpointPersistenceFailure
             )
         );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn authority_clock_fault_durably_invalidates_restart_continuation() {
+        let tmp = short_unix_socket_test_dir("clock-fault-checkpoint-invalidation");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state_path = tmp.join("authority.state");
+        let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft("test-cluster", 1);
+        storage::clock::with_time_override(1_000, || {
+            store_authority_clock_restart_checkpoint(&state_path, binding, 7, None).unwrap();
+        });
+        let checkpoint = load_authority_clock_restart_checkpoint(&state_path, binding)
+            .unwrap()
+            .unwrap();
+        let mut authority_clock = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
+            None,
+            1_000,
+            Some(1_000),
+            Some(checkpoint),
+        )
+        .unwrap();
+        assert!(
+            authority_clock.resume_single_authority_lease_horizon_generation(
+                LeaseHorizonAuthorityBinding::checked_new(7, None).unwrap()
+            )
+        );
+        assert!(authority_clock.effective_now_ms(0, Some(1_001)).is_err());
+        let target = AuthorityClockCheckpointTarget {
+            path: state_path.clone(),
+            binding,
+        };
+
+        invalidate_blocked_authority_clock_checkpoint(&authority_clock, Some(&target)).unwrap();
+        assert_eq!(
+            load_authority_clock_restart_checkpoint(&state_path, binding).unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn failed_clock_recovery_replacement_cannot_reuse_old_checkpoint() {
+        let tmp = short_unix_socket_test_dir("clock-recovery-checkpoint-invalidation");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let state_path = tmp.join("authority.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let binding = store
+            .load_or_create_authority_clock_checkpoint_binding()
+            .unwrap();
+        let authority = SingleAuthorityControlPlane::open(store).unwrap();
+        storage::clock::with_time_override(1_000, || {
+            store_authority_clock_restart_checkpoint(&state_path, binding, 7, None).unwrap();
+        });
+        let checkpoint = load_authority_clock_restart_checkpoint(&state_path, binding)
+            .unwrap()
+            .unwrap();
+        let context = authority.authority_clock_context().unwrap();
+        let mut authority_clock = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
+            None,
+            1_000,
+            Some(1_000),
+            Some(checkpoint),
+        )
+        .unwrap();
+        assert!(authority_clock.effective_now_ms(0, Some(1_001)).is_err());
+        let blocked = authority_clock.status(context);
+        authority_clock
+            .reestablish(
+                blocked.generation(),
+                None,
+                None,
+                context,
+                1_000,
+                Some(1_000),
+            )
+            .unwrap();
+
+        let mut tmp_checkpoint_path = state_path.as_os_str().to_os_string();
+        tmp_checkpoint_path.push(".clock.tmp");
+        std::fs::create_dir(PathBuf::from(tmp_checkpoint_path)).unwrap();
+        let target = AuthorityClockCheckpointTarget {
+            path: state_path.clone(),
+            binding,
+        };
+        storage::clock::with_time_override(1_000, || {
+            assert!(persist_established_authority_clock_checkpoint(
+                &authority,
+                &mut authority_clock,
+                Some(&target),
+            )
+            .is_err());
+        });
+        assert!(!authority_clock.is_established());
+        assert_eq!(
+            load_authority_clock_restart_checkpoint(&state_path, binding).unwrap(),
+            None
+        );
+
+        let mut restarted =
+            ControlPlaneAuthorityClock::new_with_restart_checkpoint(None, 1_001, Some(1_001), None)
+                .unwrap();
+        assert!(!restarted.resume_single_authority_lease_horizon_generation(
+            LeaseHorizonAuthorityBinding::checked_new(7, None).unwrap()
+        ));
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
@@ -6196,6 +6397,7 @@ mod tests {
         store_authority_clock_restart_checkpoint(
             &state_path,
             checkpoint_binding,
+            1,
             expected.max_committed_timestamp_ms(),
         )
         .expect("test restart artifact should have a paired authority-clock checkpoint");

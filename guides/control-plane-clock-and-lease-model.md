@@ -82,8 +82,9 @@ the corresponding monotonic elapsed time, even when the authority has been
 idle for longer than the skew budget. A wall/monotonic divergence beyond the
 budget latches the authority clock non-serving. Durable control-plane state is
 paired with a checksummed, node-local checkpoint naming a durable timestamp
-prefix, one coherent wall/health-clock sample, and a fixed durable-authority
-identity binding. Raft bindings cover cluster identity plus local node ID;
+prefix, the exact nonzero authority-clock generation, one coherent
+wall/health-clock sample, and a fixed durable-authority identity binding. Raft
+bindings cover cluster identity plus local node ID;
 single-authority state has a separately persisted random durable identity. A
 checkpoint copied from another authority therefore fails closed even when both
 processes share the same host clocks. On restart,
@@ -97,6 +98,28 @@ replaces the checkpoint before the admin RPC acknowledges success; a
 checkpoint persistence failure re-latches the authority non-serving. The
 checkpoint is local clock-lineage evidence; it is not replicated authority and
 must never be copied between Raft nodes.
+
+A single-authority process that already holds the exclusive durable-state lock
+may treat a valid identity-bound restart checkpoint as proof that it is a
+continuation of the persisted no-term lease-horizon authority. It resumes that
+same bounded horizon generation rather than creating a successor and waiting
+for its own horizon to expire, but only when the checkpoint generation exactly
+equals the horizon binding. Continuation never assigns or rolls back a clock
+generation. A clock fault advances the in-memory generation, and successful
+authenticated re-establishment durably checkpoints the further-advanced
+generation before acknowledging recovery; a later restart therefore cannot
+reuse an older persisted horizon as continuation evidence. This is a one-shot
+startup capability: a missing or invalid checkpoint, a generation mismatch,
+or any Raft-term-bound horizon retains the ordinary new-generation successor
+fence. A detected clock fault consumes the current process's continuation
+capability and durably removes the restart checkpoint before the process can
+continue. Authenticated recovery also removes and directory-syncs the old
+checkpoint before writing its higher-generation replacement. A crash or
+replacement-write failure therefore leaves no reusable old evidence. The new
+generation becomes restart evidence only after the replacement file and its
+directory are durable. The continuation may
+extend only through the normal committed horizon command and does not recover
+any volatile heartbeat observation or process-local consumer lease.
 
 Recovery checkpointing takes a fresh wall/health sample, validates it through
 the already re-established authority clock, and persists that exact accepted
