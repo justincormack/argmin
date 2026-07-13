@@ -3822,6 +3822,41 @@ pub struct ClusterRuntimeMapSnapshot {
     historical_cluster_epochs: Vec<ClusterEpoch>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SparsePgRouteReconstructionError {
+    UnknownClusterEpoch,
+    UnknownPg,
+}
+
+pub(crate) fn reconstruct_sparse_pg_route_at_epoch<'a>(
+    current_epoch: ClusterEpoch,
+    current_route: Option<PgRouteSnapshot>,
+    historical_pg_routes: impl Iterator<Item = &'a PgRouteSnapshot> + Clone,
+    historical_epoch_retained: bool,
+    cluster_epoch: ClusterEpoch,
+) -> Result<PgRouteSnapshot, SparsePgRouteReconstructionError> {
+    if cluster_epoch == current_epoch {
+        return current_route.ok_or(SparsePgRouteReconstructionError::UnknownPg);
+    }
+    if !historical_epoch_retained {
+        return Err(SparsePgRouteReconstructionError::UnknownClusterEpoch);
+    }
+    if !historical_pg_routes
+        .clone()
+        .any(|route| route.cluster_epoch <= cluster_epoch)
+    {
+        return Err(SparsePgRouteReconstructionError::UnknownPg);
+    }
+    let mut route = historical_pg_routes
+        .filter(|route| route.cluster_epoch >= cluster_epoch)
+        .min_by_key(|route| route.cluster_epoch)
+        .cloned()
+        .or(current_route)
+        .ok_or(SparsePgRouteReconstructionError::UnknownPg)?;
+    route.cluster_epoch = cluster_epoch;
+    Ok(route)
+}
+
 impl ClusterRuntimeMapSnapshot {
     #[must_use]
     pub fn cluster_epoch(&self) -> ClusterEpoch {
@@ -3897,43 +3932,30 @@ impl ClusterRuntimeMapSnapshot {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
     ) -> Result<PgRouteSnapshot, ControlPlaneError> {
-        if cluster_epoch == self.cluster_epoch {
-            return self
-                .pg_routes
+        let current_route = self
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == pg_id)
+            .map(PgRouteSnapshot::without_serving_authority);
+        reconstruct_sparse_pg_route_at_epoch(
+            self.cluster_epoch,
+            current_route,
+            self.historical_pg_routes
                 .iter()
-                .find(|route| route.pg_id == pg_id)
-                .map(PgRouteSnapshot::without_serving_authority)
-                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() });
-        }
-        if self
-            .historical_cluster_epochs
-            .binary_search(&cluster_epoch)
-            .is_err()
-        {
-            return Err(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch });
-        }
-        if !self
-            .historical_pg_routes
-            .iter()
-            .any(|route| route.pg_id == pg_id && route.cluster_epoch <= cluster_epoch)
-        {
-            return Err(ControlPlaneError::UnknownPg { pg_id: pg_id.get() });
-        }
-        let mut route = self
-            .historical_pg_routes
-            .iter()
-            .filter(|route| route.pg_id == pg_id && route.cluster_epoch >= cluster_epoch)
-            .min_by_key(|route| route.cluster_epoch)
-            .cloned()
-            .or_else(|| {
-                self.pg_routes
-                    .iter()
-                    .find(|route| route.pg_id == pg_id)
-                    .map(PgRouteSnapshot::without_serving_authority)
-            })
-            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-        route.cluster_epoch = cluster_epoch;
-        Ok(route)
+                .filter(|route| route.pg_id == pg_id),
+            self.historical_cluster_epochs
+                .binary_search(&cluster_epoch)
+                .is_ok(),
+            cluster_epoch,
+        )
+        .map_err(|error| match error {
+            SparsePgRouteReconstructionError::UnknownClusterEpoch => {
+                ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch }
+            }
+            SparsePgRouteReconstructionError::UnknownPg => {
+                ControlPlaneError::UnknownPg { pg_id: pg_id.get() }
+            }
+        })
     }
 
     pub fn runtime_map_at_epoch(
@@ -19406,15 +19428,26 @@ mod tests {
         let verifier_for_assert = verifier.clone();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
-            for authority_now_ms in [2_000, 2_000] {
+            for _ in 0..2 {
                 let (mut stream, _addr) = listener.accept().unwrap();
-                handle_control_plane_unix_stream_with_auth(
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let response = build_control_plane_unix_response_with_auth_and_response_clock(
                     &mut authority,
-                    &mut stream,
-                    authority_now_ms,
-                    &verifier,
+                    request,
+                    issued_at_ms,
+                    Some(&verifier),
+                    || Ok(issued_at_ms),
                 )
                 .unwrap();
+                write_control_plane_unix_response(&mut stream, response).unwrap();
             }
             assert_eq!(
                 authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
@@ -28958,6 +28991,14 @@ mod tests {
         authority
             .set_pg_acting_set(PgId::new(30), vec![NodeId::new(2)])
             .unwrap();
+        let moved_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        let intervening_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(2)])
+            .unwrap();
 
         let runtime_map = authority.snapshot().runtime_map(2_001).unwrap();
         let local_map =
@@ -28973,10 +29014,33 @@ mod tests {
             .reconstructed_pg_route_at_epoch(PgId::new(30), source_epoch)
             .unwrap();
         assert_eq!(historical.acting_set(), &[NodeId::new(1)]);
+        let moved = cluster
+            .reconstructed_pg_route_at_epoch(PgId::new(30), moved_epoch)
+            .unwrap();
+        assert_eq!(moved.acting_set(), &[NodeId::new(2)]);
+        let intervening = cluster
+            .reconstructed_pg_route_at_epoch(PgId::new(30), intervening_epoch)
+            .unwrap();
+        assert_eq!(intervening.acting_set(), &[NodeId::new(2)]);
         let current = cluster
             .reconstructed_pg_route_at_epoch(PgId::new(30), runtime_map.cluster_epoch())
             .unwrap();
         assert_eq!(current.acting_set(), &[NodeId::new(2)]);
+
+        for epoch in runtime_map.historical_cluster_epochs() {
+            for pg_id in [PgId::new(30), PgId::new(31)] {
+                let expected = runtime_map.reconstructed_pg_route_at_epoch(pg_id, *epoch);
+                let actual = cluster.reconstructed_pg_route_at_epoch(pg_id, *epoch);
+                match expected {
+                    Ok(expected) => {
+                        let actual = actual.expect("local map should retain the runtime-map route");
+                        assert!(pg_route_configuration_eq(&actual, &expected));
+                    }
+                    Err(ControlPlaneError::UnknownPg { .. }) => assert!(actual.is_err()),
+                    Err(error) => panic!("runtime map rejected retained epoch {epoch}: {error}"),
+                }
+            }
+        }
     }
 
     #[test]

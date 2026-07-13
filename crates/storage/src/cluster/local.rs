@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
-use crate::control_plane::{ClusterRuntimeMapSnapshot, NodeRouteSnapshot, PgRouteSnapshot};
+use crate::control_plane::{
+    reconstruct_sparse_pg_route_at_epoch, ClusterRuntimeMapSnapshot, NodeRouteSnapshot,
+    PgRouteSnapshot,
+};
 use crate::control_plane_lease::{
     validate_process_lease_clock, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
 };
@@ -1344,7 +1347,8 @@ pub struct LocalClusterMap {
     pg_topology: PgTopology,
     default_ec_shape: EcShape,
     pg_routes: BTreeMap<PgId, LocalPgRoute>,
-    historical_pg_routes: BTreeMap<(ClusterEpoch, PgId), PgRouteSnapshot>,
+    historical_pg_routes: BTreeMap<(PgId, ClusterEpoch), PgRouteSnapshot>,
+    historical_cluster_epochs: BTreeSet<ClusterEpoch>,
     runtime_state: Arc<LocalClusterRuntimeState>,
     process_local_registry_key: usize,
 }
@@ -1505,6 +1509,7 @@ impl LocalClusterMap {
             default_ec_shape,
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
+            historical_cluster_epochs: BTreeSet::new(),
             route_map_validity: encode_route_map_validity(RouteMapValidity::Forever),
             route_map_local_valid_until_monotonic_ms: encode_unbound_route_map_lease(
                 RouteMapValidity::Forever,
@@ -1596,6 +1601,7 @@ impl LocalClusterMap {
             default_ec_shape,
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
+            historical_cluster_epochs: BTreeSet::new(),
             route_map_validity: encode_route_map_validity(route_map_validity),
             route_map_local_valid_until_monotonic_ms: encode_unbound_route_map_lease(
                 route_map_validity,
@@ -1639,7 +1645,12 @@ impl LocalClusterMap {
         local_map.historical_pg_routes = runtime_map
             .historical_pg_routes()
             .iter()
-            .map(|route| ((route.cluster_epoch(), route.pg_id()), route.clone()))
+            .map(|route| ((route.pg_id(), route.cluster_epoch()), route.clone()))
+            .collect();
+        local_map.historical_cluster_epochs = runtime_map
+            .historical_cluster_epochs()
+            .iter()
+            .copied()
             .collect();
         let local_monotonic_ms = crate::clock::monotonic_time_millis();
         let bound_lease = runtime_map
@@ -1703,6 +1714,14 @@ impl LocalClusterMap {
                 .into_iter()
                 .map(|route| LocalPgRoute::from(&route)),
         )?;
+        let historical_pg_routes: BTreeMap<_, _> = historical_pg_routes
+            .into_iter()
+            .map(|route| ((route.pg_id(), route.cluster_epoch()), route))
+            .collect();
+        let historical_cluster_epochs = historical_pg_routes
+            .values()
+            .map(PgRouteSnapshot::cluster_epoch)
+            .collect();
         Ok(Self {
             epoch: cluster_epoch,
             route_map_validity: encode_route_map_validity(RouteMapValidity::Forever),
@@ -1715,10 +1734,8 @@ impl LocalClusterMap {
             pg_topology: self.pg_topology.clone(),
             default_ec_shape: self.default_ec_shape,
             pg_routes,
-            historical_pg_routes: historical_pg_routes
-                .into_iter()
-                .map(|route| ((route.cluster_epoch(), route.pg_id()), route))
-                .collect(),
+            historical_pg_routes,
+            historical_cluster_epochs,
             runtime_state: Arc::clone(&self.runtime_state),
             process_local_registry_key: self.process_local_registry_key,
         })
@@ -1856,6 +1873,7 @@ impl LocalClusterMap {
             default_ec_shape,
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
+            historical_cluster_epochs: BTreeSet::new(),
             route_map_validity: encode_route_map_validity(RouteMapValidity::Forever),
             route_map_local_valid_until_monotonic_ms: encode_unbound_route_map_lease(
                 RouteMapValidity::Forever,
@@ -2744,25 +2762,25 @@ impl LocalClusterMap {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
     ) -> Option<PgRouteSnapshot> {
-        if cluster_epoch == self.epoch {
-            return self.pg_route(pg_id).map(|route| {
-                PgRouteSnapshot::reconstructed(
-                    route.cluster_epoch(),
-                    route.pg_id(),
-                    route.primary_node_id(),
-                    route.acting_set().to_vec(),
-                    route.state(),
-                )
-            });
-        }
-        let mut route = self
-            .historical_pg_routes
-            .range(..=(cluster_epoch, pg_id))
-            .rev()
-            .find(|((_, route_pg_id), _)| *route_pg_id == pg_id)
-            .map(|(_, route)| route.clone())?;
-        route = route.with_cluster_epoch(cluster_epoch);
-        Some(route)
+        let current_route = self.pg_route(pg_id).map(|route| {
+            PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            )
+        });
+        reconstruct_sparse_pg_route_at_epoch(
+            self.epoch,
+            current_route,
+            self.historical_pg_routes
+                .range((pg_id, ClusterEpoch::INITIAL)..=(pg_id, self.epoch))
+                .map(|(_, route)| route),
+            self.historical_cluster_epochs.contains(&cluster_epoch),
+            cluster_epoch,
+        )
+        .ok()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -2772,7 +2790,12 @@ impl LocalClusterMap {
     ) {
         self.historical_pg_routes = routes
             .into_iter()
-            .map(|route| ((route.cluster_epoch(), route.pg_id()), route))
+            .map(|route| ((route.pg_id(), route.cluster_epoch()), route))
+            .collect();
+        self.historical_cluster_epochs = self
+            .historical_pg_routes
+            .values()
+            .map(PgRouteSnapshot::cluster_epoch)
             .collect();
     }
 

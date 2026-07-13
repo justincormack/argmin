@@ -10894,7 +10894,11 @@ Required production shape and implementation order:
    Pruning also retains absence boundaries needed by older exact references
    and follows metadata-transfer dependencies from the unmodified delta graph
    before deletion. Parsing and snapshot audit reject non-canonically ordered or
-   conflicting presence/absence markers and broken transfer chains. A
+   conflicting presence/absence markers and broken transfer chains.
+   `LocalClusterMap` built from a runtime map preserves the retained epoch set
+   and uses the same shared reverse-delta reconstruction helper as the wire
+   snapshot; compact history must never be reinterpreted as dense snapshots at
+   a consumer boundary. A
    regression matching the soak startup
    sequence configures 216 PGs one command at a time and proves this creates no
    copied historical PG routes, exactly 216 introduction markers, a bounded

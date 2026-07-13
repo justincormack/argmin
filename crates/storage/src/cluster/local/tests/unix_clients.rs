@@ -8753,8 +8753,15 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let target_node = NodeId::new(1);
     let ec_shape = EcShape { k: 2, m: 1 };
-    let mut map =
-        LocalClusterMap::open(&tmp.path().join("frontend"), &node_ids, &[0], ec_shape).unwrap();
+    let current_epoch = ClusterEpoch::new(8).unwrap();
+    let mut map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        NodeId::new(0),
+        node_ids,
+        &[0],
+        ec_shape,
+        current_epoch,
+    )
+    .unwrap();
     let socket_path = tmp.path().join("sockets").join("historical-node-1.sock");
     private_socket_dir(socket_path.parent().unwrap());
     let remote_data_dir = tmp.path().join("historical-remote-node-1");
@@ -8789,7 +8796,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let server = Arc::new(
         StorageNodeServer::bind(StorageNodeProcessConfig {
             node_id: target_node,
-            cluster_epoch: ClusterEpoch::INITIAL,
+            cluster_epoch: current_epoch,
             route_map_validity: RouteMapValidity::Forever,
             data_dir: remote_data_dir,
             default_ec_shape: ec_shape,
@@ -8797,7 +8804,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
             socket_path: socket_path.clone(),
             pg_routes: vec![StorageNodePgRoute {
                 pg_id: data_pg_id.get(),
-                cluster_epoch: ClusterEpoch::INITIAL,
+                cluster_epoch: current_epoch,
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 acting_set: node_ids.to_vec(),
@@ -8829,13 +8836,18 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
         .unwrap();
 
     assert_eq!(observed, payload);
-    assert!(matches!(
-        map.node(target_node)
-            .unwrap()
-            .storage_node()
-            .read_shard_file(data_pg_id.get(), &shard_key),
-        Err(StoreError::NotFound)
-    ));
+    let local_read = map
+        .node(target_node)
+        .unwrap()
+        .storage_node()
+        .read_shard_file(data_pg_id.get(), &shard_key);
+    assert!(
+        matches!(
+            local_read,
+            Err(StoreError::NotFound | StoreError::PgNotFound { .. })
+        ),
+        "frontend-local shard should remain absent: {local_read:?}"
+    );
     server_thread.join().unwrap();
 }
 
