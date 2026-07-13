@@ -720,9 +720,10 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The broader `AssumeRole` parameter and error matrix, role mutation precedence,
-session-principal context, and `aws:TokenIssueTime` behavior remain before
-Phase 0 can satisfy its exit condition.
+The optional `AssumeRole` security-context parameters, role maximum and role
+chaining behavior, role mutation precedence, session-principal context, and
+`aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
+condition.
 
 The role-fixture capability will use the ordinary primary and alternate test
 users, not the owner/root credential. The shared test-user policy grants only
@@ -826,6 +827,56 @@ same-account success: the assumed-role ARN omits the IAM role path,
 `PackedPolicySize` is absent when no session policy is supplied, and only the
 credential values, role unique ID, expiration, and request IDs require
 normalization.
+
+The core `AssumeRole` parameter slice completed on 2026-07-13. Its
+path-bearing same-account role is created with a 43,200-second maximum session
+duration, allowing one target to pin the complete API-level range without
+confounding it with the role's configured maximum. The AWS-backed exact golden
+matrix establishes that:
+
+- omitted, empty, too-short, and length-valid malformed `RoleArn` values and
+  omitted, empty, too-short, too-long, and pattern-invalid `RoleSessionName`
+  values receive the observed STS validation shapes, while a syntactically
+  valid nonexistent role produces the same HTTP 403 `AccessDenied` shape as an
+  authorization failure
+- `RoleArn` length is counted in decoded Unicode scalar values, not UTF-8 bytes
+  or UTF-16 code units: 2,048 multibyte BMP characters pass the length check,
+  while 2,049 fail; 2,048 supplementary characters receive only the pattern
+  error, while 2,049 receive the pattern error followed by the maximum-length
+  error
+- AWS does not normalize `RoleArn` before counting: 1,025 decomposed `e` plus
+  combining-acute pairs are rejected as 2,050 scalar values, rather than being
+  normalized to 1,025 precomposed characters
+- supplementary characters are rejected by AWS's pattern validator even
+  though the pattern rendered in the error appears to include
+  `U+10000`-`U+10FFFF`; the implementation must reproduce the observed
+  behavior rather than interpreting the displayed pattern literally
+- `RoleSessionName` accepts the two- and 64-character boundaries and rejects
+  values outside that range or outside `[\w+=,.@-]*`
+- absent `DurationSeconds` defaults to 3,600 seconds, 900 and 43,200 are the
+  accepted API boundaries, and 899 and 43,201 receive exact `ValidationError`
+  responses
+- duration parsing is signed 32-bit: `+900` and `0900` are accepted as 900;
+  `-1` and the in-range signed extrema reach ordinary minimum/maximum
+  validation; values one past either signed 32-bit extreme and a decimal form
+  return HTTP 400 `MalformedInput` with no `Message` element
+- an empty duration is also HTTP 400 `MalformedInput`, but uniquely includes
+  `missing value for decimal type`; alphabetic input has no `Message` element,
+  like the other numeric parse failures
+- each successful response's `Expiration` is exactly the default or requested
+  duration after the HTTP response date, in addition to matching the complete
+  success XML and semantic header golden
+- duplicate `RoleArn`, `RoleSessionName`, and `DurationSeconds` parameters use
+  the first wire value, and an unknown extra parameter is ignored
+
+The first implementation-facing core can therefore parse and validate
+`RoleArn`, `RoleSessionName`, and optional `DurationSeconds` from the Query
+request without guessed behavior. This does not authorize silently ignoring
+known optional `AssumeRole` inputs: session policy/policy ARNs, external ID,
+source identity, tags/transitive tags, MFA fields, and provided contexts still
+need explicit AWS-backed scope decisions. Configured role-maximum rejection and
+the one-hour role-chaining limit also remain separate from the API-level
+duration bounds pinned here.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations

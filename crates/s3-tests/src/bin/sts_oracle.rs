@@ -6,6 +6,7 @@
 
 use std::env;
 
+use aws_smithy_types::{date_time::Format as DateTimeFormat, DateTime};
 use s3_tests::{
     send_signed_request_for_service_with_credentials,
     shape::{assert_shape, response_header_value, shape, xml_tag_text, ShapeSpec},
@@ -125,14 +126,28 @@ fn assert_probe(probe: &Probe<'_>, response: &RawResponse, account_id: &str) {
             );
         }
         Expected::Error { code, message } => {
-            assert_error_probe(probe.label, response, 400, AWS_FAULT_XMLNS, code, message);
+            assert_error_probe(
+                probe.label,
+                response,
+                400,
+                AWS_FAULT_XMLNS,
+                code,
+                Some(message),
+            );
         }
         Expected::StsError {
             status,
             code,
             message,
         } => {
-            assert_error_probe(probe.label, response, status, STS_XMLNS, code, message);
+            assert_error_probe(
+                probe.label,
+                response,
+                status,
+                STS_XMLNS,
+                code,
+                Some(message),
+            );
         }
         Expected::Redirect { location } => {
             assert_shape(
@@ -153,8 +168,11 @@ fn assert_error_probe(
     status: u16,
     namespace: &str,
     code: &str,
-    message: &str,
+    message: Option<&str>,
 ) {
+    let message_element = message
+        .map(|message| format!("    <Message>{message}</Message>\n"))
+        .unwrap_or_default();
     assert_shape(
         label,
         response,
@@ -163,8 +181,7 @@ fn assert_error_probe(
             .header("content-type", "text/xml")
             .body(format!(
                 "<ErrorResponse xmlns=\"{namespace}\">\n  <Error>\n    \
-                 <Type>Sender</Type>\n    <Code>{code}</Code>\n    \
-                 <Message>{message}</Message>\n  </Error>\n  \
+                 <Type>Sender</Type>\n    <Code>{code}</Code>\n{message_element}  </Error>\n  \
                  <RequestId>{{sts_request_id}}</RequestId>\n</ErrorResponse>\n"
             )),
     );
@@ -174,6 +191,33 @@ fn form_body(parameters: &[(&str, &str)]) -> String {
     url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(parameters.iter().copied())
         .finish()
+}
+
+fn send_assume_role(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    parameters: &[(&str, &str)],
+) -> RawResponse {
+    let body = form_body(parameters);
+    QueryRequest::Post {
+        body: &body,
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send(endpoint, credentials)
+}
+
+fn assert_assume_role_error(
+    label: &str,
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    parameters: &[(&str, &str)],
+    status: u16,
+    code: &str,
+    message: Option<&str>,
+) {
+    let response = send_assume_role(endpoint, credentials, parameters);
+    assert_error_probe(label, &response, status, STS_XMLNS, code, message);
+    println!("{label}: ok");
 }
 
 fn required_xml_text(response: &RawResponse, tag: &str, label: &str) -> String {
@@ -198,11 +242,26 @@ fn assert_assume_role_success(
     account_id: &str,
     role_name: &str,
     role_session_name: &str,
+    duration_seconds: i64,
 ) {
     let access_key = required_xml_text(response, "AccessKeyId", label);
     let secret_key = required_xml_text(response, "SecretAccessKey", label);
     let session_token = required_xml_text(response, "SessionToken", label);
     let assumed_role_id = required_xml_text(response, "AssumedRoleId", label);
+    let expiration = required_xml_text(response, "Expiration", label);
+
+    let response_date = response_header_value(response, "date")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| panic!("{label}: missing date response header"));
+    let response_date = DateTime::from_str(response_date, DateTimeFormat::HttpDate)
+        .unwrap_or_else(|error| panic!("{label}: invalid date response header: {error}"));
+    let expiration = DateTime::from_str(&expiration, DateTimeFormat::DateTime)
+        .unwrap_or_else(|error| panic!("{label}: invalid Expiration timestamp: {error}"));
+    assert_eq!(
+        expiration.secs() - response_date.secs(),
+        duration_seconds,
+        "{label}: Expiration does not match the requested session duration"
+    );
 
     assert!(
         access_key.len() == 20
@@ -286,75 +345,556 @@ fn assert_assume_role_success(
     );
 }
 
+struct AssumeRoleSuccess<'a> {
+    account_id: &'a str,
+    role_name: &'a str,
+    role_session_name: &'a str,
+    duration_seconds: i64,
+}
+
+fn assert_assume_role_request_success(
+    label: &str,
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    parameters: &[(&str, &str)],
+    expected: AssumeRoleSuccess<'_>,
+) {
+    let response = send_assume_role(endpoint, credentials, parameters);
+    assert_assume_role_success(
+        label,
+        &response,
+        expected.account_id,
+        expected.role_name,
+        expected.role_session_name,
+        expected.duration_seconds,
+    );
+    println!("{label}: ok");
+}
+
 fn run_assume_role_probes(
     endpoint: &str,
     credentials: SignedRequestCredentials<'_>,
     account_id: &str,
+    caller_arn: &str,
     role_arn: &str,
     role_name: &str,
     role_session_name: &str,
 ) {
-    let missing_role_arn_body = form_body(&[
-        ("Action", "AssumeRole"),
-        ("Version", "2011-06-15"),
-        ("RoleSessionName", role_session_name),
-    ]);
-    let missing_role_arn = Probe {
-        label: "assume-role-missing-role-arn",
-        request: QueryRequest::Post {
-            body: &missing_role_arn_body,
-            content_type: Some(QUERY_CONTENT_TYPE),
-        },
-        expected: Expected::StsError {
-            status: 400,
-            code: "ValidationError",
-            message: "1 validation error detected: Value null at 'roleArn' failed to satisfy constraint: Member must not be null",
-        },
-    };
-    let response = missing_role_arn.request.send(endpoint, credentials);
-    assert_probe(&missing_role_arn, &response, account_id);
-    println!("{}: ok", missing_role_arn.label);
-
-    let missing_session_name_body = form_body(&[
-        ("Action", "AssumeRole"),
-        ("Version", "2011-06-15"),
-        ("RoleArn", role_arn),
-    ]);
-    let missing_session_name = Probe {
-        label: "assume-role-missing-session-name",
-        request: QueryRequest::Post {
-            body: &missing_session_name_body,
-            content_type: Some(QUERY_CONTENT_TYPE),
-        },
-        expected: Expected::StsError {
-            status: 400,
-            code: "ValidationError",
-            message: "1 validation error detected: Value null at 'roleSessionName' failed to satisfy constraint: Member must not be null",
-        },
-    };
-    let response = missing_session_name.request.send(endpoint, credentials);
-    assert_probe(&missing_session_name, &response, account_id);
-    println!("{}: ok", missing_session_name.label);
-
-    let body = form_body(&[
-        ("Action", "AssumeRole"),
-        ("Version", "2011-06-15"),
-        ("RoleArn", role_arn),
-        ("RoleSessionName", role_session_name),
-    ]);
-    let response = QueryRequest::Post {
-        body: &body,
-        content_type: Some(QUERY_CONTENT_TYPE),
-    }
-    .send(endpoint, credentials);
-    assert_assume_role_success(
-        "assume-role-path-bearing-role",
-        &response,
-        account_id,
-        role_name,
-        role_session_name,
+    let missing_role_arn = format!("{role_arn}-missing");
+    let malformed_role_arn = "x".repeat(20);
+    let max_role_arn = "x".repeat(2048);
+    let overlong_role_arn = "x".repeat(2049);
+    let max_bmp_role_arn = "é".repeat(2048);
+    let overlong_bmp_role_arn = "é".repeat(2049);
+    let supplementary_2048_role_arn = "😀".repeat(2048);
+    let supplementary_2049_role_arn = "😀".repeat(2049);
+    let decomposed_1025_role_arn = "e\u{301}".repeat(1025);
+    let long_session_name = "a".repeat(65);
+    let max_session_name = "b".repeat(64);
+    let unknown_role_message = format!(
+        "User: {caller_arn} is not authorized to perform: sts:AssumeRole on resource: {missing_role_arn}"
     );
-    println!("assume-role-path-bearing-role: ok");
+    let long_session_message = format!(
+        "1 validation error detected: Value '{long_session_name}' at 'roleSessionName' failed to satisfy constraint: Member must have length less than or equal to 64"
+    );
+    let malformed_role_message = format!("{malformed_role_arn} is invalid");
+    let max_role_message = format!("{max_role_arn} is invalid");
+    let overlong_role_message = format!(
+        "1 validation error detected: Value '{overlong_role_arn}' at 'roleArn' failed to satisfy constraint: Member must have length less than or equal to 2048"
+    );
+    let role_arn_pattern =
+        r"[\u0009\u000A\u000D\u0020-\u007E\u0085\u00A0-\uD7FF\uE000-\uFFFD\u10000-\u10FFFF]+";
+
+    assert_eq!(max_bmp_role_arn.len(), 4096);
+    assert_eq!(max_bmp_role_arn.chars().count(), 2048);
+    assert_eq!(max_bmp_role_arn.encode_utf16().count(), 2048);
+    assert_eq!(supplementary_2048_role_arn.len(), 8192);
+    assert_eq!(supplementary_2048_role_arn.chars().count(), 2048);
+    assert_eq!(supplementary_2048_role_arn.encode_utf16().count(), 4096);
+    assert_eq!(decomposed_1025_role_arn.len(), 3075);
+    assert_eq!(decomposed_1025_role_arn.chars().count(), 2050);
+    assert_eq!(decomposed_1025_role_arn.encode_utf16().count(), 2050);
+
+    let max_bmp_role_message = format!("{max_bmp_role_arn} is invalid");
+    let overlong_bmp_role_message = format!(
+        "1 validation error detected: Value '{overlong_bmp_role_arn}' at 'roleArn' failed to satisfy constraint: Member must have length less than or equal to 2048"
+    );
+    let supplementary_2048_role_message = format!(
+        "1 validation error detected: Value '{supplementary_2048_role_arn}' at 'roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: {role_arn_pattern}"
+    );
+    let supplementary_2049_role_message = format!(
+        "2 validation errors detected: Value '{supplementary_2049_role_arn}' at 'roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: {role_arn_pattern}; Value '{supplementary_2049_role_arn}' at 'roleArn' failed to satisfy constraint: Member must have length less than or equal to 2048"
+    );
+    let decomposed_1025_role_message = format!(
+        "1 validation error detected: Value '{decomposed_1025_role_arn}' at 'roleArn' failed to satisfy constraint: Member must have length less than or equal to 2048"
+    );
+
+    for (label, value, message) in [
+        (
+            "assume-role-max-length-bmp-role-arn",
+            max_bmp_role_arn.as_str(),
+            max_bmp_role_message.as_str(),
+        ),
+        (
+            "assume-role-overlong-bmp-role-arn",
+            overlong_bmp_role_arn.as_str(),
+            overlong_bmp_role_message.as_str(),
+        ),
+        (
+            "assume-role-max-length-supplementary-role-arn",
+            supplementary_2048_role_arn.as_str(),
+            supplementary_2048_role_message.as_str(),
+        ),
+        (
+            "assume-role-overlong-supplementary-role-arn",
+            supplementary_2049_role_arn.as_str(),
+            supplementary_2049_role_message.as_str(),
+        ),
+        (
+            "assume-role-unnormalized-decomposed-role-arn",
+            decomposed_1025_role_arn.as_str(),
+            decomposed_1025_role_message.as_str(),
+        ),
+    ] {
+        assert_assume_role_error(
+            label,
+            endpoint,
+            credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", value),
+                ("RoleSessionName", role_session_name),
+            ],
+            400,
+            "ValidationError",
+            Some(message),
+        );
+    }
+
+    assert_assume_role_error(
+        "assume-role-missing-role-arn",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleSessionName", role_session_name),
+        ],
+        400,
+        "ValidationError",
+        Some("1 validation error detected: Value null at 'roleArn' failed to satisfy constraint: Member must not be null"),
+    );
+    assert_assume_role_error(
+        "assume-role-empty-role-arn",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", ""),
+            ("RoleSessionName", role_session_name),
+        ],
+        400,
+        "ValidationError",
+        Some(
+            r"2 validation errors detected: Value '' at 'roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: [\u0009\u000A\u000D\u0020-\u007E\u0085\u00A0-\uD7FF\uE000-\uFFFD\u10000-\u10FFFF]+; Value '' at 'roleArn' failed to satisfy constraint: Member must have length greater than or equal to 20",
+        ),
+    );
+    assert_assume_role_error(
+        "assume-role-short-role-arn",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", "not-an-arn"),
+            ("RoleSessionName", role_session_name),
+        ],
+        400,
+        "ValidationError",
+        Some("1 validation error detected: Value 'not-an-arn' at 'roleArn' failed to satisfy constraint: Member must have length greater than or equal to 20"),
+    );
+    assert_assume_role_error(
+        "assume-role-malformed-role-arn",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", &malformed_role_arn),
+            ("RoleSessionName", role_session_name),
+        ],
+        400,
+        "ValidationError",
+        Some(&malformed_role_message),
+    );
+    for (label, value, message) in [
+        (
+            "assume-role-max-length-role-arn",
+            max_role_arn.as_str(),
+            max_role_message.as_str(),
+        ),
+        (
+            "assume-role-overlong-role-arn",
+            overlong_role_arn.as_str(),
+            overlong_role_message.as_str(),
+        ),
+    ] {
+        assert_assume_role_error(
+            label,
+            endpoint,
+            credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", value),
+                ("RoleSessionName", role_session_name),
+            ],
+            400,
+            "ValidationError",
+            Some(message),
+        );
+    }
+    assert_assume_role_error(
+        "assume-role-unknown-role-arn",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", &missing_role_arn),
+            ("RoleSessionName", role_session_name),
+        ],
+        403,
+        "AccessDenied",
+        Some(&unknown_role_message),
+    );
+    assert_assume_role_error(
+        "assume-role-missing-session-name",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+        ],
+        400,
+        "ValidationError",
+        Some("1 validation error detected: Value null at 'roleSessionName' failed to satisfy constraint: Member must not be null"),
+    );
+    for (label, value, message) in [
+        (
+            "assume-role-empty-session-name",
+            "",
+            "1 validation error detected: Value '' at 'roleSessionName' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "assume-role-short-session-name",
+            "a",
+            "1 validation error detected: Value 'a' at 'roleSessionName' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "assume-role-invalid-session-name",
+            "bad/name",
+            r"1 validation error detected: Value 'bad/name' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*",
+        ),
+    ] {
+        assert_assume_role_error(
+            label,
+            endpoint,
+            credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", role_arn),
+                ("RoleSessionName", value),
+            ],
+            400,
+            "ValidationError",
+            Some(message),
+        );
+    }
+    assert_assume_role_error(
+        "assume-role-long-session-name",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", &long_session_name),
+        ],
+        400,
+        "ValidationError",
+        Some(&long_session_message),
+    );
+
+    for (label, value, code, message) in [
+        (
+            "assume-role-empty-duration",
+            "",
+            "MalformedInput",
+            Some("missing value for decimal type"),
+        ),
+        (
+            "assume-role-nonnumeric-duration",
+            "abc",
+            "MalformedInput",
+            None,
+        ),
+        (
+            "assume-role-decimal-duration",
+            "900.0",
+            "MalformedInput",
+            None,
+        ),
+        (
+            "assume-role-negative-duration",
+            "-1",
+            "ValidationError",
+            Some("1 validation error detected: Value '-1' at 'durationSeconds' failed to satisfy constraint: Member must have value greater than or equal to 900"),
+        ),
+        (
+            "assume-role-short-duration",
+            "899",
+            "ValidationError",
+            Some("1 validation error detected: Value '899' at 'durationSeconds' failed to satisfy constraint: Member must have value greater than or equal to 900"),
+        ),
+        (
+            "assume-role-long-duration",
+            "43201",
+            "ValidationError",
+            Some("1 validation error detected: Value '43201' at 'durationSeconds' failed to satisfy constraint: Member must have value less than or equal to 43200"),
+        ),
+        (
+            "assume-role-i32-max-duration",
+            "2147483647",
+            "ValidationError",
+            Some("1 validation error detected: Value '2147483647' at 'durationSeconds' failed to satisfy constraint: Member must have value less than or equal to 43200"),
+        ),
+        (
+            "assume-role-i32-overflow-duration",
+            "2147483648",
+            "MalformedInput",
+            None,
+        ),
+        (
+            "assume-role-i32-min-duration",
+            "-2147483648",
+            "ValidationError",
+            Some("1 validation error detected: Value '-2147483648' at 'durationSeconds' failed to satisfy constraint: Member must have value greater than or equal to 900"),
+        ),
+        (
+            "assume-role-i32-underflow-duration",
+            "-2147483649",
+            "MalformedInput",
+            None,
+        ),
+    ] {
+        assert_assume_role_error(
+            label,
+            endpoint,
+            credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", role_arn),
+                ("RoleSessionName", role_session_name),
+                ("DurationSeconds", value),
+            ],
+            400,
+            code,
+            message,
+        );
+    }
+
+    assert_assume_role_request_success(
+        "assume-role-path-bearing-role",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+    );
+    for (label, session_name) in [
+        ("assume-role-min-session-name", "aa"),
+        ("assume-role-max-session-name", max_session_name.as_str()),
+    ] {
+        assert_assume_role_request_success(
+            label,
+            endpoint,
+            credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", role_arn),
+                ("RoleSessionName", session_name),
+            ],
+            AssumeRoleSuccess {
+                account_id,
+                role_name,
+                role_session_name: session_name,
+                duration_seconds: 3600,
+            },
+        );
+    }
+    for (label, duration, duration_seconds) in [
+        ("assume-role-min-duration", "900", 900),
+        ("assume-role-max-duration", "43200", 43200),
+        ("assume-role-leading-plus-duration", "+900", 900),
+        ("assume-role-leading-zero-duration", "0900", 900),
+    ] {
+        assert_assume_role_request_success(
+            label,
+            endpoint,
+            credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", role_arn),
+                ("RoleSessionName", role_session_name),
+                ("DurationSeconds", duration),
+            ],
+            AssumeRoleSuccess {
+                account_id,
+                role_name,
+                role_session_name,
+                duration_seconds,
+            },
+        );
+    }
+    assert_assume_role_request_success(
+        "assume-role-unknown-parameter",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+            ("Unknown", "value"),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+    );
+
+    assert_assume_role_request_success(
+        "assume-role-duplicate-role-arn-valid-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleArn", "not-an-arn"),
+            ("RoleSessionName", role_session_name),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+    );
+    assert_assume_role_error(
+        "assume-role-duplicate-role-arn-invalid-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", "not-an-arn"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+        ],
+        400,
+        "ValidationError",
+        Some("1 validation error detected: Value 'not-an-arn' at 'roleArn' failed to satisfy constraint: Member must have length greater than or equal to 20"),
+    );
+    assert_assume_role_request_success(
+        "assume-role-duplicate-session-name-valid-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+            ("RoleSessionName", "bad/name"),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+    );
+    assert_assume_role_error(
+        "assume-role-duplicate-session-name-invalid-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", "bad/name"),
+            ("RoleSessionName", role_session_name),
+        ],
+        400,
+        "ValidationError",
+        Some(
+            r"1 validation error detected: Value 'bad/name' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*",
+        ),
+    );
+    assert_assume_role_request_success(
+        "assume-role-duplicate-duration-valid-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+            ("DurationSeconds", "900"),
+            ("DurationSeconds", "899"),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name,
+            role_session_name,
+            duration_seconds: 900,
+        },
+    );
+    assert_assume_role_error(
+        "assume-role-duplicate-duration-invalid-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+            ("DurationSeconds", "899"),
+            ("DurationSeconds", "900"),
+        ],
+        400,
+        "ValidationError",
+        Some("1 validation error detected: Value '899' at 'durationSeconds' failed to satisfy constraint: Member must have value greater than or equal to 900"),
+    );
 }
 
 fn assert_cross_account_denied(
@@ -443,6 +983,7 @@ fn run_cross_account_probes(
         target_account_id,
         fixture.success_role_name,
         fixture.role_session_name,
+        3600,
     );
     println!("assume-role-cross-account-success: ok");
 }
@@ -624,12 +1165,14 @@ fn main() {
     }
 
     if let Ok(role_arn) = env::var("S3_TEST_STS_ROLE_ARN") {
+        let caller_arn = required_env("S3_TEST_STS_PRIMARY_ARN");
         let role_name = required_env("S3_TEST_STS_ROLE_NAME");
         let role_session_name = required_env("S3_TEST_STS_ROLE_SESSION_NAME");
         run_assume_role_probes(
             &endpoint,
             credentials,
             &account_id,
+            &caller_arn,
             &role_arn,
             &role_name,
             &role_session_name,

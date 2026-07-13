@@ -194,12 +194,20 @@ create_scoped_role() {
     local role_path="$2"
     local trust_policy="$3"
     local expected_arn="$4"
+    local max_session_duration="${5:-}"
     local created_arn
+    local -a create_args=(
+        --role-name "$role_name"
+        --path "$role_path"
+        --assume-role-policy-document "file://${trust_policy}"
+    )
+
+    if [[ -n "$max_session_duration" ]]; then
+        create_args+=(--max-session-duration "$max_session_duration")
+    fi
 
     if ! created_arn="$(aws_primary iam create-role \
-        --role-name "$role_name" \
-        --path "$role_path" \
-        --assume-role-policy-document "file://${trust_policy}" \
+        "${create_args[@]}" \
         --query 'Role.Arn' \
         --output text)"; then
         external_s3_test_die "could not create temporary STS oracle role $expected_arn"
@@ -223,6 +231,7 @@ create_role_fixture() {
             "primary credential account $primary_account does not match TEST_AWS_PRIMARY_ACCOUNT_ID"
     [[ "$primary_arn" == "arn:aws:iam::${primary_account}:user/"* ]] || \
         external_s3_test_die "primary credentials do not identify an IAM user"
+    export S3_TEST_STS_PRIMARY_ARN="$primary_arn"
 
     tmpdir="$(mktemp -d)"
     role_suffix="${tmpdir##*/}"
@@ -280,7 +289,8 @@ create_role_fixture() {
         "$S3_TEST_STS_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_policy" \
-        "$S3_TEST_STS_ROLE_ARN"
+        "$S3_TEST_STS_ROLE_ARN" \
+        43200
 
     wait_for_assume_role_success \
         same-account-role \
