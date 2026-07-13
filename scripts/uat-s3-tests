@@ -738,15 +738,15 @@ wait_for_control_plane_node_epochs_aligned() {
 control_plane_node_aligned_epoch() {
     awk -F, -v expected_count="$ARGMIN_LOCAL_NODE_COUNT" '
         /^node=/ {
-            if ($2 != "active" || $3 != "healthy" || $5 !~ /^[0-9]+$/) {
+            if ($2 != "active" || $3 != "1" || $4 != "healthy" || $6 !~ /^[0-9]+$/) {
                 ok = 0
                 bad = 1
                 next
             }
             count += 1
             if (epoch == "") {
-                epoch = $5
-            } else if ($5 != epoch) {
+                epoch = $6
+            } else if ($6 != epoch) {
                 ok = 0
                 bad = 1
             }

@@ -312,6 +312,19 @@ fn distinct_data_pg_key_search_limit(
         .min(u64::from(u32::MAX)) as u32
 }
 
+fn distinct_data_pg_bucket_search_limit(pg_count: u32, eligible_metadata_pg_count: u32) -> u32 {
+    const MIN_SEARCH_LIMIT: u64 = 100;
+    const EXPECTED_ELIGIBLE_BUCKET_SAFETY_FACTOR: u64 = 128;
+
+    MIN_SEARCH_LIMIT
+        .max(
+            u64::from(pg_count)
+                .div_ceil(u64::from(eligible_metadata_pg_count))
+                .saturating_mul(EXPECTED_ELIGIBLE_BUCKET_SAFETY_FACTOR),
+        )
+        .min(u64::from(u32::MAX)) as u32
+}
+
 fn choose_key_with_distinct_data_pg(
     bucket: &str,
     key_prefix: &str,
@@ -550,7 +563,21 @@ fn main() {
                 let client = client_from_env();
                 let versioned = command == "create-versioned-put-distinct-data-pg";
                 let (bucket, key, data_pg) = if target_data_pg.is_some() {
-                    let (bucket, key, data_pg) = (0..100)
+                    let topology = pg_topology_from_env();
+                    let pg_count = topology.pg_count();
+                    let eligible_metadata_pg_count = pg_count.saturating_sub(
+                        excluded_metadata_pgs
+                            .iter()
+                            .filter(|pg_id| **pg_id < pg_count)
+                            .count() as u32,
+                    );
+                    assert!(
+                        eligible_metadata_pg_count > 0,
+                        "targeted data-PG search requires at least one eligible metadata PG"
+                    );
+                    let bucket_search_limit =
+                        distinct_data_pg_bucket_search_limit(pg_count, eligible_metadata_pg_count);
+                    let (bucket, key, data_pg) = (0..bucket_search_limit)
                         .find_map(|_| {
                             let bucket = unique_bucket();
                             find_key_with_distinct_data_pg(
@@ -1036,5 +1063,6 @@ mod tests {
             "regression must exceed the old fixed bound"
         );
         assert!(distinct_data_pg_key_search_limit(216, 16, true) > 10_000);
+        assert_eq!(distinct_data_pg_bucket_search_limit(216, 16), 1_792);
     }
 }

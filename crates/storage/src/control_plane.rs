@@ -1927,6 +1927,36 @@ impl ClusterControlSnapshot {
         Ok(())
     }
 
+    fn heartbeat_update_is_volatile(&self, next: &Self, heartbeat_node_id: NodeId) -> bool {
+        if self.authority_incarnation != next.authority_incarnation
+            || self.cluster_epoch != next.cluster_epoch
+            || self.lease_grant_horizon != next.lease_grant_horizon
+            || self.pgs != next.pgs
+            || self.history != next.history
+            || self.nodes.len() != next.nodes.len()
+        {
+            return false;
+        }
+
+        self.nodes.iter().all(|(node_id, current)| {
+            let Some(updated) = next.nodes.get(node_id) else {
+                return false;
+            };
+            if *node_id != heartbeat_node_id {
+                return current == updated;
+            }
+
+            current.node_id == updated.node_id
+                && current.membership == updated.membership
+                && current.administratively_available == updated.administratively_available
+                && current.observed_availability == updated.observed_availability
+                && current.node_incarnation == updated.node_incarnation
+                && current.endpoint == updated.endpoint
+                && current.cluster_map_history_route_references
+                    == updated.cluster_map_history_route_references
+        })
+    }
+
     fn bump_epoch(&mut self) -> Result<(), ControlPlaneError> {
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
         for record in self.nodes.values_mut() {
@@ -2248,18 +2278,23 @@ impl ClusterControlSnapshot {
                         node.node_id.as_u32()
                     )
                 })?;
-                validate_serving_deadline_bound(
-                    lease_deadline_ms,
-                    max_committed_timestamp_ms,
-                    MAX_HEARTBEAT_LEASE_MS,
-                    CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
-                )
-                .map_err(|error| {
-                    format!(
-                        "node {} has an out-of-bounds serving lease: {error}",
-                        node.node_id.as_u32()
+                let covered_by_committed_horizon = self
+                    .lease_grant_horizon
+                    .is_some_and(|horizon| horizon.grant_not_after_ms() >= lease_deadline_ms);
+                if !covered_by_committed_horizon {
+                    validate_serving_deadline_bound(
+                        lease_deadline_ms,
+                        max_committed_timestamp_ms,
+                        MAX_HEARTBEAT_LEASE_MS,
+                        CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
                     )
-                })?;
+                    .map_err(|error| {
+                        format!(
+                            "node {} has an out-of-bounds serving lease: {error}",
+                            node.node_id.as_u32()
+                        )
+                    })?;
+                }
             }
             if let Some(observed_epoch) = node.last_observed_epoch {
                 if observed_epoch > self.cluster_epoch {
@@ -6111,6 +6146,37 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         Ok(applied)
     }
 
+    fn apply_heartbeat_command(
+        &mut self,
+        command: ControlPlaneCommand,
+        node_id: NodeId,
+        lease_horizon_authority: Option<LeaseHorizonAuthorityBinding>,
+        lease_deadline_ms: u64,
+    ) -> Result<(), ControlPlaneError> {
+        let horizon_already_covers_lease = lease_horizon_authority.is_some_and(|authority| {
+            self.snapshot
+                .lease_grant_horizon_covers(authority, lease_deadline_ms)
+        });
+        let applied = self.snapshot.apply_control_plane_command(command)?;
+        if horizon_already_covers_lease
+            && self
+                .snapshot
+                .heartbeat_update_is_volatile(applied.snapshot(), node_id)
+        {
+            let max_committed_timestamp_ms = self.snapshot.max_committed_timestamp_ms;
+            let mut next_snapshot = applied.into_snapshot();
+            next_snapshot.max_committed_timestamp_ms = max_committed_timestamp_ms;
+            validate_control_plane_snapshot(
+                "attempted to publish invalid volatile heartbeat state",
+                &next_snapshot,
+            )?;
+            self.snapshot = next_snapshot;
+        } else if applied.changed() {
+            self.commit_snapshot(applied.into_snapshot())?;
+        }
+        Ok(())
+    }
+
     pub fn set_node_membership(
         &mut self,
         node_id: NodeId,
@@ -6271,12 +6337,17 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         let observed_epoch = heartbeat.observed_epoch;
         let current_epoch = self.snapshot.cluster_epoch;
         let node_id = heartbeat.node_id;
-        self.apply_and_commit_command(ControlPlaneCommand::RecordNodeHeartbeat {
-            heartbeat,
-            heartbeat_at_ms: authority_now_ms,
-            lease_deadline_ms,
+        self.apply_heartbeat_command(
+            ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms: authority_now_ms,
+                lease_deadline_ms,
+                lease_horizon_authority,
+            },
+            node_id,
             lease_horizon_authority,
-        })?;
+            lease_deadline_ms,
+        )?;
         let serving = self.snapshot.node(node_id).is_some_and(|record| {
             observed_epoch == current_epoch
                 && record.can_serve_primary(self.snapshot.cluster_epoch, authority_now_ms)
@@ -6349,10 +6420,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         now_ms: u64,
     ) -> Result<HeartbeatLeaseExpiry, ControlPlaneError> {
         let expire_at_ms = self.snapshot.heartbeat_lease_expiry_timestamp(now_ms);
-        let applied =
-            self.apply_and_commit_command(ControlPlaneCommand::ExpireHeartbeatLeases {
-                expire_at_ms,
-            })?;
+        let applied = self.snapshot.apply_control_plane_command(
+            ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms },
+        )?;
         let ControlPlaneCommandResponse::ExpireHeartbeatLeases {
             expired_nodes,
             peering_pgs,
@@ -6360,10 +6430,15 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         else {
             unreachable!("heartbeat lease expiry command returned the wrong response");
         };
+        let expired_nodes = expired_nodes.clone();
+        let peering_pgs = peering_pgs.clone();
+        if !expired_nodes.is_empty() && applied.changed() {
+            self.commit_snapshot(applied.into_snapshot())?;
+        }
         Ok(HeartbeatLeaseExpiry {
             cluster_epoch: self.snapshot.cluster_epoch,
-            expired_nodes: expired_nodes.clone(),
-            peering_pgs: peering_pgs.clone(),
+            expired_nodes,
+            peering_pgs,
             snapshot: self.snapshot.clone(),
         })
     }
@@ -27450,7 +27525,8 @@ mod tests {
     #[test]
     fn single_authority_heartbeat_establishes_reuses_and_restores_lease_horizon() {
         let tmp = test_util::tempdir();
-        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let store_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&store_path);
         let mut control_plane = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         control_plane
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
@@ -27473,12 +27549,14 @@ mod tests {
         assert!(control_plane
             .snapshot()
             .lease_grant_horizon_covers(authority, first.lease().lease_deadline_ms()));
+        let durable_after_first = std::fs::read(&store_path).unwrap();
+        let persisted_after_first = store.load().unwrap().unwrap();
 
         let current_epoch = control_plane.snapshot().cluster_epoch();
-        control_plane
+        let renewed = control_plane
             .refresh_node_heartbeat_with_lease_horizon_authority(
-                heartbeat(1, current_epoch, 1_001),
-                1_001,
+                heartbeat(1, current_epoch, 12_000),
+                12_000,
                 authority,
             )
             .unwrap();
@@ -27488,17 +27566,45 @@ mod tests {
             "a covered heartbeat must not extend the durable horizon"
         );
         assert_eq!(
+            std::fs::read(&store_path).unwrap(),
+            durable_after_first,
+            "an unchanged heartbeat covered by the durable horizon must not rewrite state"
+        );
+        assert_eq!(
+            control_plane
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(renewed.lease().lease_deadline_ms()),
+            "the volatile lease renewal must still be visible to live serving checks"
+        );
+        assert_eq!(
             store.load().unwrap().unwrap().lease_grant_horizon(),
             Some(first_horizon),
             "the heartbeat and horizon must have identical restart state"
+        );
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .unwrap()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            persisted_after_first
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            "volatile renewal must not alter the restart lease"
         );
 
         let before_replacement = control_plane.snapshot().clone();
         let replacement_authority = LeaseHorizonAuthorityBinding::new(8, None);
         let error = control_plane
             .refresh_node_heartbeat_with_lease_horizon_authority(
-                heartbeat(1, current_epoch, 1_002),
-                1_002,
+                heartbeat(1, current_epoch, 12_001),
+                12_001,
                 replacement_authority,
             )
             .unwrap_err();
@@ -34674,7 +34780,8 @@ mod tests {
     #[test]
     fn expired_heartbeat_lease_marks_node_unavailable_and_bumps_epoch_once() {
         let tmp = test_util::tempdir();
-        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let store_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&store_path);
         let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         authority
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
@@ -34769,10 +34876,16 @@ mod tests {
         );
         assert_eq!(authority.serving_pg_primary(PgId::new(9), 1_112), None);
 
+        let durable_after_expiry = std::fs::read(&store_path).unwrap();
         let repeated = authority.expire_heartbeat_leases(9_999).unwrap();
         assert_eq!(repeated.expired_nodes(), &[]);
         assert_eq!(repeated.peering_pgs(), &[]);
         assert_eq!(repeated.cluster_epoch(), expiry.cluster_epoch());
+        assert_eq!(
+            std::fs::read(&store_path).unwrap(),
+            durable_after_expiry,
+            "an expiry scan with no lease transition must not rewrite state"
+        );
 
         let persisted = store.load().unwrap().unwrap();
         assert_eq!(persisted.cluster_epoch(), expiry.cluster_epoch());

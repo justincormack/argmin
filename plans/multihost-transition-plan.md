@@ -11051,9 +11051,26 @@ Required production shape and implementation order:
    starts enabled but `Suspect` and must re-establish observed health. The
    existing `MarkNodeAvailability` command remains the transitional
    administrative API in this slice. Both fields are still included in every
-   committed snapshot, and every heartbeat remains committed; the next slice
-   can now make covered, semantically unchanged liveness renewal volatile
-   without making the administrative fence volatile.
+   committed snapshot. The single-authority compatibility path now takes the
+   first bounded volatile-renewal step: after deterministic heartbeat
+   validation, a heartbeat whose deadline is already covered by the committed
+   horizon may update only process-local heartbeat/lease times, observed epoch,
+   and raw PG observations without saving the full snapshot, provided node
+   identity, endpoint, membership, administrative and observed availability,
+   exact history references, cluster epoch/history, committed PG state/proofs,
+   and the horizon are unchanged. The single-authority lease-scan wrapper
+   validates a scan that expires no node but discards its timestamp-only
+   candidate instead of saving it. Any
+   identity, topology, health transition, route-reference, proof, pending-
+   command fence, horizon, or actual expiry change still uses the durable
+   command path. Direct/replicated heartbeat commands remain durable; OpenRaft
+   needs a separate leader-local volatile overlay with the same horizon and
+   publication fences before its ordinary covered renewals can avoid log/WAL
+   traffic. File-byte regressions pin zero snapshot rewrites for covered
+   unchanged renewal and empty expiry scans. The retained route-change failure
+   that motivated this slice reached epoch 706 with every node healthy but
+   still observing epoch 705 while full-snapshot heartbeat writes contended;
+   the frontend exhausted transient retries and aborted on `pg_not_active`.
 4. Persist logical durable commands incrementally. The single-authority
    compatibility path must either append versioned/checksummed durable deltas
    to an fsync'd, identity-bound journal and replay them over the latest

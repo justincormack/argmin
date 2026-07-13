@@ -5179,9 +5179,15 @@ mod tests {
         let store = FileControlPlaneStore::new(&state_path);
         let mut authority = SingleAuthorityControlPlane::open(store)
             .expect("test control-plane authority should open");
-        authority
-            .expire_heartbeat_leases(1_000)
-            .expect("timestamp high-water should advance");
+        storage::control_plane::ControlPlaneLinearizedCommandSink::submit_control_plane_command(
+            &mut authority,
+            ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: LeaseHorizonAuthorityBinding::checked_new(1, None).unwrap(),
+                authority_now_ms: 1_000,
+                horizon_duration_ms: 100,
+            },
+        )
+        .expect("durable horizon should establish the timestamp high-water");
         let context = authority
             .authority_clock_context()
             .expect("clock context should read");
