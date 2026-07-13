@@ -196,9 +196,10 @@ add focused AWS probes for:
 - missing, wrong, duplicated, header/query, signed/unsigned, and unexpected
   session-token inputs on every S3 signing mode
 - token, expiry, signature, region, and service error precedence
-- invalid signatures combined with role deletion and policy change, so mutable
-  authorization state cannot accidentally change authentication error
-  precedence; inject provider failures in the equivalent local test
+- invalid signatures combined with role deletion and policy changes, separating
+  issuer-credential invalidation from mutable authorization behavior; inject
+  issuer-liveness and authorization-provider failures independently in the
+  equivalent local tests
 - exact success XML, namespaces, timestamps, headers, request IDs, error XML,
   status codes, error codes, and messages
 - immediate use near issuance and the exact expiry boundary
@@ -373,23 +374,36 @@ presigned, POST Object, and streaming authentication:
 3. otherwise, require and AEAD-open exactly one correctly located session token
 4. validate the embedded access key ID against the SigV4 credential in constant
    time and check credential-domain binding
-5. check embedded expiry at the AWS-pinned boundary before signature comparison
+5. check embedded expiry at the AWS-pinned boundary and resolve only the
+   embedded stable issuer-role ID, rejecting a deleted issuer as
+   `InvalidClientTokenId`; both checks precede signature comparison, but their
+   relative order remains unresolved
 6. verify SigV4 with the embedded secret access key
 7. return an immutable authenticated-session value containing the structured
    token identity and session-policy context
 
-Authentication must not resolve mutable role state before signature
-verification. Token opening, access-key/domain binding, expiry validation, and
-SigV4 verification establish the authenticated session using only authenticated
-token contents and the sealing key ring. This preserves authentication error
-precedence and keeps identity-provider availability out of signature checking.
+Authentication must not resolve mutable trust or permission-policy state before
+signature verification. AWS probes do require one narrower mutable dependency:
+after role deletion converges, credentials issued by that role return
+`InvalidClientTokenId`, and this result wins over a bad signature. Token
+opening, access-key/domain binding, expiry validation, and issuer-role existence
+therefore establish credential validity before signature comparison. The
+pre-signature lookup must expose only stable issuer identity/liveness, not role
+authorization state.
 
-At the authorization boundary, resolve the embedded stable role ID and current
-account/role/policy state, then combine it with the authenticated session policy
-and request context. A missing role, provider failure, revocation policy, or
-changed permission policy fails closed there. Phase 0 probes must pin
-the externally visible result and precedence for those mutations; they must not
-be moved into authentication merely to reproduce an unverified guess.
+The existing AWS observations establish separately that expiry and deleted-role
+liveness each win over signature mismatch. They do not establish which wins
+when an expired session's issuer has also been deleted. Keep that collision
+explicitly unresolved until a probe waits through AWS's 900-second minimum
+session lifetime; do not infer an order from the independently observed cases.
+
+At the authorization boundary, resolve current trust-independent role
+permission state, then combine it with the authenticated session policy and
+request context. A changed permission policy or authorization-provider failure
+fails closed there. No other mutable role field may move into authentication
+without AWS evidence. Phase 0 probes must still pin policy-change behavior, and
+the matching local tests must inject issuer-liveness and authorization-provider
+failures separately.
 
 The precise error mapping for missing, malformed, wrong-key, tampered, mismatched,
 and expired tokens must come from AWS probes. Existing evidence
@@ -720,9 +734,10 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The optional `AssumeRole` security-context parameters, role mutation
-precedence, session-principal context, and `aws:TokenIssueTime` behavior remain
-before Phase 0 can satisfy its exit condition.
+The optional `AssumeRole` security-context parameters, S3 signing-mode token
+matrices, expiry-versus-issuer-deletion precedence, trust/permission-policy
+mutation precedence, session-principal context, and `aws:TokenIssueTime`
+behavior remain before Phase 0 can satisfy its exit condition.
 
 The role-fixture capability will use the ordinary primary and alternate test
 users, not the owner/root credential. The shared test-user policy grants only
@@ -925,6 +940,45 @@ boundary, a 3,601-second request receives the configured-role
 observed duration-check order is therefore fixed Query-schema range, target
 role configured maximum, then the one-hour role-chaining limit.
 
+The deleted-role authentication slice completed on 2026-07-13. A separate
+permissionless role has an exact-target caller identity-policy `implicitDeny`
+and direct trust of the primary user. The fixture establishes STS assumption
+success and a valid `GetCallerIdentity` session before deleting the role, then
+waits through the observed IAM/STS convergence window until that same session
+returns `InvalidClientTokenId`. The deliberately deleted role is removed from
+the normal exit cleanup set only after `DeleteRole` succeeds; periodic cleanup
+also recognizes its unique prefix if the oracle exits earlier.
+
+The fixture then recreates the identical path, role name, and IAM role ARN. IAM
+assigns the new incarnation a different stable role ID; a newly issued session
+works and its `AssumedRoleId` and `GetCallerIdentity` `UserId` contain that new
+ID. The old session continues to return `InvalidClientTokenId`, including when
+its otherwise correct token is combined with a bad signature. Because the two
+incarnations have the same role ARN, this proves issuer liveness must bind the
+session to the stable role ID rather than looking up the mutable ARN or name.
+
+The raw exact-golden matrix compares this invalidated session with the still
+live chaining-source session. A second session from that still-live role is
+independently authenticated before supplying its token as the mismatch control.
+With a live issuer role, the correct token and secret succeed; a missing token
+or the other live session's mismatched token returns HTTP 403
+`InvalidClientTokenId` before signature validation, with
+exactly `The security token included in the request is invalid.` Supplying the
+correct token with a bad secret instead reaches HTTP 403
+`SignatureDoesNotMatch` and its standard STS message. Missing or mismatched
+tokens still win when combined with the bad secret.
+
+After issuer-role deletion converges and after the same role ARN is recreated,
+the old session's correct token and secret return the same
+`InvalidClientTokenId` golden. Correct-token/bad-signature, missing-token, and
+mismatched-token combinations all produce that result too. All errors use the
+STS 2011 namespace and complete semantic header/body shapes. This establishes
+that token presence, token/access-key binding, and stable issuer-role liveness
+are credential-validity checks before SigV4 comparison; mutable trust and
+permission policies remain authorization inputs rather than authentication
+inputs. Expiry-versus-issuer-deletion precedence is not established by this
+matrix and remains an explicit Phase 0 question.
+
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations
 have been transferred into implementation-facing conformance tests and the
@@ -933,6 +987,8 @@ compatibility record.
 ### Phase 1: Shared identity substrate and sealed-token codec
 
 - introduce structured principal/session identity
+- introduce the minimal stable role identity/liveness record needed to validate
+  a session issuer, without trust or permission-policy evaluation
 - distinguish stored long-lived credentials from decoded session credentials
 - replace per-worker copied identity stores with one shared provider
 - keep static credential behavior unchanged
@@ -949,8 +1005,9 @@ record exists.
 - implement mandatory session-token verification across header, presigned,
   POST, and streaming paths
 - implement expiry and error precedence from Phase 0
-- return a typed authenticated session without consulting current mutable role
-  or policy state; authorization remains a separate consumer
+- return a typed authenticated session after checking only stable issuer-role
+  liveness; current trust and permission-policy state remain authorization
+  inputs for a separate consumer
 - add deterministic clock boundary tests
 - add concurrency, token redaction, malformed/tampered-token, wrong-key,
   access-key-binding, and unknown-version tests
@@ -964,7 +1021,8 @@ unsupported for end-to-end S3 use until Phase 3 supplies role authorization.
 
 ### Phase 3: IAM policy and role core
 
-- add role records and stable role identity
+- extend the minimal role identity records with role configuration, trust, and
+  permission-policy state
 - add configured long-lived principal records and explicit identity-policy
   attachments, including caller-side `sts:AssumeRole` resource grants for the
   cross-account fixture; do not synthesize them from `AuthorizationProfile`
@@ -1073,9 +1131,12 @@ in-memory role through AWS-compatible public APIs.
 - header, presigned, POST Object, and streaming requests
 - missing/wrong/unexpected token matrices with valid and invalid signatures
 - expired session behavior with a deterministic clock
-- bad signatures combined with missing roles, policy changes, and injected
-  provider failures still fail at authentication before mutable role
-  authorization is attempted
+- missing or mismatched tokens and deleted issuer roles produce the AWS-pinned
+  credential error before signature comparison; a live issuer plus valid token
+  reaches bad-signature handling
+- policy changes do not alter authentication precedence, while injected
+  issuer-liveness and authorization-provider failures exercise their distinct
+  fail-closed paths
 - role permission allow, implicit deny, explicit deny, session-policy
   restriction, resource-policy allow/deny, and ACL interaction
 - same-account and cross-account assume-role paths, with explicit caller
@@ -1197,8 +1258,9 @@ The initial milestone is complete only when all of the following are true:
   key ring and role provider
 - S3 header, presigned, POST, and streaming auth require the exact session token
 - expiry and malformed-token error precedence match committed AWS observations
-- SigV4 authentication completes before current role/policy lookup, and mutable
-  identity-provider outcomes occur only at the authorization boundary
+- stable issuer-role liveness is checked at the AWS-pinned point before SigV4
+  comparison, while current trust and permission-policy lookup occurs only at
+  the authorization boundary
 - the role session's S3 permissions come from policy evaluation, including
   explicit deny, rather than `AuthorizationProfile`
 - cross-account `AssumeRole` uses an explicit caller identity-policy attachment,

@@ -114,34 +114,38 @@ fn sts_wire_shape(label: &str, response: &RawResponse) -> ShapeSpec {
         .sub("sts_extended_request_id", extended_request_id)
 }
 
+fn assert_get_caller_identity_success(label: &str, response: &RawResponse, account_id: &str) {
+    let arn = xml_tag_text(&response.body, "Arn")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| panic!("{label}: missing Arn"));
+    let user_id = xml_tag_text(&response.body, "UserId")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| panic!("{label}: missing UserId"));
+    assert_shape(
+        label,
+        response,
+        &sts_wire_shape(label, response)
+            .status(200)
+            .header("content-type", "text/xml")
+            .body(format!(
+                "<GetCallerIdentityResponse xmlns=\"{STS_XMLNS}\">\n  \
+                 <GetCallerIdentityResult>\n    <Arn>{{arn}}</Arn>\n    \
+                 <UserId>{{user_id}}</UserId>\n    \
+                 <Account>{{account}}</Account>\n  \
+                 </GetCallerIdentityResult>\n  <ResponseMetadata>\n    \
+                 <RequestId>{{sts_request_id}}</RequestId>\n  \
+                 </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
+            ))
+            .sub("arn", arn)
+            .sub("user_id", user_id)
+            .sub("account", account_id),
+    );
+}
+
 fn assert_probe(probe: &Probe<'_>, response: &RawResponse, account_id: &str) {
     match probe.expected {
         Expected::Success => {
-            let arn = xml_tag_text(&response.body, "Arn")
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| panic!("{}: missing Arn", probe.label));
-            let user_id = xml_tag_text(&response.body, "UserId")
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| panic!("{}: missing UserId", probe.label));
-            assert_shape(
-                probe.label,
-                response,
-                &sts_wire_shape(probe.label, response)
-                    .status(200)
-                    .header("content-type", "text/xml")
-                    .body(format!(
-                        "<GetCallerIdentityResponse xmlns=\"{STS_XMLNS}\">\n  \
-                         <GetCallerIdentityResult>\n    <Arn>{{arn}}</Arn>\n    \
-                         <UserId>{{user_id}}</UserId>\n    \
-                         <Account>{{account}}</Account>\n  \
-                         </GetCallerIdentityResult>\n  <ResponseMetadata>\n    \
-                         <RequestId>{{sts_request_id}}</RequestId>\n  \
-                         </ResponseMetadata>\n</GetCallerIdentityResponse>\n"
-                    ))
-                    .sub("arn", arn)
-                    .sub("user_id", user_id)
-                    .sub("account", account_id),
-            );
+            assert_get_caller_identity_success(probe.label, response, account_id);
         }
         Expected::Error { code, message } => {
             assert_error_probe(
@@ -178,6 +182,50 @@ fn assert_probe(probe: &Probe<'_>, response: &RawResponse, account_id: &str) {
             );
         }
     }
+}
+
+fn assert_assumed_role_caller_identity(
+    label: &str,
+    response: &RawResponse,
+    account_id: &str,
+    role_name: &str,
+    role_session_name: &str,
+    expected_role_id: Option<&str>,
+) {
+    let expected_arn =
+        format!("arn:aws:sts::{account_id}:assumed-role/{role_name}/{role_session_name}");
+    let arn = required_xml_text(response, "Arn", label);
+    assert_eq!(arn, expected_arn, "{label}: unexpected caller ARN");
+    let user_id = required_xml_text(response, "UserId", label);
+    let role_id = user_id
+        .strip_suffix(&format!(":{role_session_name}"))
+        .unwrap_or_else(|| panic!("{label}: UserId does not end with the role session name"));
+    assert!(
+        role_id.len() == 21
+            && role_id.starts_with("AROA")
+            && role_id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "{label}: caller UserId has an unexpected role ID shape"
+    );
+    if let Some(expected_role_id) = expected_role_id {
+        assert_eq!(
+            role_id, expected_role_id,
+            "{label}: caller UserId has an unexpected stable role ID"
+        );
+    }
+    assert_get_caller_identity_success(label, response, account_id);
+    println!("{label}: ok");
+}
+
+fn send_get_caller_identity(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: Option<&str>,
+) -> RawResponse {
+    QueryRequest::Post {
+        body: "Action=GetCallerIdentity&Version=2011-06-15",
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send_with_security_token(endpoint, credentials, security_token)
 }
 
 fn assert_error_probe(
@@ -1137,6 +1185,139 @@ fn run_role_chaining_probes(
     println!("assume-role-chaining-over-api-maximum-duration: ok");
 }
 
+struct SessionAuthenticationProbeSet<'a> {
+    active_credentials: SignedRequestCredentials<'a>,
+    active_security_token: &'a str,
+    other_live_security_token: &'a str,
+    active_role_name: &'a str,
+    active_role_session_name: &'a str,
+    recreated_credentials: SignedRequestCredentials<'a>,
+    recreated_security_token: &'a str,
+    recreated_role_name: &'a str,
+    recreated_role_session_name: &'a str,
+    recreated_role_id: &'a str,
+    old_credentials: SignedRequestCredentials<'a>,
+    old_security_token: &'a str,
+}
+
+fn run_session_authentication_probes(
+    endpoint: &str,
+    account_id: &str,
+    fixture: SessionAuthenticationProbeSet<'_>,
+) {
+    let invalid_token_message = "The security token included in the request is invalid.";
+    let signature_mismatch_message = "The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method. Consult the service documentation for details.";
+    let active_response = send_get_caller_identity(
+        endpoint,
+        fixture.active_credentials,
+        Some(fixture.active_security_token),
+    );
+    assert_assumed_role_caller_identity(
+        "session-auth-live-role-valid",
+        &active_response,
+        account_id,
+        fixture.active_role_name,
+        fixture.active_role_session_name,
+        None,
+    );
+    let recreated_response = send_get_caller_identity(
+        endpoint,
+        fixture.recreated_credentials,
+        Some(fixture.recreated_security_token),
+    );
+    assert_assumed_role_caller_identity(
+        "session-auth-recreated-role-valid",
+        &recreated_response,
+        account_id,
+        fixture.recreated_role_name,
+        fixture.recreated_role_session_name,
+        Some(fixture.recreated_role_id),
+    );
+    let old_response = send_get_caller_identity(
+        endpoint,
+        fixture.old_credentials,
+        Some(fixture.old_security_token),
+    );
+    assert_error_probe(
+        "session-auth-old-session-after-role-recreation-valid",
+        &old_response,
+        403,
+        STS_XMLNS,
+        "InvalidClientTokenId",
+        Some(invalid_token_message),
+    );
+    println!("session-auth-old-session-after-role-recreation-valid: ok");
+
+    let wrong_secret = "0".repeat(40);
+    for (
+        role_state,
+        credentials,
+        security_token,
+        other_security_token,
+        valid_token_bad_signature_error,
+    ) in [
+        (
+            "live-role",
+            fixture.active_credentials,
+            fixture.active_security_token,
+            fixture.other_live_security_token,
+            ("SignatureDoesNotMatch", signature_mismatch_message),
+        ),
+        (
+            "old-session-after-role-recreation",
+            fixture.old_credentials,
+            fixture.old_security_token,
+            fixture.active_security_token,
+            ("InvalidClientTokenId", invalid_token_message),
+        ),
+    ] {
+        let wrong_secret_credentials = SignedRequestCredentials {
+            access_key: credentials.access_key,
+            secret_key: &wrong_secret,
+            region: credentials.region,
+            tls_ca_pem: credentials.tls_ca_pem,
+        };
+        for (case, signing_credentials, supplied_token, expected_error) in [
+            (
+                "missing-token-valid-signature",
+                credentials,
+                None,
+                ("InvalidClientTokenId", invalid_token_message),
+            ),
+            (
+                "mismatched-token-valid-signature",
+                credentials,
+                Some(other_security_token),
+                ("InvalidClientTokenId", invalid_token_message),
+            ),
+            (
+                "valid-token-bad-signature",
+                wrong_secret_credentials,
+                Some(security_token),
+                valid_token_bad_signature_error,
+            ),
+            (
+                "missing-token-bad-signature",
+                wrong_secret_credentials,
+                None,
+                ("InvalidClientTokenId", invalid_token_message),
+            ),
+            (
+                "mismatched-token-bad-signature",
+                wrong_secret_credentials,
+                Some(other_security_token),
+                ("InvalidClientTokenId", invalid_token_message),
+            ),
+        ] {
+            let label = format!("session-auth-{role_state}-{case}");
+            let response = send_get_caller_identity(endpoint, signing_credentials, supplied_token);
+            let (code, message) = expected_error;
+            assert_error_probe(&label, &response, 403, STS_XMLNS, code, Some(message));
+            println!("{label}: ok");
+        }
+    }
+}
+
 struct CrossAccountProbeSet<'a> {
     caller_arn: &'a str,
     role_session_name: &'a str,
@@ -1423,6 +1604,9 @@ fn main() {
         let chain_access_key = required_env("S3_TEST_STS_CHAIN_ACCESS_KEY");
         let chain_secret_key = required_env("S3_TEST_STS_CHAIN_SECRET_KEY");
         let chain_security_token = required_env("S3_TEST_STS_CHAIN_SESSION_TOKEN");
+        let other_live_security_token = required_env("S3_TEST_STS_OTHER_LIVE_SESSION_TOKEN");
+        let chain_role_name = required_env("S3_TEST_STS_ROLE_NAME");
+        let chain_role_session_name = required_env("S3_TEST_STS_CHAIN_SOURCE_SESSION_NAME");
         let target_role_name = required_env("S3_TEST_STS_CHAIN_TARGET_ROLE_NAME");
         let target_session_name = required_env("S3_TEST_STS_CHAIN_TARGET_SESSION_NAME");
         let low_max_target_role_arn = required_env("S3_TEST_STS_DEFAULT_MAX_ROLE_ARN");
@@ -1442,6 +1626,46 @@ fn main() {
                 target_role_name: &target_role_name,
                 target_session_name: &target_session_name,
                 low_max_target_role_arn: &low_max_target_role_arn,
+            },
+        );
+
+        let deleted_access_key = required_env("S3_TEST_STS_DELETED_ROLE_ACCESS_KEY");
+        let deleted_secret_key = required_env("S3_TEST_STS_DELETED_ROLE_SECRET_KEY");
+        let deleted_security_token = required_env("S3_TEST_STS_DELETED_ROLE_SESSION_TOKEN");
+        let deleted_credentials = SignedRequestCredentials {
+            access_key: &deleted_access_key,
+            secret_key: &deleted_secret_key,
+            region: &region,
+            tls_ca_pem: None,
+        };
+        let recreated_access_key = required_env("S3_TEST_STS_RECREATED_ROLE_ACCESS_KEY");
+        let recreated_secret_key = required_env("S3_TEST_STS_RECREATED_ROLE_SECRET_KEY");
+        let recreated_security_token = required_env("S3_TEST_STS_RECREATED_ROLE_SESSION_TOKEN");
+        let recreated_role_name = required_env("S3_TEST_STS_DELETED_ROLE_NAME");
+        let recreated_role_session_name = required_env("S3_TEST_STS_RECREATED_ROLE_SESSION_NAME");
+        let recreated_role_id = required_env("S3_TEST_STS_RECREATED_ROLE_ID");
+        let recreated_credentials = SignedRequestCredentials {
+            access_key: &recreated_access_key,
+            secret_key: &recreated_secret_key,
+            region: &region,
+            tls_ca_pem: None,
+        };
+        run_session_authentication_probes(
+            &endpoint,
+            &account_id,
+            SessionAuthenticationProbeSet {
+                active_credentials: chain_credentials,
+                active_security_token: &chain_security_token,
+                other_live_security_token: &other_live_security_token,
+                active_role_name: &chain_role_name,
+                active_role_session_name: &chain_role_session_name,
+                recreated_credentials,
+                recreated_security_token: &recreated_security_token,
+                recreated_role_name: &recreated_role_name,
+                recreated_role_session_name: &recreated_role_session_name,
+                recreated_role_id: &recreated_role_id,
+                old_credentials: deleted_credentials,
+                old_security_token: &deleted_security_token,
             },
         );
     }
