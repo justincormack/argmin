@@ -729,6 +729,7 @@ wait_for_control_plane_node_epochs_aligned() {
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
             tail -n 80 "$control_plane_state_path" >&2 || true
+            print_control_plane_runtime_map_diagnostics
             die "timed out waiting for storage-node runtime-map epochs to align at or after $min_epoch"
         fi
         sleep 0.1
@@ -736,18 +737,28 @@ wait_for_control_plane_node_epochs_aligned() {
 }
 
 control_plane_node_aligned_epoch() {
-    awk -F, -v expected_count="$ARGMIN_LOCAL_NODE_COUNT" '
-        /^node=/ {
-            if ($2 != "active" || $3 != "1" || $4 != "healthy" || $6 !~ /^[0-9]+$/) {
-                ok = 0
+    local diagnostics
+    if ! diagnostics="$("${server_cmd[@]}" control-plane-runtime-map-diagnostics "$control_plane_socket_path" 2>/dev/null)"; then
+        return 0
+    fi
+    awk -v expected_count="$ARGMIN_LOCAL_NODE_COUNT" '
+        $1 ~ /^node_id=/ {
+            observed_epoch = ""
+            for (i = 1; i <= NF; i++) {
+                split($i, fields, "=")
+                if (fields[1] == "history_report_observed_epoch") {
+                    observed_epoch = fields[2]
+                    break
+                }
+            }
+            if (observed_epoch !~ /^[0-9]+$/) {
                 bad = 1
                 next
             }
             count += 1
             if (epoch == "") {
-                epoch = $6
-            } else if ($6 != epoch) {
-                ok = 0
+                epoch = observed_epoch
+            } else if (observed_epoch != epoch) {
                 bad = 1
             }
         }
@@ -756,7 +767,7 @@ control_plane_node_aligned_epoch() {
                 print epoch
             }
         }
-    ' "$control_plane_state_path"
+    ' <<<"$diagnostics"
 }
 
 wait_for_control_plane_runtime_map_ready() {

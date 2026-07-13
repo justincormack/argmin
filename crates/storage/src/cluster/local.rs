@@ -12,7 +12,7 @@ use crate::control_plane::{
     PgRouteSnapshot,
 };
 use crate::control_plane_lease::{
-    validate_process_lease_clock, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+    validate_process_lease_clock, BoundRouteMapLease, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
 };
 use crate::data_dir::prepare_private_data_dir;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
@@ -1911,6 +1911,18 @@ impl LocalClusterMap {
             candidate
                 .route_map_local_valid_until_monotonic_ms
                 .load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+
+    pub(crate) fn replace_process_local_route_map_lease(
+        &self,
+        candidate: Option<BoundRouteMapLease>,
+    ) {
+        self.route_map_local_valid_until_monotonic_ms.store(
+            candidate.map_or(ROUTE_MAP_VALID_UNTIL_UNBOUNDED, |lease| {
+                lease.local_valid_until_monotonic_ms()
+            }),
             Ordering::Release,
         );
     }

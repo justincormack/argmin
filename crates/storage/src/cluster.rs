@@ -23,8 +23,10 @@ pub use request_ops::BucketIdentityGenerations;
 
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource,
-    PendingMetadataCommandObservation, PgMetadataProof, PgRouteSnapshot,
+    ControlPlaneRuntimeMapStatus, PendingMetadataCommandObservation, PgMetadataProof,
+    PgRouteSnapshot, RuntimeMapContentDigest,
 };
+use crate::control_plane_lease::BoundRouteMapLease;
 use crate::error::{ClusterBuildError, PgMetadataTransferError, ShardIoError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::CommitDirectPutObjectCommand;
@@ -1182,6 +1184,7 @@ impl PendingMetadataCommandRefreshRecoveryError {
 pub struct StorageCluster {
     local_map: Arc<LocalClusterMap>,
     operation_epoch: ClusterEpoch,
+    runtime_map_content_digest: Option<RuntimeMapContentDigest>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
@@ -1304,18 +1307,30 @@ impl StorageClusterRuntimeMapHandle {
         }
         if candidate.cluster_epoch() == current.cluster_epoch() {
             let candidate_validity = candidate.route_map_validity();
+            let candidate_digest = candidate.runtime_map_content_digest;
             let mut generations = self
                 .same_epoch_generations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Same-epoch authoritative refreshes update the control-plane
-            // lease for all pinned generations. Requests that pinned an older
-            // generation must see both lease extensions and bounded shrinks.
+            // Same-epoch authoritative refreshes update matching pinned
+            // generations. A legacy/local unbounded generation has no digest;
+            // it may only make the one-way transition to bounded validity.
             generations.retain(|generation| {
                 let Some(generation) = generation.upgrade() else {
                     return false;
                 };
                 if generation.cluster_epoch() == candidate.cluster_epoch() {
+                    if generation.runtime_map_content_digest != candidate_digest {
+                        if generation.runtime_map_content_digest.is_none()
+                            && generation.route_map_valid_until_ms().is_none()
+                        {
+                            generation.cap_route_map_validity(candidate_validity);
+                            generation
+                                .local_map
+                                .replace_process_local_route_map_lease_from(&candidate.local_map);
+                        }
+                        return true;
+                    }
                     match (
                         generation.route_map_valid_until_ms(),
                         candidate_validity.valid_until_ms(),
@@ -1351,6 +1366,57 @@ impl StorageClusterRuntimeMapHandle {
         Ok(())
     }
 
+    fn renew_from_runtime_map_status(
+        &self,
+        status: ControlPlaneRuntimeMapStatus,
+        local_wall_ms: u64,
+        local_monotonic_ms: u64,
+    ) -> Result<Option<Arc<StorageCluster>>, StorageClusterRuntimeMapRefreshError> {
+        let current = self
+            .cluster
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(renewal) = status.lease_renewal() else {
+            return Ok(None);
+        };
+        if status.cluster_epoch() != current.cluster_epoch()
+            || current.runtime_map_content_digest != Some(renewal.content_digest())
+        {
+            return Ok(None);
+        }
+        let Some(_) = renewal.validity().valid_until_ms() else {
+            return Err(
+                StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
+                    candidate: status.cluster_epoch(),
+                },
+            );
+        };
+        let bound_lease = renewal
+            .bind_process_local_lease_at(local_wall_ms, local_monotonic_ms)
+            .map_err(|error| ClusterBuildError::RouteMapLeaseBinding {
+                message: error.to_string(),
+            })?;
+        let validity = renewal.validity();
+        let digest = renewal.content_digest();
+        let mut generations = self
+            .same_epoch_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generations.retain(|generation| {
+            let Some(generation) = generation.upgrade() else {
+                return false;
+            };
+            if generation.cluster_epoch() != status.cluster_epoch()
+                || generation.runtime_map_content_digest != Some(digest)
+            {
+                return true;
+            }
+            generation.replace_route_map_lease(validity, bound_lease);
+            true
+        });
+        Ok(Some(Arc::clone(&current)))
+    }
+
     fn expire_same_epoch_generations(&self, now_ms: u64) {
         let current_epoch = self.current().cluster_epoch();
         let expiry = RouteMapValidity::until_ms_saturating(now_ms);
@@ -1380,9 +1446,36 @@ impl StorageClusterRuntimeMapHandle {
         control_plane: &impl ControlPlaneRuntimeMapSource,
         authority_now_ms: u64,
     ) -> Result<Arc<StorageCluster>, StorageClusterRuntimeMapRefreshError> {
+        let started = Instant::now();
+        let mut first_sample = true;
+        self.refresh_from_control_plane_runtime_map_with_authority_clock(control_plane, || {
+            if std::mem::take(&mut first_sample) {
+                return authority_now_ms;
+            }
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            authority_now_ms.saturating_add(elapsed_ms)
+        })
+    }
+
+    pub(crate) fn refresh_from_control_plane_runtime_map_with_authority_clock<F>(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        mut authority_now_ms: F,
+    ) -> Result<Arc<StorageCluster>, StorageClusterRuntimeMapRefreshError>
+    where
+        F: FnMut() -> u64,
+    {
+        let status = control_plane.runtime_map_status(authority_now_ms())?;
+        let local_wall_ms = crate::clock::current_time_millis();
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        if let Some(current) =
+            self.renew_from_runtime_map_status(status, local_wall_ms, local_monotonic_ms)?
+        {
+            return Ok(current);
+        }
         let candidate = self
             .current()
-            .refresh_from_control_plane_runtime_map(control_plane, authority_now_ms)?;
+            .refresh_from_control_plane_runtime_map(control_plane, authority_now_ms())?;
         self.install(Arc::clone(&candidate))?;
         Ok(candidate)
     }
@@ -1393,11 +1486,46 @@ impl StorageClusterRuntimeMapHandle {
         authority_now_ms: u64,
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Result<Arc<StorageCluster>, StorageClusterRuntimeMapRefreshError> {
+        let started = Instant::now();
+        let mut first_sample = true;
+        self.refresh_from_control_plane_runtime_map_with_unix_storage_node_clients_and_authority_clock(
+            control_plane,
+            admission_settings,
+            || {
+                if std::mem::take(&mut first_sample) {
+                    return authority_now_ms;
+                }
+                let elapsed_ms =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                authority_now_ms.saturating_add(elapsed_ms)
+            },
+        )
+    }
+
+    pub(crate) fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients_and_authority_clock<
+        F,
+    >(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        mut authority_now_ms: F,
+    ) -> Result<Arc<StorageCluster>, StorageClusterRuntimeMapRefreshError>
+    where
+        F: FnMut() -> u64,
+    {
+        let status = control_plane.runtime_map_status(authority_now_ms())?;
+        let local_wall_ms = crate::clock::current_time_millis();
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        if let Some(current) =
+            self.renew_from_runtime_map_status(status, local_wall_ms, local_monotonic_ms)?
+        {
+            return Ok(current);
+        }
         let candidate = self
             .current()
             .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
                 control_plane,
-                authority_now_ms,
+                authority_now_ms(),
                 admission_settings,
             )?;
         self.install(Arc::clone(&candidate))?;
@@ -4312,7 +4440,11 @@ impl StorageCluster {
                 default_ec_shape,
             )?,
         );
-        Self::from_local_map(local_map)
+        Self::from_local_map_with_epoch_and_digest(
+            local_map,
+            runtime_map.cluster_epoch(),
+            Some(runtime_map.content_digest()),
+        )
     }
 
     pub fn from_runtime_map_with_unix_storage_node_clients(
@@ -4360,7 +4492,11 @@ impl StorageCluster {
             admission_settings,
         );
         local_map.install_unix_storage_node_clients(storage_node_configs)?;
-        Self::from_local_map(Arc::new(local_map))
+        Self::from_local_map_with_epoch_and_digest(
+            Arc::new(local_map),
+            runtime_map.cluster_epoch(),
+            Some(runtime_map.content_digest()),
+        )
     }
 
     pub fn refresh_from_control_plane_runtime_map(
@@ -4373,7 +4509,11 @@ impl StorageCluster {
             &self.local_map,
             &runtime_map,
         )?;
-        Ok(Self::from_local_map(Arc::new(local_map))?)
+        Ok(Self::from_local_map_with_epoch_and_digest(
+            Arc::new(local_map),
+            runtime_map.cluster_epoch(),
+            Some(runtime_map.content_digest()),
+        )?)
     }
 
     pub fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
@@ -4394,7 +4534,11 @@ impl StorageCluster {
             admission_settings,
         );
         local_map.install_unix_storage_node_clients(storage_node_configs)?;
-        Ok(Self::from_local_map(Arc::new(local_map))?)
+        Ok(Self::from_local_map_with_epoch_and_digest(
+            Arc::new(local_map),
+            runtime_map.cluster_epoch(),
+            Some(runtime_map.content_digest()),
+        )?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -4409,9 +4553,18 @@ impl StorageCluster {
         local_map: Arc<LocalClusterMap>,
         operation_epoch: ClusterEpoch,
     ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_local_map_with_epoch_and_digest(local_map, operation_epoch, None)
+    }
+
+    fn from_local_map_with_epoch_and_digest(
+        local_map: Arc<LocalClusterMap>,
+        operation_epoch: ClusterEpoch,
+        runtime_map_content_digest: Option<RuntimeMapContentDigest>,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
         Ok(Arc::new(Self {
             local_map,
             operation_epoch,
+            runtime_map_content_digest,
             #[cfg(any(test, feature = "test-hooks"))]
             test_hooks: Arc::new(Mutex::new(StorageClusterTestHooks::default())),
         }))
@@ -4444,6 +4597,22 @@ impl StorageCluster {
 
     fn cap_route_map_validity(&self, candidate: RouteMapValidity) {
         self.local_map.cap_route_map_validity(candidate);
+    }
+
+    fn replace_route_map_lease(
+        &self,
+        validity: RouteMapValidity,
+        bound_lease: Option<BoundRouteMapLease>,
+    ) {
+        match (self.route_map_valid_until_ms(), validity.valid_until_ms()) {
+            (Some(current), Some(candidate)) if candidate < current => {
+                self.cap_route_map_validity(validity);
+            }
+            (None, Some(_)) => self.cap_route_map_validity(validity),
+            _ => self.extend_route_map_validity(validity),
+        }
+        self.local_map
+            .replace_process_local_route_map_lease(bound_lease);
     }
 
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use checksum::{ChecksumAlgorithm, ChecksumHasher};
 use placement::NodeId;
 use ring::rand::SecureRandom as _;
 use thiserror::Error;
@@ -41,7 +42,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 6;
+const CONTROL_PLANE_RPC_VERSION: u16 = 7;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -3979,7 +3980,7 @@ impl NodeRouteSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeMapFreshnessProof {
     // Phase 11 single-authority freshness proof. The replicated control-plane
     // path must use a sibling proof variant rather than overloading this one.
@@ -4054,6 +4055,22 @@ pub struct ClusterRuntimeMapSnapshot {
     historical_cluster_epochs: Vec<ClusterEpoch>,
 }
 
+const RUNTIME_MAP_CONTENT_DIGEST_LEN: usize = 32;
+const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeMapContentDigest([u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
+
+impl RuntimeMapContentDigest {
+    fn from_bytes(bytes: [u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]) -> Self {
+        Self(bytes)
+    }
+
+    fn as_bytes(self) -> [u8; RUNTIME_MAP_CONTENT_DIGEST_LEN] {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SparsePgRouteReconstructionError {
     UnknownClusterEpoch,
@@ -4103,6 +4120,11 @@ impl ClusterRuntimeMapSnapshot {
     #[must_use]
     pub fn validity(&self) -> RouteMapValidity {
         self.validity
+    }
+
+    #[must_use]
+    pub fn content_digest(&self) -> RuntimeMapContentDigest {
+        runtime_map_content_digest(self)
     }
 
     pub(crate) fn bind_process_local_lease_at(
@@ -4214,6 +4236,142 @@ impl ClusterRuntimeMapSnapshot {
             historical_cluster_epochs: self.historical_cluster_epochs.clone(),
         })
     }
+}
+
+fn runtime_map_content_digest(snapshot: &ClusterRuntimeMapSnapshot) -> RuntimeMapContentDigest {
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(&mut hasher, RUNTIME_MAP_CONTENT_DIGEST_DOMAIN);
+    digest_u64(&mut hasher, snapshot.cluster_epoch().get());
+    digest_len(&mut hasher, snapshot.nodes().len());
+    for node in snapshot.nodes() {
+        digest_u32(&mut hasher, node.node_id().as_u32());
+        digest_u64(&mut hasher, node.node_incarnation());
+        digest_bytes(&mut hasher, node.endpoint().as_bytes());
+        digest_option_u64(
+            &mut hasher,
+            node.cluster_map_history_floor_epoch()
+                .map(ClusterEpoch::get),
+        );
+    }
+    digest_pg_routes(&mut hasher, snapshot.pg_routes());
+    digest_pg_routes(&mut hasher, snapshot.historical_pg_routes());
+    digest_len(&mut hasher, snapshot.historical_cluster_epochs().len());
+    for epoch in snapshot.historical_cluster_epochs() {
+        digest_u64(&mut hasher, epoch.get());
+    }
+    let checksum = hasher.finalize();
+    RuntimeMapContentDigest::from_bytes(
+        checksum
+            .bytes()
+            .try_into()
+            .expect("SHA-256 runtime-map digest must contain 32 bytes"),
+    )
+}
+
+fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSnapshot]) {
+    digest_len(hasher, routes.len());
+    for route in routes {
+        digest_u64(hasher, route.cluster_epoch().get());
+        digest_u32(hasher, route.pg_id().get());
+        digest_u32(hasher, route.primary_node_id().as_u32());
+        digest_u8(
+            hasher,
+            match route.state() {
+                PgState::Active => 1,
+                PgState::Peering => 2,
+                PgState::Degraded => 3,
+                PgState::Backfilling => 4,
+                PgState::Inconsistent => 5,
+            },
+        );
+        // The lease deadline is renewed separately and does not change route content.
+        match route.peering_metadata_transfer() {
+            Some(transfer) => {
+                digest_u8(hasher, 1);
+                digest_u64(hasher, transfer.source_epoch().get());
+                digest_pg_metadata_proof(hasher, transfer.source_metadata_proof());
+                digest_pg_metadata_proof(hasher, transfer.metadata_proof());
+                digest_option_u64(
+                    hasher,
+                    route
+                        .peering_metadata_transfer_source_route_epoch()
+                        .map(ClusterEpoch::get),
+                );
+                digest_option_u32(
+                    hasher,
+                    route
+                        .peering_metadata_transfer_source_node_id()
+                        .map(NodeId::as_u32),
+                );
+            }
+            None => digest_u8(hasher, 0),
+        }
+        match route.pending_metadata_command_recovery() {
+            Some(recovery) => {
+                digest_u8(hasher, 1);
+                digest_u32(hasher, recovery.reporting_node_id().as_u32());
+                let pending = recovery.pending();
+                digest_u64(hasher, pending.cluster_epoch().get());
+                digest_u64(hasher, pending.log_index());
+                digest_u64(hasher, pending.command_checksum());
+            }
+            None => digest_u8(hasher, 0),
+        }
+        digest_len(hasher, route.acting_set().len());
+        for node_id in route.acting_set() {
+            digest_u32(hasher, node_id.as_u32());
+        }
+    }
+}
+
+fn digest_pg_metadata_proof(hasher: &mut ChecksumHasher, proof: PgMetadataProof) {
+    digest_u64(hasher, proof.applied_log_index);
+    digest_u64(hasher, proof.applied_log_hash);
+    digest_u64(hasher, proof.state_digest);
+}
+
+fn digest_len(hasher: &mut ChecksumHasher, len: usize) {
+    digest_u64(
+        hasher,
+        u64::try_from(len).expect("runtime-map collection length must fit u64"),
+    );
+}
+
+fn digest_bytes(hasher: &mut ChecksumHasher, bytes: &[u8]) {
+    digest_len(hasher, bytes.len());
+    hasher.update(bytes);
+}
+
+fn digest_option_u64(hasher: &mut ChecksumHasher, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            digest_u8(hasher, 1);
+            digest_u64(hasher, value);
+        }
+        None => digest_u8(hasher, 0),
+    }
+}
+
+fn digest_option_u32(hasher: &mut ChecksumHasher, value: Option<u32>) {
+    match value {
+        Some(value) => {
+            digest_u8(hasher, 1);
+            digest_u32(hasher, value);
+        }
+        None => digest_u8(hasher, 0),
+    }
+}
+
+fn digest_u64(hasher: &mut ChecksumHasher, value: u64) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn digest_u32(hasher: &mut ChecksumHasher, value: u32) {
+    hasher.update(&value.to_be_bytes());
+}
+
+fn digest_u8(hasher: &mut ChecksumHasher, value: u8) {
+    hasher.update(&[value]);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5377,10 +5535,72 @@ impl PendingMetadataCommandRecoveryTask {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneRuntimeMapLeaseRenewal {
+    content_digest: RuntimeMapContentDigest,
+    validity: RouteMapValidity,
+    freshness_proof: RuntimeMapFreshnessProof,
+}
+
+impl ControlPlaneRuntimeMapLeaseRenewal {
+    fn from_runtime_map(runtime_map: &ClusterRuntimeMapSnapshot) -> Self {
+        Self {
+            content_digest: runtime_map.content_digest(),
+            validity: runtime_map.validity(),
+            freshness_proof: *runtime_map.freshness_proof(),
+        }
+    }
+
+    #[must_use]
+    pub fn content_digest(self) -> RuntimeMapContentDigest {
+        self.content_digest
+    }
+
+    #[must_use]
+    pub fn validity(self) -> RouteMapValidity {
+        self.validity
+    }
+
+    #[must_use]
+    pub fn freshness_proof(self) -> RuntimeMapFreshnessProof {
+        self.freshness_proof
+    }
+
+    pub(crate) fn bind_process_local_lease_at(
+        self,
+        local_wall_ms: u64,
+        local_monotonic_ms: u64,
+    ) -> Result<Option<BoundRouteMapLease>, LeaseClockError> {
+        let Some(authority_valid_until_ms) = self.validity.valid_until_ms() else {
+            return Ok(None);
+        };
+        validate_process_lease_clock(
+            local_wall_ms,
+            crate::clock::clock_health_time_millis(),
+            CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )?;
+        let Some(authority_issued_at_ms) = self.freshness_proof.issued_at_ms() else {
+            return Ok(Some(BoundRouteMapLease::expired(
+                authority_valid_until_ms,
+                local_monotonic_ms,
+            )));
+        };
+        BoundRouteMapLease::bind(
+            authority_issued_at_ms,
+            authority_valid_until_ms,
+            local_wall_ms,
+            local_monotonic_ms,
+            CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )
+        .map(Some)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPlaneRuntimeMapStatus {
     cluster_epoch: ClusterEpoch,
     pg_routes: usize,
     active_serving_pg_routes: usize,
+    lease_renewal: Option<ControlPlaneRuntimeMapLeaseRenewal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5426,21 +5646,25 @@ impl ControlPlaneRuntimeMapStatus {
             cluster_epoch,
             pg_routes,
             active_serving_pg_routes,
+            lease_renewal: None,
         }
     }
 
     fn from_runtime_map(runtime_map: &ClusterRuntimeMapSnapshot) -> Self {
-        Self::new(
-            runtime_map.cluster_epoch(),
-            runtime_map.pg_routes().len(),
-            runtime_map
+        Self {
+            cluster_epoch: runtime_map.cluster_epoch(),
+            pg_routes: runtime_map.pg_routes().len(),
+            active_serving_pg_routes: runtime_map
                 .pg_routes()
                 .iter()
                 .filter(|route| {
                     route.state() == PgState::Active && route.primary_lease_deadline_ms().is_some()
                 })
                 .count(),
-        )
+            lease_renewal: (runtime_map.valid_until_ms().is_some()
+                && runtime_map.freshness_proof().is_serving_authority_read())
+            .then(|| ControlPlaneRuntimeMapLeaseRenewal::from_runtime_map(runtime_map)),
+        }
     }
 
     #[must_use]
@@ -5456,6 +5680,11 @@ impl ControlPlaneRuntimeMapStatus {
     #[must_use]
     pub fn active_serving_pg_routes(&self) -> usize {
         self.active_serving_pg_routes
+    }
+
+    #[must_use]
+    pub fn lease_renewal(&self) -> Option<ControlPlaneRuntimeMapLeaseRenewal> {
+        self.lease_renewal
     }
 }
 
@@ -6799,17 +7028,8 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
         &self,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        let pg_routes = self.snapshot.pg_routes(authority_now_ms)?;
-        let active_serving_pg_routes = pg_routes
-            .iter()
-            .filter(|route| {
-                route.state() == PgState::Active && route.primary_lease_deadline_ms().is_some()
-            })
-            .count();
-        Ok(ControlPlaneRuntimeMapStatus::new(
-            self.snapshot.cluster_epoch(),
-            pg_routes.len(),
-            active_serving_pg_routes,
+        Ok(ControlPlaneRuntimeMapStatus::from_runtime_map(
+            &self.snapshot.runtime_map(authority_now_ms)?,
         ))
     }
 
@@ -9889,7 +10109,7 @@ impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
         &self,
         _authority_now_ms: u64,
     ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        self.runtime_map_status_with_read_timeout(CONTROL_PLANE_RPC_IO_TIMEOUT)
+        self.runtime_map_status_with_check_applied_timeout()
     }
 
     fn pending_metadata_command_recoveries(
@@ -9929,16 +10149,7 @@ impl ControlPlaneRuntimeMapSource for AuthenticatedUnixControlPlaneClient {
         &self,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        let payload = self.send_signed_read_only_request_with_read_timeout(
-            ControlPlaneRpcKind::RuntimeMapStatus,
-            authority_now_ms,
-            Vec::new(),
-            CONTROL_PLANE_RPC_IO_TIMEOUT,
-        )?;
-        let mut reader = PayloadReader::new(&payload);
-        let status = read_runtime_map_status(&mut reader)?;
-        reader.finish()?;
-        Ok(status)
+        self.runtime_map_status_with_check_applied_timeout(authority_now_ms)
     }
 
     fn pending_metadata_command_recoveries(
@@ -11535,6 +11746,27 @@ fn write_runtime_map_status(
             "runtime map status active serving PG routes",
         )?,
     );
+    match status.lease_renewal() {
+        Some(renewal) => {
+            write_u8(out, 1);
+            out.extend_from_slice(&renewal.content_digest().as_bytes());
+            let Some(valid_until_ms) = renewal.validity().valid_until_ms() else {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: "runtime map status renewal validity must be bounded".to_owned(),
+                });
+            };
+            if !renewal.freshness_proof().is_serving_authority_read() {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message:
+                        "runtime map status renewal requires a serving-authority freshness proof"
+                            .to_owned(),
+                });
+            }
+            write_u64(out, valid_until_ms);
+            write_runtime_map_freshness_proof(out, &renewal.freshness_proof());
+        }
+        None => write_u8(out, 0),
+    }
     Ok(())
 }
 
@@ -11542,11 +11774,51 @@ fn read_runtime_map_status(
     reader: &mut PayloadReader<'_>,
 ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
     let cluster_epoch = read_cluster_epoch(reader, "runtime map status cluster epoch")?;
-    Ok(ControlPlaneRuntimeMapStatus::new(
+    let pg_routes = reader.read_u32()? as usize;
+    let active_serving_pg_routes = reader.read_u32()? as usize;
+    let lease_renewal =
+        match reader.read_u8()? {
+            0 => None,
+            1 => {
+                let content_digest = RuntimeMapContentDigest::from_bytes(
+                    reader
+                        .read_exact(RUNTIME_MAP_CONTENT_DIGEST_LEN)?
+                        .try_into()
+                        .expect("runtime-map digest read must return 32 bytes"),
+                );
+                let valid_until_ms = reader.read_u64()?;
+                let validity = RouteMapValidity::from_valid_until_ms(Some(valid_until_ms))
+                    .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                        message:
+                            "runtime map status renewal validity uses reserved unbounded sentinel"
+                                .to_owned(),
+                    })?;
+                let freshness_proof = read_runtime_map_freshness_proof(reader)?;
+                if !freshness_proof.is_serving_authority_read() {
+                    return Err(ControlPlaneError::RpcProtocol {
+                    message:
+                        "runtime map status renewal requires a serving-authority freshness proof"
+                            .to_owned(),
+                });
+                }
+                Some(ControlPlaneRuntimeMapLeaseRenewal {
+                    content_digest,
+                    validity,
+                    freshness_proof,
+                })
+            }
+            value => {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!("invalid runtime map status renewal tag {value}"),
+                });
+            }
+        };
+    Ok(ControlPlaneRuntimeMapStatus {
         cluster_epoch,
-        reader.read_u32()? as usize,
-        reader.read_u32()? as usize,
-    ))
+        pg_routes,
+        active_serving_pg_routes,
+        lease_renewal,
+    })
 }
 
 fn write_control_plane_runtime_map_diagnostics(
@@ -23755,6 +24027,9 @@ mod tests {
             .unwrap();
         heartbeat_with_pg_proof(&mut authority, 1, 7, PgState::Active, proof, false, 2_002);
         let expected_epoch = authority.snapshot().cluster_epoch();
+        let expected_runtime_map = authority.runtime_map_snapshot(2_003).unwrap();
+        let expected_digest = expected_runtime_map.content_digest();
+        let expected_validity = expected_runtime_map.validity();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _addr) = listener.accept().unwrap();
@@ -23771,10 +24046,15 @@ mod tests {
         assert_eq!(status.cluster_epoch(), expected_epoch);
         assert_eq!(status.pg_routes(), 1);
         assert_eq!(status.active_serving_pg_routes(), 1);
+        let renewal = status
+            .lease_renewal()
+            .expect("serving runtime-map status should include a renewal certificate");
+        assert_eq!(renewal.content_digest(), expected_digest);
+        assert_eq!(renewal.validity(), expected_validity);
     }
 
     #[test]
-    fn unix_control_plane_client_runtime_map_status_check_applied_timeout_allows_slow_response() {
+    fn unix_runtime_map_source_status_uses_check_applied_timeout_for_slow_response() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -23813,9 +24093,7 @@ mod tests {
         });
 
         let client = UnixControlPlaneClient::new(&socket_path);
-        let status = client
-            .runtime_map_status_with_check_applied_timeout()
-            .unwrap();
+        let status = ControlPlaneRuntimeMapSource::runtime_map_status(&client, 2_003).unwrap();
 
         server.join().unwrap();
         assert_eq!(status.cluster_epoch(), expected_epoch);
@@ -24927,6 +25205,206 @@ mod tests {
             historical_pg_routes: Vec::new(),
             historical_cluster_epochs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn runtime_map_content_digest_excludes_lease_freshness_but_binds_route_content() {
+        let snapshot = runtime_map_test_snapshot_with_active_route();
+        let expected = snapshot.content_digest();
+        let mut renewed = snapshot.clone();
+        renewed.validity = RouteMapValidity::until_ms(22_345).unwrap();
+        renewed.freshness_proof = RuntimeMapFreshnessProof::ReadIndex {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            read_index: ControlPlaneLogId::new(7, 9).unwrap(),
+            issued_at_ms: 22_000,
+        };
+        renewed.pg_routes[0].primary_lease_deadline_ms = Some(22_345);
+
+        assert_eq!(renewed.content_digest(), expected);
+
+        renewed.nodes[0].endpoint = "/tmp/argmin-node-1-replaced.sock".to_owned();
+        assert_ne!(renewed.content_digest(), expected);
+    }
+
+    #[test]
+    fn runtime_map_status_lease_renewal_codec_round_trips_and_fails_closed() {
+        let snapshot = runtime_map_test_snapshot_with_active_route();
+        let status = ControlPlaneRuntimeMapStatus::from_runtime_map(&snapshot);
+        let mut payload = Vec::new();
+        write_runtime_map_status(&mut payload, status).unwrap();
+        let mut reader = PayloadReader::new(&payload);
+        assert_eq!(read_runtime_map_status(&mut reader).unwrap(), status);
+        reader.finish().unwrap();
+
+        let mut reconstructed_snapshot = snapshot.clone();
+        reconstructed_snapshot.freshness_proof = RuntimeMapFreshnessProof::Reconstructed {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+        };
+        assert!(
+            ControlPlaneRuntimeMapStatus::from_runtime_map(&reconstructed_snapshot)
+                .lease_renewal()
+                .is_none()
+        );
+
+        let mut unbounded = Vec::new();
+        write_u64(&mut unbounded, ClusterEpoch::INITIAL.get());
+        write_u32(&mut unbounded, 1);
+        write_u32(&mut unbounded, 1);
+        write_u8(&mut unbounded, 1);
+        unbounded.extend_from_slice(&[0; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
+        write_u64(&mut unbounded, u64::MAX);
+        let mut reader = PayloadReader::new(&unbounded);
+        assert!(matches!(
+            read_runtime_map_status(&mut reader),
+            Err(ControlPlaneError::RpcProtocol { message })
+                if message.contains("reserved unbounded sentinel")
+        ));
+
+        let mut reconstructed = Vec::new();
+        write_u64(&mut reconstructed, ClusterEpoch::INITIAL.get());
+        write_u32(&mut reconstructed, 1);
+        write_u32(&mut reconstructed, 1);
+        write_u8(&mut reconstructed, 1);
+        reconstructed.extend_from_slice(&[0; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
+        write_u64(&mut reconstructed, 12_345);
+        write_runtime_map_freshness_proof(
+            &mut reconstructed,
+            &RuntimeMapFreshnessProof::Reconstructed {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+            },
+        );
+        let mut reader = PayloadReader::new(&reconstructed);
+        assert!(matches!(
+            read_runtime_map_status(&mut reader),
+            Err(ControlPlaneError::RpcProtocol { message })
+                if message.contains("serving-authority freshness proof")
+        ));
+    }
+
+    struct CountingRuntimeMapSource {
+        status_map: ClusterRuntimeMapSnapshot,
+        full_map: ClusterRuntimeMapSnapshot,
+        full_map_calls: Cell<usize>,
+        status_authority_now_ms: Cell<Option<u64>>,
+        full_map_authority_now_ms: Cell<Option<u64>>,
+    }
+
+    impl ControlPlaneRuntimeMapSource for CountingRuntimeMapSource {
+        fn runtime_map_snapshot(
+            &self,
+            authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            self.full_map_calls.set(self.full_map_calls.get() + 1);
+            self.full_map_authority_now_ms.set(Some(authority_now_ms));
+            Ok(self.full_map.clone())
+        }
+
+        fn runtime_map_status(
+            &self,
+            authority_now_ms: u64,
+        ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+            self.status_authority_now_ms.set(Some(authority_now_ms));
+            Ok(ControlPlaneRuntimeMapStatus::from_runtime_map(
+                &self.status_map,
+            ))
+        }
+    }
+
+    fn current_runtime_map_test_snapshot() -> ClusterRuntimeMapSnapshot {
+        let now_ms = crate::clock::current_time_millis();
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        snapshot.validity = RouteMapValidity::until_ms(now_ms.saturating_add(10_000)).unwrap();
+        snapshot.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            issued_at_ms: now_ms,
+        };
+        snapshot.pg_routes[0].primary_lease_deadline_ms = Some(now_ms.saturating_add(10_000));
+        snapshot
+    }
+
+    #[test]
+    fn runtime_map_handle_renews_matching_content_without_fetching_full_snapshot() {
+        let initial_map = current_runtime_map_test_snapshot();
+        let initial = crate::cluster::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &initial_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let handle = crate::cluster::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let mut renewed_map = initial_map.clone();
+        let renewed_deadline = initial_map.valid_until_ms().unwrap().saturating_add(5_000);
+        renewed_map.validity = RouteMapValidity::until_ms(renewed_deadline).unwrap();
+        renewed_map.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            issued_at_ms: crate::clock::current_time_millis(),
+        };
+        renewed_map.pg_routes[0].primary_lease_deadline_ms = Some(renewed_deadline);
+        let source = CountingRuntimeMapSource {
+            status_map: renewed_map.clone(),
+            full_map: renewed_map,
+            full_map_calls: Cell::new(0),
+            status_authority_now_ms: Cell::new(None),
+            full_map_authority_now_ms: Cell::new(None),
+        };
+
+        let refreshed = handle
+            .refresh_from_control_plane_runtime_map(&source, crate::clock::current_time_millis())
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&refreshed, &initial));
+        assert_eq!(source.full_map_calls.get(), 0);
+        assert_eq!(initial.route_map_valid_until_ms(), Some(renewed_deadline));
+    }
+
+    #[test]
+    fn runtime_map_handle_fetches_full_snapshot_for_same_epoch_content_change() {
+        let initial_map = current_runtime_map_test_snapshot();
+        let initial = crate::cluster::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &initial_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let handle = crate::cluster::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let mut changed_map = initial_map;
+        changed_map.nodes[0].endpoint = "/tmp/argmin-node-1-replaced.sock".to_owned();
+        let mut source = CountingRuntimeMapSource {
+            status_map: changed_map.clone(),
+            full_map: changed_map,
+            full_map_calls: Cell::new(0),
+            status_authority_now_ms: Cell::new(None),
+            full_map_authority_now_ms: Cell::new(None),
+        };
+
+        let mut retry_clock = [2_000, 8_000].into_iter();
+        let refreshed = handle
+            .refresh_from_control_plane_runtime_map_with_authority_clock(&source, || {
+                retry_clock
+                    .next()
+                    .expect("status and fallback clock samples")
+            })
+            .unwrap();
+        assert!(!Arc::ptr_eq(&refreshed, &initial));
+        assert_eq!(source.full_map_calls.get(), 1);
+        assert_eq!(source.status_authority_now_ms.get(), Some(2_000));
+        assert_eq!(source.full_map_authority_now_ms.get(), Some(8_000));
+
+        let initial_deadline = initial.route_map_valid_until_ms().unwrap();
+        let renewed_deadline = initial_deadline.saturating_add(5_000);
+        source.status_map.validity = RouteMapValidity::until_ms(renewed_deadline).unwrap();
+        source.status_map.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            issued_at_ms: crate::clock::current_time_millis(),
+        };
+        source.status_map.pg_routes[0].primary_lease_deadline_ms = Some(renewed_deadline);
+        let renewed = handle
+            .refresh_from_control_plane_runtime_map(&source, crate::clock::current_time_millis())
+            .unwrap();
+        assert!(Arc::ptr_eq(&renewed, &refreshed));
+        assert_eq!(source.full_map_calls.get(), 1);
+        assert_eq!(refreshed.route_map_valid_until_ms(), Some(renewed_deadline));
+        assert_eq!(initial.route_map_valid_until_ms(), Some(initial_deadline));
     }
 
     #[test]

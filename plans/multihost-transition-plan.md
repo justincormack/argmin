@@ -11071,6 +11071,11 @@ Required production shape and implementation order:
    that motivated this slice reached epoch 706 with every node healthy but
    still observing epoch 705 while full-snapshot heartbeat writes contended;
    the frontend exhausted transient retries and aborted on `pg_not_active`.
+   UAT storage-node convergence checks now read the live accepted heartbeat
+   epochs from authenticated runtime-map diagnostics rather than the durable
+   state file. Once unchanged heartbeats are volatile, the checkpoint is not a
+   valid observation source for current node epochs and may legitimately lag
+   or contain different per-node samples until another durable transition.
 4. Persist logical durable commands incrementally. The single-authority
    compatibility path must either append versioned/checksummed durable deltas
    to an fsync'd, identity-bound journal and replay them over the latest
@@ -11116,6 +11121,38 @@ Required production shape and implementation order:
    lease needs renewal. A same-epoch lease extension should use a compact,
    explicitly authenticated renewal contract if it can safely avoid resending
    unchanged routes.
+   The first frontend compact-renewal slice is now implemented. Runtime-map
+   status RPC version 7 carries a bounded serving-authority freshness proof,
+   map validity, and a domain-separated SHA-256 digest of canonical route
+   content. The digest binds epoch, node identities/endpoints/history floors,
+   current and sparse historical routes, retained epochs, transfer proofs and
+   dependencies, pending-command recovery identity, and acting sets. It
+   deliberately excludes the freshness proof, map validity, and Active-primary
+   lease deadlines because those are the renewable authority fields. A
+   frontend generation records the digest only after building from a full map;
+   compact renewal is accepted only when both epoch and digest match exactly.
+   Missing certificates, legacy/test-only status objects, epoch mismatch, or
+   any same-epoch content change fall back to the full map. Lease extensions
+   and bounded shrinks update every still-pinned generation with the matching
+   digest, while same-epoch generations with older content are never renewed.
+   Regressions prove matching renewal performs zero full-snapshot fetches and
+   an endpoint change at the same epoch forces one before later compact
+   renewals can resume. The status frame is authenticated by the existing
+   runtime-map response policy where control-plane auth is enabled and rejects
+   unbounded validity or reconstructed/non-serving freshness proofs.
+   Until status construction is cached and independently bounded, compact
+   status reads retain the full-map path's five-second I/O timeout rather than
+   the generic one-second RPC timeout. Digest-mismatch fallback also uses one
+   monotonic retry clock across status and full-map requests, so time spent
+   waiting or retrying status cannot make the authenticated fallback request
+   immediately stale.
+   This slice removes repeated full-map encoding, transfer, decoding, and
+   frontend topology rebuild for unchanged content, but status construction
+   still derives and hashes a complete runtime-map view under the authority
+   read boundary. Cache the immutable route digest/status alongside committed
+   state so the frequent status path becomes bounded independently of retained
+   history size; measure that follow-up with the existing runtime-map build and
+   authority-lock metrics.
 9. Make the lease-horizon/restart-fence contract executable before removing
    per-heartbeat persistence. Model and property-test leader changes, process
    crashes, clock rollback/forward jump, delayed old maps, delayed old-primary
