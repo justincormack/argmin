@@ -1,0 +1,242 @@
+Sparse runtime maps break local historical route reconstruction
+Link: https://chatgpt.com/codex/cloud/security/findings/1045fed8a134819188cf013fc88c6177?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: cedad69
+Fixed Commit: 1b90025565eef8cb83eb8f7a85f8459c616dae34
+Author: justin@specialbusservice.com
+Created: 12/07/2026, 20:48:13
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Introduced: the commit compacts control-plane history into sparse reverse deltas but does not update LocalClusterMap's historical route reconstruction semantics to match. The producer and ClusterRuntimeMapSnapshot reader now use reverse-delta semantics, while the local runtime map consumer still assumes dense historical snapshots.
+The new control-plane runtime map representation no longer emits a PG route for every retained historical epoch. It emits only changed historical route records plus a baseline, and ClusterRuntimeMapSnapshot::reconstructed_pg_route_at_epoch was updated to interpret that sparse format by selecting the first historical route at or after the requested epoch, falling back to the current route. However, when a runtime map is converted into LocalClusterMap, only historical_pg_routes are copied, and LocalClusterMap::reconstructed_pg_route_at_epoch still uses the old dense-history algorithm: it selects the latest historical route at or before the requested epoch and only uses the current route when the requested epoch equals the current epoch. For example, if PG 30 moves from node 1 to node 2 at epoch 3 and the cluster later advances to epoch 10 without another PG 30 change, the sparse runtime map may contain the old node-1 route at epoch 2 and the current node-2 route at epoch 10. A local lookup for placement epoch 5 will incorrectly choose the epoch-2/node-1 route instead of the current node-2 route. Object payload metadata stores placement_cluster_epoch, so reads, cleanup, repair, and backfill of objects written during such intervening epochs can be directed to the wrong shard locations, causing NotFound/unavailability and potentially stale cleanup/backfill behavior.
+
+# Resolution
+Fixed in commit [1b90025565eef8cb83eb8f7a85f8459c616dae34](https://github.com/justincormack/argmin/commit/1b90025565eef8cb83eb8f7a85f8459c616dae34) (`Align local sparse route reconstruction`).
+
+`LocalClusterMap` now preserves the runtime map's canonical retained-epoch set instead of copying only its sparse route records. Both `ClusterRuntimeMapSnapshot` and `LocalClusterMap` call the same reverse-delta reconstruction helper: a retained historical lookup selects the first route delta at or after the requested epoch, falls back to the current route after the final delta, and rejects epochs before the PG introduction baseline. Local history is indexed by `(PG, epoch)` so this shared contract does not require expanding sparse history into dense snapshots.
+
+The regression moves PG 30, advances the cluster through unrelated PG 31 changes, and compares runtime-map and local-map reconstruction for both PGs at every retained epoch. It specifically proves the formerly stale intervening epoch resolves to PG 30's new acting set and that PG introduction boundaries remain fail-closed. An existing historical Unix-shard fixture was also corrected so its historical route is older than its current map rather than relying on the old lookup accepting an impossible future-history state.
+
+Verification for the fix:
+- `cargo nextest run -p storage`: 2,002 tests passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
+- `cargo nextest run`: 6,780 tests passed.
+- `git diff --check`: passed.
+
+# Validation
+## Rubric
+- [x] Confirm the runtime-map producer/representation is sparse rather than dense for unchanged PGs across retained epochs.
+- [x] Confirm `ClusterRuntimeMapSnapshot::reconstructed_pg_route_at_epoch` returns the correct current/future route for an intervening epoch after a PG move.
+- [x] Confirm conversion into `LocalClusterMap` copies sparse `historical_pg_routes` without converting them to dense semantics or retaining `historical_cluster_epochs`.
+- [x] Confirm `LocalClusterMap::reconstructed_pg_route_at_epoch` uses the old latest-route-at-or-before lookup and returns a stale pre-move PG route.
+- [x] Confirm this affects normal local/runtime consumers via the `LocalClusterMap` reconstruction path; LLDB backtrace shows the stale route selected inside that method, and `StorageCluster::reconstructed_pg_route_at_epoch` delegates to this local map path.
+## Report
+Validated the finding with a targeted Rust unit-test PoC and an LLDB trace. The relevant code paths match the suspected mismatch: `crates/storage/src/control_plane.rs:1645-1665` emits sparse historical runtime-map PG routes; `crates/storage/src/control_plane.rs:3794-3834` reconstructs runtime-map history using the new reverse-delta rule, selecting the first historical route at or after the requested epoch and falling back to the current route; `crates/storage/src/cluster/local.rs:1639-1643` copies only `runtime_map.historical_pg_routes()` into `LocalClusterMap`; and `crates/storage/src/cluster/local.rs:2742-2765` still uses the old dense-history rule by searching for the latest historical route at or before the requested epoch. I added a PoC test that creates PG 30 on node 1, moves it to node 2, then advances the cluster with unrelated PG changes. The runtime map output was: `epochs: source=8 moved=9 intervening=10 current=11`, `historical pg30 routes: [(8, [NodeId(1)])]`, and `runtime pg30@10 -> [NodeId(2)]; local pg30@10 -> [NodeId(1)]`. This demonstrates that the runtime map reconstructs the intervening epoch correctly as node 2, while the converted local map reconstructs it incorrectly as stale node 1. I also ran LLDB non-interactively with a breakpoint in `LocalClusterMap::reconstructed_pg_route_at_epoch` at `cluster/local.rs:2764`; at the breakpoint, `pg_id = 30`, requested `cluster_epoch = 10`, but the selected `route` had `cluster_epoch = 8` and `primary_node_id = 1`, proving the stale <= historical lookup is the source of divergence. Valgrind was attempted but is not installed in the container, and this is a deterministic logic/correctness bug rather than a memory-safety crash.
+
+# Evidence
+crates/storage/src/cluster.rs (L4360 to 4386)
+  Note: Storage clusters refresh from control-plane runtime maps through LocalClusterMap, so the mismatched reconstruction semantics affect normal runtime-map consumers.
+```
+    pub fn refresh_from_control_plane_runtime_map(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+    ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
+        let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
+        let local_map = LocalClusterMap::open_runtime_map_with_existing_local_nodes(
+            &self.local_map,
+            &runtime_map,
+        )?;
+        Ok(Self::from_local_map(Arc::new(local_map))?)
+    }
+
+    pub fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+        &self,
+        control_plane: &impl ControlPlaneRuntimeMapSource,
+        authority_now_ms: u64,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
+        let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
+        let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            self.metadata_node_id(),
+            &runtime_map,
+            self.default_payload_ec_shape(),
+        )?;
+        local_map.inherit_process_local_state_from(&self.local_map);
+        let storage_node_configs = Self::unix_storage_node_client_configs_from_runtime_map(
+```
+
+crates/storage/src/cluster/local.rs (L1639 to 1643)
+  Note: LocalClusterMap copies the sparse runtime-map historical routes directly, without preserving or using the new historical_cluster_epochs metadata or adapting the representation.
+```
+        local_map.historical_pg_routes = runtime_map
+            .historical_pg_routes()
+            .iter()
+            .map(|route| ((route.cluster_epoch(), route.pg_id()), route.clone()))
+            .collect();
+```
+
+crates/storage/src/cluster/local.rs (L2742 to 2765)
+  Note: LocalClusterMap still reconstructs historical routes with the old dense-history rule: choose the latest route at or before the requested epoch. With sparse reverse deltas, this returns stale pre-change routes for epochs after a placement change but before the current epoch.
+```
+    pub fn reconstructed_pg_route_at_epoch(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Option<PgRouteSnapshot> {
+        if cluster_epoch == self.epoch {
+            return self.pg_route(pg_id).map(|route| {
+                PgRouteSnapshot::reconstructed(
+                    route.cluster_epoch(),
+                    route.pg_id(),
+                    route.primary_node_id(),
+                    route.acting_set().to_vec(),
+                    route.state(),
+                )
+            });
+        }
+        let mut route = self
+            .historical_pg_routes
+            .range(..=(cluster_epoch, pg_id))
+            .rev()
+            .find(|((_, route_pg_id), _)| *route_pg_id == pg_id)
+            .map(|(_, route)| route.clone())?;
+        route = route.with_cluster_epoch(cluster_epoch);
+        Some(route)
+```
+
+crates/storage/src/control_plane.rs (L1645 to 1665)
+  Note: Runtime maps now include historical PG routes sparsely: changed delta records plus one baseline per current PG, not a route for every retained epoch.
+```
+    fn historical_pg_routes_for_runtime_map(
+        &self,
+    ) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
+        let mut routes = Vec::new();
+        for history in &self.history {
+            for pg in history.pgs() {
+                routes.push(history.reconstructed_pg_route(pg.pg_id())?);
+            }
+        }
+        for pg_id in self.pgs.keys().copied() {
+            let Some(baseline_epoch) = self.earliest_retained_pg_epoch(pg_id) else {
+                continue;
+            };
+            if !routes.iter().any(|candidate| {
+                candidate.pg_id() == pg_id && candidate.cluster_epoch() == baseline_epoch
+            }) {
+                routes.push(self.reconstructed_pg_route_at_epoch(pg_id, baseline_epoch)?);
+            }
+        }
+        routes.sort_by_key(|route| (route.cluster_epoch(), route.pg_id()));
+        Ok(routes)
+```
+
+crates/storage/src/control_plane.rs (L3794 to 3834)
+  Note: ClusterRuntimeMapSnapshot was updated for the new sparse reverse-delta semantics by selecting the nearest route at or after the requested epoch, or falling back to the current route.
+```
+    pub fn reconstructed_pg_route_at_epoch(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<PgRouteSnapshot, ControlPlaneError> {
+        if cluster_epoch == self.cluster_epoch {
+            return self
+                .pg_routes
+                .iter()
+                .find(|route| route.pg_id == pg_id)
+                .map(PgRouteSnapshot::without_serving_authority)
+                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() });
+        }
+        if self
+            .historical_cluster_epochs
+            .binary_search(&cluster_epoch)
+            .is_err()
+        {
+            return Err(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch });
+        }
+        if !self
+            .historical_pg_routes
+            .iter()
+            .any(|route| route.pg_id == pg_id && route.cluster_epoch <= cluster_epoch)
+        {
+            return Err(ControlPlaneError::UnknownPg { pg_id: pg_id.get() });
+        }
+        let mut route = self
+            .historical_pg_routes
+            .iter()
+            .filter(|route| route.pg_id == pg_id && route.cluster_epoch >= cluster_epoch)
+            .min_by_key(|route| route.cluster_epoch)
+            .cloned()
+            .or_else(|| {
+                self.pg_routes
+                    .iter()
+                    .find(|route| route.pg_id == pg_id)
+                    .map(PgRouteSnapshot::without_serving_authority)
+            })
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        route.cluster_epoch = cluster_epoch;
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The bug is validated and should be fixed as a storage correctness/availability regression, but it should not retain medium security criticality. Evidence shows the vulnerable code path is internal runtime-map conversion and refresh (crates/argmin-s3/src/main.rs:4808-4819, 5012-5037; crates/storage/src/cluster.rs:4360-4388). The stale route mismatch is real (crates/storage/src/control_plane.rs:3794-3835 versus crates/storage/src/cluster/local.rs:2742-2765), and the PoC demonstrated runtime pg30@10 -> node2 while local pg30@10 -> node1. However, the attack preconditions require a control-plane-managed deployment, normal/admin PG placement changes, and historical object epochs; no repository evidence shows a remote attacker can force those changes, forge runtime maps, bypass SigV4 authentication, or access data across authorization boundaries. Under the project threat model focused on S3 HTTP authentication/authorization and data confidentiality/integrity, this is an operational availability/correctness issue rather than an accepted security vulnerability.
+## Likelihood
+low - Operational occurrence is plausible in control-plane-managed multihost deployments after PG moves, but attacker exploitation is unlikely because external clients do not control PG placement changes or runtime-map contents. The default documented mode is legacy-local with localhost binding.
+## Impact
+low - The proven effect is availability/correctness: objects written in affected historical epochs can be looked up through stale shard routes, causing NotFound/unavailability and potentially stale internal cleanup/backfill behavior. There is no demonstrated unauthorized data access, auth bypass, identity compromise, RCE, or secret disclosure.
+## Assumptions
+- Static review only; no cloud APIs or live deployment were queried.
+- No Kubernetes, Terraform, Docker, or other deployment manifests were found in the checkout, so exposure is inferred from code and README defaults.
+- The affected path requires a control-plane-managed frontend/storage deployment using runtime maps, not the default legacy-local single-process mode.
+- The validation PoC is treated as credible evidence of the route reconstruction bug, but it demonstrates a deterministic storage correctness/availability failure rather than an attacker-driven security boundary bypass.
+- argmin-s3 deployed with control-plane runtime-map refresh via ARGMIN_CONTROL_PLANE_SOCKET_PATH
+- a PG placement change followed by later epoch advancement without another change for that PG
+- sparse historical runtime-map records retained for the relevant epochs
+- read, cleanup, repair, backfill, or metadata operation referencing an object placement_cluster_epoch in the intervening epoch range
+## Path
+control-plane runtime map
+  -> LocalClusterMap copies sparse historical_pg_routes
+  -> local reconstructed_pg_route_at_epoch(epoch)
+  -> stale <= route selected
+  -> read/cleanup/repair/backfill goes to wrong shard location
+  -> NotFound/unavailability; no proven auth or confidentiality impact
+## Path evidence
+- `README.md:43-55` - Documents environment-driven S3 credentials, default listen address 127.0.0.1:9000, and process roles; default exposure is not public in repository artifacts.
+- `README.md:62-67` - Describes local multihost settings as in-progress and documents HTTP request concurrency limits.
+- `crates/argmin-s3/src/main.rs:270-274` - The main binary refuses to start as root, reducing local privilege impact.
+- `crates/argmin-s3/src/config.rs:387-430` - Shows default ProcessRole::LegacyLocal, required frontend secrets, SSE wrapping key handling, and default listen address.
+- `crates/argmin-s3/src/config.rs:803-824` - Control-plane frontend auth credentials, when configured, require a cluster id and matching local frontend instance id.
+- `crates/argmin-s3/src/main.rs:4808-4819` - Control-plane-managed frontend fetches a runtime map and builds the storage cluster from it, making the affected conversion path reachable in that deployment mode.
+- `crates/argmin-s3/src/main.rs:4920-4935` - Frontend workers use the configured credential store and bind the configured TCP listen address.
+- `crates/argmin-s3/src/main.rs:5012-5037` - Frontend control-plane runtime-map refresh loop is spawned when a control-plane socket is configured.
+- `crates/server-http/src/http/mod.rs:3194-3218` - S3 HTTP requests are authenticated through authenticate_request; the finding does not bypass this boundary.
+- `crates/server-http/src/http/serve.rs:500-508` - HTTP serve layer has connection and in-flight request admission controls; this finding is not a generic network DoS primitive.
+- `crates/storage/src/control_plane.rs:1645-1666` - Control plane now builds runtime-map historical PG routes sparsely, adding changed history records plus baselines.
+- `crates/storage/src/control_plane.rs:3794-3835` - ClusterRuntimeMapSnapshot reconstructs sparse history using nearest route at or after the requested epoch, falling back to current route.
+- `crates/storage/src/cluster/local.rs:1639-1643` - LocalClusterMap copies runtime_map.historical_pg_routes directly and does not preserve historical_cluster_epochs or expand the sparse representation.
+- `crates/storage/src/cluster/local.rs:2742-2765` - LocalClusterMap reconstructs by searching historical_pg_routes <= requested epoch, which is incompatible with sparse reverse-delta runtime-map history.
+- `crates/storage/src/cluster.rs:4360-4388` - StorageCluster refresh paths consume control-plane runtime maps through LocalClusterMap, so the mismatch affects normal refresh consumers in control-plane deployments.
+## Narrative
+The finding is a real deterministic storage correctness bug: the control plane emits sparse historical PG routes and its runtime snapshot reader reconstructs by selecting the nearest historical route at or after the requested epoch, but LocalClusterMap copies those sparse records and still uses a dense-history latest-at-or-before lookup. The validation PoC showed pg30@10 resolving to node 2 in the runtime map but node 1 after conversion to LocalClusterMap. This can make affected object operations unavailable or misdirect internal maintenance after normal PG placement changes. However, static evidence does not show that an in-scope attacker can cause PG movements, forge runtime maps, bypass SigV4, read unauthorized data, or gain code execution. The issue is therefore best treated as an operational availability/data-correctness regression, not a medium security vulnerability.
+## Controls
+- AWS SigV4 authentication for S3 HTTP requests
+- optional direct TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- default localhost listen address 127.0.0.1:9000
+- connection and in-flight request semaphores
+- body/header idle timeouts
+- non-root process startup check
+- Unix socket based control-plane/storage-node communication
+- optional control-plane scoped credentials for storage/frontend/admin/raft
+- CRC64 integrity checking for object/shard data
+## Blindspots
+- No deployment manifests were present, so real-world public exposure and service topology could not be confirmed from repository artifacts.
+- Static review did not execute the server or the validation PoC in this stage.
+- The control-plane/multihost feature appears partially in-progress relative to README wording; production use may differ from repository documentation.
+- Potential secondary effects in repair/backfill/cleanup were assessed from code paths and validation notes but not fully dynamically traced here.
