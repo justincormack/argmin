@@ -705,6 +705,31 @@ acceptable test shortcut.
 Exit condition: the committed plan/test expectations do not rely on guessed
 wire or precedence behavior.
 
+Progress as of 2026-07-13, awaiting review before the role-fixture slice:
+
+- added the explicitly invoked, read-only `./scripts/aws-sts-oracle` command;
+  it signs raw Query requests with service `sts`, uses the existing primary AWS
+  test identity, and makes no IAM mutations
+- pinned regional AWS behavior for `GetCallerIdentity` over GET and POST,
+  including form content type with and without a charset
+- pinned missing, empty, unknown, and duplicate `Action`/`Version` behavior;
+  duplicate scalar parameters use the first wire value, while an unknown extra
+  parameter is ignored for this action
+- pinned full golden response bodies and complete normalized semantic header
+  sets for the missing-action/no-form-content-type redirect, successful STS XML
+  namespace, AWSFault error namespace, exact core `InvalidAction` messages,
+  `text/xml` response type, and request-ID agreement
+
+This is only the first Phase 0 review slice. Path-bearing same-account and
+cross-account role fixtures, `AssumeRole` success/error probes, role mutation
+precedence, session-principal context, and `aws:TokenIssueTime` behavior remain
+before Phase 0 can satisfy its exit condition.
+
+The oracle executable is a temporary Phase 0 research artifact, not a test of
+Argmin and not a normal testing-guide workflow. Remove it after its observations
+have been transferred into implementation-facing conformance tests and the
+compatibility record.
+
 ### Phase 1: Shared identity substrate and sealed-token codec
 
 - introduce structured principal/session identity
