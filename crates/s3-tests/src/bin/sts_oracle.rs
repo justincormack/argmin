@@ -20,6 +20,7 @@ const AWS_FAULT_XMLNS: &str = "http://webservices.amazon.com/AWSFault/2005-15-09
 enum Expected<'a> {
     Success,
     Error { code: &'a str, message: &'a str },
+    StsError { code: &'a str, message: &'a str },
     Redirect { location: &'a str },
 }
 
@@ -115,19 +116,10 @@ fn assert_probe(probe: &Probe<'_>, response: &RawResponse, account_id: &str) {
             );
         }
         Expected::Error { code, message } => {
-            assert_shape(
-                probe.label,
-                response,
-                &sts_wire_shape(probe.label, response)
-                    .status(400)
-                    .header("content-type", "text/xml")
-                    .body(format!(
-                        "<ErrorResponse xmlns=\"{AWS_FAULT_XMLNS}\">\n  <Error>\n    \
-                         <Type>Sender</Type>\n    <Code>{code}</Code>\n    \
-                         <Message>{message}</Message>\n  </Error>\n  \
-                         <RequestId>{{sts_request_id}}</RequestId>\n</ErrorResponse>\n"
-                    )),
-            );
+            assert_error_probe(probe.label, response, AWS_FAULT_XMLNS, code, message);
+        }
+        Expected::StsError { code, message } => {
+            assert_error_probe(probe.label, response, STS_XMLNS, code, message);
         }
         Expected::Redirect { location } => {
             assert_shape(
@@ -140,6 +132,213 @@ fn assert_probe(probe: &Probe<'_>, response: &RawResponse, account_id: &str) {
             );
         }
     }
+}
+
+fn assert_error_probe(
+    label: &str,
+    response: &RawResponse,
+    namespace: &str,
+    code: &str,
+    message: &str,
+) {
+    assert_shape(
+        label,
+        response,
+        &sts_wire_shape(label, response)
+            .status(400)
+            .header("content-type", "text/xml")
+            .body(format!(
+                "<ErrorResponse xmlns=\"{namespace}\">\n  <Error>\n    \
+                 <Type>Sender</Type>\n    <Code>{code}</Code>\n    \
+                 <Message>{message}</Message>\n  </Error>\n  \
+                 <RequestId>{{sts_request_id}}</RequestId>\n</ErrorResponse>\n"
+            )),
+    );
+}
+
+fn form_body(parameters: &[(&str, &str)]) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(parameters.iter().copied())
+        .finish()
+}
+
+fn required_xml_text(response: &RawResponse, tag: &str, label: &str) -> String {
+    xml_tag_text(&response.body, tag)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| panic!("{label}: missing or empty {tag}"))
+        .to_string()
+}
+
+fn replace_sensitive_xml_text(body: &mut String, tag: &str, value: &str, marker: &str) {
+    let needle = format!("<{tag}>{value}</{tag}>");
+    assert!(
+        body.matches(&needle).count() == 1,
+        "expected exactly one {tag} element while normalizing sensitive STS output"
+    );
+    *body = body.replacen(&needle, &format!("<{tag}>{marker}</{tag}>"), 1);
+}
+
+fn assert_assume_role_success(
+    label: &str,
+    response: &RawResponse,
+    account_id: &str,
+    role_name: &str,
+    role_session_name: &str,
+) {
+    let access_key = required_xml_text(response, "AccessKeyId", label);
+    let secret_key = required_xml_text(response, "SecretAccessKey", label);
+    let session_token = required_xml_text(response, "SessionToken", label);
+    let assumed_role_id = required_xml_text(response, "AssumedRoleId", label);
+
+    assert!(
+        access_key.len() == 20
+            && access_key.starts_with("ASIA")
+            && access_key.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "{label}: temporary AWS access key has an unexpected shape"
+    );
+    assert!(
+        secret_key.len() == 40
+            && secret_key
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=') }),
+        "{label}: temporary AWS secret key has an unexpected shape"
+    );
+    assert!(
+        session_token.len() >= 100
+            && session_token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')),
+        "{label}: AWS session token has an unexpected shape"
+    );
+
+    let role_id = assumed_role_id
+        .strip_suffix(&format!(":{role_session_name}"))
+        .unwrap_or_else(|| panic!("{label}: AssumedRoleId does not end with the session name"));
+    assert!(
+        role_id.len() == 21
+            && role_id.starts_with("AROA")
+            && role_id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "{label}: IAM role unique ID has an unexpected shape"
+    );
+
+    let mut normalized = response.clone();
+    replace_sensitive_xml_text(
+        &mut normalized.body,
+        "AccessKeyId",
+        &access_key,
+        "SESSION_ACCESS_KEY",
+    );
+    replace_sensitive_xml_text(
+        &mut normalized.body,
+        "SecretAccessKey",
+        &secret_key,
+        "SESSION_SECRET_KEY",
+    );
+    replace_sensitive_xml_text(
+        &mut normalized.body,
+        "SessionToken",
+        &session_token,
+        "SESSION_TOKEN",
+    );
+    replace_sensitive_xml_text(
+        &mut normalized.body,
+        "AssumedRoleId",
+        &assumed_role_id,
+        &format!("ROLE_UNIQUE_ID:{role_session_name}"),
+    );
+
+    let assumed_role_arn =
+        format!("arn:aws:sts::{account_id}:assumed-role/{role_name}/{role_session_name}");
+    assert_shape(
+        label,
+        &normalized,
+        &sts_wire_shape(label, &normalized)
+            .status(200)
+            .header("content-type", "text/xml")
+            .body(format!(
+                "<AssumeRoleResponse xmlns=\"{STS_XMLNS}\">\n  <AssumeRoleResult>\n    \
+                 <AssumedRoleUser>\n      \
+                 <AssumedRoleId>ROLE_UNIQUE_ID:{role_session_name}</AssumedRoleId>\n      \
+                 <Arn>{{assumed_role_arn}}</Arn>\n    </AssumedRoleUser>\n    \
+                 <Credentials>\n      <AccessKeyId>SESSION_ACCESS_KEY</AccessKeyId>\n      \
+                 <SecretAccessKey>SESSION_SECRET_KEY</SecretAccessKey>\n      \
+                 <SessionToken>SESSION_TOKEN</SessionToken>\n      \
+                 <Expiration>{{iso8601}}</Expiration>\n    </Credentials>\n  \
+                 </AssumeRoleResult>\n  \
+                 <ResponseMetadata>\n    <RequestId>{{sts_request_id}}</RequestId>\n  \
+                 </ResponseMetadata>\n</AssumeRoleResponse>\n"
+            ))
+            .sub("assumed_role_arn", assumed_role_arn),
+    );
+}
+
+fn run_assume_role_probes(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    account_id: &str,
+    role_arn: &str,
+    role_name: &str,
+    role_session_name: &str,
+) {
+    let missing_role_arn_body = form_body(&[
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleSessionName", role_session_name),
+    ]);
+    let missing_role_arn = Probe {
+        label: "assume-role-missing-role-arn",
+        request: QueryRequest::Post {
+            body: &missing_role_arn_body,
+            content_type: Some(QUERY_CONTENT_TYPE),
+        },
+        expected: Expected::StsError {
+            code: "ValidationError",
+            message: "1 validation error detected: Value null at 'roleArn' failed to satisfy constraint: Member must not be null",
+        },
+    };
+    let response = missing_role_arn.request.send(endpoint, credentials);
+    assert_probe(&missing_role_arn, &response, account_id);
+    println!("{}: ok", missing_role_arn.label);
+
+    let missing_session_name_body = form_body(&[
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleArn", role_arn),
+    ]);
+    let missing_session_name = Probe {
+        label: "assume-role-missing-session-name",
+        request: QueryRequest::Post {
+            body: &missing_session_name_body,
+            content_type: Some(QUERY_CONTENT_TYPE),
+        },
+        expected: Expected::StsError {
+            code: "ValidationError",
+            message: "1 validation error detected: Value null at 'roleSessionName' failed to satisfy constraint: Member must not be null",
+        },
+    };
+    let response = missing_session_name.request.send(endpoint, credentials);
+    assert_probe(&missing_session_name, &response, account_id);
+    println!("{}: ok", missing_session_name.label);
+
+    let body = form_body(&[
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleArn", role_arn),
+        ("RoleSessionName", role_session_name),
+    ]);
+    let response = QueryRequest::Post {
+        body: &body,
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send(endpoint, credentials);
+    assert_assume_role_success(
+        "assume-role-path-bearing-role",
+        &response,
+        account_id,
+        role_name,
+        role_session_name,
+    );
+    println!("assume-role-path-bearing-role: ok");
 }
 
 fn main() {
@@ -316,5 +515,18 @@ fn main() {
         let response = probe.request.send(&endpoint, credentials);
         assert_probe(&probe, &response, &account_id);
         println!("{}: ok", probe.label);
+    }
+
+    if let Ok(role_arn) = env::var("S3_TEST_STS_ROLE_ARN") {
+        let role_name = required_env("S3_TEST_STS_ROLE_NAME");
+        let role_session_name = required_env("S3_TEST_STS_ROLE_SESSION_NAME");
+        run_assume_role_probes(
+            &endpoint,
+            credentials,
+            &account_id,
+            &role_arn,
+            &role_name,
+            &role_session_name,
+        );
     }
 }

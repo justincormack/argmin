@@ -10,27 +10,34 @@ usage() {
     cat <<'EOF'
 Usage: ./scripts/aws-sts-oracle [options]
 
-Run the read-only AWS STS Query protocol oracle using the primary credentials
-from `.env`. This command does not create or mutate IAM resources.
+Run the AWS STS Query protocol oracle using the primary credentials from
+`.env`. The default probes are read-only. `--assume-role` creates and removes a
+temporary path-bearing role using the primary test user.
 
 Options:
-  --region REGION   Override the STS signing region (default: TEST_S3_REGION or us-east-1)
-  --endpoint URL    Override the regional STS endpoint
-  --dotenv PATH     Read AWS variables from a different env file
-  -h, --help        Show this help
+  --assume-role    Include the self-cleaning path-bearing role probes
+  --region REGION  Override the STS signing region (default: TEST_S3_REGION or us-east-1)
+  --endpoint URL   Override the regional STS endpoint
+  --dotenv PATH    Read AWS variables from a different env file
+  -h, --help       Show this help
 
 Examples:
   ./scripts/aws-sts-oracle
-  ./scripts/aws-sts-oracle --region eu-west-1
+  ./scripts/aws-sts-oracle --assume-role
 EOF
 }
 
+assume_role=false
 region=""
 endpoint=""
 dotenv_path="$ROOT/.env"
 
 while (($#)); do
     case "$1" in
+        --assume-role)
+            assume_role=true
+            shift
+            ;;
         --region)
             [[ $# -ge 2 ]] || external_s3_test_die "--region requires a value"
             region="$2"
@@ -73,6 +80,136 @@ export S3_TEST_REGION="$region"
 export S3_TEST_STS_ENDPOINT="$endpoint"
 export S3_TEST_TIMEOUT_SECS="${TEST_S3_TIMEOUT_SECS:-120}"
 
+aws_primary() {
+    (
+        unset AWS_PROFILE AWS_SESSION_TOKEN
+        export AWS_ACCESS_KEY_ID="$TEST_AWS_PRIMARY_ACCESS_KEY"
+        export AWS_SECRET_ACCESS_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
+        export AWS_DEFAULT_REGION="$region"
+        export AWS_REGION="$region"
+        export AWS_PAGER=""
+        aws "$@"
+    )
+}
+
+role_created=false
+tmpdir=""
+
+cleanup_role_fixture() {
+    local status=$?
+    trap - EXIT
+
+    if [[ "$role_created" == true ]]; then
+        if ! aws_primary iam delete-role --role-name "$S3_TEST_STS_ROLE_NAME"; then
+            echo "error: failed to delete temporary STS oracle role $S3_TEST_STS_ROLE_ARN" >&2
+            ((status != 0)) || status=1
+        fi
+    fi
+    if [[ -n "$tmpdir" ]]; then
+        rm -rf "$tmpdir"
+    fi
+    exit "$status"
+}
+
+create_role_fixture() {
+    command -v aws >/dev/null || external_s3_test_die "aws CLI is required for --assume-role"
+    command -v jq >/dev/null || external_s3_test_die "jq is required for --assume-role"
+
+    local created_role_arn identity_decision identity_simulation missing_role_error primary_identity primary_account primary_arn role_suffix trust_policy
+    primary_identity="$(aws_primary sts get-caller-identity --output json)"
+    primary_account="$(jq -er '.Account' <<<"$primary_identity")"
+    primary_arn="$(jq -er '.Arn' <<<"$primary_identity")"
+    [[ "$primary_account" == "$TEST_AWS_PRIMARY_ACCOUNT_ID" ]] || \
+        external_s3_test_die \
+            "primary credential account $primary_account does not match TEST_AWS_PRIMARY_ACCOUNT_ID"
+    [[ "$primary_arn" == "arn:aws:iam::${primary_account}:user/"* ]] || \
+        external_s3_test_die "primary credentials do not identify an IAM user"
+
+    tmpdir="$(mktemp -d)"
+    role_suffix="${tmpdir##*/}"
+    role_suffix="${role_suffix#tmp.}"
+    export S3_TEST_STS_ROLE_NAME="path-shape-${role_suffix}"
+    export S3_TEST_STS_ROLE_SESSION_NAME="path-shape-session"
+    export S3_TEST_STS_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_ROLE_NAME}"
+
+    trust_policy="$tmpdir/trust-policy.json"
+    jq -n --arg principal "$primary_arn" '{
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Principal: {AWS: $principal},
+            Action: "sts:AssumeRole"
+        }]
+    }' >"$trust_policy"
+
+    identity_simulation="$tmpdir/identity-simulation.json"
+    aws_primary iam simulate-principal-policy \
+        --policy-source-arn "$primary_arn" \
+        --action-names sts:AssumeRole \
+        --resource-arns "$S3_TEST_STS_ROLE_ARN" \
+        --output json >"$identity_simulation"
+    [[ "$(jq -er '.EvaluationResults | length' "$identity_simulation")" == 1 ]] || \
+        external_s3_test_die "same-account identity-policy simulation returned an unexpected result count"
+    [[ "$(jq -er '.EvaluationResults[0].EvalActionName' "$identity_simulation")" == "sts:AssumeRole" ]] || \
+        external_s3_test_die "same-account identity-policy simulation returned an unexpected action"
+    [[ "$(jq -er '.EvaluationResults[0].EvalResourceName' "$identity_simulation")" == "$S3_TEST_STS_ROLE_ARN" ]] || \
+        external_s3_test_die "same-account identity-policy simulation returned an unexpected resource"
+    identity_decision="$(jq -er '.EvaluationResults[0].EvalDecision' "$identity_simulation")"
+    [[ "$identity_decision" == "implicitDeny" ]] || \
+        external_s3_test_die \
+            "same-account role requires implicitDeny from caller identity policies, got $identity_decision"
+    echo "same-account-identity-policy-implicit-deny: ok"
+
+    missing_role_error="$tmpdir/get-missing-role.err"
+    if aws_primary iam get-role \
+        --role-name "$S3_TEST_STS_ROLE_NAME" \
+        --query 'Role.Arn' \
+        --output text >/dev/null 2>"$missing_role_error"; then
+        external_s3_test_die \
+            "unique temporary STS oracle role unexpectedly exists before creation"
+    fi
+    if ! grep -Fq \
+        'An error occurred (AccessDenied) when calling the GetRole operation:' \
+        "$missing_role_error"; then
+        cat "$missing_role_error" >&2
+        external_s3_test_die \
+            "missing path-scoped role did not produce the expected GetRole AccessDenied"
+    fi
+    echo "missing-path-role-get-access-denied: ok"
+
+    if ! created_role_arn="$(aws_primary iam create-role \
+        --role-name "$S3_TEST_STS_ROLE_NAME" \
+        --path /argmin-sts-oracle/same-account/ \
+        --assume-role-policy-document "file://${trust_policy}" \
+        --query 'Role.Arn' \
+        --output text)"; then
+        external_s3_test_die "could not create temporary STS oracle role"
+    fi
+    role_created=true
+    [[ "$created_role_arn" == "$S3_TEST_STS_ROLE_ARN" ]] || \
+        external_s3_test_die "CreateRole returned an unexpected role ARN"
+
+    aws_primary iam wait role-exists --role-name "$S3_TEST_STS_ROLE_NAME"
+
+    local attempt ready=false
+    for ((attempt = 1; attempt <= 15; attempt++)); do
+        if aws_primary sts assume-role \
+            --role-arn "$S3_TEST_STS_ROLE_ARN" \
+            --role-session-name convergence-check >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        sleep 2
+    done
+    [[ "$ready" == true ]] || \
+        external_s3_test_die "temporary STS oracle role did not converge"
+}
+
+if [[ "$assume_role" == true ]]; then
+    trap cleanup_role_fixture EXIT
+    create_role_fixture
+fi
+
 cmd=(cargo run -p s3-tests --bin sts_oracle)
 external_s3_test_print_command "AWS STS oracle" "${cmd[@]}"
-exec "${cmd[@]}"
+"${cmd[@]}"

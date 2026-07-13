@@ -608,12 +608,14 @@ cleanup pass for leftover test buckets.
 
 It currently:
 
+- removes leaked `/argmin-sts-oracle/same-account/path-shape-*` IAM roles after
+  a one-hour safety window, so it does not race an active oracle run
 - lists buckets with names starting `claude-s3-`
 - removes object versions and delete markers
 - attempts to disable legal holds and bypass governance retention
 - deletes the bucket once it is empty
 
-The script requires `aws`, `jq`, and the primary AWS credentials in `.env`.
+The script requires `aws`, `jq`, `date`, and the primary AWS credentials in `.env`.
 It exports `TEST_AWS_PRIMARY_ACCESS_KEY` / `TEST_AWS_PRIMARY_SECRET_KEY` as
 standard AWS CLI variables,
 so it uses the same user as `./scripts/aws-tests`. It is intended as an
@@ -640,7 +642,19 @@ Examples:
 ### IAM policy
 
 Attach [`crates/s3-tests/aws/test-user-policy.json`](../crates/s3-tests/aws/test-user-policy.json)
-to both test IAM users.
+to both test IAM users. For the primary account, the idempotent command below
+creates or updates a customer-managed policy and attaches it to the primary
+test user:
+
+```bash
+./scripts/aws-apply-test-user-policy
+```
+
+The command resolves the target IAM user using the primary credential, verifies
+that both credentials belong to `TEST_AWS_PRIMARY_ACCOUNT_ID`, and uses the
+owner/root credential only for the required IAM policy operations. It cannot
+update the alternate-account user; run the equivalent policy update with an
+administrator of that account.
 
 The committed policy assumes:
 

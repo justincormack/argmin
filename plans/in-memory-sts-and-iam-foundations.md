@@ -705,7 +705,7 @@ acceptable test shortcut.
 Exit condition: the committed plan/test expectations do not rely on guessed
 wire or precedence behavior.
 
-Progress as of 2026-07-13, awaiting review before the role-fixture slice:
+The initial Query-protocol slice completed on 2026-07-13:
 
 - added the explicitly invoked, read-only `./scripts/aws-sts-oracle` command;
   it signs raw Query requests with service `sts`, uses the existing primary AWS
@@ -720,10 +720,77 @@ Progress as of 2026-07-13, awaiting review before the role-fixture slice:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-This is only the first Phase 0 review slice. Path-bearing same-account and
-cross-account role fixtures, `AssumeRole` success/error probes, role mutation
-precedence, session-principal context, and `aws:TokenIssueTime` behavior remain
-before Phase 0 can satisfy its exit condition.
+The cross-account role fixture, broader `AssumeRole` parameter and error
+matrix, role mutation precedence, session-principal context, and
+`aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
+condition.
+
+The role-fixture capability will use the ordinary primary and alternate test
+users, not the owner/root credential. The shared test-user policy grants only
+`CreateRole`, `GetRole`, `UpdateAssumeRolePolicy`, and `DeleteRole` for roles
+under `/argmin-sts-oracle/`. Its identity-policy `sts:AssumeRole` grant covers
+only `/argmin-sts-oracle/cross-account/` roles in any account. Same-account
+roles use `/argmin-sts-oracle/same-account/`, so their successful assumption
+is preceded by an IAM simulation of every inline, attached, and group policy on
+the caller for that exact unique role ARN. The simulation must return
+`implicitDeny`, proving that the subsequent success comes from direct trust
+rather than an unnoticed identity-policy allow. The simulator grant is limited
+to the calling user's own ARN through `${aws:username}`. AWS requires
+`iam:ListRoles` to use `Resource: "*"`, so the policy grants that read-only
+action separately; the cleanup command sends the `/argmin-sts-oracle/` path
+prefix and applies stricter returned-path and role-name checks before deletion.
+The policy does not grant role-policy attachment or mutation, `PassRole`, or
+any other general IAM administration. The fixture users therefore cannot add
+identity permissions to these roles; roles created solely through this grant
+remain permissionless. These temporary grants should be removed with the
+oracle after Phase 0.
+
+`SimulatePrincipalPolicy` is temporary AWS-oracle fixture validation only. It
+must not appear in the endpoint-neutral `s3-tests` scenario and does not add
+that IAM operation to the implementation roadmap. When this oracle is removed,
+the real AWS/local conformance test will call only APIs implemented by both
+endpoints, beginning with `AssumeRole`; local caller policy state will be seeded
+deterministically, and keeping the dedicated AWS caller free of unrelated
+identity grants remains an out-of-band fixture-administration responsibility.
+If that AWS fixture cannot be kept controlled, provision a dedicated caller
+rather than adding an AWS-only branch to `s3-tests` or expanding the local IAM
+surface merely to inspect the fixture.
+
+The same-account role-fixture slice now:
+
+- provides `./scripts/aws-apply-test-user-policy`, which uses the primary
+  credential only to identify the target user and confines owner/root use to
+  creating or versioning the customer-managed test policy and attaching it
+- creates, converges, assumes, and deletes
+  a uniquely named `role/argmin-sts-oracle/same-account/path-shape-*` using the
+  primary test user; it never adopts or mutates an existing role, grants the
+  role no identity permissions, and normalizes temporary secrets before golden
+  response comparison
+- proves that the IAM role ARN retains `/argmin-sts-oracle/same-account/` while
+  its returned STS ARN omits the entire IAM path and retains only the unique
+  role name and `path-shape-session` session name
+- pins required `RoleArn` and `RoleSessionName` validation errors to the STS
+  2011 namespace, distinct from the AWSFault namespace used by dispatch errors
+- pins the no-session-policy success response, including element order and the
+  complete omission of `PackedPolicySize` rather than a zero value
+
+AWS also checks `GetRole` for a nonexistent role name against a pathless role
+resource, so a policy restricted to `/argmin-sts-oracle/` receives
+`AccessDenied` rather than `NoSuchEntity`. The fixture asserts this result for
+its unique missing role before creation, then requires `CreateRole` to succeed;
+`EntityAlreadyExists` is a hard failure and is never treated as an adoptable
+fixture. It never broadens the IAM resource grant merely to perform an
+existence check.
+
+`./scripts/cleanup` discovers uniquely named same-account oracle roles and
+deletes only those at least one hour old. The age floor prevents a periodic
+cleanup run from deleting another concurrently active oracle fixture. IAM
+discovery failure is reported and makes the command exit unsuccessfully after
+the existing bucket cleanup has still run; it cannot disable bucket recovery.
+
+The cross-account fixture remains pending until an administrator of the
+alternate account applies the same test-user policy there. The primary-account
+owner credential cannot and must not be used as a substitute.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations

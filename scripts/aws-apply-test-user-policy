@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/_external-s3-test-env.sh
+source "$ROOT/scripts/_external-s3-test-env.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/aws-apply-test-user-policy [options]
+
+Create or update the primary account's Argmin S3 test managed policy and
+attach it to the primary test user. The target user is discovered with its own
+credentials; the owner/root credentials are used only for IAM policy changes.
+
+Options:
+  --region REGION  Override the AWS CLI region (default: TEST_S3_REGION or us-east-1)
+  --dotenv PATH    Read AWS variables from a different env file
+  -h, --help       Show this help
+
+This command changes IAM state in the primary AWS account. It does not update
+the alternate-account test user, which must be managed by an administrator of
+that account.
+EOF
+}
+
+region=""
+dotenv_path="$ROOT/.env"
+
+while (($#)); do
+    case "$1" in
+        --region)
+            [[ $# -ge 2 ]] || external_s3_test_die "--region requires a value"
+            region="$2"
+            shift 2
+            ;;
+        --dotenv)
+            [[ $# -ge 2 ]] || external_s3_test_die "--dotenv requires a value"
+            dotenv_path="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            external_s3_test_die "unknown argument: $1"
+            ;;
+    esac
+done
+
+cd "$ROOT"
+external_s3_test_load_dotenv "$dotenv_path"
+external_s3_test_require_shell_var TEST_AWS_PRIMARY_ACCESS_KEY
+external_s3_test_require_shell_var TEST_AWS_PRIMARY_SECRET_KEY
+external_s3_test_require_shell_var TEST_AWS_PRIMARY_ACCOUNT_ID
+external_s3_test_require_shell_var TEST_AWS_OWNER_ROOT_ACCESS_KEY
+external_s3_test_require_shell_var TEST_AWS_OWNER_ROOT_SECRET_KEY
+
+command -v aws >/dev/null || external_s3_test_die "aws CLI is required"
+command -v jq >/dev/null || external_s3_test_die "jq is required"
+
+region="${region:-${TEST_S3_REGION:-us-east-1}}"
+policy_document="$ROOT/crates/s3-tests/aws/test-user-policy.json"
+policy_path="/argmin-s3-tests/"
+policy_name="test-user-policy"
+
+jq empty "$policy_document"
+
+aws_with_credentials() {
+    local access_key="$1"
+    local secret_key="$2"
+    shift 2
+
+    (
+        unset AWS_PROFILE AWS_SESSION_TOKEN
+        export AWS_ACCESS_KEY_ID="$access_key"
+        export AWS_SECRET_ACCESS_KEY="$secret_key"
+        export AWS_DEFAULT_REGION="$region"
+        export AWS_REGION="$region"
+        export AWS_PAGER=""
+        aws "$@"
+    )
+}
+
+aws_primary() {
+    aws_with_credentials \
+        "$TEST_AWS_PRIMARY_ACCESS_KEY" \
+        "$TEST_AWS_PRIMARY_SECRET_KEY" \
+        "$@"
+}
+
+aws_owner() {
+    aws_with_credentials \
+        "$TEST_AWS_OWNER_ROOT_ACCESS_KEY" \
+        "$TEST_AWS_OWNER_ROOT_SECRET_KEY" \
+        "$@"
+}
+
+primary_identity="$(aws_primary sts get-caller-identity --output json)"
+owner_identity="$(aws_owner sts get-caller-identity --output json)"
+primary_account="$(jq -er '.Account' <<<"$primary_identity")"
+primary_arn="$(jq -er '.Arn' <<<"$primary_identity")"
+owner_account="$(jq -er '.Account' <<<"$owner_identity")"
+owner_arn="$(jq -er '.Arn' <<<"$owner_identity")"
+
+[[ "$primary_account" == "$TEST_AWS_PRIMARY_ACCOUNT_ID" ]] || \
+    external_s3_test_die \
+        "primary credential account $primary_account does not match TEST_AWS_PRIMARY_ACCOUNT_ID"
+[[ "$owner_account" == "$primary_account" ]] || \
+    external_s3_test_die \
+        "owner credential account $owner_account does not match primary account $primary_account"
+[[ "$owner_arn" == "arn:aws:iam::${primary_account}:root" ]] || \
+    external_s3_test_die "TEST_AWS_OWNER_ROOT credentials do not identify the primary account root"
+
+primary_user_prefix="arn:aws:iam::${primary_account}:user/"
+[[ "$primary_arn" == "$primary_user_prefix"* ]] || \
+    external_s3_test_die "primary credentials do not identify an IAM user"
+primary_user_name="${primary_arn##*/}"
+[[ -n "$primary_user_name" ]] || external_s3_test_die "primary IAM user name is empty"
+
+policy_arn="arn:aws:iam::${primary_account}:policy${policy_path}${policy_name}"
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+policy_metadata="$tmpdir/policy.json"
+policy_error="$tmpdir/get-policy.err"
+policy_changed=false
+
+if aws_owner iam get-policy --policy-arn "$policy_arn" >"$policy_metadata" 2>"$policy_error"; then
+    default_version="$(jq -er '.Policy.DefaultVersionId' "$policy_metadata")"
+    remote_document="$tmpdir/remote-policy.json"
+    aws_owner iam get-policy-version \
+        --policy-arn "$policy_arn" \
+        --version-id "$default_version" \
+        --query 'PolicyVersion.Document' \
+        --output json >"$remote_document"
+
+    if [[ "$(jq -S -c . "$remote_document")" != "$(jq -S -c . "$policy_document")" ]]; then
+        versions="$tmpdir/versions.json"
+        aws_owner iam list-policy-versions --policy-arn "$policy_arn" >"$versions"
+        version_count="$(jq -er '.Versions | length' "$versions")"
+        if ((version_count >= 5)); then
+            oldest_non_default="$(
+                jq -er \
+                    '[.Versions[] | select(.IsDefaultVersion == false)] | sort_by(.CreateDate) | first | .VersionId' \
+                    "$versions"
+            )"
+            aws_owner iam delete-policy-version \
+                --policy-arn "$policy_arn" \
+                --version-id "$oldest_non_default"
+        fi
+        aws_owner iam create-policy-version \
+            --policy-arn "$policy_arn" \
+            --policy-document "file://${policy_document}" \
+            --set-as-default >/dev/null
+        policy_changed=true
+    fi
+elif grep -q 'NoSuchEntity' "$policy_error"; then
+    aws_owner iam create-policy \
+        --policy-name "$policy_name" \
+        --path "$policy_path" \
+        --policy-document "file://${policy_document}" >/dev/null
+    policy_changed=true
+else
+    cat "$policy_error" >&2
+    external_s3_test_die "could not inspect managed policy $policy_arn"
+fi
+
+aws_owner iam attach-user-policy \
+    --user-name "$primary_user_name" \
+    --policy-arn "$policy_arn"
+
+if [[ "$policy_changed" == true ]]; then
+    echo "updated $policy_arn and attached it to $primary_arn"
+else
+    echo "policy already current; ensured $policy_arn is attached to $primary_arn"
+fi

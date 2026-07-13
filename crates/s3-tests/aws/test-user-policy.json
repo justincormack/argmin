@@ -90,6 +90,38 @@
                 "s3:BypassGovernanceRetention"
             ],
             "Resource": "arn:aws:s3:::claude-s3-*/*"
+        },
+        {
+            "Sid": "AllowManageTemporaryStsOracleRoles",
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateRole",
+                "iam:DeleteRole",
+                "iam:GetRole",
+                "iam:UpdateAssumeRolePolicy"
+            ],
+            "Resource": "arn:aws:iam::*:role/argmin-sts-oracle/*"
+        },
+        {
+            "Sid": "AllowListTemporaryStsOracleRoles",
+            "Effect": "Allow",
+            "Action": "iam:ListRoles",
+            "Resource": "*"
+        },
+        {
+            "Sid": "AllowSimulateOwnStsOracleAuthorization",
+            "Effect": "Allow",
+            "Action": "iam:SimulatePrincipalPolicy",
+            "Resource": [
+                "arn:aws:iam::*:user/${aws:username}",
+                "arn:aws:iam::*:user/*/${aws:username}"
+            ]
+        },
+        {
+            "Sid": "AllowAssumeCrossAccountStsOracleRoles",
+            "Effect": "Allow",
+            "Action": "sts:AssumeRole",
+            "Resource": "arn:aws:iam::*:role/argmin-sts-oracle/cross-account/*"
         }
     ]
 }

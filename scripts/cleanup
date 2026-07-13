@@ -10,15 +10,17 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/cleanup [options]
 
-Delete leftover AWS-backed test buckets using the primary credentials from
-`.env` (`TEST_AWS_PRIMARY_ACCESS_KEY` / `TEST_AWS_PRIMARY_SECRET_KEY`).
+Delete leftover AWS-backed test buckets and stale STS oracle roles using the
+primary credentials from `.env` (`TEST_AWS_PRIMARY_ACCESS_KEY` /
+`TEST_AWS_PRIMARY_SECRET_KEY`).
 
 Options:
-  --region REGION         Override AWS region for API calls (default: TEST_S3_REGION or us-east-1)
-  --endpoint URL          Override the S3 endpoint URL (default: TEST_S3_ENDPOINT if set)
-  --bucket-prefix PREFIX  Only clean buckets with this prefix (default: TEST_S3_BUCKET_PREFIX or claude-s3-)
-  --dotenv PATH           Read AWS variables from a different env file
-  -h, --help              Show this help
+  --region REGION                 Override AWS region for API calls (default: TEST_S3_REGION or us-east-1)
+  --endpoint URL                  Override the S3 endpoint URL (default: TEST_S3_ENDPOINT if set)
+  --bucket-prefix PREFIX          Only clean buckets with this prefix (default: TEST_S3_BUCKET_PREFIX or claude-s3-)
+  --sts-role-min-age-seconds N    Only delete matching roles at least N seconds old (default: 3600)
+  --dotenv PATH                   Read AWS variables from a different env file
+  -h, --help                      Show this help
 
 Examples:
   ./scripts/cleanup
@@ -30,6 +32,7 @@ EOF
 region=""
 endpoint=""
 bucket_prefix=""
+sts_role_min_age_seconds=3600
 dotenv_path="$ROOT/.env"
 
 while (($#)); do
@@ -47,6 +50,11 @@ while (($#)); do
     --bucket-prefix)
       [[ $# -ge 2 ]] || external_s3_test_die "--bucket-prefix requires a value"
       bucket_prefix="$2"
+      shift 2
+      ;;
+    --sts-role-min-age-seconds)
+      [[ $# -ge 2 ]] || external_s3_test_die "--sts-role-min-age-seconds requires a value"
+      sts_role_min_age_seconds="$2"
       shift 2
       ;;
     --dotenv)
@@ -71,6 +79,8 @@ bucket_prefix="${bucket_prefix:-${TEST_S3_BUCKET_PREFIX:-claude-s3-}}"
 endpoint="${endpoint:-${TEST_S3_ENDPOINT:-}}"
 external_s3_test_require_shell_var TEST_AWS_PRIMARY_ACCESS_KEY
 external_s3_test_require_shell_var TEST_AWS_PRIMARY_SECRET_KEY
+[[ "$sts_role_min_age_seconds" =~ ^[0-9]+$ ]] || \
+  external_s3_test_die "--sts-role-min-age-seconds must be a non-negative integer"
 
 export AWS_ACCESS_KEY_ID="$TEST_AWS_PRIMARY_ACCESS_KEY"
 export AWS_SECRET_ACCESS_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
@@ -84,6 +94,53 @@ aws_s3api() {
   else
     aws s3api "$@"
   fi
+}
+
+cleanup_stale_sts_oracle_roles() {
+  local age_seconds created_at created_epoch list_error now_epoch role role_count role_name role_path roles_file roles_rows
+
+  roles_file="$tmpdir/sts-oracle-roles.json"
+  roles_rows="$tmpdir/sts-oracle-role-rows.txt"
+  list_error="$tmpdir/sts-oracle-list-roles.err"
+  if ! aws iam list-roles \
+    --path-prefix /argmin-sts-oracle/ \
+    --output json > "$roles_file" 2> "$list_error"; then
+    echo "Failed to list stale STS oracle roles; continuing bucket cleanup" >&2
+    cat "$list_error" >&2
+    failed=1
+    return
+  fi
+  jq -r \
+    '.Roles[] | select(.Path == "/argmin-sts-oracle/same-account/") | select(.RoleName | startswith("path-shape-")) | @base64' \
+    "$roles_file" > "$roles_rows"
+
+  role_count=$(grep -c . "$roles_rows" 2>/dev/null || true)
+  echo "$role_count STS oracle roles found..."
+  now_epoch=$(date +%s)
+
+  while IFS= read -r role; do
+    [[ -n "$role" ]] || continue
+    role=$(printf '%s' "$role" | base64 -d)
+    role_name=$(jq -er '.RoleName' <<<"$role")
+    role_path=$(jq -er '.Path' <<<"$role")
+    created_at=$(jq -er '.CreateDate' <<<"$role")
+
+    [[ "$role_path" == "/argmin-sts-oracle/same-account/" ]] || continue
+    [[ "$role_name" == path-shape-* ]] || continue
+    created_epoch=$(date -d "$created_at" +%s)
+    age_seconds=$((now_epoch - created_epoch))
+    if ((age_seconds < sts_role_min_age_seconds)); then
+      echo "Kept recent STS oracle role $role_name (${age_seconds}s old)"
+      continue
+    fi
+
+    if aws iam delete-role --role-name "$role_name"; then
+      echo "Deleted stale STS oracle role $role_name"
+    else
+      echo "Failed to delete stale STS oracle role $role_name" >&2
+      failed=1
+    fi
+  done < "$roles_rows"
 }
 
 tmpdir=$(mktemp -d)
@@ -179,6 +236,7 @@ aws_s3api list-buckets --query 'Buckets[].Name' --output text \
 echo "$(grep -c . "$bucketlist" 2>/dev/null || true) buckets to go..."
 
 failed=0
+cleanup_stale_sts_oracle_roles
 
 for bucket in $(head -100 "$bucketlist")
 do
