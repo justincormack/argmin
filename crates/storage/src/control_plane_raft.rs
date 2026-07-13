@@ -8,7 +8,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
 use openraft::errors::{NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable};
@@ -4199,12 +4199,16 @@ impl ControlPlaneRaftAuthority {
             .max_committed_timestamp_ms();
         artifact.store_durable_artifact(path)?;
         if let Some(log_store) = &self.log_store {
-            log_store
-                .compact_wal_through(wal_replay_offset)
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "compact control-plane OpenRaft WAL after durable checkpoint",
-                    source,
-                })?;
+            let compact_started = Instant::now();
+            let result = log_store.compact_wal_through(wal_replay_offset);
+            observability::record_control_plane_raft_checkpoint_compaction(
+                compact_started.elapsed(),
+                result.is_ok(),
+            );
+            result.map_err(|source| ControlPlaneError::Io {
+                context: "compact control-plane OpenRaft WAL after durable checkpoint",
+                source,
+            })?;
         }
         Ok(committed_timestamp_high_water_ms)
     }
@@ -6432,6 +6436,16 @@ impl ControlPlaneRaftRestartArtifact {
     }
 
     pub fn store_durable_artifact(&self, path: &Path) -> Result<(), ControlPlaneError> {
+        let store_started = Instant::now();
+        let result = self.store_durable_artifact_inner(path);
+        observability::record_control_plane_raft_checkpoint_store(
+            store_started.elapsed(),
+            result.is_ok(),
+        );
+        result
+    }
+
+    fn store_durable_artifact_inner(&self, path: &Path) -> Result<(), ControlPlaneError> {
         self.validate_restart_pair()
             .map_err(|source| ControlPlaneError::Io {
                 context: "validate control-plane OpenRaft durable restart artifact",
@@ -6448,7 +6462,12 @@ impl ControlPlaneRaftRestartArtifact {
         }
         ControlPlaneRaftRestartSentinel::for_artifact(self)
             .store_durable_sentinel(&sentinel_path)?;
+        let encode_started = Instant::now();
         let bytes = self.encode_durable_artifact()?;
+        observability::record_control_plane_raft_checkpoint_encode(
+            encode_started.elapsed(),
+            bytes.len(),
+        );
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -6469,7 +6488,10 @@ impl ControlPlaneRaftRestartArtifact {
                     context: "write control-plane OpenRaft durable restart artifact temp file",
                     source,
                 })?;
-            file.sync_all().map_err(|source| ControlPlaneError::Io {
+            let sync_started = Instant::now();
+            let result = file.sync_all();
+            observability::record_control_plane_raft_checkpoint_file_sync(sync_started.elapsed());
+            result.map_err(|source| ControlPlaneError::Io {
                 context: "sync control-plane OpenRaft durable restart artifact temp file",
                 source,
             })?;
@@ -7139,7 +7161,10 @@ impl ControlPlaneRaftRestartSentinel {
                     context: "write control-plane OpenRaft durable restart sentinel temp file",
                     source,
                 })?;
-            file.sync_all().map_err(|source| ControlPlaneError::Io {
+            let sync_started = Instant::now();
+            let result = file.sync_all();
+            observability::record_control_plane_raft_checkpoint_file_sync(sync_started.elapsed());
+            result.map_err(|source| ControlPlaneError::Io {
                 context: "sync control-plane OpenRaft durable restart sentinel temp file",
                 source,
             })?;
@@ -7740,12 +7765,13 @@ fn sync_durable_artifact_parent(path: &Path) -> Result<(), ControlPlaneError> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| ControlPlaneError::Io {
-            context: "sync control-plane OpenRaft durable restart artifact directory",
-            source,
-        })
+    let sync_started = Instant::now();
+    let result = File::open(parent).and_then(|directory| directory.sync_all());
+    observability::record_control_plane_raft_checkpoint_directory_sync(sync_started.elapsed());
+    result.map_err(|source| ControlPlaneError::Io {
+        context: "sync control-plane OpenRaft durable restart artifact directory",
+        source,
+    })
 }
 
 fn inject_control_plane_raft_wal_file_sync_failure(path: &Path) -> Result<(), ControlPlaneError> {
@@ -13547,10 +13573,25 @@ mod tests {
                 pre_checkpoint_clean_len > 0,
                 "initialized WAL-backed authority should have WAL bytes to compact"
             );
+            let metrics_before = observability::control_plane_raft_checkpoint_metrics_snapshot();
             authority
                 .store_durable_restart_artifact(&artifact_path)
                 .await
                 .expect("durable checkpoint should store and compact WAL");
+            let metrics_after = observability::control_plane_raft_checkpoint_metrics_snapshot();
+            assert!(metrics_after.encode_total > metrics_before.encode_total);
+            assert!(metrics_after.store_total > metrics_before.store_total);
+            assert!(metrics_after.bytes_total > metrics_before.bytes_total);
+            assert!(
+                metrics_after.file_sync_total >= metrics_before.file_sync_total.saturating_add(2),
+                "a first checkpoint should sync the sentinel and restart artifact files"
+            );
+            assert!(
+                metrics_after.directory_sync_total
+                    >= metrics_before.directory_sync_total.saturating_add(2),
+                "a first checkpoint should sync the directory after sentinel and artifact rename"
+            );
+            assert!(metrics_after.compaction_total > metrics_before.compaction_total);
 
             let artifact =
                 ControlPlaneRaftRestartArtifact::load_durable_artifact(&artifact_path).unwrap();
@@ -19492,10 +19533,14 @@ mod tests {
             state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
         };
 
+        let metrics_before = observability::control_plane_raft_checkpoint_metrics_snapshot();
         assert_error_contains(
             artifact.store_durable_artifact(&path),
             "durable restart sentinel belongs to cluster \"old-cluster\"",
         );
+        let metrics_after = observability::control_plane_raft_checkpoint_metrics_snapshot();
+        assert!(metrics_after.store_total > metrics_before.store_total);
+        assert!(metrics_after.store_error_total > metrics_before.store_error_total);
         assert!(!path.exists());
     }
 

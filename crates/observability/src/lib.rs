@@ -243,6 +243,26 @@ static CONTROL_PLANE_SNAPSHOT_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_SNAPSHOT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_SNAPSHOT_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_SNAPSHOT_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_ENCODE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_ENCODE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_ENCODE_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_STORE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_STORE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_STORE_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_STORE_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_FILE_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_FILE_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_FILE_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_DIRECTORY_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_DIRECTORY_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_DIRECTORY_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_HISTORY_REFERENCE_SAMPLES: OnceLock<
     Mutex<BTreeMap<u32, ControlPlaneHistoryReferenceSample>>,
 > = OnceLock::new();
@@ -463,6 +483,87 @@ pub fn control_plane_snapshot_metrics_snapshot() -> ControlPlaneSnapshotMetricSn
     }
 }
 
+pub fn record_control_plane_raft_checkpoint_encode(elapsed: Duration, bytes: usize) {
+    let elapsed_us = elapsed_us(elapsed);
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    CONTROL_PLANE_RAFT_CHECKPOINT_ENCODE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_RAFT_CHECKPOINT_ENCODE_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_CHECKPOINT_ENCODE_US_MAX, elapsed_us);
+    CONTROL_PLANE_RAFT_CHECKPOINT_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    CONTROL_PLANE_RAFT_CHECKPOINT_BYTES_LAST.store(bytes, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_CHECKPOINT_BYTES_MAX, bytes);
+}
+
+pub fn record_control_plane_raft_checkpoint_store(elapsed: Duration, succeeded: bool) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_CHECKPOINT_STORE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !succeeded {
+        CONTROL_PLANE_RAFT_CHECKPOINT_STORE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    CONTROL_PLANE_RAFT_CHECKPOINT_STORE_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_CHECKPOINT_STORE_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_raft_checkpoint_file_sync(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_CHECKPOINT_FILE_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_RAFT_CHECKPOINT_FILE_SYNC_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_CHECKPOINT_FILE_SYNC_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_raft_checkpoint_directory_sync(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_CHECKPOINT_DIRECTORY_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_RAFT_CHECKPOINT_DIRECTORY_SYNC_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(
+        &CONTROL_PLANE_RAFT_CHECKPOINT_DIRECTORY_SYNC_US_MAX,
+        elapsed_us,
+    );
+}
+
+pub fn record_control_plane_raft_checkpoint_compaction(elapsed: Duration, succeeded: bool) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !succeeded {
+        CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_US_MAX, elapsed_us);
+}
+
+#[must_use]
+pub fn control_plane_raft_checkpoint_metrics_snapshot() -> ControlPlaneRaftCheckpointMetricSnapshot
+{
+    ControlPlaneRaftCheckpointMetricSnapshot {
+        encode_total: CONTROL_PLANE_RAFT_CHECKPOINT_ENCODE_TOTAL.load(Ordering::Relaxed),
+        encode_us_total: CONTROL_PLANE_RAFT_CHECKPOINT_ENCODE_US_TOTAL.load(Ordering::Relaxed),
+        encode_us_max: CONTROL_PLANE_RAFT_CHECKPOINT_ENCODE_US_MAX.load(Ordering::Relaxed),
+        store_total: CONTROL_PLANE_RAFT_CHECKPOINT_STORE_TOTAL.load(Ordering::Relaxed),
+        store_error_total: CONTROL_PLANE_RAFT_CHECKPOINT_STORE_ERROR_TOTAL.load(Ordering::Relaxed),
+        store_us_total: CONTROL_PLANE_RAFT_CHECKPOINT_STORE_US_TOTAL.load(Ordering::Relaxed),
+        store_us_max: CONTROL_PLANE_RAFT_CHECKPOINT_STORE_US_MAX.load(Ordering::Relaxed),
+        file_sync_total: CONTROL_PLANE_RAFT_CHECKPOINT_FILE_SYNC_TOTAL.load(Ordering::Relaxed),
+        file_sync_us_total: CONTROL_PLANE_RAFT_CHECKPOINT_FILE_SYNC_US_TOTAL
+            .load(Ordering::Relaxed),
+        file_sync_us_max: CONTROL_PLANE_RAFT_CHECKPOINT_FILE_SYNC_US_MAX.load(Ordering::Relaxed),
+        directory_sync_total: CONTROL_PLANE_RAFT_CHECKPOINT_DIRECTORY_SYNC_TOTAL
+            .load(Ordering::Relaxed),
+        directory_sync_us_total: CONTROL_PLANE_RAFT_CHECKPOINT_DIRECTORY_SYNC_US_TOTAL
+            .load(Ordering::Relaxed),
+        directory_sync_us_max: CONTROL_PLANE_RAFT_CHECKPOINT_DIRECTORY_SYNC_US_MAX
+            .load(Ordering::Relaxed),
+        bytes_total: CONTROL_PLANE_RAFT_CHECKPOINT_BYTES_TOTAL.load(Ordering::Relaxed),
+        bytes_last: CONTROL_PLANE_RAFT_CHECKPOINT_BYTES_LAST.load(Ordering::Relaxed),
+        bytes_max: CONTROL_PLANE_RAFT_CHECKPOINT_BYTES_MAX.load(Ordering::Relaxed),
+        compaction_total: CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_TOTAL.load(Ordering::Relaxed),
+        compaction_error_total: CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_ERROR_TOTAL
+            .load(Ordering::Relaxed),
+        compaction_us_total: CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_US_TOTAL
+            .load(Ordering::Relaxed),
+        compaction_us_max: CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_US_MAX.load(Ordering::Relaxed),
+    }
+}
+
 impl ControlPlaneRpcMetricCounters {
     fn new() -> Self {
         Self {
@@ -504,6 +605,30 @@ pub struct ControlPlaneSnapshotMetricSnapshot {
     pub bytes_total: u64,
     pub bytes_last: u64,
     pub bytes_max: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneRaftCheckpointMetricSnapshot {
+    pub encode_total: u64,
+    pub encode_us_total: u64,
+    pub encode_us_max: u64,
+    pub store_total: u64,
+    pub store_error_total: u64,
+    pub store_us_total: u64,
+    pub store_us_max: u64,
+    pub file_sync_total: u64,
+    pub file_sync_us_total: u64,
+    pub file_sync_us_max: u64,
+    pub directory_sync_total: u64,
+    pub directory_sync_us_total: u64,
+    pub directory_sync_us_max: u64,
+    pub bytes_total: u64,
+    pub bytes_last: u64,
+    pub bytes_max: u64,
+    pub compaction_total: u64,
+    pub compaction_error_total: u64,
+    pub compaction_us_total: u64,
+    pub compaction_us_max: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

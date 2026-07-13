@@ -10728,9 +10728,12 @@ Required production shape and implementation order:
    cumulative/last/max encoded bytes. The authenticated
    `control-plane-runtime-map-diagnostics` command exports these process-local
    counters, and UAT prints them on successful and failed cleanup so subsequent
-   slices have comparable soak baselines. Command/journal bytes and the Raft
-   checkpoint path still need their corresponding counters when those paths
-   replace the single-authority full-snapshot write.
+   slices have comparable soak baselines. The Raft restart-artifact path now
+   separately reports encode count/duration, checkpoint store count/errors and
+   duration, artifact bytes, file and directory sync count/duration, and WAL
+   compaction count/errors and duration through the same authenticated
+   diagnostics response. Command/WAL append bytes still need their
+   corresponding counters before changing the peer acknowledgement boundary.
 2. Classify heartbeat fields by recovery requirement before changing the write
    path. Durable state includes membership, node/process identity changes,
    endpoints used as authority, PG topology/state, committed peering or
@@ -11567,6 +11570,15 @@ Phase 12.4 progress:
   "healthy with clean bytes", and "poisoned after an ambiguous durability
   failure" through the public status surface, while a real applied-command
   status test pins the durable vote/log/commit/applied/timestamp fields.
+- Added process-local Raft restart-artifact checkpoint metrics to the
+  authenticated runtime-map diagnostics surface. The metrics distinguish
+  artifact encoding, complete checkpoint-store success/failure, artifact bytes,
+  artifact and identity-sentinel file/directory syncs, and post-checkpoint WAL
+  compaction success/failure, with cumulative and maximum durations. Focused
+  regressions pin successful checkpoint/sync/compaction accounting, failed
+  checkpoint accounting before publication, and the bounded diagnostics line.
+  WAL command/frame bytes remain a separate required measurement before the
+  ordinary peer-response durability boundary changes.
 - Added physical WAL prefix compaction after durable restart-artifact
   checkpointing. WAL files now carry a small CRC-protected file header with the
   logical base offset, replay maps artifact offsets through that header, and

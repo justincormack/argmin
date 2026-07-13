@@ -1524,6 +1524,7 @@ fn format_control_plane_runtime_map_diagnostics(
         diagnostics.runtime_map(),
         diagnostics.rpc_metrics(),
         diagnostics.snapshot_metrics(),
+        diagnostics.raft_checkpoint_metrics(),
         diagnostics.history_reference_samples(),
     )
 }
@@ -1532,6 +1533,7 @@ fn format_control_plane_runtime_map_diagnostics_parts(
     runtime_map: &ClusterRuntimeMapSnapshot,
     rpc_metrics: &[observability::ControlPlaneRpcMetricSample],
     snapshot: observability::ControlPlaneSnapshotMetricSnapshot,
+    raft_checkpoint: observability::ControlPlaneRaftCheckpointMetricSnapshot,
     history_reference_samples: &[observability::ControlPlaneHistoryReferenceSample],
 ) -> String {
     let active_serving_pg_routes = runtime_map
@@ -1617,6 +1619,30 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         snapshot.bytes_total,
         snapshot.bytes_last,
         snapshot.bytes_max,
+    ));
+    output.push('\n');
+    output.push_str(&format!(
+        "control_plane_raft_checkpoint encode_total={} encode_us_total={} encode_us_max={} store_total={} store_error_total={} store_us_total={} store_us_max={} file_sync_total={} file_sync_us_total={} file_sync_us_max={} directory_sync_total={} directory_sync_us_total={} directory_sync_us_max={} bytes_total={} bytes_last={} bytes_max={} compaction_total={} compaction_error_total={} compaction_us_total={} compaction_us_max={}",
+        raft_checkpoint.encode_total,
+        raft_checkpoint.encode_us_total,
+        raft_checkpoint.encode_us_max,
+        raft_checkpoint.store_total,
+        raft_checkpoint.store_error_total,
+        raft_checkpoint.store_us_total,
+        raft_checkpoint.store_us_max,
+        raft_checkpoint.file_sync_total,
+        raft_checkpoint.file_sync_us_total,
+        raft_checkpoint.file_sync_us_max,
+        raft_checkpoint.directory_sync_total,
+        raft_checkpoint.directory_sync_us_total,
+        raft_checkpoint.directory_sync_us_max,
+        raft_checkpoint.bytes_total,
+        raft_checkpoint.bytes_last,
+        raft_checkpoint.bytes_max,
+        raft_checkpoint.compaction_total,
+        raft_checkpoint.compaction_error_total,
+        raft_checkpoint.compaction_us_total,
+        raft_checkpoint.compaction_us_max,
     ));
     output
 }
@@ -11158,6 +11184,14 @@ mod tests {
                 bytes_last: 1234,
                 ..observability::ControlPlaneSnapshotMetricSnapshot::default()
             },
+            observability::ControlPlaneRaftCheckpointMetricSnapshot {
+                store_total: 8,
+                file_sync_total: 9,
+                directory_sync_total: 10,
+                bytes_last: 5678,
+                compaction_total: 11,
+                ..observability::ControlPlaneRaftCheckpointMetricSnapshot::default()
+            },
             &[observability::ControlPlaneHistoryReferenceSample {
                 node_id: 2,
                 observed_epoch: floor_epoch.get(),
@@ -11188,6 +11222,12 @@ mod tests {
             "{diagnostics}"
         );
         assert!(diagnostics.contains("bytes_last=1234"), "{diagnostics}");
+        assert!(
+            diagnostics.contains(
+                "control_plane_raft_checkpoint encode_total=0 encode_us_total=0 encode_us_max=0 store_total=8 store_error_total=0 store_us_total=0 store_us_max=0 file_sync_total=9 file_sync_us_total=0 file_sync_us_max=0 directory_sync_total=10 directory_sync_us_total=0 directory_sync_us_max=0 bytes_total=0 bytes_last=5678 bytes_max=0 compaction_total=11"
+            ),
+            "{diagnostics}"
+        );
         assert!(
             diagnostics.contains(&format!(
                 "history_report_observed_epoch={} history_report_validation_epoch={} history_report_accepted_at_ms=1000 history_live_payload_epoch={} history_durable_backfill_epoch={} history_pending_metadata_command_epoch=-",

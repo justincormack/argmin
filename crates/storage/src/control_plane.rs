@@ -6022,6 +6022,7 @@ pub struct ControlPlaneRuntimeMapDiagnostics {
     runtime_map: ClusterRuntimeMapSnapshot,
     rpc_metrics: Vec<observability::ControlPlaneRpcMetricSample>,
     snapshot_metrics: observability::ControlPlaneSnapshotMetricSnapshot,
+    raft_checkpoint_metrics: observability::ControlPlaneRaftCheckpointMetricSnapshot,
     history_reference_samples: Vec<observability::ControlPlaneHistoryReferenceSample>,
 }
 
@@ -6039,6 +6040,13 @@ impl ControlPlaneRuntimeMapDiagnostics {
     #[must_use]
     pub fn snapshot_metrics(&self) -> observability::ControlPlaneSnapshotMetricSnapshot {
         self.snapshot_metrics
+    }
+
+    #[must_use]
+    pub fn raft_checkpoint_metrics(
+        &self,
+    ) -> observability::ControlPlaneRaftCheckpointMetricSnapshot {
+        self.raft_checkpoint_metrics
     }
 
     #[must_use]
@@ -12358,6 +12366,27 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, snapshot.bytes_total);
     write_u64(out, snapshot.bytes_last);
     write_u64(out, snapshot.bytes_max);
+    let raft_checkpoint = observability::control_plane_raft_checkpoint_metrics_snapshot();
+    write_u64(out, raft_checkpoint.encode_total);
+    write_u64(out, raft_checkpoint.encode_us_total);
+    write_u64(out, raft_checkpoint.encode_us_max);
+    write_u64(out, raft_checkpoint.store_total);
+    write_u64(out, raft_checkpoint.store_error_total);
+    write_u64(out, raft_checkpoint.store_us_total);
+    write_u64(out, raft_checkpoint.store_us_max);
+    write_u64(out, raft_checkpoint.file_sync_total);
+    write_u64(out, raft_checkpoint.file_sync_us_total);
+    write_u64(out, raft_checkpoint.file_sync_us_max);
+    write_u64(out, raft_checkpoint.directory_sync_total);
+    write_u64(out, raft_checkpoint.directory_sync_us_total);
+    write_u64(out, raft_checkpoint.directory_sync_us_max);
+    write_u64(out, raft_checkpoint.bytes_total);
+    write_u64(out, raft_checkpoint.bytes_last);
+    write_u64(out, raft_checkpoint.bytes_max);
+    write_u64(out, raft_checkpoint.compaction_total);
+    write_u64(out, raft_checkpoint.compaction_error_total);
+    write_u64(out, raft_checkpoint.compaction_us_total);
+    write_u64(out, raft_checkpoint.compaction_us_max);
     let runtime_node_ids = runtime_map
         .nodes()
         .iter()
@@ -12430,6 +12459,28 @@ fn read_control_plane_runtime_map_diagnostics(
         bytes_total: reader.read_u64()?,
         bytes_last: reader.read_u64()?,
         bytes_max: reader.read_u64()?,
+    };
+    let raft_checkpoint_metrics = observability::ControlPlaneRaftCheckpointMetricSnapshot {
+        encode_total: reader.read_u64()?,
+        encode_us_total: reader.read_u64()?,
+        encode_us_max: reader.read_u64()?,
+        store_total: reader.read_u64()?,
+        store_error_total: reader.read_u64()?,
+        store_us_total: reader.read_u64()?,
+        store_us_max: reader.read_u64()?,
+        file_sync_total: reader.read_u64()?,
+        file_sync_us_total: reader.read_u64()?,
+        file_sync_us_max: reader.read_u64()?,
+        directory_sync_total: reader.read_u64()?,
+        directory_sync_us_total: reader.read_u64()?,
+        directory_sync_us_max: reader.read_u64()?,
+        bytes_total: reader.read_u64()?,
+        bytes_last: reader.read_u64()?,
+        bytes_max: reader.read_u64()?,
+        compaction_total: reader.read_u64()?,
+        compaction_error_total: reader.read_u64()?,
+        compaction_us_total: reader.read_u64()?,
+        compaction_us_max: reader.read_u64()?,
     };
     let history_reference_count =
         reader.read_collection_len("control-plane history reference samples", 31)?;
@@ -12522,6 +12573,7 @@ fn read_control_plane_runtime_map_diagnostics(
         runtime_map,
         rpc_metrics,
         snapshot_metrics,
+        raft_checkpoint_metrics,
         history_reference_samples,
     })
 }
