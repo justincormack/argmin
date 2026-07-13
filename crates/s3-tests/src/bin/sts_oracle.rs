@@ -371,15 +371,29 @@ fn assert_assume_role_request_success(
     println!("{label}: ok");
 }
 
+struct AssumeRoleProbeSet<'a> {
+    caller_arn: &'a str,
+    role_arn: &'a str,
+    role_name: &'a str,
+    default_max_role_arn: &'a str,
+    default_max_role_name: &'a str,
+    role_session_name: &'a str,
+}
+
 fn run_assume_role_probes(
     endpoint: &str,
     credentials: SignedRequestCredentials<'_>,
     account_id: &str,
-    caller_arn: &str,
-    role_arn: &str,
-    role_name: &str,
-    role_session_name: &str,
+    fixture: AssumeRoleProbeSet<'_>,
 ) {
+    let AssumeRoleProbeSet {
+        caller_arn,
+        role_arn,
+        role_name,
+        default_max_role_arn,
+        default_max_role_name,
+        role_session_name,
+    } = fixture;
     let missing_role_arn = format!("{role_arn}-missing");
     let malformed_role_arn = "x".repeat(20);
     let max_role_arn = "x".repeat(2048);
@@ -895,6 +909,55 @@ fn run_assume_role_probes(
         "ValidationError",
         Some("1 validation error detected: Value '899' at 'durationSeconds' failed to satisfy constraint: Member must have value greater than or equal to 900"),
     );
+
+    assert_assume_role_request_success(
+        "assume-role-at-role-maximum-duration",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", default_max_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("DurationSeconds", "3600"),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name: default_max_role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+    );
+    assert_assume_role_error(
+        "assume-role-over-role-maximum-duration",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", default_max_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("DurationSeconds", "3601"),
+        ],
+        400,
+        "ValidationError",
+        Some("The requested DurationSeconds exceeds the MaxSessionDuration set for this role."),
+    );
+    assert_assume_role_error(
+        "assume-role-over-api-maximum-on-low-maximum-role",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", default_max_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("DurationSeconds", "43201"),
+        ],
+        400,
+        "ValidationError",
+        Some("1 validation error detected: Value '43201' at 'durationSeconds' failed to satisfy constraint: Member must have value less than or equal to 43200"),
+    );
 }
 
 fn assert_cross_account_denied(
@@ -1167,15 +1230,21 @@ fn main() {
     if let Ok(role_arn) = env::var("S3_TEST_STS_ROLE_ARN") {
         let caller_arn = required_env("S3_TEST_STS_PRIMARY_ARN");
         let role_name = required_env("S3_TEST_STS_ROLE_NAME");
+        let default_max_role_arn = required_env("S3_TEST_STS_DEFAULT_MAX_ROLE_ARN");
+        let default_max_role_name = required_env("S3_TEST_STS_DEFAULT_MAX_ROLE_NAME");
         let role_session_name = required_env("S3_TEST_STS_ROLE_SESSION_NAME");
         run_assume_role_probes(
             &endpoint,
             credentials,
             &account_id,
-            &caller_arn,
-            &role_arn,
-            &role_name,
-            &role_session_name,
+            AssumeRoleProbeSet {
+                caller_arn: &caller_arn,
+                role_arn: &role_arn,
+                role_name: &role_name,
+                default_max_role_arn: &default_max_role_arn,
+                default_max_role_name: &default_max_role_name,
+                role_session_name: &role_session_name,
+            },
         );
     }
 

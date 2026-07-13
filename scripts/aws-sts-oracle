@@ -222,7 +222,7 @@ create_role_fixture() {
     command -v aws >/dev/null || external_s3_test_die "aws CLI is required for --assume-role"
     command -v jq >/dev/null || external_s3_test_die "jq is required for --assume-role"
 
-    local identity_decision identity_simulation missing_role_error primary_identity primary_account primary_arn role_suffix trust_policy
+    local default_max_duration identity_decision identity_simulation missing_role_error primary_identity primary_account primary_arn role_suffix trust_policy
     primary_identity="$(aws_primary sts get-caller-identity --output json)"
     primary_account="$(jq -er '.Account' <<<"$primary_identity")"
     primary_arn="$(jq -er '.Arn' <<<"$primary_identity")"
@@ -239,6 +239,8 @@ create_role_fixture() {
     export S3_TEST_STS_ROLE_NAME="path-shape-${role_suffix}"
     export S3_TEST_STS_ROLE_SESSION_NAME="path-shape-session"
     export S3_TEST_STS_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_ROLE_NAME}"
+    export S3_TEST_STS_DEFAULT_MAX_ROLE_NAME="default-max-${role_suffix}"
+    export S3_TEST_STS_DEFAULT_MAX_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_DEFAULT_MAX_ROLE_NAME}"
 
     trust_policy="$tmpdir/trust-policy.json"
     jq -n --arg principal "$primary_arn" '{
@@ -292,10 +294,34 @@ create_role_fixture() {
         "$S3_TEST_STS_ROLE_ARN" \
         43200
 
+    assert_identity_decision \
+        same-account-default-max \
+        aws_primary \
+        "$primary_arn" \
+        "$S3_TEST_STS_DEFAULT_MAX_ROLE_ARN" \
+        implicitDeny
+    create_scoped_role \
+        "$S3_TEST_STS_DEFAULT_MAX_ROLE_NAME" \
+        /argmin-sts-oracle/same-account/ \
+        "$trust_policy" \
+        "$S3_TEST_STS_DEFAULT_MAX_ROLE_ARN"
+    default_max_duration="$(aws_primary iam get-role \
+        --role-name "$S3_TEST_STS_DEFAULT_MAX_ROLE_NAME" \
+        --query 'Role.MaxSessionDuration' \
+        --output text)"
+    [[ "$default_max_duration" == 3600 ]] || \
+        external_s3_test_die \
+            "temporary STS oracle role has unexpected default maximum session duration $default_max_duration"
+    echo "same-account-default-max-duration: ok"
+
     wait_for_assume_role_success \
         same-account-role \
         aws_primary \
         "$S3_TEST_STS_ROLE_ARN"
+    wait_for_assume_role_success \
+        same-account-default-max-role \
+        aws_primary \
+        "$S3_TEST_STS_DEFAULT_MAX_ROLE_ARN"
 }
 
 assert_identity_decision() {

@@ -112,7 +112,9 @@ cleanup_stale_sts_oracle_roles() {
   fi
   jq -r \
     '.Roles[] | select(
-        (.Path == "/argmin-sts-oracle/same-account/" and (.RoleName | startswith("path-shape-"))) or
+        (.Path == "/argmin-sts-oracle/same-account/" and
+            ((.RoleName | startswith("path-shape-")) or
+             (.RoleName | startswith("default-max-")))) or
         (.Path == "/argmin-sts-oracle/cross-account/" and
             ((.RoleName | startswith("cross-success-")) or
              (.RoleName | startswith("cross-trust-denied-")))) or
@@ -133,6 +135,7 @@ cleanup_stale_sts_oracle_roles() {
 
     case "$role_path:$role_name" in
       /argmin-sts-oracle/same-account/:path-shape-* | \
+        /argmin-sts-oracle/same-account/:default-max-* | \
         /argmin-sts-oracle/cross-account/:cross-success-* | \
         /argmin-sts-oracle/cross-account/:cross-trust-denied-* | \
         /argmin-sts-oracle/caller-denied/:cross-caller-denied-*) ;;

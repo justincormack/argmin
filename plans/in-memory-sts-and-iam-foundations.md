@@ -720,10 +720,9 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The optional `AssumeRole` security-context parameters, role maximum and role
-chaining behavior, role mutation precedence, session-principal context, and
-`aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
-condition.
+The optional `AssumeRole` security-context parameters, role chaining behavior,
+role mutation precedence, session-principal context, and `aws:TokenIssueTime`
+behavior remain before Phase 0 can satisfy its exit condition.
 
 The role-fixture capability will use the ordinary primary and alternate test
 users, not the owner/root credential. The shared test-user policy grants only
@@ -761,11 +760,11 @@ The same-account role-fixture slice now:
 - provides `./scripts/aws-apply-test-user-policy`, which uses the primary
   credential only to identify the target user and confines owner/root use to
   creating or versioning the customer-managed test policy and attaching it
-- creates, converges, assumes, and deletes
-  a uniquely named `role/argmin-sts-oracle/same-account/path-shape-*` using the
-  primary test user; it never adopts or mutates an existing role, grants the
-  role no identity permissions, and normalizes temporary secrets before golden
-  response comparison
+- creates, converges, assumes, and deletes uniquely named
+  `role/argmin-sts-oracle/same-account/path-shape-*` and `default-max-*` roles
+  using the primary test user; it never adopts or mutates an existing role,
+  grants neither role identity permissions, and normalizes temporary secrets
+  before golden response comparison
 - proves that the IAM role ARN retains `/argmin-sts-oracle/same-account/` while
   its returned STS ARN omits the entire IAM path and retains only the unique
   role name and `path-shape-session` session name
@@ -782,11 +781,12 @@ its unique missing role before creation, then requires `CreateRole` to succeed;
 fixture. It never broadens the IAM resource grant merely to perform an
 existence check.
 
-`./scripts/cleanup` discovers uniquely named same-account oracle roles and
-deletes only those at least one hour old. The age floor prevents a periodic
-cleanup run from deleting another concurrently active oracle fixture. IAM
-discovery failure is reported and makes the command exit unsuccessfully after
-the existing bucket cleanup has still run; it cannot disable bucket recovery.
+`./scripts/cleanup` discovers both uniquely named same-account oracle role
+shapes and deletes only those at least one hour old. The age floor prevents a
+periodic cleanup run from deleting another concurrently active oracle fixture.
+IAM discovery failure is reported and makes the command exit unsuccessfully
+after the existing bucket cleanup has still run; it cannot disable bucket
+recovery.
 
 The cross-account role-fixture slice completed on 2026-07-13. The alternate
 account's administrator applied the same test-user policy there; the
@@ -874,9 +874,21 @@ The first implementation-facing core can therefore parse and validate
 request without guessed behavior. This does not authorize silently ignoring
 known optional `AssumeRole` inputs: session policy/policy ARNs, external ID,
 source identity, tags/transitive tags, MFA fields, and provided contexts still
-need explicit AWS-backed scope decisions. Configured role-maximum rejection and
-the one-hour role-chaining limit also remain separate from the API-level
-duration bounds pinned here.
+need explicit AWS-backed scope decisions. The one-hour role-chaining limit also
+remains separate from the API-level and configured-role duration bounds pinned
+here.
+
+The configured role-maximum slice completed on 2026-07-13. A second unique
+same-account role is left at IAM's default 3,600-second maximum. The fixture
+proves an exact-target `implicitDeny` from the caller's identity policies,
+checks `GetRole` reports `MaxSessionDuration=3600`, and establishes successful
+STS convergence before the raw probes run. An explicit 3,600-second request
+receives the complete success golden, while 3,601 receives HTTP 400
+`ValidationError` with exactly `The requested DurationSeconds exceeds the
+MaxSessionDuration set for this role.` A 43,201-second request against that
+same low-maximum role instead receives the ordinary API maximum-value
+validation response. The fixed Query-schema range is therefore validated
+before the target role's mutable configured maximum.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations
