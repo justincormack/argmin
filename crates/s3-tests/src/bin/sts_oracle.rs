@@ -4,15 +4,17 @@
 //! binary: Argmin does not expose STS yet, and the repository's local test
 //! suite must remain green while Phase 0 pins the AWS wire contract.
 
-use std::env;
+use std::{env, time::Duration};
 
 use aws_smithy_types::{date_time::Format as DateTimeFormat, DateTime};
 use s3_tests::{
+    build_test_agent, presign_url_with_credentials,
     send_signed_request_for_service_with_credentials,
     shape::{
-        assert_shape, error_response_headers, response_header_value, shape, xml_tag_text, ShapeSpec,
+        assert_shape, error_response_headers, expected_error, response_header_value, shape,
+        xml_tag_text, ShapeSpec,
     },
-    RawResponse, SignedRequestCredentials,
+    PresignedRequest, RawResponse, SignedRequestCredentials,
 };
 
 const QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
@@ -238,22 +240,31 @@ fn spaced_hex(value: &str) -> String {
         .join(" ")
 }
 
+fn sanitize_s3_text(text: &str, access_key: &str, security_tokens: &[&str]) -> String {
+    let mut sanitized = text.replace(&spaced_hex(access_key), "SESSION_ACCESS_KEY_BYTES");
+    sanitized = sanitized.replace(access_key, "SESSION_ACCESS_KEY");
+    for security_token in security_tokens {
+        let uri_encoded = auth::canonical::uri_encode(security_token);
+        if uri_encoded != *security_token {
+            sanitized =
+                sanitized.replace(&spaced_hex(&uri_encoded), "SESSION_TOKEN_URI_ENCODED_BYTES");
+            sanitized = sanitized.replace(&uri_encoded, "SESSION_TOKEN_URI_ENCODED");
+        }
+        sanitized = sanitized.replace(&spaced_hex(security_token), "SESSION_TOKEN_BYTES");
+        sanitized = sanitized.replace(security_token, "SESSION_TOKEN");
+    }
+    sanitized
+}
+
 fn s3_response_with_sanitized_body(
     response: &RawResponse,
     access_key: &str,
-    security_token: Option<&str>,
+    security_tokens: &[&str],
 ) -> RawResponse {
-    let mut body = response.body.clone();
-    body = body.replace(&spaced_hex(access_key), "SESSION_ACCESS_KEY_BYTES");
-    body = body.replace(access_key, "SESSION_ACCESS_KEY");
-    if let Some(security_token) = security_token {
-        body = body.replace(&spaced_hex(security_token), "SESSION_TOKEN_BYTES");
-        body = body.replace(security_token, "SESSION_TOKEN");
-    }
     RawResponse {
         status: response.status,
         headers: response.headers.clone(),
-        body,
+        body: sanitize_s3_text(&response.body, access_key, security_tokens),
         body_read_error: response.body_read_error.clone(),
     }
 }
@@ -262,13 +273,13 @@ fn assert_s3_invalid_access_key(
     label: &str,
     response: &RawResponse,
     access_key: &str,
-    security_token: Option<&str>,
+    security_tokens: &[&str],
 ) {
     assert!(
         required_xml_text(response, "AWSAccessKeyId", label) == access_key,
         "{label}: S3 did not echo the session access key"
     );
-    let response = s3_response_with_sanitized_body(response, access_key, security_token);
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
     assert_shape(
         label,
         &response,
@@ -286,13 +297,17 @@ fn assert_s3_invalid_access_key(
     println!("{label}: ok");
 }
 
-fn assert_s3_signature_mismatch(
+fn assert_s3_signature_mismatch<F>(
     label: &str,
     response: &RawResponse,
-    endpoint: &str,
     credentials: SignedRequestCredentials<'_>,
-    security_token: &str,
-) {
+    security_tokens: &[&str],
+    expected_amz_date: Option<&str>,
+    expected_signature: Option<&str>,
+    canonical_request_for_date: F,
+) where
+    F: FnOnce(&str) -> String,
+{
     assert!(
         required_xml_text(response, "AWSAccessKeyId", label) == credentials.access_key,
         "{label}: S3 did not echo the session access key"
@@ -322,6 +337,12 @@ fn assert_s3_signature_mismatch(
                 .all(|byte| byte.is_ascii_digit()),
         "{label}: malformed signing timestamp"
     );
+    if let Some(expected_amz_date) = expected_amz_date {
+        assert!(
+            amz_date == expected_amz_date,
+            "{label}: response StringToSign has the wrong request timestamp"
+        );
+    }
     let scope = format!("{}/{}/s3/aws4_request", &amz_date[..8], credentials.region);
     assert!(
         string_to_sign_lines.next() == Some(scope.as_str()),
@@ -335,23 +356,22 @@ fn assert_s3_signature_mismatch(
         "{label}: unexpected extra StringToSign line"
     );
 
-    let parsed_endpoint = url::Url::parse(endpoint)
-        .unwrap_or_else(|error| panic!("{label}: invalid S3 endpoint: {error}"));
-    let host = parsed_endpoint
-        .host_str()
-        .unwrap_or_else(|| panic!("{label}: S3 endpoint has no host"));
-    let empty_payload_hash = auth::canonical::sha256_hex(b"");
-    let canonical_request = format!(
-        "GET\n/\n\nhost:{host}\n\
-         x-amz-content-sha256:{empty_payload_hash}\n\
-         x-amz-date:{amz_date}\n\
-         x-amz-security-token:{security_token}\n\n\
-         host;x-amz-content-sha256;x-amz-date;x-amz-security-token\n\
-         {empty_payload_hash}"
-    );
+    let canonical_request = canonical_request_for_date(amz_date);
+    let observed_canonical_request = required_xml_text(response, "CanonicalRequest", label);
+    let canonical_request_xml = canonical_request.replace('&', "&amp;");
     assert!(
-        required_xml_text(response, "CanonicalRequest", label) == canonical_request,
-        "{label}: unexpected canonical request"
+        observed_canonical_request == canonical_request_xml,
+        "{label}: unexpected canonical request\nexpected: {:?}\nobserved: {:?}",
+        sanitize_s3_text(
+            &canonical_request_xml,
+            credentials.access_key,
+            security_tokens
+        ),
+        sanitize_s3_text(
+            &observed_canonical_request,
+            credentials.access_key,
+            security_tokens
+        )
     );
     assert!(
         required_xml_text(response, "CanonicalRequestBytes", label)
@@ -370,12 +390,25 @@ fn assert_s3_signature_mismatch(
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "{label}: malformed provided signature"
     );
+    if let Some(expected_signature) = expected_signature {
+        assert!(
+            signature == expected_signature,
+            "{label}: response did not echo the presigned query signature"
+        );
+    }
 
     let response =
-        s3_response_with_sanitized_body(response, credentials.access_key, Some(security_token));
-    let sanitized_canonical_request = canonical_request.replace(security_token, "SESSION_TOKEN");
-    let sanitized_canonical_request_bytes =
-        spaced_hex(&canonical_request).replace(&spaced_hex(security_token), "SESSION_TOKEN_BYTES");
+        s3_response_with_sanitized_body(response, credentials.access_key, security_tokens);
+    let sanitized_canonical_request = sanitize_s3_text(
+        &canonical_request_xml,
+        credentials.access_key,
+        security_tokens,
+    );
+    let sanitized_canonical_request_bytes = sanitize_s3_text(
+        &spaced_hex(&canonical_request),
+        credentials.access_key,
+        security_tokens,
+    );
     assert_shape(
         label,
         &response,
@@ -403,14 +436,50 @@ fn assert_s3_signature_mismatch(
     println!("{label}: ok");
 }
 
+fn assert_s3_header_signature_mismatch(
+    label: &str,
+    response: &RawResponse,
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+) {
+    let parsed_endpoint = url::Url::parse(endpoint)
+        .unwrap_or_else(|error| panic!("{label}: invalid S3 endpoint: {error}"));
+    let host = parsed_endpoint
+        .host_str()
+        .unwrap_or_else(|| panic!("{label}: S3 endpoint has no host"));
+    let empty_payload_hash = auth::canonical::sha256_hex(b"");
+    assert_s3_signature_mismatch(
+        label,
+        response,
+        credentials,
+        &[security_token],
+        None,
+        None,
+        |amz_date| {
+            format!(
+                "GET\n/\n\nhost:{host}\n\
+                 x-amz-content-sha256:{empty_payload_hash}\n\
+                 x-amz-date:{amz_date}\n\
+                 x-amz-security-token:{security_token}\n\n\
+                 host;x-amz-content-sha256;x-amz-date;x-amz-security-token\n\
+                 {empty_payload_hash}"
+            )
+        },
+    );
+}
+
 fn assert_s3_list_buckets_access_denied(
     label: &str,
     response: &RawResponse,
     assumed_role_arn: &str,
+    access_key: &str,
+    security_tokens: &[&str],
 ) {
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
     assert_shape(
         label,
-        response,
+        &response,
         &shape()
             .status(403)
             .headers(error_response_headers())
@@ -423,6 +492,24 @@ fn assert_s3_list_buckets_access_denied(
                  s3:ListAllMyBuckets action</Message>\
                  <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
             ),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_headers_not_signed(
+    label: &str,
+    response: &RawResponse,
+    access_key: &str,
+    security_tokens: &[&str],
+) {
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .body(expected_error::headers_not_signed("x-amz-security-token")),
     );
     println!("{label}: ok");
 }
@@ -549,21 +636,439 @@ fn run_s3_header_session_authentication_probes(
                     "arn:aws:sts::{account_id}:assumed-role/{}/{}",
                     fixture.live_role_name, fixture.live_role_session_name
                 );
-                assert_s3_list_buckets_access_denied(label, &response, &assumed_role_arn);
+                assert_s3_list_buckets_access_denied(
+                    label,
+                    &response,
+                    &assumed_role_arn,
+                    credentials.access_key,
+                    security_token.as_slice(),
+                );
             }
             S3HeaderAuthExpected::InvalidAccessKey => assert_s3_invalid_access_key(
                 label,
                 &response,
                 credentials.access_key,
-                security_token,
+                security_token.as_slice(),
             ),
-            S3HeaderAuthExpected::SignatureMismatch => assert_s3_signature_mismatch(
+            S3HeaderAuthExpected::SignatureMismatch => assert_s3_header_signature_mismatch(
                 label,
                 &response,
                 endpoint,
                 credentials,
                 security_token.expect("signature mismatch probe has a session token"),
             ),
+        }
+    }
+}
+
+fn build_s3_root_presigned_request(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    query_token: Option<&str>,
+    signed_header_token: Option<&str>,
+) -> PresignedRequest {
+    let url = query_token.map_or_else(
+        || endpoint.to_string(),
+        |token| {
+            format!(
+                "{endpoint}?X-Amz-Security-Token={}",
+                auth::canonical::uri_encode(token)
+            )
+        },
+    );
+    let headers = signed_header_token
+        .map(|token| vec![("x-amz-security-token", token)])
+        .unwrap_or_default();
+    presign_url_with_credentials(
+        "GET",
+        &url,
+        Duration::from_secs(900),
+        headers,
+        None,
+        credentials,
+    )
+}
+
+fn fetch_s3_presigned_request(
+    endpoint: &str,
+    presigned: &PresignedRequest,
+    unsigned_header_token: Option<&str>,
+) -> RawResponse {
+    let mut request =
+        build_test_agent(endpoint, None, Duration::from_secs(120)).get(presigned.uri());
+    for (name, value) in presigned.headers() {
+        request = request.header(name, value);
+    }
+    if let Some(token) = unsigned_header_token {
+        request = request.header("x-amz-security-token", token);
+    }
+    let mut response = request.call().expect("presigned AWS transport error");
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("presigned AWS response header is valid UTF-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let (body, body_read_error) = match response.body_mut().read_to_string() {
+        Ok(body) => (body, None),
+        Err(error) => (String::new(), Some(error.to_string())),
+    };
+    RawResponse {
+        status: response.status().as_u16(),
+        headers,
+        body,
+        body_read_error,
+    }
+}
+
+fn required_presigned_query_value(parsed: &url::Url, name: &str, label: &str) -> String {
+    parsed
+        .query_pairs()
+        .find_map(|(candidate, value)| (candidate == name).then(|| value.into_owned()))
+        .unwrap_or_else(|| panic!("{label}: presigned URL is missing {name}"))
+}
+
+fn assert_s3_presigned_signature_mismatch(
+    label: &str,
+    response: &RawResponse,
+    presigned: &PresignedRequest,
+    credentials: SignedRequestCredentials<'_>,
+    security_tokens: &[&str],
+) {
+    let parsed = url::Url::parse(presigned.uri())
+        .unwrap_or_else(|error| panic!("{label}: invalid presigned URL: {error}"));
+    let amz_date = required_presigned_query_value(&parsed, "X-Amz-Date", label);
+    let signature = required_presigned_query_value(&parsed, "X-Amz-Signature", label);
+    let signed_headers = required_presigned_query_value(&parsed, "X-Amz-SignedHeaders", label);
+    let query_without_signature = parsed
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|part| !part.starts_with("X-Amz-Signature="))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_query = auth::canonical::canonical_query_string(&query_without_signature);
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            parsed
+                .port()
+                .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"))
+        })
+        .unwrap_or_else(|| panic!("{label}: presigned URL has no host"));
+    let mut owned_headers = vec![("host".to_string(), host)];
+    owned_headers.extend(
+        presigned
+            .headers()
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    let header_refs = owned_headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let canonical_headers = auth::canonical::canonical_headers(&header_refs);
+    assert_s3_signature_mismatch(
+        label,
+        response,
+        credentials,
+        security_tokens,
+        Some(&amz_date),
+        Some(&signature),
+        |_| {
+            auth::canonical::canonical_request(
+                "GET",
+                parsed.path(),
+                &canonical_query,
+                &canonical_headers,
+                &signed_headers,
+                "UNSIGNED-PAYLOAD",
+            )
+        },
+    );
+}
+
+#[derive(Clone, Copy)]
+enum S3PresignedAuthExpected {
+    AccessDenied,
+    HeadersNotSigned,
+    InvalidAccessKey,
+    SignatureMismatch,
+}
+
+struct S3PresignedSessionProbeSet<'a> {
+    live_credentials: SignedRequestCredentials<'a>,
+    live_security_token: &'a str,
+    live_role_name: &'a str,
+    live_role_session_name: &'a str,
+    other_live_security_token: &'a str,
+    old_credentials: SignedRequestCredentials<'a>,
+    old_security_token: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct S3PresignedProbe<'a> {
+    label: &'a str,
+    credentials: SignedRequestCredentials<'a>,
+    query_token: Option<&'a str>,
+    signed_header_token: Option<&'a str>,
+    unsigned_header_token: Option<&'a str>,
+    expected: S3PresignedAuthExpected,
+}
+
+fn run_s3_presigned_session_authentication_probes(
+    endpoint: &str,
+    account_id: &str,
+    fixture: S3PresignedSessionProbeSet<'_>,
+) {
+    let wrong_secret = "0".repeat(40);
+    let live_bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..fixture.live_credentials
+    };
+    let old_bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..fixture.old_credentials
+    };
+    let probes = [
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-query-token-valid",
+            credentials: fixture.live_credentials,
+            query_token: Some(fixture.live_security_token),
+            signed_header_token: None,
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::AccessDenied,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-token-missing-valid-signature",
+            credentials: fixture.live_credentials,
+            query_token: None,
+            signed_header_token: None,
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-query-token-mismatched-valid-signature",
+            credentials: fixture.live_credentials,
+            query_token: Some(fixture.other_live_security_token),
+            signed_header_token: None,
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-query-token-valid-bad-signature",
+            credentials: live_bad_signature_credentials,
+            query_token: Some(fixture.live_security_token),
+            signed_header_token: None,
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::SignatureMismatch,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-token-missing-bad-signature",
+            credentials: live_bad_signature_credentials,
+            query_token: None,
+            signed_header_token: None,
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-query-token-mismatched-bad-signature",
+            credentials: live_bad_signature_credentials,
+            query_token: Some(fixture.other_live_security_token),
+            signed_header_token: None,
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-signed-header-token-valid",
+            credentials: fixture.live_credentials,
+            query_token: None,
+            signed_header_token: Some(fixture.live_security_token),
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::AccessDenied,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-signed-header-overrides-query-mismatch",
+            credentials: fixture.live_credentials,
+            query_token: Some(fixture.other_live_security_token),
+            signed_header_token: Some(fixture.live_security_token),
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::AccessDenied,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-signed-header-mismatch-overrides-query-valid",
+            credentials: fixture.live_credentials,
+            query_token: Some(fixture.live_security_token),
+            signed_header_token: Some(fixture.other_live_security_token),
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label:
+                "s3-presigned-auth-live-signed-header-mismatch-overrides-query-valid-bad-signature",
+            credentials: live_bad_signature_credentials,
+            query_token: Some(fixture.live_security_token),
+            signed_header_token: Some(fixture.other_live_security_token),
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label:
+                "s3-presigned-auth-live-signed-header-valid-overrides-query-mismatch-bad-signature",
+            credentials: live_bad_signature_credentials,
+            query_token: Some(fixture.other_live_security_token),
+            signed_header_token: Some(fixture.live_security_token),
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::SignatureMismatch,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-unsigned-header-token-valid",
+            credentials: fixture.live_credentials,
+            query_token: None,
+            signed_header_token: None,
+            unsigned_header_token: Some(fixture.live_security_token),
+            expected: S3PresignedAuthExpected::HeadersNotSigned,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-query-valid-unsigned-header-mismatched",
+            credentials: fixture.live_credentials,
+            query_token: Some(fixture.live_security_token),
+            signed_header_token: None,
+            unsigned_header_token: Some(fixture.other_live_security_token),
+            expected: S3PresignedAuthExpected::HeadersNotSigned,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-query-mismatched-unsigned-header-valid",
+            credentials: fixture.live_credentials,
+            query_token: Some(fixture.other_live_security_token),
+            signed_header_token: None,
+            unsigned_header_token: Some(fixture.live_security_token),
+            expected: S3PresignedAuthExpected::HeadersNotSigned,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-unsigned-header-token-mismatched",
+            credentials: fixture.live_credentials,
+            query_token: None,
+            signed_header_token: None,
+            unsigned_header_token: Some(fixture.other_live_security_token),
+            expected: S3PresignedAuthExpected::HeadersNotSigned,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-signed-header-token-valid-bad-signature",
+            credentials: live_bad_signature_credentials,
+            query_token: None,
+            signed_header_token: Some(fixture.live_security_token),
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::SignatureMismatch,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-live-unsigned-header-token-valid-bad-signature",
+            credentials: live_bad_signature_credentials,
+            query_token: None,
+            signed_header_token: None,
+            unsigned_header_token: Some(fixture.live_security_token),
+            expected: S3PresignedAuthExpected::HeadersNotSigned,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-old-session-query-token-valid",
+            credentials: fixture.old_credentials,
+            query_token: Some(fixture.old_security_token),
+            signed_header_token: None,
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-old-session-query-token-valid-bad-signature",
+            credentials: old_bad_signature_credentials,
+            query_token: Some(fixture.old_security_token),
+            signed_header_token: None,
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-old-session-token-missing",
+            credentials: fixture.old_credentials,
+            query_token: None,
+            signed_header_token: None,
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-old-session-signed-header-token-valid",
+            credentials: fixture.old_credentials,
+            query_token: None,
+            signed_header_token: Some(fixture.old_security_token),
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+        S3PresignedProbe {
+            label: "s3-presigned-auth-old-session-signed-header-token-valid-bad-signature",
+            credentials: old_bad_signature_credentials,
+            query_token: None,
+            signed_header_token: Some(fixture.old_security_token),
+            unsigned_header_token: None,
+            expected: S3PresignedAuthExpected::InvalidAccessKey,
+        },
+    ];
+
+    for probe in probes {
+        let presigned = build_s3_root_presigned_request(
+            endpoint,
+            probe.credentials,
+            probe.query_token,
+            probe.signed_header_token,
+        );
+        let response =
+            fetch_s3_presigned_request(endpoint, &presigned, probe.unsigned_header_token);
+        let sensitive_tokens = [
+            probe.query_token,
+            probe.signed_header_token,
+            probe.unsigned_header_token,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        match probe.expected {
+            S3PresignedAuthExpected::AccessDenied => {
+                let assumed_role_arn = format!(
+                    "arn:aws:sts::{account_id}:assumed-role/{}/{}",
+                    fixture.live_role_name, fixture.live_role_session_name
+                );
+                assert_s3_list_buckets_access_denied(
+                    probe.label,
+                    &response,
+                    &assumed_role_arn,
+                    probe.credentials.access_key,
+                    &sensitive_tokens,
+                );
+            }
+            S3PresignedAuthExpected::HeadersNotSigned => assert_s3_headers_not_signed(
+                probe.label,
+                &response,
+                probe.credentials.access_key,
+                &sensitive_tokens,
+            ),
+            S3PresignedAuthExpected::InvalidAccessKey => assert_s3_invalid_access_key(
+                probe.label,
+                &response,
+                probe.credentials.access_key,
+                &sensitive_tokens,
+            ),
+            S3PresignedAuthExpected::SignatureMismatch => {
+                assert_s3_presigned_signature_mismatch(
+                    probe.label,
+                    &response,
+                    &presigned,
+                    probe.credentials,
+                    &sensitive_tokens,
+                );
+            }
         }
     }
 }
@@ -2003,6 +2508,19 @@ fn main() {
                 old_security_token: &deleted_security_token,
             },
         );
+        run_s3_presigned_session_authentication_probes(
+            &format!("https://s3.{region}.amazonaws.com/"),
+            &account_id,
+            S3PresignedSessionProbeSet {
+                live_credentials: recreated_credentials,
+                live_security_token: &recreated_security_token,
+                live_role_name: &recreated_role_name,
+                live_role_session_name: &recreated_role_session_name,
+                other_live_security_token: &other_live_security_token,
+                old_credentials: deleted_credentials,
+                old_security_token: &deleted_security_token,
+            },
+        );
         run_session_authentication_probes(
             &endpoint,
             &account_id,
@@ -2030,30 +2548,50 @@ mod tests {
     use s3_tests::RawResponse;
 
     #[test]
-    fn s3_response_sanitization_removes_literal_and_byte_encoded_credentials() {
+    fn s3_response_sanitization_removes_literal_and_encoded_credentials() {
         let access_key = "SESSIONACCESSKEY12345";
         let security_token = "opaque+session/token=value";
+        let other_security_token = "other+query/token=value";
+        let uri_encoded_token = auth::canonical::uri_encode(security_token);
+        let other_uri_encoded_token = auth::canonical::uri_encode(other_security_token);
         let response = RawResponse {
             status: 403,
             headers: Vec::new(),
             body: format!(
-                "{access_key}|{}|{security_token}|{}",
+                "{access_key}|{}|{security_token}|{}|{uri_encoded_token}|{}|\
+                 {other_security_token}|{}|{other_uri_encoded_token}|{}",
                 spaced_hex(access_key),
-                spaced_hex(security_token)
+                spaced_hex(security_token),
+                spaced_hex(&uri_encoded_token),
+                spaced_hex(other_security_token),
+                spaced_hex(&other_uri_encoded_token)
             ),
             body_read_error: None,
         };
 
-        let sanitized =
-            s3_response_with_sanitized_body(&response, access_key, Some(security_token));
+        let sanitized = s3_response_with_sanitized_body(
+            &response,
+            access_key,
+            &[security_token, other_security_token],
+        );
         assert!(!sanitized.body.contains(access_key));
         assert!(!sanitized.body.contains(&spaced_hex(access_key)));
         assert!(!sanitized.body.contains(security_token));
         assert!(!sanitized.body.contains(&spaced_hex(security_token)));
+        assert!(!sanitized.body.contains(&uri_encoded_token));
+        assert!(!sanitized.body.contains(&spaced_hex(&uri_encoded_token)));
+        assert!(!sanitized.body.contains(other_security_token));
+        assert!(!sanitized.body.contains(&spaced_hex(other_security_token)));
+        assert!(!sanitized.body.contains(&other_uri_encoded_token));
+        assert!(!sanitized
+            .body
+            .contains(&spaced_hex(&other_uri_encoded_token)));
         assert_eq!(
             sanitized.body,
             "SESSION_ACCESS_KEY|SESSION_ACCESS_KEY_BYTES|\
-             SESSION_TOKEN|SESSION_TOKEN_BYTES"
+             SESSION_TOKEN|SESSION_TOKEN_BYTES|SESSION_TOKEN_URI_ENCODED|\
+             SESSION_TOKEN_URI_ENCODED_BYTES|SESSION_TOKEN|SESSION_TOKEN_BYTES|\
+             SESSION_TOKEN_URI_ENCODED|SESSION_TOKEN_URI_ENCODED_BYTES"
         );
     }
 }

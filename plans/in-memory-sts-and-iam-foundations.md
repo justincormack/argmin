@@ -309,6 +309,9 @@ wire response for compatibility, which makes the error body sensitive even
 though the requesting client already possesses the token. Server tracing,
 panic diagnostics, and conformance-test failure output must therefore redact
 both the literal token and its byte-encoded form before recording the body.
+The presigned equivalent includes the URI-encoded token in the canonical query
+string and the hexadecimal bytes of that encoded form. Test sanitization must
+therefore cover literal, URI-encoded, and both byte-encoded representations.
 
 ### 3. Share identity state and token keys, not issued sessions
 
@@ -376,19 +379,35 @@ admission controls plus strict encoded-token and decoded-payload limits.
 Credential validation should have one common decision path used by header,
 presigned, POST Object, and streaming authentication:
 
-1. extract the access key ID and session-token input without logging either
-2. if the access key ID resolves to a stored long-lived credential, use the
+1. extract the access key ID, every mode-relevant session-token input, and the
+   signature coverage of each input without logging any of them
+2. apply mode-specific structural validation and deterministically select one
+   effective token input; represent the presented inputs and selected input as
+   distinct typed values so duplicate locations cannot be mistaken for an
+   ambiguous credential
+3. for presigned requests, reject a present but unsigned
+   `x-amz-security-token` as `HeadersNotSigned`; otherwise select a signed
+   header token when present, even when an `X-Amz-Security-Token` query value is
+   also present, and fall back to the query value only when no signed header
+   token is present
+4. if the access key ID resolves to a stored long-lived credential, use the
    static path and preserve AWS's post-signature unexpected-token behavior
-3. otherwise, require and AEAD-open exactly one correctly located session token
-4. validate the embedded access key ID against the SigV4 credential in constant
+5. otherwise, require and AEAD-open the selected effective session token
+6. validate the embedded access key ID against the SigV4 credential in constant
    time and check credential-domain binding
-5. check embedded expiry at the AWS-pinned boundary and resolve only the
+7. check embedded expiry at the AWS-pinned boundary and resolve only the
    embedded stable issuer-role ID, rejecting a deleted issuer as
    `InvalidClientTokenId`; both checks precede signature comparison, but their
    relative order remains unresolved
-6. verify SigV4 with the embedded secret access key
-7. return an immutable authenticated-session value containing the structured
+8. verify SigV4 with the embedded secret access key
+9. return an immutable authenticated-session value containing the structured
    token identity and session-policy context
+
+POST Object and streaming must plug their AWS-pinned selection rules into step
+2 rather than adding separate credential-validation pipelines. All presented
+token values, not only the selected one, remain sensitive diagnostic inputs:
+canonical-error construction and test failure sanitization must account for
+every location included in the request.
 
 Authentication must not resolve mutable trust or permission-policy state before
 signature verification. AWS probes do require one narrower mutable dependency:
@@ -749,8 +768,8 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The optional `AssumeRole` security-context parameters, S3 presigned/POST/
-streaming token matrices, expiry-versus-issuer-deletion precedence,
+The optional `AssumeRole` security-context parameters, S3 POST/streaming token
+matrices, expiry-versus-issuer-deletion precedence,
 trust/permission-policy mutation precedence, session-principal context, and
 `aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
 condition.
@@ -1012,8 +1031,46 @@ ARN, the old session also returns that same `InvalidAccessKeyId` golden for
 correct, missing, and mismatched tokens with both correct and bad signatures.
 The S3 header path therefore orders token/access-key binding and stable issuer
 liveness before signature comparison, but unlike STS renders those failures as
-`InvalidAccessKeyId`. This result is limited to header SigV4 until the
-presigned, POST Object, and streaming matrices are independently pinned.
+`InvalidAccessKeyId`. This result is limited to header SigV4 until the other
+authentication modes are independently pinned.
+
+The S3 SigV4 presigned-query slice completed on 2026-07-13 against the same
+live and invalidated sessions. A valid `X-Amz-Security-Token` query parameter
+reaches the same complete `AccessDenied` authorization response. Missing and
+independently valid but mismatched query tokens return the complete HTTP 403
+`InvalidAccessKeyId` golden before signature comparison, including when paired
+with a bad signature. A valid query token plus a bad signature reaches the
+complete `SignatureDoesNotMatch` response. The invalidated old session remains
+`InvalidAccessKeyId` with its correct query token and signature, with a bad
+signature, or with the token missing.
+
+A signed `x-amz-security-token` header is also accepted on a presigned request
+and takes precedence over `X-Amz-Security-Token` in the query string: a valid
+signed header overrides a mismatched query token, while a mismatched signed
+header overrides a valid query token. A present but unsigned
+`x-amz-security-token` header is not a credential fallback. AWS rejects it with
+the existing complete `HeadersNotSigned` `AccessDenied` golden before token or
+signature validation, whether the header token is valid or mismatched, whether
+the query token is valid or mismatched, and when the signature is bad.
+
+The same signed-header selection remains authoritative in signature
+collisions. With a bad signature, a valid signed header plus a mismatched query
+token reaches `SignatureDoesNotMatch`, while a mismatched signed header plus a
+valid query token returns `InvalidAccessKeyId`. An invalidated old session in a
+signed header also returns `InvalidAccessKeyId` before the bad signature is
+considered. Presigned location selection, selected-token binding, and stable
+issuer liveness therefore precede signature comparison.
+
+For presigned `SignatureDoesNotMatch`, the oracle validates the canonical query,
+canonical-request hash and byte list, string to sign and byte list, credential
+scope, and echoed signature. AWS XML-escapes the literal query separators to
+`&amp;` inside the `CanonicalRequest` element, while
+`CanonicalRequestBytes` and the canonical-request hash are calculated from the
+unescaped `&` bytes. Exact golden diagnostics sanitize the raw token, its
+URI-encoded form, and the byte encodings of both for every presented token, not
+only the selected header token. The dual-location bad-signature golden exercises
+both token values in one canonical request. POST Object and streaming token
+matrices remain independently unpinned.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations
@@ -1258,9 +1315,9 @@ confidentiality. No session response or request body may appear in traces.
    bucket-policy code less explicit?
 4. What is the exact AWS precedence among wrong token, missing token, bad
    signature, wrong region/service, disabled credential, and expired session on
-   presigned, POST Object, and streaming modes? The core header-token/signature
-   collisions are pinned; its remaining region/service/expiry collisions are
-   not.
+   POST Object and streaming modes? The core header and presigned
+   token/signature collisions are pinned; their remaining
+   region/service/expiry collisions are not.
 5. What total Query body and member limits does live STS enforce for the first
    supported parameter set?
 6. Should the first standalone UAT role be injected through a dedicated
