@@ -18,19 +18,23 @@ temporary-credential work rather than this plan.
 
 ## Work
 
-### 1. Validate header SigV4 alternatives
+### 1. Validate header SigV4 alternatives — completed 2026-07-13
 
-- Probe AWS with `x-amz-content-sha256` present but omitted from
-  `SignedHeaders`, for both a hashed payload and `UNSIGNED-PAYLOAD`.
-- Probe AWS with ISO-8601 basic `Date`-only signing, both date headers agreeing,
-  and both date headers disagreeing.
-- Include ordinary and `aws-chunked` requests. Use one selected signing
-  timestamp for skew validation, the seed signature, and every chunk and trailer
-  signature; do not allow those paths to select timestamps independently.
-- Record the AWS outcomes before deciding whether the apparent local rejection
-  paths are conformance defects.
-- Add matching local integration tests and change header verification only to
-  the extent required by the observed AWS behavior.
+Live AWS returned success for all of the following, now pinned by matching local
+integration tests:
+
+- `x-amz-content-sha256` present but omitted from `SignedHeaders`, with both a
+  hashed payload and `UNSIGNED-PAYLOAD`
+- a transmitted unsigned `x-amz-content-sha256` value that differs from the
+  signed canonical payload hash returns `SignatureDoesNotMatch` and creates no
+  object
+- ISO-8601 basic `Date`-only signing
+- agreeing `Date` and `x-amz-date` values
+- disagreeing date headers, with `x-amz-date` taking precedence
+- Date-only `aws-chunked` payload and signed-trailer requests
+
+Header verification now matches those results. One selected signing timestamp
+drives skew validation, the seed signature, and chunk/trailer verification.
 
 ### 2. Pin authentication ambiguity and parser grammar
 

@@ -114,6 +114,7 @@ where
     }
     headers.visit(|name, _| {
         if name.starts_with("x-amz-")
+            && name != "x-amz-content-sha256"
             && !signed_headers
                 .iter()
                 .any(|signed_header| signed_header.as_ref() == name)
@@ -142,6 +143,12 @@ pub fn derive_signing_key(
     hmac_sha256(k_service.as_ref(), b"aws4_request")
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HeaderSigningTimestamp<'a> {
+    pub header_name: &'static str,
+    pub value: &'a str,
+}
+
 pub(crate) struct VerifyRequestRecordInput<'a, H: HeaderSource + ?Sized> {
     pub method: &'a str,
     pub uri: &'a str,
@@ -149,6 +156,7 @@ pub(crate) struct VerifyRequestRecordInput<'a, H: HeaderSource + ?Sized> {
     pub headers: &'a H,
     pub body_hash: &'a str,
     pub auth: &'a SigV4Auth,
+    pub timestamp: Option<HeaderSigningTimestamp<'a>>,
     pub now_epoch_secs: u64,
 }
 
@@ -163,6 +171,7 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
         headers,
         body_hash,
         auth,
+        timestamp,
         now_epoch_secs,
     } = input;
 
@@ -194,8 +203,10 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
         }
     }
 
-    // AWS requires Host and all x-amz-* headers to be signed (security:
-    // prevents injection of request-routing and S3 control headers).
+    // AWS requires Host and all x-amz-* headers except
+    // x-amz-content-sha256 to be signed. S3 consumes x-amz-content-sha256 as
+    // the canonical request's payload hash even when it is omitted from
+    // SignedHeaders.
     let unsigned_headers = unsigned_required_headers(&auth.signed_headers, headers);
     if !unsigned_headers.is_empty() {
         return Err(AuthError::UnsignedHeaders {
@@ -217,13 +228,19 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
     );
     let creq_hash = sha256_hex(creq.as_bytes());
 
-    // Find the x-amz-date header for the timestamp
-    let timestamp = headers
-        .first_value("x-amz-date")
-        .ok_or(AuthError::MissingSignedHeader {
-            header: "x-amz-date".to_string(),
-        })?;
-    if !amz_date_matches_date_stamp(timestamp, &auth.credential.date) {
+    let timestamp = timestamp.ok_or(AuthError::MissingSignedHeader {
+        header: "x-amz-date".to_string(),
+    })?;
+    if !auth
+        .signed_headers
+        .iter()
+        .any(|signed_header| signed_header == timestamp.header_name)
+    {
+        return Err(AuthError::UnsignedHeaders {
+            headers: vec![timestamp.header_name.to_string()],
+        });
+    }
+    if !amz_date_matches_date_stamp(timestamp.value, &auth.credential.date) {
         return Err(AuthError::MalformedAuth);
     }
 
@@ -232,7 +249,7 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
         auth.credential.date, auth.credential.region, auth.credential.service
     );
 
-    let sts = string_to_sign(timestamp, &scope, &creq_hash);
+    let sts = string_to_sign(timestamp.value, &scope, &creq_hash);
 
     // Derive signing key and compute expected signature
     let signing_key = derive_signing_key(

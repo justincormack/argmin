@@ -179,6 +179,14 @@ struct StreamingSignRequest<'a> {
 
 impl StreamingSigner<'_> {
     fn sign(&self, request: &StreamingSignRequest<'_>) -> SignResult {
+        self.sign_with_timestamp_header(request, "x-amz-date")
+    }
+
+    fn sign_with_timestamp_header(
+        &self,
+        request: &StreamingSignRequest<'_>,
+        timestamp_header: &'static str,
+    ) -> SignResult {
         let (date_long, date_short) = now_parts();
         let service = "s3";
 
@@ -189,7 +197,7 @@ impl StreamingSigner<'_> {
             ("content-encoding", request.content_encoding.to_string()),
             ("host", host_val.to_string()),
             ("x-amz-content-sha256", request.content_sha256.to_string()),
-            ("x-amz-date", date_long.clone()),
+            (timestamp_header, date_long.clone()),
             (
                 "x-amz-decoded-content-length",
                 request.decoded_content_length.to_string(),
@@ -913,6 +921,62 @@ fn test_signed_chunked_put() {
 }
 
 #[test]
+fn test_signed_chunked_put_with_date_header() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "signed-chunked-date-header";
+        let data = b"signed chunks using Date";
+        let path = format!("/{bucket}/{key}");
+        let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+        let request = StreamingSignRequest {
+            method: "PUT",
+            path: &path,
+            content_sha256,
+            decoded_content_length: data.len(),
+            content_encoding: "aws-chunked",
+            extra_signed_headers: &[],
+        };
+        let sign = ctx_streaming_signer().sign_with_timestamp_header(&request, "date");
+        let wire = build_signed_chunked_body(&sign, data);
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut response = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("Date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
+            .send(&wire[..])
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let response_body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(
+            status, 200,
+            "Date-only signed chunked PUT failed: {response_body}"
+        );
+
+        let stored = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(stored.as_ref(), data);
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_signed_chunked_put_with_gzip_content_encoding() {
     s3_tests::run(async {
         let ctx = chunked_put_context_for_content_encoding_case().await;
@@ -1573,6 +1637,78 @@ fn test_signed_chunked_trailing_checksum() {
         );
 
         cleanup(&bucket, &["signed-trailer-cksum"]).await;
+    });
+}
+
+#[test]
+fn test_signed_chunked_trailing_checksum_with_date_header() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "signed-trailer-date-header";
+        let data = b"signed chunks and trailer using Date";
+        let path = format!("/{bucket}/{key}");
+        let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+
+        let crc = checksum::crc32::checksum(data);
+        use base64::Engine;
+        let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+        let request = StreamingSignRequest {
+            method: "PUT",
+            path: &path,
+            content_sha256,
+            decoded_content_length: data.len(),
+            content_encoding: "aws-chunked",
+            extra_signed_headers: &[("x-amz-trailer", "x-amz-checksum-crc32")],
+        };
+        let sign = ctx_streaming_signer().sign_with_timestamp_header(&request, "date");
+        let terminal_signature = terminal_sig_for_single_chunk(&sign, data);
+        let canonical_trailers = format!("x-amz-checksum-crc32:{crc_b64}\n");
+        let signed_trailer = trailer_signature(
+            &sign.signing_key,
+            &sign.timestamp,
+            &sign.scope,
+            &terminal_signature,
+            &canonical_trailers,
+        );
+        let trailer_header = format!("x-amz-checksum-crc32:{crc_b64}");
+        let wire =
+            build_signed_chunked_body_with_trailer(&sign, data, &trailer_header, &signed_trailer);
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut response = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("Date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
+            .header("x-amz-trailer", "x-amz-checksum-crc32")
+            .send(&wire[..])
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let response_body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(
+            status, 200,
+            "Date-only signed chunked trailer PUT failed: {response_body}"
+        );
+
+        let stored = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(stored.as_ref(), data);
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 

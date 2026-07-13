@@ -5,6 +5,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use base64::Engine;
 use ring::{digest, hmac};
 use s3_tests::{
+    assert_s3_err_code,
     shape::{assert_shape, error_response_headers, expected_error, shape},
     unique_account_regional_bucket, unique_bucket, SignedRequestCredentials, CTX,
 };
@@ -122,6 +123,19 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+fn amz_date_at(secs: u64) -> String {
+    let days = secs / 86400;
+    let (year, month, day) = days_to_ymd(days);
+    let time_of_day = secs % 86400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        year, month, day, hour, minute, second
+    )
+}
+
 fn current_http_date() -> String {
     const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     const MONTHS: [&str; 12] = [
@@ -182,7 +196,8 @@ struct Signer {
     region: String,
     service: String,
     body_hash: Option<String>,
-    include_content_sha256: bool,
+    sign_content_sha256: bool,
+    timestamp_header: &'static str,
     extra_headers: Vec<(String, String)>,
     timestamp: Option<u64>,
 }
@@ -198,7 +213,8 @@ impl Signer {
             region: CTX.region().to_string(),
             service: "s3".to_string(),
             body_hash: None,
-            include_content_sha256: true,
+            sign_content_sha256: true,
+            timestamp_header: "x-amz-date",
             extra_headers: Vec::new(),
             timestamp: None,
         }
@@ -235,7 +251,17 @@ impl Signer {
     }
 
     fn omit_content_sha256_header(mut self) -> Self {
-        self.include_content_sha256 = false;
+        self.sign_content_sha256 = false;
+        self
+    }
+
+    fn omit_content_sha256_from_signed_headers(mut self) -> Self {
+        self.sign_content_sha256 = false;
+        self
+    }
+
+    fn use_date_header(mut self) -> Self {
+        self.timestamp_header = "date";
         self
     }
 
@@ -257,16 +283,7 @@ impl Signer {
                 .unwrap()
                 .as_secs()
         });
-        let days = secs / 86400;
-        let (year, month, day) = days_to_ymd(days);
-        let time_of_day = secs % 86400;
-        let hour = time_of_day / 3600;
-        let minute = (time_of_day % 3600) / 60;
-        let second = time_of_day % 60;
-        let date_long = format!(
-            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-            year, month, day, hour, minute, second
-        );
+        let date_long = amz_date_at(secs);
         let date_short = &date_long[..8];
 
         let content_sha256 = self.body_hash.unwrap_or_else(|| sha256_hex(b""));
@@ -274,9 +291,9 @@ impl Signer {
         let host_val = host();
         let mut headers = vec![
             ("host".to_string(), host_val.to_string()),
-            ("x-amz-date".to_string(), date_long.clone()),
+            (self.timestamp_header.to_string(), date_long.clone()),
         ];
-        if self.include_content_sha256 {
+        if self.sign_content_sha256 {
             headers.push(("x-amz-content-sha256".to_string(), content_sha256.clone()));
         }
         headers.extend(self.extra_headers);
@@ -833,6 +850,96 @@ fn test_put_missing_content_sha256_header_rejected() {
 }
 
 #[test]
+fn test_put_content_sha256_header_need_not_be_signed() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+
+        for (key, body, payload_hash) in [
+            (
+                "unsigned-content-sha256-header-hashed-payload",
+                b"hashed payload with unsigned hash header".as_slice(),
+                sha256_hex(b"hashed payload with unsigned hash header"),
+            ),
+            (
+                "unsigned-content-sha256-header-unsigned-payload",
+                b"unsigned payload with unsigned hash header".as_slice(),
+                "UNSIGNED-PAYLOAD".to_string(),
+            ),
+        ] {
+            let path = format!("/{bucket}/{key}");
+            let signed = Signer::new("PUT", &path)
+                .body_hash(&payload_hash)
+                .omit_content_sha256_from_signed_headers()
+                .sign();
+            let url = format!("{}{}", CTX.endpoint(), path);
+            let mut response = agent()
+                .put(&url)
+                .header("Authorization", &signed.authorization)
+                .header("x-amz-date", &signed.amz_date)
+                .header("x-amz-content-sha256", &signed.amz_content_sha256)
+                .send(body)
+                .expect("transport error");
+            let status = response.status().as_u16();
+            let response_body = response.body_mut().read_to_string().unwrap_or_default();
+            assert_eq!(
+                status, 200,
+                "unsigned x-amz-content-sha256 case {key} failed: {response_body}"
+            );
+        }
+
+        cleanup(
+            &bucket,
+            &[
+                "unsigned-content-sha256-header-hashed-payload",
+                "unsigned-content-sha256-header-unsigned-payload",
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_unsigned_content_sha256_header_still_binds_canonical_payload_hash() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "unsigned-content-sha256-header-mismatch";
+        let path = format!("/{bucket}/{key}");
+        let body = b"payload matching the transmitted hash";
+        let signed_payload_hash = sha256_hex(b"different payload used while signing");
+        let transmitted_payload_hash = sha256_hex(body);
+        assert_ne!(signed_payload_hash, transmitted_payload_hash);
+
+        let signed = Signer::new("PUT", &path)
+            .body_hash(&signed_payload_hash)
+            .omit_content_sha256_from_signed_headers()
+            .sign();
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut response = agent()
+            .put(&url)
+            .header("Authorization", &signed.authorization)
+            .header("x-amz-date", &signed.amz_date)
+            .header("x-amz-content-sha256", &transmitted_payload_hash)
+            .send(body.as_slice())
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let response_body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 403, "expected 403, got {status}: {response_body}");
+        assert_error_code(&response_body, "SignatureDoesNotMatch");
+
+        let get_result = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_s3_err_code(&get_result, "NoSuchKey");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_upload_part_missing_content_sha256_header_rejected() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -982,6 +1089,81 @@ fn test_get_invalid_response_override_headers_sanitized_or_ignored() {
 }
 
 // ── Group 4: Date Header ────────────────────────────────────────────────
+
+#[test]
+fn test_put_sigv4_date_header_alternatives() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let signing_timestamp = amz_date_at(now);
+
+        for (key, signer, date_header, send_amz_date) in [
+            (
+                "date-only",
+                Signer::new("PUT", &format!("/{bucket}/date-only"))
+                    .body_hash(&sha256_hex(b"date only"))
+                    .at_time(now)
+                    .use_date_header(),
+                signing_timestamp.as_str(),
+                false,
+            ),
+            (
+                "both-dates-agree",
+                Signer::new("PUT", &format!("/{bucket}/both-dates-agree"))
+                    .body_hash(&sha256_hex(b"both dates agree"))
+                    .at_time(now)
+                    .header("date", &signing_timestamp),
+                signing_timestamp.as_str(),
+                true,
+            ),
+            (
+                "x-amz-date-precedes-date",
+                Signer::new("PUT", &format!("/{bucket}/x-amz-date-precedes-date"))
+                    .body_hash(&sha256_hex(b"x-amz-date precedes date"))
+                    .at_time(now)
+                    .header("date", "20000101T000000Z"),
+                "20000101T000000Z",
+                true,
+            ),
+        ] {
+            let body: &[u8] = match key {
+                "date-only" => b"date only",
+                "both-dates-agree" => b"both dates agree",
+                "x-amz-date-precedes-date" => b"x-amz-date precedes date",
+                _ => unreachable!(),
+            };
+            let path = format!("/{bucket}/{key}");
+            let signed = signer.sign();
+            let url = format!("{}{}", CTX.endpoint(), path);
+            let request = agent()
+                .put(&url)
+                .header("Authorization", &signed.authorization)
+                .header("Date", date_header)
+                .header("x-amz-content-sha256", &signed.amz_content_sha256);
+            let mut response = if send_amz_date {
+                request.header("x-amz-date", &signed.amz_date).send(body)
+            } else {
+                request.send(body)
+            }
+            .expect("transport error");
+            let status = response.status().as_u16();
+            let response_body = response.body_mut().read_to_string().unwrap_or_default();
+            assert_eq!(
+                status, 200,
+                "SigV4 date-header case {key} failed: {response_body}"
+            );
+        }
+
+        cleanup(
+            &bucket,
+            &["date-only", "both-dates-agree", "x-amz-date-precedes-date"],
+        )
+        .await;
+    });
+}
 
 #[test]
 fn test_put_date_skew_past() {

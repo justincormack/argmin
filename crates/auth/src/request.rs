@@ -13,7 +13,7 @@ use crate::encoding::{hex_encode_lower, percent_decode_lossy};
 use crate::error::AuthError;
 use crate::sigv4::{
     derive_signing_key, parse_auth_header, unsigned_required_headers, verify_request_record,
-    VerifyRequestRecordInput,
+    HeaderSigningTimestamp, VerifyRequestRecordInput,
 };
 use crate::{
     MAX_AUTHORIZATION_HEADER_LEN, MAX_PRESIGNED_QUERY_LEN, MAX_SIGNED_HEADERS_LEN,
@@ -320,7 +320,26 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
     {
         return Err(AuthError::MalformedAuth);
     }
-    let request_epoch_secs = headers.first_value("x-amz-date").and_then(parse_amz_date);
+    // S3 uses x-amz-date when present and otherwise permits an ISO-8601 basic
+    // Date header. Keep this single selection for skew validation, seed
+    // signature verification, and aws-chunked chunk/trailer verification.
+    let selected_timestamp = headers
+        .first_value("x-amz-date")
+        .map(|value| HeaderSigningTimestamp {
+            header_name: "x-amz-date",
+            value,
+        })
+        .or_else(|| {
+            headers
+                .first_value("date")
+                .map(|value| HeaderSigningTimestamp {
+                    header_name: "date",
+                    value,
+                })
+        });
+    let request_epoch_secs = selected_timestamp
+        .map(|timestamp| timestamp.value)
+        .and_then(parse_amz_date);
     if request_epoch_secs.is_some_and(|request_epoch| {
         now_epoch_secs.abs_diff(request_epoch) > crate::SIGV4_CLOCK_SKEW_SECS
     }) {
@@ -339,6 +358,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
             headers,
             body_hash: body_hash.as_ref(),
             auth: &parsed,
+            timestamp: selected_timestamp,
             now_epoch_secs,
         },
         store,
@@ -354,7 +374,10 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
 
     // Build streaming signing context for STREAMING-AWS4-HMAC-SHA256-* requests.
     let streaming = if body_hash.as_ref().starts_with("STREAMING-AWS4-HMAC-SHA256") {
-        let timestamp = headers.first_value("x-amz-date").unwrap_or("").to_owned();
+        let timestamp = selected_timestamp
+            .map(|timestamp| timestamp.value)
+            .expect("successful header SigV4 verification selected a timestamp")
+            .to_owned();
         let scope = format!(
             "{}/{}/{}/aws4_request",
             credential.date, credential.region, credential.service
@@ -595,12 +618,7 @@ where
     H: HeaderSource + ?Sized,
     S: AsRef<str>,
 {
-    let mut unsigned_headers = unsigned_required_headers(signed_headers, headers);
-    // AWS treats an unsigned x-amz-content-sha256 on presigned URLs as part of
-    // signature verification, producing SignatureDoesNotMatch rather than
-    // HeadersNotSigned. Other unsigned x-amz-* headers are rejected directly.
-    unsigned_headers.retain(|header| header != "x-amz-content-sha256");
-    unsigned_headers
+    unsigned_required_headers(signed_headers, headers)
 }
 
 fn collect_signed_headers<'a, H, S>(
