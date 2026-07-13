@@ -608,8 +608,9 @@ cleanup pass for leftover test buckets.
 
 It currently:
 
-- removes leaked `/argmin-sts-oracle/same-account/path-shape-*` IAM roles after
-  a one-hour safety window, so it does not race an active oracle run
+- removes leaked, name-checked IAM roles under the same-account, cross-account,
+  and caller-denied `/argmin-sts-oracle/` fixture paths after a one-hour safety
+  window, so it does not race an active oracle run
 - lists buckets with names starting `claude-s3-`
 - removes object versions and delete markers
 - attempts to disable legal holds and bypass governance retention

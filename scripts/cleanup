@@ -111,7 +111,13 @@ cleanup_stale_sts_oracle_roles() {
     return
   fi
   jq -r \
-    '.Roles[] | select(.Path == "/argmin-sts-oracle/same-account/") | select(.RoleName | startswith("path-shape-")) | @base64' \
+    '.Roles[] | select(
+        (.Path == "/argmin-sts-oracle/same-account/" and (.RoleName | startswith("path-shape-"))) or
+        (.Path == "/argmin-sts-oracle/cross-account/" and
+            ((.RoleName | startswith("cross-success-")) or
+             (.RoleName | startswith("cross-trust-denied-")))) or
+        (.Path == "/argmin-sts-oracle/caller-denied/" and (.RoleName | startswith("cross-caller-denied-")))
+    ) | @base64' \
     "$roles_file" > "$roles_rows"
 
   role_count=$(grep -c . "$roles_rows" 2>/dev/null || true)
@@ -125,8 +131,13 @@ cleanup_stale_sts_oracle_roles() {
     role_path=$(jq -er '.Path' <<<"$role")
     created_at=$(jq -er '.CreateDate' <<<"$role")
 
-    [[ "$role_path" == "/argmin-sts-oracle/same-account/" ]] || continue
-    [[ "$role_name" == path-shape-* ]] || continue
+    case "$role_path:$role_name" in
+      /argmin-sts-oracle/same-account/:path-shape-* | \
+        /argmin-sts-oracle/cross-account/:cross-success-* | \
+        /argmin-sts-oracle/cross-account/:cross-trust-denied-* | \
+        /argmin-sts-oracle/caller-denied/:cross-caller-denied-*) ;;
+      *) continue ;;
+    esac
     created_epoch=$(date -d "$created_at" +%s)
     age_seconds=$((now_epoch - created_epoch))
     if ((age_seconds < sts_role_min_age_seconds)); then

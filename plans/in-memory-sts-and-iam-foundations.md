@@ -720,10 +720,9 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The cross-account role fixture, broader `AssumeRole` parameter and error
-matrix, role mutation precedence, session-principal context, and
-`aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
-condition.
+The broader `AssumeRole` parameter and error matrix, role mutation precedence,
+session-principal context, and `aws:TokenIssueTime` behavior remain before
+Phase 0 can satisfy its exit condition.
 
 The role-fixture capability will use the ordinary primary and alternate test
 users, not the owner/root credential. The shared test-user policy grants only
@@ -788,9 +787,45 @@ cleanup run from deleting another concurrently active oracle fixture. IAM
 discovery failure is reported and makes the command exit unsuccessfully after
 the existing bucket cleanup has still run; it cannot disable bucket recovery.
 
-The cross-account fixture remains pending until an administrator of the
-alternate account applies the same test-user policy there. The primary-account
-owner credential cannot and must not be used as a substitute.
+The cross-account role-fixture slice completed on 2026-07-13. The alternate
+account's administrator applied the same test-user policy there; the
+primary-account owner credential was not used as a substitute.
+
+`./scripts/aws-sts-oracle --cross-account` creates three unique,
+permissionless roles in the primary account and independently proved against
+AWS that:
+
+- caller identity policy `allowed` plus trust allow produces success
+- caller identity policy `allowed` plus trust omission produces trust denial
+- caller identity policy `implicitDeny` plus trust allow produces caller-policy
+  denial
+
+The success and trust-denial roles use `/argmin-sts-oracle/cross-account/`,
+while the caller-denial role uses `/argmin-sts-oracle/caller-denied/`, outside
+the caller's identity-policy resource grant. Every created role is registered
+for cleanup only after `CreateRole` succeeds, and periodic cleanup recognizes
+the new path/name pairs with the same one-hour age floor.
+
+Each negative probe has an exact-target positive STS convergence control. The
+trust-denial role initially trusts the alternate user, is successfully assumed
+by that user, and only then has its trust replaced with the primary user; the
+fixture waits for the alternate request to transition to `AccessDenied` before
+running the golden probe. The caller-policy-denial role directly trusts both
+users. IAM simulation proves that the primary user also has `implicitDeny` for
+that exact role, after which a successful primary-user assumption proves the
+role is visible and usable through STS solely through same-account direct
+trust. The alternate user's separately simulated `implicitDeny` can therefore
+be tested against an already converged target that explicitly trusts it.
+
+Both denial paths return HTTP 403, the STS 2011 XML namespace,
+`AccessDenied`, and the same exact message shape naming the alternate IAM user
+and target role ARN. This means the wire response alone does not identify
+whether caller identity policy or role trust caused the denial. Cross-account
+success has the same exact golden XML and semantic header shape as the
+same-account success: the assumed-role ARN omits the IAM role path,
+`PackedPolicySize` is absent when no session policy is supplied, and only the
+credential values, role unique ID, expiration, and request IDs require
+normalization.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations

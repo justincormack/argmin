@@ -19,9 +19,18 @@ const AWS_FAULT_XMLNS: &str = "http://webservices.amazon.com/AWSFault/2005-15-09
 #[derive(Clone, Copy)]
 enum Expected<'a> {
     Success,
-    Error { code: &'a str, message: &'a str },
-    StsError { code: &'a str, message: &'a str },
-    Redirect { location: &'a str },
+    Error {
+        code: &'a str,
+        message: &'a str,
+    },
+    StsError {
+        status: u16,
+        code: &'a str,
+        message: &'a str,
+    },
+    Redirect {
+        location: &'a str,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -116,10 +125,14 @@ fn assert_probe(probe: &Probe<'_>, response: &RawResponse, account_id: &str) {
             );
         }
         Expected::Error { code, message } => {
-            assert_error_probe(probe.label, response, AWS_FAULT_XMLNS, code, message);
+            assert_error_probe(probe.label, response, 400, AWS_FAULT_XMLNS, code, message);
         }
-        Expected::StsError { code, message } => {
-            assert_error_probe(probe.label, response, STS_XMLNS, code, message);
+        Expected::StsError {
+            status,
+            code,
+            message,
+        } => {
+            assert_error_probe(probe.label, response, status, STS_XMLNS, code, message);
         }
         Expected::Redirect { location } => {
             assert_shape(
@@ -137,6 +150,7 @@ fn assert_probe(probe: &Probe<'_>, response: &RawResponse, account_id: &str) {
 fn assert_error_probe(
     label: &str,
     response: &RawResponse,
+    status: u16,
     namespace: &str,
     code: &str,
     message: &str,
@@ -145,7 +159,7 @@ fn assert_error_probe(
         label,
         response,
         &sts_wire_shape(label, response)
-            .status(400)
+            .status(status)
             .header("content-type", "text/xml")
             .body(format!(
                 "<ErrorResponse xmlns=\"{namespace}\">\n  <Error>\n    \
@@ -292,6 +306,7 @@ fn run_assume_role_probes(
             content_type: Some(QUERY_CONTENT_TYPE),
         },
         expected: Expected::StsError {
+            status: 400,
             code: "ValidationError",
             message: "1 validation error detected: Value null at 'roleArn' failed to satisfy constraint: Member must not be null",
         },
@@ -312,6 +327,7 @@ fn run_assume_role_probes(
             content_type: Some(QUERY_CONTENT_TYPE),
         },
         expected: Expected::StsError {
+            status: 400,
             code: "ValidationError",
             message: "1 validation error detected: Value null at 'roleSessionName' failed to satisfy constraint: Member must not be null",
         },
@@ -339,6 +355,96 @@ fn run_assume_role_probes(
         role_session_name,
     );
     println!("assume-role-path-bearing-role: ok");
+}
+
+fn assert_cross_account_denied(
+    label: &str,
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    target_account_id: &str,
+    caller_arn: &str,
+    role_arn: &str,
+    role_session_name: &str,
+) {
+    let body = form_body(&[
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleArn", role_arn),
+        ("RoleSessionName", role_session_name),
+    ]);
+    let message = format!(
+        "User: {caller_arn} is not authorized to perform: sts:AssumeRole on resource: {role_arn}"
+    );
+    let probe = Probe {
+        label,
+        request: QueryRequest::Post {
+            body: &body,
+            content_type: Some(QUERY_CONTENT_TYPE),
+        },
+        expected: Expected::StsError {
+            status: 403,
+            code: "AccessDenied",
+            message: &message,
+        },
+    };
+    let response = probe.request.send(endpoint, credentials);
+    assert_probe(&probe, &response, target_account_id);
+    println!("{}: ok", probe.label);
+}
+
+struct CrossAccountProbeSet<'a> {
+    caller_arn: &'a str,
+    role_session_name: &'a str,
+    success_role_name: &'a str,
+    success_role_arn: &'a str,
+    trust_denied_role_arn: &'a str,
+    caller_denied_role_arn: &'a str,
+}
+
+fn run_cross_account_probes(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    target_account_id: &str,
+    fixture: CrossAccountProbeSet<'_>,
+) {
+    assert_cross_account_denied(
+        "assume-role-cross-account-trust-denied",
+        endpoint,
+        credentials,
+        target_account_id,
+        fixture.caller_arn,
+        fixture.trust_denied_role_arn,
+        fixture.role_session_name,
+    );
+    assert_cross_account_denied(
+        "assume-role-cross-account-caller-policy-denied",
+        endpoint,
+        credentials,
+        target_account_id,
+        fixture.caller_arn,
+        fixture.caller_denied_role_arn,
+        fixture.role_session_name,
+    );
+
+    let body = form_body(&[
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleArn", fixture.success_role_arn),
+        ("RoleSessionName", fixture.role_session_name),
+    ]);
+    let response = QueryRequest::Post {
+        body: &body,
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send(endpoint, credentials);
+    assert_assume_role_success(
+        "assume-role-cross-account-success",
+        &response,
+        target_account_id,
+        fixture.success_role_name,
+        fixture.role_session_name,
+    );
+    println!("assume-role-cross-account-success: ok");
 }
 
 fn main() {
@@ -527,6 +633,35 @@ fn main() {
             &role_arn,
             &role_name,
             &role_session_name,
+        );
+    }
+
+    if let Ok(success_role_arn) = env::var("S3_TEST_STS_CROSS_SUCCESS_ROLE_ARN") {
+        let alt_access_key = required_env("S3_TEST_STS_ALT_ACCESS_KEY");
+        let alt_secret_key = required_env("S3_TEST_STS_ALT_SECRET_KEY");
+        let alt_credentials = SignedRequestCredentials {
+            access_key: &alt_access_key,
+            secret_key: &alt_secret_key,
+            region: &region,
+            tls_ca_pem: None,
+        };
+        let caller_arn = required_env("S3_TEST_STS_ALT_ARN");
+        let role_session_name = required_env("S3_TEST_STS_CROSS_SESSION_NAME");
+        let success_role_name = required_env("S3_TEST_STS_CROSS_SUCCESS_ROLE_NAME");
+        let trust_denied_role_arn = required_env("S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_ARN");
+        let caller_denied_role_arn = required_env("S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_ARN");
+        run_cross_account_probes(
+            &endpoint,
+            alt_credentials,
+            &account_id,
+            CrossAccountProbeSet {
+                caller_arn: &caller_arn,
+                role_session_name: &role_session_name,
+                success_role_name: &success_role_name,
+                success_role_arn: &success_role_arn,
+                trust_denied_role_arn: &trust_denied_role_arn,
+                caller_denied_role_arn: &caller_denied_role_arn,
+            },
         );
     }
 }
