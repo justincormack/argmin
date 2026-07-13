@@ -302,6 +302,14 @@ logs, errors, traces, status, and panic diagnostics. The raw presented token
 should live only in an explicitly redacted request value and be replaced by a
 decoded typed credential after successful AEAD opening.
 
+AWS S3's header-auth `SignatureDoesNotMatch` response includes the raw signed
+`x-amz-security-token` inside `CanonicalRequest` and includes its hexadecimal
+bytes inside `CanonicalRequestBytes`. Argmin must reproduce that client-visible
+wire response for compatibility, which makes the error body sensitive even
+though the requesting client already possesses the token. Server tracing,
+panic diagnostics, and conformance-test failure output must therefore redact
+both the literal token and its byte-encoded form before recording the body.
+
 ### 3. Share identity state and token keys, not issued sessions
 
 All frontend workers in a process should hold the same provider handle. The
@@ -411,6 +419,13 @@ already says expired temporary credentials win over signature mismatch, while
 unexpected token input on a static credential is checked after signature
 comparison. Add committed regressions for all paths once real temporary
 credentials exist.
+
+Do not conflate the service-facing error mapping with the shared internal
+credential-validation decision. The AWS STS Query endpoint maps missing,
+mismatched, or invalidated session credentials to `InvalidClientTokenId`; the
+S3 SigV4 header path maps the equivalent observed cases to
+`InvalidAccessKeyId`. Both can consume one typed invalid-credential result while
+rendering the AWS-pinned service-specific response.
 
 A stateless verifier cannot recover expiry or identity when the token is
 missing. Phase 0 must pin AWS's missing-token precedence. If Argmin needs to
@@ -734,10 +749,11 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The optional `AssumeRole` security-context parameters, S3 signing-mode token
-matrices, expiry-versus-issuer-deletion precedence, trust/permission-policy
-mutation precedence, session-principal context, and `aws:TokenIssueTime`
-behavior remain before Phase 0 can satisfy its exit condition.
+The optional `AssumeRole` security-context parameters, S3 presigned/POST/
+streaming token matrices, expiry-versus-issuer-deletion precedence,
+trust/permission-policy mutation precedence, session-principal context, and
+`aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
+condition.
 
 The role-fixture capability will use the ordinary primary and alternate test
 users, not the owner/root credential. The shared test-user policy grants only
@@ -978,6 +994,26 @@ are credential-validity checks before SigV4 comparison; mutable trust and
 permission policies remain authorization inputs rather than authentication
 inputs. Expiry-versus-issuer-deletion precedence is not established by this
 matrix and remains an explicit Phase 0 question.
+
+The S3 SigV4 header-authentication slice completed on 2026-07-13 using the
+permissionless recreated-role session as its positive authentication control.
+The correct access key, token, and signature reach S3 authorization and return
+the complete `AccessDenied` golden for `s3:ListAllMyBuckets`, including the new
+incarnation's assumed-role ARN. A correct token plus a bad signature instead
+returns the complete S3 `SignatureDoesNotMatch` response. The oracle validates
+the credential scope, canonical request, canonical-request hash, string to sign,
+both byte encodings, and exact XML element order before comparing a sanitized
+golden.
+
+For the live session access key, a missing token or an independently valid but
+mismatched session token returns HTTP 403 `InvalidAccessKeyId`, including when
+combined with a bad signature. After deleting and recreating the identical role
+ARN, the old session also returns that same `InvalidAccessKeyId` golden for
+correct, missing, and mismatched tokens with both correct and bad signatures.
+The S3 header path therefore orders token/access-key binding and stable issuer
+liveness before signature comparison, but unlike STS renders those failures as
+`InvalidAccessKeyId`. This result is limited to header SigV4 until the
+presigned, POST Object, and streaming matrices are independently pinned.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations
@@ -1222,7 +1258,9 @@ confidentiality. No session response or request body may appear in traces.
    bucket-policy code less explicit?
 4. What is the exact AWS precedence among wrong token, missing token, bad
    signature, wrong region/service, disabled credential, and expired session on
-   each signing mode?
+   presigned, POST Object, and streaming modes? The core header-token/signature
+   collisions are pinned; its remaining region/service/expiry collisions are
+   not.
 5. What total Query body and member limits does live STS enforce for the first
    supported parameter set?
 6. Should the first standalone UAT role be injected through a dedicated
