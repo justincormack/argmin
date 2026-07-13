@@ -11511,6 +11511,19 @@ Phase 12.4 progress:
   the same listing. Unix RPC tests
   prove exact authorization works after the original route deadline and that
   unlisted historical commands remain rejected.
+  A later route-change-control-plane-restart soak exposed the complementary
+  current-Active race: a primary heartbeat can observe a pending slot after a
+  foreground command installs it but before command convergence clears it.
+  Rejecting that heartbeat left the PG Active and discarded the only recovery
+  certificate, while the recovery path correctly required an authoritative
+  Peering route. Current-epoch Active-primary pending observations now validate
+  the reporting node against the command epoch's historical Active route, then
+  atomically preserve that route in history, transition only the affected PG
+  to Peering, bump the epoch, and retain a current-epoch Peering recovery
+  observation. The returned lease is non-serving, and peering completion stays
+  blocked until exact-command recovery clears the pending slot. A durable
+  control-plane regression pins the transition, retained route, recovery
+  certificate, and persisted snapshot.
   CL1 is closed by the paired control-plane fence; RPC4's cross-epoch physical
   shard alias remains separate work.
 - Closed DCC-2/CP2/CL4 operational recovery. The process-local authority clock
