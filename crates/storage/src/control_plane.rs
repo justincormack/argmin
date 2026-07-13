@@ -4457,6 +4457,23 @@ impl RuntimeMapContentDigest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RuntimeMapContentCertificate {
+    cluster_epoch: ClusterEpoch,
+    pg_routes: usize,
+    content_digest: RuntimeMapContentDigest,
+}
+
+impl RuntimeMapContentCertificate {
+    pub(crate) fn from_runtime_map(runtime_map: &ClusterRuntimeMapSnapshot) -> Self {
+        Self {
+            cluster_epoch: runtime_map.cluster_epoch(),
+            pg_routes: runtime_map.pg_routes().len(),
+            content_digest: runtime_map.content_digest(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SparsePgRouteReconstructionError {
     UnknownClusterEpoch,
     UnknownPg,
@@ -5935,6 +5952,18 @@ impl ControlPlaneRuntimeMapLeaseRenewal {
         }
     }
 
+    fn from_content_certificate(
+        certificate: RuntimeMapContentCertificate,
+        validity: RouteMapValidity,
+        freshness_proof: RuntimeMapFreshnessProof,
+    ) -> Self {
+        Self {
+            content_digest: certificate.content_digest,
+            validity,
+            freshness_proof,
+        }
+    }
+
     #[must_use]
     pub fn content_digest(self) -> RuntimeMapContentDigest {
         self.content_digest
@@ -6035,7 +6064,7 @@ impl ControlPlaneRuntimeMapStatus {
         }
     }
 
-    fn from_runtime_map(runtime_map: &ClusterRuntimeMapSnapshot) -> Self {
+    pub(crate) fn from_runtime_map(runtime_map: &ClusterRuntimeMapSnapshot) -> Self {
         Self {
             cluster_epoch: runtime_map.cluster_epoch(),
             pg_routes: runtime_map.pg_routes().len(),
@@ -6050,6 +6079,54 @@ impl ControlPlaneRuntimeMapStatus {
                 && runtime_map.freshness_proof().is_serving_authority_read())
             .then(|| ControlPlaneRuntimeMapLeaseRenewal::from_runtime_map(runtime_map)),
         }
+    }
+
+    pub(crate) fn from_snapshot_with_content_certificate(
+        snapshot: &ClusterControlSnapshot,
+        authority_now_ms: u64,
+        freshness_proof: RuntimeMapFreshnessProof,
+        certificate: RuntimeMapContentCertificate,
+    ) -> Result<Self, ControlPlaneError> {
+        let pg_routes = snapshot.pg_routes(authority_now_ms)?;
+        if certificate.cluster_epoch != snapshot.cluster_epoch()
+            || certificate.pg_routes != pg_routes.len()
+        {
+            return Err(ControlPlaneError::SnapshotInvariantViolation {
+                context: "runtime-map content certificate reuse",
+                message:
+                    "runtime-map content certificate does not match control-plane snapshot shape"
+                        .to_owned(),
+            });
+        }
+        let validity = pg_routes
+            .iter()
+            .filter_map(PgRouteSnapshot::primary_lease_deadline_ms)
+            .min()
+            .map_or(
+                non_serving_runtime_map_validity(authority_now_ms),
+                RouteMapValidity::until_ms_saturating,
+            );
+        let active_serving_pg_routes = pg_routes
+            .iter()
+            .filter(|route| {
+                route.state() == PgState::Active && route.primary_lease_deadline_ms().is_some()
+            })
+            .count();
+        let lease_renewal = (validity.valid_until_ms().is_some()
+            && freshness_proof.is_serving_authority_read())
+        .then(|| {
+            ControlPlaneRuntimeMapLeaseRenewal::from_content_certificate(
+                certificate,
+                validity,
+                freshness_proof,
+            )
+        });
+        Ok(Self {
+            cluster_epoch: certificate.cluster_epoch,
+            pg_routes: certificate.pg_routes,
+            active_serving_pg_routes,
+            lease_renewal,
+        })
     }
 
     #[must_use]
@@ -6753,6 +6830,7 @@ impl FileControlPlaneStore {
 pub struct SingleAuthorityControlPlane<S> {
     store: S,
     snapshot: ClusterControlSnapshot,
+    runtime_map_content_certificate: Mutex<Option<RuntimeMapContentCertificate>>,
 }
 
 impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
@@ -6770,7 +6848,11 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             &snapshot,
         )?;
         store.save(&snapshot)?;
-        Ok(Self { store, snapshot })
+        Ok(Self {
+            store,
+            snapshot,
+            runtime_map_content_certificate: Mutex::new(None),
+        })
     }
 
     #[must_use]
@@ -7377,6 +7459,11 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         )?;
         self.store.save(&next_snapshot)?;
         self.snapshot = next_snapshot;
+        *self.runtime_map_content_certificate.lock().map_err(|_| {
+            ControlPlaneError::RpcProtocol {
+                message: "control-plane runtime-map content certificate lock poisoned".to_owned(),
+            }
+        })? = None;
         Ok(())
     }
 }
@@ -7428,9 +7515,25 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
         &self,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        Ok(ControlPlaneRuntimeMapStatus::from_runtime_map(
-            &self.snapshot.runtime_map(authority_now_ms)?,
-        ))
+        let mut cached = self.runtime_map_content_certificate.lock().map_err(|_| {
+            ControlPlaneError::RpcProtocol {
+                message: "control-plane runtime-map content certificate lock poisoned".to_owned(),
+            }
+        })?;
+        if let Some(certificate) = *cached {
+            return ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
+                &self.snapshot,
+                authority_now_ms,
+                RuntimeMapFreshnessProof::SingleAuthority {
+                    authority_incarnation: self.snapshot.authority_incarnation(),
+                    issued_at_ms: authority_now_ms,
+                },
+                certificate,
+            );
+        }
+        let runtime_map = self.snapshot.runtime_map(authority_now_ms)?;
+        *cached = Some(RuntimeMapContentCertificate::from_runtime_map(&runtime_map));
+        Ok(ControlPlaneRuntimeMapStatus::from_runtime_map(&runtime_map))
     }
 
     fn pending_metadata_command_recoveries(
@@ -31420,6 +31523,95 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some(node_1_deadline), Some(node_2_deadline)]
         );
+    }
+
+    #[test]
+    fn runtime_map_content_certificate_reuses_static_content_with_fresh_lease_state() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(127), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 127, PgState::Peering, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(127),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 127, PgState::Active, 2_002);
+
+        let runtime_map = authority.snapshot().runtime_map(2_003).unwrap();
+        let certificate = RuntimeMapContentCertificate::from_runtime_map(&runtime_map);
+        let mut renewed_snapshot = authority.snapshot().clone();
+        renewed_snapshot
+            .nodes
+            .get_mut(&NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms = Some(runtime_map.valid_until_ms().unwrap() + 1_000);
+        let renewed_runtime_map = renewed_snapshot.runtime_map(2_003).unwrap();
+        assert_eq!(
+            renewed_runtime_map.content_digest(),
+            runtime_map.content_digest()
+        );
+
+        let cached_status = ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
+            &renewed_snapshot,
+            2_003,
+            *renewed_runtime_map.freshness_proof(),
+            certificate,
+        )
+        .unwrap();
+        assert_eq!(
+            cached_status,
+            ControlPlaneRuntimeMapStatus::from_runtime_map(&renewed_runtime_map)
+        );
+        assert_eq!(
+            cached_status.lease_renewal().unwrap().validity(),
+            renewed_runtime_map.validity()
+        );
+    }
+
+    #[test]
+    fn single_authority_runtime_map_content_certificate_invalidates_on_commit() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+
+        let initial_status = authority.runtime_map_status(1_000).unwrap();
+        let initial_certificate = authority
+            .runtime_map_content_certificate
+            .lock()
+            .unwrap()
+            .expect("status should cache the content certificate");
+        assert_eq!(initial_status.cluster_epoch(), ClusterEpoch::INITIAL);
+
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(authority
+            .runtime_map_content_certificate
+            .lock()
+            .unwrap()
+            .is_none());
+        let updated_status = authority.runtime_map_status(1_001).unwrap();
+        let updated_certificate = authority
+            .runtime_map_content_certificate
+            .lock()
+            .unwrap()
+            .expect("status should rebuild the invalidated certificate");
+        assert_ne!(
+            updated_status.cluster_epoch(),
+            initial_status.cluster_epoch()
+        );
+        assert_ne!(updated_certificate, initial_certificate);
     }
 
     #[test]

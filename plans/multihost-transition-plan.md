@@ -11208,12 +11208,29 @@ Required production shape and implementation order:
    waiting or retrying status cannot make the authenticated fallback request
    immediately stale.
    This slice removes repeated full-map encoding, transfer, decoding, and
-   frontend topology rebuild for unchanged content, but status construction
-   still derives and hashes a complete runtime-map view under the authority
-   read boundary. Cache the immutable route digest/status alongside committed
-   state so the frequent status path becomes bounded independently of retained
-   history size; measure that follow-up with the existing runtime-map build and
-   authority-lock metrics.
+   frontend topology rebuild for unchanged content. The authority now also
+   caches an immutable runtime-map content certificate containing only the
+   cluster epoch, current route count, and canonical route-content digest.
+   Single-authority commits invalidate the certificate; covered volatile
+   heartbeats retain it only after proving that every digest-bearing node, PG,
+   and history field is unchanged. The OpenRaft cache is keyed by the exact
+   applied log ID, and same-ID volatile overlays are eligible only under that
+   same lease-only invariant. A compact status cache hit rebuilds current PG
+   lease validity and the live single-authority/read-index freshness proof, but
+   does not reconstruct or hash retained history. The first status after a
+   content-changing publication populates the certificate from the canonical
+   full map. OpenRaft performs applied-tip validation and compact status
+   construction while borrowing the state-machine snapshot; cache hits do not
+   clone retained history, and cache misses build the canonical map in place.
+   A matching volatile heartbeat overlay is likewise borrowed under its mutex.
+   Regressions compare cached status with full-map status after lease renewal,
+   prove single-authority invalidation, and exercise repeated OpenRaft
+   read-index status. Use the existing `RuntimeMapStatus` RPC operation and
+   authority-lock timing metrics to measure this boundary in retained soaks.
+   The five-second status I/O timeout remains appropriate for the OpenRaft
+   read-index round even though local status construction is now independent of
+   retained history size; any timeout reduction must be based on measured
+   read-index latency rather than the former map-build cost.
 9. Make the lease-horizon/restart-fence contract executable before removing
    per-heartbeat persistence. Model and property-test leader changes, process
    crashes, clock rollback/forward jump, delayed old maps, delayed old-primary

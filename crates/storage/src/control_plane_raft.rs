@@ -44,8 +44,9 @@ use placement::NodeId;
 
 use crate::control_plane::{
     AuthorityIncarnation, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneError, NodeAvailabilityState,
-    NodeMembershipState, RuntimeMapFreshnessProof,
+    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneError, ControlPlaneRuntimeMapStatus,
+    NodeAvailabilityState, NodeMembershipState, RuntimeMapContentCertificate,
+    RuntimeMapFreshnessProof,
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
@@ -1722,6 +1723,12 @@ pub struct ControlPlaneRaftAuthority {
     static_peer_policy: Option<ControlPlaneRaftPeerTransportPolicy>,
     volatile_heartbeat_update_gate: tokio::sync::Mutex<()>,
     volatile_heartbeat_overlay: Mutex<Option<ControlPlaneRaftVolatileHeartbeatOverlay>>,
+    runtime_map_content_certificate: Mutex<
+        Option<(
+            LogIdOf<ControlPlaneRaftTypeConfig>,
+            RuntimeMapContentCertificate,
+        )>,
+    >,
 }
 
 #[derive(Debug, Clone)]
@@ -3534,6 +3541,7 @@ impl ControlPlaneRaftAuthority {
             static_peer_policy: None,
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
+            runtime_map_content_certificate: Mutex::new(None),
         }
     }
 
@@ -3552,6 +3560,7 @@ impl ControlPlaneRaftAuthority {
             static_peer_policy: None,
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
+            runtime_map_content_certificate: Mutex::new(None),
         }
     }
 
@@ -3571,6 +3580,7 @@ impl ControlPlaneRaftAuthority {
             static_peer_policy: Some(peer_policy),
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
+            runtime_map_content_certificate: Mutex::new(None),
         }
     }
 
@@ -4008,6 +4018,67 @@ impl ControlPlaneRaftAuthority {
                 read_index,
                 issued_at_ms,
             },
+        )
+    }
+
+    pub async fn linearized_runtime_map_status(
+        &self,
+        issued_at_ms: u64,
+    ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+        let cached_certificate = *self.runtime_map_content_certificate.lock().map_err(|_| {
+            ControlPlaneError::RpcProtocol {
+                message: "control-plane OpenRaft runtime-map content certificate lock poisoned"
+                    .to_owned(),
+            }
+        })?;
+        let (durable_status, base_applied, certificate) =
+            control_plane_runtime_map_status_via_openraft_read_index(
+                &self.raft,
+                issued_at_ms,
+                cached_certificate,
+            )
+            .await?;
+        if cached_certificate != Some((base_applied, certificate)) {
+            *self.runtime_map_content_certificate.lock().map_err(|_| {
+                ControlPlaneError::RpcProtocol {
+                    message: "control-plane OpenRaft runtime-map content certificate lock poisoned"
+                        .to_owned(),
+                }
+            })? = Some((base_applied, certificate));
+        }
+
+        let authority_status = self.status().await?;
+        let Some(authority_term) = authority_status
+            .linearized_authority_serving()
+            .then_some(authority_status.current_term())
+            .flatten()
+            .filter(|_| authority_status.applied() == Some(base_applied))
+        else {
+            return Ok(durable_status);
+        };
+        let overlay = self.lock_volatile_heartbeat_overlay()?;
+        let Some(overlay) = overlay.as_ref().filter(|overlay| {
+            overlay.authority_term == authority_term && overlay.base_applied == base_applied
+        }) else {
+            return Ok(durable_status);
+        };
+        let read_index = control_plane_log_id_from_raft(base_applied).ok_or_else(|| {
+            ControlPlaneError::CommandDecode {
+                message: format!(
+                    "invalid OpenRaft applied log id for runtime-map status: {base_applied}"
+                ),
+            }
+        })?;
+        let freshness_proof = RuntimeMapFreshnessProof::ReadIndex {
+            authority_incarnation: overlay.snapshot.authority_incarnation(),
+            read_index,
+            issued_at_ms,
+        };
+        ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
+            &overlay.snapshot,
+            issued_at_ms,
+            freshness_proof,
+            certificate,
         )
     }
 
@@ -4743,6 +4814,91 @@ pub async fn runtime_map_via_openraft_read_index(
             issued_at_ms,
         },
     )
+}
+
+async fn control_plane_runtime_map_status_via_openraft_read_index(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    issued_at_ms: u64,
+    cached_certificate: Option<(
+        LogIdOf<ControlPlaneRaftTypeConfig>,
+        RuntimeMapContentCertificate,
+    )>,
+) -> Result<
+    (
+        ControlPlaneRuntimeMapStatus,
+        LogIdOf<ControlPlaneRaftTypeConfig>,
+        RuntimeMapContentCertificate,
+    ),
+    ControlPlaneError,
+> {
+    let read_log_id = raft
+        .ensure_linearizable(ReadPolicy::ReadIndex)
+        .await
+        .map_err(|error| openraft_remote_error("runtime-map status read-index", error))?
+        .ok_or_else(|| ControlPlaneError::CommandDecode {
+            message: "OpenRaft runtime-map status read-index returned no applied log id"
+                .to_string(),
+        })?;
+    let read_index = control_plane_log_id_from_raft(read_log_id).ok_or_else(|| {
+        ControlPlaneError::CommandDecode {
+            message: format!(
+                "invalid OpenRaft read-index log id for runtime-map status: {read_log_id}"
+            ),
+        }
+    })?;
+
+    raft.with_state_machine(move |state_machine| {
+        Box::pin(async move {
+            let Some(last_applied) = state_machine.last_applied() else {
+                return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                    read_index,
+                    last_applied: state_machine.inner().last_applied(),
+                });
+            };
+            if last_applied.index() < read_log_id.index() {
+                return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                    read_index,
+                    last_applied: state_machine.inner().last_applied(),
+                });
+            }
+            let applied_read_index =
+                control_plane_log_id_from_raft(last_applied).ok_or_else(|| {
+                    ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "invalid OpenRaft applied log id for runtime-map status: {last_applied}"
+                        ),
+                    }
+                })?;
+            let snapshot = state_machine.inner().snapshot();
+            let freshness_proof = RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation: snapshot.authority_incarnation(),
+                read_index: applied_read_index,
+                issued_at_ms,
+            };
+            if let Some((cached_applied, certificate)) = cached_certificate {
+                if cached_applied == last_applied {
+                    let status =
+                        ControlPlaneRuntimeMapStatus::from_snapshot_with_content_certificate(
+                            snapshot,
+                            issued_at_ms,
+                            freshness_proof,
+                            certificate,
+                        )?;
+                    return Ok((status, last_applied, certificate));
+                }
+            }
+            let runtime_map =
+                snapshot.runtime_map_with_freshness_proof(issued_at_ms, freshness_proof)?;
+            let certificate = RuntimeMapContentCertificate::from_runtime_map(&runtime_map);
+            Ok((
+                ControlPlaneRuntimeMapStatus::from_runtime_map(&runtime_map),
+                last_applied,
+                certificate,
+            ))
+        })
+    })
+    .await
+    .map_err(|error| openraft_remote_error("runtime-map status state-machine read", error))?
 }
 
 async fn control_plane_snapshot_via_openraft_read_index(
@@ -15506,6 +15662,40 @@ mod tests {
                 .nodes()
                 .iter()
                 .any(|node| node.node_id() == NodeId::new(1)));
+
+            let compact_status = authority
+                .linearized_runtime_map_status(44_001)
+                .await
+                .unwrap();
+            assert_eq!(compact_status.cluster_epoch(), runtime_map.cluster_epoch());
+            assert_eq!(compact_status.pg_routes(), runtime_map.pg_routes().len());
+            assert_eq!(
+                compact_status
+                    .lease_renewal()
+                    .expect("read-index status should renew the runtime-map lease")
+                    .content_digest(),
+                runtime_map.content_digest()
+            );
+            assert_eq!(
+                authority
+                    .runtime_map_content_certificate
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|(log_id, _certificate)| *log_id),
+                Some(applied_log_id)
+            );
+            let repeated_status = authority
+                .linearized_runtime_map_status(44_002)
+                .await
+                .unwrap();
+            assert_eq!(
+                repeated_status
+                    .lease_renewal()
+                    .expect("repeated read-index status should use cached content")
+                    .content_digest(),
+                runtime_map.content_digest()
+            );
 
             authority.shutdown().await.unwrap();
         });

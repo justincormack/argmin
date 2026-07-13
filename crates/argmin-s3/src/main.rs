@@ -2061,6 +2061,20 @@ impl ControlPlaneRuntimeMapSource for ExperimentalRaftControlPlane {
         self.checkpoint_successful_linearized_read()?;
         Ok(snapshot)
     }
+
+    fn runtime_map_status(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
+        let status = self.block_on(
+            self.authority
+                .linearized_runtime_map_status(authority_now_ms),
+        )?;
+        self.checkpoint_successful_linearized_read()?;
+        Ok(status)
+    }
 }
 
 impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
