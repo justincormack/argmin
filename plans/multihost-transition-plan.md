@@ -11541,6 +11541,21 @@ Phase 12.4 progress:
   could leave the authority PG `Active`. Pending identities are now validated
   on every observation, and any valid pending evidence for an authority-Active
   PG triggers the same atomic fence regardless of the node-reported PG state.
+  A later soak exposed a cross-PG epoch interleaving outside the first model:
+  an unrelated PG transition bumped the global epoch and correctly cleared all
+  node PG observations between an admin preflight and an overlapping Active PG
+  acting-set update. The update previously collapsed that temporary missing
+  current-epoch acknowledgement into the permanent explicit-transfer error.
+  Active migration validation now returns a distinct structured not-ready
+  rejection only when an overlapping source observation is absent or stale;
+  current-epoch wrong-state, pending-command, and proof-floor failures remain
+  hard transfer requirements. Checked admin clients retry the not-ready result
+  only after confirming that the target PG route is still the preflight route,
+  so unrelated epoch churn can converge without allowing a retry to overwrite
+  a newer route. State-machine, RPC-codec, and authenticated checked-client
+  regressions pin the reject-without-mutation, refresh, and retry sequence. The
+  heartbeat model must include unrelated-PG epoch churn between preflight and
+  migration as a first-class generated interleaving.
   CL1 is closed by the paired control-plane fence; RPC4's cross-epoch physical
   shard alias remains separate work.
 - Closed DCC-2/CP2/CL4 operational recovery. The process-local authority clock

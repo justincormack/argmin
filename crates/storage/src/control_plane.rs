@@ -3805,6 +3805,19 @@ impl PgRouteSnapshot {
     }
 }
 
+fn same_pg_acting_set_route(left: &PgRouteSnapshot, right: &PgRouteSnapshot) -> bool {
+    left.pg_id == right.pg_id
+        && left.primary_node_id == right.primary_node_id
+        && left.acting_set == right.acting_set
+        && left.state == right.state
+        && left.peering_metadata_transfer == right.peering_metadata_transfer
+        && left.peering_metadata_transfer_source_route_epoch
+            == right.peering_metadata_transfer_source_route_epoch
+        && left.peering_metadata_transfer_source_node_id
+            == right.peering_metadata_transfer_source_node_id
+        && left.pending_metadata_command_recovery == right.pending_metadata_command_recovery
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingMetadataCommandRecovery {
     reporting_node_id: NodeId,
@@ -7547,11 +7560,11 @@ impl UnixControlPlaneClient {
         }
     }
 
-    fn retry_set_pg_acting_set_after_response_loss(
+    fn retry_set_pg_acting_set_after_retryable_failure(
         &self,
         pg_id: PgId,
         acting_set: &[NodeId],
-        pre_update_epoch: Option<ClusterEpoch>,
+        pre_update_route: Option<PgRouteSnapshot>,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
         let mut last_unconfirmed_message = None;
@@ -7568,7 +7581,7 @@ impl UnixControlPlaneClient {
                         .find(|route| route.pg_id() == pg_id)
                     else {
                         last_unconfirmed_message = Some(format!(
-                            "PG {} acting-set update was not confirmed after lost control-plane RPC response: current runtime map has no route for PG",
+                            "PG {} acting-set update was not confirmed after retryable control-plane failure: current runtime map has no route for PG",
                             pg_id.get()
                         ));
                         if Instant::now() >= deadline {
@@ -7577,12 +7590,10 @@ impl UnixControlPlaneClient {
                                     .expect("missing route message was recorded"),
                             });
                         }
-                        if pre_update_epoch.is_none() {
+                        if pre_update_route.is_none() {
                             match self.set_pg_acting_set(pg_id, acting_set.to_vec()) {
                                 Ok(cluster_epoch) => return Ok(cluster_epoch),
-                                Err(error)
-                                    if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                                }
+                                Err(error) if error.is_retryable_pg_acting_set_checked_error() => {}
                                 Err(error) => return Err(error),
                             }
                         }
@@ -7593,20 +7604,25 @@ impl UnixControlPlaneClient {
                         return Ok(route.cluster_epoch());
                     }
                     let message = format!(
-                            "PG {} acting-set update was not confirmed after lost control-plane RPC response: current route at epoch {} has acting set {:?}, expected {:?}",
+                            "PG {} acting-set update was not confirmed after retryable control-plane failure: current route at epoch {} has acting set {:?}, expected {:?}",
                             pg_id.get(),
                             route.cluster_epoch().get(),
                             route.acting_set(),
                             acting_set
                         );
-                    if pre_update_epoch.is_some_and(|epoch| route.cluster_epoch() > epoch) {
+                    if pre_update_route
+                        .as_ref()
+                        .is_some_and(|before| !same_pg_acting_set_route(before, route))
+                    {
                         return Err(ControlPlaneError::RpcUnconfirmed { message });
                     }
-                    if pre_update_epoch == Some(route.cluster_epoch()) {
+                    if pre_update_route
+                        .as_ref()
+                        .is_some_and(|before| same_pg_acting_set_route(before, route))
+                    {
                         match self.set_pg_acting_set(pg_id, acting_set.to_vec()) {
                             Ok(cluster_epoch) => return Ok(cluster_epoch),
-                            Err(error)
-                                if error.is_maybe_applied_control_plane_rpc_response_loss() => {}
+                            Err(error) if error.is_retryable_pg_acting_set_checked_error() => {}
                             Err(error) => return Err(error),
                         }
                     }
@@ -7623,7 +7639,7 @@ impl UnixControlPlaneClient {
                     if Instant::now() >= deadline {
                         return Err(ControlPlaneError::RpcUnconfirmed {
                             message: last_unconfirmed_message.unwrap_or_else(|| format!(
-                                "PG {} acting-set update was not confirmed after lost control-plane RPC response; runtime-map observation failed: {error}",
+                                "PG {} acting-set update was not confirmed after retryable control-plane failure; runtime-map observation failed: {error}",
                                 pg_id.get()
                             )),
                         });
@@ -7658,7 +7674,7 @@ impl UnixControlPlaneClient {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
-        let pre_update_epoch =
+        let pre_update_route =
             self.pg_runtime_map_snapshot(pg_id, 0)
                 .ok()
                 .and_then(|runtime_map| {
@@ -7666,12 +7682,16 @@ impl UnixControlPlaneClient {
                         .pg_routes()
                         .iter()
                         .find(|route| route.pg_id() == pg_id)
-                        .map(|route| route.cluster_epoch())
+                        .cloned()
                 });
         match self.set_pg_acting_set(pg_id, acting_set.clone()) {
             Ok(cluster_epoch) => Ok(cluster_epoch),
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
-                .retry_set_pg_acting_set_after_response_loss(pg_id, &acting_set, pre_update_epoch),
+            Err(error) if error.is_retryable_pg_acting_set_checked_error() => self
+                .retry_set_pg_acting_set_after_retryable_failure(
+                    pg_id,
+                    &acting_set,
+                    pre_update_route,
+                ),
             Err(error) => Err(error),
         }
     }
@@ -8137,11 +8157,11 @@ impl AuthenticatedUnixControlPlaneClient {
         Ok(runtime_map)
     }
 
-    fn retry_set_pg_acting_set_after_response_loss(
+    fn retry_set_pg_acting_set_after_retryable_failure(
         &self,
         pg_id: PgId,
         acting_set: &[NodeId],
-        pre_update_epoch: Option<ClusterEpoch>,
+        pre_update_route: Option<PgRouteSnapshot>,
         retry_clock: AuthenticatedAdminRetryClock,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
@@ -8159,7 +8179,7 @@ impl AuthenticatedUnixControlPlaneClient {
                         .find(|route| route.pg_id() == pg_id)
                     else {
                         last_unconfirmed_message = Some(format!(
-                            "PG {} authenticated acting-set update was not confirmed after lost control-plane RPC response: current runtime map has no route for PG",
+                            "PG {} authenticated acting-set update was not confirmed after retryable control-plane failure: current runtime map has no route for PG",
                             pg_id.get()
                         ));
                         if Instant::now() >= deadline {
@@ -8168,16 +8188,14 @@ impl AuthenticatedUnixControlPlaneClient {
                                     .expect("missing route message was recorded"),
                             });
                         }
-                        if pre_update_epoch.is_none() {
+                        if pre_update_route.is_none() {
                             match self.set_pg_acting_set(
                                 pg_id,
                                 acting_set.to_vec(),
                                 retry_clock.now_ms(),
                             ) {
                                 Ok(cluster_epoch) => return Ok(cluster_epoch),
-                                Err(error)
-                                    if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                                }
+                                Err(error) if error.is_retryable_pg_acting_set_checked_error() => {}
                                 Err(error) => return Err(error),
                             }
                         }
@@ -8188,24 +8206,29 @@ impl AuthenticatedUnixControlPlaneClient {
                         return Ok(route.cluster_epoch());
                     }
                     let message = format!(
-                        "PG {} authenticated acting-set update was not confirmed after lost control-plane RPC response: current route at epoch {} has acting set {:?}, expected {:?}",
+                        "PG {} authenticated acting-set update was not confirmed after retryable control-plane failure: current route at epoch {} has acting set {:?}, expected {:?}",
                         pg_id.get(),
                         route.cluster_epoch().get(),
                         route.acting_set(),
                         acting_set
                     );
-                    if pre_update_epoch.is_some_and(|epoch| route.cluster_epoch() > epoch) {
+                    if pre_update_route
+                        .as_ref()
+                        .is_some_and(|before| !same_pg_acting_set_route(before, route))
+                    {
                         return Err(ControlPlaneError::RpcUnconfirmed { message });
                     }
-                    if pre_update_epoch == Some(route.cluster_epoch()) {
+                    if pre_update_route
+                        .as_ref()
+                        .is_some_and(|before| same_pg_acting_set_route(before, route))
+                    {
                         match self.set_pg_acting_set(
                             pg_id,
                             acting_set.to_vec(),
                             retry_clock.now_ms(),
                         ) {
                             Ok(cluster_epoch) => return Ok(cluster_epoch),
-                            Err(error)
-                                if error.is_maybe_applied_control_plane_rpc_response_loss() => {}
+                            Err(error) if error.is_retryable_pg_acting_set_checked_error() => {}
                             Err(error) => return Err(error),
                         }
                     }
@@ -8222,7 +8245,7 @@ impl AuthenticatedUnixControlPlaneClient {
                     if Instant::now() >= deadline {
                         return Err(ControlPlaneError::RpcUnconfirmed {
                             message: last_unconfirmed_message.unwrap_or_else(|| format!(
-                                "PG {} authenticated acting-set update was not confirmed after lost control-plane RPC response; runtime-map observation failed: {error}",
+                                "PG {} authenticated acting-set update was not confirmed after retryable control-plane failure; runtime-map observation failed: {error}",
                                 pg_id.get()
                             )),
                         });
@@ -8385,7 +8408,7 @@ impl AuthenticatedUnixControlPlaneClient {
         acting_set: Vec<NodeId>,
         retry_clock: AuthenticatedAdminRetryClock,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
-        let pre_update_epoch = self
+        let pre_update_route = self
             .admin_pg_runtime_map_snapshot_with_read_timeout(
                 pg_id,
                 retry_clock,
@@ -8397,15 +8420,15 @@ impl AuthenticatedUnixControlPlaneClient {
                     .pg_routes()
                     .iter()
                     .find(|route| route.pg_id() == pg_id)
-                    .map(|route| route.cluster_epoch())
+                    .cloned()
             });
         match self.set_pg_acting_set(pg_id, acting_set.clone(), retry_clock.now_ms()) {
             Ok(cluster_epoch) => Ok(cluster_epoch),
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
-                .retry_set_pg_acting_set_after_response_loss(
+            Err(error) if error.is_retryable_pg_acting_set_checked_error() => self
+                .retry_set_pg_acting_set_after_retryable_failure(
                     pg_id,
                     &acting_set,
-                    pre_update_epoch,
+                    pre_update_route,
                     retry_clock,
                 ),
             Err(error) => Err(error),
@@ -11033,6 +11056,14 @@ fn encode_control_plane_rpc_response(
             write_u64(&mut payload, pending.log_index());
             write_u64(&mut payload, pending.command_checksum());
         }
+        Err(ControlPlaneError::PgMetadataMigrationSourceNotReady {
+            pg_id,
+            cluster_epoch,
+        }) => {
+            write_u8(&mut payload, 3);
+            write_u32(&mut payload, pg_id);
+            write_u64(&mut payload, cluster_epoch.get());
+        }
         Err(error) => {
             write_u8(&mut payload, 1);
             write_string(&mut payload, &error.to_string())?;
@@ -11077,6 +11108,16 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
                     pending_log_index,
                     pending_command_checksum,
                 ),
+            })
+        }
+        3 => {
+            let pg_id = reader.read_u32()?;
+            let cluster_epoch =
+                read_cluster_epoch(&mut reader, "metadata migration source cluster epoch")?;
+            reader.finish()?;
+            Err(ControlPlaneError::PgMetadataMigrationSourceNotReady {
+                pg_id,
+                cluster_epoch,
             })
         }
         _ => Err(ControlPlaneError::RpcProtocol {
@@ -12836,6 +12877,14 @@ pub enum ControlPlaneError {
     PgMetadataMigrationRequiresTransfer { pg_id: u32 },
 
     #[error(
+        "PG {pg_id} metadata acting-set migration source has not acknowledged current cluster epoch {cluster_epoch}"
+    )]
+    PgMetadataMigrationSourceNotReady {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
         "PG {pg_id} metadata transfer source epoch {source_epoch} is newer than current cluster epoch {cluster_epoch}"
     )]
     PgMetadataTransferSourceEpochInFuture {
@@ -13348,6 +13397,12 @@ impl ControlPlaneError {
                 | ErrorKind::Interrupted
                 | ErrorKind::NotConnected
         )
+    }
+
+    #[must_use]
+    fn is_retryable_pg_acting_set_checked_error(&self) -> bool {
+        self.is_maybe_applied_control_plane_rpc_response_loss()
+            || matches!(self, Self::PgMetadataMigrationSourceNotReady { .. })
     }
 }
 
@@ -15612,6 +15667,7 @@ fn validate_authoritative_metadata_migration_source(
                 pg_id: record.pg_id.get(),
             })?;
     let mut source_floor: Option<PgMetadataProof> = None;
+    let mut source_awaiting_current_epoch = false;
     for node_id in record
         .acting_set
         .iter()
@@ -15622,8 +15678,13 @@ fn validate_authoritative_metadata_migration_source(
             continue;
         };
         let Some(observation) = node.pg_observation(record.pg_id) else {
+            source_awaiting_current_epoch = true;
             continue;
         };
+        if observation.observed_epoch != snapshot.cluster_epoch {
+            source_awaiting_current_epoch = true;
+            continue;
+        }
         let proof_satisfies_floor = if record.active_primary == Some(node_id) {
             metadata_proof_satisfies_active_primary_observation_floor(
                 active_floor,
@@ -15637,8 +15698,7 @@ fn validate_authoritative_metadata_migration_source(
         } else {
             metadata_proof_satisfies_active_floor(active_floor, observation.metadata_proof)
         };
-        if observation.observed_epoch != snapshot.cluster_epoch
-            || observation.state != PgState::Active
+        if observation.state != PgState::Active
             || observation.has_pending_metadata_command()
             || !proof_satisfies_floor
         {
@@ -15656,8 +15716,17 @@ fn validate_authoritative_metadata_migration_source(
             _ => observation.metadata_proof,
         });
     }
-    source_floor.ok_or(ControlPlaneError::PgMetadataMigrationRequiresTransfer {
-        pg_id: record.pg_id.get(),
+    source_floor.ok_or_else(|| {
+        if source_awaiting_current_epoch {
+            ControlPlaneError::PgMetadataMigrationSourceNotReady {
+                pg_id: record.pg_id.get(),
+                cluster_epoch: snapshot.cluster_epoch,
+            }
+        } else {
+            ControlPlaneError::PgMetadataMigrationRequiresTransfer {
+                pg_id: record.pg_id.get(),
+            }
+        }
     })
 }
 
@@ -18754,6 +18823,26 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_preserves_metadata_migration_source_not_ready_identity() {
+        let cluster_epoch = ClusterEpoch::new(44).unwrap();
+        let encoded = encode_control_plane_rpc_response(Err(
+            ControlPlaneError::PgMetadataMigrationSourceNotReady {
+                pg_id: 7,
+                cluster_epoch,
+            },
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            decode_control_plane_rpc_response(encoded),
+            Err(ControlPlaneError::PgMetadataMigrationSourceNotReady {
+                pg_id: 7,
+                cluster_epoch: decoded_epoch,
+            }) if decoded_epoch == cluster_epoch
+        ));
+    }
+
+    #[test]
     fn unix_control_plane_client_fetches_pg_runtime_map_with_bounded_non_serving_validity() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -20220,6 +20309,129 @@ mod tests {
 
         server.join().unwrap();
         assert!(cluster_epoch.get() >= 2);
+    }
+
+    #[test]
+    fn authenticated_admin_pg_update_retries_after_source_acknowledges_epoch() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let target_pg_id = PgId::new(7);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        authority
+            .set_pg_acting_set(target_pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            target_pg_id.get(),
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                target_pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            target_pg_id.get(),
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        let preflight_epoch = authority.snapshot().cluster_epoch();
+
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            for request_number in 0..4 {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let expected_kind = match request_number {
+                    0 | 2 => ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+                    1 | 3 => ControlPlaneRpcKind::SetPgActingSet,
+                    _ => unreachable!(),
+                };
+                assert_eq!(request.kind, expected_kind);
+                let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let response = build_control_plane_unix_response_with_auth_and_response_clock(
+                    &mut authority,
+                    request,
+                    issued_at_ms,
+                    Some(&verifier),
+                    || Ok(issued_at_ms),
+                )
+                .unwrap();
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+
+                if request_number == 0 {
+                    authority
+                        .set_pg_acting_set(PgId::new(8), vec![NodeId::new(1)])
+                        .unwrap();
+                    assert!(authority.snapshot().cluster_epoch() > preflight_epoch);
+                }
+                if request_number == 1 {
+                    assert!(authority.snapshot().cluster_epoch() > preflight_epoch);
+                    heartbeat_with_pg_proof(
+                        &mut authority,
+                        1,
+                        target_pg_id.get(),
+                        PgState::Active,
+                        active_proof,
+                        false,
+                        2_003,
+                    );
+                }
+            }
+            authority.snapshot().clone()
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let cluster_epoch = crate::clock::with_time_override(3_000, || {
+            client.set_pg_acting_set_checked(
+                target_pg_id,
+                vec![NodeId::new(1), NodeId::new(2)],
+                3_000,
+            )
+        })
+        .unwrap();
+
+        let snapshot = server.join().unwrap();
+        assert!(cluster_epoch.get() > preflight_epoch.get() + 1);
+        assert_eq!(snapshot.cluster_epoch(), cluster_epoch);
+        assert_eq!(
+            snapshot.pg(target_pg_id).unwrap().acting_set(),
+            &[NodeId::new(1), NodeId::new(2)]
+        );
     }
 
     #[test]
@@ -35580,6 +35792,93 @@ mod tests {
         assert_eq!(pg.state(), PgState::Active);
         assert_eq!(pg.acting_set(), &[NodeId::new(1)]);
         assert_eq!(pg.active_metadata_proof(), Some(active_proof));
+    }
+
+    #[test]
+    fn active_metadata_migration_waits_for_source_after_unrelated_epoch_change() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+
+        let target_pg_id = PgId::new(40);
+        let unrelated_pg_id = PgId::new(41);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        authority
+            .set_pg_acting_set(target_pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            target_pg_id.get(),
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                target_pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            target_pg_id.get(),
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        authority
+            .set_pg_acting_set(unrelated_pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        let current_epoch = authority.snapshot().cluster_epoch();
+        assert!(authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(target_pg_id)
+            .is_none());
+        let before = authority.snapshot().clone();
+        assert!(matches!(
+            authority.set_pg_acting_set(target_pg_id, vec![NodeId::new(1), NodeId::new(2)]),
+            Err(ControlPlaneError::PgMetadataMigrationSourceNotReady {
+                pg_id: 40,
+                cluster_epoch,
+            }) if cluster_epoch == current_epoch
+        ));
+        assert_eq!(authority.snapshot(), &before);
+
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            target_pg_id.get(),
+            PgState::Active,
+            active_proof,
+            false,
+            2_003,
+        );
+
+        authority
+            .set_pg_acting_set(target_pg_id, vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        let target = authority.snapshot().pg(target_pg_id).unwrap();
+        assert_eq!(target.state(), PgState::Peering);
+        assert_eq!(target.acting_set(), &[NodeId::new(1), NodeId::new(2)]);
+        assert_eq!(target.peering_metadata_proof_floor(), Some(active_proof));
     }
 
     #[test]
