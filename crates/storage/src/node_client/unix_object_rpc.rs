@@ -680,7 +680,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteDrainRecordRequest {
             node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
+            route_cluster_epoch: self.cluster_epoch,
             pg_id,
             record: record.clone(),
         };
@@ -751,7 +751,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteDrainHeartbeatRequest {
             node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
+            route_cluster_epoch: self.cluster_epoch,
             pg_id,
             record: record.clone(),
             lease_deadline,

@@ -1326,6 +1326,113 @@ fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
 }
 
 #[test]
+fn frontend_unix_delete_bucket_adopts_live_drain_from_older_epoch() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(1);
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let drain_epoch = ClusterEpoch::INITIAL;
+    let route_epoch = ClusterEpoch::new(drain_epoch.get() + 1).unwrap();
+    let remote_data_dir = tmp.path().join("remote-delete-live-old-drain-node-1");
+    let socket_path = tmp
+        .path()
+        .join("sockets")
+        .join("delete-live-old-drain-node-1.sock");
+    let bucket = crate::tests::bucket_name("remote-delete-live-old-drain");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let original_deadline = crate::clock::current_time_millis().saturating_add(30_000);
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(&remote_data_dir, &[0], ec_shape)
+            .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        crate::PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        crate::PgMetadataStore::begin_durable_bucket_write_drain(
+            &*pg,
+            &bucket,
+            "live-drain-before-route-change",
+            "delete-owner-before-route-change",
+            drain_epoch,
+            crate::clock::current_time_millis(),
+            original_deadline,
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    private_socket_dir(socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: route_epoch,
+        route_map_validity: RouteMapValidity::Forever,
+        data_dir: remote_data_dir,
+        default_ec_shape: ec_shape,
+        pg_ids: vec![0],
+        socket_path: socket_path.clone(),
+        pg_routes: vec![StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: route_epoch,
+            state: PgState::Active,
+            primary_node_id: node_id,
+            acting_set: vec![node_id],
+        }],
+        pending_metadata_command_recoveries: Vec::new(),
+        historical_pg_routes: Vec::new(),
+    })
+    .unwrap();
+    let _server_guard = spawn_storage_node_server(server);
+
+    let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        node_id,
+        [LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path().join("frontend-delete-live-old-drain-node-1"),
+        )],
+        &[0],
+        ec_shape,
+        route_epoch,
+    )
+    .unwrap();
+    map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+        node_id,
+        socket_path,
+    )])
+    .unwrap();
+    let map = Arc::new(map);
+    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect("DeleteBucket should adopt an old-epoch live drain over the current Unix route");
+    let drain = map
+        .node(node_id)
+        .unwrap()
+        .bucket_write_reservation_client()
+        .durable_bucket_write_drain(PgId::new(0), &bucket)
+        .unwrap()
+        .expect("successful delete begin should retain its terminal drain");
+    assert_eq!(drain.cluster_epoch, drain_epoch);
+    assert_eq!(drain.drain_id, "live-drain-before-route-change");
+    assert!(drain.lease_deadline > crate::clock::current_time_millis());
+    assert_eq!(
+        map.node(node_id)
+            .unwrap()
+            .bucket_metadata_client()
+            .head_bucket_raw(PgId::new(0), &bucket)
+            .unwrap()
+            .state,
+        crate::BucketState::Deleting
+    );
+}
+
+#[test]
 fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);

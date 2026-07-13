@@ -1367,7 +1367,7 @@ pub(crate) struct StorageRpcBucketWriteDrainBeginResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketWriteDrainRecordRequest {
     pub(crate) node_id: NodeId,
-    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) route_cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) record: BucketWriteDrainRecord,
 }
@@ -1375,7 +1375,7 @@ pub(crate) struct StorageRpcBucketWriteDrainRecordRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketWriteDrainHeartbeatRequest {
     pub(crate) node_id: NodeId,
-    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) route_cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) record: BucketWriteDrainRecord,
     pub(crate) lease_deadline: u64,
@@ -11272,15 +11272,10 @@ pub(crate) fn decode_bucket_write_drain_begin_response(
 pub(crate) fn encode_bucket_write_drain_record_request(
     request: &StorageRpcBucketWriteDrainRecordRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    if request.cluster_epoch != request.record.cluster_epoch {
-        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "request route epoch must match drain epoch",
-        ));
-    }
     validate_bucket_write_drain_record(&request.record)?;
     let mut out = Vec::new();
     put_u32(&mut out, request.node_id.as_u32());
-    put_u64(&mut out, request.cluster_epoch.get());
+    put_u64(&mut out, request.route_cluster_epoch.get());
     put_u32(&mut out, request.pg_id.get());
     put_bucket_write_drain_record(&mut out, &request.record);
     Ok(out)
@@ -11291,19 +11286,14 @@ pub(crate) fn decode_bucket_write_drain_record_request(
 ) -> Result<StorageRpcBucketWriteDrainRecordRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
-    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let route_cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let record = decoder.read_bucket_write_drain_record()?;
     decoder.finish()?;
-    if cluster_epoch != record.cluster_epoch {
-        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "request route epoch must match drain epoch",
-        ));
-    }
     validate_bucket_write_drain_record(&record)?;
     Ok(StorageRpcBucketWriteDrainRecordRequest {
         node_id,
-        cluster_epoch,
+        route_cluster_epoch,
         pg_id,
         record,
     })
@@ -11312,15 +11302,10 @@ pub(crate) fn decode_bucket_write_drain_record_request(
 pub(crate) fn encode_bucket_write_drain_heartbeat_request(
     request: &StorageRpcBucketWriteDrainHeartbeatRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    if request.cluster_epoch != request.record.cluster_epoch {
-        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "request route epoch must match drain epoch",
-        ));
-    }
     validate_bucket_write_drain_record(&request.record)?;
     let mut out = Vec::new();
     put_u32(&mut out, request.node_id.as_u32());
-    put_u64(&mut out, request.cluster_epoch.get());
+    put_u64(&mut out, request.route_cluster_epoch.get());
     put_u32(&mut out, request.pg_id.get());
     put_bucket_write_drain_record(&mut out, &request.record);
     put_u64(&mut out, request.lease_deadline);
@@ -11332,20 +11317,15 @@ pub(crate) fn decode_bucket_write_drain_heartbeat_request(
 ) -> Result<StorageRpcBucketWriteDrainHeartbeatRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
-    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let route_cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let record = decoder.read_bucket_write_drain_record()?;
     let lease_deadline = decoder.read_u64()?;
     decoder.finish()?;
-    if cluster_epoch != record.cluster_epoch {
-        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "request route epoch must match drain epoch",
-        ));
-    }
     validate_bucket_write_drain_record(&record)?;
     Ok(StorageRpcBucketWriteDrainHeartbeatRequest {
         node_id,
-        cluster_epoch,
+        route_cluster_epoch,
         pg_id,
         record,
         lease_deadline,
@@ -19433,6 +19413,7 @@ mod tests {
     fn bucket_delete_coordination_max_record_requests_fit_kind_caps() {
         let bucket = BucketName::try_from("a".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap();
         let cluster_epoch = ClusterEpoch::INITIAL;
+        let route_cluster_epoch = ClusterEpoch::new(cluster_epoch.get() + 1).unwrap();
         let node_id = NodeId::new(1);
         let pg_id = PgId::new(2);
         let drain_id = "d".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN);
@@ -19441,7 +19422,7 @@ mod tests {
         let drain_payload =
             encode_bucket_write_drain_record_request(&StorageRpcBucketWriteDrainRecordRequest {
                 node_id,
-                cluster_epoch,
+                route_cluster_epoch,
                 pg_id,
                 record: BucketWriteDrainRecord {
                     bucket: bucket.clone(),
@@ -19467,6 +19448,24 @@ mod tests {
         .unwrap();
         let decoded = read_storage_rpc_request_frame_from(&mut Cursor::new(drain_frame)).unwrap();
         assert_eq!(decoded.payload, drain_payload);
+        let decoded_request = decode_bucket_write_drain_record_request(&drain_payload).unwrap();
+        assert_eq!(decoded_request.route_cluster_epoch, route_cluster_epoch);
+        assert_eq!(decoded_request.record.cluster_epoch, cluster_epoch);
+
+        let heartbeat_request = StorageRpcBucketWriteDrainHeartbeatRequest {
+            node_id,
+            route_cluster_epoch,
+            pg_id,
+            record: decoded_request.record,
+            lease_deadline: 6,
+        };
+        assert_eq!(
+            decode_bucket_write_drain_heartbeat_request(
+                &encode_bucket_write_drain_heartbeat_request(&heartbeat_request).unwrap()
+            )
+            .unwrap(),
+            heartbeat_request
+        );
 
         let mut oversized_drain_payload = drain_payload.clone();
         oversized_drain_payload.push(0);
@@ -19484,7 +19483,7 @@ mod tests {
                 && limit == STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN
         ));
 
-        let outcome_route_epoch = ClusterEpoch::new(2).unwrap();
+        let outcome_route_epoch = route_cluster_epoch;
         let outcome_payload = encode_bucket_delete_attempt_outcome_record_request(
             &StorageRpcBucketDeleteAttemptOutcomeRecordRequest {
                 node_id,

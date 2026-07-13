@@ -4690,7 +4690,7 @@ impl StorageNodeConnectionHandler {
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_cleanup(
             request.node_id,
-            request.cluster_epoch,
+            request.route_cluster_epoch,
             request.pg_id,
         ) {
             return encode_storage_rpc_error_response(&error);
@@ -4753,7 +4753,7 @@ impl StorageNodeConnectionHandler {
         request: crate::storage_rpc::StorageRpcBucketWriteDrainHeartbeatRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+            self.validate_pg_route(request.node_id, request.route_cluster_epoch, request.pg_id)
         {
             return encode_storage_rpc_error_response(&error);
         }
