@@ -2015,11 +2015,23 @@ impl ExperimentalRaftControlPlane {
         &mut self,
         now_ms: u64,
     ) -> Result<(ClusterEpoch, usize, usize), ControlPlaneError> {
-        let now_ms = self.authority_now_ms(now_ms)?;
+        let (now_ms, lease_horizon_authority) =
+            self.authority_time_and_lease_horizon_binding(now_ms)?;
         let snapshot = self.current_snapshot()?;
         let expire_at_ms = snapshot.heartbeat_lease_expiry_timestamp(now_ms);
+        let expired = snapshot.expired_node_heartbeat_leases(expire_at_ms);
+        if expired.is_empty() {
+            return Ok((snapshot.cluster_epoch(), 0, 0));
+        }
+        let authority = lease_horizon_authority.ok_or(ControlPlaneError::RpcRemote {
+            message: "OpenRaft heartbeat expiry has no serving lease-horizon authority".to_string(),
+        })?;
         let response =
-            self.submit_raft_command(ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms })?;
+            self.submit_raft_command(ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+                authority,
+                expire_at_ms,
+                expired,
+            })?;
         let ControlPlaneCommandResponse::ExpireHeartbeatLeases {
             expired_nodes,
             peering_pgs,
@@ -2066,21 +2078,45 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
         let previous_observed_epoch = pre_record_snapshot
             .node(node_id)
             .and_then(|node| node.last_observed_epoch());
+        let carries_peering_evidence = heartbeat
+            .pg_observations
+            .iter()
+            .any(|observation| observation.state == PgState::Peering);
         let lease_deadline_ms = pre_record_snapshot.heartbeat_lease_deadline(
             node_id,
             authority_now_ms,
             requested_lease_duration_ms,
         )?;
         let pre_record_epoch = pre_record_snapshot.cluster_epoch();
-        self.submit_raft_command(ControlPlaneCommand::RecordNodeHeartbeat {
+        let command = ControlPlaneCommand::RecordNodeHeartbeat {
             heartbeat,
             heartbeat_at_ms: authority_now_ms,
             lease_deadline_ms,
             lease_horizon_authority,
-        })?;
+        };
+        let mut volatile_snapshot = if carries_peering_evidence {
+            None
+        } else {
+            self.block_on(self.authority.try_apply_volatile_heartbeat(command.clone()))?
+        };
+        if volatile_snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .ready_pg_peering_completions(authority_now_ms)
+                .is_ok_and(|ready| !ready.is_empty())
+        }) {
+            volatile_snapshot = None;
+        }
+        if volatile_snapshot.is_none() {
+            self.submit_raft_command(command)?;
+        }
         #[cfg(test)]
-        self.run_after_heartbeat_commit_hook()?;
-        let snapshot = self.current_snapshot()?;
+        if volatile_snapshot.is_none() {
+            self.run_after_heartbeat_commit_hook()?;
+        }
+        let snapshot = match volatile_snapshot {
+            Some(snapshot) => snapshot,
+            None => self.current_snapshot()?,
+        };
         if let Some(expected_authority) = lease_horizon_authority {
             let (_, current_authority) =
                 self.authority_time_and_lease_horizon_binding(authority_now_ms)?;
@@ -2173,7 +2209,11 @@ impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
         pg_id: PgId,
     ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
         let response =
-            self.submit_raft_command(ControlPlaneCommand::FencePgForMetadataTransfer { pg_id })?;
+            self.submit_raft_command(ControlPlaneCommand::FencePgForMetadataTransfer {
+                pg_id,
+                source_primary_lease_deadline_ms: None,
+                lease_horizon_authority: None,
+            })?;
         let ControlPlaneCommandResponse::FencePgForMetadataTransfer {
             source_primary_lease_deadline_ms,
         } = response
@@ -5237,7 +5277,7 @@ mod tests {
     use super::*;
     use auth::SecretKey;
     use config::{ConfiguredControlPlaneRaftAuthCredential, SecretConfigValue};
-    use openraft::impls::Vote;
+    use openraft::impls::{BasicNode, Vote};
     use openraft::raft::{TransferLeaderRequest, VoteRequest};
     use storage::control_plane::{
         handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeAvailabilityState,
@@ -6719,6 +6759,11 @@ mod tests {
         assert_eq!(pg.active_metadata_proof(), Some(proof));
         assert_eq!(pg.active_metadata_proof_epoch(), Some(peering_epoch));
         let active_epoch = active_snapshot.cluster_epoch();
+        let applied_before_active_observation = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("experimental Raft status should read before active observation")
+            .applied();
 
         let active_refresh = harness
             .control_plane
@@ -6745,6 +6790,170 @@ mod tests {
         let active_route = &active_refresh.runtime_map().pg_routes()[0];
         assert_eq!(active_route.state(), PgState::Active);
         assert_eq!(active_route.primary_lease_deadline_ms(), Some(20_800));
+        let applied_after_active_observation = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("experimental Raft status should read after active observation")
+            .applied();
+        assert_ne!(
+            applied_after_active_observation, applied_before_active_observation,
+            "a changed Active proof must be durable for metadata-transfer authorization"
+        );
+
+        let steady_active_refresh = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: active_epoch,
+                    requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(7),
+                        state: PgState::Active,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                20_300,
+            )
+            .expect("unchanged experimental raft active heartbeat should refresh");
+        assert!(steady_active_refresh.lease().serving());
+        assert_eq!(steady_active_refresh.lease().lease_deadline_ms(), 20_900);
+        let frontend_runtime_map = harness
+            .control_plane
+            .runtime_map_snapshot(20_300)
+            .expect("linearized frontend runtime map should include volatile heartbeat state");
+        assert_eq!(
+            frontend_runtime_map.pg_routes()[0].primary_lease_deadline_ms(),
+            Some(20_900)
+        );
+        assert_eq!(
+            harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("experimental Raft status should read after active renewal")
+                .applied(),
+            applied_after_active_observation,
+            "an unchanged active heartbeat must update the runtime map without log progress"
+        );
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_durably_accumulates_multi_node_peering_evidence() {
+        let mut harness = experimental_raft_test_harness("multi-node-heartbeat-peering-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![
+            config::ConfiguredStorageNodeSocket {
+                node_id: 1,
+                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            },
+            config::ConfiguredStorageNodeSocket {
+                node_id: 2,
+                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+            },
+        ];
+        config.storage_pg_ids = vec![7];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        for (node_id, now_ms) in [(1, 20_000), (2, 20_010)] {
+            let observed_epoch = harness
+                .control_plane
+                .current_snapshot()
+                .expect("experimental snapshot should read before startup heartbeat")
+                .cluster_epoch();
+            harness
+                .control_plane
+                .refresh_node_heartbeat(
+                    NodeHeartbeat {
+                        node_id: NodeId::new(node_id),
+                        node_incarnation: 1,
+                        endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
+                        observed_epoch,
+                        requested_lease_duration_ms: 500,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    now_ms,
+                )
+                .expect("experimental raft startup heartbeat should refresh");
+        }
+
+        let peering_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read before peering heartbeats")
+            .cluster_epoch();
+        let proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let applied_before_peering = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("experimental Raft status should read before peering heartbeats")
+            .applied();
+
+        let first = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(7),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                20_020,
+            )
+            .expect("first peering observation should refresh durably");
+        assert_eq!(first.runtime_map().pg_routes()[0].state(), PgState::Peering);
+        assert_ne!(
+            harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("experimental Raft status should read after first peering heartbeat")
+                .applied(),
+            applied_before_peering,
+            "Peering evidence must advance the durable applied cursor"
+        );
+
+        let second = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(2),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(7),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                20_030,
+            )
+            .expect("second peering observation should complete from durable evidence");
+        let route = &second.runtime_map().pg_routes()[0];
+        assert_eq!(route.state(), PgState::Active);
+        assert_eq!(route.primary_node_id(), NodeId::new(1));
 
         harness.shutdown();
     }
@@ -6939,6 +7148,11 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read after initial heartbeat")
             .cluster_epoch();
+        let applied_before_epoch_acknowledgement = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("experimental Raft status should read before epoch acknowledgement")
+            .applied();
         let shortened = harness
             .control_plane
             .refresh_node_heartbeat(
@@ -6955,6 +7169,15 @@ mod tests {
             )
             .expect("experimental raft heartbeat should preserve longer existing lease");
         assert_eq!(shortened.lease().lease_deadline_ms(), 41_000);
+        let applied_after_epoch_acknowledgement = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("experimental Raft status should read after epoch acknowledgement")
+            .applied();
+        assert_ne!(
+            applied_after_epoch_acknowledgement, applied_before_epoch_acknowledgement,
+            "a node's first acknowledgement of a new epoch must be durable"
+        );
         assert_eq!(
             harness
                 .control_plane
@@ -6964,6 +7187,104 @@ mod tests {
                 .expect("node should exist")
                 .lease_deadline_ms(),
             Some(41_000)
+        );
+
+        let renewed = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: refreshed_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                40_200,
+            )
+            .expect("covered experimental raft heartbeat should renew volatile lease");
+        assert_eq!(renewed.lease().lease_deadline_ms(), 41_200);
+        assert_eq!(
+            harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("experimental Raft status should read after volatile renewal")
+                .applied(),
+            applied_after_epoch_acknowledgement,
+            "repeated covered renewal must retain the same applied cursor"
+        );
+
+        let rejected = harness
+            .control_plane
+            .submit_raft_command(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(99),
+                availability: NodeAvailabilityState::Unavailable,
+            })
+            .expect_err("unknown-node command should reject after committing");
+        assert!(matches!(rejected, ControlPlaneError::UnknownNode { .. }));
+        assert_eq!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("snapshot should read after committed log progress")
+                .node(NodeId::new(1))
+                .expect("node should exist")
+                .lease_deadline_ms(),
+            Some(41_200),
+            "same-term rejected log progress must rebase the acknowledged volatile lease"
+        );
+        harness
+            .control_plane
+            .submit_raft_command(ControlPlaneCommand::SetNodeMembership {
+                node_id: NodeId::new(1),
+                membership: NodeMembershipState::Active,
+            })
+            .expect("unrelated applied no-op should commit");
+        assert_eq!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("snapshot should read after applied log progress")
+                .node(NodeId::new(1))
+                .expect("node should exist")
+                .lease_deadline_ms(),
+            Some(41_200),
+            "same-term applied log progress must rebase the acknowledged volatile lease"
+        );
+        harness
+            .control_plane
+            .block_on(harness.authority.add_learner(
+                2,
+                BasicNode::new("unused-test-learner"),
+                false,
+            ))
+            .expect("unrelated learner membership entry should commit");
+        assert_eq!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("snapshot should read after membership log progress")
+                .node(NodeId::new(1))
+                .expect("node should exist")
+                .lease_deadline_ms(),
+            Some(41_200),
+            "same-term membership log progress must rebase the acknowledged volatile lease"
+        );
+        let expiry = harness
+            .control_plane
+            .expire_heartbeat_leases(41_000)
+            .expect("the old durable deadline must not expire a rebased volatile lease");
+        assert_eq!(expiry.1, 0);
+        assert_eq!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("snapshot should retain the rebased lease after the old deadline")
+                .node(NodeId::new(1))
+                .expect("node should exist")
+                .lease_deadline_ms(),
+            Some(41_200)
         );
 
         harness.shutdown();
@@ -8487,10 +8808,38 @@ mod tests {
             .expect("durable experimental active heartbeat should checkpoint");
         assert!(active_refresh.lease().serving());
         assert_eq!(active_refresh.lease().lease_deadline_ms(), 20_800);
-        let expected = harness
+        let steady_refresh = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: active_epoch,
+                    requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(7),
+                        state: PgState::Active,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                20_300,
+            )
+            .expect("unchanged durable experimental active heartbeat should stay live");
+        assert_eq!(steady_refresh.lease().lease_deadline_ms(), 20_900);
+        let live_before_restart = harness
             .control_plane
             .current_snapshot()
             .expect("durable experimental snapshot should read before restart");
+        assert_eq!(
+            live_before_restart
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(20_900)
+        );
         assert!(state_path.exists());
         harness.shutdown();
 
@@ -8502,11 +8851,59 @@ mod tests {
             .control_plane
             .current_snapshot()
             .expect("durable experimental raft snapshot should read after restart");
-        assert_eq!(restored, expected);
+        assert_eq!(
+            restored.node(NodeId::new(1)).unwrap().lease_deadline_ms(),
+            Some(20_800),
+            "leader-local covered renewal must not enter the durable restart artifact"
+        );
+        assert_ne!(restored, live_before_restart);
 
+        let durable_runtime_map =
+            ControlPlaneRuntimeMapSource::runtime_map_snapshot(&restarted.control_plane, 20_400)
+                .expect("restart should serve from the last durable Active observation");
+        assert_eq!(
+            durable_runtime_map.pg_routes()[0].primary_lease_deadline_ms(),
+            Some(20_800)
+        );
+        let applied_before_refresh = restarted
+            .control_plane
+            .block_on(restarted.authority.status())
+            .expect("restarted experimental Raft status should read")
+            .applied();
+        let refreshed = restarted
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: restored.cluster_epoch(),
+                    requested_lease_duration_ms: 600,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(7),
+                        state: PgState::Active,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                20_400,
+            )
+            .expect("fresh post-restart heartbeat should renew live serving state");
+        assert!(refreshed.lease().serving());
+        assert_eq!(refreshed.lease().lease_deadline_ms(), 21_000);
+        assert_eq!(
+            restarted
+                .control_plane
+                .block_on(restarted.authority.status())
+                .expect("restarted experimental Raft status should read after refresh")
+                .applied(),
+            applied_before_refresh,
+            "post-restart heartbeat covered by the restored horizon should remain volatile"
+        );
         let runtime_map =
-            ControlPlaneRuntimeMapSource::runtime_map_snapshot(&restarted.control_plane, 20_300)
-                .expect("durable experimental raft runtime map should read after restart");
+            ControlPlaneRuntimeMapSource::runtime_map_snapshot(&restarted.control_plane, 20_400)
+                .expect("durable experimental raft runtime map should read after fresh heartbeat");
         let restored_route = runtime_map
             .pg_routes()
             .iter()
@@ -8514,7 +8911,7 @@ mod tests {
             .expect("restored runtime map should include PG route");
         assert_eq!(restored_route.state(), PgState::Active);
         assert_eq!(restored_route.primary_node_id(), NodeId::new(1));
-        assert_eq!(restored_route.primary_lease_deadline_ms(), Some(20_800));
+        assert_eq!(restored_route.primary_lease_deadline_ms(), Some(21_000));
 
         restarted.shutdown();
         fs::remove_dir_all(&state_dir).unwrap();
@@ -8617,17 +9014,70 @@ mod tests {
             active_snapshot.pg(PgId::new(17)).unwrap().state(),
             PgState::Active
         );
+        let renewed = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: active_cluster_epoch,
+                    requested_lease_duration_ms: 700,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Active,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                50_400,
+            )
+            .expect("unchanged active heartbeat should renew the live overlay");
+        assert_eq!(renewed.lease().lease_deadline_ms(), 51_100);
+        let rejected = harness
+            .control_plane
+            .submit_raft_command(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(99),
+                availability: NodeAvailabilityState::Unavailable,
+            })
+            .expect_err("unrelated unknown-node command should reject after committing");
+        assert!(matches!(rejected, ControlPlaneError::UnknownNode { .. }));
+        assert_eq!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("rejected command should rebase the live overlay")
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(51_100)
+        );
+        let applied_before_empty_scan = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("experimental Raft status should read before empty expiry scan")
+            .applied();
 
         let no_expiry = harness
             .control_plane
-            .expire_heartbeat_leases(50_899)
-            .expect("pre-deadline expiry should apply as a no-op");
+            .expire_heartbeat_leases(50_900)
+            .expect("the old durable deadline must not expire the acknowledged lease");
         assert_eq!(no_expiry, (active_cluster_epoch, 0, 0));
+        assert_eq!(
+            harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("experimental Raft status should read after empty expiry scan")
+                .applied(),
+            applied_before_empty_scan,
+            "an empty expiry scan must not append a timestamp-only Raft command"
+        );
 
         let expiry = harness
             .control_plane
-            .expire_heartbeat_leases(50_900)
-            .expect("deadline expiry should apply through raft");
+            .expire_heartbeat_leases(51_100)
+            .expect("acknowledged deadline expiry should apply through raft");
         assert!(expiry.0 > active_cluster_epoch);
         assert_eq!(expiry.1, 1);
         assert_eq!(expiry.2, 1);
@@ -8646,6 +9096,218 @@ mod tests {
         assert_eq!(pg.state(), PgState::Peering);
         assert_eq!(pg.active_primary(), None);
         assert_eq!(pg.peering_metadata_proof_floor(), Some(proof));
+        assert_eq!(pg.previous_primary_lease_deadline_ms(), Some(51_100));
+
+        let successor_endpoint = "/tmp/argmin-experimental-raft-node-1.sock".to_string();
+        let first_successor = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 2,
+                    endpoint: successor_endpoint.clone(),
+                    observed_epoch: expired_snapshot.cluster_epoch(),
+                    requested_lease_duration_ms: 3_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                51_101,
+            )
+            .expect("successor heartbeat should be recorded while activation remains fenced");
+        let successor_epoch = first_successor.runtime_map().cluster_epoch();
+        let fenced = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 2,
+                    endpoint: successor_endpoint.clone(),
+                    observed_epoch: successor_epoch,
+                    requested_lease_duration_ms: 3_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                52_099,
+            )
+            .expect("successor heartbeat at the skew fence should remain non-serving");
+        assert_eq!(
+            fenced.runtime_map().pg_routes()[0].state(),
+            PgState::Peering
+        );
+
+        let activated = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 2,
+                    endpoint: successor_endpoint,
+                    observed_epoch: fenced.runtime_map().cluster_epoch(),
+                    requested_lease_duration_ms: 3_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                52_100,
+            )
+            .expect("successor should activate after the acknowledged lease and skew fence");
+        assert_eq!(
+            activated.runtime_map().pg_routes()[0].state(),
+            PgState::Active
+        );
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_targeted_expiry_preserves_unlisted_volatile_renewal() {
+        let mut harness = experimental_raft_test_harness("targeted-lease-expiry-overlay-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![
+            config::ConfiguredStorageNodeSocket {
+                node_id: 1,
+                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            },
+            config::ConfiguredStorageNodeSocket {
+                node_id: 2,
+                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+            },
+        ];
+        config.storage_pg_ids.clear();
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        for (node_id, now_ms, lease_ms) in [(1, 50_000, 900), (2, 50_010, 1_000)] {
+            let observed_epoch = harness
+                .control_plane
+                .current_snapshot()
+                .expect("experimental snapshot should read before startup heartbeat")
+                .cluster_epoch();
+            harness
+                .control_plane
+                .refresh_node_heartbeat(
+                    NodeHeartbeat {
+                        node_id: NodeId::new(node_id),
+                        node_incarnation: 1,
+                        endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
+                        observed_epoch,
+                        requested_lease_duration_ms: lease_ms,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    now_ms,
+                )
+                .expect("experimental raft startup heartbeat should refresh");
+        }
+
+        let observed_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read before volatile renewals")
+            .cluster_epoch();
+        for (node_id, lease_ms) in [(1, 800), (2, 1_000)] {
+            harness
+                .control_plane
+                .refresh_node_heartbeat(
+                    NodeHeartbeat {
+                        node_id: NodeId::new(node_id),
+                        node_incarnation: 1,
+                        endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
+                        observed_epoch,
+                        requested_lease_duration_ms: lease_ms,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    50_100,
+                )
+                .expect("experimental raft heartbeat should acknowledge the current epoch");
+        }
+        let applied_before_volatile_renewals = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("experimental Raft status should read before volatile renewals")
+            .applied();
+        for (node_id, lease_ms) in [(1, 700), (2, 1_000)] {
+            harness
+                .control_plane
+                .refresh_node_heartbeat(
+                    NodeHeartbeat {
+                        node_id: NodeId::new(node_id),
+                        node_incarnation: 1,
+                        endpoint: format!("/tmp/argmin-experimental-raft-node-{node_id}.sock"),
+                        observed_epoch,
+                        requested_lease_duration_ms: lease_ms,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    50_200,
+                )
+                .expect("covered experimental raft heartbeat should renew volatile lease");
+        }
+        assert_eq!(
+            harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("experimental Raft status should read after volatile renewals")
+                .applied(),
+            applied_before_volatile_renewals,
+            "steady covered renewals must not append OpenRaft commands"
+        );
+        let before_expiry = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should include volatile renewals");
+        assert_eq!(
+            before_expiry
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(50_900)
+        );
+        assert_eq!(
+            before_expiry
+                .node(NodeId::new(2))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(51_200)
+        );
+
+        let expiry = harness
+            .control_plane
+            .expire_heartbeat_leases(50_900)
+            .expect("targeted expiry should commit through Raft");
+        assert_eq!(expiry.1, 1);
+        let after_expiry = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should retain unexpired overlay lease");
+        assert_eq!(
+            after_expiry
+                .node(NodeId::new(1))
+                .unwrap()
+                .observed_availability(),
+            NodeAvailabilityState::Unavailable
+        );
+        let unlisted = after_expiry.node(NodeId::new(2)).unwrap();
+        assert_eq!(
+            unlisted.observed_availability(),
+            NodeAvailabilityState::Healthy
+        );
+        assert_eq!(unlisted.lease_deadline_ms(), Some(51_200));
 
         harness.shutdown();
     }
@@ -9522,17 +10184,57 @@ mod tests {
                 40_200,
             )
             .expect("experimental raft active heartbeat should refresh");
+        let live_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental active snapshot should read before volatile renewal")
+            .cluster_epoch();
+        let applied_before_volatile_renewal = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("experimental Raft status should read before volatile renewal")
+            .applied();
+        let renewed = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: live_epoch,
+                    requested_lease_duration_ms: 700,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(13),
+                        state: PgState::Active,
+                        metadata_proof: active_proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                40_400,
+            )
+            .expect("covered heartbeat should renew the source lease in the live overlay");
+        assert_eq!(renewed.lease().lease_deadline_ms(), 41_100);
+        assert_eq!(
+            harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("experimental Raft status should read after volatile renewal")
+                .applied(),
+            applied_before_volatile_renewal,
+            "covered source renewal must remain leader-local before fencing"
+        );
 
         let tmp = short_unix_socket_test_dir("experimental-raft-unix-transfer-admin");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
-        let fence_server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 40_300);
+        let fence_server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 40_500);
         let client = UnixControlPlaneClient::new(&socket_path);
         let fenced = client
             .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(PgId::new(13))
             .expect("Unix metadata-transfer fence should succeed");
         fence_server.join().unwrap();
-        assert_eq!(fenced.source_primary_lease_deadline_ms(), Some(40_900));
+        assert_eq!(fenced.source_primary_lease_deadline_ms(), Some(41_100));
         let fenced_epoch = fenced.runtime_map().cluster_epoch();
         assert!(fenced_epoch > active_epoch);
         let fenced_route = fenced
@@ -9544,11 +10246,32 @@ mod tests {
         assert_eq!(fenced_route.state(), PgState::Peering);
         assert_eq!(fenced_route.acting_set(), &[NodeId::new(1)]);
         assert_eq!(fenced_route.primary_lease_deadline_ms(), None);
+        let durable_fence_deadline = harness
+            .control_plane
+            .block_on(
+                harness
+                    .authority
+                    .raft()
+                    .with_state_machine(|state_machine| {
+                        let deadline = state_machine
+                            .inner()
+                            .snapshot()
+                            .pg(PgId::new(13))
+                            .and_then(|pg| pg.metadata_transfer_fence_source_lease_deadline_ms());
+                        Box::pin(async move { deadline })
+                    }),
+            )
+            .expect("durable metadata-transfer fence state should read");
+        assert_eq!(
+            durable_fence_deadline,
+            Some(41_100),
+            "the committed fence must promote the acknowledged live lease deadline"
+        );
 
         std::fs::remove_file(&socket_path).unwrap();
         let transfer = PgMetadataTransferProof::new(active_epoch, active_proof);
         let install_server =
-            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 40_400);
+            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 40_600);
         let client = UnixControlPlaneClient::new(&socket_path);
         let transfer_runtime_map = client
             .set_pg_acting_set_with_metadata_transfer_runtime_map(

@@ -15,7 +15,7 @@ use placement::NodeId;
 use std::num::NonZeroU64;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 7;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 9;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -26,6 +26,13 @@ const CONTROL_PLANE_COMMAND_PG_MIN_LEN: usize = 4;
 const CONTROL_PLANE_COMMAND_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 30;
 const CONTROL_PLANE_COMMAND_HISTORY_ROUTE_REFERENCE_MIN_LEN: usize = 13;
 const CONTROL_PLANE_COMMAND_READY_PG_MIN_LEN: usize = 48;
+const CONTROL_PLANE_COMMAND_EXPIRED_NODE_LEASE_MIN_LEN: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiredNodeHeartbeatLease {
+    pub node_id: NodeId,
+    pub lease_deadline_ms: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlPlaneCommand {
@@ -50,6 +57,11 @@ pub enum ControlPlaneCommand {
     ExpireHeartbeatLeases {
         expire_at_ms: u64,
     },
+    ExpireNodeHeartbeatLeases {
+        authority: LeaseHorizonAuthorityBinding,
+        expire_at_ms: u64,
+        expired: Vec<ExpiredNodeHeartbeatLease>,
+    },
     EstablishLeaseGrantHorizon {
         authority: LeaseHorizonAuthorityBinding,
         authority_now_ms: u64,
@@ -66,6 +78,8 @@ pub enum ControlPlaneCommand {
     },
     FencePgForMetadataTransfer {
         pg_id: PgId,
+        source_primary_lease_deadline_ms: Option<u64>,
+        lease_horizon_authority: Option<LeaseHorizonAuthorityBinding>,
     },
     SetPgState {
         pg_id: PgId,
@@ -125,6 +139,15 @@ impl std::fmt::Display for ControlPlaneCommand {
             ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms } => {
                 write!(f, "expire-heartbeat-leases(expire_at_ms={expire_at_ms})")
             }
+            ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+                authority,
+                expire_at_ms,
+                expired,
+            } => write!(
+                f,
+                "expire-node-heartbeat-leases(authority={authority:?},expire_at_ms={expire_at_ms},nodes={})",
+                expired.len()
+            ),
             ControlPlaneCommand::EstablishLeaseGrantHorizon {
                 authority,
                 authority_now_ms,
@@ -154,9 +177,15 @@ impl std::fmt::Display for ControlPlaneCommand {
                 acting_set.len(),
                 transfer.source_epoch().get()
             ),
-            ControlPlaneCommand::FencePgForMetadataTransfer { pg_id } => {
-                write!(f, "fence-pg-for-metadata-transfer(pg={})", pg_id.get())
-            }
+            ControlPlaneCommand::FencePgForMetadataTransfer {
+                pg_id,
+                source_primary_lease_deadline_ms,
+                lease_horizon_authority,
+            } => write!(
+                f,
+                "fence-pg-for-metadata-transfer(pg={},source_lease_deadline_ms={source_primary_lease_deadline_ms:?},lease_horizon_authority={lease_horizon_authority:?})",
+                pg_id.get()
+            ),
             ControlPlaneCommand::SetPgState { pg_id, state } => {
                 write!(f, "set-pg-state(pg={},state={state:?})", pg_id.get())
             }
@@ -256,9 +285,20 @@ pub fn encode_control_plane_command(
             write_pg_acting_set(&mut out, *pg_id, acting_set)?;
             write_pg_metadata_transfer_proof(&mut out, *transfer);
         }
-        ControlPlaneCommand::FencePgForMetadataTransfer { pg_id } => {
+        ControlPlaneCommand::FencePgForMetadataTransfer {
+            pg_id,
+            source_primary_lease_deadline_ms,
+            lease_horizon_authority,
+        } => {
+            if source_primary_lease_deadline_ms.is_some() != lease_horizon_authority.is_some() {
+                return Err(command_protocol_error(
+                    "metadata transfer fence must carry both source lease deadline and lease horizon authority, or neither",
+                ));
+            }
             write_u16(&mut out, 8);
             write_u32(&mut out, pg_id.get());
+            write_option_u64(&mut out, *source_primary_lease_deadline_ms);
+            write_lease_horizon_authority(&mut out, *lease_horizon_authority);
         }
         ControlPlaneCommand::SetPgState { pg_id, state } => {
             write_u16(&mut out, 9);
@@ -308,6 +348,52 @@ pub fn encode_control_plane_command(
             }
             write_u64(&mut out, *authority_now_ms);
             write_u64(&mut out, *horizon_duration_ms);
+        }
+        ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+            authority,
+            expire_at_ms,
+            expired,
+        } => {
+            if expired.is_empty() {
+                return Err(command_protocol_error(
+                    "targeted heartbeat expiry requires at least one node",
+                ));
+            }
+            let mut previous_node_id = None;
+            for lease in expired {
+                if previous_node_id.is_some_and(|previous| previous >= lease.node_id) {
+                    return Err(command_protocol_error(
+                        "targeted heartbeat expiry nodes are not strictly ordered",
+                    ));
+                }
+                if lease.lease_deadline_ms == 0 || lease.lease_deadline_ms > *expire_at_ms {
+                    return Err(command_protocol_error(format!(
+                        "targeted heartbeat expiry for node {} has invalid lease deadline {} at expiry {}",
+                        lease.node_id.as_u32(),
+                        lease.lease_deadline_ms,
+                        expire_at_ms
+                    )));
+                }
+                previous_node_id = Some(lease.node_id);
+            }
+            write_u16(&mut out, 13);
+            write_u64(&mut out, authority.clock_generation());
+            match authority.raft_term() {
+                Some(term) => {
+                    write_u8(&mut out, 1);
+                    write_u64(&mut out, term);
+                }
+                None => write_u8(&mut out, 0),
+            }
+            write_u64(&mut out, *expire_at_ms);
+            write_u32(
+                &mut out,
+                len_as_u32(expired.len(), "expired node heartbeat leases")?,
+            );
+            for lease in expired {
+                write_u32(&mut out, lease.node_id.as_u32());
+                write_u64(&mut out, lease.lease_deadline_ms);
+            }
         }
     }
     append_control_plane_command_checksum(&mut out);
@@ -402,9 +488,21 @@ pub fn decode_control_plane_command(
                 transfer,
             }
         }
-        8 => ControlPlaneCommand::FencePgForMetadataTransfer {
-            pg_id: PgId::new(reader.read_u32()?),
-        },
+        8 => {
+            let pg_id = PgId::new(reader.read_u32()?);
+            let source_primary_lease_deadline_ms = read_option_u64(&mut reader)?;
+            let lease_horizon_authority = read_lease_horizon_authority(&mut reader)?;
+            if source_primary_lease_deadline_ms.is_some() != lease_horizon_authority.is_some() {
+                return Err(command_protocol_error(
+                    "metadata transfer fence must carry both source lease deadline and lease horizon authority, or neither",
+                ));
+            }
+            ControlPlaneCommand::FencePgForMetadataTransfer {
+                pg_id,
+                source_primary_lease_deadline_ms,
+                lease_horizon_authority,
+            }
+        }
         9 => ControlPlaneCommand::SetPgState {
             pg_id: PgId::new(reader.read_u32()?),
             state: read_pg_state(&mut reader)?,
@@ -442,6 +540,47 @@ pub fn decode_control_plane_command(
                 authority,
                 authority_now_ms: reader.read_u64()?,
                 horizon_duration_ms: reader.read_u64()?,
+            }
+        }
+        13 => {
+            let authority = read_required_lease_horizon_authority(&mut reader)?;
+            let expire_at_ms = reader.read_u64()?;
+            let expired_count = reader.read_collection_len(
+                "expired node heartbeat leases",
+                CONTROL_PLANE_COMMAND_EXPIRED_NODE_LEASE_MIN_LEN,
+            )?;
+            let mut expired = Vec::with_capacity(expired_count);
+            let mut previous_node_id = None;
+            for _ in 0..expired_count {
+                let lease = ExpiredNodeHeartbeatLease {
+                    node_id: NodeId::new(reader.read_u32()?),
+                    lease_deadline_ms: reader.read_u64()?,
+                };
+                if previous_node_id.is_some_and(|previous| previous >= lease.node_id) {
+                    return Err(command_protocol_error(
+                        "targeted heartbeat expiry nodes are not strictly ordered",
+                    ));
+                }
+                if lease.lease_deadline_ms == 0 || lease.lease_deadline_ms > expire_at_ms {
+                    return Err(command_protocol_error(format!(
+                        "targeted heartbeat expiry for node {} has invalid lease deadline {} at expiry {}",
+                        lease.node_id.as_u32(),
+                        lease.lease_deadline_ms,
+                        expire_at_ms
+                    )));
+                }
+                previous_node_id = Some(lease.node_id);
+                expired.push(lease);
+            }
+            if expired.is_empty() {
+                return Err(command_protocol_error(
+                    "targeted heartbeat expiry requires at least one node",
+                ));
+            }
+            ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+                authority,
+                expire_at_ms,
+                expired,
             }
         }
         tag => {
@@ -961,6 +1100,12 @@ fn validate_committed_command_authority(
             ..
         } => *lease_horizon_authority,
         ControlPlaneCommand::EstablishLeaseGrantHorizon { authority, .. } => Some(*authority),
+        ControlPlaneCommand::ExpireNodeHeartbeatLeases { authority, .. } => Some(*authority),
+        ControlPlaneCommand::FencePgForMetadataTransfer {
+            source_primary_lease_deadline_ms: Some(_),
+            lease_horizon_authority,
+            ..
+        } => *lease_horizon_authority,
         _ => return Ok(()),
     };
     let authority_term = authority.and_then(LeaseHorizonAuthorityBinding::raft_term);
@@ -1390,6 +1535,26 @@ fn write_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
+fn write_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        None => write_u8(out, 0),
+        Some(value) => {
+            write_u8(out, 1);
+            write_u64(out, value);
+        }
+    }
+}
+
+fn read_option_u64(reader: &mut PayloadReader<'_>) -> Result<Option<u64>, ControlPlaneError> {
+    match reader.read_u8()? {
+        0 => Ok(None),
+        1 => reader.read_u64().map(Some),
+        tag => Err(command_protocol_error(format!(
+            "invalid optional u64 presence code {tag}"
+        ))),
+    }
+}
+
 fn len_as_u32(len: usize, field: &'static str) -> Result<u32, ControlPlaneError> {
     u32::try_from(len)
         .map_err(|_| command_protocol_error(format!("{field} length {len} exceeds u32::MAX")))
@@ -1584,6 +1749,20 @@ mod tests {
             ControlPlaneCommand::ExpireHeartbeatLeases {
                 expire_at_ms: 2_000,
             },
+            ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+                authority: LeaseHorizonAuthorityBinding::new(7, Some(11)),
+                expire_at_ms: 2_000,
+                expired: vec![
+                    ExpiredNodeHeartbeatLease {
+                        node_id: NodeId::new(1),
+                        lease_deadline_ms: 1_900,
+                    },
+                    ExpiredNodeHeartbeatLease {
+                        node_id: NodeId::new(2),
+                        lease_deadline_ms: 2_000,
+                    },
+                ],
+            },
             ControlPlaneCommand::EstablishLeaseGrantHorizon {
                 authority: LeaseHorizonAuthorityBinding::new(7, Some(11)),
                 authority_now_ms: 2_100,
@@ -1600,6 +1779,8 @@ mod tests {
             },
             ControlPlaneCommand::FencePgForMetadataTransfer {
                 pg_id: PgId::new(3),
+                source_primary_lease_deadline_ms: Some(1_100),
+                lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(7, Some(11))),
             },
             ControlPlaneCommand::SetPgState {
                 pg_id: PgId::new(3),
@@ -1653,6 +1834,14 @@ mod tests {
                 authority: LeaseHorizonAuthorityBinding::new(u64::MAX, Some(u64::MAX)),
                 authority_now_ms: u64::MAX,
                 horizon_duration_ms: u64::MAX,
+            },
+            ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+                authority: LeaseHorizonAuthorityBinding::new(u64::MAX, Some(u64::MAX)),
+                expire_at_ms: u64::MAX,
+                expired: vec![ExpiredNodeHeartbeatLease {
+                    node_id: NodeId::new(u32::MAX),
+                    lease_deadline_ms: u64::MAX,
+                }],
             },
             ControlPlaneCommand::SetPgActingSet {
                 pg_id: PgId::new(u32::MAX),
@@ -1837,8 +2026,8 @@ mod tests {
 
     #[test]
     fn control_plane_command_codec_rejects_semantic_decode_errors() {
-        let unknown_tag = command_frame(13, |_| {});
-        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 13");
+        let unknown_tag = command_frame(14, |_| {});
+        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 14");
 
         let zero_horizon_generation = command_frame(12, |body| {
             write_u64(body, 0);
@@ -1850,6 +2039,38 @@ mod tests {
             &zero_horizon_generation,
             "lease horizon clock generation and present Raft term must be nonzero",
         );
+
+        let reversed_expiry = ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+            authority: LeaseHorizonAuthorityBinding::new(7, Some(11)),
+            expire_at_ms: 2_000,
+            expired: vec![
+                ExpiredNodeHeartbeatLease {
+                    node_id: NodeId::new(2),
+                    lease_deadline_ms: 1_900,
+                },
+                ExpiredNodeHeartbeatLease {
+                    node_id: NodeId::new(1),
+                    lease_deadline_ms: 1_900,
+                },
+            ],
+        };
+        assert!(matches!(
+            encode_control_plane_command(&reversed_expiry),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message.contains("not strictly ordered")
+        ));
+        let reversed_expiry_frame = command_frame(13, |body| {
+            write_u64(body, 7);
+            write_u8(body, 1);
+            write_u64(body, 11);
+            write_u64(body, 2_000);
+            write_u32(body, 2);
+            write_u32(body, 2);
+            write_u64(body, 1_900);
+            write_u32(body, 1);
+            write_u64(body, 1_900);
+        });
+        assert_decode_error_contains(&reversed_expiry_frame, "not strictly ordered");
 
         let zero_horizon_raft_term = command_frame(12, |body| {
             write_u64(body, 1);
@@ -1884,6 +2105,26 @@ mod tests {
         assert_decode_error_contains(
             &invalid_heartbeat_horizon_authority,
             "invalid lease horizon authority option tag 2",
+        );
+
+        let incomplete_fence = ControlPlaneCommand::FencePgForMetadataTransfer {
+            pg_id: PgId::new(7),
+            source_primary_lease_deadline_ms: Some(1_100),
+            lease_horizon_authority: None,
+        };
+        assert!(matches!(
+            encode_control_plane_command(&incomplete_fence),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message.contains("must carry both source lease deadline")
+        ));
+        let incomplete_fence_frame = command_frame(8, |body| {
+            write_u32(body, 7);
+            write_option_u64(body, Some(1_100));
+            write_lease_horizon_authority(body, None);
+        });
+        assert_decode_error_contains(
+            &incomplete_fence_frame,
+            "must carry both source lease deadline",
         );
 
         let invalid_membership = command_frame(2, |body| {

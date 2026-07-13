@@ -45,7 +45,7 @@ use placement::NodeId;
 use crate::control_plane::{
     AuthorityIncarnation, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
     ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneError, NodeAvailabilityState,
-    NodeMembershipState,
+    NodeMembershipState, RuntimeMapFreshnessProof,
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
@@ -55,8 +55,8 @@ use crate::control_plane_auth::{
 };
 use crate::control_plane_command::{
     decode_control_plane_command, encode_control_plane_command, ControlPlaneCommand,
-    ControlPlaneCommandResponse, ControlPlaneLogId, ControlPlaneSnapshotArtifact,
-    ReplicatedControlPlaneStateMachine,
+    ControlPlaneCommandResponse, ControlPlaneCommandStateMachine, ControlPlaneLogId,
+    ControlPlaneSnapshotArtifact, ReplicatedControlPlaneStateMachine,
 };
 use crate::{ClusterEpoch, PgState};
 
@@ -1720,6 +1720,15 @@ pub struct ControlPlaneRaftAuthority {
     raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     log_store: Option<ControlPlaneRaftLogStore>,
     static_peer_policy: Option<ControlPlaneRaftPeerTransportPolicy>,
+    volatile_heartbeat_update_gate: tokio::sync::Mutex<()>,
+    volatile_heartbeat_overlay: Mutex<Option<ControlPlaneRaftVolatileHeartbeatOverlay>>,
+}
+
+#[derive(Debug, Clone)]
+struct ControlPlaneRaftVolatileHeartbeatOverlay {
+    authority_term: ControlPlaneRaftTerm,
+    base_applied: LogIdOf<ControlPlaneRaftTypeConfig>,
+    snapshot: ClusterControlSnapshot,
 }
 
 pub type ControlPlaneRaftFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -3523,6 +3532,8 @@ impl ControlPlaneRaftAuthority {
             raft,
             log_store: None,
             static_peer_policy: None,
+            volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
+            volatile_heartbeat_overlay: Mutex::new(None),
         }
     }
 
@@ -3539,6 +3550,8 @@ impl ControlPlaneRaftAuthority {
             raft,
             log_store: Some(log_store),
             static_peer_policy: None,
+            volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
+            volatile_heartbeat_overlay: Mutex::new(None),
         }
     }
 
@@ -3556,6 +3569,8 @@ impl ControlPlaneRaftAuthority {
             raft,
             log_store: Some(log_store),
             static_peer_policy: Some(peer_policy),
+            volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
+            volatile_heartbeat_overlay: Mutex::new(None),
         }
     }
 
@@ -3597,11 +3612,21 @@ impl ControlPlaneRaftAuthority {
         retain_removed_voters_as_learners: bool,
     ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
         self.reject_static_peer_reconfiguration("change-membership")?;
+        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let overlay_rebase = self.current_volatile_heartbeat_overlay().await?;
         let response = self
             .raft
             .change_membership(voters, retain_removed_voters_as_learners)
             .await
             .map_err(|error| openraft_remote_error("change-membership", error))?;
+        if let Some((authority_term, snapshot)) = overlay_rebase {
+            self.publish_rebased_volatile_heartbeat_overlay(
+                authority_term,
+                response.log_id,
+                snapshot,
+            )
+            .await?;
+        }
         Ok(response.log_id)
     }
 
@@ -3612,11 +3637,21 @@ impl ControlPlaneRaftAuthority {
         wait_for_catch_up: bool,
     ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
         self.reject_static_peer_reconfiguration("add-learner")?;
+        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let overlay_rebase = self.current_volatile_heartbeat_overlay().await?;
         let response = self
             .raft
             .add_learner(node_id, node, wait_for_catch_up)
             .await
             .map_err(|error| openraft_remote_error("add-learner", error))?;
+        if let Some((authority_term, snapshot)) = overlay_rebase {
+            self.publish_rebased_volatile_heartbeat_overlay(
+                authority_term,
+                response.log_id,
+                snapshot,
+            )
+            .await?;
+        }
         Ok(response.log_id)
     }
 
@@ -3824,28 +3859,260 @@ impl ControlPlaneRaftAuthority {
 
     pub async fn submit_control_plane_command(
         &self,
-        command: ControlPlaneCommand,
+        mut command: ControlPlaneCommand,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
-        submit_control_plane_command_via_openraft(&self.raft, command).await
+        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let status = self.status().await?;
+        let authority_term = status
+            .linearized_authority_serving()
+            .then_some(status.current_term())
+            .flatten();
+        let (durable_snapshot, durable_applied) = self.durable_snapshot_and_applied().await?;
+        let overlay_snapshot = match (authority_term, status.applied(), durable_applied) {
+            (Some(authority_term), Some(status_applied), Some(durable_applied))
+                if status_applied == durable_applied =>
+            {
+                self.volatile_heartbeat_overlay_snapshot(authority_term, durable_applied)?
+                    .map(|snapshot| (authority_term, snapshot))
+            }
+            _ => None,
+        };
+        command = overlay_snapshot
+            .as_ref()
+            .map_or(&durable_snapshot, |(_, snapshot)| snapshot)
+            .bind_metadata_transfer_fence_command(&durable_snapshot, command)?;
+        let overlay_rebase = overlay_snapshot
+            .map(|(authority_term, snapshot)| {
+                let durable_would_apply = durable_snapshot
+                    .apply_control_plane_command(command.clone())
+                    .is_ok();
+                let applied_snapshot = snapshot
+                    .apply_control_plane_command(command.clone())
+                    .map(|applied| applied.into_snapshot());
+                if durable_would_apply && applied_snapshot.is_err() {
+                    return Err(ControlPlaneError::SnapshotInvariantViolation {
+                        context: "volatile heartbeat overlay command rebase",
+                        message: "command applies to committed state but rejects against acknowledged live heartbeat state".to_string(),
+                    });
+                }
+                Ok((authority_term, snapshot, applied_snapshot.ok()))
+            })
+            .transpose()?;
+
+        let submitted = submit_control_plane_command_via_openraft(&self.raft, command).await?;
+        if let Some((authority_term, previous_snapshot, applied_snapshot)) = overlay_rebase {
+            let snapshot = match submitted.outcome() {
+                ControlPlaneRaftCommandOutcome::Applied(_) => applied_snapshot.ok_or_else(|| {
+                    ControlPlaneError::SnapshotInvariantViolation {
+                        context: "volatile heartbeat overlay command rebase",
+                        message: "committed command outcome differed from prevalidated state-machine outcome"
+                            .to_string(),
+                    }
+                })?,
+                ControlPlaneRaftCommandOutcome::Rejected(_) => previous_snapshot,
+            };
+            self.publish_rebased_volatile_heartbeat_overlay(
+                authority_term,
+                submitted.log_id(),
+                snapshot,
+            )
+            .await?;
+        }
+        Ok(submitted)
+    }
+
+    /// Applies a heartbeat only to this leader's live view when the committed
+    /// lease horizon already covers it and no durable control-plane field
+    /// changes. The overlay is tied to the exact applied log ID and leadership
+    /// term. Same-term command submission serializes with this method and
+    /// deterministically rebases the overlay; a term change makes it
+    /// ineligible immediately.
+    pub async fn try_apply_volatile_heartbeat(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
+        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let status = self.status().await?;
+        let Some(authority_term) = status
+            .linearized_authority_serving()
+            .then_some(status.current_term())
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let (durable_snapshot, Some(base_applied)) = self.durable_snapshot_and_applied().await?
+        else {
+            return Ok(None);
+        };
+        let base_snapshot = self
+            .volatile_heartbeat_overlay_snapshot(authority_term, base_applied)?
+            .unwrap_or(durable_snapshot);
+        let Some(next_snapshot) = base_snapshot.apply_covered_volatile_heartbeat(command)? else {
+            return Ok(None);
+        };
+
+        let current_status = self.status().await?;
+        if !current_status.linearized_authority_serving()
+            || current_status.current_term() != Some(authority_term)
+            || current_status.applied() != Some(base_applied)
+        {
+            return Err(ControlPlaneError::RpcRemote {
+                message: "OpenRaft authority changed while publishing volatile heartbeat"
+                    .to_string(),
+            });
+        }
+        *self.lock_volatile_heartbeat_overlay()? = Some(ControlPlaneRaftVolatileHeartbeatOverlay {
+            authority_term,
+            base_applied,
+            snapshot: next_snapshot.clone(),
+        });
+        Ok(Some(next_snapshot))
     }
 
     pub async fn linearized_runtime_map_snapshot(
         &self,
         issued_at_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        runtime_map_via_openraft_read_index(&self.raft, issued_at_ms).await
+        let (durable_snapshot, base_applied) =
+            control_plane_snapshot_via_openraft_read_index(&self.raft).await?;
+        let read_index = control_plane_log_id_from_raft(base_applied).ok_or_else(|| {
+            ControlPlaneError::CommandDecode {
+                message: format!("invalid OpenRaft applied log id for runtime map: {base_applied}"),
+            }
+        })?;
+        let status = self.status().await?;
+        let Some(authority_term) = status
+            .linearized_authority_serving()
+            .then_some(status.current_term())
+            .flatten()
+        else {
+            return durable_snapshot.runtime_map_with_freshness_proof(
+                issued_at_ms,
+                RuntimeMapFreshnessProof::ReadIndex {
+                    authority_incarnation: durable_snapshot.authority_incarnation(),
+                    read_index,
+                    issued_at_ms,
+                },
+            );
+        };
+        let snapshot = if status.applied() == Some(base_applied) {
+            self.volatile_heartbeat_overlay_snapshot(authority_term, base_applied)?
+                .unwrap_or(durable_snapshot)
+        } else {
+            durable_snapshot
+        };
+        snapshot.runtime_map_with_freshness_proof(
+            issued_at_ms,
+            RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation: snapshot.authority_incarnation(),
+                read_index,
+                issued_at_ms,
+            },
+        )
     }
 
     pub async fn current_control_plane_snapshot(
         &self,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let (durable_snapshot, applied) = self.durable_snapshot_and_applied().await?;
+        let status = self.status().await?;
+        let Some(authority_term) = status
+            .linearized_authority_serving()
+            .then_some(status.current_term())
+            .flatten()
+        else {
+            return Ok(durable_snapshot);
+        };
+        let Some(applied) = applied.filter(|applied| status.applied() == Some(*applied)) else {
+            return Ok(durable_snapshot);
+        };
+        Ok(self
+            .volatile_heartbeat_overlay_snapshot(authority_term, applied)?
+            .unwrap_or(durable_snapshot))
+    }
+
+    async fn durable_snapshot_and_applied(
+        &self,
+    ) -> Result<
+        (
+            ClusterControlSnapshot,
+            Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+        ),
+        ControlPlaneError,
+    > {
         self.raft
             .with_state_machine(|state_machine| {
                 let snapshot = state_machine.inner().snapshot().clone();
-                Box::pin(async move { snapshot })
+                let applied = state_machine.last_applied();
+                Box::pin(async move { (snapshot, applied) })
             })
             .await
             .map_err(|error| openraft_remote_error("state-machine snapshot read", error))
+    }
+
+    async fn current_volatile_heartbeat_overlay(
+        &self,
+    ) -> Result<Option<(ControlPlaneRaftTerm, ClusterControlSnapshot)>, ControlPlaneError> {
+        let status = self.status().await?;
+        let Some(authority_term) = status
+            .linearized_authority_serving()
+            .then_some(status.current_term())
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let Some(applied) = status.applied() else {
+            return Ok(None);
+        };
+        Ok(self
+            .volatile_heartbeat_overlay_snapshot(authority_term, applied)?
+            .map(|snapshot| (authority_term, snapshot)))
+    }
+
+    async fn publish_rebased_volatile_heartbeat_overlay(
+        &self,
+        authority_term: ControlPlaneRaftTerm,
+        base_applied: LogIdOf<ControlPlaneRaftTypeConfig>,
+        snapshot: ClusterControlSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        let current_status = self.status().await?;
+        if current_status.linearized_authority_serving()
+            && current_status.current_term() == Some(authority_term)
+            && current_status.applied() == Some(base_applied)
+        {
+            *self.lock_volatile_heartbeat_overlay()? =
+                Some(ControlPlaneRaftVolatileHeartbeatOverlay {
+                    authority_term,
+                    base_applied,
+                    snapshot,
+                });
+        }
+        Ok(())
+    }
+
+    fn volatile_heartbeat_overlay_snapshot(
+        &self,
+        authority_term: ControlPlaneRaftTerm,
+        base_applied: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
+        Ok(self
+            .lock_volatile_heartbeat_overlay()?
+            .as_ref()
+            .filter(|overlay| {
+                overlay.authority_term == authority_term && overlay.base_applied == base_applied
+            })
+            .map(|overlay| overlay.snapshot.clone()))
+    }
+
+    fn lock_volatile_heartbeat_overlay(
+        &self,
+    ) -> Result<MutexGuard<'_, Option<ControlPlaneRaftVolatileHeartbeatOverlay>>, ControlPlaneError>
+    {
+        self.volatile_heartbeat_overlay
+            .lock()
+            .map_err(|_| ControlPlaneError::RpcRemote {
+                message: "OpenRaft volatile heartbeat overlay mutex poisoned".to_string(),
+            })
     }
 
     pub async fn store_durable_restart_artifact(
@@ -4462,6 +4729,25 @@ pub async fn runtime_map_via_openraft_read_index(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     issued_at_ms: u64,
 ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+    let (snapshot, applied_log_id) = control_plane_snapshot_via_openraft_read_index(raft).await?;
+    let read_index = control_plane_log_id_from_raft(applied_log_id).ok_or_else(|| {
+        ControlPlaneError::CommandDecode {
+            message: format!("invalid OpenRaft applied log id for runtime map: {applied_log_id}"),
+        }
+    })?;
+    snapshot.runtime_map_with_freshness_proof(
+        issued_at_ms,
+        RuntimeMapFreshnessProof::ReadIndex {
+            authority_incarnation: snapshot.authority_incarnation(),
+            read_index,
+            issued_at_ms,
+        },
+    )
+}
+
+async fn control_plane_snapshot_via_openraft_read_index(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+) -> Result<(ClusterControlSnapshot, LogIdOf<ControlPlaneRaftTypeConfig>), ControlPlaneError> {
     let read_log_id = raft
         .ensure_linearizable(ReadPolicy::ReadIndex)
         .await
@@ -4489,7 +4775,7 @@ pub async fn runtime_map_via_openraft_read_index(
                     last_applied: state_machine.inner().last_applied(),
                 });
             }
-            state_machine.runtime_map_for_current_applied_read_index(issued_at_ms)
+            Ok((state_machine.inner().snapshot().clone(), last_applied))
         })
     })
     .await

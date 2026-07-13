@@ -20,7 +20,8 @@ use crate::control_plane_auth::{
 };
 use crate::control_plane_command::{
     AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
-    ControlPlaneCommandStateMachine, ControlPlaneLogId, ReadyPgPeeringCompletion,
+    ControlPlaneCommandStateMachine, ControlPlaneLogId, ExpiredNodeHeartbeatLease,
+    ReadyPgPeeringCompletion,
 };
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::control_plane_lease::{
@@ -1144,6 +1145,19 @@ impl NodeControlRecord {
         self.lease_deadline_ms
     }
 
+    fn pg_observation_state_matches(&self, other: &Self) -> bool {
+        self.pg_observations.len() == other.pg_observations.len()
+            && self.pg_observations.iter().all(|(pg_id, current)| {
+                other.pg_observations.get(pg_id).is_some_and(|updated| {
+                    current.pg_id == updated.pg_id
+                        && current.state == updated.state
+                        && current.observed_epoch == updated.observed_epoch
+                        && current.metadata_proof == updated.metadata_proof
+                        && current.pending_metadata_command == updated.pending_metadata_command
+                })
+            })
+    }
+
     pub fn pg_observation(&self, pg_id: PgId) -> Option<&NodePgObservationRecord> {
         self.pg_observations.get(&pg_id)
     }
@@ -2020,8 +2034,109 @@ impl ClusterControlSnapshot {
                 && current.observed_availability == updated.observed_availability
                 && current.node_incarnation == updated.node_incarnation
                 && current.endpoint == updated.endpoint
+                && current.last_observed_epoch == updated.last_observed_epoch
                 && current.cluster_map_history_route_references
                     == updated.cluster_map_history_route_references
+                && current.pg_observation_state_matches(updated)
+        })
+    }
+
+    pub(crate) fn apply_covered_volatile_heartbeat(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> Result<Option<Self>, ControlPlaneError> {
+        let ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            lease_deadline_ms,
+            lease_horizon_authority,
+            ..
+        } = &command
+        else {
+            return Ok(None);
+        };
+        let Some(authority) = *lease_horizon_authority else {
+            return Ok(None);
+        };
+        if !self.lease_grant_horizon_covers(authority, *lease_deadline_ms) {
+            return Ok(None);
+        }
+
+        let node_id = heartbeat.node_id;
+        let applied = self.apply_control_plane_command(command)?;
+        if !self.heartbeat_update_is_volatile(applied.snapshot(), node_id) {
+            return Ok(None);
+        }
+
+        let mut next_snapshot = applied.into_snapshot();
+        next_snapshot.max_committed_timestamp_ms = self.max_committed_timestamp_ms;
+        validate_control_plane_snapshot(
+            "attempted to publish invalid volatile heartbeat state",
+            &next_snapshot,
+        )?;
+        Ok(Some(next_snapshot))
+    }
+
+    pub(crate) fn bind_metadata_transfer_fence_command(
+        &self,
+        durable_snapshot: &Self,
+        command: ControlPlaneCommand,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        let ControlPlaneCommand::FencePgForMetadataTransfer { pg_id, .. } = command else {
+            return Ok(command);
+        };
+        let fence_command = || ControlPlaneCommand::FencePgForMetadataTransfer {
+            pg_id,
+            source_primary_lease_deadline_ms: None,
+            lease_horizon_authority: None,
+        };
+        let source_deadline = |snapshot: &Self| -> Result<Option<u64>, ControlPlaneError> {
+            let applied = snapshot.apply_control_plane_command(fence_command())?;
+            let ControlPlaneCommandResponse::FencePgForMetadataTransfer {
+                source_primary_lease_deadline_ms,
+            } = applied.response()
+            else {
+                unreachable!("metadata transfer fence command returned the wrong response");
+            };
+            Ok(*source_primary_lease_deadline_ms)
+        };
+        let live_source_deadline_ms = source_deadline(self)?;
+        let durable_source_deadline_ms = source_deadline(durable_snapshot)?;
+        if live_source_deadline_ms == durable_source_deadline_ms {
+            return Ok(fence_command());
+        }
+        let (Some(live_source_deadline_ms), Some(durable_source_deadline_ms)) =
+            (live_source_deadline_ms, durable_source_deadline_ms)
+        else {
+            return Err(ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata transfer fence volatile lease binding",
+                message: format!(
+                    "live source lease deadline {live_source_deadline_ms:?} is incompatible with durable deadline {durable_source_deadline_ms:?} for PG {}",
+                    pg_id.get()
+                ),
+            });
+        };
+        if live_source_deadline_ms < durable_source_deadline_ms {
+            return Err(ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata transfer fence volatile lease binding",
+                message: format!(
+                    "live source lease deadline {live_source_deadline_ms} regresses durable deadline {durable_source_deadline_ms} for PG {}",
+                    pg_id.get()
+                ),
+            });
+        }
+        let lease_horizon_authority = self.lease_grant_horizon_authority().ok_or_else(|| {
+            ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata transfer fence volatile lease binding",
+                message: format!(
+                    "live source lease deadline {live_source_deadline_ms} has no lease-horizon authority for PG {}",
+                    pg_id.get()
+                ),
+            }
+        })?;
+        Ok(ControlPlaneCommand::FencePgForMetadataTransfer {
+            pg_id,
+            source_primary_lease_deadline_ms: Some(live_source_deadline_ms),
+            lease_horizon_authority: Some(lease_horizon_authority),
         })
     }
 
@@ -2036,6 +2151,31 @@ impl ClusterControlSnapshot {
     #[must_use]
     pub fn heartbeat_lease_expiry_timestamp(&self, now_ms: u64) -> u64 {
         now_ms
+    }
+
+    #[must_use]
+    pub fn expired_node_heartbeat_leases(
+        &self,
+        expire_at_ms: u64,
+    ) -> Vec<ExpiredNodeHeartbeatLease> {
+        self.nodes
+            .values()
+            .filter(|record| {
+                !matches!(
+                    record.membership,
+                    NodeMembershipState::Out | NodeMembershipState::Removed
+                ) && record.observed_availability != NodeAvailabilityState::Unavailable
+            })
+            .filter_map(|record| {
+                record
+                    .lease_deadline_ms
+                    .filter(|lease_deadline_ms| *lease_deadline_ms <= expire_at_ms)
+                    .map(|lease_deadline_ms| ExpiredNodeHeartbeatLease {
+                        node_id: record.node_id,
+                        lease_deadline_ms,
+                    })
+            })
+            .collect()
     }
 
     fn record_committed_timestamp(&mut self, timestamp_ms: u64) -> bool {
@@ -3184,6 +3324,131 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     changed,
                 ))
             }
+            ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+                authority,
+                expire_at_ms,
+                expired,
+            } => {
+                if expired.is_empty() {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: "targeted heartbeat expiry requires at least one node".to_string(),
+                    });
+                }
+                if let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms {
+                    if expire_at_ms < max_committed_timestamp_ms {
+                        return Err(ControlPlaneError::CommittedTimestampRegression {
+                            timestamp_ms: expire_at_ms,
+                            max_committed_timestamp_ms,
+                        });
+                    }
+                }
+                let horizon =
+                    self.lease_grant_horizon
+                        .ok_or_else(|| ControlPlaneError::CommandDecode {
+                            message: "targeted heartbeat expiry requires a committed lease horizon"
+                                .to_string(),
+                        })?;
+                if horizon.authority() != authority {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "targeted heartbeat expiry authority {authority:?} does not match committed horizon authority {:?}",
+                            horizon.authority()
+                        ),
+                    });
+                }
+                let mut previous_node_id = None;
+                for lease in &expired {
+                    if previous_node_id.is_some_and(|previous| previous >= lease.node_id) {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: "targeted heartbeat expiry nodes are not strictly ordered"
+                                .to_string(),
+                        });
+                    }
+                    previous_node_id = Some(lease.node_id);
+                    if lease.lease_deadline_ms == 0
+                        || lease.lease_deadline_ms > expire_at_ms
+                        || lease.lease_deadline_ms > horizon.grant_not_after_ms()
+                    {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "targeted heartbeat expiry for node {} has invalid lease deadline {} at expiry {} under horizon {}",
+                                lease.node_id.as_u32(),
+                                lease.lease_deadline_ms,
+                                expire_at_ms,
+                                horizon.grant_not_after_ms()
+                            ),
+                        });
+                    }
+                    let record =
+                        self.nodes
+                            .get(&lease.node_id)
+                            .ok_or(ControlPlaneError::UnknownNode {
+                                node_id: lease.node_id.as_u32(),
+                            })?;
+                    if matches!(
+                        record.membership,
+                        NodeMembershipState::Out | NodeMembershipState::Removed
+                    ) || record.observed_availability == NodeAvailabilityState::Unavailable
+                    {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "targeted heartbeat expiry for node {} no longer applies",
+                                lease.node_id.as_u32()
+                            ),
+                        });
+                    }
+                    let current_deadline_ms = record.lease_deadline_ms.ok_or_else(|| {
+                        ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "targeted heartbeat expiry for node {} has no committed lease",
+                                lease.node_id.as_u32()
+                            ),
+                        }
+                    })?;
+                    if current_deadline_ms > lease.lease_deadline_ms {
+                        return Err(ControlPlaneError::NodeLeaseDeadlineRegression {
+                            node_id: lease.node_id.as_u32(),
+                            current_lease_deadline_ms: current_deadline_ms,
+                            requested_lease_deadline_ms: lease.lease_deadline_ms,
+                        });
+                    }
+                }
+
+                let mut next_snapshot = self.clone();
+                let timestamp_changed = next_snapshot.record_committed_timestamp(expire_at_ms);
+                let mut expired_nodes = Vec::with_capacity(expired.len());
+                let mut serving_expired_nodes = Vec::new();
+                for lease in expired {
+                    let record = next_snapshot
+                        .nodes
+                        .get_mut(&lease.node_id)
+                        .expect("targeted heartbeat expiry node validated before mutation");
+                    record.observed_availability = NodeAvailabilityState::Unavailable;
+                    record.lease_deadline_ms = None;
+                    expired_nodes.push(lease.node_id);
+                    if record.administratively_available {
+                        serving_expired_nodes.push(lease.node_id);
+                    }
+                }
+                let peering_pgs = if serving_expired_nodes.is_empty() {
+                    Vec::new()
+                } else {
+                    let peering_pgs =
+                        mark_pgs_peering_for_nodes(&mut next_snapshot, self, serving_expired_nodes);
+                    next_snapshot.bump_epoch()?;
+                    peering_pgs
+                };
+                let changed = timestamp_changed || !expired_nodes.is_empty();
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::ExpireHeartbeatLeases {
+                        expired_nodes,
+                        peering_pgs,
+                    },
+                    changed,
+                ))
+            }
             ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => {
                 validate_acting_set(self, pg_id, &acting_set)?;
                 let mut next_snapshot = self.clone();
@@ -3415,14 +3680,15 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     true,
                 ))
             }
-            ControlPlaneCommand::FencePgForMetadataTransfer { pg_id } => {
+            ControlPlaneCommand::FencePgForMetadataTransfer {
+                pg_id,
+                source_primary_lease_deadline_ms: committed_source_lease_deadline_ms,
+                lease_horizon_authority,
+            } => {
                 let record = self
                     .pg(pg_id)
                     .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-                let previous_primary_lease = active_primary_lease(self, record)
-                    .or_else(|| record.previous_primary_lease.clone())
-                    .map(PreviousPrimaryLease::without_reactivation_preference);
-                let source_primary_lease_deadline_ms = if record.state == PgState::Active {
+                let observed_source_lease_deadline_ms = if record.state == PgState::Active {
                     let primary = record
                         .active_primary
                         .filter(|primary| record.acting_set.contains(primary))
@@ -3457,6 +3723,58 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 } else {
                     None
                 };
+                let source_primary_lease_deadline_ms = match (
+                    committed_source_lease_deadline_ms,
+                    lease_horizon_authority,
+                    observed_source_lease_deadline_ms,
+                ) {
+                    (None, None, observed) => observed,
+                    (Some(committed), Some(authority), Some(observed)) if committed >= observed => {
+                        if !self.lease_grant_horizon_covers(authority, committed) {
+                            return Err(ControlPlaneError::CommandDecode {
+                                message: format!(
+                                    "metadata transfer fence for PG {} source lease deadline {} is not covered by the committed lease horizon",
+                                    pg_id.get(), committed
+                                ),
+                            });
+                        }
+                        Some(committed)
+                    }
+                    (Some(committed), Some(_), Some(observed)) => {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "metadata transfer fence for PG {} regresses source lease deadline from {} to {}",
+                                    pg_id.get(), observed, committed
+                            ),
+                        });
+                    }
+                    (Some(committed), Some(_), None) => {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "metadata transfer fence for PG {} supplies source lease deadline {} without a live or retained source lease",
+                                    pg_id.get(), committed
+                            ),
+                        });
+                    }
+                    (deadline, authority, _) => {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "metadata transfer fence for PG {} must carry both source lease deadline and lease horizon authority, or neither (deadline={deadline:?}, authority={authority:?})",
+                                pg_id.get()
+                            ),
+                        });
+                    }
+                };
+                let previous_primary_lease = active_primary_lease(self, record)
+                    .or_else(|| record.previous_primary_lease.clone())
+                    .map(|mut previous| {
+                        if let Some(source_primary_lease_deadline_ms) =
+                            source_primary_lease_deadline_ms
+                        {
+                            previous.lease_deadline_ms = source_primary_lease_deadline_ms;
+                        }
+                        previous.without_reactivation_preference()
+                    });
                 let active_source_floor = match record.state {
                     PgState::Peering => {
                         if record.peering_metadata_transfer.is_some() {
@@ -6474,29 +6792,16 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
     fn apply_heartbeat_command(
         &mut self,
         command: ControlPlaneCommand,
-        node_id: NodeId,
-        lease_horizon_authority: Option<LeaseHorizonAuthorityBinding>,
-        lease_deadline_ms: u64,
     ) -> Result<(), ControlPlaneError> {
-        let horizon_already_covers_lease = lease_horizon_authority.is_some_and(|authority| {
-            self.snapshot
-                .lease_grant_horizon_covers(authority, lease_deadline_ms)
-        });
-        let applied = self.snapshot.apply_control_plane_command(command)?;
-        if horizon_already_covers_lease
-            && self
-                .snapshot
-                .heartbeat_update_is_volatile(applied.snapshot(), node_id)
+        if let Some(next_snapshot) = self
+            .snapshot
+            .apply_covered_volatile_heartbeat(command.clone())?
         {
-            let max_committed_timestamp_ms = self.snapshot.max_committed_timestamp_ms;
-            let mut next_snapshot = applied.into_snapshot();
-            next_snapshot.max_committed_timestamp_ms = max_committed_timestamp_ms;
-            validate_control_plane_snapshot(
-                "attempted to publish invalid volatile heartbeat state",
-                &next_snapshot,
-            )?;
             self.snapshot = next_snapshot;
-        } else if applied.changed() {
+            return Ok(());
+        }
+        let applied = self.snapshot.apply_control_plane_command(command)?;
+        if applied.changed() {
             self.commit_snapshot(applied.into_snapshot())?;
         }
         Ok(())
@@ -6575,8 +6880,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &mut self,
         pg_id: PgId,
     ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
-        let applied = self
-            .apply_and_commit_command(ControlPlaneCommand::FencePgForMetadataTransfer { pg_id })?;
+        let applied =
+            self.apply_and_commit_command(ControlPlaneCommand::FencePgForMetadataTransfer {
+                pg_id,
+                source_primary_lease_deadline_ms: None,
+                lease_horizon_authority: None,
+            })?;
         let source_primary_lease_deadline_ms = match applied.response() {
             ControlPlaneCommandResponse::FencePgForMetadataTransfer {
                 source_primary_lease_deadline_ms,
@@ -6662,17 +6971,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         let observed_epoch = heartbeat.observed_epoch;
         let current_epoch = self.snapshot.cluster_epoch;
         let node_id = heartbeat.node_id;
-        self.apply_heartbeat_command(
-            ControlPlaneCommand::RecordNodeHeartbeat {
-                heartbeat,
-                heartbeat_at_ms: authority_now_ms,
-                lease_deadline_ms,
-                lease_horizon_authority,
-            },
-            node_id,
-            lease_horizon_authority,
+        self.apply_heartbeat_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            heartbeat_at_ms: authority_now_ms,
             lease_deadline_ms,
-        )?;
+            lease_horizon_authority,
+        })?;
         let serving = self.snapshot.node(node_id).is_some_and(|record| {
             observed_epoch == current_epoch
                 && record.can_serve_primary(self.snapshot.cluster_epoch, authority_now_ms)
@@ -28123,25 +28427,34 @@ mod tests {
         assert!(control_plane
             .snapshot()
             .lease_grant_horizon_covers(authority, first.lease().lease_deadline_ms()));
-        let durable_after_first = std::fs::read(&store_path).unwrap();
-        let persisted_after_first = store.load().unwrap().unwrap();
 
         let current_epoch = control_plane.snapshot().cluster_epoch();
-        let renewed = control_plane
+        let acknowledged = control_plane
             .refresh_node_heartbeat_with_lease_horizon_authority(
                 heartbeat(1, current_epoch, 12_000),
                 12_000,
                 authority,
             )
             .unwrap();
+        assert_eq!(acknowledged.lease().lease_deadline_ms(), 12_100);
         assert_eq!(
             control_plane.snapshot().lease_grant_horizon(),
             Some(first_horizon),
             "a covered heartbeat must not extend the durable horizon"
         );
+        let durable_after_epoch_acknowledgement = std::fs::read(&store_path).unwrap();
+        let persisted_after_epoch_acknowledgement = store.load().unwrap().unwrap();
+
+        let renewed = control_plane
+            .refresh_node_heartbeat_with_lease_horizon_authority(
+                heartbeat(1, current_epoch, 12_001),
+                12_001,
+                authority,
+            )
+            .unwrap();
         assert_eq!(
             std::fs::read(&store_path).unwrap(),
-            durable_after_first,
+            durable_after_epoch_acknowledgement,
             "an unchanged heartbeat covered by the durable horizon must not rewrite state"
         );
         assert_eq!(
@@ -28166,7 +28479,7 @@ mod tests {
                 .node(NodeId::new(1))
                 .unwrap()
                 .lease_deadline_ms(),
-            persisted_after_first
+            persisted_after_epoch_acknowledgement
                 .node(NodeId::new(1))
                 .unwrap()
                 .lease_deadline_ms(),
@@ -28177,8 +28490,8 @@ mod tests {
         let replacement_authority = LeaseHorizonAuthorityBinding::new(8, None);
         let error = control_plane
             .refresh_node_heartbeat_with_lease_horizon_authority(
-                heartbeat(1, current_epoch, 12_001),
-                12_001,
+                heartbeat(1, current_epoch, 12_002),
+                12_002,
                 replacement_authority,
             )
             .unwrap_err();
@@ -28768,6 +29081,78 @@ mod tests {
             ClusterEpoch::new(before.cluster_epoch().get() + 1).unwrap()
         );
         assert_eq!(applied.snapshot().max_committed_timestamp_ms(), Some(1_130));
+    }
+
+    #[test]
+    fn targeted_heartbeat_expiry_does_not_expire_unlisted_volatile_renewals() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        assert!(heartbeat_until_serving(&mut authority, 2, 1_000).serving());
+
+        let horizon_authority = LeaseHorizonAuthorityBinding::new(7, Some(2));
+        let authority_now_ms = authority.snapshot().max_committed_timestamp_ms().unwrap();
+        let with_horizon = authority
+            .snapshot()
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: horizon_authority,
+                authority_now_ms,
+                horizon_duration_ms: CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS,
+            })
+            .unwrap()
+            .into_snapshot();
+        let node_1_deadline = with_horizon
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        let node_2_deadline = with_horizon
+            .node(NodeId::new(2))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        let expire_at_ms = node_1_deadline.max(node_2_deadline);
+
+        let applied = with_horizon
+            .apply_control_plane_command(ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+                authority: horizon_authority,
+                expire_at_ms,
+                expired: vec![ExpiredNodeHeartbeatLease {
+                    node_id: NodeId::new(1),
+                    lease_deadline_ms: node_1_deadline,
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(
+            applied.response(),
+            &ControlPlaneCommandResponse::ExpireHeartbeatLeases {
+                expired_nodes: vec![NodeId::new(1)],
+                peering_pgs: Vec::new(),
+            }
+        );
+        assert_eq!(
+            applied
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .observed_availability(),
+            NodeAvailabilityState::Unavailable
+        );
+        let unlisted = applied.snapshot().node(NodeId::new(2)).unwrap();
+        assert_eq!(
+            unlisted.observed_availability(),
+            NodeAvailabilityState::Healthy,
+            "a durable deadline that looks expired must not override a newer volatile grant"
+        );
+        assert_eq!(unlisted.lease_deadline_ms(), Some(node_2_deadline));
     }
 
     #[test]

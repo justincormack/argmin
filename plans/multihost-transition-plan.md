@@ -11011,7 +11011,7 @@ Required production shape and implementation order:
    extension loss before durability, durable extension with response loss,
    process/leader changes, consumer refresh, and successor activation; an
    activated successor never overlaps a still-valid acknowledged consumer
-   lease. State format version 22 and durable command codec version 7 now
+   lease. State format version 22 and durable command codec version 9 now
    promote the capability into replicated state.
    `EstablishLeaseGrantHorizon` commits the accepted authority timestamp, a
    positive duration bounded to 60 seconds, the nonzero authority-clock
@@ -11081,11 +11081,54 @@ Required production shape and implementation order:
    candidate instead of saving it. Any
    identity, topology, health transition, route-reference, proof, pending-
    command fence, horizon, or actual expiry change still uses the durable
-   command path. Direct/replicated heartbeat commands remain durable; OpenRaft
-   needs a separate leader-local volatile overlay with the same horizon and
-   publication fences before its ordinary covered renewals can avoid log/WAL
-   traffic. File-byte regressions pin zero snapshot rewrites for covered
-   unchanged renewal and empty expiry scans. The retained route-change failure
+   command path. Direct/replicated heartbeat commands remain durable. OpenRaft
+   now has a separate leader-local volatile overlay outside its replicated
+   state machine. The overlay is bound to the exact serving term and applied
+   OpenRaft log ID. Same-term command submission serializes with volatile
+   heartbeat publication, prevalidates the command against committed and live
+   state, and rebases the live snapshot onto the resulting applied log ID.
+   Deterministic rejection rebases the unchanged live snapshot; successful
+   commands rebase the command's live-state result. Learner and voter
+   membership APIs use the same serialization and unchanged-snapshot rebase.
+   Metadata-transfer fencing is stronger than an ordinary overlay rebase: the
+   proposal binds the live source-primary lease deadline and its exact horizon
+   authority into the committed fence command whenever that deadline is ahead
+   of the durable source deadline. An unchanged durable lease remains derived
+   from committed state, so a later Raft term can fence and wait out an old
+   source lease without claiming the old grant under its new term. Apply rejects deadline
+   regression, missing source authority, horizon overflow, or Raft-term
+   mismatch. Durable fence state and the command response therefore carry the
+   same latest acknowledged deadline even when the durable heartbeat record
+   still contains an older deadline; transfer cannot start while that live
+   source lease remains valid.
+   A leadership-term change
+   still makes the overlay ineligible. Targeted expiry therefore preserves
+   unlisted live leases, while unrelated applied or rejected log entries cannot
+   roll back acknowledged deadlines. Snapshots, restart artifacts,
+   and followers contain committed state only. Linearized reads perform
+   ReadIndex first and include the overlay only
+   while that binding still matches. A covered heartbeat enters the overlay
+   only when identity, topology, administrative/observed availability,
+   acknowledged epoch, exact route references, node PG observations, committed
+   PG state/proofs, history, and the horizon are unchanged. A node's first
+   acknowledgement of a new epoch remains durable because restart refresh and
+   history retention consume it. Every Peering observation remains durable so
+   evidence accumulates across acting-set nodes before the completion command;
+   a changed Active proof is also durable because metadata-transfer fencing
+   consumes it. Only identical steady heartbeats without Peering evidence can
+   remain in the overlay. Empty Raft expiry scans no
+   longer append timestamp-only commands. Non-empty scans commit codec-v9
+   `ExpireNodeHeartbeatLeases` with a strictly ordered, horizon- and term-bound
+   list of the exact live-view deadlines that expired; apply fences only those
+   nodes, so an older durable deadline cannot expire another node whose newer
+   grant remains leader-local. File-byte/applied-cursor regressions pin zero
+   snapshot/log rewrites for covered unchanged renewal and empty expiry scans,
+   exact expiry leaves unlisted renewals healthy, unrelated committed progress
+   retains acknowledged deadlines and their successor-activation fence,
+   linearized frontend maps include current overlay leases, and restart excludes
+   the overlay and fails
+   closed until a fresh heartbeat restores current-epoch observation. The
+   retained route-change failure
    that motivated this slice reached epoch 706 with every node healthy but
    still observing epoch 705 while full-snapshot heartbeat writes contended;
    the frontend exhausted transient retries and aborted on `pg_not_active`.
@@ -11823,8 +11866,11 @@ Phase 12.4 progress:
    - `RecordNodeHeartbeat` commits `heartbeat_at_ms` and `lease_deadline_ms`
      for deterministic replay and validates their internal relationship.
      `ExpireHeartbeatLeases` commits the expiry timestamp used to decide which
-     leases become unavailable, and peering completion commits the timestamp
-     used for lease/proof validation. Phase 12.3 added a replicated
+     leases become unavailable. The OpenRaft path uses the term/horizon-bound
+     `ExpireNodeHeartbeatLeases` form to commit the exact live-view deadlines
+     selected for expiry without sweeping unrelated volatile renewals. Peering
+     completion commits the timestamp used for lease/proof validation. Phase
+     12.3 added a replicated
      `max_committed_timestamp_ms` high-water to the control-plane snapshot:
      timestamp-bearing apply paths reject regressions, and heartbeat apply also
      rejects per-node lease-deadline regression. The DCC-2 integration gates
