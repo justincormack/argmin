@@ -5830,11 +5830,27 @@ impl ControlPlaneRaftWalFile {
         &self,
         record: &ControlPlaneRaftWalRecord,
     ) -> Result<(), ControlPlaneRaftWalAppendError> {
-        let _guard = self
+        let append_started = Instant::now();
+        let result = self.append_record_for_log_store_inner(record);
+        observability::record_control_plane_raft_wal_append(
+            append_started.elapsed(),
+            result.is_ok(),
+        );
+        result
+    }
+
+    fn append_record_for_log_store_inner(
+        &self,
+        record: &ControlPlaneRaftWalRecord,
+    ) -> Result<(), ControlPlaneRaftWalAppendError> {
+        let lock_started = Instant::now();
+        let guard = self
             .io_lock
             .lock()
             .map_err(|_| raft_artifact_protocol_error("control-plane OpenRaft WAL lock poisoned"))
-            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord);
+        observability::record_control_plane_raft_wal_lock_wait(lock_started.elapsed());
+        let _guard = guard?;
         let frame = ControlPlaneRaftWalFrame::new(
             self.cluster_name.clone(),
             self.local_node_id,
@@ -5844,6 +5860,7 @@ impl ControlPlaneRaftWalFile {
         .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
         let frame_len = raft_len_as_u32(frame.len(), "control-plane OpenRaft WAL frame")
             .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        let frame_bytes = frame.len().saturating_add(std::mem::size_of::<u32>());
 
         if let Some(parent) = self
             .path
@@ -5880,16 +5897,23 @@ impl ControlPlaneRaftWalFile {
             &frame,
             "write control-plane OpenRaft WAL frame",
         )?;
-        inject_control_plane_raft_wal_file_sync_failure(&self.path)
-            .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
-        file.sync_all()
-            .map_err(|source| ControlPlaneError::Io {
-                context: "sync control-plane OpenRaft WAL",
-                source,
-            })
-            .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
-        sync_control_plane_raft_wal_parent(&self.path)
-            .map_err(ControlPlaneRaftWalAppendError::ReplayableRecordMayExist)?;
+        let file_sync_started = Instant::now();
+        let file_sync_result = inject_control_plane_raft_wal_file_sync_failure(&self.path)
+            .and_then(|()| {
+                file.sync_all().map_err(|source| ControlPlaneError::Io {
+                    context: "sync control-plane OpenRaft WAL",
+                    source,
+                })
+            });
+        observability::record_control_plane_raft_wal_file_sync(file_sync_started.elapsed());
+        file_sync_result.map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
+        observability::record_control_plane_raft_wal_frame_bytes(frame_bytes);
+        let directory_sync_started = Instant::now();
+        let directory_sync_result = sync_control_plane_raft_wal_parent(&self.path);
+        observability::record_control_plane_raft_wal_directory_sync(
+            directory_sync_started.elapsed(),
+        );
+        directory_sync_result.map_err(ControlPlaneRaftWalAppendError::ReplayableRecordMayExist)?;
         Ok(())
     }
 
@@ -13392,10 +13416,39 @@ mod tests {
             ControlPlaneRaftWalRecord::SaveCommitted(Some(raft_log_id(3, 1, 1))),
         ];
 
+        let metrics_before = observability::control_plane_raft_wal_metrics_snapshot();
         for record in &records {
             wal.append_record(record)
                 .expect("WAL append should succeed");
         }
+        let metrics_after = observability::control_plane_raft_wal_metrics_snapshot();
+        let physical_record_bytes = fs::metadata(wal.path()).unwrap().len()
+            - u64::try_from(ControlPlaneRaftWalFile::file_header_len()).unwrap();
+        assert!(
+            metrics_after.append_total
+                >= metrics_before
+                    .append_total
+                    .saturating_add(records.len() as u64)
+        );
+        assert!(
+            metrics_after.frame_bytes_total
+                >= metrics_before
+                    .frame_bytes_total
+                    .saturating_add(physical_record_bytes),
+            "WAL frame-byte metrics should include every length-prefixed record"
+        );
+        assert!(
+            metrics_after.file_sync_total
+                >= metrics_before
+                    .file_sync_total
+                    .saturating_add(records.len() as u64)
+        );
+        assert!(
+            metrics_after.directory_sync_total
+                >= metrics_before
+                    .directory_sync_total
+                    .saturating_add(records.len() as u64)
+        );
 
         let replayed = wal
             .replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
@@ -13952,6 +14005,7 @@ mod tests {
                 .lock()
                 .expect("test WAL file-sync fault lock should not be poisoned") =
                 Some(wal_path.clone());
+            let metrics_before = observability::control_plane_raft_wal_metrics_snapshot();
             let err = RaftLogStorage::append(
                 &mut store,
                 vec![bootstrap_membership_entry(1)],
@@ -13964,6 +14018,10 @@ mod tests {
                     .contains("append OpenRaft WAL record after ambiguous record write"),
                 "unexpected WAL append error: {err:?}"
             );
+            let metrics_after = observability::control_plane_raft_wal_metrics_snapshot();
+            assert!(metrics_after.append_total > metrics_before.append_total);
+            assert!(metrics_after.append_error_total > metrics_before.append_error_total);
+            assert!(metrics_after.file_sync_total > metrics_before.file_sync_total);
 
             let err = store
                 .export_restart_artifact()
@@ -14034,6 +14092,7 @@ mod tests {
                 .lock()
                 .expect("test WAL parent-sync fault lock should not be poisoned") =
                 Some(wal_path.clone());
+            let metrics_before = observability::control_plane_raft_wal_metrics_snapshot();
             let err = RaftLogStorage::append(
                 &mut store,
                 vec![bootstrap_membership_entry(1)],
@@ -14045,6 +14104,16 @@ mod tests {
                 err.to_string()
                     .contains("append OpenRaft WAL record after replayable record write"),
                 "unexpected WAL append error: {err:?}"
+            );
+            let metrics_after = observability::control_plane_raft_wal_metrics_snapshot();
+            let physical_record_bytes = fs::metadata(&wal_path).unwrap().len()
+                - u64::try_from(ControlPlaneRaftWalFile::file_header_len()).unwrap();
+            assert!(
+                metrics_after.frame_bytes_total
+                    >= metrics_before
+                        .frame_bytes_total
+                        .saturating_add(physical_record_bytes),
+                "file-synced WAL bytes should be counted even when parent sync fails"
             );
 
             let err = store

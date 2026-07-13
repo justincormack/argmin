@@ -263,6 +263,21 @@ static CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_TOTAL: AtomicU64 = AtomicU64::ne
 static CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_CHECKPOINT_COMPACTION_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_APPEND_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_APPEND_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_APPEND_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_APPEND_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_LOCK_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_LOCK_WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_FRAME_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_FRAME_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_FRAME_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_FILE_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_FILE_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_FILE_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_HISTORY_REFERENCE_SAMPLES: OnceLock<
     Mutex<BTreeMap<u32, ControlPlaneHistoryReferenceSample>>,
 > = OnceLock::new();
@@ -564,6 +579,65 @@ pub fn control_plane_raft_checkpoint_metrics_snapshot() -> ControlPlaneRaftCheck
     }
 }
 
+pub fn record_control_plane_raft_wal_append(elapsed: Duration, succeeded: bool) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_WAL_APPEND_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !succeeded {
+        CONTROL_PLANE_RAFT_WAL_APPEND_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    CONTROL_PLANE_RAFT_WAL_APPEND_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_WAL_APPEND_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_raft_wal_lock_wait(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_WAL_LOCK_WAIT_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_WAL_LOCK_WAIT_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_raft_wal_frame_bytes(bytes: usize) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    CONTROL_PLANE_RAFT_WAL_FRAME_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    CONTROL_PLANE_RAFT_WAL_FRAME_BYTES_LAST.store(bytes, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_WAL_FRAME_BYTES_MAX, bytes);
+}
+
+pub fn record_control_plane_raft_wal_file_sync(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_WAL_FILE_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_RAFT_WAL_FILE_SYNC_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_WAL_FILE_SYNC_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_raft_wal_directory_sync(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_MAX, elapsed_us);
+}
+
+#[must_use]
+pub fn control_plane_raft_wal_metrics_snapshot() -> ControlPlaneRaftWalMetricSnapshot {
+    ControlPlaneRaftWalMetricSnapshot {
+        append_total: CONTROL_PLANE_RAFT_WAL_APPEND_TOTAL.load(Ordering::Relaxed),
+        append_error_total: CONTROL_PLANE_RAFT_WAL_APPEND_ERROR_TOTAL.load(Ordering::Relaxed),
+        append_us_total: CONTROL_PLANE_RAFT_WAL_APPEND_US_TOTAL.load(Ordering::Relaxed),
+        append_us_max: CONTROL_PLANE_RAFT_WAL_APPEND_US_MAX.load(Ordering::Relaxed),
+        lock_wait_us_total: CONTROL_PLANE_RAFT_WAL_LOCK_WAIT_US_TOTAL.load(Ordering::Relaxed),
+        lock_wait_us_max: CONTROL_PLANE_RAFT_WAL_LOCK_WAIT_US_MAX.load(Ordering::Relaxed),
+        frame_bytes_total: CONTROL_PLANE_RAFT_WAL_FRAME_BYTES_TOTAL.load(Ordering::Relaxed),
+        frame_bytes_last: CONTROL_PLANE_RAFT_WAL_FRAME_BYTES_LAST.load(Ordering::Relaxed),
+        frame_bytes_max: CONTROL_PLANE_RAFT_WAL_FRAME_BYTES_MAX.load(Ordering::Relaxed),
+        file_sync_total: CONTROL_PLANE_RAFT_WAL_FILE_SYNC_TOTAL.load(Ordering::Relaxed),
+        file_sync_us_total: CONTROL_PLANE_RAFT_WAL_FILE_SYNC_US_TOTAL.load(Ordering::Relaxed),
+        file_sync_us_max: CONTROL_PLANE_RAFT_WAL_FILE_SYNC_US_MAX.load(Ordering::Relaxed),
+        directory_sync_total: CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_TOTAL.load(Ordering::Relaxed),
+        directory_sync_us_total: CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_TOTAL
+            .load(Ordering::Relaxed),
+        directory_sync_us_max: CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_MAX.load(Ordering::Relaxed),
+    }
+}
+
 impl ControlPlaneRpcMetricCounters {
     fn new() -> Self {
         Self {
@@ -629,6 +703,25 @@ pub struct ControlPlaneRaftCheckpointMetricSnapshot {
     pub compaction_error_total: u64,
     pub compaction_us_total: u64,
     pub compaction_us_max: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneRaftWalMetricSnapshot {
+    pub append_total: u64,
+    pub append_error_total: u64,
+    pub append_us_total: u64,
+    pub append_us_max: u64,
+    pub lock_wait_us_total: u64,
+    pub lock_wait_us_max: u64,
+    pub frame_bytes_total: u64,
+    pub frame_bytes_last: u64,
+    pub frame_bytes_max: u64,
+    pub file_sync_total: u64,
+    pub file_sync_us_total: u64,
+    pub file_sync_us_max: u64,
+    pub directory_sync_total: u64,
+    pub directory_sync_us_total: u64,
+    pub directory_sync_us_max: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

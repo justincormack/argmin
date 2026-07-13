@@ -1525,6 +1525,7 @@ fn format_control_plane_runtime_map_diagnostics(
         diagnostics.rpc_metrics(),
         diagnostics.snapshot_metrics(),
         diagnostics.raft_checkpoint_metrics(),
+        diagnostics.raft_wal_metrics(),
         diagnostics.history_reference_samples(),
     )
 }
@@ -1534,6 +1535,7 @@ fn format_control_plane_runtime_map_diagnostics_parts(
     rpc_metrics: &[observability::ControlPlaneRpcMetricSample],
     snapshot: observability::ControlPlaneSnapshotMetricSnapshot,
     raft_checkpoint: observability::ControlPlaneRaftCheckpointMetricSnapshot,
+    raft_wal: observability::ControlPlaneRaftWalMetricSnapshot,
     history_reference_samples: &[observability::ControlPlaneHistoryReferenceSample],
 ) -> String {
     let active_serving_pg_routes = runtime_map
@@ -1643,6 +1645,25 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         raft_checkpoint.compaction_error_total,
         raft_checkpoint.compaction_us_total,
         raft_checkpoint.compaction_us_max,
+    ));
+    output.push('\n');
+    output.push_str(&format!(
+        "control_plane_raft_wal append_total={} append_error_total={} append_us_total={} append_us_max={} lock_wait_us_total={} lock_wait_us_max={} frame_bytes_total={} frame_bytes_last={} frame_bytes_max={} file_sync_total={} file_sync_us_total={} file_sync_us_max={} directory_sync_total={} directory_sync_us_total={} directory_sync_us_max={}",
+        raft_wal.append_total,
+        raft_wal.append_error_total,
+        raft_wal.append_us_total,
+        raft_wal.append_us_max,
+        raft_wal.lock_wait_us_total,
+        raft_wal.lock_wait_us_max,
+        raft_wal.frame_bytes_total,
+        raft_wal.frame_bytes_last,
+        raft_wal.frame_bytes_max,
+        raft_wal.file_sync_total,
+        raft_wal.file_sync_us_total,
+        raft_wal.file_sync_us_max,
+        raft_wal.directory_sync_total,
+        raft_wal.directory_sync_us_total,
+        raft_wal.directory_sync_us_max,
     ));
     output
 }
@@ -11192,6 +11213,13 @@ mod tests {
                 compaction_total: 11,
                 ..observability::ControlPlaneRaftCheckpointMetricSnapshot::default()
             },
+            observability::ControlPlaneRaftWalMetricSnapshot {
+                append_total: 12,
+                frame_bytes_last: 345,
+                file_sync_total: 13,
+                directory_sync_total: 14,
+                ..observability::ControlPlaneRaftWalMetricSnapshot::default()
+            },
             &[observability::ControlPlaneHistoryReferenceSample {
                 node_id: 2,
                 observed_epoch: floor_epoch.get(),
@@ -11214,6 +11242,12 @@ mod tests {
         assert!(
             diagnostics.contains(
                 "control_plane_rpc kind=refresh_node_heartbeat total=9 lock_wait_us_total=10 lock_wait_us_max=11 operation_us_total=12 operation_us_max=13 response_write_us_total=14 response_write_us_max=15"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "control_plane_raft_wal append_total=12 append_error_total=0 append_us_total=0 append_us_max=0 lock_wait_us_total=0 lock_wait_us_max=0 frame_bytes_total=0 frame_bytes_last=345 frame_bytes_max=0 file_sync_total=13 file_sync_us_total=0 file_sync_us_max=0 directory_sync_total=14"
             ),
             "{diagnostics}"
         );

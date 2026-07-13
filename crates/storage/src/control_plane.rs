@@ -6023,6 +6023,7 @@ pub struct ControlPlaneRuntimeMapDiagnostics {
     rpc_metrics: Vec<observability::ControlPlaneRpcMetricSample>,
     snapshot_metrics: observability::ControlPlaneSnapshotMetricSnapshot,
     raft_checkpoint_metrics: observability::ControlPlaneRaftCheckpointMetricSnapshot,
+    raft_wal_metrics: observability::ControlPlaneRaftWalMetricSnapshot,
     history_reference_samples: Vec<observability::ControlPlaneHistoryReferenceSample>,
 }
 
@@ -6047,6 +6048,11 @@ impl ControlPlaneRuntimeMapDiagnostics {
         &self,
     ) -> observability::ControlPlaneRaftCheckpointMetricSnapshot {
         self.raft_checkpoint_metrics
+    }
+
+    #[must_use]
+    pub fn raft_wal_metrics(&self) -> observability::ControlPlaneRaftWalMetricSnapshot {
+        self.raft_wal_metrics
     }
 
     #[must_use]
@@ -12387,6 +12393,22 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, raft_checkpoint.compaction_error_total);
     write_u64(out, raft_checkpoint.compaction_us_total);
     write_u64(out, raft_checkpoint.compaction_us_max);
+    let raft_wal = observability::control_plane_raft_wal_metrics_snapshot();
+    write_u64(out, raft_wal.append_total);
+    write_u64(out, raft_wal.append_error_total);
+    write_u64(out, raft_wal.append_us_total);
+    write_u64(out, raft_wal.append_us_max);
+    write_u64(out, raft_wal.lock_wait_us_total);
+    write_u64(out, raft_wal.lock_wait_us_max);
+    write_u64(out, raft_wal.frame_bytes_total);
+    write_u64(out, raft_wal.frame_bytes_last);
+    write_u64(out, raft_wal.frame_bytes_max);
+    write_u64(out, raft_wal.file_sync_total);
+    write_u64(out, raft_wal.file_sync_us_total);
+    write_u64(out, raft_wal.file_sync_us_max);
+    write_u64(out, raft_wal.directory_sync_total);
+    write_u64(out, raft_wal.directory_sync_us_total);
+    write_u64(out, raft_wal.directory_sync_us_max);
     let runtime_node_ids = runtime_map
         .nodes()
         .iter()
@@ -12482,6 +12504,23 @@ fn read_control_plane_runtime_map_diagnostics(
         compaction_us_total: reader.read_u64()?,
         compaction_us_max: reader.read_u64()?,
     };
+    let raft_wal_metrics = observability::ControlPlaneRaftWalMetricSnapshot {
+        append_total: reader.read_u64()?,
+        append_error_total: reader.read_u64()?,
+        append_us_total: reader.read_u64()?,
+        append_us_max: reader.read_u64()?,
+        lock_wait_us_total: reader.read_u64()?,
+        lock_wait_us_max: reader.read_u64()?,
+        frame_bytes_total: reader.read_u64()?,
+        frame_bytes_last: reader.read_u64()?,
+        frame_bytes_max: reader.read_u64()?,
+        file_sync_total: reader.read_u64()?,
+        file_sync_us_total: reader.read_u64()?,
+        file_sync_us_max: reader.read_u64()?,
+        directory_sync_total: reader.read_u64()?,
+        directory_sync_us_total: reader.read_u64()?,
+        directory_sync_us_max: reader.read_u64()?,
+    };
     let history_reference_count =
         reader.read_collection_len("control-plane history reference samples", 31)?;
     if history_reference_count > runtime_map.nodes().len() {
@@ -12574,6 +12613,7 @@ fn read_control_plane_runtime_map_diagnostics(
         rpc_metrics,
         snapshot_metrics,
         raft_checkpoint_metrics,
+        raft_wal_metrics,
         history_reference_samples,
     })
 }

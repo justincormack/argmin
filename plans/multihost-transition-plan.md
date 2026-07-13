@@ -10732,8 +10732,11 @@ Required production shape and implementation order:
    separately reports encode count/duration, checkpoint store count/errors and
    duration, artifact bytes, file and directory sync count/duration, and WAL
    compaction count/errors and duration through the same authenticated
-   diagnostics response. Command/WAL append bytes still need their
-   corresponding counters before changing the peer acknowledgement boundary.
+   diagnostics response. The WAL append path now separately reports exact
+   length-prefixed frame bytes, append count/errors and duration, WAL-lock wait,
+   and append-specific file and directory sync count/duration. Authority commit
+   queue wait remains to be measured before changing the peer acknowledgement
+   boundary.
 2. Classify heartbeat fields by recovery requirement before changing the write
    path. Durable state includes membership, node/process identity changes,
    endpoints used as authority, PG topology/state, committed peering or
@@ -11577,8 +11580,17 @@ Phase 12.4 progress:
   compaction success/failure, with cumulative and maximum durations. Focused
   regressions pin successful checkpoint/sync/compaction accounting, failed
   checkpoint accounting before publication, and the bounded diagnostics line.
-  WAL command/frame bytes remain a separate required measurement before the
-  ordinary peer-response durability boundary changes.
+  WAL command/frame bytes remain deliberately separate from checkpoint bytes
+  and are covered by the following append-path metric block.
+- Added process-local Raft WAL append metrics to the authenticated diagnostics
+  surface. The counters report exact length-prefixed WAL frame bytes, append
+  count/failure and cumulative/maximum duration, WAL-lock cumulative/maximum
+  wait, and append-specific file and directory sync count/duration. The
+  measurements cover vote, log-entry batch, committed-watermark, truncation,
+  and purge records through their shared durable append boundary. Focused tests
+  pin successful multi-record byte/sync accounting and ambiguous file-sync
+  failure accounting. Authority commit queue wait is still a separate required
+  measurement before changing ordinary peer acknowledgement durability.
 - Added physical WAL prefix compaction after durable restart-artifact
   checkpointing. WAL files now carry a small CRC-protected file header with the
   logical base offset, replay maps artifact offsets through that header, and
