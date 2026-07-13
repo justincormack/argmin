@@ -22,6 +22,10 @@ This still does not cover:
 - temporary/session credentials, including session-token authentication,
   request-time expiry, and the STS AssumeRole API
 
+The new work for the last item, including the IAM identity-policy foundation it
+requires, is tracked in
+[in-memory-sts-and-iam-foundations.md](in-memory-sts-and-iam-foundations.md).
+
 Important current bucket-policy note:
 - AWS-backed testing now shows that `PutBucketPolicy` acceptance is broader
   than our current runtime evaluator. We are not keeping an acceptance-only
@@ -50,8 +54,10 @@ Completed:
 - Header SigV4 auth
 - Presigned SigV4 query auth
 - POST SigV4 form auth
-- Expiry checks for locally configured static credential records
-- Constant-time signature/token comparison
+- Stored static-credential expiry checks and rejection of unexpected session
+  tokens on static credentials; issued temporary credentials are not yet
+  supported
+- Constant-time signature comparison
 - Principal propagation from auth into request handling
 - Authorization moved into `server-core`
 - Principal-based bucket ownership (`owner_principal`)
@@ -199,12 +205,16 @@ Implementation note for the first step:
 - Presigned SigV4 query auth
 - POST SigV4 form auth
 
-Temporary/session credentials are not part of the implemented authentication
-surface. Their session-token and expiry behavior must be established against
-AWS when that feature is implemented; static-record expiry is not a substitute
-for STS credential semantics.
+2. Preserve current static-credential token and expiry behavior:
+- reject unexpected session-token input on a stored static credential with the
+  AWS-pinned post-signature precedence
+- reject an expired stored credential when an expiry is configured
+- implement issued temporary credentials, mandatory token binding, and session
+  expiry through
+  [in-memory-sts-and-iam-foundations.md](in-memory-sts-and-iam-foundations.md),
+  not as completed work in this follow-up
 
-2. Enforce AWS-like header auth rules:
+3. Enforce AWS-like header auth rules:
 - strict header scope validation for configured region/service
 - every header listed in `SignedHeaders` must be present
 - all transmitted `x-amz-*` headers except `x-amz-content-sha256` must be

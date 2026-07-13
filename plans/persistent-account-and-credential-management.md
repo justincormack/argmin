@@ -26,6 +26,11 @@ Out of scope:
 - IAM policy language
 - STS or federation APIs
 
+The initial volatile STS/IAM work is tracked separately in
+[in-memory-sts-and-iam-foundations.md](in-memory-sts-and-iam-foundations.md).
+That plan should establish provider and identity seams that this durable plan
+can later implement without coupling persistence to the HTTP or SigV4 layers.
+
 ## Why This Needs Its Own Plan
 
 Today production authentication is still backed by a single configured access
