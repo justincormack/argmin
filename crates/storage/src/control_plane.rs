@@ -15619,31 +15619,8 @@ fn prune_cluster_map_history(
     let ordinary_history_floor = current_epoch
         .get()
         .saturating_sub(CLUSTER_MAP_HISTORY_LIMIT as u64);
-    prune_unreachable_old_history_routes(history, protection, ordinary_history_floor);
-    while history.len() > CLUSTER_MAP_HISTORY_LIMIT {
-        let protected_routes = cluster_map_history_transfer_source_routes(history, protection);
-        let protected_epochs: BTreeSet<_> = protection
-            .exact_routes
-            .iter()
-            .map(|(epoch, _)| *epoch)
-            .chain(protected_history_absence_epochs(history, protection))
-            .collect();
-        let mut remove_index = None;
-        for (index, record) in history.iter_mut().enumerate() {
-            let record_epoch = record.cluster_epoch();
-            record
-                .pgs
-                .retain(|pg| protected_routes.contains(&(record_epoch, pg.pg_id)));
-            if record.pgs.is_empty() && !protected_epochs.contains(&record_epoch) {
-                remove_index = Some(index);
-                break;
-            }
-        }
-        let Some(index) = remove_index else {
-            break;
-        };
-        history.remove(index);
-    }
+    // Exact old routes extend retention; they must not displace the recent
+    // window before a new payload's route reference reaches a heartbeat.
     prune_unreachable_old_history_routes(history, protection, ordinary_history_floor);
 }
 
@@ -15747,22 +15724,6 @@ fn protected_history_absence_epochs<'a>(
             .is_some_and(|epoch| record.cluster_epoch() >= epoch && !record.absent_pgs.is_empty())
             .then_some(record.cluster_epoch())
     })
-}
-
-fn cluster_map_history_transfer_source_routes(
-    history: &[ClusterMapHistoryRecord],
-    protection: &ClusterMapHistoryProtection,
-) -> BTreeSet<(ClusterEpoch, PgId)> {
-    let roots = protection.exact_routes.iter().copied().chain(
-        history
-            .iter()
-            .flat_map(ClusterMapHistoryRecord::pgs)
-            .filter_map(|pg| {
-                pg.peering_metadata_transfer_source_route_epoch
-                    .map(|epoch| (epoch, pg.pg_id))
-            }),
-    );
-    cluster_map_history_route_dependency_closure(history, roots.collect())
 }
 
 fn active_primary_lease(
@@ -24269,7 +24230,7 @@ mod tests {
         }
 
         let history = authority.snapshot().cluster_map_history();
-        assert_eq!(history.len(), CLUSTER_MAP_HISTORY_LIMIT);
+        assert_eq!(history.len(), CLUSTER_MAP_HISTORY_LIMIT + 1);
         assert!(authority
             .snapshot()
             .cluster_map_at_epoch(source_epoch)
@@ -24410,6 +24371,58 @@ mod tests {
     }
 
     #[test]
+    fn exact_old_routes_do_not_displace_recent_reverse_deltas() {
+        let current_epoch = ClusterEpoch::new(1_000).unwrap();
+        let ordinary_floor =
+            ClusterEpoch::new(current_epoch.get() - CLUSTER_MAP_HISTORY_LIMIT as u64).unwrap();
+        let old_epoch = ClusterEpoch::new(100).unwrap();
+        let pg_id = PgId::new(42);
+        let old_pg_id = PgId::new(7);
+        let route = HistoricalPgRouteRecord {
+            pg_id,
+            state: PgState::Active,
+            acting_set: vec![NodeId::new(1), NodeId::new(2)],
+            active_primary: Some(NodeId::new(1)),
+            peering_metadata_transfer: None,
+            peering_metadata_transfer_source_route_epoch: None,
+            peering_metadata_transfer_source_node_id: None,
+        };
+        let old_route = HistoricalPgRouteRecord {
+            pg_id: old_pg_id,
+            ..route.clone()
+        };
+        let mut history = vec![ClusterMapHistoryRecord {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            cluster_epoch: old_epoch,
+            nodes: vec![NodeId::new(1), NodeId::new(2)],
+            pgs: vec![old_route],
+            absent_pgs: Vec::new(),
+        }];
+        for raw_epoch in ordinary_floor.get()..current_epoch.get() {
+            history.push(ClusterMapHistoryRecord {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+                cluster_epoch: ClusterEpoch::new(raw_epoch).unwrap(),
+                nodes: vec![NodeId::new(1), NodeId::new(2)],
+                pgs: (raw_epoch == ordinary_floor.get())
+                    .then(|| route.clone())
+                    .into_iter()
+                    .collect(),
+                absent_pgs: Vec::new(),
+            });
+        }
+        let protection = ClusterMapHistoryProtection {
+            exact_routes: [(old_epoch, old_pg_id)].into_iter().collect(),
+        };
+
+        prune_cluster_map_history(&mut history, &protection, current_epoch);
+
+        assert_eq!(history.len(), CLUSTER_MAP_HISTORY_LIMIT + 1);
+        assert!(history.iter().any(|record| {
+            record.cluster_epoch() == ordinary_floor && record.pg(pg_id).is_some()
+        }));
+    }
+
+    #[test]
     fn cluster_map_history_pruning_preserves_only_exact_storage_node_route() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -24473,7 +24486,7 @@ mod tests {
             Some(protected_epoch)
         );
         let retained_before_floor_advance = authority.snapshot().cluster_map_history().len();
-        assert_eq!(retained_before_floor_advance, CLUSTER_MAP_HISTORY_LIMIT);
+        assert_eq!(retained_before_floor_advance, CLUSTER_MAP_HISTORY_LIMIT + 1);
         let runtime_map_before_floor_advance = authority.snapshot().runtime_map(10_999).unwrap();
         assert_eq!(
             runtime_map_before_floor_advance.historical_cluster_epochs(),
@@ -24513,7 +24526,7 @@ mod tests {
         );
         assert_eq!(
             authority.snapshot().cluster_map_history().len(),
-            CLUSTER_MAP_HISTORY_LIMIT - 1
+            CLUSTER_MAP_HISTORY_LIMIT
         );
         let runtime_map_after_floor_advance = authority.snapshot().runtime_map(11_000).unwrap();
         assert_eq!(

@@ -10884,10 +10884,16 @@ Required production shape and implementation order:
    canonical retained-epoch list in RPC version 6. The explicit epoch list
    preserves epochs from before the first PG existed without inventing a route;
    filtered storage refreshes advertise only epochs represented in that
-   response. Pruning
-   retains absence boundaries needed by older exact references and follows
-   metadata-transfer dependencies from the unmodified delta graph before
-   deletion. Parsing and snapshot audit reject non-canonically ordered or
+   response. Pruning retains the ordinary 256-epoch reverse-delta window
+   independently of older exact references: exact routes extend total retained
+   history and never displace the grace window between a payload commit and
+   the heartbeat that first reports its exact route. This closes a
+   route-change restart soak failure where an old exact set filled the nominal
+   record limit, a just-written placement delta was removed before its
+   heartbeat arrived, and reconstruction selected the following Peering route.
+   Pruning also retains absence boundaries needed by older exact references
+   and follows metadata-transfer dependencies from the unmodified delta graph
+   before deletion. Parsing and snapshot audit reject non-canonically ordered or
    conflicting presence/absence markers and broken transfer chains. A
    regression matching the soak startup
    sequence configures 216 PGs one command at a time and proves this creates no
