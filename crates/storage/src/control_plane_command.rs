@@ -14,7 +14,7 @@ use placement::NodeId;
 use std::num::NonZeroU64;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 6;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 7;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -44,6 +44,7 @@ pub enum ControlPlaneCommand {
         heartbeat: NodeHeartbeat,
         heartbeat_at_ms: u64,
         lease_deadline_ms: u64,
+        lease_horizon_authority: Option<LeaseHorizonAuthorityBinding>,
     },
     ExpireHeartbeatLeases {
         expire_at_ms: u64,
@@ -112,9 +113,10 @@ impl std::fmt::Display for ControlPlaneCommand {
                 heartbeat,
                 heartbeat_at_ms,
                 lease_deadline_ms,
+                lease_horizon_authority,
             } => write!(
                 f,
-                "record-node-heartbeat(node={},heartbeat_at_ms={},lease_deadline_ms={})",
+                "record-node-heartbeat(node={},heartbeat_at_ms={},lease_deadline_ms={},lease_horizon_authority={lease_horizon_authority:?})",
                 heartbeat.node_id.as_u32(),
                 heartbeat_at_ms,
                 lease_deadline_ms
@@ -228,11 +230,13 @@ pub fn encode_control_plane_command(
             heartbeat,
             heartbeat_at_ms,
             lease_deadline_ms,
+            lease_horizon_authority,
         } => {
             write_u16(&mut out, 4);
             write_node_heartbeat(&mut out, heartbeat)?;
             write_u64(&mut out, *heartbeat_at_ms);
             write_u64(&mut out, *lease_deadline_ms);
+            write_lease_horizon_authority(&mut out, *lease_horizon_authority);
         }
         ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms } => {
             write_u16(&mut out, 5);
@@ -379,6 +383,7 @@ pub fn decode_control_plane_command(
             heartbeat: read_node_heartbeat(&mut reader)?,
             heartbeat_at_ms: reader.read_u64()?,
             lease_deadline_ms: reader.read_u64()?,
+            lease_horizon_authority: read_lease_horizon_authority(&mut reader)?,
         },
         5 => ControlPlaneCommand::ExpireHeartbeatLeases {
             expire_at_ms: reader.read_u64()?,
@@ -431,22 +436,7 @@ pub fn decode_control_plane_command(
             ControlPlaneCommand::CompleteReadyPgPeerings { ready_at_ms, ready }
         }
         12 => {
-            let clock_generation = reader.read_u64()?;
-            let raft_term = match reader.read_u8()? {
-                0 => None,
-                1 => Some(reader.read_u64()?),
-                tag => {
-                    return Err(command_protocol_error(format!(
-                        "invalid lease horizon Raft term option tag {tag}"
-                    )));
-                }
-            };
-            let authority = LeaseHorizonAuthorityBinding::checked_new(clock_generation, raft_term)
-                .ok_or_else(|| {
-                    command_protocol_error(
-                        "lease horizon clock generation and present Raft term must be nonzero",
-                    )
-                })?;
+            let authority = read_required_lease_horizon_authority(&mut reader)?;
             ControlPlaneCommand::EstablishLeaseGrantHorizon {
                 authority,
                 authority_now_ms: reader.read_u64()?,
@@ -820,6 +810,10 @@ impl ReplicatedControlPlaneStateMachine {
         command: ControlPlaneCommand,
     ) -> Result<CommittedControlPlaneLogCommand, ControlPlaneError> {
         self.validate_next_log_id(log_id)?;
+        if let Err(error) = validate_committed_command_authority(log_id, &command) {
+            self.last_applied = Some(log_id);
+            return Ok(CommittedControlPlaneLogCommand::rejected(log_id, error));
+        }
         match self.snapshot.apply_control_plane_command(command) {
             Ok(applied) => {
                 self.last_applied = Some(log_id);
@@ -951,6 +945,28 @@ impl ReplicatedControlPlaneStateMachine {
     }
 }
 
+fn validate_committed_command_authority(
+    log_id: ControlPlaneLogId,
+    command: &ControlPlaneCommand,
+) -> Result<(), ControlPlaneError> {
+    let authority = match command {
+        ControlPlaneCommand::RecordNodeHeartbeat {
+            lease_horizon_authority,
+            ..
+        } => *lease_horizon_authority,
+        ControlPlaneCommand::EstablishLeaseGrantHorizon { authority, .. } => Some(*authority),
+        _ => return Ok(()),
+    };
+    let authority_term = authority.and_then(LeaseHorizonAuthorityBinding::raft_term);
+    if authority_term == Some(log_id.term()) {
+        return Ok(());
+    }
+    Err(ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
+        authority_term,
+        committed_term: Some(log_id.term()),
+    })
+}
+
 fn append_control_plane_command_checksum(out: &mut Vec<u8>) {
     let checksum = control_plane_command_checksum(out);
     write_u64(out, checksum);
@@ -967,6 +983,57 @@ fn append_control_plane_snapshot_checksum(out: &mut Vec<u8>) {
 
 fn control_plane_snapshot_checksum(body: &[u8]) -> u64 {
     checksum::crc64::checksum(body)
+}
+
+fn write_lease_horizon_authority(
+    out: &mut Vec<u8>,
+    authority: Option<LeaseHorizonAuthorityBinding>,
+) {
+    let Some(authority) = authority else {
+        write_u8(out, 0);
+        return;
+    };
+    write_u8(out, 1);
+    write_u64(out, authority.clock_generation());
+    match authority.raft_term() {
+        Some(term) => {
+            write_u8(out, 1);
+            write_u64(out, term);
+        }
+        None => write_u8(out, 0),
+    }
+}
+
+fn read_lease_horizon_authority(
+    reader: &mut PayloadReader<'_>,
+) -> Result<Option<LeaseHorizonAuthorityBinding>, ControlPlaneError> {
+    match reader.read_u8()? {
+        0 => Ok(None),
+        1 => read_required_lease_horizon_authority(reader).map(Some),
+        tag => Err(command_protocol_error(format!(
+            "invalid lease horizon authority option tag {tag}"
+        ))),
+    }
+}
+
+fn read_required_lease_horizon_authority(
+    reader: &mut PayloadReader<'_>,
+) -> Result<LeaseHorizonAuthorityBinding, ControlPlaneError> {
+    let clock_generation = reader.read_u64()?;
+    let raft_term = match reader.read_u8()? {
+        0 => None,
+        1 => Some(reader.read_u64()?),
+        tag => {
+            return Err(command_protocol_error(format!(
+                "invalid lease horizon Raft term option tag {tag}"
+            )));
+        }
+    };
+    LeaseHorizonAuthorityBinding::checked_new(clock_generation, raft_term).ok_or_else(|| {
+        command_protocol_error(
+            "lease horizon clock generation and present Raft term must be nonzero",
+        )
+    })
 }
 
 fn write_node_heartbeat(
@@ -1506,6 +1573,7 @@ mod tests {
                 },
                 heartbeat_at_ms: 1_000,
                 lease_deadline_ms: 1_100,
+                lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(7, Some(11))),
             },
             ControlPlaneCommand::ExpireHeartbeatLeases {
                 expire_at_ms: 2_000,
@@ -1573,6 +1641,7 @@ mod tests {
                 },
                 heartbeat_at_ms: u64::MAX,
                 lease_deadline_ms: u64::MAX,
+                lease_horizon_authority: None,
             },
             ControlPlaneCommand::EstablishLeaseGrantHorizon {
                 authority: LeaseHorizonAuthorityBinding::new(u64::MAX, Some(u64::MAX)),
@@ -1662,6 +1731,7 @@ mod tests {
                 },
                 heartbeat_at_ms: 1_000,
                 lease_deadline_ms: 1_100,
+                lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(1, Some(1))),
             },
             ControlPlaneCommand::SetNodeMembership {
                 node_id: NodeId::new(2),
@@ -1787,6 +1857,29 @@ mod tests {
             "lease horizon clock generation and present Raft term must be nonzero",
         );
 
+        let invalid_heartbeat_horizon_authority = command_frame(4, |body| {
+            write_node_heartbeat(
+                body,
+                &NodeHeartbeat {
+                    node_id: NodeId::new(7),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/node.sock".to_owned(),
+                    observed_epoch: ClusterEpoch::INITIAL,
+                    requested_lease_duration_ms: 100,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+            )
+            .unwrap();
+            write_u64(body, 1_000);
+            write_u64(body, 1_100);
+            write_u8(body, 2);
+        });
+        assert_decode_error_contains(
+            &invalid_heartbeat_horizon_authority,
+            "invalid lease horizon authority option tag 2",
+        );
+
         let invalid_membership = command_frame(2, |body| {
             write_u32(body, 7);
             write_u8(body, 99);
@@ -1902,7 +1995,7 @@ mod tests {
     fn control_plane_snapshot_codec_round_trips_and_continues_replay() {
         let snapshot = sample_snapshot()
             .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
-                authority: LeaseHorizonAuthorityBinding::new(4, Some(6)),
+                authority: LeaseHorizonAuthorityBinding::new(1, Some(1)),
                 authority_now_ms: 2_000,
                 horizon_duration_ms: 30_000,
             })
@@ -2181,6 +2274,81 @@ mod tests {
             CommittedControlPlaneCommandOutcome::Applied(_)
         ));
         assert_eq!(state_machine.last_applied(), Some(log_id(1, 2)));
+    }
+
+    #[test]
+    fn replicated_heartbeat_authority_must_match_committed_raft_term() {
+        let mut baseline = ReplicatedControlPlaneStateMachine::empty();
+        baseline
+            .apply_committed_command(log_id(2, 1), sample_snapshot_commands()[0].clone())
+            .unwrap();
+        let observed_epoch = baseline.snapshot().cluster_epoch();
+        let heartbeat = ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat: NodeHeartbeat {
+                node_id: NodeId::new(1),
+                node_incarnation: 1,
+                endpoint: "/tmp/node-1.sock".to_owned(),
+                observed_epoch,
+                requested_lease_duration_ms: 100,
+                cluster_map_history_route_references: Default::default(),
+                pg_observations: Vec::new(),
+            },
+            heartbeat_at_ms: 1_000,
+            lease_deadline_ms: 1_100,
+            lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(7, Some(1))),
+        };
+
+        for command in [
+            heartbeat.clone(),
+            ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: LeaseHorizonAuthorityBinding::new(7, Some(1)),
+                authority_now_ms: 1_000,
+                horizon_duration_ms: 20_000,
+            },
+        ] {
+            let mut state_machine = baseline.clone();
+            let before = state_machine.snapshot().clone();
+            let rejected = state_machine
+                .apply_committed_command(log_id(2, 2), command)
+                .unwrap();
+            assert!(matches!(
+                rejected.outcome(),
+                CommittedControlPlaneCommandOutcome::Rejected(
+                    ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
+                        authority_term: Some(1),
+                        committed_term: Some(2),
+                    }
+                )
+            ));
+            assert_eq!(state_machine.snapshot(), &before);
+            assert_eq!(state_machine.last_applied(), Some(log_id(2, 2)));
+        }
+
+        let mut state_machine = baseline;
+        let matching = match heartbeat {
+            ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms,
+                lease_deadline_ms,
+                ..
+            } => ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms,
+                lease_deadline_ms,
+                lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(7, Some(2))),
+            },
+            _ => unreachable!(),
+        };
+        let applied = state_machine
+            .apply_committed_command(log_id(2, 2), matching)
+            .unwrap();
+        assert!(matches!(
+            applied.outcome(),
+            CommittedControlPlaneCommandOutcome::Applied(_)
+        ));
+        assert!(state_machine
+            .snapshot()
+            .lease_grant_horizon_covers(LeaseHorizonAuthorityBinding::new(7, Some(2)), 1_100,));
     }
 
     #[test]

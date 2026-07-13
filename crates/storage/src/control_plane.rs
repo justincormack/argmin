@@ -21,11 +21,11 @@ use crate::control_plane_command::{
     AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
     ControlPlaneCommandStateMachine, ControlPlaneLogId, ReadyPgPeeringCompletion,
 };
+pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::control_plane_lease::{
     bounded_renewal_deadline, successor_activation_fence_satisfied, validate_process_lease_clock,
     validate_serving_deadline_bound, BoundRouteMapLease, CommittedLeaseGrantHorizon,
-    LeaseClockError, LeaseHorizonAuthorityBinding, LeaseHorizonError,
-    CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+    LeaseClockError, LeaseHorizonError, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
 };
 use crate::{
     ClusterEpoch, PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
@@ -38,6 +38,7 @@ use crate::{
 const CLUSTER_MAP_HISTORY_LIMIT: usize = 256;
 pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
+pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_VERSION: u16 = 6;
@@ -638,6 +639,40 @@ impl ControlPlaneAuthorityClock {
         }
     }
 
+    /// Return the durable lease-horizon identity for the currently established authority.
+    pub fn lease_horizon_authority_binding(
+        &self,
+        current_raft_leadership_term: Option<u64>,
+    ) -> Result<LeaseHorizonAuthorityBinding, ControlPlaneError> {
+        if !self.established {
+            return Err(ControlPlaneError::AuthorityClockNotEstablished {
+                blocked_reason: self.blocked_reason,
+            });
+        }
+        if self.raft_leadership_term != current_raft_leadership_term {
+            return Err(ControlPlaneError::AuthorityClockRaftTermMismatch {
+                expected_term: self.raft_leadership_term,
+                actual_term: current_raft_leadership_term,
+            });
+        }
+        LeaseHorizonAuthorityBinding::checked_new(self.generation, current_raft_leadership_term)
+            .ok_or(ControlPlaneError::AuthorityClockGenerationOverflow)
+    }
+
+    /// Ensure a restarted process cannot reuse the generation that established
+    /// a restored volatile-lease capability.
+    pub fn advance_generation_past_lease_horizon(
+        &mut self,
+        previous_authority: LeaseHorizonAuthorityBinding,
+    ) -> Result<(), ControlPlaneError> {
+        let next_generation = previous_authority
+            .clock_generation()
+            .checked_add(1)
+            .ok_or(ControlPlaneError::AuthorityClockGenerationOverflow)?;
+        self.generation = self.generation.max(next_generation);
+        Ok(())
+    }
+
     /// Observe current authority and clock state before reporting status.
     pub fn observe_status(
         &mut self,
@@ -1129,6 +1164,22 @@ impl ClusterControlSnapshot {
     #[cfg(test)]
     pub(crate) fn lease_grant_horizon(&self) -> Option<CommittedLeaseGrantHorizon> {
         self.lease_grant_horizon
+    }
+
+    #[must_use]
+    pub fn lease_grant_horizon_covers(
+        &self,
+        authority: LeaseHorizonAuthorityBinding,
+        lease_deadline_ms: u64,
+    ) -> bool {
+        self.lease_grant_horizon.is_some_and(|horizon| {
+            horizon.authority() == authority && lease_deadline_ms <= horizon.grant_not_after_ms()
+        })
+    }
+
+    #[must_use]
+    pub fn lease_grant_horizon_authority(&self) -> Option<LeaseHorizonAuthorityBinding> {
+        self.lease_grant_horizon.map(|horizon| horizon.authority())
     }
 
     #[must_use]
@@ -1926,6 +1977,37 @@ impl ClusterControlSnapshot {
         .map_err(control_plane_lease_clock_error)
     }
 
+    fn establish_heartbeat_lease_horizon(
+        &mut self,
+        authority: Option<LeaseHorizonAuthorityBinding>,
+        heartbeat_at_ms: u64,
+        lease_deadline_ms: u64,
+    ) -> Result<(), ControlPlaneError> {
+        let Some(authority) = authority else {
+            return Ok(());
+        };
+        if !self.lease_grant_horizon_covers(authority, lease_deadline_ms) {
+            let horizon = CommittedLeaseGrantHorizon::establish(
+                self.lease_grant_horizon,
+                authority,
+                heartbeat_at_ms,
+                CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS,
+                CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+            )
+            .map_err(control_plane_lease_horizon_error)?;
+            self.lease_grant_horizon = Some(horizon);
+        }
+        if !self.lease_grant_horizon_covers(authority, lease_deadline_ms) {
+            return Err(ControlPlaneError::SnapshotInvariantViolation {
+                context: "committed heartbeat lease horizon does not cover its lease",
+                message: format!(
+                    "lease deadline {lease_deadline_ms} is outside the committed horizon"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_publication_invariants(&self) -> Result<(), String> {
         validate_required_cluster_map_history(
             &self.history,
@@ -2635,6 +2717,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 heartbeat,
                 heartbeat_at_ms,
                 lease_deadline_ms,
+                lease_horizon_authority,
             } => {
                 if heartbeat.requested_lease_duration_ms == 0 {
                     return Err(ControlPlaneError::InvalidLeaseDuration);
@@ -2706,6 +2789,11 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         current_epoch,
                     )?;
                     let mut next_snapshot = self.clone();
+                    next_snapshot.establish_heartbeat_lease_horizon(
+                        lease_horizon_authority,
+                        committed_heartbeat_at_ms,
+                        committed_lease_deadline_ms,
+                    )?;
                     next_snapshot.record_committed_timestamp(committed_heartbeat_at_ms);
                     let mut epoch_changed = false;
                     let mut affected_node = None;
@@ -2754,6 +2842,11 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 let mut epoch_changed = false;
                 let mut affected_node = None;
                 let mut next_snapshot = self.clone();
+                next_snapshot.establish_heartbeat_lease_horizon(
+                    lease_horizon_authority,
+                    committed_heartbeat_at_ms,
+                    committed_lease_deadline_ms,
+                )?;
                 next_snapshot.record_committed_timestamp(committed_heartbeat_at_ms);
                 {
                     let record = next_snapshot
@@ -4943,6 +5036,17 @@ pub trait ControlPlaneHeartbeatRuntimeMapSource {
         heartbeat: NodeHeartbeat,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError>;
+
+    fn refresh_node_heartbeat_with_lease_horizon_authority(
+        &mut self,
+        _heartbeat: NodeHeartbeat,
+        _authority_now_ms: u64,
+        _lease_horizon_authority: LeaseHorizonAuthorityBinding,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        Err(ControlPlaneError::RpcProtocol {
+            message: "control-plane heartbeat authority does not support lease horizons".to_owned(),
+        })
+    }
 }
 
 pub trait ControlPlaneRuntimeMapSource {
@@ -6037,6 +6141,15 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         heartbeat: NodeHeartbeat,
         authority_now_ms: u64,
     ) -> Result<HeartbeatLease, ControlPlaneError> {
+        self.heartbeat_with_lease_horizon_authority(heartbeat, authority_now_ms, None)
+    }
+
+    fn heartbeat_with_lease_horizon_authority(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+        lease_horizon_authority: Option<LeaseHorizonAuthorityBinding>,
+    ) -> Result<HeartbeatLease, ControlPlaneError> {
         if heartbeat.requested_lease_duration_ms == 0 {
             return Err(ControlPlaneError::InvalidLeaseDuration);
         }
@@ -6058,6 +6171,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             heartbeat,
             heartbeat_at_ms: authority_now_ms,
             lease_deadline_ms,
+            lease_horizon_authority,
         })?;
         let serving = self.snapshot.node(node_id).is_some_and(|record| {
             observed_epoch == current_epoch
@@ -6080,6 +6194,50 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
     ) -> Result<HeartbeatLease, ControlPlaneError> {
         self.snapshot
             .current_heartbeat_lease_for_node(node_id, now_ms)
+    }
+
+    fn refresh_node_heartbeat_internal(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+        lease_horizon_authority: Option<LeaseHorizonAuthorityBinding>,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        let history_reference_validation_epoch = self.snapshot.cluster_epoch();
+        let node_id = heartbeat.node_id;
+        let requested_observed_epoch = heartbeat.observed_epoch;
+        let previous_observed_epoch = self
+            .snapshot
+            .node(node_id)
+            .and_then(NodeControlRecord::last_observed_epoch);
+        let mut lease = self.heartbeat_with_lease_horizon_authority(
+            heartbeat,
+            authority_now_ms,
+            lease_horizon_authority,
+        )?;
+        let just_activated_pgs: BTreeSet<PgId> = self
+            .complete_ready_pg_peerings(authority_now_ms)?
+            .into_iter()
+            .collect();
+        if !just_activated_pgs.is_empty() {
+            lease = self.current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
+        }
+        let current_epoch = self.snapshot.cluster_epoch();
+        let observed_epoch = [Some(requested_observed_epoch), previous_observed_epoch]
+            .into_iter()
+            .flatten()
+            .filter(|observed_epoch| *observed_epoch <= current_epoch)
+            .max()
+            .unwrap_or(requested_observed_epoch);
+        let runtime_map = self.snapshot.runtime_map_for_storage_node_refresh(
+            authority_now_ms,
+            node_id,
+            observed_epoch,
+        )?;
+        Ok(ControlPlaneHeartbeatRefresh {
+            lease,
+            runtime_map,
+            history_reference_validation_epoch,
+        })
     }
 
     pub fn expire_heartbeat_leases(
@@ -6433,38 +6591,20 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
         heartbeat: NodeHeartbeat,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
-        let history_reference_validation_epoch = self.snapshot.cluster_epoch();
-        let node_id = heartbeat.node_id;
-        let requested_observed_epoch = heartbeat.observed_epoch;
-        let previous_observed_epoch = self
-            .snapshot
-            .node(node_id)
-            .and_then(NodeControlRecord::last_observed_epoch);
-        let mut lease = self.heartbeat(heartbeat, authority_now_ms)?;
-        let just_activated_pgs: BTreeSet<PgId> = self
-            .complete_ready_pg_peerings(authority_now_ms)?
-            .into_iter()
-            .collect();
-        if !just_activated_pgs.is_empty() {
-            lease = self.current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
-        }
-        let current_epoch = self.snapshot.cluster_epoch();
-        let observed_epoch = [Some(requested_observed_epoch), previous_observed_epoch]
-            .into_iter()
-            .flatten()
-            .filter(|observed_epoch| *observed_epoch <= current_epoch)
-            .max()
-            .unwrap_or(requested_observed_epoch);
-        let runtime_map = self.snapshot.runtime_map_for_storage_node_refresh(
+        self.refresh_node_heartbeat_internal(heartbeat, authority_now_ms, None)
+    }
+
+    fn refresh_node_heartbeat_with_lease_horizon_authority(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+        lease_horizon_authority: LeaseHorizonAuthorityBinding,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        self.refresh_node_heartbeat_internal(
+            heartbeat,
             authority_now_ms,
-            node_id,
-            observed_epoch,
-        )?;
-        Ok(ControlPlaneHeartbeatRefresh {
-            lease,
-            runtime_map,
-            history_reference_validation_epoch,
-        })
+            Some(lease_horizon_authority),
+        )
     }
 }
 
@@ -10615,6 +10755,44 @@ pub fn prepare_control_plane_heartbeat_response<T>(
 where
     T: ControlPlaneHeartbeatRuntimeMapSource,
 {
+    prepare_control_plane_heartbeat_response_internal(
+        control_plane,
+        request,
+        authority_now_ms,
+        None,
+        auth_verifier,
+    )
+}
+
+pub fn prepare_control_plane_heartbeat_response_with_lease_horizon_authority<T>(
+    control_plane: &mut T,
+    request: ControlPlaneRpcRequest,
+    authority_now_ms: u64,
+    lease_horizon_authority: LeaseHorizonAuthorityBinding,
+    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
+) -> Result<PreparedControlPlaneHeartbeatResponse, ControlPlaneError>
+where
+    T: ControlPlaneHeartbeatRuntimeMapSource,
+{
+    prepare_control_plane_heartbeat_response_internal(
+        control_plane,
+        request,
+        authority_now_ms,
+        Some(lease_horizon_authority),
+        auth_verifier,
+    )
+}
+
+fn prepare_control_plane_heartbeat_response_internal<T>(
+    control_plane: &mut T,
+    request: ControlPlaneRpcRequest,
+    authority_now_ms: u64,
+    lease_horizon_authority: Option<LeaseHorizonAuthorityBinding>,
+    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
+) -> Result<PreparedControlPlaneHeartbeatResponse, ControlPlaneError>
+where
+    T: ControlPlaneHeartbeatRuntimeMapSource,
+{
     let ControlPlaneRpcRequest { kind, payload } = request;
     if kind != ControlPlaneRpcKind::RefreshNodeHeartbeat {
         return Err(ControlPlaneError::RpcProtocol {
@@ -10655,7 +10833,15 @@ where
             .oldest_pending_metadata_command_epoch
             .map(ClusterEpoch::get),
     };
-    let refresh = control_plane.refresh_node_heartbeat(heartbeat, authority_now_ms);
+    let refresh = match lease_horizon_authority {
+        Some(lease_horizon_authority) => control_plane
+            .refresh_node_heartbeat_with_lease_horizon_authority(
+                heartbeat,
+                authority_now_ms,
+                lease_horizon_authority,
+            ),
+        None => control_plane.refresh_node_heartbeat(heartbeat, authority_now_ms),
+    };
     if let Ok(refresh) = &refresh {
         history_reference_sample.validation_epoch =
             refresh.history_reference_validation_epoch.get();
@@ -12960,6 +13146,14 @@ pub enum ControlPlaneError {
     PreviousLeaseGrantHorizonStillActive {
         authority_now_ms: u64,
         fenced_until_ms: u64,
+    },
+
+    #[error(
+        "lease grant horizon authority Raft term {authority_term:?} does not match committed Raft term {committed_term:?}"
+    )]
+    LeaseGrantHorizonAuthorityTermMismatch {
+        authority_term: Option<u64>,
+        committed_term: Option<u64>,
     },
 
     #[error("heartbeat lease deadline overflow")]
@@ -19571,7 +19765,11 @@ mod tests {
             .unwrap();
         let verifier_for_assert = verifier.clone();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let (server_ready_tx, server_ready_rx) = std::sync::mpsc::sync_channel(0);
         let server = std::thread::spawn(move || {
+            server_ready_tx
+                .send(())
+                .expect("admin auth test client should wait for server readiness");
             for authority_now_ms in [2_000, 2_000] {
                 let (mut stream, _addr) = listener.accept().unwrap();
                 handle_control_plane_unix_stream_with_auth(
@@ -19587,6 +19785,9 @@ mod tests {
                 &[NodeId::new(1)]
             );
         });
+        server_ready_rx
+            .recv()
+            .expect("admin auth test server should become ready");
 
         let client = AuthenticatedUnixControlPlaneClient::new(
             UnixControlPlaneClient::new(&socket_path),
@@ -26296,6 +26497,7 @@ mod tests {
                 },
                 heartbeat_at_ms: 1_000,
                 lease_deadline_ms: 1_100,
+                lease_horizon_authority: None,
             },
             ControlPlaneCommand::RecordNodeHeartbeat {
                 heartbeat: NodeHeartbeat {
@@ -26314,6 +26516,7 @@ mod tests {
                 },
                 heartbeat_at_ms: 1_100,
                 lease_deadline_ms: 1_200,
+                lease_horizon_authority: None,
             },
             ControlPlaneCommand::ExpireHeartbeatLeases {
                 expire_at_ms: 1_200,
@@ -26421,6 +26624,95 @@ mod tests {
         assert_eq!(horizon.authority(), replacement_authority);
         assert_eq!(horizon.grant_not_after_ms(), 71_000);
         assert_eq!(replacement.max_committed_timestamp_ms(), Some(41_000));
+    }
+
+    #[test]
+    fn single_authority_heartbeat_establishes_reuses_and_restores_lease_horizon() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut control_plane = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        control_plane
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let authority = LeaseHorizonAuthorityBinding::new(7, None);
+        let observed_epoch = control_plane.snapshot().cluster_epoch();
+
+        let first = control_plane
+            .refresh_node_heartbeat_with_lease_horizon_authority(
+                heartbeat(1, observed_epoch, 1_000),
+                1_000,
+                authority,
+            )
+            .unwrap();
+        let first_horizon = control_plane.snapshot().lease_grant_horizon().unwrap();
+        assert_eq!(
+            first_horizon.grant_not_after_ms(),
+            1_000 + CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS
+        );
+        assert!(control_plane
+            .snapshot()
+            .lease_grant_horizon_covers(authority, first.lease().lease_deadline_ms()));
+
+        let current_epoch = control_plane.snapshot().cluster_epoch();
+        control_plane
+            .refresh_node_heartbeat_with_lease_horizon_authority(
+                heartbeat(1, current_epoch, 1_001),
+                1_001,
+                authority,
+            )
+            .unwrap();
+        assert_eq!(
+            control_plane.snapshot().lease_grant_horizon(),
+            Some(first_horizon),
+            "a covered heartbeat must not extend the durable horizon"
+        );
+        assert_eq!(
+            store.load().unwrap().unwrap().lease_grant_horizon(),
+            Some(first_horizon),
+            "the heartbeat and horizon must have identical restart state"
+        );
+
+        let before_replacement = control_plane.snapshot().clone();
+        let replacement_authority = LeaseHorizonAuthorityBinding::new(8, None);
+        let error = control_plane
+            .refresh_node_heartbeat_with_lease_horizon_authority(
+                heartbeat(1, current_epoch, 1_002),
+                1_002,
+                replacement_authority,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::PreviousLeaseGrantHorizonStillActive { .. }
+        ));
+        assert_eq!(control_plane.snapshot(), &before_replacement);
+    }
+
+    #[test]
+    fn rejected_horizon_enabled_heartbeat_leaves_durable_state_unchanged() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut control_plane = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        control_plane
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let before = control_plane.snapshot().clone();
+        let future_epoch = ClusterEpoch::new(before.cluster_epoch().get() + 1).unwrap();
+
+        let error = control_plane
+            .refresh_node_heartbeat_with_lease_horizon_authority(
+                heartbeat(1, future_epoch, 1_000),
+                1_000,
+                LeaseHorizonAuthorityBinding::new(7, None),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::FutureNodeObservedEpoch { .. }
+        ));
+        assert_eq!(control_plane.snapshot(), &before);
+        assert_eq!(store.load().unwrap(), Some(before));
     }
 
     #[test]
@@ -26607,6 +26899,7 @@ mod tests {
                 heartbeat,
                 heartbeat_at_ms: 2_000,
                 lease_deadline_ms: 2_100,
+                lease_horizon_authority: None,
             })
             .unwrap();
 
@@ -26658,6 +26951,7 @@ mod tests {
                 heartbeat,
                 heartbeat_at_ms: 2_000,
                 lease_deadline_ms: 2_100,
+                lease_horizon_authority: None,
             })
             .unwrap();
 
@@ -26697,6 +26991,7 @@ mod tests {
                 heartbeat,
                 heartbeat_at_ms: 2_000,
                 lease_deadline_ms: 2_100,
+                lease_horizon_authority: None,
             })
             .unwrap_err();
 
@@ -26738,6 +27033,7 @@ mod tests {
                 heartbeat: zero_duration,
                 heartbeat_at_ms: 2_000,
                 lease_deadline_ms: 2_000,
+                lease_horizon_authority: None,
             },),
             Err(ControlPlaneError::InvalidLeaseDuration)
         ));
@@ -26750,6 +27046,7 @@ mod tests {
                     heartbeat: overlong_duration,
                     heartbeat_at_ms: 2_001,
                     lease_deadline_ms: 2_001 + MAX_HEARTBEAT_LEASE_MS + 1,
+                    lease_horizon_authority: None,
                 },
             ),
             Err(ControlPlaneError::LeaseDurationTooLong {
@@ -26765,6 +27062,7 @@ mod tests {
                 heartbeat,
                 heartbeat_at_ms: 2_001,
                 lease_deadline_ms: 2_200,
+                lease_horizon_authority: None,
             },),
             Err(ControlPlaneError::LeaseDeadlineMismatch {
                 node_id: 1,
@@ -26793,6 +27091,7 @@ mod tests {
                 heartbeat,
                 heartbeat_at_ms: 999,
                 lease_deadline_ms: 1_099,
+                lease_horizon_authority: None,
             })
             .unwrap_err();
 
@@ -26825,6 +27124,7 @@ mod tests {
                 heartbeat,
                 heartbeat_at_ms,
                 lease_deadline_ms: heartbeat_at_ms + 100,
+                lease_horizon_authority: None,
             })
             .unwrap();
 
@@ -26861,6 +27161,7 @@ mod tests {
                 heartbeat,
                 heartbeat_at_ms: 1_001,
                 lease_deadline_ms: 1_051,
+                lease_horizon_authority: None,
             })
             .unwrap_err();
 
@@ -27154,6 +27455,21 @@ mod tests {
                 true,
             ))
             .established());
+    }
+
+    #[test]
+    fn restarted_authority_clock_cannot_reuse_restored_lease_horizon_generation() {
+        let previous_authority = LeaseHorizonAuthorityBinding::new(7, Some(11));
+        let mut clock = ControlPlaneAuthorityClock::new(None, 1_000, Some(50)).unwrap();
+
+        clock
+            .advance_generation_past_lease_horizon(previous_authority)
+            .unwrap();
+        clock.bind_initial_raft_leadership_term(Some(11));
+
+        let restarted_authority = clock.lease_horizon_authority_binding(Some(11)).unwrap();
+        assert_eq!(restarted_authority.clock_generation(), 8);
+        assert_ne!(restarted_authority, previous_authority);
     }
 
     #[test]
@@ -33061,6 +33377,7 @@ mod tests {
                         heartbeat: heartbeat.clone(),
                         heartbeat_at_ms: now_ms,
                         lease_deadline_ms,
+                        lease_horizon_authority: None,
                     },
                 );
                 let authority_result = authority.heartbeat(heartbeat, now_ms);

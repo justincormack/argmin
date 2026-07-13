@@ -28,19 +28,21 @@ use storage::control_plane::{
     build_control_plane_authority_clock_admin_response, build_control_plane_unix_response,
     build_control_plane_unix_response_with_auth_and_response_clock,
     finish_control_plane_heartbeat_response, load_authority_clock_restart_checkpoint,
-    prepare_control_plane_heartbeat_response, read_control_plane_unix_request,
-    store_authority_clock_restart_checkpoint, store_validated_authority_clock_restart_checkpoint,
-    write_control_plane_unix_response, AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot,
-    ClusterRuntimeMapSnapshot, ControlPlaneAdmin, ControlPlaneAdminAuthCredential,
-    ControlPlaneAdminAuthCredentialInput, ControlPlaneAuthorityClock,
-    ControlPlaneAuthorityClockAdminSample, ControlPlaneAuthorityClockCheckpointBinding,
-    ControlPlaneAuthorityClockContext, ControlPlaneAuthorityClockStatus, ControlPlaneError,
-    ControlPlaneFrontendAuthCredential, ControlPlaneFrontendAuthCredentialInput,
-    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
-    ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
-    ControlPlaneStorageNodeAuthCredentialInput, ControlPlaneUnixAuthVerifier,
-    FencedPgMetadataTransferSnapshot, FileControlPlaneStore, PgMetadataProof,
-    PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
+    prepare_control_plane_heartbeat_response,
+    prepare_control_plane_heartbeat_response_with_lease_horizon_authority,
+    read_control_plane_unix_request, store_authority_clock_restart_checkpoint,
+    store_validated_authority_clock_restart_checkpoint, write_control_plane_unix_response,
+    AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
+    ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneAdminAuthCredentialInput,
+    ControlPlaneAuthorityClock, ControlPlaneAuthorityClockAdminSample,
+    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneAuthorityClockContext,
+    ControlPlaneAuthorityClockStatus, ControlPlaneError, ControlPlaneFrontendAuthCredential,
+    ControlPlaneFrontendAuthCredentialInput, ControlPlaneHeartbeatRefresh,
+    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
+    ControlPlaneStorageNodeAuthCredential, ControlPlaneStorageNodeAuthCredentialInput,
+    ControlPlaneUnixAuthVerifier, FencedPgMetadataTransferSnapshot, FileControlPlaneStore,
+    LeaseHorizonAuthorityBinding, PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot,
+    SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
 use storage::control_plane_auth::{
     ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
@@ -1674,7 +1676,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to bootstrap control-plane state: {error}");
         std::process::exit(1);
     });
-    let authority_clock =
+    let mut authority_clock =
         ControlPlaneAuthorityClock::new_from_process_clock_with_restart_checkpoint(
             authority.snapshot().max_committed_timestamp_ms(),
             restart_clock_checkpoint,
@@ -1683,6 +1685,14 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
             eprintln!("failed to initialize control-plane authority clock: {error}");
             std::process::exit(1);
         });
+    if let Some(previous_authority) = authority.snapshot().lease_grant_horizon_authority() {
+        authority_clock
+            .advance_generation_past_lease_horizon(previous_authority)
+            .unwrap_or_else(|error| {
+                eprintln!("failed to advance restarted control-plane clock generation: {error}");
+                std::process::exit(1);
+            });
+    }
     let authority_clock = Arc::new(Mutex::new(authority_clock));
     let authority_clock_checkpoint_target = Arc::new(AuthorityClockCheckpointTarget {
         path: PathBuf::from(state_path),
@@ -1780,7 +1790,14 @@ struct ExperimentalRaftControlPlane {
     authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
     durable_poison: Option<String>,
     durable_poison_gate: Arc<AtomicBool>,
+    #[cfg(test)]
+    after_heartbeat_commit_hook: Option<ExperimentalRaftAfterHeartbeatCommitHook>,
 }
+
+#[cfg(test)]
+type ExperimentalRaftAfterHeartbeatCommitHook = Box<
+    dyn FnOnce(&ExperimentalRaftControlPlane) -> Result<(), ControlPlaneError> + Send + 'static,
+>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExperimentalRaftServingCheckpointMarker {
@@ -1822,9 +1839,43 @@ impl ExperimentalRaftControlPlane {
         block_on_control_plane_raft(&self.runtime, future)
     }
 
+    #[cfg(test)]
+    fn run_after_heartbeat_commit_hook(&mut self) -> Result<(), ControlPlaneError> {
+        let Some(hook) = self.after_heartbeat_commit_hook.take() else {
+            return Ok(());
+        };
+        hook(self)
+    }
+
     fn authority_now_ms(&self, supplied_now_ms: u64) -> Result<u64, ControlPlaneError> {
+        Ok(self
+            .authority_time_and_lease_horizon_binding(supplied_now_ms)?
+            .0)
+    }
+
+    fn authority_time_and_lease_horizon_binding(
+        &self,
+        supplied_now_ms: u64,
+    ) -> Result<(u64, Option<LeaseHorizonAuthorityBinding>), ControlPlaneError> {
         if !self.resample_authority_time {
-            return Ok(supplied_now_ms);
+            #[cfg(test)]
+            {
+                let status = self.block_on(self.authority.status())?;
+                let term = status
+                    .local_leader()
+                    .then(|| status.current_term())
+                    .flatten()
+                    .ok_or(ControlPlaneError::RpcRemote {
+                        message: "local OpenRaft test authority is not the serving leader"
+                            .to_string(),
+                    })?;
+                return Ok((
+                    supplied_now_ms,
+                    LeaseHorizonAuthorityBinding::checked_new(1, Some(term)),
+                ));
+            }
+            #[cfg(not(test))]
+            return Ok((supplied_now_ms, None));
         }
         let status = self.block_on(self.authority.status())?;
         if !status.local_leader() {
@@ -1844,7 +1895,9 @@ impl ExperimentalRaftControlPlane {
             message: "local OpenRaft leader has no current term".to_string(),
         })?;
         authority_clock.validate_raft_leadership_term(current_term)?;
-        authority_clock.effective_process_now_ms()
+        let authority_now_ms = authority_clock.effective_process_now_ms()?;
+        let authority = authority_clock.lease_horizon_authority_binding(Some(current_term))?;
+        Ok((authority_now_ms, Some(authority)))
     }
 
     fn durable_poison_error(&self) -> Option<ControlPlaneError> {
@@ -1988,7 +2041,8 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
         heartbeat: storage::control_plane::NodeHeartbeat,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
-        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
+        let (authority_now_ms, lease_horizon_authority) =
+            self.authority_time_and_lease_horizon_binding(authority_now_ms)?;
         let node_id = heartbeat.node_id;
         let requested_observed_epoch = heartbeat.observed_epoch;
         let requested_lease_duration_ms = heartbeat.requested_lease_duration_ms;
@@ -2006,8 +2060,29 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
             heartbeat,
             heartbeat_at_ms: authority_now_ms,
             lease_deadline_ms,
+            lease_horizon_authority,
         })?;
+        #[cfg(test)]
+        self.run_after_heartbeat_commit_hook()?;
         let snapshot = self.current_snapshot()?;
+        if let Some(expected_authority) = lease_horizon_authority {
+            let (_, current_authority) =
+                self.authority_time_and_lease_horizon_binding(authority_now_ms)?;
+            if current_authority != Some(expected_authority) {
+                return Err(ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
+                    authority_term: expected_authority.raft_term(),
+                    committed_term: current_authority.and_then(|authority| authority.raft_term()),
+                });
+            }
+            if !snapshot.lease_grant_horizon_covers(expected_authority, lease_deadline_ms) {
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
+                    context: "committed Raft heartbeat horizon does not cover its lease",
+                    message: format!(
+                        "lease deadline {lease_deadline_ms} is outside the committed horizon"
+                    ),
+                });
+            }
+        }
         let mut lease = snapshot.heartbeat_lease_after_record(
             node_id,
             requested_observed_epoch,
@@ -3059,6 +3134,16 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             eprintln!("failed to initialize experimental OpenRaft authority clock: {error}");
             std::process::exit(1);
         });
+    if let Some(previous_authority) = initial_clock_snapshot.lease_grant_horizon_authority() {
+        initial_authority_clock
+            .advance_generation_past_lease_horizon(previous_authority)
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "failed to advance restarted experimental OpenRaft clock generation: {error}"
+                );
+                std::process::exit(1);
+            });
+    }
     if initial_clock_status.local_leader() {
         initial_authority_clock
             .bind_initial_raft_leadership_term(initial_clock_status.current_term());
@@ -3080,6 +3165,8 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         authority_clock: Some(Arc::clone(&authority_clock)),
         durable_poison: None,
         durable_poison_gate: Arc::clone(&durable_poison_gate),
+        #[cfg(test)]
+        after_heartbeat_commit_hook: None,
     };
     let should_bootstrap_control_plane_state =
         if experimental_raft_startup_bootstrap_requires_local_serving(raft_peer_policy.as_ref()) {
@@ -3467,21 +3554,35 @@ fn spawn_control_plane_rpc_worker(
                     );
                     let _operation_timer =
                         observability::control_plane_rpc_operation_timer(metrics_kind);
-                    let now_ms = match &authority_clock {
+                    let (now_ms, lease_horizon_authority) = match &authority_clock {
                         Some(authority_clock) if gate_request_time_with_authority_clock => {
-                            authority_clock
+                            let mut authority_clock = authority_clock
                                 .lock()
-                                .expect("control-plane authority clock mutex poisoned")
-                                .effective_process_now_ms()?
+                                .expect("control-plane authority clock mutex poisoned");
+                            let now_ms = authority_clock.effective_process_now_ms()?;
+                            let lease_horizon_authority =
+                                authority_clock.lease_horizon_authority_binding(None)?;
+                            (now_ms, Some(lease_horizon_authority))
                         }
-                        _ => storage::clock::current_time_millis(),
+                        _ => (storage::clock::current_time_millis(), None),
                     };
-                    prepare_control_plane_heartbeat_response(
-                        &mut *authority,
-                        request,
-                        now_ms,
-                        auth_verifier.as_deref(),
-                    )
+                    match lease_horizon_authority {
+                        Some(lease_horizon_authority) => {
+                            prepare_control_plane_heartbeat_response_with_lease_horizon_authority(
+                                &mut *authority,
+                                request,
+                                now_ms,
+                                lease_horizon_authority,
+                                auth_verifier.as_deref(),
+                            )
+                        }
+                        None => prepare_control_plane_heartbeat_response(
+                            &mut *authority,
+                            request,
+                            now_ms,
+                            auth_verifier.as_deref(),
+                        ),
+                    }
                 };
                 prepared.and_then(|prepared| {
                     finish_control_plane_heartbeat_response(prepared, || {
@@ -5715,6 +5816,7 @@ mod tests {
             authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
+            after_heartbeat_commit_hook: None,
         };
         ExperimentalRaftTestHarness {
             runtime,
@@ -5828,6 +5930,7 @@ mod tests {
             authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
+            after_heartbeat_commit_hook: None,
         };
         ExperimentalRaftTestHarness {
             runtime,
@@ -5902,6 +6005,7 @@ mod tests {
             authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
+            after_heartbeat_commit_hook: None,
         };
         ExperimentalRaftTestHarness {
             runtime,
@@ -5936,6 +6040,7 @@ mod tests {
             authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
+            after_heartbeat_commit_hook: None,
         };
         std::thread::spawn(move || {
             for request_index in 0..request_count {
@@ -6152,6 +6257,7 @@ mod tests {
             authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
+            after_heartbeat_commit_hook: None,
         };
         bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
@@ -6213,6 +6319,7 @@ mod tests {
             authority_clock: None,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
+            after_heartbeat_commit_hook: None,
         };
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
@@ -6468,6 +6575,119 @@ mod tests {
         .expect("experimental raft heartbeat should refresh");
 
         assert_eq!(refresh.lease().lease_deadline_ms(), 30_500);
+        let status = harness
+            .control_plane
+            .block_on(harness.control_plane.authority.status())
+            .expect("experimental Raft status should read");
+        let lease_horizon_authority = harness
+            .control_plane
+            .authority_clock
+            .as_ref()
+            .expect("resampled authority uses a clock gate")
+            .lock()
+            .expect("authority clock mutex should not be poisoned")
+            .lease_horizon_authority_binding(status.current_term())
+            .expect("heartbeat authority binding should remain established");
+        assert!(harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after horizon establishment")
+            .lease_grant_horizon_covers(
+                lease_horizon_authority,
+                refresh.lease().lease_deadline_ms(),
+            ));
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_heartbeat_rechecks_leadership_after_commit() {
+        let mut harness = experimental_raft_test_harness("heartbeat-post-commit-term-change-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![7];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        enable_resampled_authority_time(&mut harness.control_plane, 31_000);
+        let initial_term = harness
+            .control_plane
+            .block_on(harness.control_plane.authority.status())
+            .expect("experimental Raft status should read")
+            .current_term()
+            .expect("single-node leader should have a term");
+        harness.control_plane.after_heartbeat_commit_hook = Some(Box::new(move |control_plane| {
+            control_plane.block_on(
+                control_plane
+                    .authority
+                    .trigger_pre_vote_election_until_serving(Duration::from_secs(1)),
+            )?;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let status = control_plane.block_on(control_plane.authority.status())?;
+                if status
+                    .current_term()
+                    .is_some_and(|term| term > initial_term)
+                    && status.linearized_authority_serving()
+                {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(ControlPlaneError::RpcRemote {
+                        message: "test election did not advance the local Raft term".to_string(),
+                    });
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }));
+
+        let error = storage::clock::with_time_override(31_000, || {
+            harness.control_plane.refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                30_000,
+            )
+        })
+        .expect_err("a heartbeat committed under the previous term must not return a lease");
+        assert!(matches!(
+            error,
+            ControlPlaneError::AuthorityClockLeadershipChanged {
+                established_term: Some(term),
+                current_term,
+            } if term == initial_term && current_term > initial_term
+        ));
+
+        let committed = harness
+            .control_plane
+            .current_snapshot()
+            .expect("committed heartbeat snapshot should remain readable");
+        assert_eq!(
+            committed
+                .node(NodeId::new(1))
+                .expect("heartbeat should commit before the injected election")
+                .lease_deadline_ms(),
+            Some(31_500)
+        );
+        assert_eq!(
+            committed
+                .lease_grant_horizon_authority()
+                .and_then(LeaseHorizonAuthorityBinding::raft_term),
+            Some(initial_term)
+        );
 
         harness.shutdown();
     }
@@ -6617,12 +6837,18 @@ mod tests {
             cluster_map_history_route_references: Default::default(),
             pg_observations: Vec::new(),
         };
+        let lease_horizon_authority = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should expose its lease horizon")
+            .lease_grant_horizon_authority();
         harness
             .control_plane
             .submit_raft_command(ControlPlaneCommand::RecordNodeHeartbeat {
                 heartbeat: restart_heartbeat.clone(),
                 heartbeat_at_ms: 62_000,
                 lease_deadline_ms: 63_000,
+                lease_horizon_authority,
             })
             .expect("lost experimental raft restart heartbeat response should still apply");
         assert_eq!(

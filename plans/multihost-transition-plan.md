@@ -10993,7 +10993,7 @@ Required production shape and implementation order:
    extension loss before durability, durable extension with response loss,
    process/leader changes, consumer refresh, and successor activation; an
    activated successor never overlaps a still-valid acknowledged consumer
-   lease. State format version 22 and durable command codec version 6 now
+   lease. State format version 22 and durable command codec version 7 now
    promote the capability into replicated state.
    `EstablishLeaseGrantHorizon` commits the accepted authority timestamp, a
    positive duration bounded to 60 seconds, the nonzero authority-clock
@@ -11008,12 +11008,35 @@ Required production shape and implementation order:
    overflow, timestamp regression, and premature rebinding. The same horizon
    checks are always-on publication/install invariants. Command,
    snapshot-codec, canonical-state, install, and no-op replay tests pin those
-   rules. This is durable schema/apply groundwork only:
-   production proposal paths do not yet establish or grant from the horizon,
-   and every accepted heartbeat remains durable. The next slice must validate
-   proposals against the currently accepted authority-clock generation and
-   current serving Raft term, prove restart/install parity, and only then
-   introduce volatile heartbeat renewal beneath the committed bound.
+   rules. That first slice was durable schema/apply groundwork only; it did not
+   establish or grant from the horizon and kept every heartbeat durable until
+   proposal generation/term and restart parity were proved.
+   The production proposal-path slice now establishes that boundary. The
+   single-authority RPC gate extracts a horizon binding only after accepting
+   the current process clock sample; the Raft wrapper additionally binds it to
+   the current locally serving leadership term. The committed heartbeat carries
+   that binding and atomically establishes a shared 20-second horizon when its
+   deadline is not already covered; later covered heartbeats reuse it without
+   extending the horizon. OpenRaft apply requires the carried term to equal the
+   actual committed entry term, and the proposal path rechecks current local
+   leadership before returning a serving lease. Full heartbeat semantics are
+   validated before either horizon or heartbeat state mutates, so a rejected
+   heartbeat cannot advance the timestamp high-water or successor fence. The
+   duration leaves a
+   ten-second renewal runway beyond the maximum heartbeat lease, so the later
+   volatile path can amortize extension independently of node count without
+   choosing the full 60-second failover fence. A restarted process advances
+   its clock generation past the authority stored in any restored horizon and
+   therefore cannot silently reuse a pre-crash volatile-grant capability; a
+   still-active old horizon fails closed through the existing symmetric-skew
+   rebinding fence. Single-authority persistence/reuse/replacement tests, an
+   actual OpenRaft commit-term rejection, and a deterministic wrapper test that
+   forces a new election between heartbeat commit and the post-commit authority
+   check pin the proposal binding and fail-closed response boundary. Heartbeats
+   themselves deliberately remain committed in this slice. The next slice may move only
+   unchanged liveness renewal beneath the established bound to volatile state;
+   topology, identity, proof, history-reference, and observation changes still
+   require deterministic committed commands.
 4. Persist logical durable commands incrementally. The single-authority
    compatibility path must either append versioned/checksummed durable deltas
    to an fsync'd, identity-bound journal and replay them over the latest

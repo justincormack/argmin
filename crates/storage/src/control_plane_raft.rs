@@ -9063,6 +9063,7 @@ mod tests {
         ClusterControlSnapshot, NodeAvailabilityState, NodeHeartbeat, RuntimeMapFreshnessProof,
     };
     use crate::control_plane_auth::ControlPlaneScopedCredentialInput;
+    use crate::control_plane_command::LeaseHorizonAuthorityBinding;
     use crate::types::PgId;
 
     type ControlPlaneOpenRaftLogSuite = OpenRaftLogSuite<
@@ -13994,6 +13995,61 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_state_machine_rejects_stale_heartbeat_authority_term() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine
+            .apply_entry(normal_entry(
+                2,
+                7,
+                1,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                },
+            ))
+            .unwrap();
+        let before = state_machine.inner().snapshot().clone();
+
+        let response = state_machine
+            .apply_entry(normal_entry(
+                2,
+                7,
+                2,
+                ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat: NodeHeartbeat {
+                        node_id: NodeId::new(1),
+                        node_incarnation: 1,
+                        endpoint: "node-1".to_string(),
+                        observed_epoch: before.cluster_epoch(),
+                        requested_lease_duration_ms: 100,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms: 1_000,
+                    lease_deadline_ms: 1_100,
+                    lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(7, Some(1))),
+                },
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            response,
+            ControlPlaneRaftApplyResponse::Rejected(
+                ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
+                    authority_term: Some(1),
+                    committed_term: Some(2),
+                }
+            )
+        ));
+        assert_eq!(state_machine.inner().snapshot(), &before);
+        assert_eq!(state_machine.last_applied(), Some(raft_log_id(2, 7, 2)));
+        assert_eq!(
+            state_machine.inner().last_applied(),
+            Some(ControlPlaneLogId::new(2, 2).unwrap())
+        );
+    }
+
+    #[test]
     fn control_plane_raft_state_machine_rejects_invalid_restart_artifacts() {
         let inner_with_applied = replicated_state_machine_with_noops(2, 3);
         let err = ControlPlaneRaftStateMachine::from_restart_artifact(
@@ -14984,6 +15040,7 @@ mod tests {
                     },
                     heartbeat_at_ms: 12_000,
                     lease_deadline_ms: 12_345,
+                    lease_horizon_authority: Some(LeaseHorizonAuthorityBinding::new(1, Some(1))),
                 })
                 .await
                 .unwrap();
