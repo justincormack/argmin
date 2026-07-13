@@ -11037,6 +11037,23 @@ Required production shape and implementation order:
    unchanged liveness renewal beneath the established bound to volatile state;
    topology, identity, proof, history-reference, and observation changes still
    require deterministic committed commands.
+   State format version 23 now establishes the prerequisite durable/volatile
+   availability split. Each node carries an explicit durable administrative
+   availability bit separately from its observed lease health. Serving and
+   peering require both administrative permission and healthy observed state;
+   an explicit `Unavailable` command persists the administrative fence, and
+   ordinary heartbeats cannot clear it before or after restart. Observed
+   liveness remains independent: a fenced node may report healthy and renew its
+   lease, but that does not change effective availability, bump the epoch, or
+   trigger peering. Expiry under the fence likewise changes only observed
+   health. Membership `Out` or `Removed` disables administrative service and
+   rejects liveness renewal, while an explicit transition back from `Out`
+   starts enabled but `Suspect` and must re-establish observed health. The
+   existing `MarkNodeAvailability` command remains the transitional
+   administrative API in this slice. Both fields are still included in every
+   committed snapshot, and every heartbeat remains committed; the next slice
+   can now make covered, semantically unchanged liveness renewal volatile
+   without making the administrative fence volatile.
 4. Persist logical durable commands incrementally. The single-authority
    compatibility path must either append versioned/checksummed durable deltas
    to an fsync'd, identity-bound journal and replay them over the latest

@@ -1,8 +1,9 @@
 use crate::control_plane::{
-    format_snapshot, parse_snapshot, validate_control_plane_snapshot, ClusterControlSnapshot,
-    ClusterRuntimeMapSnapshot, ControlPlaneError, NodeAvailabilityState, NodeHeartbeat,
-    NodeMembershipState, NodePgHeartbeatObservation, PendingMetadataCommandObservation,
-    PgMetadataProof, PgMetadataTransferProof, RuntimeMapFreshnessProof,
+    format_snapshot, parse_snapshot, parse_snapshot_without_publication_validation,
+    validate_control_plane_snapshot, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
+    ControlPlaneError, NodeAvailabilityState, NodeHeartbeat, NodeMembershipState,
+    NodePgHeartbeatObservation, PendingMetadataCommandObservation, PgMetadataProof,
+    PgMetadataTransferProof, RuntimeMapFreshnessProof,
 };
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::types::{PgId, PgState};
@@ -467,6 +468,10 @@ pub fn encode_control_plane_snapshot(
 pub fn decode_control_plane_snapshot(
     bytes: &[u8],
 ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+    parse_snapshot(decode_control_plane_snapshot_contents(bytes)?)
+}
+
+fn decode_control_plane_snapshot_contents(bytes: &[u8]) -> Result<&str, ControlPlaneError> {
     let min_len = CONTROL_PLANE_SNAPSHOT_MAGIC.len()
         + std::mem::size_of::<u16>()
         + std::mem::size_of::<u32>()
@@ -524,7 +529,7 @@ pub fn decode_control_plane_snapshot(
             body.len() - content_offset
         )));
     }
-    let contents = std::str::from_utf8(
+    std::str::from_utf8(
         body.get(content_offset..expected_len)
             .expect("snapshot content range already checked"),
     )
@@ -532,8 +537,7 @@ pub fn decode_control_plane_snapshot(
         snapshot_protocol_error(format!(
             "control-plane snapshot content is not UTF-8: {source}"
         ))
-    })?;
-    parse_snapshot(contents)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -856,7 +860,9 @@ impl ReplicatedControlPlaneStateMachine {
         // The consensus layer must supply a mutually consistent
         // (payload, last_applied) pair. This adapter guards only against
         // rollback relative to the current applied position.
-        let snapshot = decode_control_plane_snapshot(artifact.payload())?;
+        let snapshot = parse_snapshot_without_publication_validation(
+            decode_control_plane_snapshot_contents(artifact.payload())?,
+        )?;
         validate_control_plane_snapshot(
             "attempted to install invalid replicated control-plane snapshot",
             &snapshot,

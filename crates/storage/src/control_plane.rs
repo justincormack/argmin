@@ -47,7 +47,7 @@ const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 22;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 23;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -978,7 +978,8 @@ impl NodeAvailabilityState {
 pub struct NodeControlRecord {
     node_id: NodeId,
     membership: NodeMembershipState,
-    availability: NodeAvailabilityState,
+    administratively_available: bool,
+    observed_availability: NodeAvailabilityState,
     node_incarnation: u64,
     endpoint: String,
     last_observed_epoch: Option<ClusterEpoch>,
@@ -990,15 +991,20 @@ pub struct NodeControlRecord {
 
 impl NodeControlRecord {
     fn new(node_id: NodeId, membership: NodeMembershipState) -> Self {
-        let availability = if matches!(membership, NodeMembershipState::Removed) {
-            NodeAvailabilityState::Unavailable
-        } else {
+        let administratively_available = !matches!(
+            membership,
+            NodeMembershipState::Out | NodeMembershipState::Removed
+        );
+        let observed_availability = if administratively_available {
             NodeAvailabilityState::Suspect
+        } else {
+            NodeAvailabilityState::Unavailable
         };
         Self {
             node_id,
             membership,
-            availability,
+            administratively_available,
+            observed_availability,
             node_incarnation: 0,
             endpoint: String::new(),
             last_observed_epoch: None,
@@ -1021,7 +1027,21 @@ impl NodeControlRecord {
 
     #[must_use]
     pub fn availability(&self) -> NodeAvailabilityState {
-        self.availability
+        if self.administratively_available {
+            self.observed_availability
+        } else {
+            NodeAvailabilityState::Unavailable
+        }
+    }
+
+    #[must_use]
+    pub fn administratively_available(&self) -> bool {
+        self.administratively_available
+    }
+
+    #[must_use]
+    pub fn observed_availability(&self) -> NodeAvailabilityState {
+        self.observed_availability
     }
 
     #[must_use]
@@ -1077,7 +1097,8 @@ impl NodeControlRecord {
 
     fn can_serve_primary(&self, cluster_epoch: ClusterEpoch, now_ms: u64) -> bool {
         self.membership.can_serve_primary()
-            && self.availability == NodeAvailabilityState::Healthy
+            && self.administratively_available
+            && self.observed_availability == NodeAvailabilityState::Healthy
             && self.last_observed_epoch == Some(cluster_epoch)
             && self
                 .lease_deadline_ms
@@ -1331,7 +1352,7 @@ impl ClusterControlSnapshot {
                 node_id: primary.as_u32(),
             })?;
         if !primary_record.membership.can_serve_primary()
-            || (primary_record.availability != NodeAvailabilityState::Healthy
+            || (primary_record.availability() != NodeAvailabilityState::Healthy
                 && refreshing_node_id != primary)
         {
             return Err(ControlPlaneError::PgHasNoServingPrimary {
@@ -2204,6 +2225,22 @@ impl ClusterControlSnapshot {
         }
 
         for node in self.nodes.values() {
+            if matches!(
+                node.membership,
+                NodeMembershipState::Out | NodeMembershipState::Removed
+            ) && (node.administratively_available
+                || node.observed_availability != NodeAvailabilityState::Unavailable
+                || node.lease_deadline_ms.is_some())
+            {
+                return Err(format!(
+                    "node {} with membership {:?} has administrative availability {}, observed availability {:?}, and lease deadline {:?}",
+                    node.node_id.as_u32(),
+                    node.membership,
+                    node.administratively_available,
+                    node.observed_availability,
+                    node.lease_deadline_ms
+                ));
+            }
             if let Some(lease_deadline_ms) = node.lease_deadline_ms {
                 let max_committed_timestamp_ms = self.max_committed_timestamp_ms.ok_or_else(|| {
                     format!(
@@ -2597,14 +2634,22 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         });
                     }
                     Some(record) => {
+                        let previous_membership = record.membership;
                         record.membership = membership;
                         affected_node = Some(node_id);
                         if matches!(
                             membership,
                             NodeMembershipState::Out | NodeMembershipState::Removed
                         ) {
-                            record.availability = NodeAvailabilityState::Unavailable;
+                            record.administratively_available = false;
+                            record.observed_availability = NodeAvailabilityState::Unavailable;
                             record.lease_deadline_ms = None;
+                        } else if matches!(
+                            previous_membership,
+                            NodeMembershipState::Out | NodeMembershipState::Removed
+                        ) {
+                            record.administratively_available = true;
+                            record.observed_availability = NodeAvailabilityState::Suspect;
                         }
                         changed = true;
                     }
@@ -2638,7 +2683,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         node_id: node_id.as_u32(),
                     },
                 )?;
-                if availability == NodeAvailabilityState::Healthy
+                if availability != NodeAvailabilityState::Unavailable
                     && matches!(
                         record.membership,
                         NodeMembershipState::Out | NodeMembershipState::Removed
@@ -2649,13 +2694,32 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         membership: record.membership,
                     });
                 }
-                let changed = record.availability != availability;
+                let changed = match availability {
+                    NodeAvailabilityState::Unavailable => record.administratively_available,
+                    NodeAvailabilityState::Healthy | NodeAvailabilityState::Suspect => {
+                        !record.administratively_available
+                            || record.observed_availability != availability
+                    }
+                };
                 if changed {
-                    record.availability = availability;
                     let mut affected_node = None;
-                    if availability != NodeAvailabilityState::Healthy {
-                        record.lease_deadline_ms = None;
-                        affected_node = Some(node_id);
+                    match availability {
+                        NodeAvailabilityState::Unavailable => {
+                            record.administratively_available = false;
+                            record.observed_availability = NodeAvailabilityState::Unavailable;
+                            record.lease_deadline_ms = None;
+                            affected_node = Some(node_id);
+                        }
+                        NodeAvailabilityState::Healthy => {
+                            record.administratively_available = true;
+                            record.observed_availability = NodeAvailabilityState::Healthy;
+                        }
+                        NodeAvailabilityState::Suspect => {
+                            record.administratively_available = true;
+                            record.observed_availability = NodeAvailabilityState::Suspect;
+                            record.lease_deadline_ms = None;
+                            affected_node = Some(node_id);
+                        }
                     }
                     if let Some(node_id) = affected_node {
                         mark_pgs_peering_for_nodes(&mut next_snapshot, self, [node_id]);
@@ -2850,10 +2914,12 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         epoch_changed = true;
                         affected_node = Some(heartbeat.node_id);
                     }
-                    if record.availability != NodeAvailabilityState::Healthy {
-                        record.availability = NodeAvailabilityState::Healthy;
-                        epoch_changed = true;
-                        affected_node = Some(heartbeat.node_id);
+                    if record.observed_availability != NodeAvailabilityState::Healthy {
+                        record.observed_availability = NodeAvailabilityState::Healthy;
+                        if record.administratively_available {
+                            epoch_changed = true;
+                            affected_node = Some(heartbeat.node_id);
+                        }
                     }
                     record.record_observed_epoch(heartbeat.observed_epoch);
                     record.last_heartbeat_ms = Some(heartbeat_at_ms);
@@ -2975,11 +3041,12 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 let timestamp_changed =
                     next_snapshot.record_committed_timestamp(committed_expire_at_ms);
                 let mut expired_nodes = Vec::new();
+                let mut serving_expired_nodes = Vec::new();
                 for record in next_snapshot.nodes.values_mut() {
                     if matches!(
                         record.membership,
                         NodeMembershipState::Out | NodeMembershipState::Removed
-                    ) || record.availability == NodeAvailabilityState::Unavailable
+                    ) || record.observed_availability == NodeAvailabilityState::Unavailable
                     {
                         continue;
                     }
@@ -2987,16 +3054,19 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         .lease_deadline_ms
                         .is_some_and(|lease_deadline_ms| lease_deadline_ms <= expire_at_ms)
                     {
-                        record.availability = NodeAvailabilityState::Unavailable;
+                        record.observed_availability = NodeAvailabilityState::Unavailable;
                         record.lease_deadline_ms = None;
                         expired_nodes.push(record.node_id);
+                        if record.administratively_available {
+                            serving_expired_nodes.push(record.node_id);
+                        }
                     }
                 }
-                let peering_pgs = if expired_nodes.is_empty() {
+                let peering_pgs = if serving_expired_nodes.is_empty() {
                     Vec::new()
                 } else {
                     let peering_pgs =
-                        mark_pgs_peering_for_nodes(&mut next_snapshot, self, expired_nodes.clone());
+                        mark_pgs_peering_for_nodes(&mut next_snapshot, self, serving_expired_nodes);
                     next_snapshot.bump_epoch()?;
                     peering_pgs
                 };
@@ -13561,10 +13631,11 @@ fn format_historical_pg_route_record(record: &HistoricalPgRouteRecord) -> String
 
 fn format_node_record(record: &NodeControlRecord) -> String {
     format!(
-        "{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{}",
         record.node_id.as_u32(),
         record.membership.as_str(),
-        record.availability.as_str(),
+        u8::from(record.administratively_available),
+        record.observed_availability.as_str(),
         record.node_incarnation,
         option_u64(record.last_observed_epoch.map(ClusterEpoch::get)),
         option_u64(record.last_heartbeat_ms),
@@ -13739,6 +13810,16 @@ fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> S
 }
 
 pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+    let snapshot = parse_snapshot_without_publication_validation(contents)?;
+    snapshot
+        .validate_current_state_invariants()
+        .map_err(|message| parse_error(0, &message))?;
+    Ok(snapshot)
+}
+
+pub(crate) fn parse_snapshot_without_publication_validation(
+    contents: &str,
+) -> Result<ClusterControlSnapshot, ControlPlaneError> {
     let mut version = None;
     let mut authority_incarnation = None;
     let mut cluster_epoch = None;
@@ -13956,9 +14037,6 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
         lease_grant_horizon,
         history,
     };
-    snapshot
-        .validate_lease_grant_horizon_invariant()
-        .map_err(|message| parse_error(0, &message))?;
     if format_snapshot(&snapshot) != contents {
         return Err(parse_error(
             0,
@@ -14439,22 +14517,24 @@ fn parse_node_pg_record(
 
 fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 8 {
-        return Err(parse_error(line, "node record must have eight fields"));
+    if fields.len() != 9 {
+        return Err(parse_error(line, "node record must have nine fields"));
     }
     let node_id = NodeId::new(parse_u32(line, fields[0], "node id")?);
     let membership = NodeMembershipState::from_str(fields[1])?;
-    let availability = NodeAvailabilityState::from_str(fields[2])?;
-    let node_incarnation = parse_u64(line, fields[3], "node incarnation")?;
-    let last_observed_epoch = parse_option_cluster_epoch(line, fields[4], "last observed epoch")?;
-    let last_heartbeat_ms = parse_option_u64(line, fields[5], "last heartbeat")?;
-    let lease_deadline_ms = parse_option_u64(line, fields[6], "lease deadline")?;
-    let endpoint = String::from_utf8(hex_decode(line, fields[7])?)
+    let administratively_available = parse_bool_u8(line, fields[2], "administrative availability")?;
+    let observed_availability = NodeAvailabilityState::from_str(fields[3])?;
+    let node_incarnation = parse_u64(line, fields[4], "node incarnation")?;
+    let last_observed_epoch = parse_option_cluster_epoch(line, fields[5], "last observed epoch")?;
+    let last_heartbeat_ms = parse_option_u64(line, fields[6], "last heartbeat")?;
+    let lease_deadline_ms = parse_option_u64(line, fields[7], "lease deadline")?;
+    let endpoint = String::from_utf8(hex_decode(line, fields[8])?)
         .map_err(|_| parse_error(line, "node endpoint must be valid UTF-8 after hex decoding"))?;
     Ok(NodeControlRecord {
         node_id,
         membership,
-        availability,
+        administratively_available,
+        observed_availability,
         node_incarnation,
         endpoint,
         last_observed_epoch,
@@ -15406,7 +15486,7 @@ fn validate_pg_peering_observations(
             });
         };
         if !node.membership.can_serve_primary()
-            || node.availability != NodeAvailabilityState::Healthy
+            || node.availability() != NodeAvailabilityState::Healthy
             || node
                 .lease_deadline_ms
                 .is_none_or(|lease_deadline_ms| lease_deadline_ms <= now_ms)
@@ -16311,7 +16391,7 @@ mod tests {
         let mut snapshot = ClusterControlSnapshot::empty();
         snapshot.max_committed_timestamp_ms = Some(123);
         let mut node = NodeControlRecord::new(NodeId::new(1), NodeMembershipState::Active);
-        node.availability = NodeAvailabilityState::Healthy;
+        node.observed_availability = NodeAvailabilityState::Healthy;
         node.node_incarnation = 11;
         node.endpoint = "node-1.sock".to_owned();
         node.last_observed_epoch = Some(ClusterEpoch::INITIAL);
@@ -16361,6 +16441,18 @@ mod tests {
                 "{label} should be rejected as non-canonical"
             );
         }
+    }
+
+    #[test]
+    fn parse_snapshot_rejects_serving_state_for_out_node() {
+        let canonical = format_snapshot(&canonical_snapshot_with_node());
+        let invalid = canonical.replace("node=1,active,1,healthy", "node=1,out,1,healthy");
+
+        assert!(matches!(
+            parse_snapshot(&invalid),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message.contains("node 1 with membership Out has administrative availability true")
+        ));
     }
 
     fn heartbeat(node_id: u32, observed_epoch: ClusterEpoch, _now_ms: u64) -> NodeHeartbeat {
@@ -18697,6 +18789,11 @@ mod tests {
             ClusterControlSnapshot::test_invalid_active_without_metadata_proof_epoch(PgId::new(30));
         let payload =
             crate::control_plane_command::encode_control_plane_snapshot(&invalid_snapshot).unwrap();
+        assert!(matches!(
+            crate::control_plane_command::decode_control_plane_snapshot(&payload),
+            Err(ControlPlaneError::Parse { line: 0, message })
+                if message.contains("has no metadata proof epoch")
+        ));
         let mut state_machine =
             crate::control_plane_command::ReplicatedControlPlaneStateMachine::empty();
         let before = state_machine.clone();
@@ -24891,7 +24988,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=2\nauthority_incarnation=1\ncluster_epoch=1\nnode=1,active,healthy,11,1,100,200,6e6f64652d312e736f636b\n",
+            "version=2\nauthority_incarnation=1\ncluster_epoch=1\nnode=1,active,1,healthy,11,1,100,200,6e6f64652d312e736f636b\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -24908,7 +25005,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=22\nauthority_incarnation=1\ncluster_epoch=1\n",
+            "version=23\nauthority_incarnation=1\ncluster_epoch=1\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -26256,7 +26353,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=1\n",
@@ -26279,11 +26376,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "pg=7,active,1:99,1,1,2,3,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0\n",
             ),
         )
@@ -26303,11 +26400,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "pg=7,peering,1,-,-,-,-,9,10,11,3,9,10,11,-,-,-,2,1,0,0,-,0,-,-,0,-,-,-,-,0\n",
             ),
         )
@@ -26328,11 +26425,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,1,-,0,-,-,0,-,-,-,-,0\n",
             ),
         )
@@ -26371,7 +26468,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -26394,7 +26491,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -26419,7 +26516,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -26427,7 +26524,7 @@ mod tests {
                 "history_node=2,1\n",
                 "history_node_pg=2,1,7,peering,2,100,0,0,0,-,-,-\n",
                 "history_pg=2,7,peering,1,-,-,-,-,-,-,-,-,-,-\n",
-                "node=1,active,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
                 "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
             ),
         )
@@ -26449,14 +26546,14 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
                 "history=2,1\n",
                 "history_node=2,1\n",
                 "history_pg=2,7,peering,1,-,3,9,10,11,9,10,11,2,1\n",
-                "node=1,active,healthy,11,4,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,4,100,200,6e6f64652d312e736f636b\n",
             ),
         )
         .unwrap();
@@ -26485,7 +26582,7 @@ mod tests {
             let tmp = test_util::tempdir();
             let path = tmp.path().join(format!("control-plane-{index}.state"));
             let contents = format!(
-                "version=22\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
+                "version=23\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
             );
             std::fs::write(&path, contents).unwrap();
 
@@ -26553,7 +26650,7 @@ mod tests {
             let tmp = test_util::tempdir();
             let path = tmp.path().join(format!("control-plane-{name}.state"));
             let contents = format!(
-                "version=22\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}"
+                "version=23\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}"
             );
             std::fs::write(&path, contents).unwrap();
 
@@ -26571,7 +26668,7 @@ mod tests {
 
     #[test]
     fn file_backed_authority_rejects_invalid_pg_introduction_history() {
-        let current_node = "node=1,active,suspect,11,-,-,-,2f746d702f6e6f64652d312e736f636b\n";
+        let current_node = "node=1,active,1,suspect,11,-,-,-,2f746d702f6e6f64652d312e736f636b\n";
         let current_pg = "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n";
         let cases = [
             (
@@ -26621,7 +26718,7 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "version=22\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}{current_node}{current_pg}"
+                    "version=23\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}{current_node}{current_pg}"
                 ),
             )
             .unwrap();
@@ -26645,14 +26742,14 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "history=1,1\n",
                 "history_pg_absent=1,8\n",
                 "history_pg_absent=1,7\n",
-                "node=1,active,suspect,11,-,-,-,2f746d702f6e6f64652d312e736f636b\n",
+                "node=1,active,1,suspect,11,-,-,-,2f746d702f6e6f64652d312e736f636b\n",
                 "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
                 "pg=8,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
             ),
@@ -26676,7 +26773,7 @@ mod tests {
                 "version=5\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,peering,2,100,0,0,0,0\n",
                 "pg=7,peering,1,-,-,-,-\n",
             ),
@@ -26697,12 +26794,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
-                "node=2,active,healthy,12,2,100,200,6e6f64652d322e736f636b\n",
+                "node=1,active,1,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=2,active,1,healthy,12,2,100,200,6e6f64652d322e736f636b\n",
                 "node_pg=2,7,peering,2,100,0,0,0,-,-,-\n",
                 "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
             ),
@@ -26723,11 +26820,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
-                "node=1,active,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,peering,2,100,0,0,0,-,-,-\n",
                 "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-,0\n",
             ),
@@ -26748,11 +26845,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,9,10,12,-,-,-\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0\n",
             ),
@@ -26774,11 +26871,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "max_committed_timestamp_ms=100\nlease_grant_horizon=-\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,10,20,30,-,-,-\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0\n",
             ),
@@ -26803,11 +26900,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=22\n",
+                "version=23\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,1,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,9,10,11,2,1,1\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-,0\n",
             ),
@@ -34445,10 +34542,10 @@ mod tests {
     }
 
     #[test]
-    fn temporary_availability_changes_bump_epoch_without_removing_membership() {
+    fn administrative_unavailable_fence_survives_heartbeat_and_restart() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         authority
             .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
             .unwrap();
@@ -34466,25 +34563,80 @@ mod tests {
             unavailable.availability(),
             NodeAvailabilityState::Unavailable
         );
+        assert!(!unavailable.administratively_available());
+        assert_eq!(
+            unavailable.observed_availability(),
+            NodeAvailabilityState::Unavailable
+        );
         assert!(authority.snapshot().cluster_epoch() > healthy_epoch);
 
         let unavailable_epoch = authority.snapshot().cluster_epoch();
-        let recovered = authority
+        let fenced = authority
             .heartbeat(heartbeat(2, unavailable_epoch, 500), 500)
             .unwrap();
-        assert!(recovered.cluster_epoch() > unavailable_epoch);
-        assert!(!recovered.serving());
+        assert_eq!(fenced.cluster_epoch(), unavailable_epoch);
+        assert!(!fenced.serving());
+        let fenced_node = authority.snapshot().node(NodeId::new(2)).unwrap();
+        assert!(!fenced_node.administratively_available());
+        assert_eq!(
+            fenced_node.observed_availability(),
+            NodeAvailabilityState::Healthy
+        );
+        let fenced_lease_deadline_ms = fenced_node.lease_deadline_ms();
+
+        authority
+            .mark_node_availability(NodeId::new(2), NodeAvailabilityState::Unavailable)
+            .unwrap();
+        let still_fenced = authority.snapshot().node(NodeId::new(2)).unwrap();
+        assert_eq!(authority.snapshot().cluster_epoch(), unavailable_epoch);
+        assert_eq!(
+            still_fenced.observed_availability(),
+            NodeAvailabilityState::Healthy
+        );
+        assert_eq!(still_fenced.lease_deadline_ms(), fenced_lease_deadline_ms);
+
+        let mut authority = reopen_file_authority(&store);
+        let restarted = authority.snapshot().node(NodeId::new(2)).unwrap();
+        assert!(!restarted.administratively_available());
+        assert_eq!(restarted.availability(), NodeAvailabilityState::Unavailable);
+        assert_eq!(
+            restarted.observed_availability(),
+            NodeAvailabilityState::Healthy
+        );
+        let restart_epoch = authority.snapshot().cluster_epoch();
+        assert!(!authority
+            .heartbeat(heartbeat(2, restart_epoch, 600), 600)
+            .unwrap()
+            .serving());
+        let expiry = authority.expire_heartbeat_leases(700).unwrap();
+        assert_eq!(expiry.cluster_epoch(), restart_epoch);
+        assert_eq!(expiry.expired_nodes(), &[NodeId::new(2)]);
+        assert!(expiry.peering_pgs().is_empty());
+        let expired_fenced = authority.snapshot().node(NodeId::new(2)).unwrap();
+        assert!(!expired_fenced.administratively_available());
+        assert_eq!(
+            expired_fenced.observed_availability(),
+            NodeAvailabilityState::Unavailable
+        );
+
+        authority
+            .mark_node_availability(NodeId::new(2), NodeAvailabilityState::Suspect)
+            .unwrap();
+        let enabled_epoch = authority.snapshot().cluster_epoch();
+        let recovering = authority
+            .heartbeat(heartbeat(2, enabled_epoch, 700), 700)
+            .unwrap();
+        assert!(!recovering.serving());
         let serving = authority
-            .heartbeat(heartbeat(2, recovered.cluster_epoch(), 600), 600)
+            .heartbeat(heartbeat(2, recovering.cluster_epoch(), 800), 800)
             .unwrap();
         assert!(serving.serving());
+        let enabled = authority.snapshot().node(NodeId::new(2)).unwrap();
+        assert_eq!(enabled.membership(), NodeMembershipState::Active);
+        assert!(enabled.administratively_available());
         assert_eq!(
-            authority
-                .snapshot()
-                .node(NodeId::new(2))
-                .unwrap()
-                .membership(),
-            NodeMembershipState::Active
+            enabled.observed_availability(),
+            NodeAvailabilityState::Healthy
         );
     }
 

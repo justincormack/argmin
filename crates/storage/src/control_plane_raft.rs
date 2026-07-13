@@ -17167,10 +17167,24 @@ mod tests {
                     let node802_availability = snapshot
                         .node(NodeId::new(802))
                         .map(|node| node.availability());
+                    let node802_administratively_available = snapshot
+                        .node(NodeId::new(802))
+                        .map(|node| node.administratively_available());
                     let node803_availability = snapshot
                         .node(NodeId::new(803))
                         .map(|node| node.availability());
-                    Box::pin(async move { (node_ids, node802_availability, node803_availability) })
+                    let node803_administratively_available = snapshot
+                        .node(NodeId::new(803))
+                        .map(|node| node.administratively_available());
+                    Box::pin(async move {
+                        (
+                            node_ids,
+                            node802_availability,
+                            node802_administratively_available,
+                            node803_availability,
+                            node803_administratively_available,
+                        )
+                    })
                 })
                 .await
                 .unwrap();
@@ -17179,7 +17193,9 @@ mod tests {
                 vec![NodeId::new(801), NodeId::new(802), NodeId::new(803)]
             );
             assert_eq!(restarted_state.1, Some(NodeAvailabilityState::Unavailable));
-            assert_eq!(restarted_state.2, Some(NodeAvailabilityState::Unavailable));
+            assert_eq!(restarted_state.2, Some(false));
+            assert_eq!(restarted_state.3, Some(NodeAvailabilityState::Unavailable));
+            assert_eq!(restarted_state.4, Some(false));
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
