@@ -2820,7 +2820,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     ));
                 }
                 validate_storage_cluster_map_history_floor(self, &heartbeat)?;
-                let pending_active_primary_observations = validate_pg_heartbeat_observations(
+                let pending_active_pg_observations = validate_pg_heartbeat_observations(
                     self,
                     heartbeat.node_id,
                     &heartbeat.pg_observations,
@@ -2914,11 +2914,11 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         pg.active_metadata_transfer_imported = false;
                     }
                 }
-                if !pending_active_primary_observations.is_empty() {
+                if !pending_active_pg_observations.is_empty() {
                     mark_pgs_peering_for_pg_ids(
                         &mut next_snapshot,
                         self,
-                        pending_active_primary_observations
+                        pending_active_pg_observations
                             .iter()
                             .map(|observation| observation.pg_id),
                     );
@@ -2929,7 +2929,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         mark_pgs_peering_for_nodes(&mut next_snapshot, self, [node_id]);
                     }
                     next_snapshot.bump_epoch()?;
-                    if !pending_active_primary_observations.is_empty() {
+                    if !pending_active_pg_observations.is_empty() {
                         // Preserve the validated pending-command evidence across the
                         // epoch bump that fences the old Active route. Treating it as
                         // a Peering observation makes recovery discoverable while
@@ -2939,7 +2939,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                             .nodes
                             .get_mut(&heartbeat.node_id)
                             .expect("node record validated before heartbeat mutation");
-                        for observation in pending_active_primary_observations {
+                        for observation in pending_active_pg_observations {
                             record.pg_observations.insert(
                                 observation.pg_id,
                                 NodePgObservationRecord {
@@ -15065,7 +15065,7 @@ fn validate_pg_heartbeat_observations(
     observations: &[NodePgHeartbeatObservation],
 ) -> Result<Vec<NodePgHeartbeatObservation>, ControlPlaneError> {
     let mut observed_pgs = BTreeSet::new();
-    let mut pending_active_primary_observations = Vec::new();
+    let mut pending_active_pg_observations = Vec::new();
     for observation in observations {
         if !observed_pgs.insert(observation.pg_id) {
             return Err(ControlPlaneError::DuplicatePgObservation {
@@ -15085,19 +15085,21 @@ fn validate_pg_heartbeat_observations(
                 pg_id: observation.pg_id.get(),
             });
         }
+        if let Some(pending) = observation.pending_metadata_command {
+            validate_pending_metadata_command_reporter(
+                snapshot,
+                observation.pg_id,
+                node_id,
+                pending,
+            )?;
+        }
+        if pg.state == PgState::Active && observation.pending_metadata_command.is_some() {
+            pending_active_pg_observations.push(*observation);
+        }
         if pg.state == PgState::Active
             && pg.active_primary == Some(node_id)
             && observation.state == PgState::Active
         {
-            if let Some(pending) = observation.pending_metadata_command {
-                validate_pending_metadata_command_reporter(
-                    snapshot,
-                    observation.pg_id,
-                    node_id,
-                    pending,
-                )?;
-                pending_active_primary_observations.push(*observation);
-            }
             let expected = pg.active_metadata_proof.ok_or(
                 ControlPlaneError::ActivePgMissingMetadataProof {
                     pg_id: observation.pg_id.get(),
@@ -15122,7 +15124,7 @@ fn validate_pg_heartbeat_observations(
             }
         }
     }
-    Ok(pending_active_primary_observations)
+    Ok(pending_active_pg_observations)
 }
 
 fn validate_pending_metadata_command_reporter(
@@ -16986,10 +16988,92 @@ mod tests {
         },
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PendingCommandLifecycleOp {
+        InstallPending,
+        ConvergePending,
+        Heartbeat,
+        CompleteReadyPeerings,
+        Restart,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PendingCommandSlotState {
+        NotInstalled,
+        Pending,
+        Converged,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PendingCommandLifecycleModel {
+        slot: PendingCommandSlotState,
+        pg_state: PgState,
+        observed_pending: bool,
+        peering_ready: bool,
+        route_protected: bool,
+    }
+
+    impl PendingCommandLifecycleModel {
+        fn active() -> Self {
+            Self {
+                slot: PendingCommandSlotState::NotInstalled,
+                pg_state: PgState::Active,
+                observed_pending: false,
+                peering_ready: false,
+                route_protected: false,
+            }
+        }
+
+        fn apply(&mut self, op: PendingCommandLifecycleOp) {
+            match op {
+                PendingCommandLifecycleOp::InstallPending => {
+                    if self.slot == PendingCommandSlotState::NotInstalled {
+                        self.slot = PendingCommandSlotState::Pending;
+                    }
+                }
+                PendingCommandLifecycleOp::ConvergePending => {
+                    if self.slot == PendingCommandSlotState::Pending {
+                        self.slot = PendingCommandSlotState::Converged;
+                    }
+                }
+                PendingCommandLifecycleOp::Heartbeat => {
+                    self.route_protected = self.slot == PendingCommandSlotState::Pending;
+                    match self.pg_state {
+                        PgState::Active => {
+                            if self.slot == PendingCommandSlotState::Pending {
+                                self.pg_state = PgState::Peering;
+                                self.observed_pending = true;
+                                self.peering_ready = false;
+                            }
+                        }
+                        PgState::Peering => {
+                            self.observed_pending = self.slot == PendingCommandSlotState::Pending;
+                            self.peering_ready = !self.observed_pending;
+                        }
+                        state => {
+                            panic!("pending-command model reached unexpected PG state {state:?}")
+                        }
+                    }
+                }
+                PendingCommandLifecycleOp::CompleteReadyPeerings => {
+                    if self.pg_state == PgState::Peering && self.peering_ready {
+                        self.pg_state = PgState::Active;
+                        self.peering_ready = false;
+                    }
+                }
+                PendingCommandLifecycleOp::Restart => {
+                    self.pg_state = PgState::Peering;
+                    self.observed_pending = false;
+                    self.peering_ready = false;
+                }
+            }
+        }
+    }
+
     fn control_plane_heartbeat_model_op_strategy(
     ) -> impl Strategy<Value = ControlPlaneHeartbeatModelOp> {
         prop_oneof![
-            8 => (0_u8..3, 0_u8..5, 0_u8..4).prop_map(
+            8 => (0_u8..3, 0_u8..6, 0_u8..4).prop_map(
                 |(node_slot, observation_kind, floor_kind)| {
                     ControlPlaneHeartbeatModelOp::CurrentHeartbeat {
                         node_slot,
@@ -17039,7 +17123,7 @@ mod tests {
         prop_oneof![
             8 => (
                 0_u8..3,
-                0_u8..5,
+                0_u8..6,
                 0_u8..4,
                 any::<bool>(),
                 any::<bool>(),
@@ -17250,7 +17334,7 @@ mod tests {
             return Vec::new();
         };
         if !pg.acting_set().contains(&NodeId::new(node_id)) {
-            return match observation_kind % 5 {
+            return match observation_kind % 6 {
                 0 => Vec::new(),
                 _ => vec![NodePgHeartbeatObservation {
                     pg_id,
@@ -17260,7 +17344,7 @@ mod tests {
                 }],
             };
         }
-        match observation_kind % 5 {
+        match observation_kind % 6 {
             0 => Vec::new(),
             1 => vec![NodePgHeartbeatObservation {
                 pg_id,
@@ -17284,11 +17368,21 @@ mod tests {
                     .unwrap_or_else(|| heartbeat_model_proof(3)),
                 pending_metadata_command: None,
             }],
-            _ => vec![NodePgHeartbeatObservation {
+            4 => vec![NodePgHeartbeatObservation {
                 pg_id,
                 state: PgState::Active,
                 metadata_proof: heartbeat_model_proof(observation_kind),
                 pending_metadata_command: None,
+            }],
+            _ => vec![NodePgHeartbeatObservation {
+                pg_id,
+                state: PgState::Active,
+                metadata_proof: pg
+                    .active_metadata_proof()
+                    .unwrap_or_else(|| heartbeat_model_proof(5)),
+                pending_metadata_command: Some(test_pending_metadata_command(
+                    snapshot.cluster_epoch(),
+                )),
             }],
         }
     }
@@ -17347,6 +17441,13 @@ mod tests {
             .expect("test control-plane snapshot persisted");
         prop_assert_eq!(&persisted, snapshot);
 
+        let recovery_listing = snapshot.pending_metadata_command_recoveries();
+        prop_assert!(
+            recovery_listing.failures().is_empty(),
+            "accepted heartbeat state must not contain invalid recovery evidence: {:?}",
+            recovery_listing.failures()
+        );
+
         for node in snapshot.nodes() {
             if let Some(observed_epoch) = node.last_observed_epoch() {
                 prop_assert!(
@@ -17395,7 +17496,37 @@ mod tests {
                     node.node_id().as_u32(),
                     observation.pg_id().get()
                 );
+                if let Some(pending) = observation.pending_metadata_command() {
+                    prop_assert_eq!(
+                        pg.state(),
+                        PgState::Peering,
+                        "accepted pending-command evidence must fence the PG in Peering"
+                    );
+                    let expected = PendingMetadataCommandRecoveryTask::new(
+                        observation.pg_id(),
+                        PendingMetadataCommandRecovery::new(node.node_id(), pending),
+                    );
+                    prop_assert!(
+                        recovery_listing.tasks().contains(&expected),
+                        "accepted pending-command evidence must remain discoverable"
+                    );
+                    let historical = snapshot
+                        .reconstructed_pg_route_at_epoch(
+                            observation.pg_id(),
+                            pending.cluster_epoch(),
+                        )
+                        .expect("accepted recovery evidence retains its historical route");
+                    prop_assert_eq!(historical.state(), PgState::Active);
+                    prop_assert_eq!(historical.primary_node_id(), node.node_id());
+                }
             }
+        }
+
+        for task in recovery_listing.tasks() {
+            let pg = snapshot
+                .pg(task.pg_id())
+                .expect("recovery task references known PG");
+            prop_assert_eq!(pg.state(), PgState::Peering);
         }
 
         for pg in snapshot.pgs() {
@@ -17441,6 +17572,292 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[derive(Clone)]
+    struct PendingCommandLifecycleCase {
+        snapshot: ClusterControlSnapshot,
+        model: PendingCommandLifecycleModel,
+        pending: PendingMetadataCommandObservation,
+        active_epoch: ClusterEpoch,
+        proof: PgMetadataProof,
+        now_ms: u64,
+    }
+
+    impl PendingCommandLifecycleCase {
+        fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            authority
+                .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+            authority
+                .set_pg_acting_set(heartbeat_model_pg_id(), vec![NodeId::new(1)])
+                .unwrap();
+            let proof = heartbeat_model_proof(9);
+            heartbeat_with_pg_proof(
+                &mut authority,
+                1,
+                heartbeat_model_pg_id().get(),
+                PgState::Peering,
+                proof,
+                false,
+                2_000,
+            );
+            authority.complete_ready_pg_peerings(2_010).unwrap();
+            let active_epoch = authority.snapshot().cluster_epoch();
+            let lease = heartbeat_with_pg_proof(
+                &mut authority,
+                1,
+                heartbeat_model_pg_id().get(),
+                PgState::Active,
+                proof,
+                false,
+                2_020,
+            );
+            assert!(lease.serving());
+
+            Self {
+                snapshot: authority.snapshot().clone(),
+                model: PendingCommandLifecycleModel::active(),
+                pending: test_pending_metadata_command(active_epoch),
+                active_epoch,
+                proof,
+                now_ms: 2_020,
+            }
+        }
+
+        fn apply(&mut self, op: PendingCommandLifecycleOp, trace: &[PendingCommandLifecycleOp]) {
+            self.now_ms += 1;
+            match op {
+                PendingCommandLifecycleOp::InstallPending
+                | PendingCommandLifecycleOp::ConvergePending => {}
+                PendingCommandLifecycleOp::Heartbeat => {
+                    let mut heartbeat = heartbeat_from_snapshot(
+                        &self.snapshot,
+                        1,
+                        self.snapshot.cluster_epoch(),
+                        self.now_ms,
+                    );
+                    heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+                        pg_id: heartbeat_model_pg_id(),
+                        state: self.model.pg_state,
+                        metadata_proof: self
+                            .snapshot
+                            .pg(heartbeat_model_pg_id())
+                            .and_then(PgControlRecord::active_metadata_proof)
+                            .unwrap_or(self.proof),
+                        pending_metadata_command: (self.model.slot
+                            == PendingCommandSlotState::Pending)
+                            .then_some(self.pending),
+                    }];
+                    if self.model.slot == PendingCommandSlotState::Pending {
+                        heartbeat.cluster_map_history_route_references =
+                            history_route_references([PgClusterMapHistoryRouteReference::new(
+                                PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+                                self.active_epoch,
+                                heartbeat_model_pg_id(),
+                            )]);
+                    }
+                    let lease_deadline_ms = self.now_ms + heartbeat.requested_lease_duration_ms;
+                    let applied = self
+                        .snapshot
+                        .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                            heartbeat,
+                            heartbeat_at_ms: self.now_ms,
+                            lease_deadline_ms,
+                            lease_horizon_authority: None,
+                        })
+                        .unwrap_or_else(|error| {
+                            panic!("heartbeat failed for lifecycle trace {trace:?}: {error}")
+                        });
+                    self.snapshot = applied.into_snapshot();
+                }
+                PendingCommandLifecycleOp::CompleteReadyPeerings => {
+                    let ready = self
+                        .snapshot
+                        .ready_pg_peering_completions(self.now_ms)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "ready-peering scan failed for lifecycle trace {trace:?}: {error}"
+                            )
+                        });
+                    let expected_ready =
+                        self.model.pg_state == PgState::Peering && self.model.peering_ready;
+                    assert_eq!(
+                        ready.len(),
+                        usize::from(expected_ready),
+                        "ready-peering mismatch for lifecycle trace {trace:?}"
+                    );
+                    let applied = self
+                        .snapshot
+                        .apply_control_plane_command(ControlPlaneCommand::CompleteReadyPgPeerings {
+                            ready_at_ms: self.now_ms,
+                            ready,
+                        })
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "peering completion failed for lifecycle trace {trace:?}: {error}"
+                            )
+                        });
+                    self.snapshot = applied.into_snapshot();
+                }
+                PendingCommandLifecycleOp::Restart => {
+                    let mut restarted = parse_snapshot(&format_snapshot(&self.snapshot))
+                        .unwrap_or_else(|error| {
+                            panic!("restart failed for lifecycle trace {trace:?}: {error}")
+                        });
+                    let previous = restarted.clone();
+                    restarted
+                        .bump_authority_after_restart()
+                        .unwrap_or_else(|error| {
+                            panic!("restart bump failed for lifecycle trace {trace:?}: {error}")
+                        });
+                    restarted.record_history_from(&previous);
+                    self.snapshot = restarted;
+                }
+            }
+            self.model.apply(op);
+            self.assert_matches_model(trace);
+        }
+
+        fn assert_matches_model(&self, trace: &[PendingCommandLifecycleOp]) {
+            self.snapshot
+                .validate_publication_invariants()
+                .unwrap_or_else(|error| {
+                    panic!("snapshot invariant failed for lifecycle trace {trace:?}: {error}")
+                });
+            let pg = self
+                .snapshot
+                .pg(heartbeat_model_pg_id())
+                .expect("model PG exists");
+            assert_eq!(
+                pg.state(),
+                self.model.pg_state,
+                "PG state mismatch for lifecycle trace {trace:?}"
+            );
+
+            let listing = self.snapshot.pending_metadata_command_recoveries();
+            assert!(
+                listing.failures().is_empty(),
+                "recovery discovery failed for lifecycle trace {trace:?}: {:?}",
+                listing.failures()
+            );
+            let expected_tasks =
+                self.model
+                    .observed_pending
+                    .then_some(PendingMetadataCommandRecoveryTask::new(
+                        heartbeat_model_pg_id(),
+                        PendingMetadataCommandRecovery::new(NodeId::new(1), self.pending),
+                    ));
+            assert_eq!(
+                listing.tasks(),
+                expected_tasks.as_slice(),
+                "recovery task mismatch for lifecycle trace {trace:?}"
+            );
+
+            let expected_reference = PgClusterMapHistoryRouteReference::new(
+                PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+                self.active_epoch,
+                heartbeat_model_pg_id(),
+            );
+            let references = self
+                .snapshot
+                .node(NodeId::new(1))
+                .expect("model node exists")
+                .cluster_map_history_route_references();
+            assert_eq!(
+                references
+                    .iter()
+                    .any(|reference| reference == expected_reference),
+                self.model.route_protected,
+                "pending route protection mismatch for lifecycle trace {trace:?}"
+            );
+
+            if self.model.observed_pending || self.model.route_protected {
+                let historical = self
+                    .snapshot
+                    .reconstructed_pg_route_at_epoch(heartbeat_model_pg_id(), self.active_epoch)
+                    .expect("pending recovery retains historical Active route");
+                assert_eq!(historical.state(), PgState::Active);
+                assert_eq!(historical.primary_node_id(), NodeId::new(1));
+                assert!(
+                    self.snapshot
+                        .ready_pg_peering_completions(self.now_ms)
+                        .unwrap()
+                        .is_empty(),
+                    "pending recovery must block peering completion for trace {trace:?}"
+                );
+            }
+        }
+    }
+
+    fn explore_pending_command_lifecycle_traces(
+        case: PendingCommandLifecycleCase,
+        trace: &mut Vec<PendingCommandLifecycleOp>,
+        remaining: usize,
+        visited: &mut usize,
+    ) {
+        const OPS: [PendingCommandLifecycleOp; 5] = [
+            PendingCommandLifecycleOp::InstallPending,
+            PendingCommandLifecycleOp::ConvergePending,
+            PendingCommandLifecycleOp::Heartbeat,
+            PendingCommandLifecycleOp::CompleteReadyPeerings,
+            PendingCommandLifecycleOp::Restart,
+        ];
+
+        if remaining == 0 {
+            return;
+        }
+        for op in OPS {
+            let mut child = case.clone();
+            trace.push(op);
+            child.apply(op, trace);
+            *visited += 1;
+            explore_pending_command_lifecycle_traces(child, trace, remaining - 1, visited);
+            trace.pop();
+        }
+    }
+
+    #[test]
+    fn pending_command_heartbeat_lifecycle_model_exhausts_short_interleavings() {
+        let initial = PendingCommandLifecycleCase::new();
+        initial.assert_matches_model(&[]);
+        let mut trace = Vec::new();
+        let mut visited = 1;
+        explore_pending_command_lifecycle_traces(initial, &mut trace, 6, &mut visited);
+        assert_eq!(visited, 19_531);
+    }
+
+    #[test]
+    fn pending_command_heartbeat_lifecycle_survives_restarts_and_reactivates() {
+        let mut case = PendingCommandLifecycleCase::new();
+        let mut trace = Vec::new();
+        for op in [
+            PendingCommandLifecycleOp::InstallPending,
+            PendingCommandLifecycleOp::Heartbeat,
+            PendingCommandLifecycleOp::Restart,
+            PendingCommandLifecycleOp::Heartbeat,
+            PendingCommandLifecycleOp::CompleteReadyPeerings,
+            PendingCommandLifecycleOp::ConvergePending,
+            PendingCommandLifecycleOp::Restart,
+            PendingCommandLifecycleOp::Heartbeat,
+            PendingCommandLifecycleOp::Restart,
+            PendingCommandLifecycleOp::Heartbeat,
+            PendingCommandLifecycleOp::CompleteReadyPeerings,
+            PendingCommandLifecycleOp::Heartbeat,
+        ] {
+            trace.push(op);
+            case.apply(op, &trace);
+        }
+        assert_eq!(case.model.pg_state, PgState::Active);
+        assert!(!case.model.observed_pending);
+        assert!(case
+            .snapshot
+            .active_pg_route(heartbeat_model_pg_id(), case.now_ms)
+            .is_ok());
     }
 
     #[test]
@@ -25080,10 +25497,20 @@ mod tests {
         authority
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 10_000).serving());
         authority
             .set_pg_acting_set(PgId::new(1), vec![NodeId::new(1)])
             .unwrap();
-        assert!(heartbeat_until_serving(&mut authority, 1, 10_000).serving());
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            1,
+            PgState::Peering,
+            PgMetadataProof::empty(),
+            false,
+            10_020,
+        );
+        authority.complete_ready_pg_peerings(10_030).unwrap();
         let protected_epoch = authority.snapshot().cluster_epoch();
         let mut heartbeat = heartbeat_from_record(&authority, 1, protected_epoch, 10_100);
         heartbeat.cluster_map_history_route_references =
@@ -25094,7 +25521,7 @@ mod tests {
             )]);
         heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(1),
-            state: PgState::Peering,
+            state: PgState::Active,
             metadata_proof: PgMetadataProof::empty(),
             pending_metadata_command: Some(PendingMetadataCommandObservation::new(
                 protected_epoch,
@@ -32139,17 +32566,26 @@ mod tests {
             applied_log_hash: 0xabc,
             state_digest: 0xdef,
         };
+        heartbeat_with_pg_proof(&mut authority, 1, 29, PgState::Peering, proof, false, 2_000);
+        authority.complete_ready_pg_peerings(2_010).unwrap();
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let mut heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_020);
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(29),
+            state: PgState::Active,
+            metadata_proof: proof,
+            pending_metadata_command: Some(test_pending_metadata_command(active_epoch)),
+        }];
+        authority.heartbeat(heartbeat, 2_020).unwrap();
         let mut heartbeat =
-            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_030);
         heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(29),
             state: PgState::Peering,
             metadata_proof: proof,
-            pending_metadata_command: Some(test_pending_metadata_command(
-                authority.snapshot().cluster_epoch(),
-            )),
+            pending_metadata_command: Some(test_pending_metadata_command(active_epoch)),
         }];
-        authority.heartbeat(heartbeat, 2_000).unwrap();
+        authority.heartbeat(heartbeat, 2_030).unwrap();
 
         assert!(matches!(
             authority.complete_pg_peering(
@@ -32819,9 +33255,44 @@ mod tests {
             route.pending_metadata_command_recovery(),
             Some(PendingMetadataCommandRecovery::new(NodeId::new(1), pending))
         );
+        authority = reopen_file_authority(&store);
         let pg = authority.snapshot().pg(PgId::new(32)).unwrap();
         assert_eq!(pg.state(), PgState::Peering);
         assert_eq!(pg.previous_primary_node_id(), Some(NodeId::new(1)));
+        assert!(authority
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .pg_observation(PgId::new(32))
+            .is_none());
+        assert!(authority
+            .snapshot()
+            .pending_metadata_command_recoveries()
+            .tasks()
+            .is_empty());
+
+        let restart_epoch = authority.snapshot().cluster_epoch();
+        let mut reconstructed = heartbeat_from_record(&authority, 1, restart_epoch, 2_030);
+        reconstructed.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(32),
+            state: PgState::Peering,
+            metadata_proof: active_proof,
+            pending_metadata_command: Some(pending),
+        }];
+        let reconstructed = authority
+            .refresh_node_heartbeat(reconstructed, 2_030)
+            .unwrap();
+        assert_eq!(reconstructed.runtime_map().cluster_epoch(), restart_epoch);
+        assert_eq!(
+            authority
+                .snapshot()
+                .pending_metadata_command_recoveries()
+                .tasks(),
+            &[PendingMetadataCommandRecoveryTask::new(
+                PgId::new(32),
+                PendingMetadataCommandRecovery::new(NodeId::new(1), pending),
+            )]
+        );
         let observation = authority
             .snapshot()
             .node(NodeId::new(1))
@@ -32829,7 +33300,7 @@ mod tests {
             .pg_observation(PgId::new(32))
             .unwrap();
         assert_eq!(observation.state(), PgState::Peering);
-        assert_eq!(observation.observed_epoch(), peering_epoch);
+        assert_eq!(observation.observed_epoch(), restart_epoch);
         assert_eq!(observation.pending_metadata_command(), Some(pending));
         assert_eq!(
             authority
@@ -32840,6 +33311,44 @@ mod tests {
             PgState::Active
         );
         assert_eq!(store.load().unwrap().unwrap(), *authority.snapshot());
+    }
+
+    #[test]
+    fn peering_heartbeat_rejects_pending_command_without_historical_active_primary() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(33), vec![NodeId::new(1)])
+            .unwrap();
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        let mut invalid = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
+        invalid.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(33),
+            state: PgState::Peering,
+            metadata_proof: heartbeat_model_proof(3),
+            pending_metadata_command: Some(test_pending_metadata_command(peering_epoch)),
+        }];
+        let before = authority.snapshot().clone();
+
+        assert!(matches!(
+            authority.refresh_node_heartbeat(invalid, 2_000),
+            Err(
+                ControlPlaneError::PgPeeringPendingMetadataCommandReporterNotHistoricalPrimary {
+                    pg_id: 33,
+                    node_id: 1,
+                    pending_epoch,
+                    historical_state: PgState::Peering,
+                    ..
+                }
+            ) if pending_epoch == peering_epoch
+        ));
+        assert_eq!(authority.snapshot(), &before);
+        assert_eq!(store.load().unwrap().unwrap(), before);
     }
 
     #[test]

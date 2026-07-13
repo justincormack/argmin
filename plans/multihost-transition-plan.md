@@ -11524,6 +11524,23 @@ Phase 12.4 progress:
   blocked until exact-command recovery clears the pending slot. A durable
   control-plane regression pins the transition, retained route, recovery
   certificate, and persisted snapshot.
+  The heartbeat state-machine model now treats pending-slot installation and
+  convergence as storage-node durable phases separate from control-plane
+  observation. A bounded exhaustive checker runs all 19,531 traces through six
+  operations drawn from install, converge, heartbeat, peering completion, and
+  authority restart. Restart clears reconstructible heartbeat observations and
+  peering readiness while preserving the storage-node slot; a fresh heartbeat
+  must reconstruct the exact task. A longer deterministic trace proves
+  recovery and reactivation across repeated restarts. The randomized heartbeat
+  model also generates current Active-primary pending observations and asserts
+  that every accepted pending observation fences the PG in `Peering`, remains
+  exactly discoverable, and retains its historical Active-primary route.
+  Initial model runs found two adjacent admission gaps: Peering observations
+  could persist a pending identity that did not name a historical Active
+  primary, and a valid pending observation with node-local `Peering` state
+  could leave the authority PG `Active`. Pending identities are now validated
+  on every observation, and any valid pending evidence for an authority-Active
+  PG triggers the same atomic fence regardless of the node-reported PG state.
   CL1 is closed by the paired control-plane fence; RPC4's cross-epoch physical
   shard alias remains separate work.
 - Closed DCC-2/CP2/CL4 operational recovery. The process-local authority clock

@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 60dc4fc695ef02fcaed73046d0275dfeb6fcf765462b060b1b4fc34be22710d2 # shrinks to ops = [ExpireLeases { advance_ms: 1 }, CurrentHeartbeat { node_slot: 0, observation_kind: 0, floor_kind: 1 }, CurrentHeartbeat { node_slot: 0, observation_kind: 0, floor_kind: 0 }]
+cc 99bf0cfa63b69abb6d2bad7a1f11daaf6dae192c662485cadfa5fa966f960b7b # shrinks to ops = [SetActingSet { shape: 5 }, CurrentHeartbeat { node_slot: 2, observation_kind: 2, floor_kind: 0 }]
+cc 16d3e1ad5116ee72377a061853d21286e8ba630cdee2292a7ef9569c57cc4a28 # shrinks to ops = [CurrentHeartbeat { node_slot: 0, observation_kind: 2, floor_kind: 0 }]
