@@ -720,9 +720,9 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The optional `AssumeRole` security-context parameters, role chaining behavior,
-role mutation precedence, session-principal context, and `aws:TokenIssueTime`
-behavior remain before Phase 0 can satisfy its exit condition.
+The optional `AssumeRole` security-context parameters, role mutation
+precedence, session-principal context, and `aws:TokenIssueTime` behavior remain
+before Phase 0 can satisfy its exit condition.
 
 The role-fixture capability will use the ordinary primary and alternate test
 users, not the owner/root credential. The shared test-user policy grants only
@@ -761,10 +761,10 @@ The same-account role-fixture slice now:
   credential only to identify the target user and confines owner/root use to
   creating or versioning the customer-managed test policy and attaching it
 - creates, converges, assumes, and deletes uniquely named
-  `role/argmin-sts-oracle/same-account/path-shape-*` and `default-max-*` roles
-  using the primary test user; it never adopts or mutates an existing role,
-  grants neither role identity permissions, and normalizes temporary secrets
-  before golden response comparison
+  `role/argmin-sts-oracle/same-account/path-shape-*`, `default-max-*`, and
+  `chain-target-*` roles using the primary test user; it never adopts or
+  mutates an existing role, grants none of the roles identity permissions, and
+  normalizes temporary secrets before golden response comparison
 - proves that the IAM role ARN retains `/argmin-sts-oracle/same-account/` while
   its returned STS ARN omits the entire IAM path and retains only the unique
   role name and `path-shape-session` session name
@@ -781,8 +781,8 @@ its unique missing role before creation, then requires `CreateRole` to succeed;
 fixture. It never broadens the IAM resource grant merely to perform an
 existence check.
 
-`./scripts/cleanup` discovers both uniquely named same-account oracle role
-shapes and deletes only those at least one hour old. The age floor prevents a
+`./scripts/cleanup` discovers all uniquely named same-account oracle role shapes
+and deletes only those at least one hour old. The age floor prevents a
 periodic cleanup run from deleting another concurrently active oracle fixture.
 IAM discovery failure is reported and makes the command exit unsuccessfully
 after the existing bucket cleanup has still run; it cannot disable bucket
@@ -863,9 +863,10 @@ matrix establishes that:
 - an empty duration is also HTTP 400 `MalformedInput`, but uniquely includes
   `missing value for decimal type`; alphabetic input has no `Message` element,
   like the other numeric parse failures
-- each successful response's `Expiration` is exactly the default or requested
-  duration after the HTTP response date, in addition to matching the complete
-  success XML and semantic header golden
+- each successful response's `Expiration` is either the default or requested
+  duration after the HTTP response date, or one second less when credential
+  issuance and response-date generation cross a whole-second boundary, in
+  addition to matching the complete success XML and semantic header golden
 - duplicate `RoleArn`, `RoleSessionName`, and `DurationSeconds` parameters use
   the first wire value, and an unknown extra parameter is ignored
 
@@ -889,6 +890,40 @@ MaxSessionDuration set for this role.` A 43,201-second request against that
 same low-maximum role instead receives the ordinary API maximum-value
 validation response. The fixed Query-schema range is therefore validated
 before the target role's mutable configured maximum.
+
+The role-chaining slice completed on 2026-07-13 without expanding the fixture
+IAM policy. The permissionless path-bearing role is assumed as the source. A
+unique target role has a 43,200-second configured maximum and directly trusts
+the source IAM role ARN; the long-lived primary caller has an exact-target
+`implicitDeny` for that target. The fixture verifies the source session's
+caller ARN is the path-free
+`arn:aws:sts::<account>:assumed-role/<role-name>/<session-name>` shape and
+establishes a successful target assumption with those credentials before the
+raw goldens run. This proves same-account direct role trust permits chaining
+without an identity-policy allow on the permissionless source role.
+
+IAM's `role-exists` waiter can complete before the new source role ARN is
+accepted as a trust-policy principal. Creation of the low-maximum chaining
+target therefore retries only AWS's explicit `MalformedPolicyDocument` plus
+`Invalid principal in policy` response. Every other creation failure remains
+immediate, and the role is registered for cleanup only after `CreateRole`
+succeeds.
+
+The raw request signs `x-amz-security-token` along with the other SigV4
+headers. A 3,600-second chained assumption receives the complete success
+golden. A 3,601-second request against the 43,200-second target receives HTTP
+400 `ValidationError` with exactly `The requested DurationSeconds exceeds the
+1 hour session limit for roles assumed by role chaining.` The authenticated
+caller's session status therefore imposes the one-hour bound independently of
+the target's higher configured maximum. A 43,201-second chained request instead
+receives the ordinary API maximum-value validation response, establishing that
+the fixed Query-schema range is validated before both contextual limits. A
+second target directly trusts the same source role but retains the 3,600-second
+configured maximum. After target-specific chained success convergence at that
+boundary, a 3,601-second request receives the configured-role
+`MaxSessionDuration` error rather than the role-chaining error. The complete
+observed duration-check order is therefore fixed Query-schema range, target
+role configured maximum, then the one-hour role-chaining limit.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations

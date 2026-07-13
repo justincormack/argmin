@@ -52,19 +52,37 @@ enum QueryRequest<'a> {
 
 impl QueryRequest<'_> {
     fn send(self, endpoint: &str, credentials: SignedRequestCredentials<'_>) -> RawResponse {
+        self.send_with_security_token(endpoint, credentials, None)
+    }
+
+    fn send_with_security_token(
+        self,
+        endpoint: &str,
+        credentials: SignedRequestCredentials<'_>,
+        security_token: Option<&str>,
+    ) -> RawResponse {
         match self {
-            Self::Get(query) => send_signed_request_for_service_with_credentials(
-                "GET",
-                &format!("{endpoint}/?{query}"),
-                b"",
-                std::iter::empty::<(&str, &str)>(),
-                "sts",
-                credentials,
-            ),
-            Self::Post { body, content_type } => {
-                let headers = content_type
-                    .map(|value| vec![("content-type", value)])
+            Self::Get(query) => {
+                let headers = security_token
+                    .map(|value| vec![("x-amz-security-token", value)])
                     .unwrap_or_default();
+                send_signed_request_for_service_with_credentials(
+                    "GET",
+                    &format!("{endpoint}/?{query}"),
+                    b"",
+                    headers,
+                    "sts",
+                    credentials,
+                )
+            }
+            Self::Post { body, content_type } => {
+                let mut headers = Vec::new();
+                if let Some(value) = content_type {
+                    headers.push(("content-type", value));
+                }
+                if let Some(value) = security_token {
+                    headers.push(("x-amz-security-token", value));
+                }
                 send_signed_request_for_service_with_credentials(
                     "POST",
                     &format!("{endpoint}/"),
@@ -206,6 +224,20 @@ fn send_assume_role(
     .send(endpoint, credentials)
 }
 
+fn send_assume_role_with_security_token(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+    parameters: &[(&str, &str)],
+) -> RawResponse {
+    let body = form_body(parameters);
+    QueryRequest::Post {
+        body: &body,
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send_with_security_token(endpoint, credentials, Some(security_token))
+}
+
 fn assert_assume_role_error(
     label: &str,
     endpoint: &str,
@@ -257,10 +289,11 @@ fn assert_assume_role_success(
         .unwrap_or_else(|error| panic!("{label}: invalid date response header: {error}"));
     let expiration = DateTime::from_str(&expiration, DateTimeFormat::DateTime)
         .unwrap_or_else(|error| panic!("{label}: invalid Expiration timestamp: {error}"));
-    assert_eq!(
-        expiration.secs() - response_date.secs(),
-        duration_seconds,
-        "{label}: Expiration does not match the requested session duration"
+    let expiration_from_response_date = expiration.secs() - response_date.secs();
+    assert!(
+        expiration_from_response_date == duration_seconds
+            || expiration_from_response_date == duration_seconds - 1,
+        "{label}: Expiration differs unexpectedly from the requested session duration: response-date delta is {expiration_from_response_date} seconds"
     );
 
     assert!(
@@ -995,6 +1028,115 @@ fn assert_cross_account_denied(
     println!("{}: ok", probe.label);
 }
 
+struct RoleChainingProbeSet<'a> {
+    security_token: &'a str,
+    target_role_arn: &'a str,
+    target_role_name: &'a str,
+    target_session_name: &'a str,
+    low_max_target_role_arn: &'a str,
+}
+
+fn run_role_chaining_probes(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    account_id: &str,
+    fixture: RoleChainingProbeSet<'_>,
+) {
+    let success_parameters = [
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleArn", fixture.target_role_arn),
+        ("RoleSessionName", fixture.target_session_name),
+        ("DurationSeconds", "3600"),
+    ];
+    let response = send_assume_role_with_security_token(
+        endpoint,
+        credentials,
+        fixture.security_token,
+        &success_parameters,
+    );
+    assert_assume_role_success(
+        "assume-role-chaining-at-maximum-duration",
+        &response,
+        account_id,
+        fixture.target_role_name,
+        fixture.target_session_name,
+        3600,
+    );
+    println!("assume-role-chaining-at-maximum-duration: ok");
+
+    let overlong_parameters = [
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleArn", fixture.target_role_arn),
+        ("RoleSessionName", fixture.target_session_name),
+        ("DurationSeconds", "3601"),
+    ];
+    let response = send_assume_role_with_security_token(
+        endpoint,
+        credentials,
+        fixture.security_token,
+        &overlong_parameters,
+    );
+    assert_error_probe(
+        "assume-role-chaining-over-maximum-duration",
+        &response,
+        400,
+        STS_XMLNS,
+        "ValidationError",
+        Some(
+            "The requested DurationSeconds exceeds the 1 hour session limit for roles assumed by role chaining.",
+        ),
+    );
+    println!("assume-role-chaining-over-maximum-duration: ok");
+
+    let over_both_contextual_limits_parameters = [
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleArn", fixture.low_max_target_role_arn),
+        ("RoleSessionName", fixture.target_session_name),
+        ("DurationSeconds", "3601"),
+    ];
+    let response = send_assume_role_with_security_token(
+        endpoint,
+        credentials,
+        fixture.security_token,
+        &over_both_contextual_limits_parameters,
+    );
+    assert_error_probe(
+        "assume-role-chaining-over-chaining-and-role-maximum-duration",
+        &response,
+        400,
+        STS_XMLNS,
+        "ValidationError",
+        Some("The requested DurationSeconds exceeds the MaxSessionDuration set for this role."),
+    );
+    println!("assume-role-chaining-over-chaining-and-role-maximum-duration: ok");
+
+    let over_api_maximum_parameters = [
+        ("Action", "AssumeRole"),
+        ("Version", "2011-06-15"),
+        ("RoleArn", fixture.target_role_arn),
+        ("RoleSessionName", fixture.target_session_name),
+        ("DurationSeconds", "43201"),
+    ];
+    let response = send_assume_role_with_security_token(
+        endpoint,
+        credentials,
+        fixture.security_token,
+        &over_api_maximum_parameters,
+    );
+    assert_error_probe(
+        "assume-role-chaining-over-api-maximum-duration",
+        &response,
+        400,
+        STS_XMLNS,
+        "ValidationError",
+        Some("1 validation error detected: Value '43201' at 'durationSeconds' failed to satisfy constraint: Member must have value less than or equal to 43200"),
+    );
+    println!("assume-role-chaining-over-api-maximum-duration: ok");
+}
+
 struct CrossAccountProbeSet<'a> {
     caller_arn: &'a str,
     role_session_name: &'a str,
@@ -1273,6 +1415,33 @@ fn main() {
                 success_role_arn: &success_role_arn,
                 trust_denied_role_arn: &trust_denied_role_arn,
                 caller_denied_role_arn: &caller_denied_role_arn,
+            },
+        );
+    }
+
+    if let Ok(target_role_arn) = env::var("S3_TEST_STS_CHAIN_TARGET_ROLE_ARN") {
+        let chain_access_key = required_env("S3_TEST_STS_CHAIN_ACCESS_KEY");
+        let chain_secret_key = required_env("S3_TEST_STS_CHAIN_SECRET_KEY");
+        let chain_security_token = required_env("S3_TEST_STS_CHAIN_SESSION_TOKEN");
+        let target_role_name = required_env("S3_TEST_STS_CHAIN_TARGET_ROLE_NAME");
+        let target_session_name = required_env("S3_TEST_STS_CHAIN_TARGET_SESSION_NAME");
+        let low_max_target_role_arn = required_env("S3_TEST_STS_DEFAULT_MAX_ROLE_ARN");
+        let chain_credentials = SignedRequestCredentials {
+            access_key: &chain_access_key,
+            secret_key: &chain_secret_key,
+            region: &region,
+            tls_ca_pem: None,
+        };
+        run_role_chaining_probes(
+            &endpoint,
+            chain_credentials,
+            &account_id,
+            RoleChainingProbeSet {
+                security_token: &chain_security_token,
+                target_role_arn: &target_role_arn,
+                target_role_name: &target_role_name,
+                target_session_name: &target_session_name,
+                low_max_target_role_arn: &low_max_target_role_arn,
             },
         );
     }
