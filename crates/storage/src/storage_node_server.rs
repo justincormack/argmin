@@ -775,14 +775,26 @@ impl Drop for StagedControlPlaneRuntimeConfig {
 fn bind_storage_node_route_map_lease(
     validity: RouteMapValidity,
 ) -> Result<Option<BoundRouteMapLease>, StorageNodeServerError> {
+    bind_storage_node_route_map_lease_at(
+        validity,
+        crate::clock::current_time_millis(),
+        crate::clock::monotonic_time_millis(),
+        crate::clock::clock_health_time_millis(),
+    )
+}
+
+fn bind_storage_node_route_map_lease_at(
+    validity: RouteMapValidity,
+    local_wall_ms: u64,
+    local_monotonic_ms: u64,
+    local_health_ms: Option<u64>,
+) -> Result<Option<BoundRouteMapLease>, StorageNodeServerError> {
     let Some(valid_until_ms) = validity.valid_until_ms() else {
         return Ok(None);
     };
-    let local_wall_ms = crate::clock::current_time_millis();
-    let local_monotonic_ms = crate::clock::monotonic_time_millis();
     validate_process_lease_clock(
         local_wall_ms,
-        crate::clock::clock_health_time_millis(),
+        local_health_ms,
         CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
     )
     .map_err(|error| StorageNodeServerError::RouteMapLeaseBinding {
@@ -1508,8 +1520,14 @@ pub enum StorageNodeServerError {
     },
     #[error("storage-node runtime refresh for epoch {candidate} has unbounded route-map validity")]
     RuntimeRefreshUnboundedRouteMapValidity { candidate: ClusterEpoch },
-    #[error("storage-node control-plane refresh loop interval must be non-zero")]
-    ControlPlaneRefreshLoopZeroInterval,
+    #[error(
+        "storage-node control-plane heartbeat lease duration {requested_ms}ms must be at least {minimum_ms}ms to cover the {skew_budget_ms}ms clock-skew fence and a positive operational renewal margin"
+    )]
+    ControlPlaneRefreshLoopLeaseTooShort {
+        requested_ms: u64,
+        minimum_ms: u64,
+        skew_budget_ms: u64,
+    },
     #[error("read storage-node control-plane runtime config {path:?}")]
     RuntimeConfigRead {
         path: PathBuf,
@@ -1725,6 +1743,43 @@ pub struct StorageNodeControlPlaneRefreshLoop {
     stop: Arc<(Mutex<bool>, Condvar)>,
     status: Arc<Mutex<StorageNodeControlPlaneRefreshLoopStatus>>,
     handle: Option<JoinHandle<()>>,
+}
+
+pub const STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_USABLE_LEASE_MS: u64 = 1_000;
+pub const STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS: u64 =
+    CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_USABLE_LEASE_MS;
+pub const STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS: u64 = 1_000;
+
+pub fn storage_node_control_plane_heartbeat_interval(
+    node_id: NodeId,
+    requested_lease_duration_ms: u64,
+    completed_attempts: u64,
+) -> Result<Duration, StorageNodeServerError> {
+    if requested_lease_duration_ms < STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS {
+        return Err(
+            StorageNodeServerError::ControlPlaneRefreshLoopLeaseTooShort {
+                requested_ms: requested_lease_duration_ms,
+                minimum_ms: STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+                skew_budget_ms: CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+            },
+        );
+    }
+
+    let usable_lease_duration_ms = requested_lease_duration_ms
+        .checked_sub(CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS)
+        .expect("validated heartbeat lease exceeds the clock-skew budget");
+    let maximum_interval_ms =
+        (usable_lease_duration_ms / 3).min(STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS);
+    let jitter_seed = u64::from(node_id.as_u32())
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(completed_attempts.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    let jitter_percent = 75 + jitter_seed % 26;
+    let interval_ms = maximum_interval_ms
+        .saturating_mul(jitter_percent)
+        .checked_div(100)
+        .unwrap_or_default()
+        .max(1);
+    Ok(Duration::from_millis(interval_ms))
 }
 
 impl StorageNodeControlPlaneRefreshLoop {
@@ -1997,16 +2052,14 @@ impl StorageNodeServer {
         mut control_plane: S,
         node_incarnation: u64,
         requested_lease_duration_ms: u64,
-        refresh_interval: Duration,
         authority_now_ms: F,
     ) -> Result<StorageNodeControlPlaneRefreshLoop, StorageNodeServerError>
     where
         S: ControlPlaneHeartbeatRuntimeMapSource + Send + 'static,
         F: Fn() -> u64 + Send + 'static,
     {
-        if refresh_interval.is_zero() {
-            return Err(StorageNodeServerError::ControlPlaneRefreshLoopZeroInterval);
-        }
+        let node_id = self.config_snapshot().node_id;
+        storage_node_control_plane_heartbeat_interval(node_id, requested_lease_duration_ms, 0)?;
 
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let status = Arc::new(Mutex::new(
@@ -2017,50 +2070,60 @@ impl StorageNodeServer {
         let handle = thread::Builder::new()
             .name(format!(
                 "argmin-storage-node-{}-control-plane-refresh",
-                self.config_snapshot().node_id.as_u32()
+                node_id.as_u32()
             ))
-            .spawn(move || loop {
-                let result = self.refresh_and_install_control_plane_runtime_map(
-                    &mut control_plane,
-                    node_incarnation,
-                    requested_lease_duration_ms,
-                    authority_now_ms(),
-                );
-                {
-                    let mut status = worker_status
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    status.attempts += 1;
-                    match result {
-                        Ok(lease) => {
-                            status.successes += 1;
-                            status.last_lease = Some(lease);
-                            status.last_error = None;
-                        }
-                        Err(error) => {
-                            let error = error.to_string();
-                            if status.last_error.as_deref() != Some(error.as_str()) {
-                                eprintln!(
-                                    "storage-node {} control-plane refresh failed: {error}",
-                                    self.config_snapshot().node_id.as_u32()
-                                );
+            .spawn(move || {
+                let mut completed_attempts = 0_u64;
+                loop {
+                    let result = self.refresh_and_install_control_plane_runtime_map(
+                        &mut control_plane,
+                        node_incarnation,
+                        requested_lease_duration_ms,
+                        authority_now_ms(),
+                    );
+                    {
+                        let mut status = worker_status
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        status.attempts += 1;
+                        match result {
+                            Ok(lease) => {
+                                status.successes += 1;
+                                status.last_lease = Some(lease);
+                                status.last_error = None;
                             }
-                            status.failures += 1;
-                            status.last_error = Some(error);
+                            Err(error) => {
+                                let error = error.to_string();
+                                if status.last_error.as_deref() != Some(error.as_str()) {
+                                    eprintln!(
+                                        "storage-node {} control-plane refresh failed: {error}",
+                                        self.config_snapshot().node_id.as_u32()
+                                    );
+                                }
+                                status.failures += 1;
+                                status.last_error = Some(error);
+                            }
                         }
                     }
-                }
+                    completed_attempts = completed_attempts.saturating_add(1);
+                    let refresh_interval = storage_node_control_plane_heartbeat_interval(
+                        node_id,
+                        requested_lease_duration_ms,
+                        completed_attempts,
+                    )
+                    .expect("validated heartbeat schedule remains valid");
 
-                let (lock, cvar) = &*worker_stop;
-                let stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if *stopped {
-                    break;
-                }
-                let (stopped, _) = cvar
-                    .wait_timeout(stopped, refresh_interval)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if *stopped {
-                    break;
+                    let (lock, cvar) = &*worker_stop;
+                    let stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if *stopped {
+                        break;
+                    }
+                    let (stopped, _) = cvar
+                        .wait_timeout(stopped, refresh_interval)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if *stopped {
+                        break;
+                    }
                 }
             })
             .map_err(|source| StorageNodeServerError::ControlPlaneRefreshLoopSpawn { source })?;
@@ -13994,8 +14057,7 @@ mod tests {
             .spawn_control_plane_refresh_loop(
                 authority,
                 12,
-                1_000,
-                Duration::from_millis(5),
+                STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
                 move || loop_now.fetch_add(1, Ordering::SeqCst),
             )
             .unwrap();
@@ -14027,7 +14089,62 @@ mod tests {
     }
 
     #[test]
-    fn storage_node_control_plane_refresh_loop_rejects_zero_interval() {
+    fn storage_node_control_plane_heartbeat_schedule_is_lease_derived_and_jittered() {
+        let node_7_first =
+            storage_node_control_plane_heartbeat_interval(NodeId::new(7), 10_000, 1).unwrap();
+        let node_7_second =
+            storage_node_control_plane_heartbeat_interval(NodeId::new(7), 10_000, 2).unwrap();
+        let node_8_first =
+            storage_node_control_plane_heartbeat_interval(NodeId::new(8), 10_000, 1).unwrap();
+        assert!((Duration::from_millis(750)..=Duration::from_secs(1)).contains(&node_7_first));
+        assert!((Duration::from_millis(750)..=Duration::from_secs(1)).contains(&node_7_second));
+        assert!((Duration::from_millis(750)..=Duration::from_secs(1)).contains(&node_8_first));
+        assert_ne!(node_7_first, node_7_second);
+        assert_ne!(node_7_first, node_8_first);
+
+        let default_lease = storage_node_control_plane_heartbeat_interval(
+            NodeId::new(7),
+            STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+            1,
+        )
+        .unwrap();
+        assert!((Duration::from_millis(249)..=Duration::from_millis(333)).contains(&default_lease));
+    }
+
+    #[test]
+    fn storage_node_minimum_heartbeat_lease_remains_valid_through_first_renewal() {
+        let local_wall_ms = 20_000;
+        let local_monotonic_ms = 30_000;
+        let validity = RouteMapValidity::until_ms(
+            local_wall_ms + STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+        )
+        .unwrap();
+        let bound = bind_storage_node_route_map_lease_at(
+            validity,
+            local_wall_ms,
+            local_monotonic_ms,
+            Some(local_wall_ms),
+        )
+        .unwrap()
+        .unwrap();
+        let first_renewal = storage_node_control_plane_heartbeat_interval(
+            NodeId::new(7),
+            STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+            1,
+        )
+        .unwrap();
+        let first_renewal_ms = u64::try_from(first_renewal.as_millis()).unwrap();
+
+        assert!(bound.is_valid_at_monotonic(local_monotonic_ms));
+        assert!(bound.is_valid_at_monotonic(local_monotonic_ms + first_renewal_ms));
+        assert_eq!(
+            bound.local_valid_until_monotonic_ms(),
+            local_monotonic_ms + STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_USABLE_LEASE_MS
+        );
+    }
+
+    #[test]
+    fn storage_node_control_plane_refresh_loop_rejects_too_short_lease() {
         let tmp = test_util::tempdir();
         let node_id = NodeId::new(7);
         let socket_path = tmp.path().join("sock").join("storage.sock");
@@ -14061,11 +14178,10 @@ mod tests {
             Arc::clone(&server).spawn_control_plane_refresh_loop(
                 authority,
                 12,
-                1_000,
-                Duration::ZERO,
+                STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS - 1,
                 || 1_000,
             ),
-            Err(StorageNodeServerError::ControlPlaneRefreshLoopZeroInterval)
+            Err(StorageNodeServerError::ControlPlaneRefreshLoopLeaseTooShort { .. })
         ));
     }
 

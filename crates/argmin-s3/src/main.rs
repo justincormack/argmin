@@ -4652,26 +4652,22 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
             eprintln!("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large");
             std::process::exit(1);
         });
-    let control_plane_client = build_storage_node_control_plane_client(
-        config,
-        socket_path,
-        NodeId::new(
-            config
-                .storage_node_id
-                .expect("storage node id is required for storage roles"),
-        ),
-        node_incarnation,
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("failed to configure storage-node control-plane auth client: {error}");
-        std::process::exit(1);
-    });
+    let node_id = NodeId::new(
+        config
+            .storage_node_id
+            .expect("storage node id is required for storage roles"),
+    );
+    let control_plane_client =
+        build_storage_node_control_plane_client(config, socket_path, node_id, node_incarnation)
+            .unwrap_or_else(|error| {
+                eprintln!("failed to configure storage-node control-plane auth client: {error}");
+                std::process::exit(1);
+            });
     let loop_handle = server
         .spawn_control_plane_refresh_loop(
             control_plane_client,
             node_incarnation,
             lease_ms,
-            config.control_plane_refresh_interval,
             storage::clock::current_time_millis,
         )
         .unwrap_or_else(|error| {
@@ -4679,10 +4675,10 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
             std::process::exit(1);
         });
     process_info!(
-        "argmin-s3 storage-node control-plane refresh using {} (incarnation {}, refresh {} ms, lease {} ms)",
+        "argmin-s3 storage-node control-plane refresh using {} (incarnation {}, lease-derived jittered renewal capped at {} ms, lease {} ms)",
         socket_path,
         node_incarnation,
-        config.control_plane_refresh_interval.as_millis(),
+        storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS,
         config.control_plane_heartbeat_lease_duration.as_millis()
     );
     Some(loop_handle)
@@ -4796,8 +4792,8 @@ fn build_control_plane_storage_node_process_config(
     .map_err(|error| format!("failed to load storage-node startup runtime config: {error}"))?;
     let lease_ms = u64::try_from(config.control_plane_heartbeat_lease_duration.as_millis())
         .map_err(|_| "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large".to_string())?;
-    let retry_deadline = control_plane_startup_retry_deadline(config);
-    let retry_delay = control_plane_startup_retry_delay(config);
+    let retry_deadline = storage_node_control_plane_startup_retry_deadline(config);
+    let retry_delay = storage_node_control_plane_startup_retry_delay(config);
     let started_at = Instant::now();
     let mut attempts = 0_u32;
     let refresh = loop {
@@ -4979,11 +4975,9 @@ async fn build_remote_frontend_storage_cluster_retrying_startup(
 }
 
 fn frontend_control_plane_startup_retry_deadline(config: &ServerConfig) -> Duration {
-    control_plane_startup_retry_deadline(config)
-}
-
-fn control_plane_startup_retry_deadline(config: &ServerConfig) -> Duration {
-    let refresh_budget = config.control_plane_refresh_interval.saturating_mul(20);
+    let refresh_budget = config
+        .control_plane_frontend_refresh_interval
+        .saturating_mul(20);
     let lease_budget = config
         .control_plane_heartbeat_lease_duration
         .saturating_mul(2);
@@ -4992,15 +4986,30 @@ fn control_plane_startup_retry_deadline(config: &ServerConfig) -> Duration {
         .max(lease_budget)
 }
 
-fn frontend_control_plane_startup_retry_delay(config: &ServerConfig) -> Duration {
-    control_plane_startup_retry_delay(config)
+fn storage_node_control_plane_startup_retry_deadline(config: &ServerConfig) -> Duration {
+    let lease_budget = config
+        .control_plane_heartbeat_lease_duration
+        .saturating_mul(2);
+    Duration::from_secs(30).max(lease_budget)
 }
 
-fn control_plane_startup_retry_delay(config: &ServerConfig) -> Duration {
+fn frontend_control_plane_startup_retry_delay(config: &ServerConfig) -> Duration {
     config
-        .control_plane_refresh_interval
+        .control_plane_frontend_refresh_interval
         .max(Duration::from_millis(50))
         .min(Duration::from_secs(1))
+}
+
+fn storage_node_control_plane_startup_retry_delay(config: &ServerConfig) -> Duration {
+    let node_id = NodeId::new(config.storage_node_id.unwrap_or_default());
+    let lease_ms = u64::try_from(config.control_plane_heartbeat_lease_duration.as_millis())
+        .expect("validated control-plane heartbeat lease duration fits u64");
+    storage::storage_node_server::storage_node_control_plane_heartbeat_interval(
+        node_id, lease_ms, 0,
+    )
+    .expect("validated control-plane heartbeat lease has a renewal schedule")
+    .max(Duration::from_millis(50))
+    .min(Duration::from_secs(1))
 }
 
 fn frontend_control_plane_startup_error_is_retryable(error: &str) -> bool {
@@ -5270,7 +5279,7 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
                 eprintln!("failed to configure frontend control-plane auth client: {error}");
                 std::process::exit(1);
             }),
-            config.control_plane_refresh_interval,
+            config.control_plane_frontend_refresh_interval,
             storage::clock::current_time_millis,
             admission_settings,
         )
@@ -5281,7 +5290,7 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
     process_info!(
         "argmin-s3 frontend control-plane runtime-map refresh using {} (refresh {} ms)",
         socket_path,
-        config.control_plane_refresh_interval.as_millis(),
+        config.control_plane_frontend_refresh_interval.as_millis(),
     );
     Some(loop_handle)
 }
@@ -5639,8 +5648,8 @@ mod tests {
             control_plane_raft_peer_sockets: Vec::new(),
             control_plane_raft_auth_credentials: Vec::new(),
             control_plane_lease_scan_interval: std::time::Duration::from_millis(250),
-            control_plane_refresh_interval: std::time::Duration::from_millis(250),
-            control_plane_heartbeat_lease_duration: std::time::Duration::from_millis(1000),
+            control_plane_frontend_refresh_interval: std::time::Duration::from_millis(250),
+            control_plane_heartbeat_lease_duration: std::time::Duration::from_millis(2000),
             storage_cluster_epoch: 9,
             storage_pg_ids: vec![1, 3, 5],
             ec_k: 4,
@@ -11898,7 +11907,7 @@ mod tests {
         config.storage_node_socket_path = None;
         config.storage_node_sockets.clear();
         config.control_plane_socket_path = Some(socket_path.display().to_string());
-        config.control_plane_refresh_interval = std::time::Duration::from_millis(5);
+        config.control_plane_frontend_refresh_interval = std::time::Duration::from_millis(5);
 
         let cluster = build_remote_frontend_storage_cluster(&config, &ec_config).unwrap();
         assert_eq!(
@@ -12053,7 +12062,8 @@ mod tests {
         frontend_config.storage_node_socket_path = None;
         frontend_config.storage_node_sockets.clear();
         frontend_config.control_plane_socket_path = Some(socket_path.display().to_string());
-        frontend_config.control_plane_refresh_interval = std::time::Duration::from_millis(5);
+        frontend_config.control_plane_frontend_refresh_interval =
+            std::time::Duration::from_millis(5);
 
         let cluster = build_remote_frontend_storage_cluster(&frontend_config, &ec_config)
             .expect("frontend should bootstrap from restarted durable raft runtime map");
@@ -12199,7 +12209,7 @@ mod tests {
         config.storage_node_data_dir = Some(tmp.join("node-0-data").display().to_string());
         config.storage_node_socket_path = Some(endpoint.display().to_string());
         config.control_plane_socket_path = Some(socket_path.display().to_string());
-        config.control_plane_refresh_interval = std::time::Duration::from_millis(1);
+        config.control_plane_frontend_refresh_interval = std::time::Duration::from_millis(1);
 
         let (node_config, control_plane_node_incarnation, data_dir_guard) =
             build_storage_node_process_config(&config, &ec_config).unwrap();

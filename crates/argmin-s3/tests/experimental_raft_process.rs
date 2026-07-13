@@ -313,7 +313,7 @@ impl ChildGuard {
                 peer_auth_credentials,
             )
             .env("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "1000")
-            .env("ARGMIN_CONTROL_PLANE_REFRESH_MS", "50")
+            .env("ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS", "50")
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         for (key, value) in extra_env {

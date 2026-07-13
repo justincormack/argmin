@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use storage::control_plane::MAX_HEARTBEAT_LEASE_MS;
+use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS;
 use storage::LocalUnixStorageNodeClientConfig;
 
 const LOCAL_DEBUG_ENDPOINT_COMPILED_IN: bool = cfg!(any(test, feature = "local-debug-endpoints"));
@@ -298,7 +299,7 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_raft_peer_sockets: Vec<ConfiguredControlPlaneRaftPeerSocket>,
     pub(crate) control_plane_raft_auth_credentials: Vec<ConfiguredControlPlaneRaftAuthCredential>,
     pub(crate) control_plane_lease_scan_interval: Duration,
-    pub(crate) control_plane_refresh_interval: Duration,
+    pub(crate) control_plane_frontend_refresh_interval: Duration,
     pub(crate) control_plane_heartbeat_lease_duration: Duration,
     pub(crate) storage_cluster_epoch: u64,
     pub(crate) storage_pg_ids: Vec<u32>,
@@ -353,8 +354,8 @@ impl ServerConfig {
     ///   `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS` (`node_id=/absolute/socket,...`, optional experimental Raft peer map)
     ///   `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` (`node_id=credential_id:version:secret,...`, required for multi-node experimental Raft peer auth)
     ///   `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` (250)
-    ///   `ARGMIN_CONTROL_PLANE_REFRESH_MS` (250)
-    ///   `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` (1000)
+    ///   `ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS` (250)
+    ///   `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` (2000)
     ///   `ARGMIN_EC_K` (4)
     ///   `ARGMIN_EC_M` (2)
     ///   `ARGMIN_LOCAL_NODE_COUNT` (`ARGMIN_EC_K + ARGMIN_EC_M`)
@@ -548,13 +549,15 @@ impl ServerConfig {
             .parse()
             .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS: {e}"))?;
         let control_plane_lease_scan_interval = Duration::from_millis(control_plane_lease_scan_ms);
-        let control_plane_refresh_ms: u64 = get("ARGMIN_CONTROL_PLANE_REFRESH_MS")
-            .unwrap_or_else(|| "250".to_string())
-            .parse()
-            .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_REFRESH_MS: {e}"))?;
-        let control_plane_refresh_interval = Duration::from_millis(control_plane_refresh_ms);
+        let control_plane_frontend_refresh_ms: u64 =
+            get("ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS")
+                .unwrap_or_else(|| "250".to_string())
+                .parse()
+                .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS: {e}"))?;
+        let control_plane_frontend_refresh_interval =
+            Duration::from_millis(control_plane_frontend_refresh_ms);
         let control_plane_heartbeat_lease_ms: u64 = get("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS")
-            .unwrap_or_else(|| "1000".to_string())
+            .unwrap_or_else(|| "2000".to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS: {e}"))?;
         let control_plane_heartbeat_lease_duration =
@@ -864,17 +867,13 @@ impl ServerConfig {
         if control_plane_lease_scan_interval.is_zero() {
             return Err("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS must be > 0".to_string());
         }
-        if control_plane_refresh_interval.is_zero() {
-            return Err("ARGMIN_CONTROL_PLANE_REFRESH_MS must be > 0".to_string());
+        if control_plane_frontend_refresh_interval.is_zero() {
+            return Err("ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS must be > 0".to_string());
         }
-        if control_plane_heartbeat_lease_duration.is_zero() {
-            return Err("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be > 0".to_string());
-        }
-        if control_plane_heartbeat_lease_duration < control_plane_refresh_interval {
-            return Err(
-                "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be >= ARGMIN_CONTROL_PLANE_REFRESH_MS"
-                    .to_string(),
-            );
+        if control_plane_heartbeat_lease_ms < STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be >= {STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS}"
+            ));
         }
         if control_plane_heartbeat_lease_ms > MAX_HEARTBEAT_LEASE_MS {
             return Err(format!(
@@ -954,7 +953,7 @@ impl ServerConfig {
             control_plane_raft_peer_sockets,
             control_plane_raft_auth_credentials,
             control_plane_lease_scan_interval,
-            control_plane_refresh_interval,
+            control_plane_frontend_refresh_interval,
             control_plane_heartbeat_lease_duration,
             storage_cluster_epoch,
             storage_pg_ids,
@@ -1873,12 +1872,12 @@ mod tests {
             Duration::from_millis(250)
         );
         assert_eq!(
-            cfg.control_plane_refresh_interval,
+            cfg.control_plane_frontend_refresh_interval,
             Duration::from_millis(250)
         );
         assert_eq!(
             cfg.control_plane_heartbeat_lease_duration,
-            Duration::from_millis(1000)
+            Duration::from_millis(2000)
         );
         assert_eq!(
             cfg.stream_read_chunk_size,
@@ -1954,8 +1953,8 @@ mod tests {
                 "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
                 "7=raft-peer:1:peer-7-secret,8=raft-peer:1:peer-8-secret",
             ),
-            ("ARGMIN_CONTROL_PLANE_REFRESH_MS", "200"),
-            ("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", "900"),
+            ("ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS", "200"),
+            ("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", "2900"),
             ("ARGMIN_LOCAL_NODE_COUNT", "12"),
             ("ARGMIN_EC_K", "8"),
             ("ARGMIN_EC_M", "4"),
@@ -2068,12 +2067,12 @@ mod tests {
             Duration::from_millis(125)
         );
         assert_eq!(
-            cfg.control_plane_refresh_interval,
+            cfg.control_plane_frontend_refresh_interval,
             Duration::from_millis(200)
         );
         assert_eq!(
             cfg.control_plane_heartbeat_lease_duration,
-            Duration::from_millis(900)
+            Duration::from_millis(2900)
         );
         assert_eq!(cfg.local_node_count, 12);
         assert_eq!(cfg.ec_k, 8);
@@ -2234,12 +2233,12 @@ mod tests {
             Duration::from_millis(250)
         );
         assert_eq!(
-            cfg.control_plane_refresh_interval,
+            cfg.control_plane_frontend_refresh_interval,
             Duration::from_millis(250)
         );
         assert_eq!(
             cfg.control_plane_heartbeat_lease_duration,
-            Duration::from_millis(1000)
+            Duration::from_millis(2000)
         );
         assert_eq!(cfg.account_id, "");
         assert_eq!(cfg.storage_node_id, None);
@@ -3719,35 +3718,40 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_refresh_interval_zero() {
+    fn control_plane_frontend_refresh_interval_zero() {
         let err = ServerConfig::from_lookup(make_required_env(&[(
-            "ARGMIN_CONTROL_PLANE_REFRESH_MS",
+            "ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS",
             "0",
         )]))
         .unwrap_err();
-        assert!(err.contains("ARGMIN_CONTROL_PLANE_REFRESH_MS must be > 0"));
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS must be > 0"));
     }
 
     #[test]
-    fn control_plane_heartbeat_lease_duration_zero() {
+    fn control_plane_heartbeat_lease_duration_too_short_for_renewal_margin() {
         let err = ServerConfig::from_lookup(make_required_env(&[(
             "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS",
-            "0",
+            "1999",
         )]))
         .unwrap_err();
-        assert!(err.contains("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be > 0"));
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be >= 2000"));
     }
 
     #[test]
-    fn control_plane_heartbeat_lease_duration_must_cover_refresh_interval() {
-        let err = ServerConfig::from_lookup(make_required_env(&[
-            ("ARGMIN_CONTROL_PLANE_REFRESH_MS", "1000"),
-            ("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", "500"),
+    fn control_plane_frontend_refresh_interval_is_independent_of_heartbeat_lease() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS", "1000"),
+            ("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", "2500"),
         ]))
-        .unwrap_err();
-        assert!(err.contains(
-            "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS must be >= ARGMIN_CONTROL_PLANE_REFRESH_MS"
-        ));
+        .unwrap();
+        assert_eq!(
+            cfg.control_plane_frontend_refresh_interval,
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            cfg.control_plane_heartbeat_lease_duration,
+            Duration::from_millis(2500)
+        );
     }
 
     #[test]
@@ -3801,13 +3805,13 @@ mod tests {
     }
 
     #[test]
-    fn invalid_control_plane_refresh_interval() {
+    fn invalid_control_plane_frontend_refresh_interval() {
         let err = ServerConfig::from_lookup(make_required_env(&[(
-            "ARGMIN_CONTROL_PLANE_REFRESH_MS",
+            "ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS",
             "not_a_number",
         )]))
         .unwrap_err();
-        assert!(err.contains("ARGMIN_CONTROL_PLANE_REFRESH_MS"));
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS"));
     }
 
     #[test]

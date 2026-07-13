@@ -11231,6 +11231,27 @@ Required production shape and implementation order:
    read-index round even though local status construction is now independent of
    retained history size; any timeout reduction must be based on measured
    read-index latency rather than the former map-build cost.
+   Refresh scheduling is now split by role. Frontend compact-status polling is
+   configured independently through
+   `ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS` (250 ms by default); the previous
+   generic `ARGMIN_CONTROL_PLANE_REFRESH_MS` setting has been removed while the
+   project is pre-release so it cannot continue to imply one cadence for two
+   different protocols. Storage nodes derive renewal timing from the requested
+   heartbeat lease instead of a frontend setting. After each attempt they wait
+   a deterministic per-node/per-attempt jitter between 75% and 100% of one
+   third of the usable local lease after subtracting the symmetric one-second
+   clock-skew fence, capped at one second. A lease shorter than two seconds is
+   rejected: it must reserve the full one-second skew budget plus at least one
+   second of operational local validity. The default is therefore two seconds
+   and retains an approximately 249-333 ms renewal interval with roughly
+   two-thirds of usable validity still available after a normal wait. The
+   ten-second route-change soak lease drops from ten heartbeats per second per
+   node to approximately one to 1.3.
+   Storage and frontend startup retry budgets now use their respective lease
+   and polling schedules, and UAT configures only the frontend polling cadence.
+   This reduces steady internal RPC/lock traffic and synchronized bursts; the
+   committed horizon and volatile-overlay rules above, rather than scheduling,
+   remain the durability and failover fence.
 9. Make the lease-horizon/restart-fence contract executable before removing
    per-heartbeat persistence. Model and property-test leader changes, process
    crashes, clock rollback/forward jump, delayed old maps, delayed old-primary

@@ -214,9 +214,9 @@ if [[ "$smoke" == "control-plane-runtime-map" ]]; then
     export ARGMIN_EC_M=1
     export ARGMIN_LOCAL_NODE_COUNT=2
     export ARGMIN_PG_COUNT=2
-    export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS="${ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
-    export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-1000}"
+    export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-2000}"
 fi
 if [[ "$smoke" == "route-change" || "$smoke" == "route-change-node-restart" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" ]]; then
     export ARGMIN_EC_K=1
@@ -226,7 +226,7 @@ if [[ "$smoke" == "route-change" || "$smoke" == "route-change-node-restart" || "
     route_change_default_pg_count=$((repeat_count + route_change_metadata_pg_slack))
     ((route_change_default_pg_count >= 16)) || route_change_default_pg_count=16
     export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-$route_change_default_pg_count}"
-    export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS="${ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
     route_change_required_pg_count=$((repeat_count + route_change_metadata_pg_slack))
@@ -251,7 +251,7 @@ if [[ "$smoke" == "pg-backfill-migration" ]]; then
     pg_backfill_default_pg_count=$((repeat_count + pg_backfill_metadata_pg_slack))
     ((pg_backfill_default_pg_count >= 16)) || pg_backfill_default_pg_count=16
     export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-$pg_backfill_default_pg_count}"
-    export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS="${ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
     export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
@@ -276,7 +276,7 @@ if [[ "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-
     metadata_migration_default_pg_count="$repeat_count"
     ((metadata_migration_default_pg_count >= 16)) || metadata_migration_default_pg_count=16
     export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-$metadata_migration_default_pg_count}"
-    export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS="${ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
     export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
@@ -291,7 +291,7 @@ if [[ "$smoke" == "cleanup-versioned-stress" ]]; then
     cleanup_stress_default_pg_count="$repeat_count"
     ((cleanup_stress_default_pg_count >= 16)) || cleanup_stress_default_pg_count=16
     export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-$cleanup_stress_default_pg_count}"
-    export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS="${ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
     export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
