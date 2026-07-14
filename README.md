@@ -272,10 +272,6 @@ IDs, or bucket prefix are missing. For AWS S3, the alternate credentials must
 belong to a different AWS account with a different S3 canonical owner ID. A
 second IAM user in the same AWS account is not sufficient.
 
-When `S3_TEST_ENDPOINT` is set, `s3-tests` now defaults to a 30 second client
-timeout and disables the AWS SDK stalled-stream watchdog to avoid false
-positive throughput failures on slower remote endpoints.
-
 Full AWS environment setup, including the committed IAM policy, required
 account-level S3 Block Public Access settings, the separate HTTP-only
 `s3-http-tests` crate, the local-only `s3-local-tests` crate, and local

@@ -410,10 +410,6 @@ fn build_client(
     build_client_with_ca(endpoint, access_key, secret_key, region, tls_ca_pem)
 }
 
-fn external_test_mode() -> bool {
-    std::env::var_os("S3_TEST_ENDPOINT").is_some()
-}
-
 fn configured_test_timeout() -> std::time::Duration {
     let timeout_secs: u64 = std::env::var("S3_TEST_TIMEOUT_SECS")
         .ok()
@@ -443,20 +439,15 @@ pub fn build_client_with_ca(
 
     let http_client = hyper_client::TestHttpClient::new(tls_ca_pem);
 
-    let mut s3_config = aws_sdk_s3::config::Builder::new()
+    let s3_config = aws_sdk_s3::config::Builder::new()
         .behavior_version_latest()
         .credentials_provider(creds)
         .region(aws_sdk_s3::config::Region::new(region.to_string()))
         .endpoint_url(endpoint)
         .timeout_config(timeout_config)
         .http_client(http_client)
-        .force_path_style(true);
-    if external_test_mode() {
-        s3_config.set_stalled_stream_protection(Some(
-            aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
-        ));
-    }
-    let s3_config = s3_config.build();
+        .force_path_style(true)
+        .build();
 
     Client::from_conf(s3_config)
 }

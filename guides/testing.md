@@ -417,11 +417,10 @@ You can override the region or forward any normal `cargo test` selectors:
 ./scripts/aws-tests object_lock
 ```
 
-When `S3_TEST_ENDPOINT` is set, `s3-tests` defaults to a 30 second client
-timeout instead of the local 5 second timeout, and disables the AWS SDK
-stalled-stream watchdog. This keeps slower remote runs from failing with
-`ThroughputBelowMinimum` while preserving the stricter local defaults for the
-embedded server.
+The `s3-tests` client defaults to a 30 second operation-attempt timeout. The
+AWS wrapper defaults `S3_TEST_TIMEOUT_SECS` to 120 seconds; use
+`--timeout-secs` to override it. AWS and local clients otherwise use the same
+AWS SDK stalled-stream protection.
 
 ### AWS convergence and retries
 
