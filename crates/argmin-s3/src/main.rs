@@ -6386,21 +6386,51 @@ mod tests {
         name: &str,
         state_path: &Path,
     ) -> ExperimentalRaftTestHarness {
+        experimental_raft_durable_test_harness_inner(name, state_path, None)
+    }
+
+    fn experimental_raft_durable_wal_test_harness(
+        name: &str,
+        state_path: &Path,
+    ) -> ExperimentalRaftTestHarness {
+        let wal_path = durable_artifact_wal_path(state_path);
+        experimental_raft_durable_test_harness_inner(name, state_path, Some(&wal_path))
+    }
+
+    fn experimental_raft_durable_test_harness_inner(
+        name: &str,
+        state_path: &Path,
+        wal_path: Option<&Path>,
+    ) -> ExperimentalRaftTestHarness {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("test runtime should build");
         let handle = runtime.handle().clone();
         let authority = runtime.block_on(async {
-            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                format!(
-                    "argmin-s3-experimental-durable-raft-{name}-{}",
-                    std::process::id()
-                ),
-                1,
-                state_path,
-            )
-            .await
+            let cluster_name = format!(
+                "argmin-s3-experimental-durable-raft-{name}-{}",
+                std::process::id()
+            );
+            let authority = match wal_path {
+                Some(wal_path) => {
+                    ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                        cluster_name,
+                        1,
+                        state_path,
+                        wal_path,
+                    )
+                    .await
+                }
+                None => {
+                    ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                        cluster_name,
+                        1,
+                        state_path,
+                    )
+                    .await
+                }
+            }
             .expect("durable experimental raft authority should initialize");
             if !authority
                 .is_initialized()
@@ -7073,6 +7103,511 @@ mod tests {
             )
             .expect("durable availability fence state should read");
         assert_eq!(durable_previous_deadline, Some(20_900));
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_production_shaped_heartbeat_write_amplification_gate() {
+        const STORAGE_NODE_COUNT: u32 = 3;
+        const PG_COUNT: u32 = 116;
+        const RETAINED_HISTORY_EPOCHS: usize = 256;
+        const STEADY_HEARTBEAT_ROUNDS: u64 = 64;
+        const HEARTBEAT_LEASE_MS: u64 = 10_000;
+        const MAX_AMORTIZED_DURABLE_BYTES_PER_SECOND: u64 = 1024 * 1024;
+
+        fn heartbeat(
+            node_id: u32,
+            endpoint: &str,
+            observed_epoch: ClusterEpoch,
+            pg_observations: Vec<NodePgHeartbeatObservation>,
+        ) -> NodeHeartbeat {
+            NodeHeartbeat {
+                node_id: NodeId::new(node_id),
+                node_incarnation: 1,
+                endpoint: endpoint.to_owned(),
+                observed_epoch,
+                requested_lease_duration_ms: HEARTBEAT_LEASE_MS,
+                cluster_map_history_route_references: Default::default(),
+                pg_observations,
+            }
+        }
+
+        fn durable_wal_offsets(
+            harness: &ExperimentalRaftTestHarness,
+        ) -> storage::control_plane_raft::ControlPlaneRaftWalOffsets {
+            harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("production-shaped Raft status should read")
+                .durable_wal_offsets()
+                .expect("production-shaped durable Raft authority should expose WAL offsets")
+        }
+
+        fn active_primary_observations(
+            snapshot: &ClusterControlSnapshot,
+            node_id: u32,
+            metadata_proof: PgMetadataProof,
+        ) -> Vec<NodePgHeartbeatObservation> {
+            snapshot
+                .pgs()
+                .filter(|pg| pg.active_primary() == Some(NodeId::new(node_id)))
+                .map(|pg| NodePgHeartbeatObservation {
+                    pg_id: pg.pg_id(),
+                    state: PgState::Active,
+                    metadata_proof,
+                    pending_metadata_command: None,
+                })
+                .collect()
+        }
+
+        let state_dir = short_unix_socket_test_dir("raft-write-amplification-gate");
+        let state_path = state_dir.0.path().join("control-plane.state");
+        let wal_path = durable_artifact_wal_path(&state_path);
+        let endpoints = (0..STORAGE_NODE_COUNT)
+            .map(|node_id| {
+                state_dir
+                    .0
+                    .path()
+                    .join(format!("storage-node-{node_id}.sock"))
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let mut config = test_server_config();
+        config.storage_node_sockets = endpoints
+            .iter()
+            .enumerate()
+            .map(
+                |(node_id, socket_path)| config::ConfiguredStorageNodeSocket {
+                    node_id: u32::try_from(node_id).expect("test node id should fit u32"),
+                    socket_path: socket_path.clone(),
+                },
+            )
+            .collect();
+        config.storage_pg_ids = (0..PG_COUNT).collect();
+
+        let mut harness = experimental_raft_durable_wal_test_harness(
+            "production-shaped-write-amplification",
+            &state_path,
+        );
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("production-shaped Raft bootstrap should succeed");
+
+        let acting_set_a = vec![NodeId::new(0), NodeId::new(1)];
+        let acting_set_b = vec![NodeId::new(1), NodeId::new(2)];
+        let mut use_acting_set_b = vec![false; usize::try_from(PG_COUNT).unwrap()];
+        for change_index in 0..(RETAINED_HISTORY_EPOCHS - 1) {
+            let pg_index = change_index % usize::try_from(PG_COUNT).unwrap();
+            let acting_set = if use_acting_set_b[pg_index] {
+                acting_set_b.clone()
+            } else {
+                acting_set_a.clone()
+            };
+            use_acting_set_b[pg_index] = !use_acting_set_b[pg_index];
+            harness
+                .control_plane
+                .submit_raft_command(ControlPlaneCommand::SetPgActingSet {
+                    pg_id: PgId::new(u32::try_from(pg_index).unwrap()),
+                    acting_set,
+                })
+                .expect("production-shaped route change should commit");
+        }
+        let shaped_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("production-shaped snapshot should read");
+        assert_eq!(shaped_snapshot.pgs().count(), PG_COUNT as usize);
+        assert_eq!(
+            shaped_snapshot.cluster_map_history().len(),
+            RETAINED_HISTORY_EPOCHS,
+            "release workload must exercise the full ordinary retained-history window"
+        );
+
+        let mut now_ms = 1_000_000_u64;
+        let mut heartbeat_requests = 0_u64;
+        let mut stable = false;
+        for _ in 0..8 {
+            let applied_before = harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("pre-activation Raft status should read")
+                .applied();
+            for node_id in 0..STORAGE_NODE_COUNT {
+                let observed_epoch = harness
+                    .control_plane
+                    .current_snapshot()
+                    .expect("heartbeat epoch should read")
+                    .cluster_epoch();
+                harness
+                    .control_plane
+                    .refresh_node_heartbeat(
+                        heartbeat(
+                            node_id,
+                            &endpoints[usize::try_from(node_id).unwrap()],
+                            observed_epoch,
+                            Vec::new(),
+                        ),
+                        now_ms,
+                    )
+                    .expect("pre-activation heartbeat should refresh");
+                heartbeat_requests += 1;
+                now_ms += 1;
+            }
+            let applied_after = harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("post-heartbeat Raft status should read")
+                .applied();
+            if applied_after == applied_before {
+                stable = true;
+                break;
+            }
+        }
+        assert!(stable, "storage-node heartbeat state should converge");
+
+        let peering_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("peering snapshot should read")
+            .cluster_epoch();
+        let metadata_proof = PgMetadataProof {
+            applied_log_index: 1,
+            applied_log_hash: 2,
+            state_digest: 3,
+        };
+        for node_id in [0_u32, 2, 1] {
+            let snapshot = harness
+                .control_plane
+                .current_snapshot()
+                .expect("peering observation snapshot should read");
+            assert_eq!(snapshot.cluster_epoch(), peering_epoch);
+            let pg_observations = snapshot
+                .pgs()
+                .filter(|pg| pg.acting_set().contains(&NodeId::new(node_id)))
+                .map(|pg| NodePgHeartbeatObservation {
+                    pg_id: pg.pg_id(),
+                    state: PgState::Peering,
+                    metadata_proof,
+                    pending_metadata_command: None,
+                })
+                .collect();
+            harness
+                .control_plane
+                .refresh_node_heartbeat(
+                    heartbeat(
+                        node_id,
+                        &endpoints[usize::try_from(node_id).unwrap()],
+                        peering_epoch,
+                        pg_observations,
+                    ),
+                    now_ms,
+                )
+                .expect("production-shaped peering heartbeat should refresh");
+            heartbeat_requests += 1;
+            now_ms += 1;
+        }
+        assert!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("active production-shaped snapshot should read")
+                .pgs()
+                .all(|pg| pg.state() == PgState::Active),
+            "production-shaped workload should serve every PG before measurement"
+        );
+
+        let active_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("active observation snapshot should read")
+            .cluster_epoch();
+        for node_id in 0..STORAGE_NODE_COUNT {
+            let snapshot = harness
+                .control_plane
+                .current_snapshot()
+                .expect("active observation routes should read");
+            assert_eq!(snapshot.cluster_epoch(), active_epoch);
+            let pg_observations = active_primary_observations(&snapshot, node_id, metadata_proof);
+            harness
+                .control_plane
+                .refresh_node_heartbeat(
+                    heartbeat(
+                        node_id,
+                        &endpoints[usize::try_from(node_id).unwrap()],
+                        active_epoch,
+                        pg_observations,
+                    ),
+                    now_ms,
+                )
+                .expect("current primary Active observation should refresh");
+            heartbeat_requests += 1;
+            now_ms += 1;
+        }
+
+        stable = false;
+        for _ in 0..8 {
+            let applied_before = harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("post-activation Raft status should read")
+                .applied();
+            for node_id in 0..STORAGE_NODE_COUNT {
+                let snapshot = harness
+                    .control_plane
+                    .current_snapshot()
+                    .expect("post-activation heartbeat state should read");
+                let observed_epoch = snapshot.cluster_epoch();
+                let pg_observations =
+                    active_primary_observations(&snapshot, node_id, metadata_proof);
+                harness
+                    .control_plane
+                    .refresh_node_heartbeat(
+                        heartbeat(
+                            node_id,
+                            &endpoints[usize::try_from(node_id).unwrap()],
+                            observed_epoch,
+                            pg_observations,
+                        ),
+                        now_ms,
+                    )
+                    .expect("post-activation heartbeat should refresh");
+                heartbeat_requests += 1;
+                now_ms += 1;
+            }
+            let applied_after = harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("post-activation heartbeat status should read")
+                .applied();
+            if applied_after == applied_before {
+                stable = true;
+                break;
+            }
+        }
+        assert!(stable, "active heartbeat state should converge");
+
+        harness.control_plane.checkpoint_serving_reads = true;
+        let warm_status = harness
+            .control_plane
+            .runtime_map_status(now_ms)
+            .expect("production-shaped compact status should warm its certificate");
+        assert_eq!(warm_status.pg_routes(), PG_COUNT as usize);
+        assert_eq!(warm_status.active_serving_pg_routes(), PG_COUNT as usize);
+        let content_digest = warm_status
+            .lease_renewal()
+            .expect("active production-shaped status should carry a lease renewal")
+            .content_digest();
+
+        let durable_timestamp_before = harness
+            .control_plane
+            .current_snapshot()
+            .expect("pre-measurement snapshot should read")
+            .max_committed_timestamp_ms()
+            .expect("heartbeat setup should establish a committed timestamp");
+        let applied_before = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("pre-measurement Raft status should read")
+            .applied();
+        let artifact_before = fs::read(&state_path).expect("restart artifact should read");
+        let wal_before = fs::read(&wal_path).expect("Raft WAL should read");
+        let wal_offsets_before = durable_wal_offsets(&harness);
+        let durability_metrics_before = harness.authority.durability_metric_snapshots();
+        assert_eq!(
+            wal_offsets_before.base_offset(),
+            wal_offsets_before.clean_len(),
+            "warm checkpoint should leave no uncompacted WAL suffix"
+        );
+
+        let measured_heartbeats_before = heartbeat_requests;
+        for _ in 0..STEADY_HEARTBEAT_ROUNDS {
+            let snapshot = harness
+                .control_plane
+                .current_snapshot()
+                .expect("steady heartbeat state should read");
+            let observed_epoch = snapshot.cluster_epoch();
+            for node_id in 0..STORAGE_NODE_COUNT {
+                let pg_observations =
+                    active_primary_observations(&snapshot, node_id, metadata_proof);
+                harness
+                    .control_plane
+                    .refresh_node_heartbeat(
+                        heartbeat(
+                            node_id,
+                            &endpoints[usize::try_from(node_id).unwrap()],
+                            observed_epoch,
+                            pg_observations,
+                        ),
+                        now_ms,
+                    )
+                    .expect("covered steady heartbeat should refresh");
+                heartbeat_requests += 1;
+                now_ms += 1;
+            }
+            let status = harness
+                .control_plane
+                .runtime_map_status(now_ms)
+                .expect("compact runtime-map status should refresh");
+            assert_eq!(status.pg_routes(), PG_COUNT as usize);
+            assert_eq!(status.active_serving_pg_routes(), PG_COUNT as usize);
+            assert_eq!(
+                status
+                    .lease_renewal()
+                    .expect("active compact status should renew its lease")
+                    .content_digest(),
+                content_digest,
+                "lease-only heartbeats must not invalidate route content"
+            );
+            now_ms += 1;
+        }
+        let steady_heartbeat_requests = heartbeat_requests - measured_heartbeats_before;
+
+        let applied_after_steady = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("post-measurement Raft status should read")
+            .applied();
+        let artifact_after_steady = fs::read(&state_path).expect("restart artifact should reread");
+        let wal_after_steady = fs::read(&wal_path).expect("Raft WAL should reread");
+        let durability_metrics_after_steady = harness.authority.durability_metric_snapshots();
+        assert_eq!(applied_after_steady, applied_before);
+        assert_eq!(artifact_after_steady, artifact_before);
+        assert_eq!(wal_after_steady, wal_before);
+        assert_eq!(durable_wal_offsets(&harness), wal_offsets_before);
+        assert_eq!(
+            durability_metrics_after_steady, durability_metrics_before,
+            "steady covered heartbeats and compact status reads must not encode, store, sync, compact, or append durable state"
+        );
+        assert_eq!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("post-measurement snapshot should read")
+                .max_committed_timestamp_ms(),
+            Some(durable_timestamp_before),
+            "covered renewals must not ratchet committed timestamp state"
+        );
+
+        let horizon_probe_heartbeats_before = heartbeat_requests;
+        let mut horizon_extension_at_ms = None;
+        for _ in 0..128 {
+            now_ms += 250;
+            let snapshot = harness
+                .control_plane
+                .current_snapshot()
+                .expect("horizon-extension state should read");
+            let observed_epoch = snapshot.cluster_epoch();
+            let pg_observations = active_primary_observations(&snapshot, 0, metadata_proof);
+            harness
+                .control_plane
+                .refresh_node_heartbeat(
+                    heartbeat(0, &endpoints[0], observed_epoch, pg_observations),
+                    now_ms,
+                )
+                .expect("horizon-extension heartbeat should refresh");
+            heartbeat_requests += 1;
+            let applied = harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("horizon-extension status should read")
+                .applied();
+            if applied != applied_before {
+                horizon_extension_at_ms = Some(now_ms);
+                break;
+            }
+        }
+        let horizon_extension_at_ms = horizon_extension_at_ms
+            .expect("bounded heartbeat runway should eventually require one durable extension");
+        let horizon_probe_heartbeats = heartbeat_requests - horizon_probe_heartbeats_before;
+        let wal_offsets_after_extension = durable_wal_offsets(&harness);
+        let durability_metrics_after_extension = harness.authority.durability_metric_snapshots();
+        assert_eq!(
+            wal_offsets_after_extension.base_offset(),
+            wal_offsets_after_extension.clean_len(),
+            "horizon-extension checkpoint should compact its WAL suffix"
+        );
+        let wal_offset_advance = wal_offsets_after_extension
+            .base_offset()
+            .checked_sub(wal_offsets_before.base_offset())
+            .expect("WAL base offset must advance monotonically");
+        assert!(wal_offset_advance > 0);
+        let checkpoint_metrics_before = durability_metrics_after_steady.checkpoint;
+        let checkpoint_metrics_after = durability_metrics_after_extension.checkpoint;
+        let checkpoint_store_delta = checkpoint_metrics_after
+            .store_total
+            .checked_sub(checkpoint_metrics_before.store_total)
+            .expect("checkpoint store count must advance monotonically");
+        let checkpoint_file_sync_delta = checkpoint_metrics_after
+            .file_sync_total
+            .checked_sub(checkpoint_metrics_before.file_sync_total)
+            .expect("checkpoint file-sync count must advance monotonically");
+        let checkpoint_directory_sync_delta = checkpoint_metrics_after
+            .directory_sync_total
+            .checked_sub(checkpoint_metrics_before.directory_sync_total)
+            .expect("checkpoint directory-sync count must advance monotonically");
+        let checkpoint_bytes = checkpoint_metrics_after
+            .bytes_total
+            .checked_sub(checkpoint_metrics_before.bytes_total)
+            .expect("checkpoint byte count must advance monotonically");
+        assert!(checkpoint_store_delta > 0);
+        assert!(checkpoint_file_sync_delta > 0);
+        assert!(checkpoint_directory_sync_delta > 0);
+        assert!(checkpoint_bytes > 0);
+        let wal_metrics_before = durability_metrics_after_steady
+            .wal
+            .expect("production-shaped durable authority should expose WAL metrics");
+        let wal_metrics_after = durability_metrics_after_extension
+            .wal
+            .expect("production-shaped durable authority should retain WAL metrics");
+        let wal_append_delta = wal_metrics_after
+            .append_total
+            .checked_sub(wal_metrics_before.append_total)
+            .expect("WAL append count must advance monotonically");
+        let wal_file_sync_delta = wal_metrics_after
+            .file_sync_total
+            .checked_sub(wal_metrics_before.file_sync_total)
+            .expect("WAL file-sync count must advance monotonically");
+        let wal_directory_sync_delta = wal_metrics_after
+            .directory_sync_total
+            .checked_sub(wal_metrics_before.directory_sync_total)
+            .expect("WAL directory-sync count must advance monotonically");
+        let wal_bytes_appended = wal_metrics_after
+            .frame_bytes_total
+            .checked_sub(wal_metrics_before.frame_bytes_total)
+            .expect("WAL frame byte count must advance monotonically");
+        assert!(wal_append_delta > 0);
+        assert!(wal_file_sync_delta > 0);
+        assert!(wal_directory_sync_delta > 0);
+        assert!(wal_bytes_appended > 0);
+        let extension_interval_ms = horizon_extension_at_ms
+            .checked_sub(durable_timestamp_before)
+            .expect("horizon extension must follow the previous durable timestamp");
+        assert!(extension_interval_ms > 0);
+        let logical_durable_bytes = checkpoint_bytes
+            .checked_add(wal_bytes_appended)
+            .expect("logical durable byte accounting should not overflow");
+        let amortized_durable_bytes_per_second = logical_durable_bytes
+            .checked_mul(1000)
+            .expect("amortized byte accounting should not overflow")
+            .div_ceil(extension_interval_ms);
+        assert!(
+            amortized_durable_bytes_per_second < MAX_AMORTIZED_DURABLE_BYTES_PER_SECOND,
+            "measured horizon-extension durability rate {amortized_durable_bytes_per_second} B/s exceeds the release limit {MAX_AMORTIZED_DURABLE_BYTES_PER_SECOND} B/s"
+        );
+        assert_eq!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("post-extension snapshot should read")
+                .cluster_map_history()
+                .len(),
+            RETAINED_HISTORY_EPOCHS
+        );
+
+        eprintln!(
+            "control_plane_write_amplification_release pgs={PG_COUNT} retained_epochs={RETAINED_HISTORY_EPOCHS} storage_nodes={STORAGE_NODE_COUNT} steady_heartbeats={steady_heartbeat_requests} compact_status_reads={STEADY_HEARTBEAT_ROUNDS} steady_checkpoint_stores=0 steady_checkpoint_syncs=0 steady_wal_appends=0 steady_wal_syncs=0 horizon_probe_heartbeats={horizon_probe_heartbeats} checkpoint_stores={checkpoint_store_delta} checkpoint_file_syncs={checkpoint_file_sync_delta} checkpoint_directory_syncs={checkpoint_directory_sync_delta} checkpoint_bytes={checkpoint_bytes} horizon_wal_appends={wal_append_delta} horizon_wal_file_syncs={wal_file_sync_delta} horizon_wal_directory_syncs={wal_directory_sync_delta} horizon_wal_bytes_appended={wal_bytes_appended} horizon_wal_offset_advance={wal_offset_advance} horizon_extension_interval_ms={extension_interval_ms} amortized_durable_bytes_per_second={amortized_durable_bytes_per_second}",
+        );
 
         harness.shutdown();
     }

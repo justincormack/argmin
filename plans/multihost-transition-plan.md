@@ -11160,6 +11160,27 @@ Required production shape and implementation order:
    state file. Once unchanged heartbeats are volatile, the checkpoint is not a
    valid observation source for current node epochs and may legitimately lag
    or contain different per-node samples until another durable transition.
+   A production-shaped release regression now makes this write-amplification
+   boundary executable. It boots a WAL-backed durable OpenRaft authority with
+   three storage nodes and 116 serving PGs, constructs the complete ordinary
+   256-epoch sparse-history window, warms the compact runtime-map certificate
+   and serving checkpoint, then runs 192 canonical unchanged heartbeats and 64
+   compact status reads. The test brackets authority-scoped checkpoint and WAL
+   metric snapshots and requires zero encode/store/file-sync/directory-sync/
+   compaction and append/frame-byte deltas during that phase; restart-artifact
+   bytes, WAL bytes/offsets, the applied log id, and the committed timestamp are
+   retained as secondary invariants. It then advances heartbeat time until
+   exactly one bounded horizon extension is required and calculates the rate
+   from cumulative checkpoint-encoded-byte and WAL-frame-byte metric deltas, so
+   repeated identical writes cannot escape the accounting. The initial
+   optimized release result with operation accounting was one checkpoint store
+   (two file and two directory syncs) plus four WAL appends/syncs: 87,696
+   checkpoint bytes plus 1,547 WAL bytes over 10,010 ms, or 8,916 logical
+   durable bytes/s, below the 1 MiB/s release limit. The gate runs from
+   `scripts/ci-control-plane-release` and prints its accounting on success.
+   This closes the steady-heartbeat and bounded-horizon measurement gate; it
+   does not close the separate ordinary peer-RPC checkpoint-before-response
+   blocker in items 5 and 6.
 4. Persist logical durable commands incrementally. The single-authority
    compatibility path must either append versioned/checksummed durable deltas
    to an fsync'd, identity-bound journal and replay them over the latest

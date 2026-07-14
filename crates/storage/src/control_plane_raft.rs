@@ -1729,6 +1729,139 @@ pub struct ControlPlaneRaftAuthority {
             RuntimeMapContentCertificate,
         )>,
     >,
+    checkpoint_metrics: Arc<ControlPlaneRaftCheckpointMetrics>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneRaftDurabilityMetricSnapshots {
+    pub checkpoint: observability::ControlPlaneRaftCheckpointMetricSnapshot,
+    pub wal: Option<observability::ControlPlaneRaftWalMetricSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct ControlPlaneRaftCheckpointMetrics {
+    snapshot: Mutex<observability::ControlPlaneRaftCheckpointMetricSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct ControlPlaneRaftWalMetrics {
+    snapshot: Mutex<observability::ControlPlaneRaftWalMetricSnapshot>,
+}
+
+fn raft_metric_elapsed_us(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn lock_raft_metric_snapshot<T>(snapshot: &Mutex<T>) -> MutexGuard<'_, T> {
+    snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl ControlPlaneRaftCheckpointMetrics {
+    fn snapshot(&self) -> observability::ControlPlaneRaftCheckpointMetricSnapshot {
+        *lock_raft_metric_snapshot(&self.snapshot)
+    }
+
+    fn record_encode(&self, elapsed: Duration, bytes: usize) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.encode_total = snapshot.encode_total.saturating_add(1);
+        snapshot.encode_us_total = snapshot.encode_us_total.saturating_add(elapsed_us);
+        snapshot.encode_us_max = snapshot.encode_us_max.max(elapsed_us);
+        snapshot.bytes_total = snapshot.bytes_total.saturating_add(bytes);
+        snapshot.bytes_last = bytes;
+        snapshot.bytes_max = snapshot.bytes_max.max(bytes);
+    }
+
+    fn record_store(&self, elapsed: Duration, succeeded: bool) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.store_total = snapshot.store_total.saturating_add(1);
+        if !succeeded {
+            snapshot.store_error_total = snapshot.store_error_total.saturating_add(1);
+        }
+        snapshot.store_us_total = snapshot.store_us_total.saturating_add(elapsed_us);
+        snapshot.store_us_max = snapshot.store_us_max.max(elapsed_us);
+    }
+
+    fn record_file_sync(&self, elapsed: Duration) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.file_sync_total = snapshot.file_sync_total.saturating_add(1);
+        snapshot.file_sync_us_total = snapshot.file_sync_us_total.saturating_add(elapsed_us);
+        snapshot.file_sync_us_max = snapshot.file_sync_us_max.max(elapsed_us);
+    }
+
+    fn record_directory_sync(&self, elapsed: Duration) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.directory_sync_total = snapshot.directory_sync_total.saturating_add(1);
+        snapshot.directory_sync_us_total =
+            snapshot.directory_sync_us_total.saturating_add(elapsed_us);
+        snapshot.directory_sync_us_max = snapshot.directory_sync_us_max.max(elapsed_us);
+    }
+
+    fn record_compaction(&self, elapsed: Duration, succeeded: bool) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.compaction_total = snapshot.compaction_total.saturating_add(1);
+        if !succeeded {
+            snapshot.compaction_error_total = snapshot.compaction_error_total.saturating_add(1);
+        }
+        snapshot.compaction_us_total = snapshot.compaction_us_total.saturating_add(elapsed_us);
+        snapshot.compaction_us_max = snapshot.compaction_us_max.max(elapsed_us);
+    }
+}
+
+impl ControlPlaneRaftWalMetrics {
+    fn snapshot(&self) -> observability::ControlPlaneRaftWalMetricSnapshot {
+        *lock_raft_metric_snapshot(&self.snapshot)
+    }
+
+    fn record_append(&self, elapsed: Duration, succeeded: bool) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.append_total = snapshot.append_total.saturating_add(1);
+        if !succeeded {
+            snapshot.append_error_total = snapshot.append_error_total.saturating_add(1);
+        }
+        snapshot.append_us_total = snapshot.append_us_total.saturating_add(elapsed_us);
+        snapshot.append_us_max = snapshot.append_us_max.max(elapsed_us);
+    }
+
+    fn record_lock_wait(&self, elapsed: Duration) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.lock_wait_us_total = snapshot.lock_wait_us_total.saturating_add(elapsed_us);
+        snapshot.lock_wait_us_max = snapshot.lock_wait_us_max.max(elapsed_us);
+    }
+
+    fn record_frame_bytes(&self, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.frame_bytes_total = snapshot.frame_bytes_total.saturating_add(bytes);
+        snapshot.frame_bytes_last = bytes;
+        snapshot.frame_bytes_max = snapshot.frame_bytes_max.max(bytes);
+    }
+
+    fn record_file_sync(&self, elapsed: Duration) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.file_sync_total = snapshot.file_sync_total.saturating_add(1);
+        snapshot.file_sync_us_total = snapshot.file_sync_us_total.saturating_add(elapsed_us);
+        snapshot.file_sync_us_max = snapshot.file_sync_us_max.max(elapsed_us);
+    }
+
+    fn record_directory_sync(&self, elapsed: Duration) {
+        let elapsed_us = raft_metric_elapsed_us(elapsed);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.directory_sync_total = snapshot.directory_sync_total.saturating_add(1);
+        snapshot.directory_sync_us_total =
+            snapshot.directory_sync_us_total.saturating_add(elapsed_us);
+        snapshot.directory_sync_us_max = snapshot.directory_sync_us_max.max(elapsed_us);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3545,6 +3678,7 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
+            checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
         }
     }
 
@@ -3564,6 +3698,7 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
+            checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
         }
     }
 
@@ -3584,12 +3719,24 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
+            checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
         }
     }
 
     #[must_use]
     pub fn raft(&self) -> &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine> {
         &self.raft
+    }
+
+    #[must_use]
+    pub fn durability_metric_snapshots(&self) -> ControlPlaneRaftDurabilityMetricSnapshots {
+        ControlPlaneRaftDurabilityMetricSnapshots {
+            checkpoint: self.checkpoint_metrics.snapshot(),
+            wal: self
+                .log_store
+                .as_ref()
+                .and_then(ControlPlaneRaftLogStore::wal_metric_snapshot),
+        }
     }
 
     pub async fn initialize_membership(
@@ -4230,14 +4377,17 @@ impl ControlPlaneRaftAuthority {
             .inner
             .snapshot()
             .max_committed_timestamp_ms();
-        artifact.store_durable_artifact(path)?;
+        artifact.store_durable_artifact_with_metrics(path, Some(&self.checkpoint_metrics))?;
         if let Some(log_store) = &self.log_store {
             let compact_started = Instant::now();
             let result = log_store.compact_wal_through(wal_replay_offset);
+            let compact_elapsed = compact_started.elapsed();
             observability::record_control_plane_raft_checkpoint_compaction(
-                compact_started.elapsed(),
+                compact_elapsed,
                 result.is_ok(),
             );
+            self.checkpoint_metrics
+                .record_compaction(compact_elapsed, result.is_ok());
             result.map_err(|source| ControlPlaneError::Io {
                 context: "compact control-plane OpenRaft WAL after durable checkpoint",
                 source,
@@ -5082,6 +5232,7 @@ pub struct ControlPlaneRaftWalFile {
     cluster_name: String,
     local_node_id: ControlPlaneRaftNodeId,
     io_lock: Arc<Mutex<()>>,
+    metrics: Arc<ControlPlaneRaftWalMetrics>,
 }
 
 #[derive(Debug)]
@@ -5212,6 +5363,10 @@ impl ControlPlaneRaftLogStore {
             })?;
         }
         Ok(())
+    }
+
+    fn wal_metric_snapshot(&self) -> Option<observability::ControlPlaneRaftWalMetricSnapshot> {
+        self.wal.as_ref().map(|wal| wal.metrics.snapshot())
     }
 
     fn restart_artifact_from_inner(
@@ -5847,6 +6002,7 @@ impl ControlPlaneRaftWalFile {
             cluster_name: config.cluster_name,
             local_node_id: config.local_node_id,
             io_lock: Arc::new(Mutex::new(())),
+            metrics: Arc::new(ControlPlaneRaftWalMetrics::default()),
         }
     }
 
@@ -5868,10 +6024,9 @@ impl ControlPlaneRaftWalFile {
     ) -> Result<(), ControlPlaneRaftWalAppendError> {
         let append_started = Instant::now();
         let result = self.append_record_for_log_store_inner(record);
-        observability::record_control_plane_raft_wal_append(
-            append_started.elapsed(),
-            result.is_ok(),
-        );
+        let append_elapsed = append_started.elapsed();
+        observability::record_control_plane_raft_wal_append(append_elapsed, result.is_ok());
+        self.metrics.record_append(append_elapsed, result.is_ok());
         result
     }
 
@@ -5885,7 +6040,9 @@ impl ControlPlaneRaftWalFile {
             .lock()
             .map_err(|_| raft_artifact_protocol_error("control-plane OpenRaft WAL lock poisoned"))
             .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord);
-        observability::record_control_plane_raft_wal_lock_wait(lock_started.elapsed());
+        let lock_elapsed = lock_started.elapsed();
+        observability::record_control_plane_raft_wal_lock_wait(lock_elapsed);
+        self.metrics.record_lock_wait(lock_elapsed);
         let _guard = guard?;
         let frame = ControlPlaneRaftWalFrame::new(
             self.cluster_name.clone(),
@@ -5941,14 +6098,17 @@ impl ControlPlaneRaftWalFile {
                     source,
                 })
             });
-        observability::record_control_plane_raft_wal_file_sync(file_sync_started.elapsed());
+        let file_sync_elapsed = file_sync_started.elapsed();
+        observability::record_control_plane_raft_wal_file_sync(file_sync_elapsed);
+        self.metrics.record_file_sync(file_sync_elapsed);
         file_sync_result.map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
         observability::record_control_plane_raft_wal_frame_bytes(frame_bytes);
+        self.metrics.record_frame_bytes(frame_bytes);
         let directory_sync_started = Instant::now();
         let directory_sync_result = sync_control_plane_raft_wal_parent(&self.path);
-        observability::record_control_plane_raft_wal_directory_sync(
-            directory_sync_started.elapsed(),
-        );
+        let directory_sync_elapsed = directory_sync_started.elapsed();
+        observability::record_control_plane_raft_wal_directory_sync(directory_sync_elapsed);
+        self.metrics.record_directory_sync(directory_sync_elapsed);
         directory_sync_result.map_err(ControlPlaneRaftWalAppendError::ReplayableRecordMayExist)?;
         Ok(())
     }
@@ -6496,16 +6656,29 @@ impl ControlPlaneRaftRestartArtifact {
     }
 
     pub fn store_durable_artifact(&self, path: &Path) -> Result<(), ControlPlaneError> {
+        self.store_durable_artifact_with_metrics(path, None)
+    }
+
+    fn store_durable_artifact_with_metrics(
+        &self,
+        path: &Path,
+        metrics: Option<&ControlPlaneRaftCheckpointMetrics>,
+    ) -> Result<(), ControlPlaneError> {
         let store_started = Instant::now();
-        let result = self.store_durable_artifact_inner(path);
-        observability::record_control_plane_raft_checkpoint_store(
-            store_started.elapsed(),
-            result.is_ok(),
-        );
+        let result = self.store_durable_artifact_inner(path, metrics);
+        let store_elapsed = store_started.elapsed();
+        observability::record_control_plane_raft_checkpoint_store(store_elapsed, result.is_ok());
+        if let Some(metrics) = metrics {
+            metrics.record_store(store_elapsed, result.is_ok());
+        }
         result
     }
 
-    fn store_durable_artifact_inner(&self, path: &Path) -> Result<(), ControlPlaneError> {
+    fn store_durable_artifact_inner(
+        &self,
+        path: &Path,
+        metrics: Option<&ControlPlaneRaftCheckpointMetrics>,
+    ) -> Result<(), ControlPlaneError> {
         self.validate_restart_pair()
             .map_err(|source| ControlPlaneError::Io {
                 context: "validate control-plane OpenRaft durable restart artifact",
@@ -6521,13 +6694,14 @@ impl ControlPlaneRaftRestartArtifact {
             Err(error) => return Err(error),
         }
         ControlPlaneRaftRestartSentinel::for_artifact(self)
-            .store_durable_sentinel(&sentinel_path)?;
+            .store_durable_sentinel(&sentinel_path, metrics)?;
         let encode_started = Instant::now();
         let bytes = self.encode_durable_artifact()?;
-        observability::record_control_plane_raft_checkpoint_encode(
-            encode_started.elapsed(),
-            bytes.len(),
-        );
+        let encode_elapsed = encode_started.elapsed();
+        observability::record_control_plane_raft_checkpoint_encode(encode_elapsed, bytes.len());
+        if let Some(metrics) = metrics {
+            metrics.record_encode(encode_elapsed, bytes.len());
+        }
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -6550,7 +6724,11 @@ impl ControlPlaneRaftRestartArtifact {
                 })?;
             let sync_started = Instant::now();
             let result = file.sync_all();
-            observability::record_control_plane_raft_checkpoint_file_sync(sync_started.elapsed());
+            let sync_elapsed = sync_started.elapsed();
+            observability::record_control_plane_raft_checkpoint_file_sync(sync_elapsed);
+            if let Some(metrics) = metrics {
+                metrics.record_file_sync(sync_elapsed);
+            }
             result.map_err(|source| ControlPlaneError::Io {
                 context: "sync control-plane OpenRaft durable restart artifact temp file",
                 source,
@@ -6560,7 +6738,7 @@ impl ControlPlaneRaftRestartArtifact {
             context: "commit control-plane OpenRaft durable restart artifact",
             source,
         })?;
-        sync_durable_artifact_parent(path)?;
+        sync_durable_artifact_parent(path, metrics)?;
         Ok(())
     }
 
@@ -7199,7 +7377,11 @@ impl ControlPlaneRaftRestartSentinel {
         Self::decode_durable_sentinel(&bytes)
     }
 
-    fn store_durable_sentinel(&self, path: &Path) -> Result<(), ControlPlaneError> {
+    fn store_durable_sentinel(
+        &self,
+        path: &Path,
+        metrics: Option<&ControlPlaneRaftCheckpointMetrics>,
+    ) -> Result<(), ControlPlaneError> {
         let bytes = self.encode_durable_sentinel()?;
         if let Some(parent) = path
             .parent()
@@ -7223,7 +7405,11 @@ impl ControlPlaneRaftRestartSentinel {
                 })?;
             let sync_started = Instant::now();
             let result = file.sync_all();
-            observability::record_control_plane_raft_checkpoint_file_sync(sync_started.elapsed());
+            let sync_elapsed = sync_started.elapsed();
+            observability::record_control_plane_raft_checkpoint_file_sync(sync_elapsed);
+            if let Some(metrics) = metrics {
+                metrics.record_file_sync(sync_elapsed);
+            }
             result.map_err(|source| ControlPlaneError::Io {
                 context: "sync control-plane OpenRaft durable restart sentinel temp file",
                 source,
@@ -7233,7 +7419,7 @@ impl ControlPlaneRaftRestartSentinel {
             context: "commit control-plane OpenRaft durable restart sentinel",
             source,
         })?;
-        sync_durable_artifact_parent(path)?;
+        sync_durable_artifact_parent(path, metrics)?;
         Ok(())
     }
 }
@@ -7820,14 +8006,21 @@ pub fn durable_artifact_wal_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{file_name}.wal"))
 }
 
-fn sync_durable_artifact_parent(path: &Path) -> Result<(), ControlPlaneError> {
+fn sync_durable_artifact_parent(
+    path: &Path,
+    metrics: Option<&ControlPlaneRaftCheckpointMetrics>,
+) -> Result<(), ControlPlaneError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let sync_started = Instant::now();
     let result = File::open(parent).and_then(|directory| directory.sync_all());
-    observability::record_control_plane_raft_checkpoint_directory_sync(sync_started.elapsed());
+    let sync_elapsed = sync_started.elapsed();
+    observability::record_control_plane_raft_checkpoint_directory_sync(sync_elapsed);
+    if let Some(metrics) = metrics {
+        metrics.record_directory_sync(sync_elapsed);
+    }
     result.map_err(|source| ControlPlaneError::Io {
         context: "sync control-plane OpenRaft durable restart artifact directory",
         source,
@@ -19713,7 +19906,7 @@ mod tests {
             cluster_name: "old-cluster".to_string(),
             local_node_id: 1,
         }
-        .store_durable_sentinel(&sentinel_path)
+        .store_durable_sentinel(&sentinel_path, None)
         .unwrap();
         let artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "new-cluster".to_string(),
@@ -19765,7 +19958,7 @@ mod tests {
                 cluster_name: "control-plane-raft-missing-artifact-sentinel-test".to_string(),
                 local_node_id: 1,
             }
-            .store_durable_sentinel(&durable_artifact_sentinel_path(&path))
+            .store_durable_sentinel(&durable_artifact_sentinel_path(&path), None)
             .unwrap();
 
             assert_error_contains(
@@ -19825,7 +20018,7 @@ mod tests {
                 cluster_name: cluster_name.to_string(),
                 local_node_id: 2,
             }
-            .store_durable_sentinel(&durable_artifact_sentinel_path(&path))
+            .store_durable_sentinel(&durable_artifact_sentinel_path(&path), None)
             .unwrap();
 
             assert_error_contains(
@@ -20268,7 +20461,7 @@ mod tests {
                 cluster_name: cluster_name.to_string(),
                 local_node_id: 1,
             }
-            .store_durable_sentinel(&durable_artifact_sentinel_path(&path))
+            .store_durable_sentinel(&durable_artifact_sentinel_path(&path), None)
             .unwrap();
 
             assert_error_contains(

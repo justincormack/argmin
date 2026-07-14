@@ -15,5 +15,11 @@ cargo nextest run --release -p storage \
     replicated_snapshot_install_validates_control_plane_invariants_before_mutation
 
 echo
+echo "== release control-plane write-amplification boundary =="
+cargo nextest run --release -p argmin-s3 --bin argmin-s3 \
+    experimental_raft_production_shaped_heartbeat_write_amplification_gate \
+    --success-output immediate
+
+echo
 echo "== release control-plane process suite =="
 cargo nextest run --release -p argmin-s3 --test experimental_raft_process
