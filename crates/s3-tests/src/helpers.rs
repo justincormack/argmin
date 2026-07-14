@@ -1184,7 +1184,40 @@ where
         extra_headers,
         payload_hash,
         credentials,
-        true,
+        PresignSettings {
+            service: "s3",
+            include_host_signed_header: true,
+            preserve_base_query_order: false,
+        },
+    )
+}
+
+pub fn presign_url_for_service_with_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    expires: Duration,
+    extra_headers: I,
+    payload_hash: Option<&str>,
+    service: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> PresignedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    presign_url_with_credentials_inner(
+        method,
+        url_str,
+        expires,
+        extra_headers,
+        payload_hash,
+        credentials,
+        PresignSettings {
+            service,
+            include_host_signed_header: true,
+            preserve_base_query_order: true,
+        },
     )
 }
 
@@ -1208,8 +1241,19 @@ where
         extra_headers,
         payload_hash,
         credentials,
-        false,
+        PresignSettings {
+            service: "s3",
+            include_host_signed_header: false,
+            preserve_base_query_order: false,
+        },
     )
+}
+
+#[derive(Clone, Copy)]
+struct PresignSettings<'a> {
+    service: &'a str,
+    include_host_signed_header: bool,
+    preserve_base_query_order: bool,
 }
 
 fn presign_url_with_credentials_inner<K, V, I>(
@@ -1219,7 +1263,7 @@ fn presign_url_with_credentials_inner<K, V, I>(
     extra_headers: I,
     payload_hash: Option<&str>,
     credentials: SignedRequestCredentials<'_>,
-    include_host_signed_header: bool,
+    settings: PresignSettings<'_>,
 ) -> PresignedRequest
 where
     K: AsRef<str>,
@@ -1248,7 +1292,7 @@ where
 
     let payload_hash = payload_hash.unwrap_or("UNSIGNED-PAYLOAD").to_string();
     let mut request_headers = Vec::new();
-    if include_host_signed_header {
+    if settings.include_host_signed_header {
         request_headers.push(("host".to_string(), host));
     }
     if payload_hash != "UNSIGNED-PAYLOAD" {
@@ -1269,8 +1313,8 @@ where
         .map(|(name, value)| format!("{name}:{value}\n"))
         .collect();
     let credential = format!(
-        "{}/{}/{}/s3/aws4_request",
-        credentials.access_key, date_stamp, credentials.region
+        "{}/{}/{}/{}/aws4_request",
+        credentials.access_key, date_stamp, credentials.region, settings.service
     );
     let mut raw_query_parts = Vec::new();
     if !base_query.is_empty() {
@@ -1282,15 +1326,31 @@ where
     raw_query_parts.push(format!("X-Amz-Expires={}", expires.as_secs()));
     raw_query_parts.push(format!("X-Amz-SignedHeaders={signed_headers}"));
     let canonical_query = normalize_query(&raw_query_parts.join("&"));
+    let wire_query = if settings.preserve_base_query_order && !base_query.is_empty() {
+        format!(
+            "{base_query}&{}",
+            normalize_query(&raw_query_parts[1..].join("&"))
+        )
+    } else {
+        canonical_query.clone()
+    };
     let canonical_request = format!(
         "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
-    let scope = format!("{date_stamp}/{}/s3/aws4_request", credentials.region);
+    let scope = format!(
+        "{date_stamp}/{}/{}/aws4_request",
+        credentials.region, settings.service
+    );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         sha256_hex(canonical_request.as_bytes())
     );
-    let signing_key = derive_signing_key(credentials.secret_key, date_stamp, credentials.region);
+    let signing_key = derive_signing_key_with_service(
+        credentials.secret_key,
+        date_stamp,
+        credentials.region,
+        settings.service,
+    );
     let signature = hmac_sha256(&signing_key, string_to_sign.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1299,7 +1359,7 @@ where
         "{}{}?{}&X-Amz-Signature={signature}",
         parsed.origin().ascii_serialization(),
         path,
-        canonical_query
+        wire_query
     );
     let headers = request_headers
         .into_iter()
@@ -2013,16 +2073,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     hmac::sign(&key, data).as_ref().to_vec()
 }
 
-fn derive_signing_key(secret_key: &str, date_stamp: &str, region: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(
-        format!("AWS4{secret_key}").as_bytes(),
-        date_stamp.as_bytes(),
-    );
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, b"s3");
-    hmac_sha256(&k_service, b"aws4_request")
-}
-
 fn format_amz_date(epoch_secs: u64) -> String {
     let days = epoch_secs / 86_400;
     let time_of_day = epoch_secs % 86_400;
@@ -2556,5 +2606,67 @@ mod tests {
             copy_source_with_version("bucket", "key with space", "version with+plus"),
             "bucket/key%20with%20space?versionId=version%20with%2Bplus"
         );
+    }
+
+    #[test]
+    fn presign_url_for_service_uses_requested_credential_scope() {
+        let request = presign_url_for_service_with_credentials(
+            "GET",
+            "https://example.com/object",
+            Duration::from_secs(900),
+            Vec::<(&str, &str)>::new(),
+            None,
+            "sts",
+            SignedRequestCredentials {
+                access_key: "ACCESSKEY",
+                secret_key: "secret",
+                region: "test-region-1",
+                tls_ca_pem: None,
+            },
+        );
+        let parsed = url::Url::parse(request.uri()).expect("parse presigned URL");
+        let credential = parsed
+            .query_pairs()
+            .find_map(|(name, value)| (name == "X-Amz-Credential").then_some(value.into_owned()))
+            .expect("presigned URL has credential");
+
+        assert!(credential.starts_with("ACCESSKEY/"));
+        assert!(credential.ends_with("/test-region-1/sts/aws4_request"));
+    }
+
+    #[test]
+    fn presign_url_for_service_preserves_base_query_wire_order() {
+        let credentials = SignedRequestCredentials {
+            access_key: "ACCESSKEY",
+            secret_key: "secret",
+            region: "test-region-1",
+            tls_ca_pem: None,
+        };
+        let presign = |query: &str| {
+            presign_url_for_service_with_credentials(
+                "GET",
+                &format!("https://example.com/object?{query}"),
+                Duration::from_secs(900),
+                Vec::<(&str, &str)>::new(),
+                None,
+                "sts",
+                credentials,
+            )
+        };
+        let first = presign("X-Amz-Security-Token=z&X-Amz-Security-Token=a");
+        let reversed = presign("X-Amz-Security-Token=a&X-Amz-Security-Token=z");
+        let token_values = |request: &PresignedRequest| {
+            url::Url::parse(request.uri())
+                .expect("parse presigned URL")
+                .query_pairs()
+                .filter_map(|(name, value)| {
+                    (name == "X-Amz-Security-Token").then_some(value.into_owned())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(token_values(&first), ["z", "a"]);
+        assert_eq!(token_values(&reversed), ["a", "z"]);
+        assert_ne!(first.uri(), reversed.uri());
     }
 }

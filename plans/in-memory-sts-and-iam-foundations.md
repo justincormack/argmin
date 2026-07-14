@@ -390,11 +390,21 @@ not evidence for any S3 mode; each S3 mode requires its own collision matrix.
 The S3 header-auth route is now independently pinned to perform its own scope
 validation before the specifically probed session-token presence and binding,
 stable issuer-role liveness, and HMAC checks; wrong region wins when region and
-service are both wrong. The matrix does not yet order scope validation against
-empty, malformed, or duplicate signed token headers, so it does not establish
-scope's placement relative to mode-specific token structural validation. These
-results apply only to header SigV4. Presigned, POST Object, and streaming scope
-collisions remain unresolved.
+service are both wrong. The header matrix does not yet order scope validation
+against empty, malformed, or duplicate signed token headers, so it does not
+establish scope's placement relative to all header-specific token structural
+validation.
+
+The presigned-query route is independently pinned to parse its
+`X-Amz-Credential` scope before the probed query and HTTP-header token
+selection, structure, coverage, binding, issuer-liveness, and HMAC checks;
+wrong region also wins when region and service are both wrong. Its matrix
+includes missing, empty, malformed, mismatched, identical-duplicate, and
+conflicting-duplicate query tokens in both conflicting orders, plus selected
+signed-header and present unsigned-header cases. Duplicate signed HTTP token
+headers were not sent, so their ordering remains unresolved. These results
+apply only to header and presigned SigV4 respectively. POST Object and streaming
+scope collisions remain unresolved.
 
 Credential validation should have one common decision path used by STS and S3
 header, presigned, POST Object, and streaming authentication:
@@ -812,10 +822,9 @@ The initial Query-protocol slice completed on 2026-07-13:
   `text/xml` response type, and request-ID agreement
 
 Before Phase 0 can satisfy the first-milestone exit condition, it still needs
-to pin expiry-versus-issuer-deletion precedence, the remaining S3
-presigned/POST/streaming temporary-credential region/service collisions,
-permission-policy mutation behavior, and the temporary access-key/token
-envelope decisions.
+to pin expiry-versus-issuer-deletion precedence, the remaining S3 POST and
+streaming temporary-credential region/service collisions, permission-policy
+mutation behavior, and the temporary access-key/token envelope decisions.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
 remain unsupported compatibility gaps and must never be silently ignored.
@@ -1255,7 +1264,8 @@ specifically probed token presence and binding, issuer liveness, and HMAC
 checks. Empty, malformed, and duplicate signed token-header collisions remain
 unpinned, so this does not order scope validation against every mode-specific
 structural token check. It also does not establish the placement or collision
-behavior for presigned, POST Object, or streaming authentication.
+behavior for presigned, POST Object, or streaming authentication; the separate
+presigned matrix below establishes that mode's own behavior.
 
 The S3 SigV4 presigned-query slice completed on 2026-07-13 against the same
 live and invalidated sessions. A valid `X-Amz-Security-Token` query parameter
@@ -1294,6 +1304,38 @@ URI-encoded form, and the byte encodings of both for every presented token, not
 only the selected header token. The dual-location bad-signature golden exercises
 both token values in one canonical request. The POST Object matrix described
 next and the streaming matrix were not part of that presigned slice.
+
+The S3 SigV4 presigned-query signing-scope slice completed on 2026-07-14 against
+the existing bucket-specific endpoint. A correctly scoped live session first
+reaches authorization and receives the complete `s3:ListBucket` `AccessDenied`
+golden. Complete response goldens then establish that:
+
+- a wrong region returns HTTP 400 `AuthorizationQueryParametersError`, the
+  exact `X-Amz-Credential` wrong/expected-region message, the expected `Region`
+  XML element, and the `x-amz-bucket-region` response header
+- service `sts` returns HTTP 400 `AuthorizationQueryParametersError` with
+  exactly `Error parsing the X-Amz-Credential parameter; incorrect service
+  "sts". This endpoint belongs to "s3".`, omits the `Region` XML element, and
+  retains the `x-amz-bucket-region` header
+- when region and service are both wrong, only the wrong-region response is
+  rendered
+- each scope error precedes the probed query-token presence and structural
+  cases, signed-header selection, unsigned-header coverage validation,
+  token/access-key binding, stable issuer-role liveness, and HMAC comparison.
+  The query cases include missing, empty, malformed, independently valid but
+  mismatched, identical duplicate, and conflicting duplicate tokens in both
+  conflicting wire orders. Signed-header cases include valid, empty, malformed,
+  and mismatched-selected values, and the unsigned-header case combines a valid
+  query token with a present valid but uncovered header. The invalidated old
+  session and a live token signed with a bad secret also receive the scope
+  error. The presigner sorts a separate canonical query for SigV4 while
+  retaining the supplied base-query order in the emitted URI; the oracle parses
+  each URI to assert that order and asserts that the two conflicting-order URIs
+  differ
+
+This pins presigned-query scope ordering only for those cases. Duplicate signed
+HTTP token headers were not sent, and this matrix does not establish scope
+placement for POST Object or aws-chunked streaming.
 
 The S3 POST Object session-authentication slice completed on 2026-07-14. The
 `--assume-role` fixture creates one unique `claude-s3-` bucket with the primary
@@ -1636,9 +1678,9 @@ confidentiality. No session response or request body may appear in traces.
 4. What is the exact AWS precedence among wrong token, missing token, wrong
    region/service, disabled credential, and expired session? The core header,
    presigned, POST Object, and streaming token/signature collisions are pinned;
-   STS and S3 header region/service collisions are now pinned separately.
-   Presigned, POST Object, and streaming scope collisions, disabled-credential
-   collisions, and the remaining expiry collisions are not.
+   STS, S3 header, and S3 presigned-query region/service collisions are now
+   pinned separately. POST Object and streaming scope collisions,
+   disabled-credential collisions, and the remaining expiry collisions are not.
 5. What total Query body and member limits does live STS enforce for the first
    supported parameter set?
 6. Should the first standalone UAT role be injected through a dedicated

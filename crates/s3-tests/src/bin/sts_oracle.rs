@@ -12,8 +12,8 @@ use std::{
 use aws_smithy_types::{date_time::Format as DateTimeFormat, DateTime};
 use ring::hmac;
 use s3_tests::{
-    build_test_agent, post_object_raw_to_test_endpoint_with_headers, presign_url_with_credentials,
-    send_signed_request_for_service_with_credentials,
+    build_test_agent, post_object_raw_to_test_endpoint_with_headers,
+    presign_url_for_service_with_credentials, send_signed_request_for_service_with_credentials,
     shape::{
         assert_shape, error_response_headers, expected_error, response_header_value, shape,
         xml_tag_text, ShapeSpec,
@@ -790,19 +790,28 @@ struct S3HeaderScopeProbeSet<'a> {
     old_security_token: &'a str,
 }
 
+struct S3ListBucketDeniedFixture<'a> {
+    account_id: &'a str,
+    bucket: &'a str,
+    role_name: &'a str,
+    role_session_name: &'a str,
+    credentials: SignedRequestCredentials<'a>,
+    security_token: &'a str,
+}
+
 fn assert_s3_list_bucket_access_denied(
     label: &str,
     response: &RawResponse,
-    fixture: &S3HeaderScopeProbeSet<'_>,
+    fixture: S3ListBucketDeniedFixture<'_>,
 ) {
     let response = s3_response_with_sanitized_body(
         response,
-        fixture.live_credentials.access_key,
-        &[fixture.live_security_token],
+        fixture.credentials.access_key,
+        &[fixture.security_token],
     );
     let assumed_role_arn = format!(
         "arn:aws:sts::{}:assumed-role/{}/{}",
-        fixture.account_id, fixture.live_role_name, fixture.live_role_session_name
+        fixture.account_id, fixture.role_name, fixture.role_session_name
     );
     assert_shape(
         label,
@@ -810,7 +819,7 @@ fn assert_s3_list_bucket_access_denied(
         &shape()
             .status(403)
             .headers(error_response_headers())
-            .header("x-amz-bucket-region", fixture.live_credentials.region)
+            .header("x-amz-bucket-region", fixture.credentials.region)
             .sub("assumed_role_arn", assumed_role_arn)
             .sub("bucket", fixture.bucket)
             .body(
@@ -889,7 +898,14 @@ fn run_s3_header_scope_probes(endpoint: &str, fixture: S3HeaderScopeProbeSet<'_>
     assert_s3_list_bucket_access_denied(
         "s3-header-scope-live-role-correct-scope",
         &positive_response,
-        &fixture,
+        S3ListBucketDeniedFixture {
+            account_id: fixture.account_id,
+            bucket: fixture.bucket,
+            role_name: fixture.live_role_name,
+            role_session_name: fixture.live_role_session_name,
+            credentials: fixture.live_credentials,
+            security_token: fixture.live_security_token,
+        },
     );
 
     let wrong_secret = "0".repeat(40);
@@ -1208,24 +1224,48 @@ fn build_s3_root_presigned_request(
     query_token: Option<&str>,
     signed_header_token: Option<&str>,
 ) -> PresignedRequest {
-    let url = query_token.map_or_else(
-        || endpoint.to_string(),
-        |token| {
+    build_s3_root_presigned_request_for_service(
+        endpoint,
+        credentials,
+        &query_token.into_iter().collect::<Vec<_>>(),
+        &signed_header_token.into_iter().collect::<Vec<_>>(),
+        "s3",
+    )
+}
+
+fn build_s3_root_presigned_request_for_service(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    query_tokens: &[&str],
+    signed_header_tokens: &[&str],
+    service: &str,
+) -> PresignedRequest {
+    let url = query_tokens
+        .iter()
+        .map(|token| {
             format!(
-                "{endpoint}?X-Amz-Security-Token={}",
+                "X-Amz-Security-Token={}",
                 auth::canonical::uri_encode(token)
             )
-        },
-    );
-    let headers = signed_header_token
-        .map(|token| vec![("x-amz-security-token", token)])
-        .unwrap_or_default();
-    presign_url_with_credentials(
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let url = if url.is_empty() {
+        endpoint.to_string()
+    } else {
+        format!("{endpoint}?{url}")
+    };
+    let headers = signed_header_tokens
+        .iter()
+        .map(|token| ("x-amz-security-token", *token))
+        .collect::<Vec<_>>();
+    presign_url_for_service_with_credentials(
         "GET",
         &url,
         Duration::from_secs(900),
         headers,
         None,
+        service,
         credentials,
     )
 }
@@ -1343,6 +1383,7 @@ enum S3PresignedAuthExpected {
     SignatureMismatch,
 }
 
+#[derive(Clone, Copy)]
 struct S3PresignedSessionProbeSet<'a> {
     live_credentials: SignedRequestCredentials<'a>,
     live_security_token: &'a str,
@@ -1612,6 +1653,313 @@ fn run_s3_presigned_session_authentication_probes(
             }
         }
     }
+}
+
+fn assert_s3_presigned_wrong_region_scope(
+    label: &str,
+    response: &RawResponse,
+    wrong_region: &str,
+    expected_region: &str,
+    access_key: &str,
+    security_tokens: &[&str],
+) {
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    let message = format!(
+        "Error parsing the X-Amz-Credential parameter; the region '{wrong_region}' is wrong; \
+         expecting '{expected_region}'"
+    );
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .header("x-amz-bucket-region", expected_region)
+            .body(expected_error::with_region(
+                "AuthorizationQueryParametersError",
+                &message,
+                expected_region,
+            )),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_presigned_wrong_service_scope(
+    label: &str,
+    response: &RawResponse,
+    expected_region: &str,
+    access_key: &str,
+    security_tokens: &[&str],
+) {
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .header("x-amz-bucket-region", expected_region)
+            .body(expected_error::with_host_id(
+                "AuthorizationQueryParametersError",
+                "Error parsing the X-Amz-Credential parameter; incorrect service \"sts\". This endpoint belongs to \"s3\".",
+            )),
+    );
+    println!("{label}: ok");
+}
+
+#[derive(Clone, Copy)]
+enum S3PresignedScopeExpected {
+    WrongRegion,
+    WrongService,
+}
+
+fn run_s3_presigned_scope_probes(
+    endpoint: &str,
+    account_id: &str,
+    bucket: &str,
+    fixture: S3PresignedSessionProbeSet<'_>,
+) {
+    let positive = build_s3_root_presigned_request_for_service(
+        endpoint,
+        fixture.live_credentials,
+        &[fixture.live_security_token],
+        &[],
+        "s3",
+    );
+    let positive_response = fetch_s3_presigned_request(endpoint, &positive, None);
+    assert_s3_list_bucket_access_denied(
+        "s3-presigned-scope-live-role-correct-scope",
+        &positive_response,
+        S3ListBucketDeniedFixture {
+            account_id,
+            bucket,
+            role_name: fixture.live_role_name,
+            role_session_name: fixture.live_role_session_name,
+            credentials: fixture.live_credentials,
+            security_token: fixture.live_security_token,
+        },
+    );
+
+    let wrong_region = if fixture.live_credentials.region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    };
+    let wrong_secret = "0".repeat(40);
+    for (scope, live_credentials, old_credentials, service, expected) in [
+        (
+            "wrong-region",
+            SignedRequestCredentials {
+                region: wrong_region,
+                ..fixture.live_credentials
+            },
+            SignedRequestCredentials {
+                region: wrong_region,
+                ..fixture.old_credentials
+            },
+            "s3",
+            S3PresignedScopeExpected::WrongRegion,
+        ),
+        (
+            "wrong-service",
+            fixture.live_credentials,
+            fixture.old_credentials,
+            "sts",
+            S3PresignedScopeExpected::WrongService,
+        ),
+    ] {
+        let bad_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..live_credentials
+        };
+        let mut conflicting_query_uri = None;
+        for (case, credentials, query_tokens, signed_header_tokens, unsigned_header_token) in [
+            (
+                "valid-query",
+                live_credentials,
+                vec![fixture.live_security_token],
+                vec![],
+                None,
+            ),
+            ("missing-token", live_credentials, vec![], vec![], None),
+            ("empty-query", live_credentials, vec![""], vec![], None),
+            (
+                "malformed-query",
+                live_credentials,
+                vec!["not-a-session-token"],
+                vec![],
+                None,
+            ),
+            (
+                "mismatched-query",
+                live_credentials,
+                vec![fixture.other_live_security_token],
+                vec![],
+                None,
+            ),
+            (
+                "valid-query-bad-signature",
+                bad_signature_credentials,
+                vec![fixture.live_security_token],
+                vec![],
+                None,
+            ),
+            (
+                "old-session-valid-query",
+                old_credentials,
+                vec![fixture.old_security_token],
+                vec![],
+                None,
+            ),
+            (
+                "duplicate-identical-query",
+                live_credentials,
+                vec![fixture.live_security_token, fixture.live_security_token],
+                vec![],
+                None,
+            ),
+            (
+                "duplicate-conflicting-query",
+                live_credentials,
+                vec![
+                    fixture.live_security_token,
+                    fixture.other_live_security_token,
+                ],
+                vec![],
+                None,
+            ),
+            (
+                "duplicate-conflicting-query-reversed",
+                live_credentials,
+                vec![
+                    fixture.other_live_security_token,
+                    fixture.live_security_token,
+                ],
+                vec![],
+                None,
+            ),
+            (
+                "valid-signed-header",
+                live_credentials,
+                vec![],
+                vec![fixture.live_security_token],
+                None,
+            ),
+            (
+                "mismatched-signed-header-valid-query",
+                live_credentials,
+                vec![fixture.live_security_token],
+                vec![fixture.other_live_security_token],
+                None,
+            ),
+            (
+                "empty-signed-header",
+                live_credentials,
+                vec![],
+                vec![""],
+                None,
+            ),
+            (
+                "malformed-signed-header",
+                live_credentials,
+                vec![],
+                vec!["not-a-session-token"],
+                None,
+            ),
+            (
+                "unsigned-header-valid-query",
+                live_credentials,
+                vec![fixture.live_security_token],
+                vec![],
+                Some(fixture.live_security_token),
+            ),
+        ] {
+            let label = format!("s3-presigned-scope-{scope}-{case}");
+            let presigned = build_s3_root_presigned_request_for_service(
+                endpoint,
+                credentials,
+                &query_tokens,
+                &signed_header_tokens,
+                service,
+            );
+            let parsed_presigned = url::Url::parse(presigned.uri())
+                .unwrap_or_else(|error| panic!("{label}: invalid presigned URL: {error}"));
+            let wire_query_tokens = parsed_presigned
+                .query_pairs()
+                .filter_map(|(name, value)| {
+                    (name == "X-Amz-Security-Token").then_some(value.into_owned())
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                wire_query_tokens.len() == query_tokens.len()
+                    && wire_query_tokens
+                        .iter()
+                        .zip(&query_tokens)
+                        .all(|(wire, supplied)| wire == *supplied),
+                "{label}: presigned URI did not preserve the supplied token-query wire order"
+            );
+            if case == "duplicate-conflicting-query" {
+                conflicting_query_uri = Some(presigned.uri().to_string());
+            } else if case == "duplicate-conflicting-query-reversed" {
+                let forward_uri = conflicting_query_uri.as_deref().unwrap_or_else(|| {
+                    panic!("{label}: forward conflicting-query URI was not captured")
+                });
+                assert!(
+                    forward_uri != presigned.uri(),
+                    "{label}: reversed duplicate query produced the same wire URI"
+                );
+            }
+            let response = fetch_s3_presigned_request(endpoint, &presigned, unsigned_header_token);
+            let sensitive_tokens = query_tokens
+                .iter()
+                .chain(signed_header_tokens.iter())
+                .copied()
+                .chain(unsigned_header_token)
+                .collect::<Vec<_>>();
+            match expected {
+                S3PresignedScopeExpected::WrongRegion => {
+                    assert_s3_presigned_wrong_region_scope(
+                        &label,
+                        &response,
+                        wrong_region,
+                        fixture.live_credentials.region,
+                        credentials.access_key,
+                        &sensitive_tokens,
+                    );
+                }
+                S3PresignedScopeExpected::WrongService => {
+                    assert_s3_presigned_wrong_service_scope(
+                        &label,
+                        &response,
+                        fixture.live_credentials.region,
+                        credentials.access_key,
+                        &sensitive_tokens,
+                    );
+                }
+            }
+        }
+    }
+
+    let both_wrong_credentials = SignedRequestCredentials {
+        region: wrong_region,
+        ..fixture.live_credentials
+    };
+    let presigned = build_s3_root_presigned_request_for_service(
+        endpoint,
+        both_wrong_credentials,
+        &[fixture.live_security_token],
+        &[],
+        "sts",
+    );
+    let response = fetch_s3_presigned_request(endpoint, &presigned, None);
+    assert_s3_presigned_wrong_region_scope(
+        "s3-presigned-scope-both-wrong-valid-query",
+        &response,
+        wrong_region,
+        fixture.live_credentials.region,
+        fixture.live_credentials.access_key,
+        &[fixture.live_security_token],
+    );
 }
 
 struct S3PostSessionProbeSet<'a> {
@@ -5346,18 +5694,25 @@ fn main() {
                 old_security_token: &deleted_security_token,
             },
         );
+        let presigned_fixture = S3PresignedSessionProbeSet {
+            live_credentials: recreated_credentials,
+            live_security_token: &recreated_security_token,
+            live_role_name: &recreated_role_name,
+            live_role_session_name: &recreated_role_session_name,
+            other_live_security_token: &other_live_security_token,
+            old_credentials: deleted_credentials,
+            old_security_token: &deleted_security_token,
+        };
         run_s3_presigned_session_authentication_probes(
             &format!("https://s3.{region}.amazonaws.com/"),
             &account_id,
-            S3PresignedSessionProbeSet {
-                live_credentials: recreated_credentials,
-                live_security_token: &recreated_security_token,
-                live_role_name: &recreated_role_name,
-                live_role_session_name: &recreated_role_session_name,
-                other_live_security_token: &other_live_security_token,
-                old_credentials: deleted_credentials,
-                old_security_token: &deleted_security_token,
-            },
+            presigned_fixture,
+        );
+        run_s3_presigned_scope_probes(
+            &format!("https://{post_bucket}.s3.{region}.amazonaws.com/"),
+            &account_id,
+            &post_bucket,
+            presigned_fixture,
         );
         let recreated_session_arn = required_env("S3_TEST_STS_RECREATED_SESSION_ARN");
         run_s3_session_context_probes(
