@@ -48,6 +48,35 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
+async fn assert_checksum_completion_preserved_upload(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    expected_etag: &str,
+) {
+    let parts = CTX
+        .client()
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parts.parts().len(), 1);
+    assert_eq!(parts.parts()[0].part_number(), Some(1));
+    assert_eq!(parts.parts()[0].e_tag(), Some(expected_etag));
+
+    let object = CTX
+        .client()
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await;
+    assert_eq!(err_status(&object), 404);
+}
+
 fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -3378,6 +3407,8 @@ fn test_multipart_checksum_sha256() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
+        // COMPOSITE checksum = sha256(raw_part_checksum)-1
+        let composite = "Ok6Cs5b96ux6+MWQkJO7UBT5sKPBeXBLwvj/hK89smg=-1";
 
         // -- bad object-level checksum rejected --
         let key = "mymultipart";
@@ -3450,6 +3481,30 @@ fn test_multipart_checksum_sha256() {
             .await;
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "BadDigest");
+        assert_checksum_completion_preserved_upload(&bucket, key, upload_id, resp.e_tag().unwrap())
+            .await;
+
+        let corrected = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .checksum_sha256(composite)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(resp.e_tag().unwrap())
+                            .checksum_sha256(resp.checksum_sha256().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(corrected.checksum_sha256(), Some(composite));
 
         // -- missing part checksum rejected --
         let key2 = "mymultipart2";
@@ -3497,6 +3552,35 @@ fn test_multipart_checksum_sha256() {
             .await;
         assert_eq!(err_status(&result2), 400);
         assert_s3_err_code(&result2, "InvalidRequest");
+        assert_checksum_completion_preserved_upload(
+            &bucket,
+            key2,
+            upload_id2,
+            resp2.e_tag().unwrap(),
+        )
+        .await;
+
+        let corrected2 = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key2)
+            .upload_id(upload_id2)
+            .checksum_sha256(composite)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(resp2.e_tag().unwrap())
+                            .checksum_sha256(resp2.checksum_sha256().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(corrected2.checksum_sha256(), Some(composite));
 
         // -- successful COMPOSITE SHA-256 upload --
         let key3 = "mymultipart3";
@@ -3523,8 +3607,6 @@ fn test_multipart_checksum_sha256() {
             .await
             .unwrap();
 
-        // COMPOSITE checksum = sha256(raw_part_checksum)-1
-        let composite = "Ok6Cs5b96ux6+MWQkJO7UBT5sKPBeXBLwvj/hK89smg=-1";
         let complete_resp = client
             .complete_multipart_upload()
             .bucket(&bucket)
@@ -3558,22 +3640,7 @@ fn test_multipart_checksum_sha256() {
             .unwrap();
         assert_eq!(head.checksum_sha256(), Some(composite));
 
-        // Abort the incomplete uploads, then clean up the completed key.
-        let _ = client
-            .abort_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .send()
-            .await;
-        let _ = client
-            .abort_multipart_upload()
-            .bucket(&bucket)
-            .key(key2)
-            .upload_id(upload_id2)
-            .send()
-            .await;
-        cleanup(&bucket, &[key2, key3]).await;
+        cleanup(&bucket, &[key, key2, key3]).await;
     });
 }
 

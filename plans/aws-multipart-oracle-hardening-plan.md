@@ -50,9 +50,12 @@ For each matrix:
   and permits a corrected completion.
 - [x] Prove rejected completion over an existing object leaves the old ETag and
   bytes visible until a valid completion atomically replaces it.
-- [ ] Apply the same state assertions to `InvalidPartOrder`, `EntityTooSmall`,
+- [x] Apply the same state assertions to `InvalidPartOrder`, `EntityTooSmall`,
   checksum failures, expected-size failures, conditional failures, and malformed
-  completion bodies.
+  completion bodies. Raw response-shape tests explicitly accept AWS's documented
+  CompleteMultipartUpload behavior where a processing failure may use either
+  its ordinary error status or an error body embedded in HTTP 200. SDK-based
+  tests already handle both forms; the local server uses ordinary error statuses.
 - [ ] Determine AWS precedence when several completion errors coexist; include
   upload existence, XML shape, part order, missing part, ETag, part size,
   checksum, condition, and expected object size.

@@ -84,6 +84,26 @@ async fn prepare_single_part_multipart_upload(
     (upload_id, part.e_tag().unwrap().to_string())
 }
 
+async fn assert_conditional_multipart_part_preserved(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    expected_etag: &str,
+) {
+    let output = CTX
+        .client()
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send_retrying_operation_aborted("list parts after rejected conditional completion")
+        .await
+        .unwrap();
+    assert_eq!(output.parts().len(), 1);
+    assert_eq!(output.parts()[0].part_number(), Some(1));
+    assert_eq!(output.parts()[0].e_tag(), Some(expected_etag));
+}
+
 /// Cleanup helper: delete object + bucket.
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
@@ -1053,7 +1073,7 @@ fn test_complete_multipart_ifnonmatch_nonexisted_good() {
 fn test_complete_multipart_ifnonmatch_overwrite_existed_failed() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        put_object(&bucket, "obj", b"original").await;
+        let original_etag = put_object(&bucket, "obj", b"original").await;
         let (upload_id, part_etag) =
             prepare_single_part_multipart_upload(&bucket, "obj", b"overwrite").await;
 
@@ -1077,14 +1097,7 @@ fn test_complete_multipart_ifnonmatch_overwrite_existed_failed() {
             .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
         assert_eq!(err_status(&result), 412);
-        CTX.client()
-            .abort_multipart_upload()
-            .bucket(&bucket)
-            .key("obj")
-            .upload_id(&upload_id)
-            .send_retrying_operation_aborted("abort conditional multipart upload")
-            .await
-            .unwrap();
+        assert_conditional_multipart_part_preserved(&bucket, "obj", &upload_id, &part_etag).await;
 
         let resp = CTX
             .client()
@@ -1096,6 +1109,36 @@ fn test_complete_multipart_ifnonmatch_overwrite_existed_failed() {
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], b"original");
+
+        CTX.client()
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .if_match(&original_etag)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("retry conditional multipart upload")
+            .await
+            .unwrap();
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("get corrected conditional object")
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"overwrite");
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -1148,7 +1191,7 @@ fn test_complete_multipart_ifmatch_good() {
 fn test_complete_multipart_ifmatch_failed() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        put_object(&bucket, "obj", b"v1").await;
+        let original_etag = put_object(&bucket, "obj", b"v1").await;
         let (upload_id, part_etag) =
             prepare_single_part_multipart_upload(&bucket, "obj", b"v2").await;
 
@@ -1172,14 +1215,7 @@ fn test_complete_multipart_ifmatch_failed() {
             .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
         assert_eq!(err_status(&result), 412);
-        CTX.client()
-            .abort_multipart_upload()
-            .bucket(&bucket)
-            .key("obj")
-            .upload_id(&upload_id)
-            .send_retrying_operation_aborted("abort conditional multipart upload")
-            .await
-            .unwrap();
+        assert_conditional_multipart_part_preserved(&bucket, "obj", &upload_id, &part_etag).await;
 
         let resp = CTX
             .client()
@@ -1191,6 +1227,36 @@ fn test_complete_multipart_ifmatch_failed() {
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], b"v1");
+
+        CTX.client()
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .if_match(&original_etag)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("retry conditional multipart upload")
+            .await
+            .unwrap();
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("get corrected conditional object")
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"v2");
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -1223,16 +1289,47 @@ fn test_complete_multipart_ifmatch_nonexisted_failed() {
             .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
         assert_eq!(err_status(&result), 404);
+        assert_conditional_multipart_part_preserved(&bucket, "obj", &upload_id, &part_etag).await;
+        let get = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("get object after rejected conditional completion")
+            .await;
+        assert_eq!(err_status(&get), 404);
+
         CTX.client()
-            .abort_multipart_upload()
+            .complete_multipart_upload()
             .bucket(&bucket)
             .key("obj")
             .upload_id(&upload_id)
-            .send_retrying_operation_aborted("abort conditional multipart upload")
+            .if_none_match("*")
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("retry conditional multipart upload")
             .await
             .unwrap();
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("get corrected conditional object")
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"created");
 
-        cleanup(&bucket, &[]).await;
+        cleanup(&bucket, &["obj"]).await;
     });
 }
 

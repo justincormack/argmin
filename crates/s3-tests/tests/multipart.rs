@@ -387,6 +387,82 @@ async fn assert_list_parts_no_such_upload(bucket: &str, key: &str, upload_id: &s
     assert_s3_err_code(&result, "NoSuchUpload");
 }
 
+async fn assert_multipart_parts_preserved(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    expected: &[(i32, i64, &str)],
+) {
+    let output = CTX
+        .client()
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send_retrying_operation_aborted("list parts after rejected multipart completion")
+        .await
+        .unwrap();
+    let actual: Vec<_> = output
+        .parts()
+        .iter()
+        .map(|part| {
+            (
+                part.part_number().unwrap(),
+                part.size().unwrap(),
+                part.e_tag().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+async fn assert_object_contents_and_etag(
+    bucket: &str,
+    key: &str,
+    expected_etag: &str,
+    expected_body: &[u8],
+) {
+    let output = CTX
+        .client()
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("get object after multipart completion attempt")
+        .await
+        .unwrap();
+    assert_eq!(output.e_tag(), Some(expected_etag));
+    assert_eq!(
+        output.body.collect().await.unwrap().into_bytes().as_ref(),
+        expected_body
+    );
+}
+
+fn assert_complete_multipart_processing_error_shape(
+    operation: &str,
+    response: &RawResponse,
+    error_status: u16,
+    expected_body: String,
+) {
+    // AWS documents that CompleteMultipartUpload may commit a 200 response
+    // before processing finishes and then embed an error in the body. The SDK
+    // handles both forms automatically; raw shape tests must do so explicitly.
+    // The local server completes processing before sending headers and uses the
+    // ordinary error status.
+    assert!(
+        response.status == error_status || response.status == 200,
+        "{operation}: expected status {error_status} or embedded-error status 200, got {}",
+        response.status
+    );
+    assert_shape(
+        operation,
+        response,
+        &shape()
+            .status(response.status)
+            .headers(error_response_headers())
+            .body(expected_body),
+    );
+}
+
 fn primary_credentials() -> SignedRequestCredentials<'static> {
     SignedRequestCredentials {
         access_key: CTX.access_key(),
@@ -1756,6 +1832,10 @@ fn test_complete_multipart_upload_xml_precedence() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "complete-multipart-xml-precedence";
+        let original_body = b"object before malformed completion";
+        let original =
+            put_object_retrying_operation_aborted(client, &bucket, key, original_body.to_vec())
+                .await;
         let create = client
             .create_multipart_upload()
             .bucket(&bucket)
@@ -1764,6 +1844,16 @@ fn test_complete_multipart_upload_xml_precedence() {
             .await
             .unwrap();
         let valid_upload_id = create.upload_id().unwrap().to_string();
+        let part_body = b"object after corrected completion";
+        let part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            &valid_upload_id,
+            1,
+            part_body.to_vec(),
+        )
+        .await;
         let invalid_upload_id = "a".repeat(1025);
 
         let valid_url = object_url(
@@ -1813,15 +1903,54 @@ fn test_complete_multipart_upload_xml_precedence() {
             assert_invalid_upload_id_no_such_upload(&invalid_response, &invalid_upload_id);
         }
 
+        assert_multipart_parts_preserved(
+            &bucket,
+            key,
+            &valid_upload_id,
+            &[(1, part_body.len() as i64, part.e_tag().unwrap())],
+        )
+        .await;
+        assert_object_contents_and_etag(&bucket, key, original.e_tag().unwrap(), original_body)
+            .await;
+
         client
-            .abort_multipart_upload()
+            .complete_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .upload_id(valid_upload_id)
-            .send_retrying_operation_aborted("abort multipart upload after XML precedence test")
+            .upload_id(&valid_upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("retry multipart completion with well-formed XML")
             .await
             .unwrap();
-        cleanup(&bucket, &[]).await;
+        assert_list_parts_no_such_upload(&bucket, key, &valid_upload_id).await;
+        let completed = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object after corrected malformed completion")
+            .await
+            .unwrap();
+        assert_eq!(
+            completed
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+                .as_ref(),
+            part_body
+        );
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
@@ -3316,6 +3445,10 @@ fn test_complete_multipart_upload_rejects_mismatched_expected_object_size() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "mp-object-size-mismatch";
+        let original_body = b"object before expected-size mismatch";
+        let original =
+            put_object_retrying_operation_aborted(client, &bucket, key, original_body.to_vec())
+                .await;
 
         let create = client
             .create_multipart_upload()
@@ -3359,7 +3492,57 @@ fn test_complete_multipart_upload_rejects_mismatched_expected_object_size() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidRequest");
 
-        cleanup(&bucket, &[]).await;
+        assert_multipart_parts_preserved(
+            &bucket,
+            key,
+            &upload_id,
+            &[(1, body.len() as i64, part.e_tag().unwrap())],
+        )
+        .await;
+        assert_object_contents_and_etag(&bucket, key, original.e_tag().unwrap(), original_body)
+            .await;
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .mpu_object_size(body.len() as i64)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted(
+                "retry multipart completion with corrected object size",
+            )
+            .await
+            .unwrap();
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        let completed = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get object after corrected expected-size completion")
+            .await
+            .unwrap();
+        assert_eq!(
+            completed
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+                .as_ref(),
+            body
+        );
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
@@ -5499,12 +5682,11 @@ fn test_complete_multipart_invalid_part_error_shape() {
             &single_part_complete_body("\"ffffffffffffffff\""),
             &[],
         );
-        assert_shape(
+        assert_complete_multipart_processing_error_shape(
             "CompleteMultipartUpload InvalidPart",
             &response,
-            &shape().status(400).headers(error_response_headers()).body(
-                expected_error::complete_multipart_invalid_part(&upload_id, 1, "ffffffffffffffff"),
-            ),
+            400,
+            expected_error::complete_multipart_invalid_part(&upload_id, 1, "ffffffffffffffff"),
         );
 
         raw_abort_upload(&bucket, key, &upload_id);
@@ -5519,10 +5701,15 @@ fn test_complete_multipart_invalid_part_order_error_shape() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         let key = "shape-complete-invalid-order.txt";
+        let original_body = b"object before invalid part order";
+        let original =
+            put_object_retrying_operation_aborted(client, &bucket, key, original_body.to_vec())
+                .await;
         let (_, upload_id) = raw_create_upload(&bucket, key, &[]);
         let large_part = vec![b'a'; 5 * 1024 * 1024];
         let (_, etag_one) = raw_upload_part(&bucket, key, &upload_id, 1, &large_part, &[]);
-        let (_, etag_two) = raw_upload_part(&bucket, key, &upload_id, 2, &[b'b'; 256], &[]);
+        let final_part = [b'b'; 256];
+        let (_, etag_two) = raw_upload_part(&bucket, key, &upload_id, 2, &final_part, &[]);
 
         let response = raw_complete_upload(
             &bucket,
@@ -5536,16 +5723,46 @@ fn test_complete_multipart_invalid_part_order_error_shape() {
             ),
             &[],
         );
-        assert_shape(
+        assert_complete_multipart_processing_error_shape(
             "CompleteMultipartUpload InvalidPartOrder",
             &response,
-            &shape().status(400).headers(error_response_headers()).body(
-                expected_error::complete_multipart_invalid_part_order(&upload_id),
-            ),
+            400,
+            expected_error::complete_multipart_invalid_part_order(&upload_id),
         );
 
-        raw_abort_upload(&bucket, key, &upload_id);
-        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+        assert_multipart_parts_preserved(
+            &bucket,
+            key,
+            &upload_id,
+            &[
+                (1, large_part.len() as i64, &etag_one),
+                (2, final_part.len() as i64, &etag_two),
+            ],
+        )
+        .await;
+        assert_object_contents_and_etag(&bucket, key, original.e_tag().unwrap(), original_body)
+            .await;
+
+        let corrected = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &format!(
+                "<CompleteMultipartUpload>\
+                 <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag></Part>\
+                 <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag></Part>\
+                 </CompleteMultipartUpload>"
+            ),
+            &[],
+        );
+        assert_eq!(corrected.status, 200, "corrected completion: {corrected:?}");
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        let mut completed_body = large_part;
+        completed_body.extend_from_slice(&final_part);
+        let completed_etag = xml_tag_text(&corrected.body, "ETag").unwrap();
+        assert_object_contents_and_etag(&bucket, key, completed_etag, &completed_body).await;
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
@@ -5556,9 +5773,14 @@ fn test_complete_multipart_entity_too_small_error_shape() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         let key = "shape-complete-entity-too-small.txt";
+        let original_body = b"object before entity too small";
+        let original =
+            put_object_retrying_operation_aborted(client, &bucket, key, original_body.to_vec())
+                .await;
         let (_, upload_id) = raw_create_upload(&bucket, key, &[]);
-        let (_, etag_one) = raw_upload_part(&bucket, key, &upload_id, 1, &[0u8; 100], &[]);
-        let (_, etag_two) = raw_upload_part(&bucket, key, &upload_id, 2, &[0u8; 100], &[]);
+        let small_part = [0u8; 100];
+        let (_, etag_one) = raw_upload_part(&bucket, key, &upload_id, 1, &small_part, &[]);
+        let (_, etag_two) = raw_upload_part(&bucket, key, &upload_id, 2, &small_part, &[]);
 
         let response = raw_complete_upload(
             &bucket,
@@ -5573,21 +5795,45 @@ fn test_complete_multipart_entity_too_small_error_shape() {
             &[],
         );
         // The error echoes the first offending part's ETag without quotes.
-        assert_shape(
+        assert_complete_multipart_processing_error_shape(
             "CompleteMultipartUpload EntityTooSmall",
             &response,
-            &shape().status(400).headers(error_response_headers()).body(
-                expected_error::complete_multipart_entity_too_small(
-                    100,
-                    5242880,
-                    1,
-                    etag_one.trim_matches('"'),
-                ),
+            400,
+            expected_error::complete_multipart_entity_too_small(
+                100,
+                5242880,
+                1,
+                etag_one.trim_matches('"'),
             ),
         );
 
-        raw_abort_upload(&bucket, key, &upload_id);
-        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+        assert_multipart_parts_preserved(
+            &bucket,
+            key,
+            &upload_id,
+            &[
+                (1, small_part.len() as i64, &etag_one),
+                (2, small_part.len() as i64, &etag_two),
+            ],
+        )
+        .await;
+        assert_object_contents_and_etag(&bucket, key, original.e_tag().unwrap(), original_body)
+            .await;
+
+        let corrected = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &single_part_complete_body(&etag_two)
+                .replace("<PartNumber>1</PartNumber>", "<PartNumber>2</PartNumber>"),
+            &[],
+        );
+        assert_eq!(corrected.status, 200, "corrected completion: {corrected:?}");
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        let completed_etag = xml_tag_text(&corrected.body, "ETag").unwrap();
+        assert_object_contents_and_etag(&bucket, key, completed_etag, &small_part).await;
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
@@ -5599,6 +5845,10 @@ fn test_complete_multipart_checksum_mismatch_error_shape() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         let key = "shape-complete-checksum-mismatch.txt";
+        let original_body = b"object before checksum mismatch";
+        let original =
+            put_object_retrying_operation_aborted(client, &bucket, key, original_body.to_vec())
+                .await;
         let (_, upload_id) =
             raw_create_upload(&bucket, key, &[("x-amz-checksum-algorithm", "SHA256")]);
 
@@ -5614,27 +5864,42 @@ fn test_complete_multipart_checksum_mismatch_error_shape() {
             &[("x-amz-checksum-sha256", part_checksum.as_str())],
         );
 
+        let valid_body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag>\
+             <ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+             </CompleteMultipartUpload>"
+        );
         let response = raw_complete_upload(
             &bucket,
             key,
             &upload_id,
-            &format!(
-                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag>\
-                 <ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
-                 </CompleteMultipartUpload>"
-            ),
+            &valid_body,
             &[("x-amz-checksum-sha256", "bad")],
         );
-        assert_shape(
+        assert_complete_multipart_processing_error_shape(
             "CompleteMultipartUpload checksum header invalid",
             &response,
-            &shape().status(400).headers(error_response_headers()).body(
-                expected_error::complete_multipart_checksum_header_invalid("x-amz-checksum-sha256"),
-            ),
+            400,
+            expected_error::complete_multipart_checksum_header_invalid("x-amz-checksum-sha256"),
         );
 
-        raw_abort_upload(&bucket, key, &upload_id);
-        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+        assert_multipart_parts_preserved(
+            &bucket,
+            key,
+            &upload_id,
+            &[(1, part_body.len() as i64, &etag)],
+        )
+        .await;
+        assert_object_contents_and_etag(&bucket, key, original.e_tag().unwrap(), original_body)
+            .await;
+
+        let corrected = raw_complete_upload(&bucket, key, &upload_id, &valid_body, &[]);
+        assert_eq!(corrected.status, 200, "corrected completion: {corrected:?}");
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        let completed_etag = xml_tag_text(&corrected.body, "ETag").unwrap();
+        assert_object_contents_and_etag(&bucket, key, completed_etag, part_body).await;
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
@@ -5646,6 +5911,10 @@ fn test_complete_multipart_missing_part_checksum_error_shape() {
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
         let key = "shape-complete-missing-part-checksum.txt";
+        let original_body = b"object before missing part checksum";
+        let original =
+            put_object_retrying_operation_aborted(client, &bucket, key, original_body.to_vec())
+                .await;
         let (_, upload_id) =
             raw_create_upload(&bucket, key, &[("x-amz-checksum-algorithm", "SHA256")]);
 
@@ -5668,16 +5937,40 @@ fn test_complete_multipart_missing_part_checksum_error_shape() {
             &single_part_complete_body(&etag),
             &[],
         );
-        assert_shape(
+        assert_complete_multipart_processing_error_shape(
             "CompleteMultipartUpload missing part checksum",
             &response,
-            &shape().status(400).headers(error_response_headers()).body(
-                expected_error::complete_multipart_missing_part_checksum("sha256", 1),
-            ),
+            400,
+            expected_error::complete_multipart_missing_part_checksum("sha256", 1),
         );
 
-        raw_abort_upload(&bucket, key, &upload_id);
-        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+        assert_multipart_parts_preserved(
+            &bucket,
+            key,
+            &upload_id,
+            &[(1, part_body.len() as i64, &etag)],
+        )
+        .await;
+        assert_object_contents_and_etag(&bucket, key, original.e_tag().unwrap(), original_body)
+            .await;
+
+        let corrected = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &format!(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag>\
+                 <ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                 </CompleteMultipartUpload>"
+            ),
+            &[],
+        );
+        assert_eq!(corrected.status, 200, "corrected completion: {corrected:?}");
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        let completed_etag = xml_tag_text(&corrected.body, "ETag").unwrap();
+        assert_object_contents_and_etag(&bucket, key, completed_etag, part_body).await;
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
