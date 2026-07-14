@@ -23,9 +23,10 @@ use storage::control_plane_auth::{
 };
 use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
-    durable_artifact_wal_path, write_control_plane_raft_peer_transport_frame,
-    ControlPlaneRaftEntry, ControlPlaneRaftLeaderId, ControlPlaneRaftPeerFrameIdentity,
-    ControlPlaneRaftPeerRpcRequest, ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile,
+    durable_artifact_wal_path, read_control_plane_raft_peer_transport_frame,
+    write_control_plane_raft_peer_transport_frame, ControlPlaneRaftEntry, ControlPlaneRaftLeaderId,
+    ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerRpcRequest,
+    ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile,
     ControlPlaneRaftWalFileConfig, ControlPlaneRaftWalRecord,
 };
 use storage::{ClusterEpoch, NodeId, PgId};
@@ -1674,16 +1675,52 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
         follower_vote_before_crash.committed,
         "bootstrapped follower should persist a committed vote before direct append: {follower_vote_before_crash:?}"
     );
-    let prev_log_id = follower_log_before_crash
+    let preparation_prev_log_id = follower_log_before_crash
         .last_log_id
         .expect("bootstrapped follower should have a log tip before append");
     let append_vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(
         follower_vote_before_crash
             .term
-            .checked_add(1)
-            .expect("test vote term should advance"),
+            .checked_add(1_000)
+            .expect("synthetic leader vote term should advance past local elections"),
         101,
     );
+    let preparation_request = AppendEntriesRequest {
+        vote: append_vote,
+        prev_log_id: Some(preparation_prev_log_id),
+        entries: Vec::new(),
+        leader_commit: follower_log_before_crash.committed,
+    };
+    let preparation_frame = ControlPlaneRaftPeerRpcRequest::AppendEntries(preparation_request)
+        .encode_frame_for_peer(&ControlPlaneRaftPeerFrameIdentity::new(
+            cluster_name.clone(),
+            101,
+            103,
+        ))
+        .expect("synthetic leader preparation should encode");
+    let preparation_frame = sign_process_test_raft_peer_frame(
+        &cluster_name,
+        101,
+        103,
+        ControlPlaneAuthOperation::RaftAppendEntries,
+        preparation_frame,
+    );
+    let mut preparation_stream =
+        UnixStream::connect(&follower_peer_socket).expect("follower peer socket should connect");
+    write_control_plane_raft_peer_transport_frame(&mut preparation_stream, &preparation_frame)
+        .expect("synthetic leader preparation should be written");
+    read_control_plane_raft_peer_transport_frame(
+        &mut preparation_stream,
+        ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+    )
+    .expect("synthetic leader preparation should be acknowledged");
+
+    let follower_log_before_crash =
+        artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
+            .expect("prepared follower artifact plus WAL should expose current log state");
+    let prev_log_id = follower_log_before_crash
+        .last_log_id
+        .expect("prepared follower should have a log tip before append");
     let appended_log_id = LogId::new(
         append_vote.leader_id,
         prev_log_id
@@ -1717,15 +1754,6 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
         ControlPlaneAuthOperation::RaftAppendEntries,
         append_frame,
     );
-    let follower_wal = raft_wal_file(wal_path(test_dir.path(), 103), &cluster_name, 103);
-    follower_wal
-        .append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
-            ControlPlaneRaftLeaderId,
-        >::new_committed(
-            follower_vote_before_crash.term,
-            follower_vote_before_crash.node_id,
-        )))
-        .expect("test should pre-create follower WAL before blocking checkpoint temp path");
     node101.stop();
     node102.stop();
     let follower_checkpoint_tmp_path =
@@ -1739,7 +1767,6 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
         UnixStream::connect(&follower_peer_socket).expect("follower peer socket should connect");
     write_control_plane_raft_peer_transport_frame(&mut peer_stream, &append_frame)
         .expect("append frame should be written to follower peer socket");
-    drop(peer_stream);
 
     let status = wait_for_process_exit(&mut restarted103, Duration::from_secs(5));
     fs::remove_dir(&follower_checkpoint_tmp_path)
@@ -1758,10 +1785,13 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
     let follower_log_after_crash =
         artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
             .expect("artifact plus WAL should restore after peer append crash");
+    let follower_vote_after_crash =
+        artifact_persisted_vote_with_wal(&follower_state_path, &cluster_name, 103)
+            .expect("artifact plus WAL should restore vote after peer append crash");
     assert_eq!(
         follower_log_after_crash.last_log_id,
         Some(appended_log_id),
-        "artifact plus WAL must recover the unacknowledged-but-fsynced follower append; before={follower_log_before_crash:?} after={follower_log_after_crash:?}"
+        "artifact plus WAL must recover the unacknowledged-but-fsynced follower append; before={follower_log_before_crash:?} after={follower_log_after_crash:?} vote_after={follower_vote_after_crash:?}"
     );
 
     let mut recovered103 =
