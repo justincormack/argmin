@@ -21,7 +21,7 @@ use crate::control_plane_auth::{
 use crate::control_plane_command::{
     AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
     ControlPlaneCommandStateMachine, ControlPlaneLogId, ExpiredNodeHeartbeatLease,
-    ReadyPgPeeringCompletion,
+    PromotedNodeHeartbeatLease, ReadyPgPeeringCompletion,
 };
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::control_plane_lease::{
@@ -2076,6 +2076,96 @@ impl ClusterControlSnapshot {
         Ok(Some(next_snapshot))
     }
 
+    pub(crate) fn promote_volatile_heartbeat_leases_command(
+        &self,
+        durable: &Self,
+    ) -> Result<Option<ControlPlaneCommand>, ControlPlaneError> {
+        if self.lease_grant_horizon != durable.lease_grant_horizon
+            || self.nodes.len() != durable.nodes.len()
+        {
+            return Err(ControlPlaneError::SnapshotInvariantViolation {
+                context: "volatile heartbeat lease promotion",
+                message:
+                    "live and durable snapshots do not share the same lease horizon and node set"
+                        .to_string(),
+            });
+        }
+
+        let mut promoted = Vec::new();
+        for (node_id, durable_node) in &durable.nodes {
+            let live_node = self.nodes.get(node_id).ok_or_else(|| {
+                ControlPlaneError::SnapshotInvariantViolation {
+                    context: "volatile heartbeat lease promotion",
+                    message: format!("live snapshot is missing durable node {}", node_id.as_u32()),
+                }
+            })?;
+            if live_node.node_incarnation != durable_node.node_incarnation
+                || live_node.endpoint != durable_node.endpoint
+            {
+                return Err(ControlPlaneError::SnapshotInvariantViolation {
+                    context: "volatile heartbeat lease promotion",
+                    message: format!(
+                        "live node {} identity differs from durable state",
+                        node_id.as_u32()
+                    ),
+                });
+            }
+            match (durable_node.lease_deadline_ms, live_node.lease_deadline_ms) {
+                (Some(durable_deadline_ms), Some(live_deadline_ms))
+                    if live_deadline_ms > durable_deadline_ms =>
+                {
+                    promoted.push(PromotedNodeHeartbeatLease {
+                        node_id: *node_id,
+                        node_incarnation: live_node.node_incarnation,
+                        lease_deadline_ms: live_deadline_ms,
+                    });
+                }
+                (Some(durable_deadline_ms), Some(live_deadline_ms))
+                    if live_deadline_ms < durable_deadline_ms =>
+                {
+                    return Err(ControlPlaneError::NodeLeaseDeadlineRegression {
+                        node_id: node_id.as_u32(),
+                        current_lease_deadline_ms: durable_deadline_ms,
+                        requested_lease_deadline_ms: live_deadline_ms,
+                    });
+                }
+                (None, Some(live_deadline_ms)) => {
+                    return Err(ControlPlaneError::SnapshotInvariantViolation {
+                        context: "volatile heartbeat lease promotion",
+                        message: format!(
+                            "live node {} has lease deadline {} without a durable base lease",
+                            node_id.as_u32(),
+                            live_deadline_ms
+                        ),
+                    });
+                }
+                (Some(_), None) => {
+                    return Err(ControlPlaneError::SnapshotInvariantViolation {
+                        context: "volatile heartbeat lease promotion",
+                        message: format!(
+                            "live node {} dropped its durable lease outside a replicated command",
+                            node_id.as_u32()
+                        ),
+                    });
+                }
+                (Some(_), Some(_)) | (None, None) => {}
+            }
+        }
+        if promoted.is_empty() {
+            return Ok(None);
+        }
+        let authority = self.lease_grant_horizon_authority().ok_or_else(|| {
+            ControlPlaneError::SnapshotInvariantViolation {
+                context: "volatile heartbeat lease promotion",
+                message: "live lease advances have no committed lease horizon".to_string(),
+            }
+        })?;
+        Ok(Some(ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+            authority,
+            promoted,
+        }))
+    }
+
     pub(crate) fn bind_metadata_transfer_fence_command(
         &self,
         durable_snapshot: &Self,
@@ -3005,6 +3095,118 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     next_snapshot,
                     ControlPlaneCommandResponse::EstablishLeaseGrantHorizon,
                     horizon_changed || timestamp_changed,
+                ))
+            }
+            ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+                authority,
+                promoted,
+            } => {
+                if promoted.is_empty() {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: "heartbeat lease promotion requires at least one node".to_string(),
+                    });
+                }
+                let horizon =
+                    self.lease_grant_horizon
+                        .ok_or_else(|| ControlPlaneError::CommandDecode {
+                            message: "heartbeat lease promotion requires a committed lease horizon"
+                                .to_string(),
+                        })?;
+                if horizon.authority() != authority {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "heartbeat lease promotion authority {authority:?} does not match committed horizon authority {:?}",
+                            horizon.authority()
+                        ),
+                    });
+                }
+                let mut previous_node_id = None;
+                for lease in &promoted {
+                    if previous_node_id.is_some_and(|previous| previous >= lease.node_id) {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: "heartbeat lease promotion nodes are not strictly ordered"
+                                .to_string(),
+                        });
+                    }
+                    previous_node_id = Some(lease.node_id);
+                    if lease.lease_deadline_ms == 0
+                        || lease.lease_deadline_ms > horizon.grant_not_after_ms()
+                    {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "heartbeat lease promotion for node {} has invalid deadline {} under horizon {}",
+                                lease.node_id.as_u32(),
+                                lease.lease_deadline_ms,
+                                horizon.grant_not_after_ms()
+                            ),
+                        });
+                    }
+                    let record =
+                        self.nodes
+                            .get(&lease.node_id)
+                            .ok_or(ControlPlaneError::UnknownNode {
+                                node_id: lease.node_id.as_u32(),
+                            })?;
+                    if matches!(
+                        record.membership,
+                        NodeMembershipState::Out | NodeMembershipState::Removed
+                    ) {
+                        return Err(ControlPlaneError::NodeCannotReceiveLease {
+                            node_id: lease.node_id.as_u32(),
+                            membership: record.membership,
+                        });
+                    }
+                    if !record.administratively_available
+                        || record.observed_availability != NodeAvailabilityState::Healthy
+                    {
+                        return Err(ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "heartbeat lease promotion for node {} requires a healthy available durable node",
+                                lease.node_id.as_u32()
+                            ),
+                        });
+                    }
+                    if record.node_incarnation != lease.node_incarnation {
+                        return Err(ControlPlaneError::NodeIncarnationMismatch {
+                            node_id: lease.node_id.as_u32(),
+                            sender_incarnation: lease.node_incarnation,
+                            current_incarnation: record.node_incarnation,
+                        });
+                    }
+                    let current_deadline_ms = record.lease_deadline_ms.ok_or_else(|| {
+                        ControlPlaneError::CommandDecode {
+                            message: format!(
+                                "heartbeat lease promotion for node {} has no durable base lease",
+                                lease.node_id.as_u32()
+                            ),
+                        }
+                    })?;
+                    if current_deadline_ms > lease.lease_deadline_ms {
+                        return Err(ControlPlaneError::NodeLeaseDeadlineRegression {
+                            node_id: lease.node_id.as_u32(),
+                            current_lease_deadline_ms: current_deadline_ms,
+                            requested_lease_deadline_ms: lease.lease_deadline_ms,
+                        });
+                    }
+                }
+
+                let mut next_snapshot = self.clone();
+                let mut changed = false;
+                for lease in promoted {
+                    let record = next_snapshot
+                        .nodes
+                        .get_mut(&lease.node_id)
+                        .expect("heartbeat lease promotion node validated before mutation");
+                    if record.lease_deadline_ms != Some(lease.lease_deadline_ms) {
+                        record.lease_deadline_ms = Some(lease.lease_deadline_ms);
+                        changed = true;
+                    }
+                }
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::PromoteNodeHeartbeatLeases,
+                    changed,
                 ))
             }
             ControlPlaneCommand::RecordNodeHeartbeat {
@@ -17341,6 +17543,113 @@ mod tests {
         node.lease_deadline_ms = Some(200);
         snapshot.nodes.insert(node.node_id, node);
         snapshot
+    }
+
+    #[test]
+    fn volatile_lease_promotion_makes_acting_set_fence_durable() {
+        let authority = LeaseHorizonAuthorityBinding::new(7, Some(11));
+        let pg_id = PgId::new(9);
+        let proof = PgMetadataProof {
+            applied_log_index: 1,
+            applied_log_hash: 2,
+            state_digest: 3,
+        };
+        let mut durable = canonical_snapshot_with_node();
+        durable.lease_grant_horizon = Some(CommittedLeaseGrantHorizon::from_parts(authority, 900));
+        durable.nodes.insert(
+            NodeId::new(2),
+            NodeControlRecord::new(NodeId::new(2), NodeMembershipState::Active),
+        );
+        durable
+            .nodes
+            .get_mut(&NodeId::new(1))
+            .unwrap()
+            .pg_observations
+            .insert(
+                pg_id,
+                NodePgObservationRecord {
+                    pg_id,
+                    state: PgState::Active,
+                    observed_epoch: durable.cluster_epoch,
+                    observed_at_ms: 100,
+                    metadata_proof: proof,
+                    pending_metadata_command: None,
+                },
+            );
+        durable.pgs.insert(
+            pg_id,
+            PgControlRecord {
+                state: PgState::Active,
+                active_primary: Some(NodeId::new(1)),
+                active_metadata_proof: Some(proof),
+                active_metadata_proof_epoch: Some(durable.cluster_epoch),
+                ..PgControlRecord::new(pg_id, vec![NodeId::new(1)])
+            },
+        );
+        validate_control_plane_snapshot("promotion test durable snapshot", &durable).unwrap();
+
+        let mut live = durable.clone();
+        live.nodes
+            .get_mut(&NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms = Some(700);
+        let promotion = live
+            .promote_volatile_heartbeat_leases_command(&durable)
+            .unwrap()
+            .expect("newer live deadline should require promotion");
+        assert_eq!(
+            promotion,
+            ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+                authority,
+                promoted: vec![PromotedNodeHeartbeatLease {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 11,
+                    lease_deadline_ms: 700,
+                }],
+            }
+        );
+
+        let wrong_incarnation = durable
+            .apply_control_plane_command(ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+                authority,
+                promoted: vec![PromotedNodeHeartbeatLease {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 12,
+                    lease_deadline_ms: 700,
+                }],
+            })
+            .unwrap_err();
+        assert!(matches!(
+            wrong_incarnation,
+            ControlPlaneError::NodeIncarnationMismatch {
+                node_id: 1,
+                sender_incarnation: 12,
+                current_incarnation: 11,
+            }
+        ));
+        assert_eq!(
+            durable.node(NodeId::new(1)).unwrap().lease_deadline_ms(),
+            Some(200)
+        );
+
+        let promoted = durable
+            .apply_control_plane_command(promotion)
+            .unwrap()
+            .into_snapshot();
+        let transitioned = promoted
+            .apply_control_plane_command(ControlPlaneCommand::SetPgActingSet {
+                pg_id,
+                acting_set: vec![NodeId::new(1), NodeId::new(2)],
+            })
+            .unwrap()
+            .into_snapshot();
+        assert_eq!(
+            transitioned
+                .pg(pg_id)
+                .unwrap()
+                .previous_primary_lease_deadline_ms(),
+            Some(700)
+        );
     }
 
     #[test]

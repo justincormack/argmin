@@ -3880,8 +3880,8 @@ impl ControlPlaneRaftAuthority {
             .linearized_authority_serving()
             .then_some(status.current_term())
             .flatten();
-        let (durable_snapshot, durable_applied) = self.durable_snapshot_and_applied().await?;
-        let overlay_snapshot = match (authority_term, status.applied(), durable_applied) {
+        let (mut durable_snapshot, durable_applied) = self.durable_snapshot_and_applied().await?;
+        let mut overlay_snapshot = match (authority_term, status.applied(), durable_applied) {
             (Some(authority_term), Some(status_applied), Some(durable_applied))
                 if status_applied == durable_applied =>
             {
@@ -3890,6 +3890,36 @@ impl ControlPlaneRaftAuthority {
             }
             _ => None,
         };
+        if let Some((overlay_authority_term, live_snapshot)) = overlay_snapshot.take() {
+            if let Some(promotion) =
+                live_snapshot.promote_volatile_heartbeat_leases_command(&durable_snapshot)?
+            {
+                let promoted_durable = durable_snapshot
+                    .apply_control_plane_command(promotion.clone())?
+                    .into_snapshot();
+                let promoted_live = live_snapshot
+                    .apply_control_plane_command(promotion.clone())?
+                    .into_snapshot();
+                let submitted_promotion =
+                    submit_control_plane_command_via_openraft(&self.raft, promotion).await?;
+                match submitted_promotion.into_outcome() {
+                    ControlPlaneRaftCommandOutcome::Applied(
+                        ControlPlaneCommandResponse::PromoteNodeHeartbeatLeases,
+                    ) => {}
+                    ControlPlaneRaftCommandOutcome::Applied(response) => {
+                        return Err(ControlPlaneError::SnapshotInvariantViolation {
+                            context: "volatile heartbeat lease promotion",
+                            message: format!("promotion returned unexpected response {response:?}"),
+                        });
+                    }
+                    ControlPlaneRaftCommandOutcome::Rejected(error) => return Err(error),
+                }
+                durable_snapshot = promoted_durable;
+                overlay_snapshot = Some((overlay_authority_term, promoted_live));
+            } else {
+                overlay_snapshot = Some((overlay_authority_term, live_snapshot));
+            }
+        }
         command = overlay_snapshot
             .as_ref()
             .map_or(&durable_snapshot, |(_, snapshot)| snapshot)
@@ -14607,7 +14637,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_raft_state_machine_rejects_stale_heartbeat_authority_term() {
+    fn control_plane_raft_state_machine_rejects_stale_lease_authority_terms() {
         let mut state_machine = ControlPlaneRaftStateMachine::empty();
         state_machine
             .apply_entry(normal_entry(
@@ -14658,6 +14688,37 @@ mod tests {
         assert_eq!(
             state_machine.inner().last_applied(),
             Some(ControlPlaneLogId::new(2, 2).unwrap())
+        );
+
+        let response = state_machine
+            .apply_entry(normal_entry(
+                2,
+                7,
+                3,
+                ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+                    authority: LeaseHorizonAuthorityBinding::new(7, Some(1)),
+                    promoted: vec![crate::control_plane_command::PromotedNodeHeartbeatLease {
+                        node_id: NodeId::new(1),
+                        node_incarnation: 1,
+                        lease_deadline_ms: 1_100,
+                    }],
+                },
+            ))
+            .unwrap();
+        assert!(matches!(
+            response,
+            ControlPlaneRaftApplyResponse::Rejected(
+                ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
+                    authority_term: Some(1),
+                    committed_term: Some(2),
+                }
+            )
+        ));
+        assert_eq!(state_machine.inner().snapshot(), &before);
+        assert_eq!(state_machine.last_applied(), Some(raft_log_id(2, 7, 3)));
+        assert_eq!(
+            state_machine.inner().last_applied(),
+            Some(ControlPlaneLogId::new(2, 3).unwrap())
         );
     }
 

@@ -11017,8 +11017,9 @@ Required production shape and implementation order:
    extension loss before durability, durable extension with response loss,
    process/leader changes, consumer refresh, and successor activation; an
    activated successor never overlaps a still-valid acknowledged consumer
-   lease. State format version 22 and durable command codec version 9 now
-   promote the capability into replicated state.
+   lease. State format version 22 and durable command codec version 9 first
+   promoted the capability into replicated state; codec version 10 adds the
+   durable volatile-lease promotion described below.
    `EstablishLeaseGrantHorizon` commits the accepted authority timestamp, a
    positive duration bounded to 60 seconds, the nonzero authority-clock
    generation, and an optional nonzero serving Raft term. Deterministic apply
@@ -11096,7 +11097,23 @@ Required production shape and implementation order:
    Deterministic rejection rebases the unchanged live snapshot; successful
    commands rebase the command's live-state result. Learner and voter
    membership APIs use the same serialization and unchanged-snapshot rebase.
-   Metadata-transfer fencing is stronger than an ordinary overlay rebase: the
+   Before any ordinary state-machine command consumes a live overlay whose
+   acknowledged node deadlines are ahead of durable state, the leader first
+   commits `PromoteNodeHeartbeatLeases`. The command carries a nonempty,
+   strictly ordered list of node id, incarnation, and exact deadline tuples,
+   and is bound to the current committed horizon authority and Raft term.
+   Apply rejects identity changes, unavailable or lease-less durable nodes,
+   deadline regression, horizon overflow, malformed ordering, and authority
+   mismatch, then changes only the durable node lease deadlines. The original
+   command is proposed only after promotion applies. A rejection, lost
+   response, crash, or leadership change between those entries therefore
+   leaves a conservative durable fence rather than forgetting an acknowledged
+   lease. Placement, availability, targeted expiry, and metadata-transfer
+   transitions consequently derive previous-primary fences from deadlines at
+   least as new as the live overlay. Promotion is paid only when another
+   durable command follows volatile renewal; steady heartbeats remain free of
+   replicated log and checkpoint writes.
+   Metadata-transfer fencing is additionally explicit in its own command: the
    proposal binds the live source-primary lease deadline and its exact horizon
    authority into the committed fence command whenever that deadline is ahead
    of the durable source deadline. An unchanged durable lease remains derived
@@ -11123,7 +11140,7 @@ Required production shape and implementation order:
    a changed Active proof is also durable because metadata-transfer fencing
    consumes it. Only identical steady heartbeats without Peering evidence can
    remain in the overlay. Empty Raft expiry scans no
-   longer append timestamp-only commands. Non-empty scans commit codec-v9
+   longer append timestamp-only commands. Non-empty scans commit codec-v10
    `ExpireNodeHeartbeatLeases` with a strictly ordered, horizon- and term-bound
    list of the exact live-view deadlines that expired; apply fences only those
    nodes, so an older durable deadline cannot expire another node whose newer
@@ -11931,7 +11948,11 @@ Phase 12.4 progress:
      leases become unavailable. The OpenRaft path uses the term/horizon-bound
      `ExpireNodeHeartbeatLeases` form to commit the exact live-view deadlines
      selected for expiry without sweeping unrelated volatile renewals. Peering
-     completion commits the timestamp used for lease/proof validation. Phase
+     and placement commands first commit the codec-v10
+     `PromoteNodeHeartbeatLeases` form whenever their leader-local overlay
+     contains newer acknowledged deadlines, so every durable transition that
+     derives a previous-primary fence observes those grants.
+     Peering completion commits the timestamp used for lease/proof validation. Phase
      12.3 added a replicated
      `max_committed_timestamp_ms` high-water to the control-plane snapshot:
      timestamp-bearing apply paths reject regressions, and heartbeat apply also

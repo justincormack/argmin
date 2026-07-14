@@ -15,7 +15,7 @@ use placement::NodeId;
 use std::num::NonZeroU64;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 9;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 10;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -27,10 +27,18 @@ const CONTROL_PLANE_COMMAND_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 30;
 const CONTROL_PLANE_COMMAND_HISTORY_ROUTE_REFERENCE_MIN_LEN: usize = 13;
 const CONTROL_PLANE_COMMAND_READY_PG_MIN_LEN: usize = 48;
 const CONTROL_PLANE_COMMAND_EXPIRED_NODE_LEASE_MIN_LEN: usize = 12;
+const CONTROL_PLANE_COMMAND_PROMOTED_NODE_LEASE_MIN_LEN: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpiredNodeHeartbeatLease {
     pub node_id: NodeId,
+    pub lease_deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromotedNodeHeartbeatLease {
+    pub node_id: NodeId,
+    pub node_incarnation: u64,
     pub lease_deadline_ms: u64,
 }
 
@@ -61,6 +69,10 @@ pub enum ControlPlaneCommand {
         authority: LeaseHorizonAuthorityBinding,
         expire_at_ms: u64,
         expired: Vec<ExpiredNodeHeartbeatLease>,
+    },
+    PromoteNodeHeartbeatLeases {
+        authority: LeaseHorizonAuthorityBinding,
+        promoted: Vec<PromotedNodeHeartbeatLease>,
     },
     EstablishLeaseGrantHorizon {
         authority: LeaseHorizonAuthorityBinding,
@@ -147,6 +159,14 @@ impl std::fmt::Display for ControlPlaneCommand {
                 f,
                 "expire-node-heartbeat-leases(authority={authority:?},expire_at_ms={expire_at_ms},nodes={})",
                 expired.len()
+            ),
+            ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+                authority,
+                promoted,
+            } => write!(
+                f,
+                "promote-node-heartbeat-leases(authority={authority:?},nodes={})",
+                promoted.len()
             ),
             ControlPlaneCommand::EstablishLeaseGrantHorizon {
                 authority,
@@ -395,6 +415,50 @@ pub fn encode_control_plane_command(
                 write_u64(&mut out, lease.lease_deadline_ms);
             }
         }
+        ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+            authority,
+            promoted,
+        } => {
+            if promoted.is_empty() {
+                return Err(command_protocol_error(
+                    "heartbeat lease promotion requires at least one node",
+                ));
+            }
+            let mut previous_node_id = None;
+            for lease in promoted {
+                if previous_node_id.is_some_and(|previous| previous >= lease.node_id) {
+                    return Err(command_protocol_error(
+                        "heartbeat lease promotion nodes are not strictly ordered",
+                    ));
+                }
+                if lease.lease_deadline_ms == 0 {
+                    return Err(command_protocol_error(format!(
+                        "heartbeat lease promotion for node {} has invalid deadline {}",
+                        lease.node_id.as_u32(),
+                        lease.lease_deadline_ms
+                    )));
+                }
+                previous_node_id = Some(lease.node_id);
+            }
+            write_u16(&mut out, 14);
+            write_u64(&mut out, authority.clock_generation());
+            match authority.raft_term() {
+                Some(term) => {
+                    write_u8(&mut out, 1);
+                    write_u64(&mut out, term);
+                }
+                None => write_u8(&mut out, 0),
+            }
+            write_u32(
+                &mut out,
+                len_as_u32(promoted.len(), "promoted node heartbeat leases")?,
+            );
+            for lease in promoted {
+                write_u32(&mut out, lease.node_id.as_u32());
+                write_u64(&mut out, lease.node_incarnation);
+                write_u64(&mut out, lease.lease_deadline_ms);
+            }
+        }
     }
     append_control_plane_command_checksum(&mut out);
     Ok(out)
@@ -583,6 +647,45 @@ pub fn decode_control_plane_command(
                 expired,
             }
         }
+        14 => {
+            let authority = read_required_lease_horizon_authority(&mut reader)?;
+            let promoted_count = reader.read_collection_len(
+                "promoted node heartbeat leases",
+                CONTROL_PLANE_COMMAND_PROMOTED_NODE_LEASE_MIN_LEN,
+            )?;
+            let mut promoted = Vec::with_capacity(promoted_count);
+            let mut previous_node_id = None;
+            for _ in 0..promoted_count {
+                let lease = PromotedNodeHeartbeatLease {
+                    node_id: NodeId::new(reader.read_u32()?),
+                    node_incarnation: reader.read_u64()?,
+                    lease_deadline_ms: reader.read_u64()?,
+                };
+                if previous_node_id.is_some_and(|previous| previous >= lease.node_id) {
+                    return Err(command_protocol_error(
+                        "heartbeat lease promotion nodes are not strictly ordered",
+                    ));
+                }
+                if lease.lease_deadline_ms == 0 {
+                    return Err(command_protocol_error(format!(
+                        "heartbeat lease promotion for node {} has invalid deadline {}",
+                        lease.node_id.as_u32(),
+                        lease.lease_deadline_ms
+                    )));
+                }
+                previous_node_id = Some(lease.node_id);
+                promoted.push(lease);
+            }
+            if promoted.is_empty() {
+                return Err(command_protocol_error(
+                    "heartbeat lease promotion requires at least one node",
+                ));
+            }
+            ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+                authority,
+                promoted,
+            }
+        }
         tag => {
             return Err(command_protocol_error(format!(
                 "unknown control-plane command tag {tag}"
@@ -686,6 +789,7 @@ pub enum ControlPlaneCommandResponse {
     MarkNodeAvailability,
     RecordNodeHeartbeat,
     EstablishLeaseGrantHorizon,
+    PromoteNodeHeartbeatLeases,
     ExpireHeartbeatLeases {
         expired_nodes: Vec<NodeId>,
         peering_pgs: Vec<PgId>,
@@ -1101,6 +1205,7 @@ fn validate_committed_command_authority(
         } => *lease_horizon_authority,
         ControlPlaneCommand::EstablishLeaseGrantHorizon { authority, .. } => Some(*authority),
         ControlPlaneCommand::ExpireNodeHeartbeatLeases { authority, .. } => Some(*authority),
+        ControlPlaneCommand::PromoteNodeHeartbeatLeases { authority, .. } => Some(*authority),
         ControlPlaneCommand::FencePgForMetadataTransfer {
             source_primary_lease_deadline_ms: Some(_),
             lease_horizon_authority,
@@ -1763,6 +1868,21 @@ mod tests {
                     },
                 ],
             },
+            ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+                authority: LeaseHorizonAuthorityBinding::new(7, Some(11)),
+                promoted: vec![
+                    PromotedNodeHeartbeatLease {
+                        node_id: NodeId::new(1),
+                        node_incarnation: 12,
+                        lease_deadline_ms: 2_100,
+                    },
+                    PromotedNodeHeartbeatLease {
+                        node_id: NodeId::new(2),
+                        node_incarnation: 13,
+                        lease_deadline_ms: 2_200,
+                    },
+                ],
+            },
             ControlPlaneCommand::EstablishLeaseGrantHorizon {
                 authority: LeaseHorizonAuthorityBinding::new(7, Some(11)),
                 authority_now_ms: 2_100,
@@ -1840,6 +1960,14 @@ mod tests {
                 expire_at_ms: u64::MAX,
                 expired: vec![ExpiredNodeHeartbeatLease {
                     node_id: NodeId::new(u32::MAX),
+                    lease_deadline_ms: u64::MAX,
+                }],
+            },
+            ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+                authority: LeaseHorizonAuthorityBinding::new(u64::MAX, Some(u64::MAX)),
+                promoted: vec![PromotedNodeHeartbeatLease {
+                    node_id: NodeId::new(u32::MAX),
+                    node_incarnation: u64::MAX,
                     lease_deadline_ms: u64::MAX,
                 }],
             },
@@ -2026,8 +2154,8 @@ mod tests {
 
     #[test]
     fn control_plane_command_codec_rejects_semantic_decode_errors() {
-        let unknown_tag = command_frame(14, |_| {});
-        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 14");
+        let unknown_tag = command_frame(15, |_| {});
+        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 15");
 
         let zero_horizon_generation = command_frame(12, |body| {
             write_u64(body, 0);
@@ -2071,6 +2199,49 @@ mod tests {
             write_u64(body, 1_900);
         });
         assert_decode_error_contains(&reversed_expiry_frame, "not strictly ordered");
+
+        let reversed_promotion = ControlPlaneCommand::PromoteNodeHeartbeatLeases {
+            authority: LeaseHorizonAuthorityBinding::new(7, Some(11)),
+            promoted: vec![
+                PromotedNodeHeartbeatLease {
+                    node_id: NodeId::new(2),
+                    node_incarnation: 1,
+                    lease_deadline_ms: 2_100,
+                },
+                PromotedNodeHeartbeatLease {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    lease_deadline_ms: 2_100,
+                },
+            ],
+        };
+        assert!(matches!(
+            encode_control_plane_command(&reversed_promotion),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message.contains("not strictly ordered")
+        ));
+        let reversed_promotion_frame = command_frame(14, |body| {
+            write_u64(body, 7);
+            write_u8(body, 1);
+            write_u64(body, 11);
+            write_u32(body, 2);
+            for node_id in [2, 1] {
+                write_u32(body, node_id);
+                write_u64(body, 1);
+                write_u64(body, 2_100);
+            }
+        });
+        assert_decode_error_contains(&reversed_promotion_frame, "not strictly ordered");
+        let zero_deadline_promotion_frame = command_frame(14, |body| {
+            write_u64(body, 7);
+            write_u8(body, 1);
+            write_u64(body, 11);
+            write_u32(body, 1);
+            write_u32(body, 1);
+            write_u64(body, 0);
+            write_u64(body, 0);
+        });
+        assert_decode_error_contains(&zero_deadline_promotion_frame, "invalid deadline 0");
 
         let zero_horizon_raft_term = command_frame(12, |body| {
             write_u64(body, 1);

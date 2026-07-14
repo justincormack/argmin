@@ -7036,6 +7036,44 @@ mod tests {
             "an unchanged active heartbeat must update the runtime map without log progress"
         );
 
+        let response = harness
+            .control_plane
+            .submit_raft_command(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(1),
+                availability: NodeAvailabilityState::Unavailable,
+            })
+            .expect("availability fence should commit after volatile renewal");
+        assert_eq!(response, ControlPlaneCommandResponse::MarkNodeAvailability);
+        let fenced = harness
+            .control_plane
+            .current_snapshot()
+            .expect("availability fence snapshot should read");
+        assert_eq!(
+            fenced
+                .pg(PgId::new(7))
+                .expect("fenced PG should remain present")
+                .previous_primary_lease_deadline_ms(),
+            Some(20_900),
+            "the durable availability transition must preserve the acknowledged volatile lease"
+        );
+        let durable_previous_deadline = harness
+            .control_plane
+            .block_on(
+                harness
+                    .authority
+                    .raft()
+                    .with_state_machine(|state_machine| {
+                        let deadline = state_machine
+                            .inner()
+                            .snapshot()
+                            .pg(PgId::new(7))
+                            .and_then(|pg| pg.previous_primary_lease_deadline_ms());
+                        Box::pin(async move { deadline })
+                    }),
+            )
+            .expect("durable availability fence state should read");
+        assert_eq!(durable_previous_deadline, Some(20_900));
+
         harness.shutdown();
     }
 
@@ -7419,6 +7457,27 @@ mod tests {
             })
             .expect_err("unknown-node command should reject after committing");
         assert!(matches!(rejected, ControlPlaneError::UnknownNode { .. }));
+        let durable_promoted_deadline = harness
+            .control_plane
+            .block_on(
+                harness
+                    .authority
+                    .raft()
+                    .with_state_machine(|state_machine| {
+                        let deadline = state_machine
+                            .inner()
+                            .snapshot()
+                            .node(NodeId::new(1))
+                            .and_then(|node| node.lease_deadline_ms());
+                        Box::pin(async move { deadline })
+                    }),
+            )
+            .expect("durable state should retain promotion before rejected command");
+        assert_eq!(
+            durable_promoted_deadline,
+            Some(41_200),
+            "a rejected follow-up must not discard the acknowledged lease promotion"
+        );
         assert_eq!(
             harness
                 .control_plane
