@@ -36,10 +36,6 @@ const SLOW_PART_SIZE: usize = 8 * 1024 * 1024;
 const SLOW_PART_CHUNK_SIZE: usize = 64 * 1024;
 const CONCURRENT_MULTIPART_OPERATION_ATTEMPTS: usize = 20;
 
-fn external_test_mode() -> bool {
-    std::env::var_os("S3_TEST_ENDPOINT").is_some()
-}
-
 fn assert_invalid_part_number_body_shape(
     body: &str,
     part_number_requested: u32,
@@ -1090,12 +1086,8 @@ fn test_abort_multipart_upload_after_complete_wrong_upload_id_fails() {
 }
 
 #[test]
-fn test_abort_multipart_upload_invalid_present_upload_id_overlong_message_external() {
+fn test_abort_multipart_upload_invalid_present_upload_id_overlong_message() {
     s3_tests::run(async {
-        if !external_test_mode() {
-            return;
-        }
-
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "multipart-invalid-upload-id-message";
@@ -1138,12 +1130,8 @@ fn test_abort_multipart_upload_invalid_present_upload_id_overlong_message_extern
 }
 
 #[test]
-fn test_upload_part_invalid_present_upload_id_overlong_auth_precedence_external() {
+fn test_upload_part_invalid_present_upload_id_overlong_auth_precedence() {
     s3_tests::run(async {
-        if !external_test_mode() {
-            return;
-        }
-
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "multipart-invalid-upload-id-auth-precedence";
@@ -1178,12 +1166,8 @@ fn test_upload_part_invalid_present_upload_id_overlong_auth_precedence_external(
 }
 
 #[test]
-fn test_complete_multipart_upload_invalid_present_upload_id_overlong_message_external() {
+fn test_complete_multipart_upload_invalid_present_upload_id_overlong_message() {
     s3_tests::run(async {
-        if !external_test_mode() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "multipart-complete-invalid-upload-id-message";
         let invalid_upload_id = "a".repeat(1025);
@@ -1209,12 +1193,8 @@ fn test_complete_multipart_upload_invalid_present_upload_id_overlong_message_ext
 }
 
 #[test]
-fn test_complete_multipart_upload_invalid_present_upload_id_overlong_auth_precedence_external() {
+fn test_complete_multipart_upload_invalid_present_upload_id_overlong_auth_precedence() {
     s3_tests::run(async {
-        if !external_test_mode() {
-            return;
-        }
-
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "multipart-complete-invalid-upload-id-auth-precedence";
@@ -1250,12 +1230,8 @@ fn test_complete_multipart_upload_invalid_present_upload_id_overlong_auth_preced
 }
 
 #[test]
-fn test_list_parts_invalid_present_upload_id_overlong_message_external() {
+fn test_list_parts_invalid_present_upload_id_overlong_message() {
     s3_tests::run(async {
-        if !external_test_mode() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "multipart-list-parts-invalid-upload-id-message";
         let invalid_upload_id = "a".repeat(1025);
@@ -1280,12 +1256,8 @@ fn test_list_parts_invalid_present_upload_id_overlong_message_external() {
 }
 
 #[test]
-fn test_list_parts_invalid_present_upload_id_overlong_auth_precedence_external() {
+fn test_list_parts_invalid_present_upload_id_overlong_auth_precedence() {
     s3_tests::run(async {
-        if !external_test_mode() {
-            return;
-        }
-
         let client = CTX.client();
         let bucket = setup_bucket().await;
         let key = "multipart-list-parts-invalid-upload-id-auth-precedence";
