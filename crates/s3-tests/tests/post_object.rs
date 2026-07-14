@@ -1,13 +1,15 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use auth::canonical::{canonical_request, sha256_hex, string_to_sign};
 use aws_sdk_s3::{primitives::ByteStream, types::ServerSideEncryption};
 use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, err_status, post_object_raw_to_test_endpoint_with_headers,
+    send_signed_request_with_credentials,
     shape::{assert_shape, error_response_headers, expected_error, shape},
     sigv4_post_fields_for_credentials, sigv4_post_sse_c_fields_for_credentials,
     sse_c_header_values, test_sse_c_key, unique_bucket, RawResponse, SendRetryingOperationAborted,
-    CTX,
+    SignedRequestCredentials, CTX,
 };
 
 /// Create a bucket, returning its name.
@@ -218,6 +220,130 @@ fn build_multipart(
 
     let content_type = format!("multipart/form-data; boundary={}", boundary);
     (content_type, body)
+}
+
+struct HeaderAuthorization {
+    authorization: String,
+    date: String,
+    payload_hash: String,
+}
+
+fn header_authorization_for_post(
+    access_key: &str,
+    secret: &str,
+    region: &str,
+    bucket: &str,
+    body: &[u8],
+) -> HeaderAuthorization {
+    let (date_stamp, date) = current_dates();
+    let endpoint = url::Url::parse(CTX.endpoint()).expect("parse endpoint URL");
+    let host = endpoint
+        .host_str()
+        .map(|host| {
+            if let Some(port) = endpoint.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+        .expect("endpoint has host");
+    let path = format!("/{bucket}");
+    let payload_hash = sha256_hex(body);
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{date}\n");
+    let canonical_request = canonical_request(
+        "POST",
+        &path,
+        "",
+        &canonical_headers,
+        signed_headers,
+        &payload_hash,
+    );
+    let scope = format!("{date_stamp}/{region}/s3/aws4_request");
+    let string_to_sign = string_to_sign(&date, &scope, &sha256_hex(canonical_request.as_bytes()));
+    let signing_key = derive_signing_key(secret, &date_stamp, region, "s3");
+    let signature =
+        hex_encode(hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes()).as_ref());
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    );
+
+    HeaderAuthorization {
+        authorization,
+        date,
+        payload_hash,
+    }
+}
+
+fn post_object_with_header_and_policy_auth(
+    bucket: &str,
+    fields: &[(String, String)],
+    file_data: &[u8],
+    header_access_key: &str,
+    header_secret: &str,
+    invalidate_header: bool,
+) -> (u16, String) {
+    let field_refs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let (content_type, body) = build_multipart(&field_refs, file_data, "mixed-auth.txt");
+    let signed = header_authorization_for_post(
+        header_access_key,
+        header_secret,
+        CTX.region(),
+        bucket,
+        &body,
+    );
+    let authorization = if invalidate_header {
+        let (prefix, _) = signed
+            .authorization
+            .split_once("Signature=")
+            .expect("Authorization contains Signature");
+        format!("{prefix}Signature={}", "0".repeat(64))
+    } else {
+        signed.authorization
+    };
+    let url = format!("{}/{bucket}", CTX.endpoint());
+    let mut response = agent()
+        .post(&url)
+        .header("Content-Type", &content_type)
+        .header("Authorization", &authorization)
+        .header("x-amz-date", &signed.date)
+        .header("x-amz-content-sha256", &signed.payload_hash)
+        .send(&body[..])
+        .expect("HTTP transport error");
+    let status = response.status().as_u16();
+    let response_body = response.body_mut().read_to_string().unwrap_or_default();
+    (status, response_body)
+}
+
+fn invalidate_post_signature(fields: &mut [(String, String)]) {
+    let signature = fields
+        .iter_mut()
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-signature"))
+        .expect("POST fields contain x-amz-signature");
+    signature.1 = "0".repeat(64);
+}
+
+fn assert_post_object_header_auth_rejected(case: &str, status: u16, body: &str) {
+    assert_eq!(status, 400, "{case}: expected 400, got {status}: {body}");
+    assert_error_code(body, "InvalidArgument");
+    assert!(
+        body.contains(
+            "<Message>x-amz-content-sha256 must be UNSIGNED-PAYLOAD, STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD, STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER or a valid sha256 value.</Message>"
+        ),
+        "{case}: unexpected error message: {body}"
+    );
+    assert!(
+        body.contains("<ArgumentName>x-amz-content-sha256</ArgumentName>"),
+        "{case}: expected x-amz-content-sha256 argument name, got: {body}"
+    );
+    assert!(
+        !body.contains("<ArgumentValue>"),
+        "{case}: AWS omits ArgumentValue for this rejection: {body}"
+    );
 }
 
 /// Helper: build SigV4 POST form fields for a given bucket/key/file.
@@ -452,6 +578,126 @@ async fn wait_for_put_object_access_denied(client: &aws_sdk_s3::Client, bucket: 
 }
 
 // ── Basic upload ────────────────────────────────────────────────────────
+
+#[test]
+fn test_post_object_with_header_sigv4_auth_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "header-sigv4-post-object";
+        let fields = [("key".to_string(), key.to_string())];
+        let field_refs = fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let (content_type, request_body) = build_multipart(
+            &field_refs,
+            b"header authenticated POST Object",
+            "header-auth.txt",
+        );
+        let response = send_signed_request_with_credentials(
+            "POST",
+            &format!("{}/{bucket}", CTX.endpoint()),
+            &request_body,
+            [("content-type", content_type.as_str())],
+            SignedRequestCredentials {
+                access_key: CTX.access_key(),
+                secret_key: CTX.secret_key(),
+                region: CTX.region(),
+                tls_ca_pem: CTX.tls_ca_pem(),
+            },
+        );
+        let status = response.status;
+        let body = response.body;
+        assert_post_object_header_auth_rejected("standalone header auth", status, &body);
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
+    });
+}
+
+#[test]
+fn test_simultaneous_header_and_post_policy_auth_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let file_data = b"simultaneous header and POST policy authentication";
+
+        let primary_fields = sigv4_fields_for_credentials(
+            CTX.access_key(),
+            CTX.secret_key(),
+            CTX.region(),
+            &bucket,
+            "mixed-primary",
+            &[],
+        );
+        let (status, body) = post_object_with_header_and_policy_auth(
+            &bucket,
+            &primary_fields,
+            file_data,
+            CTX.access_key(),
+            CTX.secret_key(),
+            false,
+        );
+        assert_post_object_header_auth_rejected("both valid, same principal", status, &body);
+
+        let mut invalid_post_fields = primary_fields.clone();
+        invalidate_post_signature(&mut invalid_post_fields);
+        let (status, body) = post_object_with_header_and_policy_auth(
+            &bucket,
+            &invalid_post_fields,
+            file_data,
+            CTX.access_key(),
+            CTX.secret_key(),
+            false,
+        );
+        assert_post_object_header_auth_rejected("valid header, invalid POST", status, &body);
+
+        let (status, body) = post_object_with_header_and_policy_auth(
+            &bucket,
+            &primary_fields,
+            file_data,
+            CTX.access_key(),
+            CTX.secret_key(),
+            true,
+        );
+        assert_post_object_header_auth_rejected("invalid header, valid POST", status, &body);
+
+        let alt_fields = sigv4_fields_for_credentials(
+            CTX.alt_access_key(),
+            CTX.alt_secret_key(),
+            CTX.region(),
+            &bucket,
+            "mixed-alt-policy",
+            &[],
+        );
+        let (status, body) = post_object_with_header_and_policy_auth(
+            &bucket,
+            &alt_fields,
+            file_data,
+            CTX.access_key(),
+            CTX.secret_key(),
+            false,
+        );
+        assert_post_object_header_auth_rejected(
+            "authorized header principal, denied POST principal",
+            status,
+            &body,
+        );
+
+        let (status, body) = post_object_with_header_and_policy_auth(
+            &bucket,
+            &primary_fields,
+            file_data,
+            CTX.alt_access_key(),
+            CTX.alt_secret_key(),
+            false,
+        );
+        assert_post_object_header_auth_rejected(
+            "denied header principal, authorized POST principal",
+            status,
+            &body,
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
+    });
+}
 
 #[test]
 fn test_post_object_authenticated_request() {

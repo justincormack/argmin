@@ -196,6 +196,12 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::Auth(auth::AuthError::MalformedAuth) => {
             "malformed Authorization header".to_string()
         }
+        ServerError::Auth(auth::AuthError::MalformedAuthComponents) => {
+            "The authorization header is malformed; the authorization header requires three components: Credential, SignedHeaders, and Signature.".to_string()
+        }
+        ServerError::Auth(auth::AuthError::MalformedSignedHeaders) => {
+            "The authorization header is malformed; the authorization component \" SignedHeaders=\" is malformed.".to_string()
+        }
         ServerError::Auth(auth::AuthError::UnsupportedAuthType) => {
             "unsupported Authorization type".to_string()
         }
@@ -247,6 +253,9 @@ fn client_error_message(err: &ServerError) -> String {
         }
         ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
             "A header you provided implies functionality that is not implemented".to_string()
+        }
+        ServerError::Auth(auth::AuthError::MultipleAuthMechanisms { .. }) => {
+            "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter, Signature query string parameter or the Authorization header should be specified".to_string()
         }
         ServerError::Auth(auth::AuthError::SignatureMismatch { .. }) => {
             "The request signature we calculated does not match the signature you \
@@ -451,7 +460,8 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::MissingContentLength => {
             "You must provide the Content-Length HTTP header.".to_string()
         }
-        ServerError::UnsupportedStreamingToken { .. } => {
+        ServerError::UnsupportedStreamingToken { .. }
+        | ServerError::PostObjectHeaderAuthUnsupported => {
             "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, \
              STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, \
              STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, \
@@ -626,6 +636,17 @@ impl S3Response {
                 );
                 Self::new(400).chunked_xml_body(body)
             }
+            ServerError::Auth(
+                auth::AuthError::MalformedAuthComponents | auth::AuthError::MalformedSignedHeaders,
+            ) => {
+                let body = xml::error_xml_with_host_id(
+                    "AuthorizationHeaderMalformed",
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
             ServerError::AccessDenied
             | ServerError::ObjectLockProtectedAccessDenied
             | ServerError::Auth(auth::AuthError::MissingAuth)
@@ -679,6 +700,16 @@ impl S3Response {
             ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
                 let body = xml::header_not_implemented_xml("Authorization", resource, request_id);
                 Self::new(501).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::MultipleAuthMechanisms { authorization }) => {
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    "Authorization",
+                    Some(authorization),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
             }
             ServerError::MaxMessageLengthExceeded {
                 max_message_length_bytes,
@@ -932,6 +963,16 @@ impl S3Response {
                     &client_error_message(err),
                     "x-amz-content-sha256",
                     Some(token),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::PostObjectHeaderAuthUnsupported => {
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    "x-amz-content-sha256",
+                    None,
                     request_id,
                     host_id,
                 );

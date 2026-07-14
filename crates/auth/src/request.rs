@@ -250,6 +250,13 @@ pub fn authenticate_request<H: HeaderSource + ?Sized>(
     }
 
     if let Some(auth_header) = authorization_header {
+        if query_param_lossy(query_string, "X-Amz-Algorithm").is_some()
+            || query_param_lossy(query_string, "Signature").is_some()
+        {
+            return Err(AuthError::MultipleAuthMechanisms {
+                authorization: auth_header.to_string(),
+            });
+        }
         // Empty Authorization header → AccessDenied (AWS behavior)
         if auth_header.trim().is_empty() {
             return Err(AuthError::AccessDenied);
@@ -490,12 +497,6 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         parse_amz_date(request_date.as_ref()).ok_or(AuthError::InvalidQueryParam {
             param: "X-Amz-Date",
         })?;
-    if !amz_date_matches_date_stamp(request_date.as_ref(), credential.date) {
-        return Err(AuthError::InvalidQueryParam {
-            param: "X-Amz-Credential",
-        });
-    }
-
     let expires = query_param_lossy(query_string, "X-Amz-Expires")
         .ok_or(AuthError::MissingQueryParam {
             param: "X-Amz-Expires",
@@ -521,6 +522,11 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
             x_amz_expires: expires,
             expires_epoch: request_epoch.saturating_add(expires),
             server_time_epoch: now_epoch_secs,
+        });
+    }
+    if !amz_date_matches_date_stamp(request_date.as_ref(), credential.date) {
+        return Err(AuthError::InvalidQueryParam {
+            param: "X-Amz-Credential",
         });
     }
 
@@ -552,8 +558,12 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         .then(|| headers.first_value("x-amz-security-token"))
         .flatten();
 
-    let signed_header_pairs = collect_signed_headers(&signed_headers, headers)?;
-    let canonical_hdrs = canonical_headers(&signed_header_pairs);
+    let signed_header_pairs = collect_signed_headers(&signed_headers, headers);
+    let signed_header_pair_refs = signed_header_pairs
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let canonical_hdrs = canonical_headers(&signed_header_pair_refs);
     let signed_headers_joined = signed_headers.join(";");
     let canonical_qs = canonical_query_string(&query_without_signature(query_string));
     // AWS treats x-amz-content-sha256 as a presigned payload-hash override
@@ -621,31 +631,26 @@ where
     unsigned_required_headers(signed_headers, headers)
 }
 
-fn collect_signed_headers<'a, H, S>(
-    signed_headers: &[S],
-    headers: &'a H,
-) -> Result<Vec<(&'a str, &'a str)>, AuthError>
+fn collect_signed_headers<H, S>(signed_headers: &[S], headers: &H) -> Vec<(String, String)>
 where
     H: HeaderSource + ?Sized,
     S: AsRef<str>,
 {
-    let mut out: Vec<(&str, &str)> = Vec::new();
+    let mut out = Vec::new();
     for signed_name in signed_headers {
         let signed_name = signed_name.as_ref();
         let mut found = false;
         headers.visit(|name, value| {
             if name == signed_name {
-                out.push((name, value));
+                out.push((name.to_string(), value.to_string()));
                 found = true;
             }
         });
         if !found {
-            return Err(AuthError::MissingSignedHeader {
-                header: signed_name.to_owned(),
-            });
+            out.push((signed_name.to_owned(), String::new()));
         }
     }
-    Ok(out)
+    out
 }
 
 pub(crate) fn validate_static_record_expiry(
@@ -1889,14 +1894,13 @@ mod tests {
     }
 
     #[test]
-    fn collect_signed_headers_optional_missing_is_rejected() {
+    fn collect_signed_headers_includes_missing_headers_with_empty_values() {
         let signed_headers = vec!["x-custom-header".to_string()];
         let headers = [("host", "example.com")];
-        let err = collect_signed_headers(&signed_headers, &headers).unwrap_err();
-        assert!(matches!(
-            err,
-            AuthError::MissingSignedHeader { header } if header == "x-custom-header"
-        ));
+        assert_eq!(
+            collect_signed_headers(&signed_headers, &headers),
+            [("x-custom-header".to_string(), String::new())]
+        );
     }
 
     // ── Streaming signing context ─────────────────────────────────────
@@ -2166,10 +2170,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            AuthError::MissingSignedHeader { header } if header == "host"
-        ));
+        assert!(matches!(err, AuthError::SignatureMismatch { .. }));
     }
 
     #[test]
@@ -2290,10 +2291,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            AuthError::MissingSignedHeader { header } if header == "x-amz-date"
-        ));
+        assert!(matches!(err, AuthError::SignatureMismatch { .. }));
     }
 
     #[test]
@@ -2313,10 +2311,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            AuthError::MissingSignedHeader { header } if header == "x-amz-content-sha256"
-        ));
+        assert!(matches!(err, AuthError::SignatureMismatch { .. }));
     }
 
     #[test]
@@ -2342,6 +2337,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::DuplicateAuthorizationHeader));
+    }
+
+    #[test]
+    fn authenticate_header_and_query_auth_rejected_before_parsing() {
+        let store = example_store();
+        let authorization = "not-even-valid-header-auth";
+        let headers = [("authorization", authorization), ("host", "example.com")];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            "X-Amz-Algorithm=not-even-valid-query-auth",
+            &headers,
+            b"",
+            &store,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            presigned_example_time(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::MultipleAuthMechanisms { authorization: value }
+                if value == authorization
+        ));
     }
 
     #[test]

@@ -36,22 +36,39 @@ integration tests:
 Header verification now matches those results. One selected signing timestamp
 drives skew validation, the seed signature, and chunk/trailer verification.
 
-### 2. Pin authentication ambiguity and parser grammar
+### 2. Pin authentication ambiguity and parser grammar — completed 2026-07-13
 
-- Test simultaneous header/presigned-query and header/POST-policy
-  authentication with an explicit precedence matrix:
-  - both mechanisms independently valid
-  - header valid and the other mechanism invalid
-  - header invalid and the other mechanism valid
-  - both valid under different principals, with only one principal authorized
-    for the requested operation
-- Use the different-principal cases to make the selected mechanism observable;
-  do not infer precedence from an otherwise ambiguous `200` or `403`.
-- Test duplicate and unknown Authorization attributes; empty, duplicate,
-  unsorted, and non-lowercase `SignedHeaders`; and duplicate presign auth query
-  parameters.
-- Record exact AWS status, error code, relevant error details, and effective
-  principal before changing parser acceptance or precedence.
+Live AWS established the following behavior, now pinned by matching local
+integration tests:
+
+- A request containing both an Authorization header and presigned-query auth
+  is rejected before either signature or principal is selected. All validity
+  and opposite-account principal combinations return `400 InvalidArgument`,
+  identify `Authorization`, echo its value, and report that only one auth
+  mechanism is allowed.
+- The proposed independently-valid header/POST-policy matrix cannot exist:
+  multipart POST Object does not accept SigV4 Authorization-header auth even
+  when it is the only authentication mechanism. A present
+  `x-amz-content-sha256` produces `400 InvalidArgument` with that argument name
+  and no argument value; an omitted header produces the existing missing-header
+  `InvalidRequest`. The mixed validity and opposite-account POST matrix reaches
+  the same payload-header rejection before POST-policy auth is selected.
+- Authorization attributes are strict. Unknown attributes or duplicate
+  `Credential`, `SignedHeaders`, or `Signature` attributes return
+  `400 AuthorizationHeaderMalformed` with the three-required-components
+  message. An empty `SignedHeaders` value has AWS's component-specific message.
+- Names inside header `SignedHeaders` are lowercased, sorted, and deduplicated
+  before canonicalization. Duplicate, unsorted, and non-lowercase variants of
+  an otherwise valid request all authenticate successfully.
+- Duplicate presign auth query parameters are accepted and the first value on
+  the wire is authoritative. Identical duplicates authenticate; a conflicting
+  second value is ignored; a conflicting first value controls parsing, expiry,
+  signed-header canonicalization, or signature verification as applicable.
+- Presigned canonicalization represents a listed but absent signed header with
+  an empty value and reaches signature verification. It does not fail early as
+  a missing signed header.
+- Presigned time-window rejection precedes the check that `X-Amz-Date` agrees
+  with the credential date scope.
 
 ### 3. Pin time and error precedence
 

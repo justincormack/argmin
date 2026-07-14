@@ -3528,6 +3528,14 @@ impl HttpFrontend {
             bucket,
             file_name.is_some()
         );
+        if req.header_count("authorization") == 1
+            && req
+                .header("authorization")
+                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256"))
+        {
+            Self::require_content_sha256_for_sigv4_header_auth(req)?;
+            return Err(ServerError::PostObjectHeaderAuthUnsupported);
+        }
         let header_auth = self.authenticate_with_payload_check(req, false, true)?;
 
         let field = |name: &str| -> Option<&str> {

@@ -364,6 +364,9 @@ pub enum ServerError {
     #[error("unsupported streaming token: {token}")]
     UnsupportedStreamingToken { token: String },
 
+    #[error("POST Object does not accept SigV4 Authorization header authentication")]
+    PostObjectHeaderAuthUnsupported,
+
     #[error("malformed trailer: {reason}")]
     MalformedTrailerError { reason: String },
 
@@ -463,9 +466,12 @@ impl ServerError {
             Self::VersionNotFound { .. } => "NoSuchVersion",
             Self::DeleteMarkerHit { .. } => "NoSuchKey",
             Self::Auth(auth::AuthError::MissingAuth) => "AccessDenied",
-            Self::Auth(auth::AuthError::MalformedAuth) | Self::WrongRegion { .. } => {
-                "AuthorizationHeaderMalformed"
-            }
+            Self::Auth(
+                auth::AuthError::MalformedAuth
+                | auth::AuthError::MalformedAuthComponents
+                | auth::AuthError::MalformedSignedHeaders,
+            )
+            | Self::WrongRegion { .. } => "AuthorizationHeaderMalformed",
             Self::Auth(
                 auth::AuthError::UnsupportedAuthType
                 | auth::AuthError::InvalidCredentialScope { .. }
@@ -474,6 +480,7 @@ impl ServerError {
             ) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
+            Self::Auth(auth::AuthError::MultipleAuthMechanisms { .. }) => "InvalidArgument",
             Self::Auth(auth::AuthError::SignatureMismatch { .. }) => "SignatureDoesNotMatch",
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
             Self::Auth(auth::AuthError::PresignedRequestExpired { .. }) => "AccessDenied",
@@ -568,6 +575,7 @@ impl ServerError {
             Self::IncompleteBody => "IncompleteBody",
             Self::MissingContentLength => "MissingContentLength",
             Self::UnsupportedStreamingToken { .. } => "InvalidArgument",
+            Self::PostObjectHeaderAuthUnsupported => "InvalidArgument",
             Self::MalformedTrailerError { .. } => "MalformedTrailerError",
             Self::XAmzContentSHA256Mismatch { .. } => "XAmzContentSHA256Mismatch",
             Self::NotImplemented { .. }
@@ -595,6 +603,8 @@ impl ServerError {
             Self::WrongRegion { .. }
             | Self::Auth(
                 auth::AuthError::MalformedAuth
+                | auth::AuthError::MalformedAuthComponents
+                | auth::AuthError::MalformedSignedHeaders
                 | auth::AuthError::UnsupportedAuthType
                 | auth::AuthError::InvalidCredentialScope { .. }
                 | auth::AuthError::InvalidCredentialScopeRegion { .. }
@@ -604,6 +614,7 @@ impl ServerError {
                 | auth::AuthError::InvalidQueryCredentialService { .. }
                 | auth::AuthError::MissingQueryParam { .. },
             ) => 400,
+            Self::Auth(auth::AuthError::MultipleAuthMechanisms { .. }) => 400,
             Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => 400,
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => 501,
             Self::Auth(_) => 403,
@@ -658,6 +669,7 @@ impl ServerError {
             | Self::MalformedTrailerError { .. } => 400,
             Self::MissingContentLength => 411,
             Self::UnsupportedStreamingToken { .. } => 400,
+            Self::PostObjectHeaderAuthUnsupported => 400,
             Self::AccessDenied
             | Self::ObjectLockProtectedAccessDenied
             | Self::PostPolicyAccessDenied { .. }
@@ -1055,6 +1067,15 @@ mod tests {
     fn s3_error_code_auth_duplicate_authorization() {
         let err = ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader);
         assert_eq!(err.s3_error_code(), "NotImplemented");
+    }
+
+    #[test]
+    fn auth_multiple_mechanisms_is_invalid_argument_400() {
+        let err = ServerError::Auth(auth::AuthError::MultipleAuthMechanisms {
+            authorization: "redacted".to_string(),
+        });
+        assert_eq!(err.s3_error_code(), "InvalidArgument");
+        assert_eq!(err.http_status(), 400);
     }
 
     #[test]

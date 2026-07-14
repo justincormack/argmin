@@ -7615,17 +7615,8 @@ Connection: close\r\n\r\n",
         let tmp = test_util::tempdir();
         let frontend = setup_frontend(tmp.path());
         create_test_bucket(&frontend, "mybucket");
-        let signed = sign_headers("POST", "/mybucket", "localhost", &[], &[]);
-        let req = make_s3req(
-            "POST",
-            "/mybucket",
-            &[
-                ("host", "localhost"),
-                ("authorization", &signed.authorization),
-                ("x-amz-date", &signed.amz_date),
-                ("x-amz-content-sha256", &signed.amz_content_sha256),
-            ],
-        );
+        let req = make_s3req("POST", "/mybucket", &[("host", "localhost")]);
+        let fields = sign_post_policy_fields("mybucket", "mykey", &[], &[]);
         let state = Arc::new(ServerState {
             pool: vec![Arc::clone(&frontend)],
             host_id: frontend.host_id.clone(),
@@ -7640,12 +7631,7 @@ Connection: close\r\n\r\n",
         let worker_frontend = Arc::clone(&frontend);
         let join = tokio::task::spawn_blocking(move || {
             let ctx = worker_frontend
-                .prepare_streaming_post_object(
-                    &req,
-                    "mybucket",
-                    &[("key".to_string(), "mykey".to_string())],
-                    Some("upload.txt"),
-                )
+                .prepare_streaming_post_object(&req, "mybucket", &fields, Some("upload.txt"))
                 .unwrap();
             let ctx = Arc::new(ctx);
             worker_guard.arm_post(&ctx);

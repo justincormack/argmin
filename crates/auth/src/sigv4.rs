@@ -56,22 +56,40 @@ pub fn parse_auth_header(value: &str) -> Result<SigV4Auth, AuthError> {
     let mut signed_headers_str = None;
     let mut signature_str = None;
 
-    for part in rest.split(',') {
+    let parts: Vec<&str> = rest.split(',').collect();
+    if parts.len() != 3 {
+        return Err(AuthError::MalformedAuthComponents);
+    }
+    for part in parts {
         let part = part.trim();
         if let Some(val) = part.strip_prefix("Credential=") {
+            if credential_str.is_some() {
+                return Err(AuthError::MalformedAuthComponents);
+            }
             credential_str = Some(val);
         } else if let Some(val) = part.strip_prefix("SignedHeaders=") {
+            if signed_headers_str.is_some() {
+                return Err(AuthError::MalformedAuthComponents);
+            }
             signed_headers_str = Some(val);
         } else if let Some(val) = part.strip_prefix("Signature=") {
+            if signature_str.is_some() {
+                return Err(AuthError::MalformedAuthComponents);
+            }
             signature_str = Some(val);
+        } else {
+            return Err(AuthError::MalformedAuthComponents);
         }
     }
 
-    let credential_str = credential_str.ok_or(AuthError::MalformedAuth)?;
-    let signed_headers_str = signed_headers_str.ok_or(AuthError::MalformedAuth)?;
-    let signature_str = signature_str.ok_or(AuthError::MalformedAuth)?;
+    let credential_str = credential_str.ok_or(AuthError::MalformedAuthComponents)?;
+    let signed_headers_str = signed_headers_str.ok_or(AuthError::MalformedAuthComponents)?;
+    let signature_str = signature_str.ok_or(AuthError::MalformedAuthComponents)?;
 
-    if signed_headers_str.is_empty() || signed_headers_str.len() > MAX_SIGNED_HEADERS_LEN {
+    if signed_headers_str.is_empty() {
+        return Err(AuthError::MalformedSignedHeaders);
+    }
+    if signed_headers_str.len() > MAX_SIGNED_HEADERS_LEN {
         return Err(AuthError::MalformedAuth);
     }
     if signature_str.len() != SIGNATURE_HEX_LEN || !is_lower_hex(signature_str) {
@@ -82,11 +100,14 @@ pub fn parse_auth_header(value: &str) -> Result<SigV4Auth, AuthError> {
         parse_credential_scope_ref(credential_str).ok_or(AuthError::MalformedAuth)?,
     );
 
-    let signed_headers: Vec<String> = signed_headers_str
+    let mut signed_headers: Vec<String> = signed_headers_str
         .split(';')
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(str::to_ascii_lowercase)
         .collect();
+
+    signed_headers.sort_unstable();
+    signed_headers.dedup();
 
     if signed_headers.is_empty() || signed_headers.len() > MAX_SIGNED_HEADER_COUNT {
         return Err(AuthError::MalformedAuth);
@@ -522,33 +543,44 @@ mod tests {
             "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert!(matches!(
             parse_auth_header(header),
-            Err(AuthError::MalformedAuth)
+            Err(AuthError::MalformedAuthComponents)
         ));
     }
 
     #[test]
     fn parse_auth_header_missing_signature() {
         let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, SignedHeaders=host";
-        let err = parse_auth_header(header).unwrap_err();
-        assert_eq!(err.to_string(), AuthError::MalformedAuth.to_string());
+        assert!(matches!(
+            parse_auth_header(header),
+            Err(AuthError::MalformedAuthComponents)
+        ));
     }
 
     #[test]
     fn parse_auth_header_empty_signed_headers() {
         let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, SignedHeaders=, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let err = parse_auth_header(header).unwrap_err();
-        assert_eq!(err.to_string(), AuthError::MalformedAuth.to_string());
+        assert!(matches!(
+            parse_auth_header(header),
+            Err(AuthError::MalformedSignedHeaders)
+        ));
     }
 
     #[test]
-    fn parse_auth_header_ignores_unknown_components() {
+    fn parse_auth_header_rejects_unknown_components() {
         let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, Foo=bar, SignedHeaders=host, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(matches!(
+            parse_auth_header(header),
+            Err(AuthError::MalformedAuthComponents)
+        ));
+    }
+
+    #[test]
+    fn parse_auth_header_normalizes_signed_header_names() {
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/20130524/us-east-1/s3/aws4_request, SignedHeaders=X-Amz-Date;host;Host;x-amz-content-sha256, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let auth = parse_auth_header(header).unwrap();
-        assert_eq!(auth.credential.access_key_id, "AKID");
-        assert_eq!(auth.signed_headers, vec!["host"]);
         assert_eq!(
-            auth.signature,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            auth.signed_headers,
+            vec!["host", "x-amz-content-sha256", "x-amz-date"]
         );
     }
 

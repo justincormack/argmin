@@ -696,6 +696,130 @@ fn test_put_no_content_type() {
 // ── Group 3: Authorization Header ───────────────────────────────────────
 
 #[test]
+fn test_authorization_attribute_and_signed_headers_grammar() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "authorization-grammar";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"authorization grammar"))
+            .send()
+            .await
+            .unwrap();
+
+        let path = format!("/{bucket}/{key}");
+        let signed = Signer::new("GET", &path).body_hash(&sha256_hex(b"")).sign();
+        let credential = signed
+            .authorization
+            .split_once("Credential=")
+            .and_then(|(_, rest)| rest.split_once(','))
+            .map(|(value, _)| value)
+            .unwrap();
+        let signed_headers = signed
+            .authorization
+            .split_once("SignedHeaders=")
+            .and_then(|(_, rest)| rest.split_once(','))
+            .map(|(value, _)| value)
+            .unwrap();
+        let signature = signed
+            .authorization
+            .split_once("Signature=")
+            .map(|(_, value)| value)
+            .unwrap();
+
+        let cases = vec![
+            (
+                "unknown attribute",
+                signed
+                    .authorization
+                    .replacen("AWS4-HMAC-SHA256 ", "AWS4-HMAC-SHA256 Foo=bar, ", 1),
+            ),
+            (
+                "duplicate Credential",
+                format!("{}, Credential={credential}", signed.authorization),
+            ),
+            (
+                "duplicate SignedHeaders attribute",
+                format!("{}, SignedHeaders={signed_headers}", signed.authorization),
+            ),
+            (
+                "duplicate Signature",
+                format!("{}, Signature={signature}", signed.authorization),
+            ),
+            (
+                "empty SignedHeaders",
+                signed.authorization.replace(signed_headers, ""),
+            ),
+            (
+                "duplicate signed header name",
+                signed
+                    .authorization
+                    .replace(signed_headers, "host;host;x-amz-content-sha256;x-amz-date"),
+            ),
+            (
+                "unsorted signed header names",
+                signed
+                    .authorization
+                    .replace(signed_headers, "x-amz-date;host;x-amz-content-sha256"),
+            ),
+            (
+                "non-lowercase signed header name",
+                signed
+                    .authorization
+                    .replace(signed_headers, "Host;x-amz-content-sha256;x-amz-date"),
+            ),
+        ];
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        for (case, authorization) in cases {
+            let mut response = agent()
+                .get(&url)
+                .header("Authorization", &authorization)
+                .header("x-amz-date", &signed.amz_date)
+                .header("x-amz-content-sha256", &signed.amz_content_sha256)
+                .call()
+                .expect("transport error");
+            let status = response.status().as_u16();
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            match case {
+                "unknown attribute"
+                | "duplicate Credential"
+                | "duplicate SignedHeaders attribute"
+                | "duplicate Signature" => {
+                    assert_eq!(status, 400, "{case}: expected 400, got {status}: {body}");
+                    assert_error_code(&body, "AuthorizationHeaderMalformed");
+                    assert!(
+                        body.contains(
+                            "<Message>The authorization header is malformed; the authorization header requires three components: Credential, SignedHeaders, and Signature.</Message>"
+                        ),
+                        "{case}: unexpected error message: {body}"
+                    );
+                }
+                "empty SignedHeaders" => {
+                    assert_eq!(status, 400, "{case}: expected 400, got {status}: {body}");
+                    assert_error_code(&body, "AuthorizationHeaderMalformed");
+                    assert!(
+                        body.contains(
+                            "<Message>The authorization header is malformed; the authorization component \" SignedHeaders=\" is malformed.</Message>"
+                        ),
+                        "{case}: unexpected error message: {body}"
+                    );
+                }
+                _ => {
+                    assert_eq!(status, 200, "{case}: expected 200, got {status}: {body}");
+                    assert_eq!(body, "authorization grammar", "{case}: wrong object body");
+                }
+            }
+        }
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_put_empty_authorization() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;

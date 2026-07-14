@@ -5,6 +5,10 @@ pub enum AuthError {
     MissingAuth,
     #[error("malformed Authorization header")]
     MalformedAuth,
+    #[error("Authorization header does not contain exactly the required components")]
+    MalformedAuthComponents,
+    #[error("Authorization SignedHeaders component is empty")]
+    MalformedSignedHeaders,
     #[error("unsupported Authorization type")]
     UnsupportedAuthType,
     #[error("missing query auth parameter: {param}")]
@@ -43,6 +47,8 @@ pub enum AuthError {
     UnknownAccessKey,
     #[error("duplicate Authorization header")]
     DuplicateAuthorizationHeader,
+    #[error("multiple authentication mechanisms supplied")]
+    MultipleAuthMechanisms { authorization: String },
     #[error("access denied")]
     AccessDenied,
     #[error("signature mismatch")]
@@ -86,6 +92,8 @@ impl std::fmt::Debug for AuthError {
         match self {
             Self::MissingAuth => f.write_str("MissingAuth"),
             Self::MalformedAuth => f.write_str("MalformedAuth"),
+            Self::MalformedAuthComponents => f.write_str("MalformedAuthComponents"),
+            Self::MalformedSignedHeaders => f.write_str("MalformedSignedHeaders"),
             Self::UnsupportedAuthType => f.write_str("UnsupportedAuthType"),
             Self::MissingQueryParam { param } => f
                 .debug_struct("MissingQueryParam")
@@ -159,6 +167,14 @@ impl std::fmt::Debug for AuthError {
                 .finish(),
             Self::UnknownAccessKey => f.write_str("UnknownAccessKey"),
             Self::DuplicateAuthorizationHeader => f.write_str("DuplicateAuthorizationHeader"),
+            Self::MultipleAuthMechanisms { authorization } => f
+                .debug_struct("MultipleAuthMechanisms")
+                .field(
+                    "authorization",
+                    &observability::redacted("authorization_header"),
+                )
+                .field("authorization_len", &authorization.len())
+                .finish(),
             Self::AccessDenied => f.write_str("AccessDenied"),
             Self::SignatureMismatch { .. } => f.write_str("SignatureMismatch"),
             Self::UnexpectedSecurityToken { .. } => f
@@ -208,6 +224,16 @@ mod tests {
         let display = err.to_string();
         assert_eq!(display, "unexpected security token");
         assert!(!display.contains("tok\nen"));
+    }
+
+    #[test]
+    fn multiple_auth_mechanisms_debug_redacts_authorization() {
+        let err = AuthError::MultipleAuthMechanisms {
+            authorization: "AWS4-HMAC-SHA256 secret-signature".to_string(),
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("<redacted:authorization_header>"));
+        assert!(!debug.contains("secret-signature"));
     }
 
     #[test]
