@@ -1,0 +1,273 @@
+Volatile Raft leases lost from durable failover fences
+Link: https://chatgpt.com/codex/cloud/security/findings/d32f4452801481919ee48f47cfb51321?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 1c7eda3
+Author: justin@specialbusservice.com
+Created: 13/07/2026, 20:31:11
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced. The new volatile Raft heartbeat overlay is not consistently promoted into durable fencing state for all commands that depend on the active primary lease. The patch handles metadata-transfer fences specially, but misses generic placement and availability transitions that also derive previous_primary_lease from the active primary.
+Heartbeat renewals can now be applied only to a Raft leader-local overlay when the committed lease horizon covers them. Later commands are pre-applied to that overlay and the overlay is rebased after the durable Raft command commits, but the command actually written to Raft is usually unchanged and is applied by followers/restarts against the durable snapshot. Only FencePgForMetadataTransfer is explicitly rewritten to carry the live source lease deadline. Other commands that move an Active PG into Peering, such as SetPgActingSet and MarkNodeAvailability/mark_pgs_peering_for_nodes, still capture previous_primary_lease from the durable snapshot's node.lease_deadline_ms. If the active primary's latest lease exists only in the volatile overlay, the durable command stores an older previous-primary deadline. A subsequent restart or leadership transfer drops the overlay, so peering completion can be allowed after the stale durable deadline instead of the longer lease actually granted to the old primary. Under failover/reconfiguration conditions this can authorize a successor primary while the old primary still believes it has a valid serving lease, risking split-brain writes and object metadata/data corruption.
+
+# Resolution
+Fixed by [`41d81e90`](https://github.com/justincormack/argmin/commit/41d81e90) (`Persist volatile Raft lease fences`).
+
+The Raft authority now detects heartbeat lease deadlines that have advanced only in the leader-local overlay and commits a `PromoteNodeHeartbeatLeases` entry before submitting a durable command that could consume those deadlines. Promotion copies the acknowledged deadlines into replicated state, so placement, availability, expiry, peering, and metadata-transfer commands derive previous-primary fences from the same lease deadlines acknowledged to storage nodes and frontends. Followers, leadership changes, and restart replay therefore retain the conservative fence instead of reverting to the older durable deadline.
+
+The promotion command is fail-closed and deterministic. It is bound to the current committed lease-horizon authority and Raft term, requires a nonempty strictly ordered node list, checks node identity and incarnation, rejects deadline regression and deadlines beyond the committed horizon, and updates only durable heartbeat lease deadlines. If promotion commits but the requested command later rejects, fails, or is interrupted by a crash or leadership change, retaining the longer deadline is conservative and prevents early successor activation. Command codec version 10 adds the replicated form with malformed and noncanonical decode coverage.
+
+Regression coverage verifies that a volatile renewal is promoted before an acting-set transition, the resulting previous-primary fence uses the acknowledged deadline, wrong-incarnation promotion rejects without mutation, rejected follow-up commands do not discard the promoted fence, and stale Raft authority terms reject deterministically while advancing the applied cursor. The complete workspace validation for the fix passed all 6,816 nextest tests, workspace clippy with `-D warnings`, formatting, and `git diff --check`.
+
+# Validation
+## Rubric
+- [x] Confirm volatile heartbeat can advance node lease only in leader-local overlay without durable Raft log progress.
+- [x] Confirm Raft submission rewrites only metadata-transfer fence commands and leaves generic placement/availability commands unchanged.
+- [x] Confirm `SetPgActingSet` computes and persists `previous_primary_lease` from the snapshot it is applied against, so durable replay uses stale `node.lease_deadline_ms`.
+- [x] Demonstrate a durable/restart replay snapshot stores an older previous-primary deadline than the live overlay for the same command.
+- [x] Demonstrate security impact: at a time after the stale durable fence but before the real volatile lease, successor activation succeeds in durable replay state while the live-overlay state still rejects it.
+## Report
+Validated the finding with a targeted Rust unit-test PoC plus an LLDB trace. Key code evidence: `apply_covered_volatile_heartbeat` accepts covered heartbeats into a volatile snapshot and restores `max_committed_timestamp_ms` without durable progress (`crates/storage/src/control_plane.rs:2044-2076`). In Raft submission, the overlay is used only for `bind_metadata_transfer_fence_command`; non-`FencePgForMetadataTransfer` commands are submitted unchanged to OpenRaft (`crates/storage/src/control_plane_raft.rs:3880-3902`). That binder explicitly returns unchanged for all non-metadata-transfer commands (`crates/storage/src/control_plane.rs:2079-2086`). `SetPgActingSet` derives `previous_primary_lease` from `active_primary_lease(self, record)` (`crates/storage/src/control_plane.rs:3452-3461`) and persists it (`crates/storage/src/control_plane.rs:3530-3534`); `active_primary_lease` reads `node.lease_deadline_ms` from the snapshot it is applied against (`crates/storage/src/control_plane.rs:16888-16901`).
+
+The PoC constructs a durable Active PG on node 1, then applies a covered heartbeat only to a volatile overlay extending node 1's lease from 2103ms to 7104ms. It then emulates the Raft submission path for generic `SetPgActingSet`: `bind_metadata_transfer_fence_command` returns the command unchanged, so applying it to the durable snapshot records `previous_primary_lease_deadline_ms=2103`, while applying the same command to the live overlay would record 7104. Command output: `durable_node_deadline=2103 live_node_deadline=7104 durable_previous_deadline=Some(2103) live_previous_deadline=Some(7104)`. Finally, at 3103ms, the durable/restart state accepts successor node 2 activation, while the live-overlay-equivalent state rejects with `PgPreviousPrimaryLeaseStillActive ... lease_deadline_ms: 7104`: `complete_at_ms=3103 durable_completion_ok=true live_completion_error=PgPreviousPrimaryLeaseStillActive { ... lease_deadline_ms: 7104 }`.
+
+Reproduction command: `cargo test -p storage poc_raft_set_pg_acting_set_volatile_lease_not_promoted_allows_early_successor -- --nocapture` passed and printed the above divergent durable-vs-live behavior. I also ran LLDB non-interactively; it stopped at the PoC's durable `apply_control_plane_command(submitted.clone())` call and continued to the same successful test output, confirming the replay path under debugger. A crash/ASan finding is not expected because this is a logical stale-durable-state bug, not a memory-corruption bug. Valgrind was attempted but is not installed in the container.
+
+# Evidence
+crates/storage/src/control_plane_raft.rs (L3880 to 3903)
+  Note: The overlay is only used to precompute/rebase live state; except for metadata-transfer fences, the command submitted to Raft is not rewritten to carry volatile lease deadlines, so durable followers apply it against stale durable state.
+```
+        command = overlay_snapshot
+            .as_ref()
+            .map_or(&durable_snapshot, |(_, snapshot)| snapshot)
+            .bind_metadata_transfer_fence_command(&durable_snapshot, command)?;
+        let overlay_rebase = overlay_snapshot
+            .map(|(authority_term, snapshot)| {
+                let durable_would_apply = durable_snapshot
+                    .apply_control_plane_command(command.clone())
+                    .is_ok();
+                let applied_snapshot = snapshot
+                    .apply_control_plane_command(command.clone())
+                    .map(|applied| applied.into_snapshot());
+                if durable_would_apply && applied_snapshot.is_err() {
+                    return Err(ControlPlaneError::SnapshotInvariantViolation {
+                        context: "volatile heartbeat overlay command rebase",
+                        message: "command applies to committed state but rejects against acknowledged live heartbeat state".to_string(),
+                    });
+                }
+                Ok((authority_term, snapshot, applied_snapshot.ok()))
+            })
+            .transpose()?;
+
+        let submitted = submit_control_plane_command_via_openraft(&self.raft, command).await?;
+        if let Some((authority_term, previous_snapshot, applied_snapshot)) = overlay_rebase {
+```
+
+crates/storage/src/control_plane.rs (L16888 to 16901)
+  Note: active_primary_lease derives the fence deadline directly from the snapshot's node.lease_deadline_ms, which is stale in durable snapshots after volatile renewals.
+```
+fn active_primary_lease(
+    snapshot: &ClusterControlSnapshot,
+    record: &PgControlRecord,
+) -> Option<PreviousPrimaryLease> {
+    let node_id = (record.state == PgState::Active)
+        .then_some(record.active_primary)
+        .flatten()?;
+    let node = snapshot.node(node_id)?;
+    Some(PreviousPrimaryLease {
+        node_id,
+        node_incarnation: node.node_incarnation(),
+        endpoint: node.endpoint().to_owned(),
+        lease_deadline_ms: node.lease_deadline_ms()?,
+        prefer_reactivation: true,
+```
+
+crates/storage/src/control_plane.rs (L16934 to 16957)
+  Note: Availability-driven peering transitions have the same stale-deadline problem: they preserve previous_primary_lease from the previous durable snapshot rather than binding any live overlay lease.
+```
+            let previous_primary_lease = previous
+                .pg(record.pg_id)
+                .and_then(|previous_record| active_primary_lease(previous, previous_record))
+                .or_else(|| record.previous_primary_lease.clone());
+            let peering_metadata_proof_floor_epoch = if record.state == PgState::Active {
+                record.active_metadata_proof_epoch
+            } else {
+                None
+            };
+            let peering_metadata_proof_floor_imported =
+                record.state == PgState::Active && record.active_metadata_transfer_imported;
+            record.peering_metadata_proof_floor = if record.state == PgState::Active {
+                record.active_metadata_proof
+            } else {
+                None
+            };
+            record.peering_metadata_proof_floor_epoch = peering_metadata_proof_floor_epoch;
+            record.peering_metadata_proof_floor_imported = peering_metadata_proof_floor_imported;
+            record.state = PgState::Peering;
+            record.active_primary = None;
+            record.active_metadata_proof = None;
+            record.active_metadata_proof_epoch = None;
+            record.active_metadata_transfer_imported = false;
+            record.previous_primary_lease = previous_primary_lease;
+```
+
+crates/storage/src/control_plane.rs (L2057 to 2075)
+  Note: Covered heartbeats are accepted into a volatile snapshot without durable Raft log progress, making node lease_deadline_ms newer in memory than in the durable state machine.
+```
+        let Some(authority) = *lease_horizon_authority else {
+            return Ok(None);
+        };
+        if !self.lease_grant_horizon_covers(authority, *lease_deadline_ms) {
+            return Ok(None);
+        }
+
+        let node_id = heartbeat.node_id;
+        let applied = self.apply_control_plane_command(command)?;
+        if !self.heartbeat_update_is_volatile(applied.snapshot(), node_id) {
+            return Ok(None);
+        }
+
+        let mut next_snapshot = applied.into_snapshot();
+        next_snapshot.max_committed_timestamp_ms = self.max_committed_timestamp_ms;
+        validate_control_plane_snapshot(
+            "attempted to publish invalid volatile heartbeat state",
+            &next_snapshot,
+        )?;
+```
+
+crates/storage/src/control_plane.rs (L2082 to 2140)
+  Note: Only FencePgForMetadataTransfer is bound to the live overlay lease deadline before commit, demonstrating the needed durable promotion but leaving other primary-fencing commands uncovered.
+```
+        command: ControlPlaneCommand,
+    ) -> Result<ControlPlaneCommand, ControlPlaneError> {
+        let ControlPlaneCommand::FencePgForMetadataTransfer { pg_id, .. } = command else {
+            return Ok(command);
+        };
+        let fence_command = || ControlPlaneCommand::FencePgForMetadataTransfer {
+            pg_id,
+            source_primary_lease_deadline_ms: None,
+            lease_horizon_authority: None,
+        };
+        let source_deadline = |snapshot: &Self| -> Result<Option<u64>, ControlPlaneError> {
+            let applied = snapshot.apply_control_plane_command(fence_command())?;
+            let ControlPlaneCommandResponse::FencePgForMetadataTransfer {
+                source_primary_lease_deadline_ms,
+            } = applied.response()
+            else {
+                unreachable!("metadata transfer fence command returned the wrong response");
+            };
+            Ok(*source_primary_lease_deadline_ms)
+        };
+        let live_source_deadline_ms = source_deadline(self)?;
+        let durable_source_deadline_ms = source_deadline(durable_snapshot)?;
+        if live_source_deadline_ms == durable_source_deadline_ms {
+            return Ok(fence_command());
+        }
+        let (Some(live_source_deadline_ms), Some(durable_source_deadline_ms)) =
+            (live_source_deadline_ms, durable_source_deadline_ms)
+        else {
+            return Err(ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata transfer fence volatile lease binding",
+                message: format!(
+                    "live source lease deadline {live_source_deadline_ms:?} is incompatible with durable deadline {durable_source_deadline_ms:?} for PG {}",
+                    pg_id.get()
+                ),
+            });
+        };
+        if live_source_deadline_ms < durable_source_deadline_ms {
+            return Err(ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata transfer fence volatile lease binding",
+                message: format!(
+                    "live source lease deadline {live_source_deadline_ms} regresses durable deadline {durable_source_deadline_ms} for PG {}",
+                    pg_id.get()
+                ),
+            });
+        }
+        let lease_horizon_authority = self.lease_grant_horizon_authority().ok_or_else(|| {
+            ControlPlaneError::SnapshotInvariantViolation {
+                context: "metadata transfer fence volatile lease binding",
+                message: format!(
+                    "live source lease deadline {live_source_deadline_ms} has no lease-horizon authority for PG {}",
+                    pg_id.get()
+                ),
+            }
+        })?;
+        Ok(ControlPlaneCommand::FencePgForMetadataTransfer {
+            pg_id,
+            source_primary_lease_deadline_ms: Some(live_source_deadline_ms),
+            lease_horizon_authority: Some(lease_horizon_authority),
+        })
+```
+
+crates/storage/src/control_plane.rs (L3452 to 3461)
+  Note: SetPgActingSet captures previous_primary_lease from self; in the committed Raft state machine self is the durable snapshot, so this records a stale primary deadline when the real renewal is only in the overlay.
+```
+            ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => {
+                validate_acting_set(self, pg_id, &acting_set)?;
+                let mut next_snapshot = self.clone();
+                let mut changed = false;
+                match next_snapshot.pgs.get_mut(&pg_id) {
+                    Some(record) if record.acting_set == acting_set => {}
+                    Some(record) => {
+                        let previous_primary_lease = active_primary_lease(self, record)
+                            .or_else(|| record.previous_primary_lease.clone())
+                            .map(PreviousPrimaryLease::without_reactivation_preference);
+```
+
+crates/storage/src/control_plane.rs (L3534 to 3534)
+  Note: The possibly stale previous_primary_lease is persisted into the PG's Peering state and later controls successor activation after restart or leadership change.
+```
+                        record.previous_primary_lease = previous_primary_lease;
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from high to medium. The code evidence and executable PoC support that the stale-lease bug is real and can break Raft fencing safety, with high data integrity/availability impact. But the attack path is constrained to experimental Raft control-plane deployments, off by default, on internal Unix/Raft peer sockets with credential controls for multi-node mode, and requires failover/reconfiguration plus timing. There is no clear public unauthenticated or straightforward S3-only path that a professional triage would normally accept as high severity.
+## Likelihood
+low - Exploitation is not directly exposed through unauthenticated public HTTP. It requires experimental Raft mode, internal control-plane/failover timing, volatile lease state newer than durable state, and a restart or leadership transfer. These are plausible but narrow operational conditions.
+## Impact
+high - If the preconditions occur, stale durable fencing can permit overlapping primaries, leading to object metadata/data corruption and availability loss. This is a serious integrity/availability impact for storage data.
+## Assumptions
+- The vulnerable path matters only when the experimental Raft control-plane mode is enabled and a multi-node or failover-capable deployment is used.
+- A realistic attacker is either an authenticated/internal storage-control actor able to participate in heartbeat/failover timing, or an authenticated S3 client able to issue writes during a naturally occurring failover/reconfiguration window.
+- No repository deployment manifest was found proving that this experimental Raft mode is publicly enabled by default.
+- ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT enabled
+- active PG primary has a lease renewal present only in the volatile heartbeat overlay
+- a generic Active-to-Peering transition such as SetPgActingSet or MarkNodeAvailability occurs
+- restart or Raft leadership transfer drops/rebases the volatile overlay before the true live lease is represented durably
+- writes or activation occur in the stale-deadline overlap window
+## Path
+internal heartbeat/admin event -> volatile lease overlay -> generic Raft PG transition -> stale durable previous_primary_lease -> restart/leader transfer -> early successor primary -> split-brain S3 writes/data corruption
+## Path evidence
+- `crates/storage/src/control_plane.rs:2044-2076` - Covered RecordNodeHeartbeat commands can be applied to a volatile snapshot and preserve max_committed_timestamp_ms, creating live lease state newer than durable Raft state.
+- `crates/storage/src/control_plane.rs:2079-2086` - Only FencePgForMetadataTransfer is specially bound; all other commands immediately return unchanged.
+- `crates/storage/src/control_plane_raft.rs:3880-3902` - The overlay is used to precompute/rebase, but the command submitted to OpenRaft is the command after only metadata-transfer binding.
+- `crates/storage/src/control_plane.rs:3452-3461` - SetPgActingSet captures previous_primary_lease from active_primary_lease(self, record), which is stale when self is durable replay state.
+- `crates/storage/src/control_plane.rs:3528-3535` - The previous_primary_lease value is persisted into the PG's Peering state.
+- `crates/storage/src/control_plane.rs:16888-16901` - active_primary_lease reads node.lease_deadline_ms from the supplied snapshot, so durable snapshots produce stale deadlines after volatile renewal.
+- `crates/storage/src/control_plane.rs:16934-16957` - Availability-driven peering transitions also derive previous_primary_lease from the previous snapshot, sharing the same stale-deadline failure mode.
+- `crates/argmin-s3/src/config.rs:527-544` - Experimental Raft control plane is disabled by default and enabled only via ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT.
+- `crates/argmin-s3/src/config.rs:758-763` - Multi-node experimental Raft peer configuration requires Raft auth credentials, limiting exposure to internal authenticated peers.
+- `crates/argmin-s3/src/main.rs:2765-2807` - Raft peer frames are optionally decoded through an auth envelope and verified when auth policy is configured.
+- `crates/argmin-s3/src/main.rs:5162-5178` - The public S3 frontend binds to ARGMIN_LISTEN_ADDR, defaulting in config to 127.0.0.1:9000; the vulnerable control-plane path is separate from direct HTTP request parsing.
+## Narrative
+The finding is a real control-plane safety bug. Code accepts covered heartbeats into a volatile snapshot without durable progress, but the Raft submission path only rewrites FencePgForMetadataTransfer; generic PG transition commands are submitted unchanged. SetPgActingSet and availability-driven peering derive previous_primary_lease from the snapshot they are applied against, so durable replay can store an older node.lease_deadline_ms than the live overlay. The earlier executable PoC demonstrated durable_previous_deadline=2103 vs live_previous_deadline=7104 and durable successor completion at 3103ms while the live-equivalent state correctly rejected activation until 7104ms. However, exploitability is constrained: this is experimental Raft control-plane code, off by default, using internal Unix sockets and authenticated peer/control-plane credentials in multi-node setups. It is therefore a credible integrity/availability issue, but the assigned high severity should be reduced because there is no direct public unauthenticated attack path and exploitation requires failover/reconfiguration timing.
+## Controls
+- SigV4 authentication on S3 frontend
+- default listen address 127.0.0.1:9000
+- Unix-domain control-plane and Raft peer sockets
+- ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT feature/config gate
+- Raft peer auth credentials required for multi-node peer socket configuration
+- connection and in-flight request admission controls
+- root process rejection
+## Blindspots
+- Static review only; no live multi-node cluster or end-to-end S3 write corruption test was run in this stage.
+- No Kubernetes, Terraform, Docker Compose, or load-balancer manifests were found to prove actual public exposure or production enablement.
+- The validation PoC demonstrates the state-machine and durable-vs-live divergence, but not a complete external attacker workflow.
+- Operational deployment practices for the experimental Raft flag and Unix socket permissions are unknown.
