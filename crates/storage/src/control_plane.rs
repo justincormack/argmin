@@ -23585,6 +23585,9 @@ mod tests {
 
     #[test]
     fn unix_control_plane_heartbeat_retry_observes_completed_peering_after_lost_response() {
+        const TEST_HEARTBEAT_LEASE_MS: u64 = 3_000;
+        const TEST_RETRY_SERVER_DELAY: Duration = Duration::from_millis(200);
+
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -23599,6 +23602,7 @@ mod tests {
         let peering_epoch = authority.snapshot().cluster_epoch();
         let expected_active_epoch = ClusterEpoch::new(peering_epoch.get() + 1).unwrap();
         let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
+        peering_heartbeat.requested_lease_duration_ms = TEST_HEARTBEAT_LEASE_MS;
         peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(22),
             state: PgState::Peering,
@@ -23623,6 +23627,7 @@ mod tests {
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
             assert_eq!(request.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            std::thread::sleep(TEST_RETRY_SERVER_DELAY);
             respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_050)
                 .unwrap();
             assert_eq!(
@@ -23636,7 +23641,7 @@ mod tests {
         let refresh = client.refresh_node_heartbeat(peering_heartbeat, 0).unwrap();
 
         server.join().unwrap();
-        assert_eq!(refresh.lease().lease_deadline_ms(), 2_150);
+        assert_eq!(refresh.lease().lease_deadline_ms(), 5_050);
         assert_eq!(refresh.runtime_map().cluster_epoch(), expected_active_epoch);
         let route = refresh
             .runtime_map()
