@@ -381,8 +381,16 @@ admission controls plus strict encoded-token and decoded-payload limits.
 
 ### 5. Add token-aware authentication once, shared by every SigV4 mode
 
-Credential validation should have one common decision path used by header,
-presigned, POST Object, and streaming authentication:
+The STS route performs its AWS-pinned credential-scope validation before
+entering the shared temporary-credential path: simultaneous region and service
+errors are aggregated in that order, and either individual error precedes STS
+token resolution and HMAC comparison. This placement is STS-specific. Do not
+reuse it to order scope validation against temporary-credential checks in S3
+header, presigned, POST Object, or streaming authentication until each mode's
+collisions are independently pinned.
+
+Credential validation should have one common decision path used by STS and S3
+header, presigned, POST Object, and streaming authentication:
 
 1. extract the access key ID, every mode-relevant session-token input, and the
    signature coverage of each input without logging any of them
@@ -797,9 +805,9 @@ The initial Query-protocol slice completed on 2026-07-13:
   `text/xml` response type, and request-ID agreement
 
 Before Phase 0 can satisfy the first-milestone exit condition, it still needs
-to pin expiry-versus-issuer-deletion and region/service precedence,
-permission-policy mutation behavior, and the temporary access-key/token
-envelope decisions.
+to pin expiry-versus-issuer-deletion precedence, the remaining S3
+temporary-credential region/service collisions, permission-policy mutation
+behavior, and the temporary access-key/token envelope decisions.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
 remain unsupported compatibility gaps and must never be silently ignored.
@@ -1168,6 +1176,30 @@ session authentication or resource-authorization input. Stable issuer-role
 liveness remains an authentication requirement as pinned by role deletion;
 current role permission-policy mutation behavior remains a separate open
 question.
+
+The STS signing-scope slice completed on 2026-07-14. The existing configured
+regional endpoint success is its positive control. Complete STS response
+goldens establish that:
+
+- signing that endpoint for another valid region returns HTTP 403
+  `SignatureDoesNotMatch` with exactly `Credential should be scoped to a valid
+  region. `, including its trailing space
+- signing with service `s3` returns the same code with exactly `Credential
+  should be scoped to correct service: 'sts'. `; when both region and service
+  are wrong, AWS concatenates the two messages in region-then-service order
+- the global `https://sts.amazonaws.com` endpoint accepts a request scoped to
+  `us-east-1`, while a `us-west-2` scope receives the same wrong-region golden
+- wrong-region and wrong-service scope errors each precede session-token
+  presence and binding, stable issuer-role liveness, and HMAC comparison. A
+  live session with a valid, missing, or independently valid mismatched token,
+  and a deleted-role session with those same token shapes, all receive the
+  scope error; a valid token combined with a bad secret does too
+
+On the STS route, credential-scope parsing must therefore occur before
+temporary-credential resolution. Only a correctly region- and service-scoped
+STS request proceeds to token opening, token/access-key binding, expiry and
+issuer-liveness checks, and signature comparison. No ordering relative to
+scope validation is inferred here for any S3 authentication mode.
 
 The S3 SigV4 header-authentication slice completed on 2026-07-13 using the
 permissionless recreated-role session as its positive authentication control.

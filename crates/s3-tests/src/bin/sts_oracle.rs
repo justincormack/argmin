@@ -24,6 +24,13 @@ use s3_tests::{
 const QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 const STS_XMLNS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
 const AWS_FAULT_XMLNS: &str = "http://webservices.amazon.com/AWSFault/2005-15-09";
+const STS_WRONG_REGION_SCOPE_MESSAGE: &str = "Credential should be scoped to a valid region. ";
+const STS_WRONG_SERVICE_SCOPE_MESSAGE: &str =
+    "Credential should be scoped to correct service: 'sts'. ";
+const STS_WRONG_REGION_AND_SERVICE_SCOPE_MESSAGE: &str = concat!(
+    "Credential should be scoped to a valid region. ",
+    "Credential should be scoped to correct service: 'sts'. "
+);
 
 #[derive(Clone, Copy)]
 enum Expected<'a> {
@@ -69,6 +76,16 @@ impl QueryRequest<'_> {
         credentials: SignedRequestCredentials<'_>,
         security_token: Option<&str>,
     ) -> RawResponse {
+        self.send_with_scope(endpoint, credentials, security_token, "sts")
+    }
+
+    fn send_with_scope(
+        self,
+        endpoint: &str,
+        credentials: SignedRequestCredentials<'_>,
+        security_token: Option<&str>,
+        service: &str,
+    ) -> RawResponse {
         match self {
             Self::Get(query) => {
                 let headers = security_token
@@ -79,7 +96,7 @@ impl QueryRequest<'_> {
                     &format!("{endpoint}/?{query}"),
                     b"",
                     headers,
-                    "sts",
+                    service,
                     credentials,
                 )
             }
@@ -96,7 +113,7 @@ impl QueryRequest<'_> {
                     &format!("{endpoint}/"),
                     body.as_bytes(),
                     headers,
-                    "sts",
+                    service,
                     credentials,
                 )
             }
@@ -234,6 +251,99 @@ fn send_get_caller_identity(
         content_type: Some(QUERY_CONTENT_TYPE),
     }
     .send_with_security_token(endpoint, credentials, security_token)
+}
+
+fn send_get_caller_identity_with_scope(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: Option<&str>,
+    service: &str,
+) -> RawResponse {
+    QueryRequest::Post {
+        body: "Action=GetCallerIdentity&Version=2011-06-15",
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send_with_scope(endpoint, credentials, security_token, service)
+}
+
+fn assert_signing_scope_error(label: &str, response: &RawResponse, message: &str) {
+    assert_error_probe(
+        label,
+        response,
+        403,
+        STS_XMLNS,
+        "SignatureDoesNotMatch",
+        Some(message),
+    );
+    println!("{label}: ok");
+}
+
+fn run_signing_scope_probes(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    account_id: &str,
+) {
+    let wrong_region = if credentials.region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    };
+    let wrong_region_credentials = SignedRequestCredentials {
+        region: wrong_region,
+        ..credentials
+    };
+    let regional_wrong_region =
+        send_get_caller_identity_with_scope(endpoint, wrong_region_credentials, None, "sts");
+    assert_signing_scope_error(
+        "scope-regional-wrong-region",
+        &regional_wrong_region,
+        STS_WRONG_REGION_SCOPE_MESSAGE,
+    );
+
+    let regional_wrong_service =
+        send_get_caller_identity_with_scope(endpoint, credentials, None, "s3");
+    assert_signing_scope_error(
+        "scope-regional-wrong-service",
+        &regional_wrong_service,
+        STS_WRONG_SERVICE_SCOPE_MESSAGE,
+    );
+
+    let regional_wrong_region_and_service =
+        send_get_caller_identity_with_scope(endpoint, wrong_region_credentials, None, "s3");
+    assert_signing_scope_error(
+        "scope-regional-wrong-region-and-service",
+        &regional_wrong_region_and_service,
+        STS_WRONG_REGION_AND_SERVICE_SCOPE_MESSAGE,
+    );
+
+    let global_credentials = SignedRequestCredentials {
+        region: "us-east-1",
+        ..credentials
+    };
+    let global_success = send_get_caller_identity_with_scope(
+        "https://sts.amazonaws.com",
+        global_credentials,
+        None,
+        "sts",
+    );
+    assert_get_caller_identity_success("scope-global-us-east-1", &global_success, account_id);
+    println!("scope-global-us-east-1: ok");
+
+    let global_wrong_credentials = SignedRequestCredentials {
+        region: "us-west-2",
+        ..credentials
+    };
+    let global_wrong_region = send_get_caller_identity_with_scope(
+        "https://sts.amazonaws.com",
+        global_wrong_credentials,
+        None,
+        "sts",
+    );
+    assert_signing_scope_error(
+        "scope-global-wrong-region",
+        &global_wrong_region,
+        STS_WRONG_REGION_SCOPE_MESSAGE,
+    );
 }
 
 fn spaced_hex(value: &str) -> String {
@@ -4418,6 +4528,98 @@ fn run_session_authentication_probes(
     println!("session-auth-old-session-after-role-recreation-valid: ok");
 
     let wrong_secret = "0".repeat(40);
+    let wrong_region = if fixture.active_credentials.region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    };
+    for (role_state, credentials, security_token, other_security_token) in [
+        (
+            "live-role",
+            fixture.active_credentials,
+            fixture.active_security_token,
+            fixture.other_live_security_token,
+        ),
+        (
+            "old-session",
+            fixture.old_credentials,
+            fixture.old_security_token,
+            fixture.active_security_token,
+        ),
+    ] {
+        let wrong_region_credentials = SignedRequestCredentials {
+            region: wrong_region,
+            ..credentials
+        };
+        let wrong_region_bad_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..wrong_region_credentials
+        };
+        let wrong_service_bad_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..credentials
+        };
+        for (case, signing_credentials, supplied_token, service) in [
+            (
+                "valid-token-wrong-region",
+                wrong_region_credentials,
+                Some(security_token),
+                "sts",
+            ),
+            (
+                "missing-token-wrong-region",
+                wrong_region_credentials,
+                None,
+                "sts",
+            ),
+            (
+                "mismatched-token-wrong-region",
+                wrong_region_credentials,
+                Some(other_security_token),
+                "sts",
+            ),
+            (
+                "valid-token-wrong-region-bad-signature",
+                wrong_region_bad_signature_credentials,
+                Some(security_token),
+                "sts",
+            ),
+            (
+                "valid-token-wrong-service",
+                credentials,
+                Some(security_token),
+                "s3",
+            ),
+            ("missing-token-wrong-service", credentials, None, "s3"),
+            (
+                "mismatched-token-wrong-service",
+                credentials,
+                Some(other_security_token),
+                "s3",
+            ),
+            (
+                "valid-token-wrong-service-bad-signature",
+                wrong_service_bad_signature_credentials,
+                Some(security_token),
+                "s3",
+            ),
+        ] {
+            let label = format!("scope-{role_state}-{case}");
+            let response = send_get_caller_identity_with_scope(
+                endpoint,
+                signing_credentials,
+                supplied_token,
+                service,
+            );
+            let message = if service == "sts" {
+                STS_WRONG_REGION_SCOPE_MESSAGE
+            } else {
+                STS_WRONG_SERVICE_SCOPE_MESSAGE
+            };
+            assert_signing_scope_error(&label, &response, message);
+        }
+    }
+
     for (
         role_state,
         credentials,
@@ -4719,6 +4921,7 @@ fn main() {
         assert_probe(&probe, &response, &account_id);
         println!("{}: ok", probe.label);
     }
+    run_signing_scope_probes(&endpoint, credentials, &account_id);
 
     if let Ok(role_arn) = env::var("S3_TEST_STS_ROLE_ARN") {
         let caller_arn = required_env("S3_TEST_STS_PRIMARY_ARN");
