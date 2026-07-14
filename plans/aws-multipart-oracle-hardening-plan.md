@@ -37,8 +37,12 @@ For each matrix:
   stored no parts.
 - [x] Pin CompleteMultipartUpload ordering across active/nonexistent upload IDs,
   well-formed/malformed XML, and primary/alternate principals.
-- [ ] Cover missing, empty, duplicate, percent-encoded, and wrong-key upload IDs
-  across the four operations, including exact error fields and precedence.
+- [x] Cover missing/empty, duplicate, percent-encoded, and wrong-key upload IDs
+  across UploadPart, CompleteMultipartUpload, ListParts, and
+  AbortMultipartUpload, including exact error fields, first-value precedence,
+  key binding, and final upload/part/object state. An absent `uploadId` only
+  identifies UploadPart when `partNumber` is present; absent IDs on POST, GET,
+  and DELETE select the corresponding non-multipart object operation.
 
 ### 2. Completion validation and atomic publication
 

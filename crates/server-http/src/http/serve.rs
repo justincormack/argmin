@@ -6744,8 +6744,7 @@ Connection: close\r\n\r\n",
         );
         assert!(matches!(
             is_streaming_write(&parts),
-            Err(ServerError::InvalidRequest { reason })
-                if reason == "missing uploadId query parameter"
+            Err(ServerError::UploadPartMissingUploadId)
         ));
     }
 

@@ -2918,13 +2918,41 @@ impl HttpFrontend {
                     req,
                     ManagedEncryptionReadHeaderContext::Multipart,
                 )?;
-                let upload_id =
-                    parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
-                let upload_id_text = upload_id.as_str().to_string();
                 let wire_ids = WireResponseIds::new(
                     current_trace_context().request_id(),
                     self.host_id.clone(),
                 );
+                let upload_id =
+                    match parse_required_upload_id(req.query_param_lossy("uploadId").as_deref()) {
+                        Ok(upload_id) => upload_id,
+                        Err(ServerError::NoSuchUpload { upload_id }) => {
+                            return Ok(S3Response::complete_multipart_no_such_upload(
+                                &upload_id, &wire_ids,
+                            ));
+                        }
+                        Err(err) => return Err(err),
+                    };
+                let upload_id_text = upload_id.as_str().to_string();
+                let requester = self.requester_from_auth(auth, req);
+                let upload_request = multipart_object_request(
+                    &bucket,
+                    &key,
+                    upload_id,
+                    requester,
+                    expected_bucket_owner,
+                )?;
+                match self
+                    .coordinator
+                    .validate_complete_multipart_upload_target(&upload_request)
+                {
+                    Ok(()) => {}
+                    Err(ServerError::NoSuchUpload { upload_id }) => {
+                        return Ok(S3Response::complete_multipart_no_such_upload(
+                            &upload_id, &wire_ids,
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                }
                 let parts = match xml::parse_complete_multipart_upload_xml(&req.body) {
                     Ok(parts) => parts,
                     Err(ServerError::MalformedXML { .. }) => {
@@ -2948,16 +2976,9 @@ impl HttpFrontend {
                     })
                     .transpose()?;
                 let sse_customer = parse_sse_customer_request(req)?;
-                let requester = self.requester_from_auth(auth, req);
                 let result = match self.coordinator.complete_multipart_upload(
                     &crate::coordinator::CompleteMultipartUploadRequest {
-                        upload: multipart_object_request(
-                            &bucket,
-                            &key,
-                            upload_id,
-                            requester,
-                            expected_bucket_owner,
-                        )?,
+                        upload: upload_request,
                         parts: &parts,
                         claimed_checksum: claimed_checksum.as_ref(),
                         expected_object_size,
@@ -9037,19 +9058,25 @@ mod tests {
     // ── UploadPart validation ────────────────────────────────────────
 
     #[test]
-    fn upload_part_missing_upload_id() {
+    fn upload_part_copy_missing_upload_id() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
 
-        let req = make_req("partNumber=1");
+        let req = new_req(
+            http::Method::PUT,
+            "/mybucket/mykey",
+            "partNumber=1",
+            vec![("x-amz-copy-source".to_string(), "/src/key".to_string())],
+            vec![],
+        );
         let op = S3Operation::UploadPart {
             bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Err(ServerError::UploadPartCopyMissingUploadId) => {}
+            Err(e) => panic!("expected UploadPartCopyMissingUploadId, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -10214,13 +10241,17 @@ mod tests {
             bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::NoSuchUpload { upload_id }) => {
-                assert_eq!(upload_id, invalid_upload_id);
-            }
-            Err(e) => panic!("expected NoSuchUpload, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 404);
+        let body = String::from_utf8(response_body(resp)).unwrap();
+        assert!(
+            body.starts_with("<Error><Code>NoSuchUpload</Code>"),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!("<UploadId>{invalid_upload_id}</UploadId>")),
+            "{body}"
+        );
     }
 
     #[test]

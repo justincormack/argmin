@@ -413,27 +413,31 @@ pub(crate) fn parse_part_number(value: &str) -> Result<u32, ServerError> {
 }
 
 pub(crate) fn parse_upload_part_query(query_string: &str) -> Result<(String, u32), ServerError> {
-    parse_upload_part_query_with(query_string, |value| ServerError::InvalidUploadPartNumber {
-        value,
-    })
+    parse_upload_part_query_with(
+        query_string,
+        ServerError::UploadPartMissingUploadId,
+        |value| ServerError::InvalidUploadPartNumber { value },
+    )
 }
 
 pub(crate) fn parse_upload_part_copy_query(
     query_string: &str,
 ) -> Result<(String, u32), ServerError> {
-    parse_upload_part_query_with(query_string, |value| {
-        ServerError::InvalidUploadPartCopyNumber { value }
-    })
+    parse_upload_part_query_with(
+        query_string,
+        ServerError::UploadPartCopyMissingUploadId,
+        |value| ServerError::InvalidUploadPartCopyNumber { value },
+    )
 }
 
 fn parse_upload_part_query_with(
     query_string: &str,
+    missing_upload_id: ServerError,
     invalid_part_number: impl FnOnce(String) -> ServerError,
 ) -> Result<(String, u32), ServerError> {
-    let upload_id =
-        query_param_lossy(query_string, "uploadId").ok_or_else(|| ServerError::InvalidRequest {
-            reason: "missing uploadId query parameter".to_string(),
-        })?;
+    let upload_id = query_param_lossy(query_string, "uploadId")
+        .filter(|value| !value.is_empty())
+        .ok_or(missing_upload_id)?;
     let part_number = query_param_lossy(query_string, "partNumber").ok_or_else(|| {
         ServerError::InvalidRequest {
             reason: "missing partNumber query parameter".to_string(),
@@ -636,6 +640,14 @@ mod tests {
                 if reason == "missing partNumber query parameter"
         ));
         assert!(matches!(
+            parse_upload_part_query("partNumber=1"),
+            Err(ServerError::UploadPartMissingUploadId)
+        ));
+        assert!(matches!(
+            parse_upload_part_query("partNumber=1&uploadId="),
+            Err(ServerError::UploadPartMissingUploadId)
+        ));
+        assert!(matches!(
             parse_upload_part_query("partNumber=abc&uploadId=abc123"),
             Err(ServerError::InvalidUploadPartNumber { value }) if value == "abc"
         ));
@@ -650,6 +662,14 @@ mod tests {
         assert!(matches!(
             parse_upload_part_copy_query("partNumber=0&uploadId=abc123"),
             Err(ServerError::InvalidUploadPartCopyNumber { value }) if value == "0"
+        ));
+        assert!(matches!(
+            parse_upload_part_copy_query("partNumber=1"),
+            Err(ServerError::UploadPartCopyMissingUploadId)
+        ));
+        assert!(matches!(
+            parse_upload_part_copy_query("partNumber=1&uploadId="),
+            Err(ServerError::UploadPartCopyMissingUploadId)
         ));
     }
 

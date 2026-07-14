@@ -310,6 +310,9 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::InvalidUploadPartCopyNumber { .. } => {
             "Part number must be an integer between 1 and 10000, inclusive".to_string()
         }
+        ServerError::UploadPartMissingUploadId | ServerError::UploadPartCopyMissingUploadId => {
+            "This operation does not accept partNumber without uploadId".to_string()
+        }
         ServerError::InvalidManagedEncryptionReadHeader { header, .. } => {
             managed_encryption_read_header_message(header).to_string()
         }
@@ -570,6 +573,26 @@ impl S3Response {
                     &client_error_message(err),
                     "partNumber",
                     Some(value),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::UploadPartMissingUploadId => {
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    "partNumber",
+                    Some("partNumber"),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::UploadPartCopyMissingUploadId => {
+                let body = xml::invalid_argument_error_xml_no_decl(
+                    &client_error_message(err),
+                    "partNumber",
+                    Some("partNumber"),
                     request_id,
                     host_id,
                 );

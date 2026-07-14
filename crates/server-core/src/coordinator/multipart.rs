@@ -817,6 +817,26 @@ impl Coordinator {
         }
     }
 
+    /// Validate the upload target before parsing a completion body.
+    ///
+    /// AWS resolves a missing or wrong-key upload ID before reporting malformed
+    /// completion XML, while authorization still follows XML validation. The
+    /// full completion path repeats this lookup so a concurrent terminal state
+    /// transition cannot use a stale existence check.
+    pub fn validate_complete_multipart_upload_target(
+        &self,
+        upload: &MultipartObjectRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.storage_node()
+            .load_in_progress_multipart_upload(
+                upload.bucket_name_typed(),
+                upload.key_typed(),
+                upload.upload_id(),
+            )
+            .map(|_| ())
+            .map_err(Self::map_object_pg_action_error)
+    }
+
     /// Abort an in-progress multipart upload.
     ///
     /// Publishes an abort metadata command, best-effort deletes all part shard

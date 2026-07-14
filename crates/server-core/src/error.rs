@@ -156,6 +156,12 @@ pub enum ServerError {
     #[error("invalid part number")]
     InvalidPartNumber { part_number: u32, parts_count: u32 },
 
+    #[error("UploadPart requires an upload ID")]
+    UploadPartMissingUploadId,
+
+    #[error("UploadPartCopy requires an upload ID")]
+    UploadPartCopyMissingUploadId,
+
     #[error("invalid upload part number: {value}")]
     InvalidUploadPartNumber { value: String },
 
@@ -512,6 +518,8 @@ impl ServerError {
             Self::InvalidRequest { .. } | Self::InvalidRequestHostId { .. } => "InvalidRequest",
             Self::BadRequest { .. } => "BadRequest",
             Self::InvalidArgument { .. }
+            | Self::UploadPartMissingUploadId
+            | Self::UploadPartCopyMissingUploadId
             | Self::InvalidUploadPartNumber { .. }
             | Self::InvalidUploadPartCopyNumber { .. }
             | Self::InvalidManagedEncryptionReadHeader { .. }
@@ -635,6 +643,8 @@ impl ServerError {
             | Self::InvalidRequestHostId { .. }
             | Self::BadRequest { .. }
             | Self::InvalidArgument { .. }
+            | Self::UploadPartMissingUploadId
+            | Self::UploadPartCopyMissingUploadId
             | Self::InvalidUploadPartNumber { .. }
             | Self::InvalidUploadPartCopyNumber { .. }
             | Self::InvalidManagedEncryptionReadHeader { .. }

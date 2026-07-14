@@ -1422,6 +1422,230 @@ fn test_list_parts_invalid_present_upload_id_overlong_message() {
 }
 
 #[test]
+fn test_multipart_upload_id_wire_matrix() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let missing_key = "upload-part-missing-upload-id";
+        let missing_url = object_url(CTX.endpoint(), &bucket, missing_key, Some("partNumber=1"));
+        let missing_response = send_signed_request_with_credentials(
+            "PUT",
+            &missing_url,
+            b"must not become an object",
+            std::iter::empty::<(&str, &str)>(),
+            primary_credentials(),
+        );
+        assert_shape(
+            "UploadPart missing uploadId",
+            &missing_response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::invalid_argument_with_value(
+                    "This operation does not accept partNumber without uploadId",
+                    "partNumber",
+                    "partNumber",
+                ),
+            ),
+        );
+
+        for (operation, method, query_prefix, body, headers) in [
+            ("UploadPart", "PUT", "partNumber=1&", b"x".as_slice(), None),
+            (
+                "CompleteMultipartUpload",
+                "POST",
+                "",
+                b"<".as_slice(),
+                Some(("content-type", "application/xml")),
+            ),
+            ("ListParts", "GET", "", b"".as_slice(), None),
+            ("AbortMultipartUpload", "DELETE", "", b"".as_slice(), None),
+        ] {
+            for case in [
+                "empty",
+                "encoded-valid",
+                "wrong-key",
+                "valid-first-duplicate",
+                "invalid-first-duplicate",
+            ] {
+                let key = format!("upload-id-wire-{operation}-{case}");
+                let create = client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send_retrying_operation_aborted("create upload for upload ID wire matrix")
+                    .await
+                    .unwrap();
+                let upload_id = create.upload_id().unwrap();
+                let encoded_upload_id =
+                    format!("%{:02X}{}", upload_id.as_bytes()[0], &upload_id[1..]);
+                let mut invalid_upload_id = upload_id.to_string();
+                let replacement = if invalid_upload_id.ends_with('A') {
+                    'B'
+                } else {
+                    'A'
+                };
+                invalid_upload_id.pop();
+                invalid_upload_id.push(replacement);
+
+                let query = match case {
+                    "empty" => format!("{query_prefix}uploadId="),
+                    "encoded-valid" => format!("{query_prefix}uploadId={encoded_upload_id}"),
+                    "wrong-key" => format!("{query_prefix}uploadId={upload_id}"),
+                    "valid-first-duplicate" => {
+                        format!("{query_prefix}uploadId={upload_id}&uploadId={invalid_upload_id}")
+                    }
+                    "invalid-first-duplicate" => {
+                        format!("{query_prefix}uploadId={invalid_upload_id}&uploadId={upload_id}")
+                    }
+                    _ => unreachable!(),
+                };
+                let request_key = if case == "wrong-key" {
+                    format!("{key}-wrong")
+                } else {
+                    key.clone()
+                };
+                let url = object_url(CTX.endpoint(), &bucket, &request_key, Some(&query));
+                let response = send_signed_request_with_credentials(
+                    method,
+                    &url,
+                    body,
+                    headers,
+                    primary_credentials(),
+                );
+
+                let selects_active_upload =
+                    matches!(case, "encoded-valid" | "valid-first-duplicate");
+                if selects_active_upload {
+                    match operation {
+                        "UploadPart" => {
+                            assert_eq!(response.status, 200, "{operation} {case}: {response:?}");
+                            assert!(response.body.is_empty(), "{operation} {case}: {response:?}");
+                            assert!(
+                                response.headers.iter().any(|(name, _)| name == "etag"),
+                                "{operation} {case}: {response:?}"
+                            );
+                        }
+                        "CompleteMultipartUpload" => {
+                            assert_shape(
+                                &format!("{operation} {case}"),
+                                &response,
+                                &shape()
+                                    .status(400)
+                                    .headers(error_response_headers())
+                                    .body(expected_error::malformed_xml_no_decl()),
+                            );
+                        }
+                        "ListParts" => {
+                            assert_eq!(response.status, 200, "{operation} {case}: {response:?}");
+                            assert!(
+                                response
+                                    .body
+                                    .contains(&format!("<UploadId>{upload_id}</UploadId>")),
+                                "{operation} {case}: {response:?}"
+                            );
+                            assert!(
+                                response.body.contains(&format!("<Key>{key}</Key>")),
+                                "{operation} {case}: {response:?}"
+                            );
+                        }
+                        "AbortMultipartUpload" => {
+                            assert_eq!(response.status, 204, "{operation} {case}: {response:?}");
+                            assert!(response.body.is_empty(), "{operation} {case}: {response:?}");
+                        }
+                        _ => unreachable!(),
+                    }
+                } else if operation == "UploadPart" && case == "empty" {
+                    assert_shape(
+                        "UploadPart empty uploadId",
+                        &response,
+                        &shape().status(400).headers(error_response_headers()).body(
+                            expected_error::invalid_argument_with_value(
+                                "This operation does not accept partNumber without uploadId",
+                                "partNumber",
+                                "partNumber",
+                            ),
+                        ),
+                    );
+                } else {
+                    let echoed_upload_id = match case {
+                        "empty" => "",
+                        "wrong-key" => upload_id,
+                        "invalid-first-duplicate" => invalid_upload_id.as_str(),
+                        _ => unreachable!(),
+                    };
+                    let body = if operation == "CompleteMultipartUpload" {
+                        expected_error::complete_multipart_no_such_upload(echoed_upload_id)
+                    } else {
+                        expected_error::no_such_upload(echoed_upload_id)
+                    };
+                    assert_shape(
+                        &format!("{operation} {case}"),
+                        &response,
+                        &shape()
+                            .status(404)
+                            .headers(error_response_headers())
+                            .body(body),
+                    );
+                }
+
+                let listed = client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(upload_id)
+                    .send_retrying_operation_aborted("verify upload ID wire matrix state")
+                    .await;
+                if operation == "AbortMultipartUpload" && selects_active_upload {
+                    assert_eq!(
+                        err_status(&listed),
+                        404,
+                        "{operation} {case} left the selected upload active: {listed:?}"
+                    );
+                } else {
+                    let listed = listed.unwrap_or_else(|err| {
+                        panic!("{operation} {case} damaged the active upload: {err:?}")
+                    });
+                    let expected_part_count =
+                        usize::from(operation == "UploadPart" && selects_active_upload);
+                    assert_eq!(
+                        listed.parts().len(),
+                        expected_part_count,
+                        "{operation} {case} stored unexpected parts: {:?}",
+                        listed.parts()
+                    );
+                    if expected_part_count == 1 {
+                        assert_eq!(listed.parts()[0].part_number(), Some(1));
+                        assert_eq!(listed.parts()[0].size(), Some(1));
+                    }
+                }
+
+                let head = client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send_retrying_operation_aborted("verify upload ID matrix non-publication")
+                    .await;
+                assert_eq!(
+                    err_status(&head),
+                    404,
+                    "{operation} {case} unexpectedly published an object: {head:?}"
+                );
+            }
+        }
+
+        let missing_head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(missing_key)
+            .send_retrying_operation_aborted("verify missing upload ID non-publication")
+            .await;
+        assert_eq!(err_status(&missing_head), 404, "{missing_head:?}");
+
+        cleanup(&bucket, &[missing_key]).await;
+    });
+}
+
+#[test]
 fn test_multipart_upload_id_authorization_precedence() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -4224,6 +4448,31 @@ fn test_upload_part_copy_number_wire_matrix() {
             .unwrap();
         let upload_id = create.upload_id().unwrap().to_string();
         let copy_source = format!("{bucket}/{src_key}");
+
+        for (case, query) in [
+            ("UploadPartCopy missing uploadId", "partNumber=1"),
+            ("UploadPartCopy empty uploadId", "partNumber=1&uploadId="),
+        ] {
+            let url = object_url(CTX.endpoint(), &bucket, dst_key, Some(query));
+            let response = send_signed_request_with_credentials(
+                "PUT",
+                &url,
+                b"",
+                [("x-amz-copy-source", copy_source.as_str())],
+                primary_credentials(),
+            );
+            assert_shape(
+                case,
+                &response,
+                &shape().status(400).headers(error_response_headers()).body(
+                    expected_error::invalid_argument_with_value_no_decl(
+                        "This operation does not accept partNumber without uploadId",
+                        "partNumber",
+                        "partNumber",
+                    ),
+                ),
+            );
+        }
 
         let missing_url = object_url(
             CTX.endpoint(),
