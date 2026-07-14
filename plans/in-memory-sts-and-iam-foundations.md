@@ -312,6 +312,11 @@ both the literal token and its byte-encoded form before recording the body.
 The presigned equivalent includes the URI-encoded token in the canonical query
 string and the hexadecimal bytes of that encoded form. Test sanitization must
 therefore cover literal, URI-encoded, and both byte-encoded representations.
+POST Object's `SignatureDoesNotMatch` response echoes the complete base64 POST
+policy as `StringToSign` and its hexadecimal bytes as `StringToSignBytes`; a
+policy containing the token condition is bearer-sensitive even though the raw
+token is not directly visible. Sanitize both complete policy representations
+as well as every separately presented token.
 
 ### 3. Share identity state and token keys, not issued sessions
 
@@ -390,24 +395,36 @@ presigned, POST Object, and streaming authentication:
    header token when present, even when an `X-Amz-Security-Token` query value is
    also present, and fall back to the query value only when no signed header
    token is present
-4. if the access key ID resolves to a stored long-lived credential, use the
+4. for POST Object, select `x-amz-security-token` only from the multipart form;
+   its matching POST-policy condition follows the existing validation rules.
+   Credential extraction accepts duplicate form-token fields only when every
+   value is identical, while retaining their multiplicity for later POST-policy
+   condition evaluation. Conflicting duplicates return `InvalidAccessKeyId`
+   without selecting either value. Treat an empty value like a missing token,
+   and map a malformed non-empty token to `InvalidToken`. These form-token
+   shape/binding checks precede POST policy-signature verification.
+   A token in the HTTP header is not a fallback or a competing token location:
+   its presence selects the non-POST authentication route, which rejects the
+   request as `AccessDenied` with `No AWSAccessKey was presented.` before POST
+   form-token, token decoding, issuer-liveness, or policy-signature validation
+5. if the access key ID resolves to a stored long-lived credential, use the
    static path and preserve AWS's post-signature unexpected-token behavior
-5. otherwise, require and AEAD-open the selected effective session token
-6. validate the embedded access key ID against the SigV4 credential in constant
+6. otherwise, require and AEAD-open the selected effective session token
+7. validate the embedded access key ID against the SigV4 credential in constant
    time and check credential-domain binding
-7. check embedded expiry at the AWS-pinned boundary and resolve only the
+8. check embedded expiry at the AWS-pinned boundary and resolve only the
    embedded stable issuer-role ID, rejecting a deleted issuer as
    `InvalidClientTokenId`; both checks precede signature comparison, but their
    relative order remains unresolved
-8. verify SigV4 with the embedded secret access key
-9. return an immutable authenticated-session value containing the structured
+9. verify SigV4 with the embedded secret access key
+10. return an immutable authenticated-session value containing the structured
    token identity and session-policy context
 
-POST Object and streaming must plug their AWS-pinned selection rules into step
-2 rather than adding separate credential-validation pipelines. All presented
-token values, not only the selected one, remain sensitive diagnostic inputs:
-canonical-error construction and test failure sanitization must account for
-every location included in the request.
+Streaming must plug its AWS-pinned selection rules into step 2 rather than
+adding a separate credential-validation pipeline. All presented token values,
+not only the selected one, remain sensitive diagnostic inputs: canonical-error
+construction and test failure sanitization must account for every location
+included in the request.
 
 Authentication must not resolve mutable trust or permission-policy state before
 signature verification. AWS probes do require one narrower mutable dependency:
@@ -768,8 +785,8 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The optional `AssumeRole` security-context parameters, S3 POST/streaming token
-matrices, expiry-versus-issuer-deletion precedence,
+The optional `AssumeRole` security-context parameters, the S3 streaming token
+matrix, expiry-versus-issuer-deletion precedence,
 trust/permission-policy mutation precedence, session-principal context, and
 `aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
 condition.
@@ -1069,8 +1086,66 @@ scope, and echoed signature. AWS XML-escapes the literal query separators to
 unescaped `&` bytes. Exact golden diagnostics sanitize the raw token, its
 URI-encoded form, and the byte encodings of both for every presented token, not
 only the selected header token. The dual-location bad-signature golden exercises
-both token values in one canonical request. POST Object and streaming token
-matrices remain independently unpinned.
+both token values in one canonical request. The POST Object matrix described
+next and the streaming matrix were not part of that presigned slice.
+
+The S3 POST Object session-authentication slice completed on 2026-07-14. The
+`--assume-role` fixture creates one unique `claude-s3-` bucket with the primary
+test user, exports only its name, and independently empties and deletes it on
+exit; it does not use the owner credential. The permissionless recreated role
+then provides the positive authentication control without writing an object: a
+correct form token and policy signature reach authorization and return the
+complete `s3:PutObject` `AccessDenied` golden containing the assumed-role ARN
+and exact object resource.
+
+For POST-policy authentication, `x-amz-security-token` is selected from the
+multipart form and is covered by a matching policy condition. A missing, empty,
+or independently valid but mismatched form token returns the complete HTTP 403
+`InvalidAccessKeyId` golden before policy-signature comparison, including with
+a bad signature. Two conflicting form-token fields return `InvalidAccessKeyId`
+rather than selecting the first or last value: valid-then-mismatched and
+mismatched-then-valid orders produce the same result with correct and bad
+signatures. Two identical valid values are accepted as one effective token for
+credential and signature verification, but are not erased from POST-policy
+evaluation. With a correct signature, the equality condition fails with the
+complete HTTP 403 `AccessDenied` message `Invalid according to Policy: Policy
+Condition failed: ["eq", "$x-amz-security-token", "<token>"]`. With a bad
+signature, `SignatureDoesNotMatch` wins over that policy-condition failure. A
+malformed non-empty token returns the complete HTTP 400 `InvalidToken` golden,
+echoes the rejected value in `Token-0`, and also wins over a bad signature.
+
+A correct form token plus a bad signature reaches the complete
+`SignatureDoesNotMatch` golden. Its `StringToSign` is exactly the base64 POST
+policy, `StringToSignBytes` is the hexadecimal encoding of that policy, and the
+provided signature and access key are echoed without canonical-request fields.
+The golden sanitizes the complete policy and its byte encoding in addition to
+all presented token forms.
+
+The invalidated old role session returns `InvalidAccessKeyId` with its correct
+or mismatched form token, with a missing token, and with correct or bad
+signatures. Form-token presence, token/access-key binding, and stable issuer
+liveness therefore precede POST policy-signature verification just as they do
+on the header and presigned paths.
+
+An HTTP `x-amz-security-token` header does not supply or override the POST form
+token. Its mere presence selects a different authentication route, which
+returns the complete HTTP 403 `AccessDenied` golden with exactly
+`No AWSAccessKey was presented.` This response wins for a header-only token, a
+valid form plus mismatched header, a mismatched form plus valid header, and a
+bad POST policy signature. A malformed header token and an invalidated old
+session header token produce the same response when combined with a valid form
+token and bad policy signature. Header-presence routing therefore precedes
+header-token decoding, issuer-liveness validation, form-token selection, and
+POST policy-signature comparison. With the empty, malformed, and duplicate form
+matrix pinned, the remaining independently unpinned S3 temporary credential
+mode is aws-chunked streaming.
+
+During this slice, one newly created role produced one successful STS
+assumption followed immediately by `AccessDenied` for the same request. The
+fixture now requires three consecutive successful assumptions, resetting the
+count on any failure, before treating a positive target as converged. A single
+successful response is not sufficient evidence that distributed STS caches
+have converged.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations
@@ -1315,8 +1390,8 @@ confidentiality. No session response or request body may appear in traces.
    bucket-policy code less explicit?
 4. What is the exact AWS precedence among wrong token, missing token, bad
    signature, wrong region/service, disabled credential, and expired session on
-   POST Object and streaming modes? The core header and presigned
-   token/signature collisions are pinned; their remaining
+   streaming mode? The core header, presigned, and POST Object token/signature
+   collisions are pinned; their remaining
    region/service/expiry collisions are not.
 5. What total Query body and member limits does live STS enforce for the first
    supported parameter set?

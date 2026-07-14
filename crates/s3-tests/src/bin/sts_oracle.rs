@@ -8,13 +8,13 @@ use std::{env, time::Duration};
 
 use aws_smithy_types::{date_time::Format as DateTimeFormat, DateTime};
 use s3_tests::{
-    build_test_agent, presign_url_with_credentials,
+    build_test_agent, post_object_raw_to_test_endpoint_with_headers, presign_url_with_credentials,
     send_signed_request_for_service_with_credentials,
     shape::{
         assert_shape, error_response_headers, expected_error, response_header_value, shape,
         xml_tag_text, ShapeSpec,
     },
-    PresignedRequest, RawResponse, SignedRequestCredentials,
+    sigv4_post_fields_for_credentials, PresignedRequest, RawResponse, SignedRequestCredentials,
 };
 
 const QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
@@ -244,6 +244,9 @@ fn sanitize_s3_text(text: &str, access_key: &str, security_tokens: &[&str]) -> S
     let mut sanitized = text.replace(&spaced_hex(access_key), "SESSION_ACCESS_KEY_BYTES");
     sanitized = sanitized.replace(access_key, "SESSION_ACCESS_KEY");
     for security_token in security_tokens {
+        if security_token.is_empty() {
+            continue;
+        }
         let uri_encoded = auth::canonical::uri_encode(security_token);
         if uri_encoded != *security_token {
             sanitized =
@@ -1068,6 +1071,647 @@ fn run_s3_presigned_session_authentication_probes(
                     probe.credentials,
                     &sensitive_tokens,
                 );
+            }
+        }
+    }
+}
+
+struct S3PostSessionProbeSet<'a> {
+    live_credentials: SignedRequestCredentials<'a>,
+    live_security_token: &'a str,
+    live_role_name: &'a str,
+    live_role_session_name: &'a str,
+    other_live_security_token: &'a str,
+    old_credentials: SignedRequestCredentials<'a>,
+    old_security_token: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum S3PostAuthExpected {
+    AccessDenied,
+    InvalidAccessKey,
+    InvalidToken,
+    NoAccessKeyPresented,
+    PolicyConditionFailed,
+    SignatureMismatch,
+}
+
+#[derive(Clone, Copy)]
+enum S3PostFormTokens<'a> {
+    Missing,
+    One(&'a str),
+    Two(&'a str, &'a str),
+}
+
+impl<'a> S3PostFormTokens<'a> {
+    fn append_to(self, fields: &mut Vec<(String, String)>) {
+        let mut append = |token: &'a str| {
+            fields.push(("x-amz-security-token".to_string(), token.to_string()));
+        };
+        match self {
+            Self::Missing => {}
+            Self::One(token) => append(token),
+            Self::Two(first, second) => {
+                append(first);
+                append(second);
+            }
+        }
+    }
+
+    fn values(self) -> [Option<&'a str>; 2] {
+        match self {
+            Self::Missing => [None, None],
+            Self::One(token) => [Some(token), None],
+            Self::Two(first, second) => [Some(first), Some(second)],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct S3PostProbe<'a> {
+    label: &'a str,
+    credentials: SignedRequestCredentials<'a>,
+    policy_token: Option<&'a str>,
+    form_tokens: S3PostFormTokens<'a>,
+    header_token: Option<&'a str>,
+    expected: S3PostAuthExpected,
+}
+
+struct S3PostResult {
+    response: RawResponse,
+    policy: String,
+    signature: String,
+}
+
+fn required_post_field(fields: &[(String, String)], name: &str, label: &str) -> String {
+    fields
+        .iter()
+        .find_map(|(candidate, value)| (candidate == name).then(|| value.clone()))
+        .unwrap_or_else(|| panic!("{label}: POST Object fields are missing {name}"))
+}
+
+fn send_s3_post_probe(endpoint: &str, bucket: &str, probe: S3PostProbe<'_>) -> S3PostResult {
+    let key = probe.label;
+    let token_conditions = probe
+        .policy_token
+        .map(|token| vec![serde_json::json!({"x-amz-security-token": token})])
+        .unwrap_or_default();
+    let mut fields = sigv4_post_fields_for_credentials(
+        probe.credentials.access_key,
+        probe.credentials.secret_key,
+        probe.credentials.region,
+        bucket,
+        key,
+        &token_conditions,
+    );
+    probe.form_tokens.append_to(&mut fields);
+    let headers = probe
+        .header_token
+        .map(|token| vec![("x-amz-security-token".to_string(), token.to_string())])
+        .unwrap_or_default();
+    let policy = required_post_field(&fields, "policy", probe.label);
+    let signature = required_post_field(&fields, "x-amz-signature", probe.label);
+    let response = post_object_raw_to_test_endpoint_with_headers(
+        endpoint,
+        None,
+        bucket,
+        &fields,
+        b"STS POST Object oracle",
+        "oracle.txt",
+        &headers,
+    );
+    S3PostResult {
+        response,
+        policy,
+        signature,
+    }
+}
+
+fn s3_post_response_with_sanitized_body(
+    response: &RawResponse,
+    access_key: &str,
+    security_tokens: &[&str],
+    policy: &str,
+) -> RawResponse {
+    let mut body = response
+        .body
+        .replace(&spaced_hex(policy), "POST_POLICY_BYTES");
+    body = body.replace(policy, "POST_POLICY");
+    RawResponse {
+        status: response.status,
+        headers: response.headers.clone(),
+        body: sanitize_s3_text(&body, access_key, security_tokens),
+        body_read_error: response.body_read_error.clone(),
+    }
+}
+
+fn assert_s3_post_access_denied(
+    probe: S3PostProbe<'_>,
+    result: &S3PostResult,
+    bucket: &str,
+    assumed_role_arn: &str,
+    security_tokens: &[&str],
+) {
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        security_tokens,
+        &result.policy,
+    );
+    assert_shape(
+        probe.label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("assumed_role_arn", assumed_role_arn)
+            .sub("bucket", bucket)
+            .sub("key", probe.label)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>User: {assumed_role_arn} is not authorized to perform: \
+                 s3:PutObject on resource: \"arn:aws:s3:::{bucket}/{key}\" because no \
+                 identity-based policy allows the s3:PutObject action</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn assert_s3_post_invalid_access_key(
+    probe: S3PostProbe<'_>,
+    result: &S3PostResult,
+    security_tokens: &[&str],
+) {
+    assert!(
+        required_xml_text(&result.response, "AWSAccessKeyId", probe.label)
+            == probe.credentials.access_key,
+        "{}: S3 did not echo the session access key",
+        probe.label
+    );
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        security_tokens,
+        &result.policy,
+    );
+    assert_shape(
+        probe.label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>InvalidAccessKeyId</Code>\
+                 <Message>The AWS Access Key Id you provided does not exist in our records.</Message>\
+                 <AWSAccessKeyId>SESSION_ACCESS_KEY</AWSAccessKeyId>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn assert_s3_post_no_access_key_presented(
+    probe: S3PostProbe<'_>,
+    result: &S3PostResult,
+    security_tokens: &[&str],
+) {
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        security_tokens,
+        &result.policy,
+    );
+    assert_shape(
+        probe.label,
+        &response,
+        &shape().status(403).headers(error_response_headers()).body(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>No AWSAccessKey was presented.</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+        ),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn assert_s3_post_invalid_token(
+    probe: S3PostProbe<'_>,
+    result: &S3PostResult,
+    security_tokens: &[&str],
+    rejected_token: &str,
+) {
+    assert!(
+        required_xml_text(&result.response, "Token-0", probe.label) == rejected_token,
+        "{}: S3 did not echo the rejected session token",
+        probe.label
+    );
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        security_tokens,
+        &result.policy,
+    );
+    assert_shape(
+        probe.label,
+        &response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .body(expected_error::invalid_token(
+                "The provided token is malformed or otherwise invalid.",
+                "SESSION_TOKEN",
+            )),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn assert_s3_post_signature_mismatch(
+    probe: S3PostProbe<'_>,
+    result: &S3PostResult,
+    security_tokens: &[&str],
+) {
+    assert!(
+        required_xml_text(&result.response, "AWSAccessKeyId", probe.label)
+            == probe.credentials.access_key,
+        "{}: S3 did not echo the session access key",
+        probe.label
+    );
+    assert!(
+        required_xml_text(&result.response, "StringToSign", probe.label) == result.policy,
+        "{}: S3 did not echo the POST policy as StringToSign",
+        probe.label
+    );
+    assert!(
+        required_xml_text(&result.response, "StringToSignBytes", probe.label)
+            == spaced_hex(&result.policy),
+        "{}: StringToSignBytes does not encode the POST policy",
+        probe.label
+    );
+    let signature = required_xml_text(&result.response, "SignatureProvided", probe.label);
+    assert!(
+        signature.len() == 64
+            && signature
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{}: malformed provided signature",
+        probe.label
+    );
+    assert!(
+        signature == result.signature,
+        "{}: S3 did not echo the POST policy signature",
+        probe.label
+    );
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        security_tokens,
+        &result.policy,
+    );
+    assert_shape(
+        probe.label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("signature", signature)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>SignatureDoesNotMatch</Code>\
+                 <Message>The request signature we calculated does not match the signature \
+                 you provided. Check your key and signing method.</Message>\
+                 <AWSAccessKeyId>SESSION_ACCESS_KEY</AWSAccessKeyId>\
+                 <StringToSign>POST_POLICY</StringToSign>\
+                 <SignatureProvided>{signature}</SignatureProvided>\
+                 <StringToSignBytes>POST_POLICY_BYTES</StringToSignBytes>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn assert_s3_post_policy_condition_failed(
+    probe: S3PostProbe<'_>,
+    result: &S3PostResult,
+    security_tokens: &[&str],
+) {
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        security_tokens,
+        &result.policy,
+    );
+    assert_shape(
+        probe.label,
+        &response,
+        &shape().status(403).headers(error_response_headers()).body(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>Invalid according to Policy: Policy Condition failed: \
+                 [\"eq\", \"$x-amz-security-token\", \"SESSION_TOKEN\"]</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+        ),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn run_s3_post_session_authentication_probes(
+    endpoint: &str,
+    account_id: &str,
+    bucket: &str,
+    fixture: S3PostSessionProbeSet<'_>,
+) {
+    let wrong_secret = "0".repeat(40);
+    let malformed_security_token = "malformed-session-token";
+    let live_bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..fixture.live_credentials
+    };
+    let old_bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..fixture.old_credentials
+    };
+    let probes = [
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-valid",
+            credentials: fixture.live_credentials,
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.live_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::AccessDenied,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-token-missing-valid-signature",
+            credentials: fixture.live_credentials,
+            policy_token: None,
+            form_tokens: S3PostFormTokens::Missing,
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-mismatched-valid-signature",
+            credentials: fixture.live_credentials,
+            policy_token: Some(fixture.other_live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.other_live_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-empty-valid-signature",
+            credentials: fixture.live_credentials,
+            policy_token: Some(""),
+            form_tokens: S3PostFormTokens::One(""),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-malformed-valid-signature",
+            credentials: fixture.live_credentials,
+            policy_token: Some(malformed_security_token),
+            form_tokens: S3PostFormTokens::One(malformed_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidToken,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-valid-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.live_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::SignatureMismatch,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-token-missing-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: None,
+            form_tokens: S3PostFormTokens::Missing,
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-mismatched-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: Some(fixture.other_live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.other_live_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-empty-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: Some(""),
+            form_tokens: S3PostFormTokens::One(""),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-malformed-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: Some(malformed_security_token),
+            form_tokens: S3PostFormTokens::One(malformed_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidToken,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-duplicate-valid-then-mismatched",
+            credentials: fixture.live_credentials,
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::Two(
+                fixture.live_security_token,
+                fixture.other_live_security_token,
+            ),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-duplicate-mismatched-then-valid",
+            credentials: fixture.live_credentials,
+            policy_token: Some(fixture.other_live_security_token),
+            form_tokens: S3PostFormTokens::Two(
+                fixture.other_live_security_token,
+                fixture.live_security_token,
+            ),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-duplicate-valid-then-mismatched-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::Two(
+                fixture.live_security_token,
+                fixture.other_live_security_token,
+            ),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-duplicate-mismatched-then-valid-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: Some(fixture.other_live_security_token),
+            form_tokens: S3PostFormTokens::Two(
+                fixture.other_live_security_token,
+                fixture.live_security_token,
+            ),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-duplicate-identical-valid",
+            credentials: fixture.live_credentials,
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::Two(
+                fixture.live_security_token,
+                fixture.live_security_token,
+            ),
+            header_token: None,
+            expected: S3PostAuthExpected::PolicyConditionFailed,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-token-duplicate-identical-valid-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::Two(
+                fixture.live_security_token,
+                fixture.live_security_token,
+            ),
+            header_token: None,
+            expected: S3PostAuthExpected::SignatureMismatch,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-header-token-valid",
+            credentials: fixture.live_credentials,
+            policy_token: None,
+            form_tokens: S3PostFormTokens::Missing,
+            header_token: Some(fixture.live_security_token),
+            expected: S3PostAuthExpected::NoAccessKeyPresented,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-valid-header-mismatched",
+            credentials: fixture.live_credentials,
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.live_security_token),
+            header_token: Some(fixture.other_live_security_token),
+            expected: S3PostAuthExpected::NoAccessKeyPresented,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-mismatched-header-valid",
+            credentials: fixture.live_credentials,
+            policy_token: Some(fixture.other_live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.other_live_security_token),
+            header_token: Some(fixture.live_security_token),
+            expected: S3PostAuthExpected::NoAccessKeyPresented,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-header-token-valid-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: None,
+            form_tokens: S3PostFormTokens::Missing,
+            header_token: Some(fixture.live_security_token),
+            expected: S3PostAuthExpected::NoAccessKeyPresented,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-valid-header-malformed-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.live_security_token),
+            header_token: Some(malformed_security_token),
+            expected: S3PostAuthExpected::NoAccessKeyPresented,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-live-form-valid-header-invalidated-bad-signature",
+            credentials: live_bad_signature_credentials,
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.live_security_token),
+            header_token: Some(fixture.old_security_token),
+            expected: S3PostAuthExpected::NoAccessKeyPresented,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-old-form-token-valid",
+            credentials: fixture.old_credentials,
+            policy_token: Some(fixture.old_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.old_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-old-form-token-valid-bad-signature",
+            credentials: old_bad_signature_credentials,
+            policy_token: Some(fixture.old_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.old_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-old-token-missing-valid-signature",
+            credentials: fixture.old_credentials,
+            policy_token: None,
+            form_tokens: S3PostFormTokens::Missing,
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-old-form-token-mismatched-valid-signature",
+            credentials: fixture.old_credentials,
+            policy_token: Some(fixture.other_live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.other_live_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+        S3PostProbe {
+            label: "s3-post-auth-old-form-token-mismatched-bad-signature",
+            credentials: old_bad_signature_credentials,
+            policy_token: Some(fixture.other_live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.other_live_security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::InvalidAccessKey,
+        },
+    ];
+
+    for probe in probes {
+        let result = send_s3_post_probe(endpoint, bucket, probe);
+        let form_tokens = probe.form_tokens.values();
+        let sensitive_tokens = [
+            probe.policy_token,
+            form_tokens[0],
+            form_tokens[1],
+            probe.header_token,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        match probe.expected {
+            S3PostAuthExpected::AccessDenied => {
+                let assumed_role_arn = format!(
+                    "arn:aws:sts::{account_id}:assumed-role/{}/{}",
+                    fixture.live_role_name, fixture.live_role_session_name
+                );
+                assert_s3_post_access_denied(
+                    probe,
+                    &result,
+                    bucket,
+                    &assumed_role_arn,
+                    &sensitive_tokens,
+                );
+            }
+            S3PostAuthExpected::InvalidAccessKey => {
+                assert_s3_post_invalid_access_key(probe, &result, &sensitive_tokens);
+            }
+            S3PostAuthExpected::InvalidToken => {
+                let rejected_token = form_tokens[0]
+                    .expect("InvalidToken POST probe must present a form session token");
+                assert_s3_post_invalid_token(probe, &result, &sensitive_tokens, rejected_token);
+            }
+            S3PostAuthExpected::NoAccessKeyPresented => {
+                assert_s3_post_no_access_key_presented(probe, &result, &sensitive_tokens);
+            }
+            S3PostAuthExpected::PolicyConditionFailed => {
+                assert_s3_post_policy_condition_failed(probe, &result, &sensitive_tokens);
+            }
+            S3PostAuthExpected::SignatureMismatch => {
+                assert_s3_post_signature_mismatch(probe, &result, &sensitive_tokens);
             }
         }
     }
@@ -2521,6 +3165,21 @@ fn main() {
                 old_security_token: &deleted_security_token,
             },
         );
+        let post_bucket = required_env("S3_TEST_STS_POST_BUCKET");
+        run_s3_post_session_authentication_probes(
+            &format!("https://s3.{region}.amazonaws.com"),
+            &account_id,
+            &post_bucket,
+            S3PostSessionProbeSet {
+                live_credentials: recreated_credentials,
+                live_security_token: &recreated_security_token,
+                live_role_name: &recreated_role_name,
+                live_role_session_name: &recreated_role_session_name,
+                other_live_security_token: &other_live_security_token,
+                old_credentials: deleted_credentials,
+                old_security_token: &deleted_security_token,
+            },
+        );
         run_session_authentication_probes(
             &endpoint,
             &account_id,
@@ -2544,7 +3203,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{s3_response_with_sanitized_body, spaced_hex};
+    use super::{
+        s3_post_response_with_sanitized_body, s3_response_with_sanitized_body, spaced_hex,
+    };
     use s3_tests::RawResponse;
 
     #[test]
@@ -2592,6 +3253,40 @@ mod tests {
              SESSION_TOKEN|SESSION_TOKEN_BYTES|SESSION_TOKEN_URI_ENCODED|\
              SESSION_TOKEN_URI_ENCODED_BYTES|SESSION_TOKEN|SESSION_TOKEN_BYTES|\
              SESSION_TOKEN_URI_ENCODED|SESSION_TOKEN_URI_ENCODED_BYTES"
+        );
+    }
+
+    #[test]
+    fn s3_post_response_sanitization_removes_policy_and_credentials() {
+        let access_key = "SESSIONACCESSKEY12345";
+        let security_token = "opaque+session/token=value";
+        let policy = "eyJjb25kaXRpb25zIjpbInNlc3Npb24tdG9rZW4iXX0=";
+        let response = RawResponse {
+            status: 403,
+            headers: Vec::new(),
+            body: format!(
+                "{access_key}|{}|{security_token}|{}|{policy}|{}",
+                spaced_hex(access_key),
+                spaced_hex(security_token),
+                spaced_hex(policy)
+            ),
+            body_read_error: None,
+        };
+
+        let sanitized = s3_post_response_with_sanitized_body(
+            &response,
+            access_key,
+            &[security_token, ""],
+            policy,
+        );
+        assert!(!sanitized.body.contains(access_key));
+        assert!(!sanitized.body.contains(security_token));
+        assert!(!sanitized.body.contains(policy));
+        assert!(!sanitized.body.contains(&spaced_hex(policy)));
+        assert_eq!(
+            sanitized.body,
+            "SESSION_ACCESS_KEY|SESSION_ACCESS_KEY_BYTES|SESSION_TOKEN|\
+             SESSION_TOKEN_BYTES|POST_POLICY|POST_POLICY_BYTES"
         );
     }
 }

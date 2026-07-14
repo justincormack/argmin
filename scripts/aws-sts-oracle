@@ -12,7 +12,8 @@ Usage: ./scripts/aws-sts-oracle [options]
 
 Run the AWS STS Query protocol oracle using the primary credentials from
 `.env`. The default probes are read-only. `--assume-role` creates and removes a
-set of temporary path-bearing roles using the primary test user.
+set of temporary path-bearing roles and one prefixed S3 bucket using the primary
+test user.
 
 Options:
   --assume-role     Include the self-cleaning same-account role probes
@@ -164,14 +165,19 @@ wait_for_assume_role_success() {
     local label="$1"
     local aws_command="$2"
     local role_arn="$3"
-    local attempt ready=false
+    local attempt consecutive_successes=0 ready=false
 
-    for ((attempt = 1; attempt <= 15; attempt++)); do
+    for ((attempt = 1; attempt <= 30; attempt++)); do
         if "$aws_command" sts assume-role \
             --role-arn "$role_arn" \
             --role-session-name convergence-check >/dev/null 2>&1; then
-            ready=true
-            break
+            ((consecutive_successes += 1))
+            if ((consecutive_successes == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_successes=0
         fi
         sleep 2
     done
@@ -231,9 +237,10 @@ wait_for_deleted_role_session_invalid() {
 }
 
 declare -a created_role_names=()
+created_bucket=""
 tmpdir=""
 
-cleanup_role_fixture() {
+cleanup_assume_role_fixture() {
     local status=$?
     trap - EXIT
 
@@ -244,6 +251,16 @@ cleanup_role_fixture() {
             ((status != 0)) || status=1
         fi
     done
+    if [[ -n "$created_bucket" ]]; then
+        if ! aws_primary s3 rm "s3://${created_bucket}" --recursive; then
+            echo "error: failed to empty temporary STS oracle bucket $created_bucket" >&2
+            ((status != 0)) || status=1
+        fi
+        if ! aws_primary s3api delete-bucket --bucket "$created_bucket"; then
+            echo "error: failed to delete temporary STS oracle bucket $created_bucket" >&2
+            ((status != 0)) || status=1
+        fi
+    fi
     if [[ -n "$tmpdir" ]]; then
         rm -rf "$tmpdir"
     fi
@@ -315,7 +332,7 @@ create_scoped_role() {
     aws_primary iam wait role-exists --role-name "$role_name"
 }
 
-create_role_fixture() {
+create_assume_role_fixture() {
     command -v aws >/dev/null || external_s3_test_die "aws CLI is required for --assume-role"
     command -v jq >/dev/null || external_s3_test_die "jq is required for --assume-role"
 
@@ -336,6 +353,21 @@ create_role_fixture() {
     tmpdir="$(mktemp -d)"
     role_suffix="${tmpdir##*/}"
     role_suffix="${role_suffix#tmp.}"
+    role_suffix="${role_suffix,,}"
+    export S3_TEST_STS_POST_BUCKET="claude-s3-sts-oracle-${role_suffix}"
+    local -a create_bucket_args=(
+        s3api create-bucket
+        --bucket "$S3_TEST_STS_POST_BUCKET"
+    )
+    if [[ "$region" != us-east-1 ]]; then
+        create_bucket_args+=(
+            --create-bucket-configuration "LocationConstraint=${region}"
+        )
+    fi
+    aws_primary "${create_bucket_args[@]}" >/dev/null
+    created_bucket="$S3_TEST_STS_POST_BUCKET"
+    aws_primary s3api wait bucket-exists --bucket "$created_bucket"
+    echo "post-object-bucket-fixture: ok"
     export S3_TEST_STS_ROLE_NAME="path-shape-${role_suffix}"
     export S3_TEST_STS_ROLE_SESSION_NAME="path-shape-session"
     export S3_TEST_STS_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_ROLE_NAME}"
@@ -744,8 +776,8 @@ create_cross_account_role_fixtures() {
 }
 
 if [[ "$assume_role" == true ]]; then
-    trap cleanup_role_fixture EXIT
-    create_role_fixture
+    trap cleanup_assume_role_fixture EXIT
+    create_assume_role_fixture
 fi
 if [[ "$cross_account" == true ]]; then
     create_cross_account_role_fixtures
