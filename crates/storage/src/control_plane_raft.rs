@@ -3253,9 +3253,12 @@ fn experimental_raft_config(
     Ok(Arc::new(
         Config {
             cluster_name: cluster_name.into(),
-            heartbeat_interval: 50,
-            election_timeout_min: 150,
-            election_timeout_max: 300,
+            // Peer acknowledgements include WAL and checkpoint fsyncs. Leave
+            // enough election margin for that durability boundary under I/O
+            // contention without delaying control-plane failover excessively.
+            heartbeat_interval: 250,
+            election_timeout_min: 1_500,
+            election_timeout_max: 3_000,
             enable_tick: timers_enabled,
             enable_heartbeat: timers_enabled,
             enable_elect: timers_enabled,
