@@ -79,58 +79,20 @@ impl AtomicAttemptError {
     fn new(context: &'static str, message: String) -> Self {
         Self { context, message }
     }
-
-    fn is_external_retryable(&self) -> bool {
-        self.message.contains("TimeoutError")
-            || self.message.contains("DispatchFailure")
-            || self.message.contains("IncompleteMessage")
-            || self.message.contains("ConnectorError")
-            || self.message.contains("OperationAborted")
-            || self.message.contains("SlowDown")
-    }
-}
-
-fn external_test_mode() -> bool {
-    std::env::var_os("S3_TEST_ENDPOINT").is_some()
 }
 
 async fn atomic_read_case(size: usize) {
-    retry_atomic_case(|| atomic_read_attempt(size)).await;
+    run_atomic_case(|| atomic_read_attempt(size)).await;
 }
 
-async fn retry_atomic_case<F, Fut>(mut attempt_fn: F)
+async fn run_atomic_case<F, Fut>(attempt_fn: F)
 where
-    F: FnMut() -> Fut,
+    F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(), AtomicAttemptError>>,
 {
-    let max_attempts = if external_test_mode() { 3 } else { 1 };
-    let mut last_error = None;
-
-    for attempt in 1..=max_attempts {
-        match attempt_fn().await {
-            Ok(()) => return,
-            Err(err)
-                if attempt < max_attempts
-                    && external_test_mode()
-                    && err.is_external_retryable() =>
-            {
-                eprintln!(
-                    "retrying atomic case after {} retryable error on attempt {attempt}/{max_attempts}: {}",
-                    err.context, err.message
-                );
-                last_error = Some(err);
-            }
-            Err(err) => {
-                panic!("atomic case failed during {}: {}", err.context, err.message);
-            }
-        }
+    if let Err(err) = attempt_fn().await {
+        panic!("atomic case failed during {}: {}", err.context, err.message);
     }
-
-    let err = last_error.expect("atomic read retry loop must record the final error");
-    panic!(
-        "atomic case failed after {max_attempts} attempts during {}: {}",
-        err.context, err.message
-    );
 }
 
 async fn atomic_read_attempt(size: usize) -> Result<(), AtomicAttemptError> {
@@ -193,7 +155,7 @@ async fn atomic_read_attempt(size: usize) -> Result<(), AtomicAttemptError> {
 }
 
 async fn atomic_write_case(size: usize) {
-    retry_atomic_case(|| atomic_write_attempt(size)).await;
+    run_atomic_case(|| atomic_write_attempt(size)).await;
 }
 
 async fn atomic_write_attempt(size: usize) -> Result<(), AtomicAttemptError> {
@@ -245,7 +207,7 @@ async fn atomic_write_attempt(size: usize) -> Result<(), AtomicAttemptError> {
 }
 
 async fn atomic_dual_write_case(size: usize) {
-    retry_atomic_case(|| atomic_dual_write_attempt(size)).await;
+    run_atomic_case(|| atomic_dual_write_attempt(size)).await;
 }
 
 async fn atomic_dual_write_attempt(size: usize) -> Result<(), AtomicAttemptError> {
@@ -403,7 +365,7 @@ async fn atomic_conditional_write_attempt() -> Result<(), AtomicAttemptError> {
 #[test]
 fn test_atomic_conditional_write() {
     s3_tests::run(async {
-        retry_atomic_case(atomic_conditional_write_attempt).await;
+        run_atomic_case(atomic_conditional_write_attempt).await;
     });
 }
 
@@ -486,7 +448,7 @@ async fn atomic_dual_conditional_write_attempt() -> Result<(), AtomicAttemptErro
 #[test]
 fn test_atomic_dual_conditional_write() {
     s3_tests::run(async {
-        retry_atomic_case(atomic_dual_conditional_write_attempt).await;
+        run_atomic_case(atomic_dual_conditional_write_attempt).await;
     });
 }
 

@@ -138,7 +138,9 @@ Completed:
   - transient hyper closed/incomplete-message errors are classified as retryable connector IO;
   - lifecycle ACL deletion waits through AWS delete convergence;
   - SSE-C cleanup aborts visible multipart uploads and retries bucket deletion on AWS cleanup races;
-  - atomic read tests retry the whole scenario on external-S3 transport timeouts.
+  - atomic read tests initially retried the whole scenario on external-S3
+    transport timeouts; that endpoint-dependent retry was later removed, so
+    AWS and local tests now execute the same single-attempt scenario logic.
 
 ## Verification Checklist
 
