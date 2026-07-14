@@ -14,7 +14,7 @@ use super::authz_results::{
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 use super::object_state::StaleObjectPayload;
 use super::request_types::{
-    AppendStreamPartRequest, BeginStreamPartRequest, CompleteMultipartUploadRequest,
+    AppendStreamPartRequest, BeginStreamPartRequest, CompleteMultipartUploadRequest, CompletePart,
     CreateMultipartUploadRequest, FinalizeStreamPartRequest, ListMultipartUploadsRequest,
     ListPartsRequest, MultipartObjectRequest,
 };
@@ -131,6 +131,28 @@ fn complete_multipart_checksum_value(
             }
         },
     }
+}
+
+fn composite_checksum_value_from_complete_parts(
+    algorithm: ChecksumAlgorithm,
+    parts: &[CompletePart],
+) -> Option<String> {
+    use base64::Engine;
+
+    let mut concatenated = Vec::new();
+    for part in parts {
+        let claim = part.checksum.as_ref()?;
+        if claim.algorithm() != algorithm {
+            return None;
+        }
+        concatenated.extend_from_slice(claim.expected_bytes());
+    }
+    let checksum = compute_checksum(algorithm, &concatenated);
+    Some(format!(
+        "{}-{}",
+        base64::engine::general_purpose::STANDARD.encode(checksum.bytes()),
+        parts.len()
+    ))
 }
 
 impl Coordinator {
@@ -520,29 +542,41 @@ impl Coordinator {
 
             let requested_part_numbers: Vec<u32> =
                 parts.iter().map(|part| part.part_number).collect();
+            let checksum_config = upload.checksum;
             #[cfg(test)]
             maybe_run_multipart_complete_snapshot_hook(bucket.as_str(), key.as_str());
-            let completion_snapshot = storage_node
+            let completion_snapshot = match storage_node
                 .load_multipart_completion_snapshot(&upload, &requested_part_numbers)
-                .map_err(|error| match error {
-                    storage::ObjectPgActionError::Metadata(
-                        storage::MetadataError::PartNotFound { part_number, .. },
-                    ) => ServerError::InvalidPart { part_number },
-                    other => Coordinator::map_object_pg_action_error(other),
-                })?;
-
-            if !req.cond.is_empty() {
-                let existing_etag = completion_snapshot.existing_etag.as_deref();
-                if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
-                    return Err(ServerError::ObjectNotFound {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    });
+            {
+                Ok(snapshot) => snapshot,
+                Err(storage::ObjectPgActionError::Metadata(
+                    storage::MetadataError::PartNotFound { part_number, .. },
+                )) => {
+                    // For composite-checksum uploads AWS can reject an object-level
+                    // checksum using only the completion XML, before reporting that
+                    // a requested part does not exist.
+                    if let (Some(config), Some(claimed)) = (checksum_config, claimed_checksum) {
+                        if config.checksum_type() == ChecksumType::Composite
+                            && claimed.algorithm() == config.algorithm()
+                        {
+                            claimed.validate_complete_multipart_header_value()?;
+                            if composite_checksum_value_from_complete_parts(
+                                config.algorithm(),
+                                parts,
+                            )
+                            .is_some_and(|computed| computed != claimed.encoded_value())
+                            {
+                                return Err(ServerError::ChecksumDigestMismatch {
+                                    algorithm: claimed.algorithm().as_str().to_ascii_lowercase(),
+                                });
+                            }
+                        }
+                    }
+                    return Err(ServerError::InvalidPart { part_number });
                 }
-                check_write_conditions(req.cond, existing_etag)?;
-            }
+                Err(other) => return Err(Coordinator::map_object_pg_action_error(other)),
+            };
 
-            let checksum_config = upload.checksum;
             let stores_unconfigured_crc64nvme_checksum_claim = checksum_config.is_none()
                 && claimed_checksum.is_some_and(|claimed| {
                     claimed
@@ -562,18 +596,8 @@ impl Coordinator {
                 checksum_config
             };
 
-            let mut part_records: Vec<MultipartPartRecord> =
-                Vec::with_capacity(completion_snapshot.part_records.len());
-            for (cp, part) in parts.iter().zip(completion_snapshot.part_records) {
-                if let Some(config) = checksum_config {
-                    if config.checksum_type() == ChecksumType::Composite && cp.checksum.is_none() {
-                        return Err(ServerError::CompleteMultipartMissingPartChecksum {
-                            algorithm: config.algorithm().as_str().to_ascii_lowercase(),
-                            part_number: cp.part_number,
-                        });
-                    }
-                }
-
+            let part_records = completion_snapshot.part_records;
+            for (cp, part) in parts.iter().zip(&part_records) {
                 let stored_etag = etag_bytes_to_crc64(&part.etag)
                     .map(format_etag)
                     .unwrap_or_default();
@@ -581,6 +605,34 @@ impl Coordinator {
                     return Err(ServerError::InvalidPart {
                         part_number: cp.part_number,
                     });
+                }
+            }
+
+            let checksum_value = effective_checksum_config
+                .map(|config| complete_multipart_checksum_value(config, &part_records))
+                .transpose()?;
+
+            if let Some(claimed) = claimed_checksum {
+                claimed.validate_complete_multipart_header_value()?;
+                if checksum_config.is_some_and(|config| config.algorithm() == claimed.algorithm())
+                    && checksum_value
+                        .as_ref()
+                        .is_some_and(|computed| computed != claimed.encoded_value())
+                {
+                    return Err(ServerError::ChecksumDigestMismatch {
+                        algorithm: claimed.algorithm().as_str().to_ascii_lowercase(),
+                    });
+                }
+            }
+
+            for (cp, part) in parts.iter().zip(&part_records) {
+                if let Some(config) = checksum_config {
+                    if config.checksum_type() == ChecksumType::Composite && cp.checksum.is_none() {
+                        return Err(ServerError::CompleteMultipartMissingPartChecksum {
+                            algorithm: config.algorithm().as_str().to_ascii_lowercase(),
+                            part_number: cp.part_number,
+                        });
+                    }
                 }
 
                 if let Some(ref claim) = cp.checksum {
@@ -611,8 +663,35 @@ impl Coordinator {
                         }
                     }
                 }
+            }
 
-                part_records.push(part);
+            if let Some(claimed) = claimed_checksum {
+                match checksum_config.map(MultipartChecksumConfig::algorithm) {
+                    Some(upload_algo) if claimed.algorithm() != upload_algo => {
+                        return Err(ServerError::InvalidRequest {
+                            reason: format!(
+                                "checksum header algorithm {} does not match upload algorithm {}",
+                                claimed.algorithm().as_str(),
+                                upload_algo.as_str()
+                            ),
+                        });
+                    }
+                    None if claimed
+                        .algorithm()
+                        .accepts_unconfigured_complete_multipart_header() => {}
+                    None if claimed
+                        .algorithm()
+                        .stores_unconfigured_complete_multipart_header() => {}
+                    None => {
+                        return Err(ServerError::InvalidRequestHostId {
+                            reason: format!(
+                                "Checksum Type mismatch occurred, expected checksum Type: null, actual checksum Type: {}",
+                                claimed.algorithm().as_str().to_ascii_lowercase(),
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
             }
 
             if part_records.len() > 1 {
@@ -633,14 +712,36 @@ impl Coordinator {
             etag_crc64.copy_from_slice(&etag_bytes_vec);
 
             let total_size: u64 = part_records.iter().map(|p| p.size).sum();
+            if checksum_config.is_some()
+                && parts
+                    .iter()
+                    .enumerate()
+                    .any(|(index, part)| part.part_number != (index + 1) as u32)
+            {
+                return Err(ServerError::InvalidRequest {
+                    reason:
+                        "Part numbers must be consecutive and begin with 1 when a checksum is used."
+                            .to_string(),
+                });
+            }
             if let Some(expected) = expected_object_size {
                 if expected != total_size {
                     return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "x-amz-mp-object-size {expected} does not match actual object size {total_size}"
-                    ),
-                });
+                        reason: format!(
+                            "The provided 'x-amz-mp-object-size' header value {expected} does not match what was computed: {total_size}"
+                        ),
+                    });
                 }
+            }
+            if !req.cond.is_empty() {
+                let existing_etag = completion_snapshot.existing_etag.as_deref();
+                if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
+                    return Err(ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    });
+                }
+                check_write_conditions(req.cond, existing_etag)?;
             }
             #[cfg(feature = "deep-tracing")]
             if let Some(trace) = observability::current_context() {
@@ -682,49 +783,6 @@ impl Coordinator {
                     )),
                 );
                     object_offset_start = object_offset_end_exclusive;
-                }
-            }
-
-            let checksum_value = effective_checksum_config
-                .map(|config| complete_multipart_checksum_value(config, &part_records))
-                .transpose()?;
-
-            if let Some(claimed) = claimed_checksum {
-                match checksum_config.map(MultipartChecksumConfig::algorithm) {
-                    Some(upload_algo) if claimed.algorithm() != upload_algo => {
-                        return Err(ServerError::InvalidRequest {
-                            reason: format!(
-                                "checksum header algorithm {} does not match upload algorithm {}",
-                                claimed.algorithm().as_str(),
-                                upload_algo.as_str()
-                            ),
-                        });
-                    }
-                    None if claimed
-                        .algorithm()
-                        .accepts_unconfigured_complete_multipart_header() => {}
-                    None if claimed
-                        .algorithm()
-                        .stores_unconfigured_complete_multipart_header() => {}
-                    None => {
-                        return Err(ServerError::InvalidRequestHostId {
-                            reason: format!(
-                                "Checksum Type mismatch occurred, expected checksum Type: null, actual checksum Type: {}",
-                                claimed.algorithm().as_str().to_ascii_lowercase(),
-                            ),
-                        });
-                    }
-                    _ => {}
-                }
-                claimed.validate_complete_multipart_header_value()?;
-                if checksum_config.is_some() {
-                    if let Some(ref computed) = checksum_value {
-                        if computed != claimed.encoded_value() {
-                            return Err(ServerError::ChecksumDigestMismatch {
-                                algorithm: claimed.algorithm().as_str().to_ascii_lowercase(),
-                            });
-                        }
-                    }
                 }
             }
 

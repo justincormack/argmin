@@ -5902,6 +5902,48 @@ fn complete_multipart_composite_rejects_missing_part_checksum_elements() {
 }
 
 #[test]
+fn complete_multipart_checksum_part_number_gap_is_invalid_request() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, parts) = create_checksum_upload(
+        &coord,
+        "bucket",
+        "key",
+        ChecksumAlgorithm::Sha256,
+        None,
+        &[b"omitted-part-one", b"selected-part-two"],
+    );
+
+    let err = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts[1..],
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ServerError::InvalidRequest { reason }
+            if reason
+                == "Part numbers must be consecutive and begin with 1 when a checksum is used."
+    ));
+}
+
+#[test]
 fn complete_multipart_crc32_composite_checksum() {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;

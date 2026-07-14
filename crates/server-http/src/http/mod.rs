@@ -2922,6 +2922,10 @@ impl HttpFrontend {
                     current_trace_context().request_id(),
                     self.host_id.clone(),
                 );
+                // AWS rejects unsupported conditional-header combinations before
+                // resolving the upload, but evaluates a supported condition only
+                // after all multipart completion validation has succeeded.
+                let cond = write_condition_from_headers(req)?;
                 let upload_id =
                     match parse_required_upload_id(req.query_param_lossy("uploadId").as_deref()) {
                         Ok(upload_id) => upload_id,
@@ -2953,6 +2957,24 @@ impl HttpFrontend {
                     }
                     Err(err) => return Err(err),
                 }
+                // AWS validates the value shape of these headers after resolving
+                // the upload but before parsing the completion XML.
+                let claimed_checksum = extract_encoded_checksum_header(req)?;
+                if let Some(claimed) = claimed_checksum.as_ref() {
+                    claimed.validate_complete_multipart_header_value()?;
+                }
+                let expected_object_size = req
+                    .header("x-amz-mp-object-size")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| ServerError::InvalidRequest {
+                                reason: format!(
+                                    "Value for x-amz-mp-object-size header is invalid: '{value}'"
+                                ),
+                            })
+                    })
+                    .transpose()?;
                 let parts = match xml::parse_complete_multipart_upload_xml(&req.body) {
                     Ok(parts) => parts,
                     Err(ServerError::MalformedXML { .. }) => {
@@ -2960,21 +2982,6 @@ impl HttpFrontend {
                     }
                     Err(err) => return Err(err),
                 };
-                let cond = write_condition_from_headers(req)?;
-                // Extract object-level checksum claim from request headers as a raw
-                // string. CompleteMultipartUpload checksums may be composite ("base64-N"),
-                // so we cannot decode them as plain base64.
-                let claimed_checksum = extract_encoded_checksum_header(req)?;
-                let expected_object_size = req
-                    .header("x-amz-mp-object-size")
-                    .map(|value| {
-                        value
-                            .parse::<u64>()
-                            .map_err(|_| ServerError::InvalidRequest {
-                                reason: format!("invalid x-amz-mp-object-size: {value}"),
-                            })
-                    })
-                    .transpose()?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 let result = match self.coordinator.complete_multipart_upload(
                     &crate::coordinator::CompleteMultipartUploadRequest {
@@ -10411,7 +10418,10 @@ mod tests {
             http::Method::GET,
             "",
             &format!("uploadId={upload_id}"),
-            vec![("x-amz-checksum-sha256".to_string(), "AAAAAA==".to_string())],
+            vec![(
+                "x-amz-checksum-sha256".to_string(),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            )],
             xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {

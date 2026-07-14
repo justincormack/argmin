@@ -56,9 +56,14 @@ For each matrix:
   CompleteMultipartUpload behavior where a processing failure may use either
   its ordinary error status or an error body embedded in HTTP 200. SDK-based
   tests already handle both forms; the local server uses ordinary error statuses.
-- [ ] Determine AWS precedence when several completion errors coexist; include
+- [x] Determine AWS precedence when several completion errors coexist; include
   upload existence, XML shape, part order, missing part, ETag, part size,
-  checksum, condition, and expected object size.
+  checksum, condition, and expected object size. The oracle matrix also pins
+  header-shape validation and proves that aggregate-checksum precedence is not
+  a total linear order: it beats a missing part, while an ETag mismatch beats
+  the aggregate checksum. AWS's repeatable `InternalError` for a valid,
+  checksum-configured but non-consecutive part list is covered under the
+  documented compatibility policy that permits Argmin's `InvalidRequest`.
 - [ ] Probe retries after successful completion and after abort, including object
   overwrite/delete and bucket delete/recreate histories.
 

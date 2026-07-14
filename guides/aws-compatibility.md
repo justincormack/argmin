@@ -87,6 +87,9 @@ client requests where the input is not a server fault. Known cases:
   Argmin returns `400 InvalidArgument`.
 - S3 Control `UntagResource` with more than 50 `tagKeys` query parameters.
   Argmin returns `400 InvalidTag`.
+- `CompleteMultipartUpload` for a checksum-configured upload when the supplied
+  valid parts are not consecutive from part 1, such as completing with part 2
+  alone. Argmin returns `400 InvalidRequest`.
 
 Argmin intentionally does not match the `500 InternalError` status in these
 cases. Treating malformed client input as a server fault would be the wrong

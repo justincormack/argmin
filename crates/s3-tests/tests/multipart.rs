@@ -5251,6 +5251,396 @@ fn single_part_complete_body(etag: &str) -> String {
 }
 
 #[test]
+fn test_complete_multipart_validation_precedence() {
+    s3_tests::run(async {
+        use base64::Engine;
+
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "complete-validation-precedence.txt";
+        let original =
+            put_object_retrying_operation_aborted(client, &bucket, key, b"existing".to_vec()).await;
+
+        let (_, upload_id) =
+            raw_create_upload(&bucket, key, &[("x-amz-checksum-algorithm", "SHA256")]);
+        let part_body = [b'a'; 100];
+        let part_checksum = base64::engine::general_purpose::STANDARD
+            .encode(ring::digest::digest(&ring::digest::SHA256, &part_body).as_ref());
+        let (_, etag_one) = raw_upload_part(
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            &part_body,
+            &[("x-amz-checksum-sha256", &part_checksum)],
+        );
+        let (_, etag_two) = raw_upload_part(
+            &bucket,
+            key,
+            &upload_id,
+            2,
+            &part_body,
+            &[("x-amz-checksum-sha256", &part_checksum)],
+        );
+        let wrong_object_checksum = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+
+        let cases = [
+            (
+                "invalid expected-size header before xml",
+                "<".to_string(),
+                vec![("x-amz-mp-object-size", "bad")],
+            ),
+            (
+                "invalid checksum header versus xml",
+                "<".to_string(),
+                vec![("x-amz-checksum-sha256", "bad")],
+            ),
+            (
+                "conflicting conditions versus xml",
+                "<".to_string(),
+                vec![("if-match", "*"), ("if-none-match", "*")],
+            ),
+            (
+                "part order versus missing part",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>999</PartNumber><ETag>{etag_one}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![],
+            ),
+            (
+                "part order versus object checksum",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![("x-amz-checksum-sha256", wrong_object_checksum.as_str())],
+            ),
+            (
+                "missing part versus condition",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>999</PartNumber><ETag>{etag_one}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![("if-match", "\"wrong\"")],
+            ),
+            (
+                "missing part versus object checksum",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>999</PartNumber><ETag>{etag_one}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![("x-amz-checksum-sha256", wrong_object_checksum.as_str())],
+            ),
+            (
+                "object checksum versus etag",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>1</PartNumber><ETag>\"wrong\"</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![("x-amz-checksum-sha256", wrong_object_checksum.as_str())],
+            ),
+            (
+                "etag versus condition",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>1</PartNumber><ETag>\"wrong\"</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![("if-match", "\"wrong\"")],
+            ),
+            (
+                "etag versus missing checksum",
+                "<CompleteMultipartUpload>\
+                 <Part><PartNumber>1</PartNumber><ETag>\"wrong\"</ETag></Part>\
+                 </CompleteMultipartUpload>"
+                    .to_string(),
+                vec![],
+            ),
+            (
+                "missing checksum versus condition",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![("if-match", "\"wrong\"")],
+            ),
+            (
+                "missing checksum versus size",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag></Part>\
+                     <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![],
+            ),
+            (
+                "condition versus size",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![("if-match", "\"wrong\"")],
+            ),
+            (
+                "condition versus expected size",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![("if-match", "\"wrong\""), ("x-amz-mp-object-size", "999")],
+            ),
+            (
+                "size versus expected size",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![("x-amz-mp-object-size", "999")],
+            ),
+            (
+                "expected size versus object checksum",
+                format!(
+                    "<CompleteMultipartUpload>\
+                     <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                     </CompleteMultipartUpload>"
+                ),
+                vec![
+                    ("x-amz-mp-object-size", "999"),
+                    ("x-amz-checksum-sha256", wrong_object_checksum.as_str()),
+                ],
+            ),
+        ];
+
+        for (name, body, headers) in cases {
+            let response = raw_complete_upload(&bucket, key, &upload_id, &body, &headers);
+            let (expected_status, expected_code, expected_message, may_be_embedded) = match name {
+                "invalid expected-size header before xml" => (
+                    400,
+                    "InvalidRequest",
+                    "Value for x-amz-mp-object-size header is invalid: 'bad'",
+                    false,
+                ),
+                "invalid checksum header versus xml" => (
+                    400,
+                    "InvalidRequest",
+                    "Value for x-amz-checksum-sha256 header is invalid.",
+                    false,
+                ),
+                "conflicting conditions versus xml" => (
+                    501,
+                    "NotImplemented",
+                    "A header you provided implies functionality that is not implemented",
+                    false,
+                ),
+                "part order versus missing part" | "part order versus object checksum" => (
+                    400,
+                    "InvalidPartOrder",
+                    "The list of parts was not in ascending order. Parts must be ordered by part number.",
+                    true,
+                ),
+                "missing part versus condition" => (
+                    400,
+                    "InvalidPart",
+                    "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
+                    true,
+                ),
+                "missing part versus object checksum"
+                | "expected size versus object checksum" => (
+                    400,
+                    "BadDigest",
+                    "The sha256 you specified did not match the calculated checksum.",
+                    true,
+                ),
+                "object checksum versus etag" | "etag versus condition"
+                | "etag versus missing checksum" => (
+                    400,
+                    "InvalidPart",
+                    "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
+                    true,
+                ),
+                "missing checksum versus condition" | "missing checksum versus size" => (
+                    400,
+                    "InvalidRequest",
+                    "The upload was created using a sha256 checksum. The complete request must include the checksum for each part. It was missing for part 1 in the request.",
+                    true,
+                ),
+                "condition versus size" | "size versus expected size" => (
+                    400,
+                    "EntityTooSmall",
+                    "Your proposed upload is smaller than the minimum allowed size",
+                    true,
+                ),
+                "condition versus expected size" => (
+                    400,
+                    "InvalidRequest",
+                    "The provided 'x-amz-mp-object-size' header value 999 does not match what was computed: 100",
+                    true,
+                ),
+                _ => unreachable!("unhandled precedence case {name}"),
+            };
+            assert!(
+                response.status == expected_status || (may_be_embedded && response.status == 200),
+                "{name}: unexpected response: {response:?}"
+            );
+            assert_eq!(
+                xml_tag_text(&response.body, "Code"),
+                Some(expected_code),
+                "{name}: {response:?}"
+            );
+            assert_eq!(
+                xml_tag_text(&response.body, "Message"),
+                Some(expected_message),
+                "{name}: {response:?}"
+            );
+        }
+
+        let invalid_upload_id = "a".repeat(1025);
+        for (name, headers) in [
+            (
+                "invalid upload versus expected-size header",
+                vec![("x-amz-mp-object-size", "bad")],
+            ),
+            (
+                "invalid upload versus checksum header",
+                vec![("x-amz-checksum-sha256", "bad")],
+            ),
+            (
+                "invalid upload versus conflicting conditions",
+                vec![("if-match", "*"), ("if-none-match", "*")],
+            ),
+        ] {
+            let response = raw_complete_upload(&bucket, key, &invalid_upload_id, "<", &headers);
+            let (expected_status, expected_code, expected_message) = if name
+                == "invalid upload versus conflicting conditions"
+            {
+                (
+                    501,
+                    "NotImplemented",
+                    "A header you provided implies functionality that is not implemented",
+                )
+            } else {
+                (
+                        404,
+                        "NoSuchUpload",
+                        "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
+                    )
+            };
+            assert_eq!(response.status, expected_status, "{name}: {response:?}");
+            assert_eq!(
+                xml_tag_text(&response.body, "Code"),
+                Some(expected_code),
+                "{name}: {response:?}"
+            );
+            assert_eq!(
+                xml_tag_text(&response.body, "Message"),
+                Some(expected_message),
+                "{name}: {response:?}"
+            );
+        }
+
+        let checksum_algorithm_mismatch = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &format!(
+                "<CompleteMultipartUpload>\
+                 <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag></Part>\
+                 </CompleteMultipartUpload>"
+            ),
+            &[("x-amz-checksum-crc32", "AAAAAA==")],
+        );
+        assert!(
+            checksum_algorithm_mismatch.status == 400
+                || checksum_algorithm_mismatch.status == 200,
+            "checksum algorithm mismatch versus missing part checksum: {checksum_algorithm_mismatch:?}"
+        );
+        assert_eq!(
+            xml_tag_text(&checksum_algorithm_mismatch.body, "Code"),
+            Some("InvalidRequest")
+        );
+        assert_eq!(
+            xml_tag_text(&checksum_algorithm_mismatch.body, "Message"),
+            Some(
+                "The upload was created using a sha256 checksum. The complete request must include the checksum for each part. It was missing for part 1 in the request."
+            )
+        );
+
+        let checksum_part_number_gap = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &format!(
+                "<CompleteMultipartUpload>\
+                 <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                 </CompleteMultipartUpload>"
+            ),
+            &[],
+        );
+        match (
+            checksum_part_number_gap.status,
+            xml_tag_text(&checksum_part_number_gap.body, "Code"),
+        ) {
+            (500 | 200, Some("InternalError")) => assert_eq!(
+                xml_tag_text(&checksum_part_number_gap.body, "Message"),
+                Some("We encountered an internal error. Please try again.")
+            ),
+            (400, Some("InvalidRequest")) => assert_eq!(
+                xml_tag_text(&checksum_part_number_gap.body, "Message"),
+                Some("Part numbers must be consecutive and begin with 1 when a checksum is used.")
+            ),
+            result => {
+                panic!("checksum part-number gap returned {result:?}: {checksum_part_number_gap:?}")
+            }
+        }
+
+        assert_multipart_parts_preserved(
+            &bucket,
+            key,
+            &upload_id,
+            &[
+                (1, part_body.len() as i64, &etag_one),
+                (2, part_body.len() as i64, &etag_two),
+            ],
+        )
+        .await;
+        assert_object_contents_and_etag(&bucket, key, original.e_tag().unwrap(), b"existing").await;
+
+        let corrected = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &format!(
+                "<CompleteMultipartUpload>\
+                 <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag><ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                 </CompleteMultipartUpload>"
+            ),
+            &[],
+        );
+        assert_eq!(corrected.status, 200, "corrected completion: {corrected:?}");
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        let completed_etag = xml_tag_text(&corrected.body, "ETag").unwrap();
+        assert_object_contents_and_etag(&bucket, key, completed_etag, &part_body).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_multipart_flow_response_shape() {
     s3_tests::run(async {
         let client = CTX.client();
