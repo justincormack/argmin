@@ -43,7 +43,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 7;
+const CONTROL_PLANE_RPC_VERSION: u16 = 8;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -6226,6 +6226,7 @@ pub struct ControlPlaneRuntimeMapDiagnostics {
     snapshot_metrics: observability::ControlPlaneSnapshotMetricSnapshot,
     raft_checkpoint_metrics: observability::ControlPlaneRaftCheckpointMetricSnapshot,
     raft_wal_metrics: observability::ControlPlaneRaftWalMetricSnapshot,
+    raft_command_metrics: observability::ControlPlaneRaftCommandMetricSnapshot,
     history_reference_samples: Vec<observability::ControlPlaneHistoryReferenceSample>,
 }
 
@@ -6255,6 +6256,11 @@ impl ControlPlaneRuntimeMapDiagnostics {
     #[must_use]
     pub fn raft_wal_metrics(&self) -> observability::ControlPlaneRaftWalMetricSnapshot {
         self.raft_wal_metrics
+    }
+
+    #[must_use]
+    pub fn raft_command_metrics(&self) -> observability::ControlPlaneRaftCommandMetricSnapshot {
+        self.raft_command_metrics
     }
 
     #[must_use]
@@ -12611,6 +12617,13 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, raft_wal.directory_sync_total);
     write_u64(out, raft_wal.directory_sync_us_total);
     write_u64(out, raft_wal.directory_sync_us_max);
+    let raft_command = observability::control_plane_raft_command_metrics_snapshot();
+    write_u64(out, raft_command.submit_total);
+    write_u64(out, raft_command.submit_error_total);
+    write_u64(out, raft_command.queue_wait_us_total);
+    write_u64(out, raft_command.queue_wait_us_max);
+    write_u64(out, raft_command.operation_us_total);
+    write_u64(out, raft_command.operation_us_max);
     let runtime_node_ids = runtime_map
         .nodes()
         .iter()
@@ -12723,6 +12736,14 @@ fn read_control_plane_runtime_map_diagnostics(
         directory_sync_us_total: reader.read_u64()?,
         directory_sync_us_max: reader.read_u64()?,
     };
+    let raft_command_metrics = observability::ControlPlaneRaftCommandMetricSnapshot {
+        submit_total: reader.read_u64()?,
+        submit_error_total: reader.read_u64()?,
+        queue_wait_us_total: reader.read_u64()?,
+        queue_wait_us_max: reader.read_u64()?,
+        operation_us_total: reader.read_u64()?,
+        operation_us_max: reader.read_u64()?,
+    };
     let history_reference_count =
         reader.read_collection_len("control-plane history reference samples", 31)?;
     if history_reference_count > runtime_map.nodes().len() {
@@ -12816,6 +12837,7 @@ fn read_control_plane_runtime_map_diagnostics(
         snapshot_metrics,
         raft_checkpoint_metrics,
         raft_wal_metrics,
+        raft_command_metrics,
         history_reference_samples,
     })
 }

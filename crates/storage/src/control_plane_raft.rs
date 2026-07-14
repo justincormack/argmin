@@ -1730,12 +1730,14 @@ pub struct ControlPlaneRaftAuthority {
         )>,
     >,
     checkpoint_metrics: Arc<ControlPlaneRaftCheckpointMetrics>,
+    command_metrics: Arc<ControlPlaneRaftCommandMetrics>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ControlPlaneRaftDurabilityMetricSnapshots {
     pub checkpoint: observability::ControlPlaneRaftCheckpointMetricSnapshot,
     pub wal: Option<observability::ControlPlaneRaftWalMetricSnapshot>,
+    pub command: observability::ControlPlaneRaftCommandMetricSnapshot,
 }
 
 #[derive(Debug, Default)]
@@ -1746,6 +1748,11 @@ struct ControlPlaneRaftCheckpointMetrics {
 #[derive(Debug, Default)]
 struct ControlPlaneRaftWalMetrics {
     snapshot: Mutex<observability::ControlPlaneRaftWalMetricSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct ControlPlaneRaftCommandMetrics {
+    snapshot: Mutex<observability::ControlPlaneRaftCommandMetricSnapshot>,
 }
 
 fn raft_metric_elapsed_us(elapsed: Duration) -> u64 {
@@ -1861,6 +1868,26 @@ impl ControlPlaneRaftWalMetrics {
         snapshot.directory_sync_us_total =
             snapshot.directory_sync_us_total.saturating_add(elapsed_us);
         snapshot.directory_sync_us_max = snapshot.directory_sync_us_max.max(elapsed_us);
+    }
+}
+
+impl ControlPlaneRaftCommandMetrics {
+    fn snapshot(&self) -> observability::ControlPlaneRaftCommandMetricSnapshot {
+        *lock_raft_metric_snapshot(&self.snapshot)
+    }
+
+    fn record_submission(&self, queue_wait: Duration, operation: Duration, succeeded: bool) {
+        let queue_wait_us = raft_metric_elapsed_us(queue_wait);
+        let operation_us = raft_metric_elapsed_us(operation);
+        let mut snapshot = lock_raft_metric_snapshot(&self.snapshot);
+        snapshot.submit_total = snapshot.submit_total.saturating_add(1);
+        if !succeeded {
+            snapshot.submit_error_total = snapshot.submit_error_total.saturating_add(1);
+        }
+        snapshot.queue_wait_us_total = snapshot.queue_wait_us_total.saturating_add(queue_wait_us);
+        snapshot.queue_wait_us_max = snapshot.queue_wait_us_max.max(queue_wait_us);
+        snapshot.operation_us_total = snapshot.operation_us_total.saturating_add(operation_us);
+        snapshot.operation_us_max = snapshot.operation_us_max.max(operation_us);
     }
 }
 
@@ -3679,6 +3706,7 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
+            command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
     }
 
@@ -3699,6 +3727,7 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
+            command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
     }
 
@@ -3720,6 +3749,7 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
+            command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
     }
 
@@ -3736,6 +3766,7 @@ impl ControlPlaneRaftAuthority {
                 .log_store
                 .as_ref()
                 .and_then(ControlPlaneRaftLogStore::wal_metric_snapshot),
+            command: self.command_metrics.snapshot(),
         }
     }
 
@@ -4019,9 +4050,28 @@ impl ControlPlaneRaftAuthority {
 
     pub async fn submit_control_plane_command(
         &self,
+        command: ControlPlaneCommand,
+    ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+        let queue_started = Instant::now();
+        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
+        let queue_wait = queue_started.elapsed();
+        let operation_started = Instant::now();
+        let result = self.submit_control_plane_command_locked(command).await;
+        let operation = operation_started.elapsed();
+        observability::record_control_plane_raft_command_submission(
+            queue_wait,
+            operation,
+            result.is_ok(),
+        );
+        self.command_metrics
+            .record_submission(queue_wait, operation, result.is_ok());
+        result
+    }
+
+    async fn submit_control_plane_command_locked(
+        &self,
         mut command: ControlPlaneCommand,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
-        let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
         let status = self.status().await?;
         let authority_term = status
             .linearized_authority_serving()
@@ -16021,6 +16071,48 @@ mod tests {
             assert_eq!(
                 status.latest_metadata_transfer_fence_source_lease_deadline_ms(),
                 None
+            );
+
+            let command_metrics_before = authority.durability_metric_snapshots().command;
+            let update_guard = authority.volatile_heartbeat_update_gate.lock().await;
+            let mut queued_submission = Box::pin(authority.submit_control_plane_command(
+                ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(100),
+                    availability: NodeAvailabilityState::Healthy,
+                },
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), queued_submission.as_mut())
+                    .await
+                    .is_err(),
+                "command submission should wait behind the authority update gate"
+            );
+            drop(update_guard);
+            let queued = queued_submission.await.unwrap();
+            assert!(matches!(
+                queued.outcome(),
+                ControlPlaneRaftCommandOutcome::Rejected(ControlPlaneError::UnknownNode {
+                    node_id
+                }) if *node_id == 100
+            ));
+            let command_metrics_after = authority.durability_metric_snapshots().command;
+            assert_eq!(
+                command_metrics_after.submit_total,
+                command_metrics_before.submit_total + 1
+            );
+            assert_eq!(
+                command_metrics_after.submit_error_total, command_metrics_before.submit_error_total,
+                "a deterministic state-machine rejection is still a successful Raft submission"
+            );
+            assert!(
+                command_metrics_after.queue_wait_us_total
+                    > command_metrics_before.queue_wait_us_total,
+                "queued command should record authority gate wait time"
+            );
+            assert!(
+                command_metrics_after.operation_us_total
+                    > command_metrics_before.operation_us_total,
+                "queued command should record guarded submission time"
             );
 
             authority.shutdown().await.unwrap();

@@ -1530,6 +1530,7 @@ fn format_control_plane_runtime_map_diagnostics(
         diagnostics.snapshot_metrics(),
         diagnostics.raft_checkpoint_metrics(),
         diagnostics.raft_wal_metrics(),
+        diagnostics.raft_command_metrics(),
         diagnostics.history_reference_samples(),
     )
 }
@@ -1540,6 +1541,7 @@ fn format_control_plane_runtime_map_diagnostics_parts(
     snapshot: observability::ControlPlaneSnapshotMetricSnapshot,
     raft_checkpoint: observability::ControlPlaneRaftCheckpointMetricSnapshot,
     raft_wal: observability::ControlPlaneRaftWalMetricSnapshot,
+    raft_command: observability::ControlPlaneRaftCommandMetricSnapshot,
     history_reference_samples: &[observability::ControlPlaneHistoryReferenceSample],
 ) -> String {
     let active_serving_pg_routes = runtime_map
@@ -1668,6 +1670,16 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         raft_wal.directory_sync_total,
         raft_wal.directory_sync_us_total,
         raft_wal.directory_sync_us_max,
+    ));
+    output.push('\n');
+    output.push_str(&format!(
+        "control_plane_raft_command submit_total={} submit_error_total={} queue_wait_us_total={} queue_wait_us_max={} operation_us_total={} operation_us_max={}",
+        raft_command.submit_total,
+        raft_command.submit_error_total,
+        raft_command.queue_wait_us_total,
+        raft_command.queue_wait_us_max,
+        raft_command.operation_us_total,
+        raft_command.operation_us_max,
     ));
     output
 }
@@ -11972,6 +11984,14 @@ mod tests {
                 directory_sync_total: 14,
                 ..observability::ControlPlaneRaftWalMetricSnapshot::default()
             },
+            observability::ControlPlaneRaftCommandMetricSnapshot {
+                submit_total: 15,
+                submit_error_total: 1,
+                queue_wait_us_total: 16,
+                queue_wait_us_max: 17,
+                operation_us_total: 18,
+                operation_us_max: 19,
+            },
             &[observability::ControlPlaneHistoryReferenceSample {
                 node_id: 2,
                 observed_epoch: floor_epoch.get(),
@@ -12000,6 +12020,12 @@ mod tests {
         assert!(
             diagnostics.contains(
                 "control_plane_raft_wal append_total=12 append_error_total=0 append_us_total=0 append_us_max=0 lock_wait_us_total=0 lock_wait_us_max=0 frame_bytes_total=0 frame_bytes_last=345 frame_bytes_max=0 file_sync_total=13 file_sync_us_total=0 file_sync_us_max=0 directory_sync_total=14"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "control_plane_raft_command submit_total=15 submit_error_total=1 queue_wait_us_total=16 queue_wait_us_max=17 operation_us_total=18 operation_us_max=19"
             ),
             "{diagnostics}"
         );

@@ -278,6 +278,12 @@ static CONTROL_PLANE_RAFT_WAL_FILE_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_COMMAND_SUBMIT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_COMMAND_SUBMIT_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_COMMAND_QUEUE_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_COMMAND_QUEUE_WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_COMMAND_OPERATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_RAFT_COMMAND_OPERATION_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_HISTORY_REFERENCE_SAMPLES: OnceLock<
     Mutex<BTreeMap<u32, ControlPlaneHistoryReferenceSample>>,
 > = OnceLock::new();
@@ -638,6 +644,35 @@ pub fn control_plane_raft_wal_metrics_snapshot() -> ControlPlaneRaftWalMetricSna
     }
 }
 
+pub fn record_control_plane_raft_command_submission(
+    queue_wait: Duration,
+    operation: Duration,
+    succeeded: bool,
+) {
+    let queue_wait_us = elapsed_us(queue_wait);
+    let operation_us = elapsed_us(operation);
+    CONTROL_PLANE_RAFT_COMMAND_SUBMIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !succeeded {
+        CONTROL_PLANE_RAFT_COMMAND_SUBMIT_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    CONTROL_PLANE_RAFT_COMMAND_QUEUE_WAIT_US_TOTAL.fetch_add(queue_wait_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_COMMAND_QUEUE_WAIT_US_MAX, queue_wait_us);
+    CONTROL_PLANE_RAFT_COMMAND_OPERATION_US_TOTAL.fetch_add(operation_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_RAFT_COMMAND_OPERATION_US_MAX, operation_us);
+}
+
+#[must_use]
+pub fn control_plane_raft_command_metrics_snapshot() -> ControlPlaneRaftCommandMetricSnapshot {
+    ControlPlaneRaftCommandMetricSnapshot {
+        submit_total: CONTROL_PLANE_RAFT_COMMAND_SUBMIT_TOTAL.load(Ordering::Relaxed),
+        submit_error_total: CONTROL_PLANE_RAFT_COMMAND_SUBMIT_ERROR_TOTAL.load(Ordering::Relaxed),
+        queue_wait_us_total: CONTROL_PLANE_RAFT_COMMAND_QUEUE_WAIT_US_TOTAL.load(Ordering::Relaxed),
+        queue_wait_us_max: CONTROL_PLANE_RAFT_COMMAND_QUEUE_WAIT_US_MAX.load(Ordering::Relaxed),
+        operation_us_total: CONTROL_PLANE_RAFT_COMMAND_OPERATION_US_TOTAL.load(Ordering::Relaxed),
+        operation_us_max: CONTROL_PLANE_RAFT_COMMAND_OPERATION_US_MAX.load(Ordering::Relaxed),
+    }
+}
+
 impl ControlPlaneRpcMetricCounters {
     fn new() -> Self {
         Self {
@@ -722,6 +757,16 @@ pub struct ControlPlaneRaftWalMetricSnapshot {
     pub directory_sync_total: u64,
     pub directory_sync_us_total: u64,
     pub directory_sync_us_max: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneRaftCommandMetricSnapshot {
+    pub submit_total: u64,
+    pub submit_error_total: u64,
+    pub queue_wait_us_total: u64,
+    pub queue_wait_us_max: u64,
+    pub operation_us_total: u64,
+    pub operation_us_max: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

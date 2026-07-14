@@ -11227,7 +11227,7 @@ Required production shape and implementation order:
    explicitly authenticated renewal contract if it can safely avoid resending
    unchanged routes.
    The first frontend compact-renewal slice is now implemented. Runtime-map
-   status RPC version 7 carries a bounded serving-authority freshness proof,
+   status RPC version 8 carries a bounded serving-authority freshness proof,
    map validity, and a domain-separated SHA-256 digest of canonical route
    content. The digest binds epoch, node identities/endpoints/history floors,
    current and sparse historical routes, retained epochs, transfer proofs and
@@ -11627,8 +11627,14 @@ Phase 12.4 progress:
   measurements cover vote, log-entry batch, committed-watermark, truncation,
   and purge records through their shared durable append boundary. Focused tests
   pin successful multi-record byte/sync accounting and ambiguous file-sync
-  failure accounting. Authority commit queue wait is still a separate required
-  measurement before changing ordinary peer acknowledgement durability.
+  failure accounting. The authority command path now also measures submission
+  count/errors, wait at the existing serialized update gate, and guarded
+  operation duration. These counters are authority-scoped for deterministic
+  release tests and exported through authenticated runtime-map diagnostics; a
+  contention regression holds the real update gate and proves the queued
+  command records wait without introducing a second queue. This closes the
+  required commit-queue measurement before changing ordinary peer
+  acknowledgement durability.
 - Added physical WAL prefix compaction after durable restart-artifact
   checkpointing. WAL files now carry a small CRC-protected file header with the
   logical base offset, replay maps artifact offsets through that header, and
