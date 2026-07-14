@@ -5119,7 +5119,7 @@ const RAFT_ENTRY_MIN_LEN: usize = 8 + 8 + 8 + 1;
 const RAFT_MEMBERSHIP_CONFIG_MIN_LEN: usize = 4;
 const RAFT_MEMBERSHIP_NODE_MIN_LEN: usize = 8 + 4;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct ControlPlaneRaftLogStoreInner {
     vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
@@ -5614,6 +5614,9 @@ impl ControlPlaneRaftLogStore {
     ) -> Result<(), io::Error> {
         let mut candidate = inner.clone();
         record.apply_to_log_store_inner(&mut candidate)?;
+        if candidate == *inner {
+            return Ok(());
+        }
         if let Some(wal) = &self.wal {
             if let Err(error) = wal.append_record_for_log_store(record) {
                 match error {
@@ -13916,6 +13919,62 @@ mod tests {
                 "WAL-backed log store should report a positive clean WAL length after mutations: {durability:?}"
             );
             assert_eq!(durability.wal_poisoned, None);
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_wal_backed_log_store_skips_idempotent_records() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let wal = test_raft_wal_file(tmp.path().join("raft.wal"), "test-cluster", 1);
+            let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                ControlPlaneRaftLogStoreRestartArtifact::default(),
+                wal,
+            )
+            .expect("WAL-backed log store should initialize");
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            let committed = raft_log_id(3, 1, 1);
+            let purged = raft_log_id(0, 1, 0);
+
+            RaftLogStorage::append(
+                &mut store,
+                vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
+            RaftLogStorage::save_committed(&mut store, Some(committed))
+                .await
+                .unwrap();
+            RaftLogStorage::purge(&mut store, purged).await.unwrap();
+
+            let before_state = store.export_restart_artifact().unwrap();
+            let before_offsets = store
+                .status_snapshot()
+                .unwrap()
+                .durability
+                .wal_offsets
+                .expect("WAL-backed log store should report offsets");
+
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
+            RaftLogStorage::save_committed(&mut store, Some(committed))
+                .await
+                .unwrap();
+            RaftLogStorage::append(&mut store, Vec::new(), IOFlushed::noop())
+                .await
+                .unwrap();
+            RaftLogStorage::truncate_after(&mut store, Some(committed))
+                .await
+                .unwrap();
+            RaftLogStorage::purge(&mut store, purged).await.unwrap();
+
+            assert_eq!(store.export_restart_artifact().unwrap(), before_state);
+            assert_eq!(
+                store.status_snapshot().unwrap().durability.wal_offsets,
+                Some(before_offsets),
+                "idempotent storage operations must not grow the WAL"
+            );
         });
     }
 
