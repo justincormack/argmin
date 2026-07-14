@@ -276,6 +276,7 @@ The repository now uses role-based test configuration names in `.env`:
 - `TEST_S3_BUCKET_PREFIX`
 - `TEST_S3_TIMEOUT_SECS`
 - optional `TEST_S3_ENDPOINT`
+- optional `TEST_S3_CONTROL_ENDPOINT`
 
 `PRIMARY` is the main AWS test user, `ALT` is a user from a different AWS
 account, `OWNER_ROOT` is the root credential for the primary account, and
@@ -356,6 +357,13 @@ The external `s3-tests` harness hard-fails if any of these are missing:
   - Prefer `https://...` for full coverage.
   - `http://...` is allowed for partial runs, but tests that explicitly require
     HTTPS will fail.
+- `S3_TEST_S3_CONTROL_ENDPOINT`
+  - Endpoint used for the narrow S3 Control test surface. The harness does not
+    infer it from the ordinary S3 endpoint or identify AWS by hostname.
+  - `./scripts/aws-tests` derives the AWS account-prefixed endpoint by default;
+    `./scripts/uat-s3-tests` uses the standalone local server endpoint.
+  - Embedded local `cargo test` runs set it to the embedded server endpoint
+    automatically.
 - `S3_TEST_ACCESS_KEY`
 - `S3_TEST_SECRET_KEY`
 - `S3_TEST_ACCOUNT_ID`
@@ -498,6 +506,7 @@ Recommended command:
 ```bash
 eval "$(grep = .env)" && \
 S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+S3_TEST_S3_CONTROL_ENDPOINT=https://111122223333.s3-control.us-east-1.amazonaws.com \
 S3_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY" \
 S3_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY" \
 S3_TEST_REGION="${TEST_S3_REGION:-us-east-1}" \

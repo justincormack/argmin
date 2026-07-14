@@ -16,6 +16,8 @@ Extra arguments are passed directly to `cargo test -p s3-tests`.
 Options:
   --region REGION         Override `S3_TEST_REGION` (default: TEST_S3_REGION or us-east-1)
   --endpoint URL          Override `S3_TEST_ENDPOINT` (default: TEST_S3_ENDPOINT or derived from region)
+  --s3-control-endpoint URL
+                          Override `S3_TEST_S3_CONTROL_ENDPOINT` (default: TEST_S3_CONTROL_ENDPOINT or derived from account and region)
   --bucket-prefix PREFIX  Override `S3_TEST_BUCKET_PREFIX` (default: TEST_S3_BUCKET_PREFIX or claude-s3-)
   --timeout-secs SECS     Override `S3_TEST_TIMEOUT_SECS` (default: TEST_S3_TIMEOUT_SECS or 120)
   --dotenv PATH           Read AWS variables from a different env file
@@ -30,6 +32,7 @@ EOF
 
 region=""
 endpoint=""
+s3_control_endpoint=""
 bucket_prefix=""
 timeout_secs=""
 dotenv_path="$ROOT/.env"
@@ -45,6 +48,11 @@ while (($#)); do
         --endpoint)
             [[ $# -ge 2 ]] || external_s3_test_die "--endpoint requires a value"
             endpoint="$2"
+            shift 2
+            ;;
+        --s3-control-endpoint)
+            [[ $# -ge 2 ]] || external_s3_test_die "--s3-control-endpoint requires a value"
+            s3_control_endpoint="$2"
             shift 2
             ;;
         --bucket-prefix)
@@ -84,7 +92,14 @@ bucket_prefix="${bucket_prefix:-${TEST_S3_BUCKET_PREFIX:-claude-s3-}}"
 timeout_secs="${timeout_secs:-${TEST_S3_TIMEOUT_SECS:-120}}"
 endpoint="${endpoint:-${TEST_S3_ENDPOINT:-}}"
 endpoint="${endpoint:-$(external_s3_test_default_endpoint "$region")}"
-external_s3_test_export_common_env "$region" "$endpoint" "$bucket_prefix" "$timeout_secs"
+s3_control_endpoint="${s3_control_endpoint:-${TEST_S3_CONTROL_ENDPOINT:-}}"
+s3_control_endpoint="${s3_control_endpoint:-$(external_s3_test_default_s3_control_endpoint "$TEST_AWS_PRIMARY_ACCOUNT_ID" "$region")}"
+external_s3_test_export_common_env \
+    "$region" \
+    "$endpoint" \
+    "$bucket_prefix" \
+    "$timeout_secs" \
+    "$s3_control_endpoint"
 
 cmd=(cargo test -p s3-tests --no-fail-fast)
 cmd+=("${cargo_args[@]}")

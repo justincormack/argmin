@@ -12,8 +12,8 @@ use aws_sdk_s3::types::{
     Tag, Tagging, VersioningConfiguration,
 };
 use s3_tests::{
-    put_bucket_lifecycle_with_md5, send_signed_request_to_endpoint_for_service_with_credentials,
-    unique_bucket, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
+    put_bucket_lifecycle_with_md5, send_signed_request_for_service_with_credentials, unique_bucket,
+    SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
@@ -345,26 +345,6 @@ fn percent_encode_path_segment(value: &str) -> String {
     out
 }
 
-fn bucket_abac_control_endpoint() -> String {
-    if CTX.tls_ca_pem().is_some() || !CTX.endpoint().contains("amazonaws.com") {
-        CTX.endpoint().to_string()
-    } else {
-        format!(
-            "https://{}.s3-control.{}.amazonaws.com",
-            CTX.account_id(),
-            CTX.region()
-        )
-    }
-}
-
-fn bucket_abac_connect_endpoint() -> String {
-    if CTX.tls_ca_pem().is_some() || !CTX.endpoint().contains("amazonaws.com") {
-        CTX.endpoint().to_string()
-    } else {
-        bucket_abac_control_endpoint()
-    }
-}
-
 fn raw_primary_credentials() -> SignedRequestCredentials<'static> {
     SignedRequestCredentials {
         access_key: CTX.access_key(),
@@ -389,15 +369,11 @@ fn tag_resource_body(tags: &[(&str, &str)]) -> String {
 }
 
 fn tag_resource(bucket: &str, tags: &[(&str, &str)]) -> s3_tests::RawResponse {
-    let endpoint = bucket_abac_control_endpoint();
-    let connect_endpoint = bucket_abac_connect_endpoint();
     let resource = percent_encode_path_segment(&bucket_resource_arn(bucket));
-    let signed_url = format!("{endpoint}/v20180820/tags/{resource}");
-    let connect_url = format!("{connect_endpoint}/v20180820/tags/{resource}");
-    send_signed_request_to_endpoint_for_service_with_credentials(
+    let url = format!("{}/v20180820/tags/{resource}", CTX.s3_control_endpoint());
+    send_signed_request_for_service_with_credentials(
         "POST",
-        &connect_url,
-        &signed_url,
+        &url,
         tag_resource_body(tags).as_bytes(),
         [("x-amz-account-id", CTX.account_id())],
         "s3",
@@ -406,20 +382,19 @@ fn tag_resource(bucket: &str, tags: &[(&str, &str)]) -> s3_tests::RawResponse {
 }
 
 fn untag_resource(bucket: &str, tag_keys: &[&str]) -> s3_tests::RawResponse {
-    let endpoint = bucket_abac_control_endpoint();
-    let connect_endpoint = bucket_abac_connect_endpoint();
     let resource = percent_encode_path_segment(&bucket_resource_arn(bucket));
     let query = tag_keys
         .iter()
         .map(|key| format!("tagKeys={}", percent_encode_path_segment(key)))
         .collect::<Vec<_>>()
         .join("&");
-    let signed_url = format!("{endpoint}/v20180820/tags/{resource}?{query}");
-    let connect_url = format!("{connect_endpoint}/v20180820/tags/{resource}?{query}");
-    send_signed_request_to_endpoint_for_service_with_credentials(
+    let url = format!(
+        "{}/v20180820/tags/{resource}?{query}",
+        CTX.s3_control_endpoint()
+    );
+    send_signed_request_for_service_with_credentials(
         "DELETE",
-        &connect_url,
-        &signed_url,
+        &url,
         &[],
         [("x-amz-account-id", CTX.account_id())],
         "s3",

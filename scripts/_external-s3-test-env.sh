@@ -31,11 +31,18 @@ external_s3_test_default_endpoint() {
     printf 'https://s3.%s.amazonaws.com\n' "$region"
 }
 
+external_s3_test_default_s3_control_endpoint() {
+    local account_id="$1"
+    local region="$2"
+    printf 'https://%s.s3-control.%s.amazonaws.com\n' "$account_id" "$region"
+}
+
 external_s3_test_export_common_env() {
     local region="$1"
     local endpoint="$2"
     local bucket_prefix="$3"
     local timeout_secs="$4"
+    local s3_control_endpoint="$5"
 
     external_s3_test_require_shell_var TEST_AWS_PRIMARY_ACCESS_KEY
     external_s3_test_require_shell_var TEST_AWS_PRIMARY_SECRET_KEY
@@ -45,6 +52,7 @@ external_s3_test_export_common_env() {
     external_s3_test_require_shell_var TEST_AWS_ALT_ACCOUNT_ID
 
     export S3_TEST_ENDPOINT="$endpoint"
+    export S3_TEST_S3_CONTROL_ENDPOINT="$s3_control_endpoint"
     export S3_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY"
     export S3_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
     export S3_TEST_ACCOUNT_ID="$TEST_AWS_PRIMARY_ACCOUNT_ID"

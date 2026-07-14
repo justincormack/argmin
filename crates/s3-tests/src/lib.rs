@@ -83,6 +83,7 @@ pub struct TestContext {
     owner_root_client: Option<Client>,
     alt_client: Client,
     endpoint: String,
+    s3_control_endpoint: String,
     access_key: String,
     secret_key: String,
     alt_access_key: String,
@@ -101,6 +102,7 @@ impl TestContext {
     /// server or connect to an external endpoint:
     ///
     /// - `S3_TEST_ENDPOINT`: external endpoint URL
+    /// - `S3_TEST_S3_CONTROL_ENDPOINT`: external S3 Control endpoint URL
     /// - `S3_TEST_ACCESS_KEY`: primary access key
     /// - `S3_TEST_SECRET_KEY`: primary secret key
     /// - `S3_TEST_ACCOUNT_ID`: primary AWS account ID
@@ -130,6 +132,14 @@ impl TestContext {
             assert!(
                 endpoint.starts_with("https://") || endpoint.starts_with("http://"),
                 "S3_TEST_ENDPOINT must use http:// or https://; https:// is recommended for full external s3-tests coverage; got {endpoint}"
+            );
+            let s3_control_endpoint = std::env::var("S3_TEST_S3_CONTROL_ENDPOINT").expect(
+                "S3_TEST_S3_CONTROL_ENDPOINT required with S3_TEST_ENDPOINT; set it to the S3 Control endpoint used by this test target",
+            );
+            assert!(
+                s3_control_endpoint.starts_with("https://")
+                    || s3_control_endpoint.starts_with("http://"),
+                "S3_TEST_S3_CONTROL_ENDPOINT must use http:// or https://; got {s3_control_endpoint}"
             );
             let access_key = std::env::var("S3_TEST_ACCESS_KEY")
                 .expect("S3_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
@@ -237,6 +247,7 @@ impl TestContext {
                 owner_root_client,
                 alt_client,
                 endpoint,
+                s3_control_endpoint,
                 access_key,
                 secret_key,
                 alt_access_key,
@@ -251,6 +262,7 @@ impl TestContext {
             // Local server mode
             let server = TestServer::start().await;
             let endpoint = server.endpoint().to_string();
+            let s3_control_endpoint = endpoint.clone();
             let client = build_client_with_ca(
                 &endpoint,
                 server::TEST_ACCESS_KEY,
@@ -285,6 +297,7 @@ impl TestContext {
                 owner_root_client,
                 alt_client,
                 endpoint,
+                s3_control_endpoint,
                 access_key: server::TEST_ACCESS_KEY.to_string(),
                 secret_key: server::TEST_SECRET_KEY.to_string(),
                 alt_access_key: server::ALT_ACCESS_KEY.to_string(),
@@ -339,6 +352,11 @@ impl TestContext {
     /// The HTTP endpoint URL (e.g. "http://127.0.0.1:12345").
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// The endpoint URL for S3 Control requests.
+    pub fn s3_control_endpoint(&self) -> &str {
+        &self.s3_control_endpoint
     }
 
     /// The local test server CA, if running against the embedded HTTPS server.
