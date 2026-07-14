@@ -11195,7 +11195,12 @@ Required production shape and implementation order:
    status reads over the same 116-PG, 256-epoch state; it requires all serving
    operations to succeed, the applied log and WAL offsets to remain unchanged,
    exactly eight checkpoint stores, and zero WAL append/sync deltas, while
-   reporting checkpoint and request latency maxima.
+   reporting checkpoint and request latency maxima. The release accounting also
+   reports horizon-window checkpoint/WAL store and sync duration totals plus
+   accurately labelled authority-lifetime maxima; monotonic maximum counters
+   are not subtracted as though they were interval maxima. Concurrent
+   checkpoint timing reports summed call latency, whole-batch wall time, and
+   the maximum individual call separately.
    The public split boundary is authority-instance-bound and internally
    serialized. Before any artifact encoding or filesystem mutation,
    persistence rejects a token captured by another authority, a WAL replay
