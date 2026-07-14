@@ -328,6 +328,55 @@ wait_for_streaming_bucket_policy_success() {
     echo "streaming-bucket-policy-success: ok"
 }
 
+wait_for_session_context_bucket_policy_success() {
+    local attempt consecutive_successes=0 empty_body error_file key ready=false
+    local -a keys=(
+        context-role-principal
+        context-session-principal
+        context-principal-arn-role
+        context-userid-match
+        context-token-issue-after-lower
+        context-token-issue-before-upper
+        context-token-issue-deny-before-lower
+    )
+
+    empty_body="$tmpdir/session-context-empty-body"
+    error_file="$tmpdir/session-context-bucket-policy-convergence.err"
+    : >"$empty_body"
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        local all_succeeded=true
+        for key in "${keys[@]}"; do
+            if ! aws_with_session_credentials \
+                "$S3_TEST_STS_RECREATED_ROLE_ACCESS_KEY" \
+                "$S3_TEST_STS_RECREATED_ROLE_SECRET_KEY" \
+                "$S3_TEST_STS_RECREATED_ROLE_SESSION_TOKEN" \
+                s3api put-object \
+                --bucket "$S3_TEST_STS_POST_BUCKET" \
+                --key "$key" \
+                --body "$empty_body" >/dev/null 2>"$error_file"; then
+                all_succeeded=false
+                break
+            fi
+        done
+        if [[ "$all_succeeded" == true ]]; then
+            ((consecutive_successes += 1))
+            if ((consecutive_successes == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_successes=0
+        fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        cat "$error_file" >&2
+        external_s3_test_die \
+            "session-context bucket policy did not converge to PutObject success"
+    fi
+    echo "session-context-bucket-policy-success: ok"
+}
+
 declare -a created_role_names=()
 created_bucket=""
 tmpdir=""
@@ -431,7 +480,8 @@ create_assume_role_fixture() {
     local chain_source_identity chain_source_session chain_target_max_duration default_max_duration
     local deleted_role_identity deleted_role_session deleted_role_stable_id identity_decision identity_simulation missing_role_error
     local other_live_access_key other_live_identity other_live_secret_key other_live_session other_live_session_token
-    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix source_identity_session streaming_bucket_policy trust_chain_source trust_chain_source_with_set trust_default_max trust_external_id trust_policy trust_source_identity trust_source_identity_condition trust_source_identity_target
+    local recreated_expiration recreated_expiration_epoch recreated_issue_epoch
+    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix source_identity_session streaming_bucket_policy trust_chain_source trust_chain_source_with_set trust_default_max trust_external_id trust_policy trust_recreated_role_revoked trust_source_identity trust_source_identity_condition trust_source_identity_target
     primary_identity="$(aws_primary sts get-caller-identity --output json)"
     primary_account="$(jq -er '.Account' <<<"$primary_identity")"
     primary_arn="$(jq -er '.Arn' <<<"$primary_identity")"
@@ -891,27 +941,175 @@ create_assume_role_fixture() {
     [[ "$(jq -er '.Arn' <<<"$recreated_role_identity")" == \
         "arn:aws:sts::${primary_account}:assumed-role/${S3_TEST_STS_DELETED_ROLE_NAME}/${S3_TEST_STS_RECREATED_ROLE_SESSION_NAME}" ]] || \
         external_s3_test_die "recreated-role session has an unexpected caller ARN"
+    export S3_TEST_STS_RECREATED_ROLE_ARN="$S3_TEST_STS_DELETED_ROLE_ARN"
+    export S3_TEST_STS_RECREATED_SESSION_ARN
+    S3_TEST_STS_RECREATED_SESSION_ARN="arn:aws:sts::${primary_account}:assumed-role/${S3_TEST_STS_DELETED_ROLE_NAME}/${S3_TEST_STS_RECREATED_ROLE_SESSION_NAME}"
+    export S3_TEST_STS_RECREATED_USER_ID="${recreated_role_stable_id}:${S3_TEST_STS_RECREATED_ROLE_SESSION_NAME}"
     echo "same-account-recreated-role-session: ok"
     wait_for_deleted_role_session_invalid same-account-old-session-after-role-recreation
 
+    export S3_TEST_STS_TOKEN_ISSUE_LOWER_BOUND
+    export S3_TEST_STS_TOKEN_ISSUE_UPPER_BOUND
+    recreated_expiration="$(jq -er '.Credentials.Expiration' <<<"$recreated_role_session")"
+    recreated_expiration_epoch="$(date -u -d "$recreated_expiration" '+%s')"
+    recreated_issue_epoch=$((recreated_expiration_epoch - 3600))
+    S3_TEST_STS_TOKEN_ISSUE_LOWER_BOUND="$(date -u \
+        -d "@$((recreated_issue_epoch - 1))" '+%Y-%m-%dT%H:%M:%SZ')"
+    S3_TEST_STS_TOKEN_ISSUE_UPPER_BOUND="$(date -u \
+        -d "@$((recreated_issue_epoch + 1))" '+%Y-%m-%dT%H:%M:%SZ')"
+
     streaming_bucket_policy="$tmpdir/streaming-bucket-policy.json"
     jq -n \
-        --arg principal "$S3_TEST_STS_DELETED_ROLE_ARN" \
-        --arg resource "arn:aws:s3:::${S3_TEST_STS_POST_BUCKET}/streaming-*" \
+        --arg role_principal "$S3_TEST_STS_RECREATED_ROLE_ARN" \
+        --arg session_principal "$S3_TEST_STS_RECREATED_SESSION_ARN" \
+        --arg user_id "$S3_TEST_STS_RECREATED_USER_ID" \
+        --arg lower_bound "$S3_TEST_STS_TOKEN_ISSUE_LOWER_BOUND" \
+        --arg upper_bound "$S3_TEST_STS_TOKEN_ISSUE_UPPER_BOUND" \
+        --arg bucket_arn "arn:aws:s3:::${S3_TEST_STS_POST_BUCKET}" \
         '{
             Version: "2012-10-17",
-            Statement: [{
-                Sid: "AllowRecreatedRoleStreamingOracle",
-                Effect: "Allow",
-                Principal: {AWS: $principal},
-                Action: "s3:PutObject",
-                Resource: $resource
-            }]
+            Statement: [
+                {
+                    Sid: "AllowRecreatedRoleStreamingOracle",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/streaming-*")
+                },
+                {
+                    Sid: "AllowIamRolePrincipal",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-role-principal")
+                },
+                {
+                    Sid: "AllowExactSessionPrincipal",
+                    Effect: "Allow",
+                    Principal: {AWS: $session_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-session-principal")
+                },
+                {
+                    Sid: "AllowRolePrincipalArnCondition",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-principal-arn-role"),
+                    Condition: {ArnEquals: {"aws:PrincipalArn": $role_principal}}
+                },
+                {
+                    Sid: "RejectSessionPrincipalArnCondition",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-principal-arn-session"),
+                    Condition: {ArnEquals: {"aws:PrincipalArn": $session_principal}}
+                },
+                {
+                    Sid: "AllowRoleUserIdCondition",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-userid-match"),
+                    Condition: {StringEquals: {"aws:userid": $user_id}}
+                },
+                {
+                    Sid: "RejectWrongRoleUserIdCondition",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-userid-mismatch"),
+                    Condition: {StringEquals: {"aws:userid": ($user_id + "-wrong")}}
+                },
+                {
+                    Sid: "AllowTokenIssuedAfterLowerBound",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-token-issue-after-lower"),
+                    Condition: {DateGreaterThan: {"aws:TokenIssueTime": $lower_bound}}
+                },
+                {
+                    Sid: "AllowTokenIssuedBeforeUpperBound",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-token-issue-before-upper"),
+                    Condition: {DateLessThan: {"aws:TokenIssueTime": $upper_bound}}
+                },
+                {
+                    Sid: "RejectTokenIssuedBeforeLowerBound",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-token-issue-before-lower"),
+                    Condition: {DateLessThan: {"aws:TokenIssueTime": $lower_bound}}
+                },
+                {
+                    Sid: "RejectTokenIssuedAfterUpperBound",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-token-issue-after-upper"),
+                    Condition: {DateGreaterThan: {"aws:TokenIssueTime": $upper_bound}}
+                },
+                {
+                    Sid: "AllowFalseTokenIssueDenyControl",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-token-issue-deny-before-lower")
+                },
+                {
+                    Sid: "DenyTokensIssuedBeforeLowerBound",
+                    Effect: "Deny",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-token-issue-deny-before-lower"),
+                    Condition: {DateLessThan: {"aws:TokenIssueTime": $lower_bound}}
+                },
+                {
+                    Sid: "AllowTrueTokenIssueDenyControl",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-token-issue-deny-before-upper")
+                },
+                {
+                    Sid: "DenyTokensIssuedBeforeUpperBound",
+                    Effect: "Deny",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-token-issue-deny-before-upper"),
+                    Condition: {DateLessThan: {"aws:TokenIssueTime": $upper_bound}}
+                }
+            ]
         }' >"$streaming_bucket_policy"
     aws_primary s3api put-bucket-policy \
         --bucket "$S3_TEST_STS_POST_BUCKET" \
         --policy "file://${streaming_bucket_policy}"
     wait_for_streaming_bucket_policy_success
+    wait_for_session_context_bucket_policy_success
+
+    trust_recreated_role_revoked="$tmpdir/trust-recreated-role-revoked.json"
+    jq -n --arg principal "$primary_arn" '{
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Principal: {AWS: $principal},
+            Action: "sts:AssumeRole",
+            Condition: {StringEquals: {"sts:ExternalId": "revoked-for-oracle"}}
+        }]
+    }' >"$trust_recreated_role_revoked"
+    aws_primary iam update-assume-role-policy \
+        --role-name "$S3_TEST_STS_DELETED_ROLE_NAME" \
+        --policy-document "file://${trust_recreated_role_revoked}"
+    wait_for_assume_role_denied \
+        same-account-recreated-role-trust-revoked \
+        aws_primary \
+        "$S3_TEST_STS_RECREATED_ROLE_ARN"
+    wait_for_session_context_bucket_policy_success
 }
 
 assert_identity_decision() {

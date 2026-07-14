@@ -668,6 +668,183 @@ fn run_s3_header_session_authentication_probes(
     }
 }
 
+struct S3SessionContextProbeSet<'a> {
+    credentials: SignedRequestCredentials<'a>,
+    security_token: &'a str,
+    assumed_role_arn: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum S3SessionContextExpected {
+    Success,
+    AccessDenied,
+    ExplicitResourceDeny,
+}
+
+fn assert_s3_session_context_put_success(label: &str, response: &RawResponse) {
+    assert_shape(
+        label,
+        response,
+        &shape()
+            .status(200)
+            .header("x-amz-id-2", "{host_id}")
+            .header("x-amz-request-id", "{request_id}")
+            .header("x-amz-server-side-encryption", "AES256")
+            .header("etag", "\"d41d8cd98f00b204e9800998ecf8427e\"")
+            .header("x-amz-checksum-crc64nvme", "AAAAAAAAAAA=")
+            .header("x-amz-checksum-type", "FULL_OBJECT")
+            .body_empty(),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_session_context_put_access_denied(
+    label: &str,
+    response: &RawResponse,
+    bucket: &str,
+    assumed_role_arn: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+) {
+    let response =
+        s3_response_with_sanitized_body(response, credentials.access_key, &[security_token]);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("assumed_role_arn", assumed_role_arn)
+            .sub("bucket", bucket)
+            .sub("key", label)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>User: {assumed_role_arn} is not authorized to perform: \
+                 s3:PutObject on resource: \"arn:aws:s3:::{bucket}/{key}\" because no \
+                 identity-based policy allows the s3:PutObject action</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_session_context_put_explicit_deny(
+    label: &str,
+    response: &RawResponse,
+    bucket: &str,
+    assumed_role_arn: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+) {
+    let response =
+        s3_response_with_sanitized_body(response, credentials.access_key, &[security_token]);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("assumed_role_arn", assumed_role_arn)
+            .sub("bucket", bucket)
+            .sub("key", label)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>User: {assumed_role_arn} is not authorized to perform: \
+                 s3:PutObject on resource: \"arn:aws:s3:::{bucket}/{key}\" with an \
+                 explicit deny in a resource-based policy</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{label}: ok");
+}
+
+fn run_s3_session_context_probes(
+    endpoint: &str,
+    bucket: &str,
+    fixture: S3SessionContextProbeSet<'_>,
+) {
+    for (label, expected) in [
+        ("context-role-principal", S3SessionContextExpected::Success),
+        (
+            "context-session-principal",
+            S3SessionContextExpected::Success,
+        ),
+        (
+            "context-principal-arn-role",
+            S3SessionContextExpected::Success,
+        ),
+        ("context-userid-match", S3SessionContextExpected::Success),
+        (
+            "context-token-issue-after-lower",
+            S3SessionContextExpected::Success,
+        ),
+        (
+            "context-token-issue-before-upper",
+            S3SessionContextExpected::Success,
+        ),
+        (
+            "context-token-issue-deny-before-lower",
+            S3SessionContextExpected::Success,
+        ),
+        (
+            "context-principal-arn-session",
+            S3SessionContextExpected::AccessDenied,
+        ),
+        (
+            "context-userid-mismatch",
+            S3SessionContextExpected::AccessDenied,
+        ),
+        (
+            "context-token-issue-before-lower",
+            S3SessionContextExpected::AccessDenied,
+        ),
+        (
+            "context-token-issue-after-upper",
+            S3SessionContextExpected::AccessDenied,
+        ),
+        (
+            "context-token-issue-deny-before-upper",
+            S3SessionContextExpected::ExplicitResourceDeny,
+        ),
+    ] {
+        let response = send_signed_request_for_service_with_credentials(
+            "PUT",
+            &format!("{endpoint}/{label}"),
+            b"",
+            [("x-amz-security-token", fixture.security_token)],
+            "s3",
+            fixture.credentials,
+        );
+        match expected {
+            S3SessionContextExpected::Success => {
+                assert_s3_session_context_put_success(label, &response);
+            }
+            S3SessionContextExpected::AccessDenied => {
+                assert_s3_session_context_put_access_denied(
+                    label,
+                    &response,
+                    bucket,
+                    fixture.assumed_role_arn,
+                    fixture.credentials,
+                    fixture.security_token,
+                );
+            }
+            S3SessionContextExpected::ExplicitResourceDeny => {
+                assert_s3_session_context_put_explicit_deny(
+                    label,
+                    &response,
+                    bucket,
+                    fixture.assumed_role_arn,
+                    fixture.credentials,
+                    fixture.security_token,
+                );
+            }
+        }
+    }
+}
+
 fn build_s3_root_presigned_request(
     endpoint: &str,
     credentials: SignedRequestCredentials<'_>,
@@ -4718,6 +4895,16 @@ fn main() {
             },
         );
         let post_bucket = required_env("S3_TEST_STS_POST_BUCKET");
+        let recreated_session_arn = required_env("S3_TEST_STS_RECREATED_SESSION_ARN");
+        run_s3_session_context_probes(
+            &format!("https://{post_bucket}.s3.{region}.amazonaws.com"),
+            &post_bucket,
+            S3SessionContextProbeSet {
+                credentials: recreated_credentials,
+                security_token: &recreated_security_token,
+                assumed_role_arn: &recreated_session_arn,
+            },
+        );
         run_s3_post_session_authentication_probes(
             &format!("https://s3.{region}.amazonaws.com"),
             &account_id,

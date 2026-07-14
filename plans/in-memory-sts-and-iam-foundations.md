@@ -774,8 +774,12 @@ acceptable test shortcut.
 - decide the exact first supported `AssumeRole` parameter set from evidence
 - record success/error golden shapes and token-auth matrices
 
-Exit condition: the committed plan/test expectations do not rely on guessed
-wire or precedence behavior.
+Exit condition for the first usable `AssumeRole` milestone: the committed
+plan/test expectations needed by Phases 1 through 5 do not rely on guessed wire
+or precedence behavior. Phase 0 does not block those phases on optional
+`AssumeRole` parameter families assigned to Phase 6; until those parameters are
+implemented, requests containing them must be rejected rather than silently
+ignored.
 
 The initial Query-protocol slice completed on 2026-07-13:
 
@@ -792,12 +796,13 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The remaining session-policy, tag, MFA, and provided-context `AssumeRole`
-parameters,
-expiry-versus-issuer-deletion precedence,
-trust/permission-policy mutation precedence, session-principal context, and
-`aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
-condition.
+Before Phase 0 can satisfy the first-milestone exit condition, it still needs
+to pin expiry-versus-issuer-deletion and region/service precedence,
+permission-policy mutation behavior, and the temporary access-key/token
+envelope decisions.
+Session policies, tags and transitive tags, MFA, and provided contexts are
+Phase 6 completeness work rather than blockers for beginning Phase 1. They
+remain unsupported compatibility gaps and must never be silently ignored.
 
 The role-fixture capability will use the ordinary primary and alternate test
 users, not the owner/root credential. The shared test-user policy grants only
@@ -1129,6 +1134,41 @@ permission policies remain authorization inputs rather than authentication
 inputs. Expiry-versus-issuer-deletion precedence is not established by this
 matrix and remains an explicit Phase 0 question.
 
+The session-principal context and trust-mutation slice completed on 2026-07-14.
+It uses the permissionless recreated-role session and a self-cleaning bucket
+policy whose statements isolate each identity representation on a separate
+object key. The fixture requires three consecutive successful passes across
+every positive statement before and after trust mutation. Complete S3 response
+goldens establish that:
+
+- both the IAM role ARN and the exact path-free assumed-role session ARN are
+  accepted as resource-policy principals for the session
+- `aws:PrincipalArn` is the path-bearing IAM role ARN, not the assumed-role
+  session ARN: the role value permits `PutObject`, while the session value does
+  not match and receives the ordinary authorization `AccessDenied`
+- `aws:userid` is `<stable-role-id>:<role-session-name>`; that exact value
+  permits the request and a distinct value does not
+- `aws:TokenIssueTime` is present and is the immutable credential issuance
+  instant rather than request time. Both bounds are derived from the AWS
+  response's `Credentials.Expiration` minus the requested 3,600-second duration,
+  avoiding any dependency on the oracle host's clock. One-second bounds around
+  that server-derived issuance time let `DateGreaterThan`/`DateLessThan`
+  independently prove both sides. A true `DateLessThan` explicit deny overrides
+  a matching allow with the exact resource-policy-deny response; the
+  corresponding false deny leaves the allow effective
+
+After positive policy convergence, the fixture changes the recreated role's
+trust policy so the primary user can no longer perform an ordinary assumption
+and requires three consecutive STS `AccessDenied` results. The already-issued
+session continues to pass every positive resource-policy statement for three
+consecutive iterations, and the complete raw matrix runs only after that
+convergence.
+Current trust policy is therefore an `AssumeRole` issuance input, not an active
+session authentication or resource-authorization input. Stable issuer-role
+liveness remains an authentication requirement as pinned by role deletion;
+current role permission-policy mutation behavior remains a separate open
+question.
+
 The S3 SigV4 header-authentication slice completed on 2026-07-13 using the
 permissionless recreated-role session as its positive authentication control.
 The correct access key, token, and signature reach S3 authorization and return
@@ -1377,8 +1417,10 @@ the known-gap documentation is current.
 
 ### Phase 6: Complete `AssumeRole` parameters and role chaining
 
-- add session policies, external IDs, source identity, session tags,
-  transitivity, packed policy behavior, and chaining
+- implement the already pinned external-ID, source-identity, and role-chaining
+  behavior
+- probe and implement session policies, session tags, transitivity, provided
+  contexts, and packed-policy behavior
 - add MFA only with a real MFA identity/verification model
 - add every associated request context key and policy test
 
