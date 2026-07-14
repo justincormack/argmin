@@ -1,0 +1,296 @@
+Raft no-op RPCs can bypass WAL compaction
+Link: https://chatgpt.com/codex/cloud/security/findings/0a74aa2fa9208191a5b71237e45b1117?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 8aee2df
+Author: justin@specialbusservice.com
+Created: 14/07/2026, 11:56:19
+Assignee: Unassigned
+Signals: Security, Attack-path
+
+# Resolution
+
+Invalid: the reported WAL-growth path is not reachable through the current
+OpenRaft peer RPC implementation. Repeated equal Vote RPCs do not call
+`save_vote`, duplicate AppendEntries and heartbeat requests do not append log
+records, committed state is persisted only when apply progress advances, and
+PreVote/TransferLeader requests do not write the Raft log store. The finding's
+own dynamic validation confirmed that repeated no-op Vote RPCs left WAL offsets
+unchanged while correctly skipping restart-artifact checkpoints.
+
+Defense-in-depth hardening was added in commit `cce2e481` (`Skip idempotent
+Raft WAL records`). The log store now applies every proposed record to a
+candidate state and returns before WAL append/fsync when that state is
+identical. Direct WAL-backed regression coverage pins equal vote, equal commit,
+empty append, truncate-at-tip, and repeated-purge operations as state- and
+offset-preserving. This removes reliance on OpenRaft's current upstream
+deduplication behavior, but does not validate the original claimed exploit.
+
+Validated with:
+
+- `cargo nextest run -p storage control_plane_raft_wal_backed_log_store_skips_idempotent_records`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo nextest run` (6,815 passed)
+
+# Summary
+Introduced: the checkpoint decision now compares an incomplete logical marker instead of always checkpointing ordinary peer RPCs. Because WAL offsets are excluded from the marker, durable WAL growth is not considered a reason to checkpoint and compact.
+Before this change, every ordinary Raft peer RPC with durability enabled forced a durable restart artifact checkpoint before a response was sent. The new logic records a before/after ExperimentalRaftCheckpointMarker and only checkpoints if the marker changes. That marker includes logical Raft fields such as vote, last log, committed, applied, and snapshot IDs, but it does not include durable WAL offsets or WAL poison state even though those fields exist in ControlPlaneRaftAuthorityStatus. The checkpoint path is also where the WAL is compacted. The log store appends WAL records for save_vote and save_committed operations before applying the value, including cases where the logical value remains the same. Therefore, ordinary peer RPCs that result in idempotent persisted WAL records can leave the marker unchanged, skip the checkpoint, and skip WAL compaction. A malicious or compromised configured Raft peer could repeatedly send such no-op/idempotent RPCs to grow the WAL until disk exhaustion, causing service availability loss.
+
+# Validation
+## Rubric
+- [x] Confirm whether the new checkpoint marker omits durable WAL offsets/poison state.
+- [x] Confirm whether unchanged ordinary peer RPCs skip checkpointing, and whether checkpointing performs WAL compaction.
+- [x] Dynamically exercise a WAL-backed ordinary peer RPC where the logical marker is unchanged and checkpoint_ordinary_rpc=true.
+- [ ] Demonstrate that such unchanged peer RPCs advance WAL offsets while leaving the marker unchanged (falsified: offsets remained unchanged).
+- [x] Inspect the OpenRaft/storage call chain to determine whether idempotent peer Vote/save paths are actually invoked for identical peer messages.
+## Report
+I could not validate the suspected WAL-growth vulnerability; the critical attacker-controlled no-op peer RPC did not grow the WAL. True parts: the new marker omits WAL fields (crates/argmin-s3/src/main.rs:1860-1914) even though status exposes durable_wal_offsets/poison state (crates/storage/src/control_plane_raft.rs:2736-2738, 2931-2942). The peer handler does skip checkpointing when before/after markers are equal (crates/argmin-s3/src/main.rs:2960-3022), and checkpointing is where WAL compaction occurs (crates/storage/src/control_plane_raft.rs:4193-4211). However, the reachable no-op Vote RPC counterexample failed to produce WAL growth: I added and ran a targeted WAL-backed unit test that first checkpointed a state-changing Vote RPC, then sent 5 identical Vote RPCs with artifact_path=None. The identical RPCs succeeded, proving checkpoint was skipped, but WAL offsets stayed exactly ControlPlaneRaftWalOffsets { base_offset: 108, clean_len: 108 }. Command output: `autovalidator evidence: marker unchanged and WAL offsets stayed ControlPlaneRaftWalOffsets { base_offset: 108, clean_len: 108 }`. Code inspection explains this: storage save_vote would append if called (crates/storage/src/control_plane_raft.rs:8733-8739 via apply_record at 5607-5615), but OpenRaft only emits SaveVote when the incoming vote is strictly greater; equal votes only touch the lease and do not call save_vote (/root/.cargo/.../openraft-0.10.0-alpha.26/src/engine/handler/vote_handler/mod.rs:132-142). Existing test `experimental_raft_peer_vote_response_default_durable_context_checkpoints_and_compacts` passed, confirming state-changing durable peer RPCs checkpoint and compact. Crash reproduction was not applicable to this logic bug; targeted tests did not crash. Valgrind and gdb were unavailable; lldb ran `experimental_raft_no_op_peer_vote_response_skips_checkpoint` and the process exited 0 with no stopped backtrace.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L1860 to 1914)
+  Note: The checkpoint marker tracks only logical Raft status fields. It omits durable WAL offsets and WAL poison state, so WAL changes can be invisible to the new checkpoint-skip predicate.
+```
+struct ExperimentalRaftCheckpointMarker {
+    current_leader: Option<ControlPlaneRaftNodeId>,
+    persisted_vote: Option<(u64, ControlPlaneRaftNodeId, bool)>,
+    current_term: Option<u64>,
+    last_log: Option<(u64, ControlPlaneRaftNodeId, u64)>,
+    last_purged: Option<(u64, ControlPlaneRaftNodeId, u64)>,
+    committed: Option<(u64, ControlPlaneRaftNodeId, u64)>,
+    applied: Option<(u64, ControlPlaneRaftNodeId, u64)>,
+    current_snapshot: Option<(u64, ControlPlaneRaftNodeId, u64)>,
+}
+
+impl ExperimentalRaftCheckpointMarker {
+    fn from_status(status: &ControlPlaneRaftAuthorityStatus) -> Self {
+        Self {
+            current_leader: status.current_leader(),
+            persisted_vote: status
+                .persisted_vote()
+                .map(|vote| (vote.leader_id.term, vote.leader_id.node_id, vote.committed)),
+            current_term: status.current_term(),
+            last_log: status.last_log_id().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
+            last_purged: status.last_purged_log_id().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
+            committed: status.committed().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
+            applied: status.applied().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
+            current_snapshot: status.current_snapshot().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
+        }
+```
+
+crates/argmin-s3/src/main.rs (L2960 to 3022)
+  Note: The new before/after marker comparison decides whether an ordinary peer RPC needs a durable checkpoint. If the marker is unchanged, no checkpoint or WAL compaction is performed.
+```
+    let checkpoint_marker_before = if durability.checkpoint_ordinary_rpc
+        && matches!(request.kind, ControlPlaneRaftPeerFrameKind::OrdinaryRpc)
+    {
+        Some(
+            block_on_control_plane_raft(runtime, authority.status())
+                .map(|status| ExperimentalRaftCheckpointMarker::from_status(&status))
+                .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?,
+        )
+    } else {
+        None
+    };
+    let raw_response_frame = block_on_control_plane_raft(runtime, async {
+        match request.kind {
+            ControlPlaneRaftPeerFrameKind::OrdinaryRpc => {
+                handle_control_plane_raft_peer_rpc_frame(
+                    authority.raft(),
+                    request.frame,
+                    request.identity,
+                )
+                .await
+            }
+            ControlPlaneRaftPeerFrameKind::Snapshot => {
+                handle_control_plane_raft_peer_snapshot_frame(
+                    authority.raft(),
+                    request.frame,
+                    policy.limits().max_frame_bytes,
+                    policy.limits().max_snapshot_bytes,
+                    request.identity,
+                )
+                .await
+            }
+        }
+    })
+    .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
+    let response_frame = if let Some(auth_policy) = policy.auth_policy() {
+        auth_policy
+            .sign_peer_frame(
+                &ControlPlaneRaftPeerFrameIdentity::new(
+                    request.identity.cluster_name.clone(),
+                    request.identity.target,
+                    request.identity.source,
+                ),
+                request.operation,
+                raw_response_frame,
+            )
+            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?
+    } else {
+        raw_response_frame
+    };
+
+    let checkpoint_marker_after = if checkpoint_marker_before.is_some() {
+        Some(
+            block_on_control_plane_raft(runtime, authority.status())
+                .map(|status| ExperimentalRaftCheckpointMarker::from_status(&status))
+                .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?,
+        )
+    } else {
+        None
+    };
+    let checkpoint_before_response =
+        matches!(request.kind, ControlPlaneRaftPeerFrameKind::Snapshot)
+            || checkpoint_marker_before != checkpoint_marker_after;
+    if checkpoint_before_response {
+```
+
+crates/storage/src/control_plane_raft.rs (L2736 to 2738)
+  Note: The authority status has durable WAL state available, including offsets and poison state, but these fields are not incorporated into ExperimentalRaftCheckpointMarker.
+```
+    durable_wal_backed: bool,
+    durable_wal_offsets: Option<ControlPlaneRaftWalOffsets>,
+    durable_wal_poisoned: Option<String>,
+```
+
+crates/storage/src/control_plane_raft.rs (L2931 to 2942)
+  Note: Public accessors expose WAL offsets and WAL poison state, confirming that this durable state can be observed but is ignored by the new marker.
+```
+    pub fn durable_wal_backed(&self) -> bool {
+        self.durable_wal_backed
+    }
+
+    #[must_use]
+    pub fn durable_wal_offsets(&self) -> Option<ControlPlaneRaftWalOffsets> {
+        self.durable_wal_offsets
+    }
+
+    #[must_use]
+    pub fn durable_wal_poisoned(&self) -> Option<&str> {
+        self.durable_wal_poisoned.as_deref()
+```
+
+crates/storage/src/control_plane_raft.rs (L4193 to 4211)
+  Note: The durable restart artifact checkpoint is the point where the WAL is compacted. Skipping the checkpoint also skips compaction.
+```
+        let artifact = self.capture_durable_restart_artifact().await?;
+        let wal_replay_offset = artifact.wal_replay_offset;
+        let committed_timestamp_high_water_ms = artifact
+            .state_machine
+            .inner
+            .snapshot()
+            .max_committed_timestamp_ms();
+        artifact.store_durable_artifact(path)?;
+        if let Some(log_store) = &self.log_store {
+            let compact_started = Instant::now();
+            let result = log_store.compact_wal_through(wal_replay_offset);
+            observability::record_control_plane_raft_checkpoint_compaction(
+                compact_started.elapsed(),
+                result.is_ok(),
+            );
+            result.map_err(|source| ControlPlaneError::Io {
+                context: "compact control-plane OpenRaft WAL after durable checkpoint",
+                source,
+            })?;
+```
+
+crates/storage/src/control_plane_raft.rs (L8733 to 8749)
+  Note: save_vote and save_committed append WAL records through apply_record. These persisted records can advance WAL offsets even when the resulting logical vote or committed value is unchanged.
+```
+    async fn save_vote(
+        &mut self,
+        vote: &VoteOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        let mut inner = self.lock()?;
+        self.apply_record(&mut inner, &ControlPlaneRaftWalRecord::SaveVote(*vote))
+    }
+
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    ) -> Result<(), io::Error> {
+        let mut inner = self.lock()?;
+        self.apply_record(
+            &mut inner,
+            &ControlPlaneRaftWalRecord::SaveCommitted(committed),
+        )
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from medium to ignore because the report's necessary exploit step is not validated. The code does skip checkpoints for unchanged ordinary peer RPC markers, and checkpoints compact WAL, but validation through the normal peer RPC handler showed repeated identical Vote RPCs skipped checkpoint without increasing WAL offsets. Additionally, the affected surface is an experimental internal Unix-domain Raft peer interface with private socket-directory enforcement, optional/required peer authentication for multi-node deployments, identity validation, worker limits, and I/O timeouts. This does not present a confirmed vulnerability reachable by the main public S3 threat model.
+## Likelihood
+ignore - Exploitation would require internal/local Raft peer access and an RPC pattern that appends durable WAL while leaving the marker unchanged. Supplied validation found the obvious idempotent Vote RPC did not grow WAL, making real-world exploitability unlikely and currently unproven.
+## Impact
+ignore - The claimed impact is availability loss from disk exhaustion, but the critical WAL-growth behavior was not reproduced for a reachable no-op peer Vote RPC. The surface is internal-only and protected by local socket permissions/auth, so even if a related reliability bug existed, impact would be limited to a configured experimental control-plane deployment.
+## Assumptions
+- Analysis is limited to repository artifacts and the supplied validation evidence; no cloud APIs or live deployment state were consulted.
+- The relevant attack surface is the experimental OpenRaft control-plane peer listener, not the public S3 HTTP API.
+- A realistic attacker for this path would need local Unix-socket access or configured Raft peer credentials; ordinary S3 clients do not reach this handler.
+- ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT enabled
+- ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH configured
+- durable Raft/WAL mode with checkpoint-before-ack durability context
+- attacker can connect to the private Unix-domain Raft peer socket or act as a configured Raft peer
+- an ordinary Raft peer RPC must append durable WAL bytes while leaving the checkpoint marker unchanged
+## Path
+Raft peer/local socket -> auth/identity check -> ordinary RPC -> marker compare -> checkpoint skipped if unchanged -X-> proven WAL growth/disk exhaustion
+## Path evidence
+- `crates/argmin-s3/src/main.rs:1860-1914` - ExperimentalRaftCheckpointMarker tracks logical Raft fields but not durable WAL offsets or poison state.
+- `crates/argmin-s3/src/main.rs:2960-3022` - Ordinary peer RPCs are checkpointed only when the before/after marker differs; snapshots always checkpoint.
+- `crates/storage/src/control_plane_raft.rs:4193-4211` - Durable restart artifact storage is also the place where the log store compacts WAL through the replay offset.
+- `crates/storage/src/control_plane_raft.rs:5607-5654` - If storage save methods are called, apply_record appends records to the WAL before committing the in-memory candidate state.
+- `crates/storage/src/control_plane_raft.rs:8733-8749` - save_vote and save_committed delegate to apply_record, but repository code alone does not prove attacker-reachable no-op RPCs invoke these methods repeatedly.
+- `crates/argmin-s3/src/config.rs:350-355` - Experimental Raft is disabled by default; Raft peer socket and peer map are optional, and peer auth credentials are required for multi-node experimental Raft peer auth.
+- `crates/argmin-s3/src/config.rs:720-776` - Raft peer socket paths must be absolute; multi-node peer socket configuration requires a local matching socket and Raft auth credentials.
+- `crates/argmin-s3/src/main.rs:2820-2901` - Peer RPC handler enforces I/O timeouts, verifies auth envelopes when configured, and validates incoming frame identity before dispatch.
+- `crates/argmin-s3/src/main.rs:4555-4624` - Control-plane Unix socket binding creates private directories and rejects socket directories with group/other permissions.
+- `crates/argmin-s3/src/main.rs:90-92` - Raft peer RPCs have a 64-worker limit and one-second I/O timeout controls.
+## Narrative
+The commit does introduce checkpoint skipping for ordinary Raft peer RPCs when a reduced logical marker is unchanged, and the checkpoint path is where WAL compaction occurs. However, the reachable exploit premise was not demonstrated: the supplied executable validation sent repeated identical Vote RPCs through the peer handler and observed that the responses succeeded and checkpointing was skipped, but WAL offsets stayed unchanged. Static evidence also shows this surface is an internal experimental Raft peer Unix socket with private directory checks and optional/required peer auth for multi-node configurations, not the public S3 API. Therefore the reported disk-exhaustion vulnerability is best treated as an unconfirmed or false-positive security finding, with at most a defense-in-depth reliability concern.
+## Controls
+- Experimental Raft disabled by default
+- Raft peer listener uses Unix-domain socket, not a TCP public listener
+- Socket directory must be owner-private
+- Multi-node Raft peer configuration requires auth credentials
+- Peer auth envelope verification and identity validation
+- Raft peer RPC worker limit
+- Raft peer read/write timeout
+- Durable poison gate rejects peer RPCs after durable authority poison
+## Blindspots
+- Static analysis did not exhaustively prove behavior of every OpenRaft ordinary RPC variant because some call paths are in external dependencies.
+- No production deployment manifests were present to confirm whether experimental Raft peer sockets are enabled in real deployments.
+- The supplied validation disproved the obvious no-op Vote case, but additional tests would be needed to rule out all possible idempotent committed/log replication paths.
