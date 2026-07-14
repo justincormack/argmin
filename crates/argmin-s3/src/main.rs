@@ -1841,7 +1841,7 @@ struct ExperimentalRaftControlPlane {
     authority: Arc<ControlPlaneRaftAuthority>,
     durable_artifact_path: Option<Arc<PathBuf>>,
     durable_checkpoint_lock: Option<Arc<Mutex<()>>>,
-    durable_serving_checkpoint: Mutex<Option<ExperimentalRaftServingCheckpointMarker>>,
+    durable_serving_checkpoint: Mutex<Option<ExperimentalRaftCheckpointMarker>>,
     checkpoint_serving_reads: bool,
     resample_authority_time: bool,
     authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
@@ -1857,15 +1857,18 @@ type ExperimentalRaftAfterHeartbeatCommitHook = Box<
 >;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExperimentalRaftServingCheckpointMarker {
+struct ExperimentalRaftCheckpointMarker {
     current_leader: Option<ControlPlaneRaftNodeId>,
     persisted_vote: Option<(u64, ControlPlaneRaftNodeId, bool)>,
     current_term: Option<u64>,
+    last_log: Option<(u64, ControlPlaneRaftNodeId, u64)>,
+    last_purged: Option<(u64, ControlPlaneRaftNodeId, u64)>,
     committed: Option<(u64, ControlPlaneRaftNodeId, u64)>,
     applied: Option<(u64, ControlPlaneRaftNodeId, u64)>,
+    current_snapshot: Option<(u64, ControlPlaneRaftNodeId, u64)>,
 }
 
-impl ExperimentalRaftServingCheckpointMarker {
+impl ExperimentalRaftCheckpointMarker {
     fn from_status(status: &ControlPlaneRaftAuthorityStatus) -> Self {
         Self {
             current_leader: status.current_leader(),
@@ -1873,6 +1876,20 @@ impl ExperimentalRaftServingCheckpointMarker {
                 .persisted_vote()
                 .map(|vote| (vote.leader_id.term, vote.leader_id.node_id, vote.committed)),
             current_term: status.current_term(),
+            last_log: status.last_log_id().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
+            last_purged: status.last_purged_log_id().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
             committed: status.committed().map(|log_id| {
                 (
                     log_id.leader_id.term,
@@ -1881,6 +1898,13 @@ impl ExperimentalRaftServingCheckpointMarker {
                 )
             }),
             applied: status.applied().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
+            current_snapshot: status.current_snapshot().map(|log_id| {
                 (
                     log_id.leader_id.term,
                     log_id.leader_id.node_id,
@@ -2000,7 +2024,7 @@ impl ExperimentalRaftControlPlane {
         let marker = status
             .as_ref()
             .filter(|status| status.linearized_authority_serving())
-            .map(ExperimentalRaftServingCheckpointMarker::from_status);
+            .map(ExperimentalRaftCheckpointMarker::from_status);
         if let Some(marker) = marker {
             {
                 let checkpointed = self
@@ -2933,6 +2957,17 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
     durability: ExperimentalRaftPeerRpcDurability<'_>,
 ) -> Result<Vec<u8>, ExperimentalRaftPeerRpcWorkerError> {
     ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
+    let checkpoint_marker_before = if durability.checkpoint_ordinary_rpc
+        && matches!(request.kind, ControlPlaneRaftPeerFrameKind::OrdinaryRpc)
+    {
+        Some(
+            block_on_control_plane_raft(runtime, authority.status())
+                .map(|status| ExperimentalRaftCheckpointMarker::from_status(&status))
+                .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?,
+        )
+    } else {
+        None
+    };
     let raw_response_frame = block_on_control_plane_raft(runtime, async {
         match request.kind {
             ControlPlaneRaftPeerFrameKind::OrdinaryRpc => {
@@ -2972,8 +3007,18 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
         raw_response_frame
     };
 
-    let checkpoint_before_response = durability.checkpoint_ordinary_rpc
-        || matches!(request.kind, ControlPlaneRaftPeerFrameKind::Snapshot);
+    let checkpoint_marker_after = if checkpoint_marker_before.is_some() {
+        Some(
+            block_on_control_plane_raft(runtime, authority.status())
+                .map(|status| ExperimentalRaftCheckpointMarker::from_status(&status))
+                .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?,
+        )
+    } else {
+        None
+    };
+    let checkpoint_before_response =
+        matches!(request.kind, ControlPlaneRaftPeerFrameKind::Snapshot)
+            || checkpoint_marker_before != checkpoint_marker_after;
     if checkpoint_before_response {
         let Some(path) = durability.artifact_path else {
             return Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(
@@ -7563,7 +7608,7 @@ mod tests {
 
     #[test]
     fn experimental_raft_peer_rpc_checkpoint_failure_writes_no_response() {
-        let harness = experimental_raft_test_harness("peer-checkpoint-before-ack");
+        let harness = experimental_raft_uninitialized_test_harness("peer-checkpoint-before-ack");
         let cluster_name = format!(
             "argmin-s3-experimental-raft-peer-checkpoint-before-ack-{}",
             std::process::id()
@@ -8656,6 +8701,64 @@ mod tests {
             .block_on(authority.shutdown())
             .expect("WAL-backed authority should shut down");
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn experimental_raft_no_op_peer_vote_response_skips_checkpoint() {
+        let harness = experimental_raft_test_harness("peer-no-op-vote");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-no-op-vote-{}",
+            std::process::id()
+        );
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
+        let persisted_vote = harness
+            .runtime
+            .block_on(harness.authority.status())
+            .expect("initialized authority status should read")
+            .persisted_vote()
+            .expect("initialized authority should have a persisted vote");
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: persisted_vote,
+            last_log_id: None,
+            leadership_transfer: false,
+        });
+        let request_frame = request
+            .encode_frame_for_peer(&identity)
+            .expect("peer request should encode");
+        let (mut client_stream, mut server_stream) =
+            UnixStream::pair().expect("test UnixStream pair should create");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+            .expect("client should write request frame");
+
+        let result = handle_experimental_raft_peer_rpc_before_ack(
+            harness.runtime.handle(),
+            &harness.authority,
+            &mut server_stream,
+            1,
+            &policy,
+            ExperimentalRaftPeerRpcDurability {
+                artifact_path: None,
+                checkpoint_lock: None,
+                poison_gate: None,
+                checkpoint_ordinary_rpc: true,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "unchanged durable Raft state should not require a new checkpoint: {result:?}"
+        );
+        read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        )
+        .expect("no-op peer vote should receive a response");
+
+        harness.shutdown();
     }
 
     #[test]
