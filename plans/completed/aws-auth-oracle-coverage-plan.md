@@ -1,5 +1,9 @@
 # AWS Authentication Oracle Coverage Plan
 
+Status: archived as completed on 2026-07-14. The constrained-user fixture work
+in section 4 remains explicitly deferred until the local IAM model can express
+the same policy without endpoint-specific test behavior.
+
 ## Goal
 
 Close the authentication compatibility gaps found in the July 2026 review by
