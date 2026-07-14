@@ -15672,7 +15672,7 @@ fn max_object_size_constant() {
 
 #[test]
 fn max_parts_constant() {
-    assert_eq!(MAX_PARTS, 10_000);
+    assert_eq!(MAX_MULTIPART_PARTS, 10_000);
 }
 
 #[test]
@@ -15698,8 +15698,8 @@ fn complete_multipart_too_many_parts() {
         })
         .unwrap();
 
-    // Build a part list with MAX_PARTS + 1 entries.
-    let parts: Vec<_> = (1..=MAX_PARTS as u32 + 1)
+    // Build a part list with MAX_MULTIPART_PARTS + 1 entries.
+    let parts: Vec<_> = (1..=MAX_MULTIPART_PARTS as u32 + 1)
         .map(|n| CompletePart {
             part_number: n,
             etag: "dummy".to_string(),

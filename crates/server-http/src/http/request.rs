@@ -413,6 +413,23 @@ pub(crate) fn parse_part_number(value: &str) -> Result<u32, ServerError> {
 }
 
 pub(crate) fn parse_upload_part_query(query_string: &str) -> Result<(String, u32), ServerError> {
+    parse_upload_part_query_with(query_string, |value| ServerError::InvalidUploadPartNumber {
+        value,
+    })
+}
+
+pub(crate) fn parse_upload_part_copy_query(
+    query_string: &str,
+) -> Result<(String, u32), ServerError> {
+    parse_upload_part_query_with(query_string, |value| {
+        ServerError::InvalidUploadPartCopyNumber { value }
+    })
+}
+
+fn parse_upload_part_query_with(
+    query_string: &str,
+    invalid_part_number: impl FnOnce(String) -> ServerError,
+) -> Result<(String, u32), ServerError> {
     let upload_id =
         query_param_lossy(query_string, "uploadId").ok_or_else(|| ServerError::InvalidRequest {
             reason: "missing uploadId query parameter".to_string(),
@@ -423,10 +440,16 @@ pub(crate) fn parse_upload_part_query(query_string: &str) -> Result<(String, u32
         }
     })?;
 
-    Ok((
-        upload_id.into_owned(),
-        parse_part_number(part_number.as_ref())?,
-    ))
+    let value = part_number.as_ref();
+    let parsed = value
+        .parse::<u32>()
+        .ok()
+        .filter(|part_number| {
+            (1..=crate::coordinator::MAX_MULTIPART_PARTS as u32).contains(part_number)
+        })
+        .ok_or_else(|| invalid_part_number(value.to_string()))?;
+
+    Ok((upload_id.into_owned(), parsed))
 }
 
 /// Percent-decode a string (RFC 3986) into raw bytes. Does NOT treat + as space.
@@ -614,8 +637,19 @@ mod tests {
         ));
         assert!(matches!(
             parse_upload_part_query("partNumber=abc&uploadId=abc123"),
-            Err(ServerError::InvalidArgument { reason })
-                if reason == "partNumber must be a positive integer"
+            Err(ServerError::InvalidUploadPartNumber { value }) if value == "abc"
+        ));
+        assert!(matches!(
+            parse_upload_part_query("partNumber=10001&uploadId=abc123"),
+            Err(ServerError::InvalidUploadPartNumber { value }) if value == "10001"
+        ));
+        assert_eq!(
+            parse_upload_part_query("partNumber=%2B1&uploadId=abc123").unwrap(),
+            ("abc123".to_string(), 1)
+        );
+        assert!(matches!(
+            parse_upload_part_copy_query("partNumber=0&uploadId=abc123"),
+            Err(ServerError::InvalidUploadPartCopyNumber { value }) if value == "0"
         ));
     }
 

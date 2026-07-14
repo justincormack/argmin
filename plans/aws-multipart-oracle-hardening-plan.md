@@ -57,9 +57,11 @@ For each matrix:
 
 ### 3. Part upload and copy boundaries
 
-- [ ] Pin part-number parsing and limits at missing, empty, nonnumeric, signed,
-  zero, 1, 10,000, 10,001, duplicate, and overflow values for UploadPart and
-  UploadPartCopy.
+- [x] Pin UploadPart part-number parsing and limits at missing, empty,
+  nonnumeric, signed, zero, 1, 10,000, 10,001, duplicate, and overflow values.
+  Pin UploadPartCopy's shared numeric/duplicate rules and its distinct
+  no-XML-declaration error shape. Assert the accepted first duplicate is the
+  part stored and that missing `partNumber` publishes no object.
 - [ ] Pin zero-byte parts, 5 MiB minus one/exactly 5 MiB non-final parts, final
   part exceptions, overwritten parts, and maximum-part completion behavior.
 - [ ] Cross invalid part numbers/ranges/checksums with invalid upload IDs and

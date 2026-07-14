@@ -972,6 +972,10 @@ pub mod expected_error {
         )
     }
 
+    pub fn put_multipart_upload_method_not_allowed() -> String {
+        xml::put_multipart_upload_method_not_allowed_error_xml(REQUEST_ID, HOST_ID)
+    }
+
     /// `InvalidArgument` without an XML declaration, used by AWS for some
     /// multipart and object-attributes errors.
     pub fn invalid_argument_no_decl(message: &str, argument_name: &str) -> String {

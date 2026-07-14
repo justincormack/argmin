@@ -1189,6 +1189,186 @@ fn test_upload_part_invalid_present_upload_id_overlong_message() {
 }
 
 #[test]
+fn test_upload_part_number_wire_matrix() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "upload-part-number-wire-matrix";
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("create multipart upload for part-number matrix")
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let missing_url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            key,
+            Some(&format!("uploadId={upload_id}")),
+        );
+        let missing_response = send_signed_request_with_credentials(
+            "PUT",
+            &missing_url,
+            b"must not become an object",
+            std::iter::empty::<(&str, &str)>(),
+            primary_credentials(),
+        );
+        assert_shape(
+            "UploadPart missing partNumber",
+            &missing_response,
+            &shape()
+                .status(405)
+                .headers(error_response_headers())
+                .header("allow", "DELETE, POST, GET")
+                .body(expected_error::put_multipart_upload_method_not_allowed()),
+        );
+
+        const INVALID_PART_NUMBER_MESSAGE: &str =
+            "Part number must be an integer between 1 and 10000, inclusive";
+        for (case, value, query) in [
+            ("empty", "", format!("partNumber=&uploadId={upload_id}")),
+            (
+                "nonnumeric",
+                "abc",
+                format!("partNumber=abc&uploadId={upload_id}"),
+            ),
+            (
+                "negative",
+                "-1",
+                format!("partNumber=-1&uploadId={upload_id}"),
+            ),
+            ("zero", "0", format!("partNumber=0&uploadId={upload_id}")),
+            (
+                "above maximum",
+                "10001",
+                format!("partNumber=10001&uploadId={upload_id}"),
+            ),
+            (
+                "u32 overflow",
+                "4294967296",
+                format!("partNumber=4294967296&uploadId={upload_id}"),
+            ),
+            (
+                "decimal overflow",
+                "999999999999999999999999",
+                format!("partNumber=999999999999999999999999&uploadId={upload_id}"),
+            ),
+            (
+                "invalid first duplicate",
+                "0",
+                format!("partNumber=0&partNumber=4&uploadId={upload_id}"),
+            ),
+        ] {
+            let url = object_url(CTX.endpoint(), &bucket, key, Some(&query));
+            let response = send_signed_request_with_credentials(
+                "PUT",
+                &url,
+                b"must not become a part",
+                std::iter::empty::<(&str, &str)>(),
+                primary_credentials(),
+            );
+            assert_shape(
+                case,
+                &response,
+                &shape().status(400).headers(error_response_headers()).body(
+                    expected_error::invalid_argument_with_value(
+                        INVALID_PART_NUMBER_MESSAGE,
+                        "partNumber",
+                        value,
+                    ),
+                ),
+            );
+        }
+
+        let accepted_cases = [
+            (
+                1,
+                format!("partNumber=%2B1&uploadId={upload_id}"),
+                b"explicit plus".as_slice(),
+            ),
+            (
+                2,
+                format!("partNumber=2&partNumber=4&uploadId={upload_id}"),
+                b"first duplicate two".as_slice(),
+            ),
+            (
+                3,
+                format!("partNumber=3&partNumber=0&uploadId={upload_id}"),
+                b"first duplicate three".as_slice(),
+            ),
+            (
+                10_000,
+                format!("partNumber=10000&uploadId={upload_id}"),
+                b"maximum".as_slice(),
+            ),
+        ];
+        for (_, query, body) in &accepted_cases {
+            let url = object_url(CTX.endpoint(), &bucket, key, Some(query));
+            let response = send_signed_request_with_credentials(
+                "PUT",
+                &url,
+                body,
+                std::iter::empty::<(&str, &str)>(),
+                primary_credentials(),
+            );
+            assert_eq!(response.status, 200, "unexpected response: {response:?}");
+            assert!(
+                response.body.is_empty(),
+                "unexpected response: {response:?}"
+            );
+            assert!(
+                response.headers.iter().any(|(name, _)| name == "etag"),
+                "UploadPart response lacks ETag: {response:?}"
+            );
+        }
+
+        let listed = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send_retrying_operation_aborted("list parts after part-number matrix")
+            .await
+            .unwrap();
+        let stored_parts: Vec<_> = listed
+            .parts()
+            .iter()
+            .map(|part| (part.part_number().unwrap(), part.size().unwrap()))
+            .collect();
+        let expected_parts: Vec<_> = accepted_cases
+            .iter()
+            .map(|(part_number, _, body)| (*part_number, body.len() as i64))
+            .collect();
+        assert_eq!(stored_parts, expected_parts);
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("head object after UploadPart part-number matrix")
+            .await;
+        assert_eq!(
+            err_status(&head),
+            404,
+            "UploadPart matrix unexpectedly published an object: {head:?}"
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send_retrying_operation_aborted("abort multipart upload after part-number matrix")
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_complete_multipart_upload_invalid_present_upload_id_overlong_message() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -4020,6 +4200,143 @@ fn test_multipart_copy_invalid_part_number_exceeds_max() {
             .key(dst_key)
             .upload_id(upload_id)
             .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        cleanup(&bucket, &[src_key]).await;
+    });
+}
+
+#[test]
+fn test_upload_part_copy_number_wire_matrix() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let src_key = "upload-part-copy-number-source";
+        let dst_key = "upload-part-copy-number-matrix";
+        put_object_retrying_operation_aborted(client, &bucket, src_key, b"copy body".to_vec())
+            .await;
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send_retrying_operation_aborted("create multipart upload for copy part-number matrix")
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+        let copy_source = format!("{bucket}/{src_key}");
+
+        let missing_url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            dst_key,
+            Some(&format!("uploadId={upload_id}")),
+        );
+        let missing_response = send_signed_request_with_credentials(
+            "PUT",
+            &missing_url,
+            b"",
+            [("x-amz-copy-source", copy_source.as_str())],
+            primary_credentials(),
+        );
+        assert_shape(
+            "UploadPartCopy missing partNumber",
+            &missing_response,
+            &shape()
+                .status(405)
+                .headers(error_response_headers())
+                .header("allow", "DELETE, POST, GET")
+                .body(expected_error::put_multipart_upload_method_not_allowed()),
+        );
+
+        const INVALID_PART_NUMBER_MESSAGE: &str =
+            "Part number must be an integer between 1 and 10000, inclusive";
+        for (case, value, query) in [
+            ("empty", "", format!("partNumber=&uploadId={upload_id}")),
+            (
+                "above maximum",
+                "10001",
+                format!("partNumber=10001&uploadId={upload_id}"),
+            ),
+            (
+                "invalid first duplicate",
+                "0",
+                format!("partNumber=0&partNumber=3&uploadId={upload_id}"),
+            ),
+        ] {
+            let url = object_url(CTX.endpoint(), &bucket, dst_key, Some(&query));
+            let response = send_signed_request_with_credentials(
+                "PUT",
+                &url,
+                b"",
+                [("x-amz-copy-source", copy_source.as_str())],
+                primary_credentials(),
+            );
+            assert_shape(
+                case,
+                &response,
+                &shape().status(400).headers(error_response_headers()).body(
+                    expected_error::invalid_argument_with_value_no_decl(
+                        INVALID_PART_NUMBER_MESSAGE,
+                        "partNumber",
+                        value,
+                    ),
+                ),
+            );
+        }
+
+        for query in [
+            format!("partNumber=%2B1&uploadId={upload_id}"),
+            format!("partNumber=2&partNumber=4&uploadId={upload_id}"),
+            format!("partNumber=10000&uploadId={upload_id}"),
+        ] {
+            let url = object_url(CTX.endpoint(), &bucket, dst_key, Some(&query));
+            let response = send_signed_request_with_credentials(
+                "PUT",
+                &url,
+                b"",
+                [("x-amz-copy-source", copy_source.as_str())],
+                primary_credentials(),
+            );
+            assert_eq!(response.status, 200, "unexpected response: {response:?}");
+            assert!(
+                response.body.contains("<CopyPartResult"),
+                "unexpected response: {response:?}"
+            );
+        }
+
+        let listed = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(&upload_id)
+            .send_retrying_operation_aborted("list parts after copy part-number matrix")
+            .await
+            .unwrap();
+        let stored_parts: Vec<_> = listed
+            .parts()
+            .iter()
+            .map(|part| (part.part_number().unwrap(), part.size().unwrap()))
+            .collect();
+        assert_eq!(stored_parts, [(1, 9), (2, 9), (10_000, 9)]);
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send_retrying_operation_aborted("head destination after copy part-number matrix")
+            .await;
+        assert_eq!(
+            err_status(&head),
+            404,
+            "UploadPartCopy matrix unexpectedly published an object: {head:?}"
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .send_retrying_operation_aborted("abort multipart upload after copy part-number matrix")
             .await
             .unwrap();
         cleanup(&bucket, &[src_key]).await;

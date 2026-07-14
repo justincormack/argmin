@@ -2848,7 +2848,7 @@ impl HttpFrontend {
             }
             S3Operation::UploadPart { bucket, key } => {
                 let (upload_id_raw, part_number) =
-                    request::parse_upload_part_query(req.query_string())?;
+                    request::parse_upload_part_copy_query(req.query_string())?;
                 let upload_id = parse_present_upload_id(upload_id_raw.as_str())?;
                 // Normal UploadPart requests are intercepted in serve.rs and
                 // streamed before they reach dispatch_routed(). Only copy-source
@@ -9087,8 +9087,10 @@ mod tests {
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
-            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Err(ServerError::InvalidUploadPartCopyNumber { value }) => {
+                assert_eq!(value, "abc");
+            }
+            Err(e) => panic!("expected InvalidUploadPartCopyNumber, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

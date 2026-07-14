@@ -111,6 +111,27 @@ pub fn invalid_argument_error_xml(
     )
 }
 
+/// Format AWS's response to `PUT ?uploadId=...` without `partNumber`.
+#[must_use]
+pub fn put_multipart_upload_method_not_allowed_error_xml(
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>MethodNotAllowed</Code>\
+         <Message>The specified method is not allowed against this resource.</Message>\
+         <Method>PUT</Method>\
+         <ResourceType>UPLOAD</ResourceType>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an S3 `InvalidArgument` error response without an XML declaration.
 #[must_use]
 pub fn invalid_argument_error_xml_no_decl(
@@ -5236,6 +5257,22 @@ mod tests {
         assert!(xml.contains("<Code>NoSuchBucket</Code>"));
         assert!(xml.contains("<Message>The bucket does not exist</Message>"));
         assert!(xml.contains("<?xml"));
+    }
+
+    #[test]
+    fn put_multipart_upload_method_not_allowed_error_xml_format() {
+        assert_eq!(
+            put_multipart_upload_method_not_allowed_error_xml("req-1", "host-1"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error>\
+             <Code>MethodNotAllowed</Code>\
+             <Message>The specified method is not allowed against this resource.</Message>\
+             <Method>PUT</Method>\
+             <ResourceType>UPLOAD</ResourceType>\
+             <RequestId>req-1</RequestId>\
+             <HostId>host-1</HostId>\
+             </Error>"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@ use super::response_types::{
 };
 use super::{
     compute_checksum, optional_list_object_key, Coordinator,
-    COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT, MAX_PARTS, MIN_PART_SIZE, TRACE_TARGET,
+    COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT, MAX_MULTIPART_PARTS, MIN_PART_SIZE, TRACE_TARGET,
 };
 #[cfg(test)]
 use super::{
@@ -357,9 +357,11 @@ impl Coordinator {
     }
 
     pub(super) fn validate_upload_part_number(part_number: u32) -> Result<(), ServerError> {
-        if !(1..=MAX_PARTS as u32).contains(&part_number) {
+        if !(1..=MAX_MULTIPART_PARTS as u32).contains(&part_number) {
             return Err(ServerError::InvalidArgument {
-                reason: format!("part number must be between 1 and {MAX_PARTS}, got {part_number}"),
+                reason: format!(
+                    "part number must be between 1 and {MAX_MULTIPART_PARTS}, got {part_number}"
+                ),
             });
         }
         Ok(())
@@ -502,10 +504,10 @@ impl Coordinator {
                     reason: "part list must not be empty".to_string(),
                 });
             }
-            if parts.len() > MAX_PARTS {
+            if parts.len() > MAX_MULTIPART_PARTS {
                 return Err(ServerError::InvalidRequest {
                     reason: format!(
-                        "part list exceeds maximum of {MAX_PARTS} parts, got {}",
+                        "part list exceeds maximum of {MAX_MULTIPART_PARTS} parts, got {}",
                         parts.len()
                     ),
                 });

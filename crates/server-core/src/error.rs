@@ -138,6 +138,9 @@ pub enum ServerError {
     #[error("method not allowed")]
     MethodNotAllowed,
 
+    #[error("PUT is not allowed on a multipart upload resource")]
+    PutMultipartUploadMethodNotAllowed,
+
     #[error("head on delete marker version not allowed")]
     HeadDeleteMarkerMethodNotAllowed {
         version_id: VersionId,
@@ -152,6 +155,12 @@ pub enum ServerError {
 
     #[error("invalid part number")]
     InvalidPartNumber { part_number: u32, parts_count: u32 },
+
+    #[error("invalid upload part number: {value}")]
+    InvalidUploadPartNumber { value: String },
+
+    #[error("invalid upload part copy number: {value}")]
+    InvalidUploadPartCopyNumber { value: String },
 
     /// A read/write/delete conditional header did not hold; `condition`
     /// names the failing header for the AWS-shaped `<Condition>` element.
@@ -503,6 +512,8 @@ impl ServerError {
             Self::InvalidRequest { .. } | Self::InvalidRequestHostId { .. } => "InvalidRequest",
             Self::BadRequest { .. } => "BadRequest",
             Self::InvalidArgument { .. }
+            | Self::InvalidUploadPartNumber { .. }
+            | Self::InvalidUploadPartCopyNumber { .. }
             | Self::InvalidManagedEncryptionReadHeader { .. }
             | Self::InvalidVersionId { .. }
             | Self::DuplicateChecksumHeader { .. } => "InvalidArgument",
@@ -517,9 +528,9 @@ impl ServerError {
             Self::MetadataTooLarge | Self::MetadataTooLargeDetailed { .. } => "MetadataTooLarge",
             Self::RequestHeaderSectionTooLarge => "RequestHeaderSectionTooLarge",
             Self::MaxMessageLengthExceeded { .. } => "MaxMessageLengthExceeded",
-            Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => {
-                "MethodNotAllowed"
-            }
+            Self::MethodNotAllowed
+            | Self::PutMultipartUploadMethodNotAllowed
+            | Self::HeadDeleteMarkerMethodNotAllowed { .. } => "MethodNotAllowed",
             Self::InvalidRange { .. } => "InvalidRange",
             Self::InvalidPartNumber { .. } => "InvalidPartNumber",
             Self::SlowDown => "SlowDown",
@@ -624,6 +635,8 @@ impl ServerError {
             | Self::InvalidRequestHostId { .. }
             | Self::BadRequest { .. }
             | Self::InvalidArgument { .. }
+            | Self::InvalidUploadPartNumber { .. }
+            | Self::InvalidUploadPartCopyNumber { .. }
             | Self::InvalidManagedEncryptionReadHeader { .. }
             | Self::InvalidVersionId { .. }
             | Self::DuplicateChecksumHeader { .. }
@@ -688,7 +701,9 @@ impl ServerError {
             | Self::MetadataTooLarge
             | Self::MetadataTooLargeDetailed { .. }
             | Self::RequestHeaderSectionTooLarge => 400,
-            Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => 405,
+            Self::MethodNotAllowed
+            | Self::PutMultipartUploadMethodNotAllowed
+            | Self::HeadDeleteMarkerMethodNotAllowed { .. } => 405,
             Self::InvalidRange { .. } | Self::InvalidPartNumber { .. } => 416,
             Self::PreconditionFailed { .. } | Self::UploadPartCopyPreconditionFailed { .. } => 412,
             Self::NotModified { .. } => 304,

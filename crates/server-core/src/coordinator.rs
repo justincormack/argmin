@@ -260,7 +260,7 @@ const S3_MAX_LIST_KEYS: u32 = 1_000;
 const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
 /// Maximum number of parts in a multipart upload (matches AWS S3).
-const MAX_PARTS: usize = 10_000;
+pub const MAX_MULTIPART_PARTS: usize = 10_000;
 
 #[derive(Debug, Default)]
 struct BucketFastPathCache {

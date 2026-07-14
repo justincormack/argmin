@@ -306,6 +306,10 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::MalformedPOSTRequest { reason }
         | ServerError::MalformedChunkedBody { reason }
         | ServerError::InvalidTag { reason, .. } => reason.clone(),
+        ServerError::InvalidUploadPartNumber { .. }
+        | ServerError::InvalidUploadPartCopyNumber { .. } => {
+            "Part number must be an integer between 1 and 10000, inclusive".to_string()
+        }
         ServerError::InvalidManagedEncryptionReadHeader { header, .. } => {
             managed_encryption_read_header_message(header).to_string()
         }
@@ -344,6 +348,9 @@ fn client_error_message(err: &ServerError) -> String {
         }
         ServerError::MaxMessageLengthExceeded { .. } => "Your request was too big.".to_string(),
         ServerError::MethodNotAllowed => "method not allowed".to_string(),
+        ServerError::PutMultipartUploadMethodNotAllowed => {
+            "The specified method is not allowed against this resource.".to_string()
+        }
         ServerError::HeadDeleteMarkerMethodNotAllowed { .. } => {
             "head on delete marker version not allowed".to_string()
         }
@@ -551,6 +558,33 @@ impl S3Response {
                 version_id,
                 last_modified,
             } => Self::head_delete_marker_method_not_allowed(*version_id, *last_modified),
+            ServerError::PutMultipartUploadMethodNotAllowed => {
+                let body =
+                    xml::put_multipart_upload_method_not_allowed_error_xml(request_id, host_id);
+                Self::new(405)
+                    .header("Allow", "DELETE, POST, GET")
+                    .chunked_xml_body(body)
+            }
+            ServerError::InvalidUploadPartNumber { value } => {
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    "partNumber",
+                    Some(value),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidUploadPartCopyNumber { value } => {
+                let body = xml::invalid_argument_error_xml_no_decl(
+                    &client_error_message(err),
+                    "partNumber",
+                    Some(value),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
             ServerError::NoSuchBucketPolicy { bucket } => {
                 let body = xml::no_such_bucket_policy_error_xml(bucket, request_id, host_id);
                 Self::new(404).chunked_xml_body(body)

@@ -664,6 +664,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
                 key,
             })
         }
+        ("PUT", Some(_))
+            if query_has_key(query, "uploadId") && !query_has_key(query, "partNumber") =>
+        {
+            Err(ServerError::PutMultipartUploadMethodNotAllowed)
+        }
         ("PUT", Some(key)) if query_has_key(query, "partNumber") => Ok(S3Operation::UploadPart {
             bucket: bucket.clone(),
             key,
@@ -1517,6 +1522,14 @@ mod tests {
                 key: "mykey".to_string()
             }
         );
+    }
+
+    #[test]
+    fn put_multipart_upload_without_part_number_is_method_not_allowed() {
+        assert!(matches!(
+            route("PUT", "/mybucket/mykey", "uploadId=abc"),
+            Err(ServerError::PutMultipartUploadMethodNotAllowed)
+        ));
     }
 
     #[test]

@@ -1876,19 +1876,23 @@ fn is_streaming_write(
         return Ok(None);
     }
 
-    // Check headers via hyper types (not yet parsed into S3Request).
-    let has_copy_source = parts.headers.contains_key("x-amz-copy-source");
-    if has_copy_source {
-        return Ok(None);
-    }
-
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
     let method = parts.method.as_str();
 
-    let Some(op) = route(method, path, query).ok() else {
-        return Ok(None);
+    let op = match route(method, path, query) {
+        Ok(op) => op,
+        Err(err @ ServerError::PutMultipartUploadMethodNotAllowed) => return Err(err),
+        Err(_) => return Ok(None),
     };
+
+    // Check headers via hyper types (not yet parsed into S3Request). Do this
+    // after routing so request-shape errors known from the URI can be returned
+    // without collecting a CopyObject/UploadPartCopy body.
+    let has_copy_source = parts.headers.contains_key("x-amz-copy-source");
+    if has_copy_source {
+        return Ok(None);
+    }
     match op {
         S3Operation::PutObject { bucket, key } => {
             Ok(Some(StreamingWriteOp::PutObject { bucket, key }))
@@ -6775,8 +6779,7 @@ Connection: close\r\n\r\n",
         );
         assert!(matches!(
             is_streaming_write(&parts),
-            Err(ServerError::InvalidArgument { reason })
-                if reason == "partNumber must be a positive integer"
+            Err(ServerError::InvalidUploadPartNumber { value }) if value == "abc"
         ));
     }
 
@@ -6789,9 +6792,25 @@ Connection: close\r\n\r\n",
         );
         assert!(matches!(
             is_streaming_write(&parts),
-            Err(ServerError::InvalidArgument { reason })
-                if reason == "partNumber must be >= 1"
+            Err(ServerError::InvalidUploadPartNumber { value }) if value == "0"
         ));
+    }
+
+    #[test]
+    fn put_multipart_upload_without_part_number_is_rejected_before_body_routing() {
+        for headers in [
+            vec![("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+            vec![
+                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+                ("x-amz-copy-source", "/src/key"),
+            ],
+        ] {
+            let parts = make_parts("PUT", "/mybucket/mykey?uploadId=abc", headers.as_slice());
+            assert!(matches!(
+                is_streaming_write(&parts),
+                Err(ServerError::PutMultipartUploadMethodNotAllowed)
+            ));
+        }
     }
 
     #[test]
@@ -7776,6 +7795,53 @@ Connection: keep-alive\r\n\r\n"
             bytes_sent < TOTAL_BODY_BYTES,
             "server read the full denied UploadPart body before responding: sent {bytes_sent} bytes"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn put_multipart_upload_without_part_number_rejects_large_partial_body_immediately() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let upload_id = create_test_bucket_and_upload(&frontend, "mybucket", "mykey");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+        let declared_body_bytes = MAX_BUFFERED_CONTROL_BODY_SIZE + 1;
+
+        for copy_source_header in ["", "x-amz-copy-source: mybucket/source\r\n"] {
+            let mut stream = StdTcpStream::connect(&addr).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "PUT /mybucket/mykey?uploadId={upload_id} HTTP/1.1\r\n\
+                         Host: {addr}\r\n\
+                         {copy_source_header}\
+                         Content-Length: {declared_body_bytes}\r\n\
+                         Connection: keep-alive\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            stream.write_all(b"x").unwrap();
+
+            // Keep the request write half open. Receiving the complete response
+            // proves routing did not wait for the declared body, its size limit,
+            // or the body idle timeout.
+            let response = read_http_response(&mut stream, Duration::from_secs(3));
+            let _ = stream.shutdown(Shutdown::Write);
+
+            assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+            assert!(
+                response.contains("<Code>MethodNotAllowed</Code>"),
+                "{response}"
+            );
+            assert!(response.contains("<Method>PUT</Method>"), "{response}");
+            assert!(
+                response.contains("<ResourceType>UPLOAD</ResourceType>"),
+                "{response}"
+            );
+            assert!(
+                !response.contains("MaxMessageLengthExceeded"),
+                "request shape must win over buffered body size: {response}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
