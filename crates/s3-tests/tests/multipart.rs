@@ -442,6 +442,39 @@ fn assert_invalid_upload_id_no_such_upload(response: &RawResponse, invalid_uploa
     );
 }
 
+fn assert_access_denied(response: &RawResponse) {
+    assert_eq!(
+        response.status, 403,
+        "unexpected response body: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains("<Code>AccessDenied</Code>"),
+        "unexpected response body: {}",
+        response.body
+    );
+}
+
+fn assert_malformed_xml(response: &RawResponse) {
+    assert_eq!(
+        response.status, 400,
+        "unexpected response body: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains("<Code>MalformedXML</Code>"),
+        "unexpected response body: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains(
+            "<Message>The XML you provided was not well-formed or did not validate against our published schema</Message>"
+        ),
+        "unexpected response body: {}",
+        response.body
+    );
+}
+
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
@@ -1130,20 +1163,10 @@ fn test_abort_multipart_upload_invalid_present_upload_id_overlong_message() {
 }
 
 #[test]
-fn test_upload_part_invalid_present_upload_id_overlong_auth_precedence() {
+fn test_upload_part_invalid_present_upload_id_overlong_message() {
     s3_tests::run(async {
-        let client = CTX.client();
         let bucket = setup_bucket().await;
-        let key = "multipart-invalid-upload-id-auth-precedence";
-
-        client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .send_retrying_operation_aborted("S3 operation during multipart test")
-            .await
-            .unwrap();
-
+        let key = "multipart-upload-part-invalid-upload-id-message";
         let invalid_upload_id = "a".repeat(1025);
         let url = object_url(
             CTX.endpoint(),
@@ -1157,11 +1180,11 @@ fn test_upload_part_invalid_present_upload_id_overlong_auth_precedence() {
             &url,
             b"x",
             std::iter::empty::<(&str, &str)>(),
-            alt_credentials(),
+            primary_credentials(),
         );
         assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
 
-        cleanup(&bucket, &[key]).await;
+        cleanup(&bucket, &[]).await;
     });
 }
 
@@ -1193,43 +1216,6 @@ fn test_complete_multipart_upload_invalid_present_upload_id_overlong_message() {
 }
 
 #[test]
-fn test_complete_multipart_upload_invalid_present_upload_id_overlong_auth_precedence() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_bucket().await;
-        let key = "multipart-complete-invalid-upload-id-auth-precedence";
-
-        client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .send_retrying_operation_aborted("S3 operation during multipart test")
-            .await
-            .unwrap();
-
-        let invalid_upload_id = "a".repeat(1025);
-        let url = object_url(
-            CTX.endpoint(),
-            &bucket,
-            key,
-            Some(&format!("uploadId={invalid_upload_id}")),
-        );
-        let body = complete_multipart_upload_xml("\"abc\"", 1);
-
-        let response = send_signed_request_with_credentials(
-            "POST",
-            &url,
-            &body,
-            [("content-type", "application/xml")],
-            alt_credentials(),
-        );
-        assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
-
-        cleanup(&bucket, &[key]).await;
-    });
-}
-
-#[test]
 fn test_list_parts_invalid_present_upload_id_overlong_message() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -1256,38 +1242,182 @@ fn test_list_parts_invalid_present_upload_id_overlong_message() {
 }
 
 #[test]
-fn test_list_parts_invalid_present_upload_id_overlong_auth_precedence() {
+fn test_multipart_upload_id_authorization_precedence() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
-        let key = "multipart-list-parts-invalid-upload-id-auth-precedence";
-
-        client
+        let key = "multipart-upload-id-auth-precedence";
+        let create = client
             .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .send_retrying_operation_aborted("create multipart upload for precedence test")
             .await
             .unwrap();
-
+        let valid_upload_id = create.upload_id().unwrap().to_string();
         let invalid_upload_id = "a".repeat(1025);
-        let url = object_url(
+        let complete_body = complete_multipart_upload_xml("\"abc\"", 1);
+
+        for (operation, method, valid_query, invalid_query, body, headers) in [
+            (
+                "UploadPart",
+                "PUT",
+                format!("partNumber=1&uploadId={valid_upload_id}"),
+                format!("partNumber=1&uploadId={invalid_upload_id}"),
+                b"x".as_slice(),
+                None,
+            ),
+            (
+                "CompleteMultipartUpload",
+                "POST",
+                format!("uploadId={valid_upload_id}"),
+                format!("uploadId={invalid_upload_id}"),
+                complete_body.as_slice(),
+                Some(("content-type", "application/xml")),
+            ),
+            (
+                "ListParts",
+                "GET",
+                format!("uploadId={valid_upload_id}"),
+                format!("uploadId={invalid_upload_id}"),
+                b"".as_slice(),
+                None,
+            ),
+            (
+                "AbortMultipartUpload",
+                "DELETE",
+                format!("uploadId={valid_upload_id}"),
+                format!("uploadId={invalid_upload_id}"),
+                b"".as_slice(),
+                None,
+            ),
+        ] {
+            let valid_url = object_url(CTX.endpoint(), &bucket, key, Some(&valid_query));
+            let valid_response = send_signed_request_with_credentials(
+                method,
+                &valid_url,
+                body,
+                headers,
+                alt_credentials(),
+            );
+            assert_access_denied(&valid_response);
+
+            let invalid_url = object_url(CTX.endpoint(), &bucket, key, Some(&invalid_query));
+            let invalid_response = send_signed_request_with_credentials(
+                method,
+                &invalid_url,
+                body,
+                headers,
+                alt_credentials(),
+            );
+            assert_invalid_upload_id_no_such_upload(&invalid_response, &invalid_upload_id);
+
+            assert_ne!(
+                valid_response.status, invalid_response.status,
+                "{operation} did not distinguish authorization from upload-ID validation"
+            );
+        }
+
+        let parts = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&valid_upload_id)
+            .send_retrying_operation_aborted(
+                "list parts after denied multipart authorization requests",
+            )
+            .await
+            .unwrap();
+        assert!(
+            parts.parts().is_empty(),
+            "denied UploadPart request unexpectedly stored parts: {:?}",
+            parts.parts()
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(valid_upload_id)
+            .send_retrying_operation_aborted("abort multipart upload after precedence test")
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_upload_xml_precedence() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "complete-multipart-xml-precedence";
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("create multipart upload for XML precedence test")
+            .await
+            .unwrap();
+        let valid_upload_id = create.upload_id().unwrap().to_string();
+        let invalid_upload_id = "a".repeat(1025);
+
+        let valid_url = object_url(
             CTX.endpoint(),
             &bucket,
             key,
-            Some(&format!("uploadId={invalid_upload_id}")),
+            Some(&format!("uploadId={valid_upload_id}")),
         );
-
-        let response = send_signed_request_with_credentials(
-            "GET",
-            &url,
-            b"",
-            std::iter::empty::<(&str, &str)>(),
+        let authorization_canary = send_signed_request_with_credentials(
+            "POST",
+            &valid_url,
+            &complete_multipart_upload_xml("\"abc\"", 1),
+            [("content-type", "application/xml")],
             alt_credentials(),
         );
-        assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
+        assert_access_denied(&authorization_canary);
 
-        cleanup(&bucket, &[key]).await;
+        for credentials in [primary_credentials(), alt_credentials()] {
+            let valid_url = object_url(
+                CTX.endpoint(),
+                &bucket,
+                key,
+                Some(&format!("uploadId={valid_upload_id}")),
+            );
+            let valid_response = send_signed_request_with_credentials(
+                "POST",
+                &valid_url,
+                b"<",
+                [("content-type", "application/xml")],
+                credentials,
+            );
+            assert_malformed_xml(&valid_response);
+
+            let invalid_url = object_url(
+                CTX.endpoint(),
+                &bucket,
+                key,
+                Some(&format!("uploadId={invalid_upload_id}")),
+            );
+            let invalid_response = send_signed_request_with_credentials(
+                "POST",
+                &invalid_url,
+                b"<",
+                [("content-type", "application/xml")],
+                credentials,
+            );
+            assert_invalid_upload_id_no_such_upload(&invalid_response, &invalid_upload_id);
+        }
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(valid_upload_id)
+            .send_retrying_operation_aborted("abort multipart upload after XML precedence test")
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
     });
 }
 
@@ -2446,6 +2576,104 @@ fn test_multipart_overwrites_existing_object() {
     });
 }
 
+#[test]
+fn test_failed_multipart_completion_preserves_existing_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "failed-completion-preserves-existing";
+        let original_body = b"original object".to_vec();
+        let replacement_body = b"replacement object".to_vec();
+
+        let original =
+            put_object_retrying_operation_aborted(client, &bucket, key, original_body.clone())
+                .await;
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+        let uploaded_part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            replacement_body.clone(),
+        )
+        .await;
+
+        let rejected = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag("\"ffffffffffffffff\"")
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await;
+        assert_s3_err_code(&rejected, "InvalidPart");
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(get.e_tag(), original.e_tag());
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes(),
+            original_body
+        );
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(uploaded_part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes(),
+            replacement_body
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
 // ── HeadObject on multipart object ──────────────────────────────────
 
 #[test]
@@ -2857,8 +3085,16 @@ fn test_multipart_complete_incorrect_etag() {
             .unwrap();
         let upload_id = create.upload_id().unwrap();
 
-        upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, vec![0u8; 256])
-            .await;
+        let part_body = vec![0u8; 256];
+        let uploaded_part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            part_body.clone(),
+        )
+        .await;
 
         // Complete with a fabricated ETag
         let result = client
@@ -2880,14 +3116,59 @@ fn test_multipart_complete_incorrect_etag() {
             .await;
         assert_s3_err_code(&result, "InvalidPart");
 
-        let _ = client
-            .abort_multipart_upload()
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await;
+        assert_eq!(
+            err_status(&head),
+            404,
+            "unexpected HeadObject result: {head:?}"
+        );
+
+        let parts = client
+            .list_parts()
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
             .send_retrying_operation_aborted("S3 operation during multipart test")
-            .await;
-        cleanup(&bucket, &[]).await;
+            .await
+            .unwrap();
+        assert_eq!(parts.parts().len(), 1);
+        assert_eq!(parts.parts()[0].part_number(), Some(1));
+        assert_eq!(parts.parts()[0].e_tag(), uploaded_part.e_tag());
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(uploaded_part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(get.body.collect().await.unwrap().into_bytes(), part_body);
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
