@@ -116,6 +116,7 @@ cleanup_stale_sts_oracle_roles() {
             ((.RoleName | startswith("path-shape-")) or
              (.RoleName | startswith("default-max-")) or
              (.RoleName | startswith("external-id-")) or
+             (.RoleName | startswith("source-identity-")) or
              (.RoleName | startswith("chain-target-")) or
              (.RoleName | startswith("deleted-role-")))) or
         (.Path == "/argmin-sts-oracle/cross-account/" and
@@ -140,6 +141,7 @@ cleanup_stale_sts_oracle_roles() {
       /argmin-sts-oracle/same-account/:path-shape-* | \
         /argmin-sts-oracle/same-account/:default-max-* | \
         /argmin-sts-oracle/same-account/:external-id-* | \
+        /argmin-sts-oracle/same-account/:source-identity-* | \
         /argmin-sts-oracle/same-account/:chain-target-* | \
         /argmin-sts-oracle/same-account/:deleted-role-* | \
         /argmin-sts-oracle/cross-account/:cross-success-* | \

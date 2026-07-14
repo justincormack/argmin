@@ -2591,6 +2591,33 @@ fn assert_assume_role_error(
     println!("{label}: ok");
 }
 
+struct AssumeRoleErrorExpected<'a> {
+    status: u16,
+    code: &'a str,
+    message: Option<&'a str>,
+}
+
+fn assert_assume_role_error_with_security_token(
+    label: &str,
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+    parameters: &[(&str, &str)],
+    expected: AssumeRoleErrorExpected<'_>,
+) {
+    let response =
+        send_assume_role_with_security_token(endpoint, credentials, security_token, parameters);
+    assert_error_probe(
+        label,
+        &response,
+        expected.status,
+        STS_XMLNS,
+        expected.code,
+        expected.message,
+    );
+    println!("{label}: ok");
+}
+
 fn required_xml_text(response: &RawResponse, tag: &str, label: &str) -> String {
     xml_tag_text(&response.body, tag)
         .filter(|value| !value.is_empty())
@@ -2614,6 +2641,7 @@ fn assert_assume_role_success(
     role_name: &str,
     role_session_name: &str,
     duration_seconds: i64,
+    source_identity: Option<&str>,
 ) {
     let access_key = required_xml_text(response, "AccessKeyId", label);
     let secret_key = required_xml_text(response, "SecretAccessKey", label);
@@ -2694,6 +2722,9 @@ fn assert_assume_role_success(
 
     let assumed_role_arn =
         format!("arn:aws:sts::{account_id}:assumed-role/{role_name}/{role_session_name}");
+    let source_identity_element = source_identity
+        .map(|value| format!("    <SourceIdentity>{value}</SourceIdentity>\n"))
+        .unwrap_or_default();
     assert_shape(
         label,
         &normalized,
@@ -2708,7 +2739,7 @@ fn assert_assume_role_success(
                  <Credentials>\n      <AccessKeyId>SESSION_ACCESS_KEY</AccessKeyId>\n      \
                  <SecretAccessKey>SESSION_SECRET_KEY</SecretAccessKey>\n      \
                  <SessionToken>SESSION_TOKEN</SessionToken>\n      \
-                 <Expiration>{{iso8601}}</Expiration>\n    </Credentials>\n  \
+                 <Expiration>{{iso8601}}</Expiration>\n    </Credentials>\n{source_identity_element}  \
                  </AssumeRoleResult>\n  \
                  <ResponseMetadata>\n    <RequestId>{{sts_request_id}}</RequestId>\n  \
                  </ResponseMetadata>\n</AssumeRoleResponse>\n"
@@ -2739,6 +2770,34 @@ fn assert_assume_role_request_success(
         expected.role_name,
         expected.role_session_name,
         expected.duration_seconds,
+        None,
+    );
+    println!("{label}: ok");
+}
+
+fn assert_assume_role_source_identity_success(
+    label: &str,
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: Option<&str>,
+    parameters: &[(&str, &str)],
+    expected: AssumeRoleSuccess<'_>,
+    source_identity: &str,
+) {
+    let response = match security_token {
+        Some(token) => {
+            send_assume_role_with_security_token(endpoint, credentials, token, parameters)
+        }
+        None => send_assume_role(endpoint, credentials, parameters),
+    };
+    assert_assume_role_success(
+        label,
+        &response,
+        expected.account_id,
+        expected.role_name,
+        expected.role_session_name,
+        expected.duration_seconds,
+        Some(source_identity),
     );
     println!("{label}: ok");
 }
@@ -3570,6 +3629,409 @@ fn run_assume_role_probes(
     );
 }
 
+struct SourceIdentityProbeSet<'a> {
+    caller_arn: &'a str,
+    source_identity: &'a str,
+    source_role_arn: &'a str,
+    source_role_name: &'a str,
+    condition_role_arn: &'a str,
+    condition_role_name: &'a str,
+    role_session_name: &'a str,
+    source_session_token: &'a str,
+    source_session_role_name: &'a str,
+    source_session_name: &'a str,
+    target_role_arn: &'a str,
+    target_role_name: &'a str,
+    target_session_name: &'a str,
+    no_set_target_role_arn: &'a str,
+}
+
+fn run_source_identity_probes(
+    endpoint: &str,
+    primary_credentials: SignedRequestCredentials<'_>,
+    source_credentials: SignedRequestCredentials<'_>,
+    account_id: &str,
+    fixture: SourceIdentityProbeSet<'_>,
+) {
+    let SourceIdentityProbeSet {
+        caller_arn,
+        source_identity,
+        source_role_arn,
+        source_role_name,
+        condition_role_arn,
+        condition_role_name,
+        role_session_name,
+        source_session_token,
+        source_session_role_name,
+        source_session_name,
+        target_role_arn,
+        target_role_name,
+        target_session_name,
+        no_set_target_role_arn,
+    } = fixture;
+    let max_source_identity = "s".repeat(64);
+    let overlong_source_identity = "s".repeat(65);
+    let overlong_invalid_source_identity = "!".repeat(65);
+    let multibyte_source_identity = "é".repeat(33);
+    let supplementary_source_identity = "😀".repeat(33);
+    let source_identity_pattern = r"[\w+=,.@-]*";
+    let overlong_source_identity_message = format!(
+        "1 validation error detected: Value '{overlong_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 64"
+    );
+    let overlong_invalid_source_identity_message = format!(
+        "2 validation errors detected: Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}; Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 64"
+    );
+    let multibyte_source_identity_message = format!(
+        "1 validation error detected: Value '{multibyte_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}"
+    );
+    let supplementary_source_identity_message = format!(
+        "1 validation error detected: Value '{supplementary_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}"
+    );
+    assert_eq!(max_source_identity.len(), 64);
+    assert_eq!(overlong_source_identity.len(), 65);
+    assert_eq!(overlong_invalid_source_identity.len(), 65);
+    assert_eq!(multibyte_source_identity.len(), 66);
+    assert_eq!(multibyte_source_identity.chars().count(), 33);
+    assert_eq!(multibyte_source_identity.encode_utf16().count(), 33);
+    assert_eq!(supplementary_source_identity.len(), 132);
+    assert_eq!(supplementary_source_identity.chars().count(), 33);
+    assert_eq!(supplementary_source_identity.encode_utf16().count(), 66);
+
+    for (label, value, message) in [
+        (
+            "assume-role-empty-source-identity",
+            "",
+            "1 validation error detected: Value '' at 'sourceIdentity' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "assume-role-short-source-identity",
+            "a",
+            "1 validation error detected: Value 'a' at 'sourceIdentity' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "assume-role-invalid-source-identity",
+            "bad value",
+            r"1 validation error detected: Value 'bad value' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*",
+        ),
+        (
+            "assume-role-short-invalid-source-identity",
+            "!",
+            r"2 validation errors detected: Value '!' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*; Value '!' at 'sourceIdentity' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "assume-role-overlong-source-identity",
+            overlong_source_identity.as_str(),
+            overlong_source_identity_message.as_str(),
+        ),
+        (
+            "assume-role-overlong-invalid-source-identity",
+            overlong_invalid_source_identity.as_str(),
+            overlong_invalid_source_identity_message.as_str(),
+        ),
+        (
+            "assume-role-multibyte-source-identity-length-units",
+            multibyte_source_identity.as_str(),
+            multibyte_source_identity_message.as_str(),
+        ),
+        (
+            "assume-role-supplementary-source-identity-length-units",
+            supplementary_source_identity.as_str(),
+            supplementary_source_identity_message.as_str(),
+        ),
+    ] {
+        assert_assume_role_error(
+            label,
+            endpoint,
+            primary_credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", source_role_arn),
+                ("RoleSessionName", role_session_name),
+                ("SourceIdentity", value),
+            ],
+            400,
+            "ValidationError",
+            Some(message),
+        );
+    }
+
+    for (label, value) in [
+        ("assume-role-min-source-identity", "ab"),
+        (
+            "assume-role-all-allowed-source-identity-characters",
+            "azAZ09_+=,.@-",
+        ),
+        (
+            "assume-role-max-source-identity",
+            max_source_identity.as_str(),
+        ),
+    ] {
+        assert_assume_role_source_identity_success(
+            label,
+            endpoint,
+            primary_credentials,
+            None,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", source_role_arn),
+                ("RoleSessionName", role_session_name),
+                ("SourceIdentity", value),
+            ],
+            AssumeRoleSuccess {
+                account_id,
+                role_name: source_role_name,
+                role_session_name,
+                duration_seconds: 3600,
+            },
+            value,
+        );
+    }
+
+    let condition_denied_message = format!(
+        "User: {caller_arn} is not authorized to perform: sts:AssumeRole on resource: {condition_role_arn}"
+    );
+    assert_assume_role_source_identity_success(
+        "assume-role-source-identity-condition-match",
+        endpoint,
+        primary_credentials,
+        None,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", condition_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("SourceIdentity", source_identity),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name: condition_role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+        source_identity,
+    );
+    assert_assume_role_error(
+        "assume-role-source-identity-condition-missing",
+        endpoint,
+        primary_credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", condition_role_arn),
+            ("RoleSessionName", role_session_name),
+        ],
+        403,
+        "AccessDenied",
+        Some(&condition_denied_message),
+    );
+    for (label, value) in [
+        (
+            "assume-role-source-identity-reserved-prefix-lower",
+            "aws:reserved",
+        ),
+        (
+            "assume-role-source-identity-reserved-prefix-upper",
+            "AWS:reserved",
+        ),
+    ] {
+        let message = format!(
+            "1 validation error detected: Value '{value}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}"
+        );
+        assert_assume_role_error(
+            label,
+            endpoint,
+            primary_credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", source_role_arn),
+                ("RoleSessionName", role_session_name),
+                ("SourceIdentity", value),
+            ],
+            400,
+            "ValidationError",
+            Some(&message),
+        );
+    }
+    let condition_set_denied_message = format!(
+        "User: {caller_arn} is not authorized to perform: sts:SetSourceIdentity on resource: {condition_role_arn}"
+    );
+    assert_assume_role_error(
+        "assume-role-source-identity-condition-mismatch",
+        endpoint,
+        primary_credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", condition_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("SourceIdentity", "wrong-source-identity"),
+        ],
+        403,
+        "AccessDenied",
+        Some(&condition_set_denied_message),
+    );
+    assert_assume_role_source_identity_success(
+        "assume-role-duplicate-source-identity-match-first",
+        endpoint,
+        primary_credentials,
+        None,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", condition_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("SourceIdentity", source_identity),
+            ("SourceIdentity", "wrong-source-identity"),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name: condition_role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+        source_identity,
+    );
+    assert_assume_role_error(
+        "assume-role-duplicate-source-identity-mismatch-first",
+        endpoint,
+        primary_credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", condition_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("SourceIdentity", "wrong-source-identity"),
+            ("SourceIdentity", source_identity),
+        ],
+        403,
+        "AccessDenied",
+        Some(&condition_set_denied_message),
+    );
+    assert_assume_role_source_identity_success(
+        "assume-role-duplicate-source-identity-valid-before-invalid",
+        endpoint,
+        primary_credentials,
+        None,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", condition_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("SourceIdentity", source_identity),
+            ("SourceIdentity", "bad value"),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name: condition_role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+        source_identity,
+    );
+    assert_assume_role_error(
+        "assume-role-duplicate-source-identity-invalid-before-valid",
+        endpoint,
+        primary_credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", condition_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("SourceIdentity", "bad value"),
+            ("SourceIdentity", source_identity),
+        ],
+        400,
+        "ValidationError",
+        Some(
+            r"1 validation error detected: Value 'bad value' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*",
+        ),
+    );
+
+    let source_session_arn = format!(
+        "arn:aws:sts::{account_id}:assumed-role/{source_session_role_name}/{source_session_name}"
+    );
+    assert_assume_role_source_identity_success(
+        "assume-role-source-identity-chaining-inherits",
+        endpoint,
+        source_credentials,
+        Some(source_session_token),
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", target_role_arn),
+            ("RoleSessionName", target_session_name),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name: target_role_name,
+            role_session_name: target_session_name,
+            duration_seconds: 3600,
+        },
+        source_identity,
+    );
+    assert_assume_role_source_identity_success(
+        "assume-role-source-identity-chaining-explicit-same",
+        endpoint,
+        source_credentials,
+        Some(source_session_token),
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", target_role_arn),
+            ("RoleSessionName", target_session_name),
+            ("SourceIdentity", source_identity),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name: target_role_name,
+            role_session_name: target_session_name,
+            duration_seconds: 3600,
+        },
+        source_identity,
+    );
+    assert_assume_role_error_with_security_token(
+        "assume-role-source-identity-chaining-cannot-change",
+        endpoint,
+        source_credentials,
+        source_session_token,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", target_role_arn),
+            ("RoleSessionName", target_session_name),
+            ("SourceIdentity", "different-source-identity"),
+        ],
+        AssumeRoleErrorExpected {
+            status: 400,
+            code: "ValidationError",
+            message: Some("The source identity is already set for this assume role session"),
+        },
+    );
+    let no_set_denied_message = format!(
+        "User: {source_session_arn} is not authorized to perform: sts:SetSourceIdentity on resource: {no_set_target_role_arn}"
+    );
+    assert_assume_role_error_with_security_token(
+        "assume-role-source-identity-chaining-requires-set-permission",
+        endpoint,
+        source_credentials,
+        source_session_token,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", no_set_target_role_arn),
+            ("RoleSessionName", target_session_name),
+        ],
+        AssumeRoleErrorExpected {
+            status: 403,
+            code: "AccessDenied",
+            message: Some(&no_set_denied_message),
+        },
+    );
+}
+
 fn assert_cross_account_denied(
     label: &str,
     endpoint: &str,
@@ -3639,6 +4101,7 @@ fn run_role_chaining_probes(
         fixture.target_role_name,
         fixture.target_session_name,
         3600,
+        None,
     );
     println!("assume-role-chaining-at-maximum-duration: ok");
 
@@ -3899,6 +4362,7 @@ fn run_cross_account_probes(
         fixture.success_role_name,
         fixture.role_session_name,
         3600,
+        None,
     );
     println!("assume-role-cross-account-success: ok");
 }
@@ -4102,6 +4566,48 @@ fn main() {
                 external_id_role_arn: &external_id_role_arn,
                 external_id_role_name: &external_id_role_name,
                 role_session_name: &role_session_name,
+            },
+        );
+
+        let source_identity = required_env("S3_TEST_STS_SOURCE_IDENTITY");
+        let source_identity_role_arn = required_env("S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN");
+        let source_identity_role_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_ROLE_NAME");
+        let condition_role_arn = required_env("S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN");
+        let condition_role_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_NAME");
+        let source_access_key = required_env("S3_TEST_STS_SOURCE_IDENTITY_ACCESS_KEY");
+        let source_secret_key = required_env("S3_TEST_STS_SOURCE_IDENTITY_SECRET_KEY");
+        let source_session_token = required_env("S3_TEST_STS_SOURCE_IDENTITY_SESSION_TOKEN");
+        let source_session_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_SESSION_NAME");
+        let target_role_arn = required_env("S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_ARN");
+        let target_role_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_NAME");
+        let target_session_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_TARGET_SESSION_NAME");
+        let no_set_target_role_arn = required_env("S3_TEST_STS_CHAIN_TARGET_ROLE_ARN");
+        let source_credentials = SignedRequestCredentials {
+            access_key: &source_access_key,
+            secret_key: &source_secret_key,
+            region: &region,
+            tls_ca_pem: None,
+        };
+        run_source_identity_probes(
+            &endpoint,
+            credentials,
+            source_credentials,
+            &account_id,
+            SourceIdentityProbeSet {
+                caller_arn: &caller_arn,
+                source_identity: &source_identity,
+                source_role_arn: &source_identity_role_arn,
+                source_role_name: &source_identity_role_name,
+                condition_role_arn: &condition_role_arn,
+                condition_role_name: &condition_role_name,
+                role_session_name: &role_session_name,
+                source_session_token: &source_session_token,
+                source_session_role_name: &source_identity_role_name,
+                source_session_name: &source_session_name,
+                target_role_arn: &target_role_arn,
+                target_role_name: &target_role_name,
+                target_session_name: &target_session_name,
+                no_set_target_role_arn: &no_set_target_role_arn,
             },
         );
     }

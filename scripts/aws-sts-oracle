@@ -153,6 +153,14 @@ aws_chaining_source() {
         "$@"
 }
 
+aws_source_identity_session() {
+    aws_with_session_credentials \
+        "$S3_TEST_STS_SOURCE_IDENTITY_ACCESS_KEY" \
+        "$S3_TEST_STS_SOURCE_IDENTITY_SECRET_KEY" \
+        "$S3_TEST_STS_SOURCE_IDENTITY_SESSION_TOKEN" \
+        "$@"
+}
+
 aws_deleted_role_session() {
     aws_with_session_credentials \
         "$S3_TEST_STS_DELETED_ROLE_ACCESS_KEY" \
@@ -211,23 +219,54 @@ wait_for_external_id_assume_role_success() {
     echo "$label-sts-success: ok"
 }
 
+wait_for_source_identity_assume_role_success() {
+    local label="$1"
+    local role_arn="$2"
+    local source_identity="$3"
+    local attempt consecutive_successes=0 ready=false
+
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if aws_primary sts assume-role \
+            --role-arn "$role_arn" \
+            --role-session-name convergence-check \
+            --source-identity "$source_identity" >/dev/null 2>&1; then
+            ((consecutive_successes += 1))
+            if ((consecutive_successes == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_successes=0
+        fi
+        sleep 2
+    done
+    [[ "$ready" == true ]] || \
+        external_s3_test_die "$label did not converge to STS success"
+    echo "$label-sts-success: ok"
+}
+
 wait_for_assume_role_denied() {
     local label="$1"
     local aws_command="$2"
     local role_arn="$3"
-    local attempt error_file ready=false
+    local attempt consecutive_denials=0 error_file ready=false
 
     error_file="$tmpdir/${label}-convergence.err"
-    for ((attempt = 1; attempt <= 15; attempt++)); do
+    for ((attempt = 1; attempt <= 30; attempt++)); do
         if "$aws_command" sts assume-role \
             --role-arn "$role_arn" \
             --role-session-name convergence-check >/dev/null 2>"$error_file"; then
-            :
+            consecutive_denials=0
         elif grep -Fq \
             'An error occurred (AccessDenied) when calling the AssumeRole operation:' \
             "$error_file"; then
-            ready=true
-            break
+            ((consecutive_denials += 1))
+            if ((consecutive_denials == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_denials=0
         fi
         sleep 2
     done
@@ -392,7 +431,7 @@ create_assume_role_fixture() {
     local chain_source_identity chain_source_session chain_target_max_duration default_max_duration
     local deleted_role_identity deleted_role_session deleted_role_stable_id identity_decision identity_simulation missing_role_error
     local other_live_access_key other_live_identity other_live_secret_key other_live_session other_live_session_token
-    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix streaming_bucket_policy trust_chain_source trust_default_max trust_external_id trust_policy
+    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix source_identity_session streaming_bucket_policy trust_chain_source trust_chain_source_with_set trust_default_max trust_external_id trust_policy trust_source_identity trust_source_identity_condition trust_source_identity_target
     primary_identity="$(aws_primary sts get-caller-identity --output json)"
     primary_account="$(jq -er '.Account' <<<"$primary_identity")"
     primary_arn="$(jq -er '.Arn' <<<"$primary_identity")"
@@ -429,6 +468,15 @@ create_assume_role_fixture() {
     export S3_TEST_STS_EXTERNAL_ID="argmin-sts-oracle-external-id"
     export S3_TEST_STS_EXTERNAL_ID_ROLE_NAME="external-id-${role_suffix}"
     export S3_TEST_STS_EXTERNAL_ID_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_EXTERNAL_ID_ROLE_NAME}"
+    export S3_TEST_STS_SOURCE_IDENTITY="argmin-sts-oracle-source"
+    export S3_TEST_STS_SOURCE_IDENTITY_ROLE_NAME="source-identity-${role_suffix}"
+    export S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_SOURCE_IDENTITY_ROLE_NAME}"
+    export S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_NAME="source-identity-condition-${role_suffix}"
+    export S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_NAME}"
+    export S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_NAME="source-identity-target-${role_suffix}"
+    export S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_NAME}"
+    export S3_TEST_STS_SOURCE_IDENTITY_SESSION_NAME="source-identity-source"
+    export S3_TEST_STS_SOURCE_IDENTITY_TARGET_SESSION_NAME="source-identity-target"
     export S3_TEST_STS_CHAIN_SOURCE_SESSION_NAME="chaining-source"
     export S3_TEST_STS_CHAIN_TARGET_SESSION_NAME="chaining-target"
     export S3_TEST_STS_CHAIN_TARGET_ROLE_NAME="chain-target-${role_suffix}"
@@ -549,15 +597,97 @@ create_assume_role_fixture() {
         "$trust_external_id" \
         "$S3_TEST_STS_EXTERNAL_ID_ROLE_ARN"
 
-    trust_chain_source="$tmpdir/trust-chain-source.json"
-    jq -n --arg principal "$S3_TEST_STS_ROLE_ARN" '{
+    assert_identity_decision \
+        same-account-source-identity \
+        aws_primary \
+        "$primary_arn" \
+        "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
+        implicitDeny
+    trust_source_identity="$tmpdir/trust-source-identity.json"
+    jq -n --arg principal "$primary_arn" '{
         Version: "2012-10-17",
         Statement: [{
             Effect: "Allow",
             Principal: {AWS: $principal},
+            Action: ["sts:AssumeRole", "sts:SetSourceIdentity"]
+        }]
+    }' >"$trust_source_identity"
+    create_scoped_role \
+        "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_NAME" \
+        /argmin-sts-oracle/same-account/ \
+        "$trust_source_identity" \
+        "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN"
+
+    assert_identity_decision \
+        same-account-source-identity-condition \
+        aws_primary \
+        "$primary_arn" \
+        "$S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN" \
+        implicitDeny
+    trust_source_identity_condition="$tmpdir/trust-source-identity-condition.json"
+    jq -n \
+        --arg principal "$primary_arn" \
+        --arg source_identity "$S3_TEST_STS_SOURCE_IDENTITY" \
+        '{
+            Version: "2012-10-17",
+            Statement: [{
+                Effect: "Allow",
+                Principal: {AWS: $principal},
+                Action: ["sts:AssumeRole", "sts:SetSourceIdentity"],
+                Condition: {StringEquals: {"sts:SourceIdentity": $source_identity}}
+            }]
+        }' >"$trust_source_identity_condition"
+    create_scoped_role \
+        "$S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_NAME" \
+        /argmin-sts-oracle/same-account/ \
+        "$trust_source_identity_condition" \
+        "$S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN"
+
+    trust_source_identity_target="$tmpdir/trust-source-identity-target.json"
+    jq -n \
+        --arg principal "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
+        --arg source_identity "$S3_TEST_STS_SOURCE_IDENTITY" \
+        '{
+            Version: "2012-10-17",
+            Statement: [{
+                Effect: "Allow",
+                Principal: {AWS: $principal},
+                Action: ["sts:AssumeRole", "sts:SetSourceIdentity"],
+                Condition: {StringEquals: {"sts:SourceIdentity": $source_identity}}
+            }]
+        }' >"$trust_source_identity_target"
+    create_scoped_role \
+        "$S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_NAME" \
+        /argmin-sts-oracle/same-account/ \
+        "$trust_source_identity_target" \
+        "$S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_ARN" \
+        "" \
+        true
+
+    trust_chain_source="$tmpdir/trust-chain-source.json"
+    trust_chain_source_with_set="$tmpdir/trust-chain-source-with-set.json"
+    jq -n \
+        --arg principal "$S3_TEST_STS_ROLE_ARN" \
+        --arg source_identity_principal "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
+        '{
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Principal: {AWS: [$principal, $source_identity_principal]},
             Action: "sts:AssumeRole"
         }]
     }' >"$trust_chain_source"
+    jq -n \
+        --arg principal "$S3_TEST_STS_ROLE_ARN" \
+        --arg source_identity_principal "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
+        '{
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Principal: {AWS: [$principal, $source_identity_principal]},
+            Action: ["sts:AssumeRole", "sts:SetSourceIdentity"]
+        }]
+    }' >"$trust_chain_source_with_set"
     assert_identity_decision \
         same-account-chain-target \
         aws_primary \
@@ -567,7 +697,7 @@ create_assume_role_fixture() {
     create_scoped_role \
         "$S3_TEST_STS_CHAIN_TARGET_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
-        "$trust_chain_source" \
+        "$trust_chain_source_with_set" \
         "$S3_TEST_STS_CHAIN_TARGET_ROLE_ARN" \
         43200
     chain_target_max_duration="$(aws_primary iam get-role \
@@ -607,6 +737,48 @@ create_assume_role_fixture() {
         same-account-external-id-role \
         "$S3_TEST_STS_EXTERNAL_ID_ROLE_ARN" \
         "$S3_TEST_STS_EXTERNAL_ID"
+    wait_for_source_identity_assume_role_success \
+        same-account-source-identity-role \
+        "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
+        "$S3_TEST_STS_SOURCE_IDENTITY"
+    wait_for_source_identity_assume_role_success \
+        same-account-source-identity-condition-role \
+        "$S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN" \
+        "$S3_TEST_STS_SOURCE_IDENTITY"
+
+    source_identity_session="$(aws_primary sts assume-role \
+        --role-arn "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
+        --role-session-name "$S3_TEST_STS_SOURCE_IDENTITY_SESSION_NAME" \
+        --source-identity "$S3_TEST_STS_SOURCE_IDENTITY" \
+        --duration-seconds 3600 \
+        --output json)"
+    export S3_TEST_STS_SOURCE_IDENTITY_ACCESS_KEY
+    export S3_TEST_STS_SOURCE_IDENTITY_SECRET_KEY
+    export S3_TEST_STS_SOURCE_IDENTITY_SESSION_TOKEN
+    S3_TEST_STS_SOURCE_IDENTITY_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$source_identity_session")"
+    S3_TEST_STS_SOURCE_IDENTITY_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$source_identity_session")"
+    S3_TEST_STS_SOURCE_IDENTITY_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$source_identity_session")"
+    [[ "$(jq -er '.SourceIdentity' <<<"$source_identity_session")" == \
+        "$S3_TEST_STS_SOURCE_IDENTITY" ]] || \
+        external_s3_test_die \
+            "temporary source-identity session did not preserve its source identity"
+    echo "same-account-source-identity-session: ok"
+
+    wait_for_assume_role_success \
+        same-account-source-identity-target \
+        aws_source_identity_session \
+        "$S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_ARN"
+    wait_for_assume_role_success \
+        same-account-source-identity-no-set-positive-control \
+        aws_source_identity_session \
+        "$S3_TEST_STS_CHAIN_TARGET_ROLE_ARN"
+    aws_primary iam update-assume-role-policy \
+        --role-name "$S3_TEST_STS_CHAIN_TARGET_ROLE_NAME" \
+        --policy-document "file://${trust_chain_source}"
+    wait_for_assume_role_denied \
+        same-account-source-identity-no-set \
+        aws_source_identity_session \
+        "$S3_TEST_STS_CHAIN_TARGET_ROLE_ARN"
 
     chain_source_session="$(aws_primary sts assume-role \
         --role-arn "$S3_TEST_STS_ROLE_ARN" \

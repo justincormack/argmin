@@ -792,7 +792,8 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The remaining optional `AssumeRole` security-context parameters,
+The remaining session-policy, tag, MFA, and provided-context `AssumeRole`
+parameters,
 expiry-versus-issuer-deletion precedence,
 trust/permission-policy mutation precedence, session-principal context, and
 `aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
@@ -835,9 +836,10 @@ The same-account role-fixture slice now:
   credential only to identify the target user and confines owner/root use to
   creating or versioning the customer-managed test policy and attaching it
 - creates, converges, assumes, and deletes uniquely named
-  `role/argmin-sts-oracle/same-account/path-shape-*`, `default-max-*`, and
-  `chain-target-*` roles using the primary test user; it never adopts or
-  mutates an existing role, grants none of the roles identity permissions, and
+  roles under `role/argmin-sts-oracle/same-account/`, including the
+  `path-shape-*`, `default-max-*`, `external-id-*`, `source-identity-*`, and
+  `chain-target-*` fixture families, using the primary test user; it never
+  adopts an existing role, grants none of the roles identity permissions, and
   normalizes temporary secrets before golden response comparison
 - proves that the IAM role ARN retains `/argmin-sts-oracle/same-account/` while
   its returned STS ARN omits the entire IAM path and retains only the unique
@@ -947,11 +949,11 @@ matrix establishes that:
 The first implementation-facing core can therefore parse and validate
 `RoleArn`, `RoleSessionName`, and optional `DurationSeconds` from the Query
 request without guessed behavior. This does not authorize silently ignoring
-known optional `AssumeRole` inputs: session policy/policy ARNs, source identity,
-tags/transitive tags, MFA fields, and provided contexts still need explicit
-AWS-backed scope decisions. External ID parsing and trust-policy evaluation are
-pinned by the following slice. The one-hour role-chaining limit also remains
-separate from the API-level and configured-role duration bounds pinned here.
+known optional `AssumeRole` inputs: session policy/policy ARNs, tags/transitive
+tags, MFA fields, and provided contexts still need explicit AWS-backed scope
+decisions. External ID and source identity are pinned by the following slices.
+The one-hour role-chaining limit also remains separate from the API-level and
+configured-role duration bounds pinned here.
 
 The `ExternalId` validation and trust-policy slice completed on 2026-07-14.
 The exact AWS-backed matrix establishes that:
@@ -992,6 +994,55 @@ role pins the security meaning of the selected value. Local support must carry
 that selected value in typed request context and evaluate it as
 `sts:ExternalId` in the role trust policy; accepting and ignoring the parameter
 would fail the oracle.
+
+The `SourceIdentity` validation, trust-policy, and chaining slice completed on
+2026-07-14. It uses three unique permissionless role shapes: an unconditioned
+source role granting both `sts:AssumeRole` and `sts:SetSourceIdentity`, a role
+with an exact `sts:SourceIdentity` trust condition, and a chaining target that
+trusts the source IAM role with the same condition. The exact AWS-backed matrix
+establishes that:
+
+- omission is schema-valid; a present value must contain 2 through 64
+  characters and match `[\w+=,.@-]*`
+- `azAZ09_+=,.@-` and the two- and 64-character boundaries succeed, pinning
+  every rendered character class and the exact success XML; the response adds
+  `SourceIdentity` after `Credentials`, while `PackedPolicySize` remains absent
+- empty, one-character, space-containing, and 65-character inputs receive the
+  exact single-error `ValidationError` shapes; simultaneous pattern/length
+  failures produce two errors ordered pattern first and length second
+- length is counted in decoded Unicode scalar values rather than UTF-8 bytes or
+  UTF-16 units: 33 `é` characters and 33 supplementary characters receive only
+  the pattern error despite occupying 66 UTF-8 bytes and, for the supplementary
+  case, 66 UTF-16 units
+- both `aws:reserved` and `AWS:reserved` receive the ordinary exact pattern
+  error because the colon is outside the admitted pattern; AWS exposes no
+  separate reserved-prefix error for these inputs
+- the condition-matching value succeeds; omission denies `sts:AssumeRole`,
+  while a different shape-valid value denies `sts:SetSourceIdentity`, each with
+  its complete exact `AccessDenied` response
+- duplicate `SourceIdentity` fields use the first wire value for validation,
+  trust evaluation, and the returned source identity: expected-first succeeds
+  even when followed by either a wrong or pattern-invalid value, while the
+  reverse orders return the first value's authorization or validation error
+- a source identity is inherited when the resulting temporary credentials
+  assume another role, even when the chained request omits the parameter; the
+  inherited value appears in the exact success response
+- explicitly repeating the inherited value also succeeds, while trying to
+  replace it returns HTTP 400 `ValidationError` with exactly `The source
+  identity is already set for this assume role session`
+- the target must grant `sts:SetSourceIdentity` for inheritance. The fixture
+  first converges a successful assumption against the exact target, then
+  removes only that action with `UpdateAssumeRolePolicy` and requires three
+  consecutive denials, resetting the count on any success or other response;
+  the raw request then receives the exact `AccessDenied` naming the source
+  session, `sts:SetSourceIdentity`, and target role ARN
+
+Local sessions therefore need an immutable optional source-identity field in
+the sealed session context. AssumeRole must authorize `sts:SetSourceIdentity`
+when setting or propagating it, evaluate `sts:SourceIdentity` in trust policy,
+and later expose the same immutable value as `aws:SourceIdentity` during
+resource authorization. Treating it as request-only decoration would fail both
+the direct and chained oracle matrices.
 
 The configured role-maximum slice completed on 2026-07-13. A second unique
 same-account role is left at IAM's default 3,600-second maximum. The fixture
