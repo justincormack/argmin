@@ -18,7 +18,8 @@ use s3_tests::{
         assert_shape, error_response_headers, expected_error, response_header_value, shape,
         xml_tag_text, ShapeSpec,
     },
-    sigv4_post_fields_for_credentials, PresignedRequest, RawResponse, SignedRequestCredentials,
+    sigv4_post_fields_for_credentials, sigv4_post_fields_for_service_with_credentials,
+    PresignedRequest, RawResponse, SignedRequestCredentials,
 };
 
 const QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
@@ -1962,6 +1963,7 @@ fn run_s3_presigned_scope_probes(
     );
 }
 
+#[derive(Clone, Copy)]
 struct S3PostSessionProbeSet<'a> {
     live_credentials: SignedRequestCredentials<'a>,
     live_security_token: &'a str,
@@ -2025,8 +2027,19 @@ struct S3PostProbe<'a> {
 
 struct S3PostResult {
     response: RawResponse,
+    credential: String,
     policy: String,
     signature: String,
+}
+
+#[derive(Clone, Copy)]
+struct S3PostScopeProbe<'a> {
+    label: &'a str,
+    credentials: SignedRequestCredentials<'a>,
+    service: &'a str,
+    policy_token: Option<&'a str>,
+    form_tokens: S3PostFormTokens<'a>,
+    header_token: Option<&'a str>,
 }
 
 fn required_post_field(fields: &[(String, String)], name: &str, label: &str) -> String {
@@ -2056,6 +2069,7 @@ fn send_s3_post_probe(endpoint: &str, bucket: &str, probe: S3PostProbe<'_>) -> S
         .map(|token| vec![("x-amz-security-token".to_string(), token.to_string())])
         .unwrap_or_default();
     let policy = required_post_field(&fields, "policy", probe.label);
+    let credential = required_post_field(&fields, "x-amz-credential", probe.label);
     let signature = required_post_field(&fields, "x-amz-signature", probe.label);
     let response = post_object_raw_to_test_endpoint_with_headers(
         endpoint,
@@ -2068,6 +2082,48 @@ fn send_s3_post_probe(endpoint: &str, bucket: &str, probe: S3PostProbe<'_>) -> S
     );
     S3PostResult {
         response,
+        credential,
+        policy,
+        signature,
+    }
+}
+
+fn send_s3_post_scope_probe(
+    endpoint: &str,
+    bucket: &str,
+    probe: S3PostScopeProbe<'_>,
+) -> S3PostResult {
+    let token_conditions = probe
+        .policy_token
+        .map(|token| vec![serde_json::json!({"x-amz-security-token": token})])
+        .unwrap_or_default();
+    let mut fields = sigv4_post_fields_for_service_with_credentials(
+        probe.credentials,
+        probe.service,
+        bucket,
+        probe.label,
+        &token_conditions,
+    );
+    probe.form_tokens.append_to(&mut fields);
+    let headers = probe
+        .header_token
+        .map(|token| vec![("x-amz-security-token".to_string(), token.to_string())])
+        .unwrap_or_default();
+    let policy = required_post_field(&fields, "policy", probe.label);
+    let credential = required_post_field(&fields, "x-amz-credential", probe.label);
+    let signature = required_post_field(&fields, "x-amz-signature", probe.label);
+    let response = post_object_raw_to_test_endpoint_with_headers(
+        endpoint,
+        None,
+        bucket,
+        &fields,
+        b"STS POST Object scope oracle",
+        "oracle.txt",
+        &headers,
+    );
+    S3PostResult {
+        response,
+        credential,
         policy,
         signature,
     }
@@ -2601,6 +2657,321 @@ fn run_s3_post_session_authentication_probes(
             }
         }
     }
+}
+
+fn assert_s3_post_wrong_region_scope(
+    label: &str,
+    result: &S3PostResult,
+    credentials: SignedRequestCredentials<'_>,
+    security_tokens: &[&str],
+    wrong_region: &str,
+    expected_region: &str,
+) {
+    assert!(
+        required_xml_text(&result.response, "ArgumentValue", label) == result.credential,
+        "{label}: S3 did not echo the POST credential"
+    );
+    let credential = sanitize_s3_text(&result.credential, credentials.access_key, security_tokens);
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        credentials.access_key,
+        security_tokens,
+        &result.policy,
+    );
+    let message = format!("the region '{wrong_region}' is wrong; expecting '{expected_region}'");
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .sub("credential", credential)
+            .sub("message", message)
+            .sub("region", expected_region)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>InvalidArgument</Code><Message>{message}</Message>\
+                 <ArgumentName>X-Amz-Credential</ArgumentName>\
+                 <ArgumentValue>{credential}</ArgumentValue><Region>{region}</Region>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_post_wrong_service_scope(
+    label: &str,
+    result: &S3PostResult,
+    credentials: SignedRequestCredentials<'_>,
+    security_tokens: &[&str],
+) {
+    assert!(
+        required_xml_text(&result.response, "ArgumentValue", label) == result.credential,
+        "{label}: S3 did not echo the POST credential"
+    );
+    let credential = sanitize_s3_text(&result.credential, credentials.access_key, security_tokens);
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        credentials.access_key,
+        security_tokens,
+        &result.policy,
+    );
+    assert_shape(
+        label,
+        &response,
+        &shape().status(400).headers(error_response_headers()).body(
+            expected_error::invalid_argument_with_value(
+                "incorrect service \"sts\". This endpoint belongs to \"s3\".",
+                "X-Amz-Credential",
+                &credential,
+            ),
+        ),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_post_scope_no_access_key_presented(
+    label: &str,
+    result: &S3PostResult,
+    credentials: SignedRequestCredentials<'_>,
+    security_tokens: &[&str],
+) {
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        credentials.access_key,
+        security_tokens,
+        &result.policy,
+    );
+    assert_shape(
+        label,
+        &response,
+        &shape().status(403).headers(error_response_headers()).body(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error><Code>AccessDenied</Code>\
+             <Message>No AWSAccessKey was presented.</Message>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+        ),
+    );
+    println!("{label}: ok");
+}
+
+#[derive(Clone, Copy)]
+enum S3PostScopeExpected {
+    WrongRegion,
+    WrongService,
+}
+
+fn run_s3_post_scope_probes(endpoint: &str, bucket: &str, fixture: S3PostSessionProbeSet<'_>) {
+    let wrong_region = if fixture.live_credentials.region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    };
+    let wrong_secret = "0".repeat(40);
+    let malformed_security_token = "malformed-session-token";
+    for (scope, live_credentials, old_credentials, service, expected) in [
+        (
+            "wrong-region",
+            SignedRequestCredentials {
+                region: wrong_region,
+                ..fixture.live_credentials
+            },
+            SignedRequestCredentials {
+                region: wrong_region,
+                ..fixture.old_credentials
+            },
+            "s3",
+            S3PostScopeExpected::WrongRegion,
+        ),
+        (
+            "wrong-service",
+            fixture.live_credentials,
+            fixture.old_credentials,
+            "sts",
+            S3PostScopeExpected::WrongService,
+        ),
+    ] {
+        let bad_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..live_credentials
+        };
+        for (case, credentials, policy_token, form_tokens, header_token) in [
+            (
+                "valid-form",
+                live_credentials,
+                Some(fixture.live_security_token),
+                S3PostFormTokens::One(fixture.live_security_token),
+                None,
+            ),
+            (
+                "missing-token",
+                live_credentials,
+                None,
+                S3PostFormTokens::Missing,
+                None,
+            ),
+            (
+                "empty-form",
+                live_credentials,
+                Some(""),
+                S3PostFormTokens::One(""),
+                None,
+            ),
+            (
+                "malformed-form",
+                live_credentials,
+                Some(malformed_security_token),
+                S3PostFormTokens::One(malformed_security_token),
+                None,
+            ),
+            (
+                "mismatched-form",
+                live_credentials,
+                Some(fixture.other_live_security_token),
+                S3PostFormTokens::One(fixture.other_live_security_token),
+                None,
+            ),
+            (
+                "valid-form-bad-signature",
+                bad_signature_credentials,
+                Some(fixture.live_security_token),
+                S3PostFormTokens::One(fixture.live_security_token),
+                None,
+            ),
+            (
+                "old-session-valid-form",
+                old_credentials,
+                Some(fixture.old_security_token),
+                S3PostFormTokens::One(fixture.old_security_token),
+                None,
+            ),
+            (
+                "duplicate-identical-form",
+                live_credentials,
+                Some(fixture.live_security_token),
+                S3PostFormTokens::Two(fixture.live_security_token, fixture.live_security_token),
+                None,
+            ),
+            (
+                "duplicate-conflicting-form",
+                live_credentials,
+                Some(fixture.live_security_token),
+                S3PostFormTokens::Two(
+                    fixture.live_security_token,
+                    fixture.other_live_security_token,
+                ),
+                None,
+            ),
+            (
+                "duplicate-conflicting-form-reversed",
+                live_credentials,
+                Some(fixture.other_live_security_token),
+                S3PostFormTokens::Two(
+                    fixture.other_live_security_token,
+                    fixture.live_security_token,
+                ),
+                None,
+            ),
+            (
+                "valid-header-valid-form",
+                live_credentials,
+                Some(fixture.live_security_token),
+                S3PostFormTokens::One(fixture.live_security_token),
+                Some(fixture.live_security_token),
+            ),
+            (
+                "malformed-header-valid-form",
+                live_credentials,
+                Some(fixture.live_security_token),
+                S3PostFormTokens::One(fixture.live_security_token),
+                Some(malformed_security_token),
+            ),
+            (
+                "old-session-header-valid-form",
+                live_credentials,
+                Some(fixture.live_security_token),
+                S3PostFormTokens::One(fixture.live_security_token),
+                Some(fixture.old_security_token),
+            ),
+        ] {
+            let label = format!("s3-post-scope-{scope}-{case}");
+            let result = send_s3_post_scope_probe(
+                endpoint,
+                bucket,
+                S3PostScopeProbe {
+                    label: &label,
+                    credentials,
+                    service,
+                    policy_token,
+                    form_tokens,
+                    header_token,
+                },
+            );
+            let form_token_values = form_tokens.values();
+            let sensitive_tokens = [
+                policy_token,
+                form_token_values[0],
+                form_token_values[1],
+                header_token,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if header_token.is_some() {
+                assert_s3_post_scope_no_access_key_presented(
+                    &label,
+                    &result,
+                    credentials,
+                    &sensitive_tokens,
+                );
+            } else {
+                match expected {
+                    S3PostScopeExpected::WrongRegion => assert_s3_post_wrong_region_scope(
+                        &label,
+                        &result,
+                        credentials,
+                        &sensitive_tokens,
+                        wrong_region,
+                        fixture.live_credentials.region,
+                    ),
+                    S3PostScopeExpected::WrongService => assert_s3_post_wrong_service_scope(
+                        &label,
+                        &result,
+                        credentials,
+                        &sensitive_tokens,
+                    ),
+                }
+            }
+        }
+    }
+
+    let label = "s3-post-scope-both-wrong-valid-form";
+    let result = send_s3_post_scope_probe(
+        endpoint,
+        bucket,
+        S3PostScopeProbe {
+            label,
+            credentials: SignedRequestCredentials {
+                region: wrong_region,
+                ..fixture.live_credentials
+            },
+            service: "sts",
+            policy_token: Some(fixture.live_security_token),
+            form_tokens: S3PostFormTokens::One(fixture.live_security_token),
+            header_token: None,
+        },
+    );
+    assert_s3_post_wrong_region_scope(
+        label,
+        &result,
+        SignedRequestCredentials {
+            region: wrong_region,
+            ..fixture.live_credentials
+        },
+        &[fixture.live_security_token],
+        wrong_region,
+        fixture.live_credentials.region,
+    );
 }
 
 const STREAMING_PAYLOAD_HASH: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
@@ -5724,19 +6095,25 @@ fn main() {
                 assumed_role_arn: &recreated_session_arn,
             },
         );
+        let post_fixture = S3PostSessionProbeSet {
+            live_credentials: recreated_credentials,
+            live_security_token: &recreated_security_token,
+            live_role_name: &recreated_role_name,
+            live_role_session_name: &recreated_role_session_name,
+            other_live_security_token: &other_live_security_token,
+            old_credentials: deleted_credentials,
+            old_security_token: &deleted_security_token,
+        };
         run_s3_post_session_authentication_probes(
             &format!("https://s3.{region}.amazonaws.com"),
             &account_id,
             &post_bucket,
-            S3PostSessionProbeSet {
-                live_credentials: recreated_credentials,
-                live_security_token: &recreated_security_token,
-                live_role_name: &recreated_role_name,
-                live_role_session_name: &recreated_role_session_name,
-                other_live_security_token: &other_live_security_token,
-                old_credentials: deleted_credentials,
-                old_security_token: &deleted_security_token,
-            },
+            post_fixture,
+        );
+        run_s3_post_scope_probes(
+            &format!("https://s3.{region}.amazonaws.com"),
+            &post_bucket,
+            post_fixture,
         );
         run_s3_streaming_session_authentication_probes(
             &format!("https://s3.{region}.amazonaws.com"),

@@ -3,6 +3,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
 
+use crate::helpers::SignedRequestCredentials;
 use crate::{build_test_agent, sse_c_header_values, RawResponse};
 
 fn is_operation_aborted_response(status: u16, body: &str) -> bool {
@@ -25,8 +26,14 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn sign_policy_v4(policy_b64: &str, secret: &str, date: &str, region: &str) -> String {
-    let signing_key = derive_signing_key(secret, date, region, "s3");
+fn sign_policy_v4(
+    policy_b64: &str,
+    secret: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> String {
+    let signing_key = derive_signing_key(secret, date, region, service);
     let sig = hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
     hex_encode(sig.as_ref())
 }
@@ -164,9 +171,34 @@ pub fn sigv4_post_fields_for_credentials(
 ) -> Vec<(String, String)> {
     let (short_date, full_date) = current_dates();
     sigv4_post_fields_for_credentials_with_dates(
-        access_key,
-        secret,
-        region,
+        PostSigningCredentials {
+            access_key,
+            secret,
+            region,
+            service: "s3",
+        },
+        bucket,
+        key,
+        (&short_date, &full_date),
+        extra_conditions,
+    )
+}
+
+pub fn sigv4_post_fields_for_service_with_credentials(
+    credentials: SignedRequestCredentials<'_>,
+    service: &str,
+    bucket: &str,
+    key: &str,
+    extra_conditions: &[serde_json::Value],
+) -> Vec<(String, String)> {
+    let (short_date, full_date) = current_dates();
+    sigv4_post_fields_for_credentials_with_dates(
+        PostSigningCredentials {
+            access_key: credentials.access_key,
+            secret: credentials.secret_key,
+            region: credentials.region,
+            service,
+        },
         bucket,
         key,
         (&short_date, &full_date),
@@ -185,9 +217,12 @@ pub fn sigv4_post_fields_for_credentials_at_epoch(
 ) -> Vec<(String, String)> {
     let (short_date, full_date) = dates_for_epoch(signing_epoch_secs);
     sigv4_post_fields_for_credentials_with_dates(
-        access_key,
-        secret,
-        region,
+        PostSigningCredentials {
+            access_key,
+            secret,
+            region,
+            service: "s3",
+        },
         bucket,
         key,
         (&short_date, &full_date),
@@ -195,17 +230,26 @@ pub fn sigv4_post_fields_for_credentials_at_epoch(
     )
 }
 
+#[derive(Clone, Copy)]
+struct PostSigningCredentials<'a> {
+    access_key: &'a str,
+    secret: &'a str,
+    region: &'a str,
+    service: &'a str,
+}
+
 fn sigv4_post_fields_for_credentials_with_dates(
-    access_key: &str,
-    secret: &str,
-    region: &str,
+    credentials: PostSigningCredentials<'_>,
     bucket: &str,
     key: &str,
     dates: (&str, &str),
     extra_conditions: &[serde_json::Value],
 ) -> Vec<(String, String)> {
     let (short_date, full_date) = dates;
-    let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
+    let credential = format!(
+        "{}/{}/{}/{}/aws4_request",
+        credentials.access_key, short_date, credentials.region, credentials.service
+    );
 
     let mut all_conditions = vec![
         serde_json::json!({"x-amz-algorithm": "AWS4-HMAC-SHA256"}),
@@ -215,7 +259,13 @@ fn sigv4_post_fields_for_credentials_with_dates(
     all_conditions.extend_from_slice(extra_conditions);
 
     let policy_b64 = make_policy(bucket, key, 3600, &all_conditions);
-    let signature = sign_policy_v4(&policy_b64, secret, short_date, region);
+    let signature = sign_policy_v4(
+        &policy_b64,
+        credentials.secret,
+        short_date,
+        credentials.region,
+        credentials.service,
+    );
 
     vec![
         ("key".to_string(), key.to_string()),
@@ -365,4 +415,43 @@ pub fn post_object_to_test_endpoint(
         file_name,
         &[],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_fields_for_service_use_requested_credential_scope() {
+        let fields = sigv4_post_fields_for_service_with_credentials(
+            SignedRequestCredentials {
+                access_key: "ACCESSKEY",
+                secret_key: "secret",
+                region: "test-region-1",
+                tls_ca_pem: None,
+            },
+            "sts",
+            "bucket",
+            "key",
+            &[],
+        );
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find_map(|(candidate, value)| (candidate == name).then_some(value.as_str()))
+                .unwrap_or_else(|| panic!("missing {name} POST field"))
+        };
+        let credential = field("x-amz-credential");
+
+        assert!(credential.starts_with("ACCESSKEY/"));
+        assert!(credential.ends_with("/test-region-1/sts/aws4_request"));
+        let policy = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(field("policy"))
+                .expect("decode POST policy")
+        };
+        let policy = String::from_utf8(policy).expect("POST policy is UTF-8");
+        assert!(policy.contains(credential));
+    }
 }

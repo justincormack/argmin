@@ -36,7 +36,8 @@ pub use helpers::{
 pub use post_form::{
     post_object_raw_to_test_endpoint_with_headers, post_object_to_test_endpoint,
     post_object_to_test_endpoint_with_headers, sigv4_post_fields_for_credentials,
-    sigv4_post_fields_for_credentials_at_epoch, sigv4_post_sse_c_fields_for_credentials,
+    sigv4_post_fields_for_credentials_at_epoch, sigv4_post_fields_for_service_with_credentials,
+    sigv4_post_sse_c_fields_for_credentials,
 };
 pub use raw_http_client::{Agent, Response};
 pub use server::TestServer;
