@@ -19,7 +19,8 @@ This follow-up covers:
 This still does not cover:
 - full IAM policy language
 - full bucket policy evaluation
-- STS AssumeRole API implementation
+- temporary/session credentials, including session-token authentication,
+  request-time expiry, and the STS AssumeRole API
 
 Important current bucket-policy note:
 - AWS-backed testing now shows that `PutBucketPolicy` acceptance is broader
@@ -49,7 +50,7 @@ Completed:
 - Header SigV4 auth
 - Presigned SigV4 query auth
 - POST SigV4 form auth
-- Temporary/session credential checks (`session_token`, credential expiry)
+- Expiry checks for locally configured static credential records
 - Constant-time signature/token comparison
 - Principal propagation from auth into request handling
 - Authorization moved into `server-core`
@@ -65,6 +66,9 @@ Completed:
 - Schema-level length checks for bucket auth/identity fields
 - Public access block and ownership-controls integration
 - Auth, presigned, public-access, and owner-XML integration coverage
+
+Deferred outside this plan:
+- Temporary/session credential support
 
 Still open:
 - Account-level Block Public Access controls
@@ -195,14 +199,18 @@ Implementation note for the first step:
 - Presigned SigV4 query auth
 - POST SigV4 form auth
 
-2. Accept temporary credentials:
-- require matching session token when bound to the credential
-- reject expired credentials
+Temporary/session credentials are not part of the implemented authentication
+surface. Their session-token and expiry behavior must be established against
+AWS when that feature is implemented; static-record expiry is not a substitute
+for STS credential semantics.
 
-3. Enforce AWS-like header auth rules:
+2. Enforce AWS-like header auth rules:
 - strict header scope validation for configured region/service
 - every header listed in `SignedHeaders` must be present
-- all `x-amz-*` headers must be signed
+- all transmitted `x-amz-*` headers except `x-amz-content-sha256` must be
+  listed in `SignedHeaders`; when omitted from that list,
+  `x-amz-content-sha256` still supplies the canonical request payload hash and
+  is therefore bound by the signature
 - malformed/duplicate auth headers rejected consistently
 
 ### Authorization
@@ -453,6 +461,7 @@ Unit tests:
 Targeted integration tests:
 - `cargo test -p s3-tests --test headers`
 - `cargo test -p s3-tests --test presigned`
+- `cargo test -p s3-tests --test chunked`
 - `cargo test -p s3-tests --test public_access_block`
 - `cargo test -p s3-tests --test bucket_anon`
 - `cargo test -p s3-tests --test ownership`

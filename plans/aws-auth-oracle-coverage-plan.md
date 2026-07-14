@@ -93,7 +93,14 @@ integration tests:
   cover header, presigned, and POST records expiring before signature
   comparison; no STS, session-token, or AWS `ExpiredToken` case was added.
 
-### 4. Strengthen authorization identities used by the oracle
+### 4. Strengthen authorization identities used by the oracle — deferred
+
+The `SECOND` AWS user currently has the same IAM policy as the primary user,
+while the local server has only the coarse `Standard` authorization profile and
+no corresponding identity-policy model. A positive IAM-policy canary therefore
+cannot have the same semantics on both endpoints yet. `s3-tests` must not branch
+on the endpoint, so this work is deferred until the local IAM model can express
+the committed AWS fixture policy.
 
 - Commit and document the IAM policy expected for the same-account constrained
   `SECOND` user.
@@ -107,7 +114,10 @@ integration tests:
 - Keep these tests focused on preventing accidental `Standard`-principal
   elevation to owner-account-admin behavior.
 
-### 5. Repair coverage documentation
+Do not add AWS-only fixture checks or endpoint discrimination to `s3-tests` as
+an interim substitute.
+
+### 5. Repair coverage documentation — completed 2026-07-14
 
 - Remove or replace the stale `access_matrix` command in
   `guides/security-testing.md`.
@@ -127,8 +137,10 @@ integration tests:
   including any differences from the documentation.
 - Multiple-auth, malformed grammar, time-boundary, and error-precedence behavior
   is no longer inferred from local code.
-- The constrained-user fixture is reproducible from committed IAM policy.
+- Once the local IAM model can represent it, the constrained-user fixture is
+  reproducible from committed IAM policy without endpoint-specific test code.
 - The targeted `./scripts/aws-tests --test ...` runs for `headers`, `presigned`,
-  `post_object`, `chunked`, `object_write_constrained`, and `boe_constrained`
-  pass against AWS.
+  `post_object`, and `chunked` pass against AWS. The
+  `object_write_constrained` and `boe_constrained` fixture criterion remains
+  deferred with section 4.
 - `cargo nextest run`, formatting, and clippy are clean.

@@ -430,9 +430,9 @@ The main categories currently covered are:
   - An owner-side read-back such as `GetBucketPolicy` is not sufficient proof
     that the corresponding data-plane authorization decision has converged.
   - Existing helpers in `bucket_policy.rs`, `ownership.rs`,
-    `public_access_block.rs`, `access_matrix.rs`, and `bucket_anon.rs` wait
-    for the exact operation under test (`GetObject`, `ListObjects`,
-    `GetBucketPolicyStatus`, `CopyObject`, `UploadPartCopy`,
+    `public_access_block.rs`, `public_access_acl_matrix.rs`, and
+    `bucket_anon.rs` wait for the exact operation under test (`GetObject`,
+    `ListObjects`, `GetBucketPolicyStatus`, `CopyObject`, `UploadPartCopy`,
     `CreateMultipartUpload`, and similar) rather than assuming immediate
     consistency after the control-plane write.
 
