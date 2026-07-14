@@ -320,13 +320,6 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
     auth_header: &str,
 ) -> Result<AuthContext, AuthError> {
     let parsed = parse_auth_header(auth_header)?;
-    if expected_region
-        .exact()
-        .is_some_and(|region| parsed.credential.region != region)
-        || parsed.credential.service != expected_service
-    {
-        return Err(AuthError::MalformedAuth);
-    }
     // S3 uses x-amz-date when present and otherwise permits an ISO-8601 basic
     // Date header. Keep this single selection for skew validation, seed
     // signature verification, and aws-chunked chunk/trailer verification.
@@ -351,6 +344,17 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         now_epoch_secs.abs_diff(request_epoch) > crate::SIGV4_CLOCK_SKEW_SECS
     }) {
         return Err(AuthError::RequestExpired);
+    }
+    if let Some(region) = expected_region.exact() {
+        if parsed.credential.region != region {
+            return Err(AuthError::InvalidHeaderCredentialRegion {
+                provided_region: parsed.credential.region.to_string(),
+                expected_region: region.to_string(),
+            });
+        }
+    }
+    if parsed.credential.service != expected_service {
+        return Err(AuthError::MalformedAuth);
     }
     let body_hash = match headers.first_value("x-amz-content-sha256") {
         Some("UNSIGNED-PAYLOAD") => Cow::Borrowed("UNSIGNED-PAYLOAD"),
@@ -2382,10 +2386,41 @@ mod tests {
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
+            aws_example_time(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidHeaderCredentialRegion {
+                provided_region,
+                expected_region,
+            } if provided_region == "eu-west-1" && expected_region == "us-east-1"
+        ));
+    }
+
+    #[test]
+    fn authenticate_header_skew_precedes_region_mismatch() {
+        let store = example_store();
+        let headers = [
+            ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/eu-west-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("range", "bytes=0-9"),
+            ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let err = authenticate_request(
+            "GET",
+            "/test.txt",
+            "",
+            &headers,
+            b"",
+            &store,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
             0,
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::MalformedAuth));
+        assert!(matches!(err, AuthError::RequestExpired));
     }
 
     #[test]
@@ -2407,7 +2442,7 @@ mod tests {
             &store,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
-            0,
+            aws_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));

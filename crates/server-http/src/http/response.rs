@@ -233,6 +233,12 @@ fn client_error_message(err: &ServerError) -> String {
         }) => format!(
             "Error parsing the X-Amz-Credential parameter; incorrect service \"{provided_service}\". This endpoint belongs to \"{expected_service}\"."
         ),
+        ServerError::Auth(auth::AuthError::InvalidHeaderCredentialRegion {
+            provided_region,
+            expected_region,
+        }) => format!(
+            "The authorization header is malformed; the region '{provided_region}' is wrong; expecting '{expected_region}'"
+        ),
         ServerError::Auth(auth::AuthError::InvalidCredentialScope { param }) => {
             format!("invalid credential scope: {param}")
         }
@@ -644,6 +650,19 @@ impl S3Response {
                     &client_error_message(err),
                     request_id,
                     host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::InvalidHeaderCredentialRegion {
+                expected_region,
+                ..
+            }) => {
+                let body = xml::error_xml_with_region(
+                    "AuthorizationHeaderMalformed",
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                    expected_region,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -3452,6 +3471,22 @@ mod tests {
         assert!(body.contains("<Region>us-west-2</Region>"));
         assert!(body.contains("expecting 'us-west-2'"));
         assert!(body.contains("<HostId>"));
+        assert!(!body.contains("<Resource>"));
+    }
+
+    #[test]
+    fn header_credential_region_error_response_has_wrong_region_body_without_bucket_hint() {
+        let err = ServerError::Auth(auth::AuthError::InvalidHeaderCredentialRegion {
+            provided_region: "us-east-1".to_string(),
+            expected_region: "us-west-2".to_string(),
+        });
+        let resp = S3Response::error(&err, "/", TEST_HOST_ID);
+        assert_eq!(resp.status_code, 400);
+        assert_eq!(find_header(&resp, "x-amz-bucket-region"), None);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>AuthorizationHeaderMalformed</Code>"));
+        assert!(body.contains("<Region>us-west-2</Region>"));
+        assert!(body.contains("the region 'us-east-1' is wrong; expecting 'us-west-2'"));
         assert!(!body.contains("<Resource>"));
     }
 

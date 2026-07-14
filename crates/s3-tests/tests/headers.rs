@@ -377,6 +377,28 @@ fn signed_put(bucket: &str, key: &str, body: &[u8]) -> (u16, String) {
     (status, body_str)
 }
 
+fn send_signed_get_with_token(
+    path: &str,
+    signed: &SignedHeaders,
+    token: Option<&str>,
+) -> (u16, String) {
+    let url = format!("{}{}", CTX.endpoint(), path);
+    let request = agent()
+        .get(&url)
+        .header("Authorization", &signed.authorization)
+        .header("x-amz-date", &signed.amz_date)
+        .header("x-amz-content-sha256", &signed.amz_content_sha256);
+    let request = if let Some(token) = token {
+        request.header("x-amz-security-token", token)
+    } else {
+        request
+    };
+    let mut response = request.call().expect("transport error");
+    let status = response.status().as_u16();
+    let body = response.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
+}
+
 fn signed_put_without_content_length(bucket: &str, key: &str, body: &[u8]) -> (u16, String) {
     let path = format!("/{}/{}", bucket, key);
     let body_hash = sha256_hex(body);
@@ -1356,6 +1378,64 @@ fn test_put_date_skew_future() {
 }
 
 #[test]
+fn test_header_sigv4_clock_skew_stable_margins() {
+    s3_tests::run(async {
+        const ACCEPTED_MARGIN_SECS: u64 = 5 * 60;
+        const REJECTED_MARGIN_SECS: u64 = 20 * 60;
+
+        let bucket = setup_bucket().await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cases = [
+            ("past-inside", now - ACCEPTED_MARGIN_SECS, 200, None),
+            ("future-inside", now + ACCEPTED_MARGIN_SECS, 200, None),
+            (
+                "past-outside",
+                now - REJECTED_MARGIN_SECS,
+                403,
+                Some("RequestTimeTooSkewed"),
+            ),
+            (
+                "future-outside",
+                now + REJECTED_MARGIN_SECS,
+                403,
+                Some("RequestTimeTooSkewed"),
+            ),
+        ];
+
+        for (key, timestamp, expected_status, expected_error) in cases {
+            let body = format!("stable clock-skew margin: {key}");
+            let path = format!("/{bucket}/{key}");
+            let signed = Signer::new("PUT", &path)
+                .body_hash(&sha256_hex(body.as_bytes()))
+                .at_time(timestamp)
+                .sign();
+            let url = format!("{}{}", CTX.endpoint(), path);
+            let mut response = agent()
+                .put(&url)
+                .header("Authorization", &signed.authorization)
+                .header("x-amz-date", &signed.amz_date)
+                .header("x-amz-content-sha256", &signed.amz_content_sha256)
+                .send(body.as_bytes())
+                .expect("transport error");
+            let status = response.status().as_u16();
+            let response_body = response.body_mut().read_to_string().unwrap_or_default();
+            assert_eq!(
+                status, expected_status,
+                "clock-skew case {key}: expected {expected_status}, got {status}: {response_body}"
+            );
+            if let Some(code) = expected_error {
+                assert_error_code(&response_body, code);
+            }
+        }
+
+        cleanup(&bucket, &["past-inside", "future-inside"]).await;
+    });
+}
+
+#[test]
 fn test_put_date_tampered() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -2094,6 +2174,109 @@ fn test_header_sigv4_bad_signature_with_unexpected_security_token_reports_signat
         assert_error_code(&body, "SignatureDoesNotMatch");
 
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_header_sigv4_error_precedence_cross_product() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let path = format!("/{bucket}");
+        let token = "static-credential-unexpected-token";
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let skewed = now - 20 * 60;
+        let wrong_region = if CTX.region() == "us-east-1" {
+            "us-west-2"
+        } else {
+            "us-east-1"
+        };
+        let unknown_access_key = "AKIAIOSFODNN7INVALID";
+        let wrong_secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYWRONGKEY000";
+        let empty_hash = sha256_hex(b"");
+
+        let cases = vec![
+            (
+                "skew precedes bad scope, unknown credentials, signature, and token",
+                Signer::new("GET", &path)
+                    .access_key(unknown_access_key)
+                    .secret_key(wrong_secret)
+                    .region(wrong_region)
+                    .body_hash(&empty_hash)
+                    .header("x-amz-security-token", token)
+                    .at_time(skewed)
+                    .sign(),
+                403,
+                "RequestTimeTooSkewed",
+            ),
+            (
+                "bad scope precedes unknown credentials, signature, and token",
+                Signer::new("GET", &path)
+                    .access_key(unknown_access_key)
+                    .secret_key(wrong_secret)
+                    .region(wrong_region)
+                    .body_hash(&empty_hash)
+                    .header("x-amz-security-token", token)
+                    .sign(),
+                400,
+                "AuthorizationHeaderMalformed",
+            ),
+            (
+                "skew precedes unknown credentials, signature, and token",
+                Signer::new("GET", &path)
+                    .access_key(unknown_access_key)
+                    .secret_key(wrong_secret)
+                    .body_hash(&empty_hash)
+                    .header("x-amz-security-token", token)
+                    .at_time(skewed)
+                    .sign(),
+                403,
+                "RequestTimeTooSkewed",
+            ),
+            (
+                "unknown credentials precede signature and token",
+                Signer::new("GET", &path)
+                    .access_key(unknown_access_key)
+                    .secret_key(wrong_secret)
+                    .body_hash(&empty_hash)
+                    .header("x-amz-security-token", token)
+                    .sign(),
+                403,
+                "InvalidAccessKeyId",
+            ),
+            (
+                "bad signature precedes token",
+                Signer::new("GET", &path)
+                    .secret_key(wrong_secret)
+                    .body_hash(&empty_hash)
+                    .header("x-amz-security-token", token)
+                    .sign(),
+                403,
+                "SignatureDoesNotMatch",
+            ),
+            (
+                "token is checked after a valid signature",
+                Signer::new("GET", &path)
+                    .body_hash(&empty_hash)
+                    .header("x-amz-security-token", token)
+                    .sign(),
+                400,
+                "InvalidToken",
+            ),
+        ];
+
+        for (case, signed, expected_status, expected_code) in cases {
+            let (status, body) = send_signed_get_with_token(&path, &signed, Some(token));
+            assert_eq!(
+                status, expected_status,
+                "{case}: expected {expected_status}, got {status}: {body}"
+            );
+            assert_error_code(&body, expected_code);
+        }
+
+        cleanup(&bucket, &[]).await;
     });
 }
 

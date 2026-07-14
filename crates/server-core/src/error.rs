@@ -469,7 +469,8 @@ impl ServerError {
             Self::Auth(
                 auth::AuthError::MalformedAuth
                 | auth::AuthError::MalformedAuthComponents
-                | auth::AuthError::MalformedSignedHeaders,
+                | auth::AuthError::MalformedSignedHeaders
+                | auth::AuthError::InvalidHeaderCredentialRegion { .. },
             )
             | Self::WrongRegion { .. } => "AuthorizationHeaderMalformed",
             Self::Auth(
@@ -605,6 +606,7 @@ impl ServerError {
                 auth::AuthError::MalformedAuth
                 | auth::AuthError::MalformedAuthComponents
                 | auth::AuthError::MalformedSignedHeaders
+                | auth::AuthError::InvalidHeaderCredentialRegion { .. }
                 | auth::AuthError::UnsupportedAuthType
                 | auth::AuthError::InvalidCredentialScope { .. }
                 | auth::AuthError::InvalidCredentialScopeRegion { .. }
@@ -1075,6 +1077,16 @@ mod tests {
             authorization: "redacted".to_string(),
         });
         assert_eq!(err.s3_error_code(), "InvalidArgument");
+        assert_eq!(err.http_status(), 400);
+    }
+
+    #[test]
+    fn auth_header_region_mismatch_is_authorization_header_malformed_400() {
+        let err = ServerError::Auth(auth::AuthError::InvalidHeaderCredentialRegion {
+            provided_region: "us-west-2".to_string(),
+            expected_region: "us-east-1".to_string(),
+        });
+        assert_eq!(err.s3_error_code(), "AuthorizationHeaderMalformed");
         assert_eq!(err.http_status(), 400);
     }
 

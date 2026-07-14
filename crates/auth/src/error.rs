@@ -27,6 +27,11 @@ pub enum AuthError {
         provided_service: String,
         expected_service: String,
     },
+    #[error("invalid Authorization credential region")]
+    InvalidHeaderCredentialRegion {
+        provided_region: String,
+        expected_region: String,
+    },
     #[error("invalid credential scope: {param}")]
     InvalidCredentialScope { param: &'static str },
     #[error("invalid credential scope region: {param}")]
@@ -128,6 +133,14 @@ impl std::fmt::Debug for AuthError {
                     "expected_service",
                     &observability::escaped(expected_service),
                 )
+                .finish(),
+            Self::InvalidHeaderCredentialRegion {
+                provided_region,
+                expected_region,
+            } => f
+                .debug_struct("InvalidHeaderCredentialRegion")
+                .field("provided_region", &observability::escaped(provided_region))
+                .field("expected_region", &observability::escaped(expected_region))
                 .finish(),
             Self::InvalidCredentialScope { param } => f
                 .debug_struct("InvalidCredentialScope")

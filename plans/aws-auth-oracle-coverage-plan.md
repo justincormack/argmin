@@ -70,20 +70,28 @@ integration tests:
 - Presigned time-window rejection precedes the check that `X-Amz-Date` agrees
   with the credential date scope.
 
-### 3. Pin time and error precedence
+### 3. Pin time and error precedence — completed 2026-07-14
 
-- Use comfortably inside/outside accepted and rejected margins for stable AWS
-  CI coverage of header and POST signing time.
-- Keep exact clock-skew-boundary probes documentary or repeated rather than
-  making them single-shot CI assertions, because AWS server time, transit time,
-  and timestamp precision make the exact boundary unstable.
-- Probe POST requests with an unexpired policy but old or future
-  `x-amz-date` values using the same stable-margin rule.
-- Add a small AWS cross-product covering bad scope, unknown credentials, bad
-  signatures, skew, and token inputs supplied with static credentials so error
-  precedence for the implemented AWS surface is explicit.
-- Test locally configured static-record expiry separately. Do not add STS,
-  temporary-credential, or session-token-expiry cases to the AWS matrix.
+Live AWS established the following behavior, now pinned by matching local
+integration tests:
+
+- Header SigV4 requests signed five minutes in the past or future are accepted;
+  requests signed twenty minutes in the past or future return
+  `RequestTimeTooSkewed`. These stable margins deliberately avoid a
+  timing-sensitive exact-boundary CI assertion.
+- POST Object SigV4 does not use the header-authentication clock-skew window.
+  With an unexpired policy, dates five and twenty minutes in either direction
+  all authenticate successfully. Policy expiration, rather than a separate
+  fifteen-minute request-time check, controls these cases.
+- For a well-formed header SigV4 request, AWS applies the tested errors in this
+  order: clock skew, wrong credential-scope region, unknown access key, bad
+  signature, then an unexpected security token supplied with static
+  credentials. The cross-product exposed and fixed two local ordering bugs:
+  scope had been checked before skew in the auth crate, while bucket-aware HTTP
+  routing had deferred scope validation until after credential lookup.
+- Static-record expiry remains separate internal behavior. Existing auth tests
+  cover header, presigned, and POST records expiring before signature
+  comparison; no STS, session-token, or AWS `ExpiredToken` case was added.
 
 ### 4. Strengthen authorization identities used by the oracle
 

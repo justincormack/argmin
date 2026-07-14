@@ -942,7 +942,7 @@ impl HttpFrontend {
             | S3Operation::ListObjectsV2 { bucket } => Some(bucket.clone()),
             _ => None,
         };
-        let defer_region_check = self.should_defer_region_check(&operation);
+        let auth_bucket = operation.bucket_name().map(BucketName::as_str);
         let auth = {
             observability::trace_scope!(
                 TRACE_TARGET,
@@ -951,11 +951,11 @@ impl HttpFrontend {
                 s3req.method.as_str(),
                 s3req.path()
             );
-            self.authenticate(s3req, defer_region_check)
+            self.authenticate(s3req, auth_bucket)
         };
         let result = match auth {
             Ok(auth) => {
-                if defer_region_check {
+                if auth_bucket.is_some() {
                     if let Err(err) = self.enforce_bucket_region_for_operation(&operation, &auth) {
                         Err(err)
                     } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
@@ -3172,9 +3172,9 @@ impl HttpFrontend {
     fn authenticate(
         &self,
         req: &S3Request,
-        defer_region_check: bool,
+        bucket: Option<&str>,
     ) -> Result<AuthContext, ServerError> {
-        self.authenticate_with_payload_check(req, true, defer_region_check)
+        self.authenticate_with_payload_check(req, true, bucket)
     }
 
     /// Authenticate a request, optionally skipping x-amz-content-sha256 body
@@ -3187,35 +3187,21 @@ impl HttpFrontend {
         &self,
         req: &S3Request,
         verify_payload_hash: bool,
-        defer_region_check: bool,
+        bucket: Option<&str>,
     ) -> Result<AuthContext, ServerError> {
         let now = current_auth_epoch_secs()?;
 
-        let auth_result = if defer_region_check {
-            authenticate_request(
-                req.method.as_str(),
-                req.path(),
-                req.query_string(),
-                &req.header_source(),
-                &req.body,
-                &self.credentials,
-                auth::ExpectedSigningRegion::DeferredToBucketRouting,
-                "s3",
-                now,
-            )
-        } else {
-            authenticate_request(
-                req.method.as_str(),
-                req.path(),
-                req.query_string(),
-                &req.header_source(),
-                &req.body,
-                &self.credentials,
-                auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
-                "s3",
-                now,
-            )
-        };
+        let auth_result = authenticate_request(
+            req.method.as_str(),
+            req.path(),
+            req.query_string(),
+            &req.header_source(),
+            &req.body,
+            &self.credentials,
+            auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
+            "s3",
+            now,
+        );
 
         let auth = match auth_result {
             Ok(auth) => auth,
@@ -3233,6 +3219,22 @@ impl HttpFrontend {
                     return Err(err);
                 }
                 return Err(ServerError::Auth(auth::AuthError::UnsupportedAuthType));
+            }
+            Err(auth::AuthError::InvalidHeaderCredentialRegion {
+                provided_region,
+                expected_region,
+            }) => {
+                let bucket_region_header = if let Some(bucket) = bucket {
+                    self.coordinator
+                        .bucket_exists(&parse_bucket_name(bucket)?)?
+                } else {
+                    false
+                };
+                return Err(ServerError::WrongRegion {
+                    provided_region,
+                    expected_region,
+                    bucket_region_header,
+                });
             }
             Err(err) => return Err(ServerError::Auth(err)),
         };
@@ -3273,10 +3275,6 @@ impl HttpFrontend {
             });
         }
         Ok(())
-    }
-
-    fn should_defer_region_check(&self, operation: &S3Operation) -> bool {
-        operation.bucket_name().is_some()
     }
 
     fn enforce_bucket_region_for_operation(
@@ -3536,7 +3534,7 @@ impl HttpFrontend {
             Self::require_content_sha256_for_sigv4_header_auth(req)?;
             return Err(ServerError::PostObjectHeaderAuthUnsupported);
         }
-        let header_auth = self.authenticate_with_payload_check(req, false, true)?;
+        let header_auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
 
         let field = |name: &str| -> Option<&str> {
             form_fields
@@ -3956,7 +3954,7 @@ impl HttpFrontend {
             key
         );
         Self::require_content_sha256_for_sigv4_header_auth(req)?;
-        let auth = self.authenticate_with_payload_check(req, false, true)?;
+        let auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
         self.enforce_bucket_region_raw(bucket, &auth)?;
         reject_directory_bucket_only_object_features(req)?;
 
@@ -4308,7 +4306,7 @@ impl HttpFrontend {
             part_number
         );
         Self::require_content_sha256_for_sigv4_header_auth(req)?;
-        let auth = self.authenticate_with_payload_check(req, false, true)?;
+        let auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
         self.enforce_bucket_region_raw(bucket, &auth)?;
 
         validate_request_checksum_headers(req, false, false, false)?;
@@ -6754,16 +6752,6 @@ mod tests {
             }
             other => panic!("expected WrongRegion, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn create_bucket_defers_region_check() {
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-
-        assert!(fe.should_defer_region_check(&S3Operation::CreateBucket {
-            bucket: test_bucket_name("mybucket"),
-        }));
     }
 
     fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {

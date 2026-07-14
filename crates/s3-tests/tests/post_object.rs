@@ -177,6 +177,10 @@ fn current_dates() -> (String, String) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    sigv4_dates_at(epoch)
+}
+
+fn sigv4_dates_at(epoch: u64) -> (String, String) {
     let iso = epoch_to_iso8601(epoch);
     // short date: YYYYMMDD
     let short = iso[..10].replace('-', "");
@@ -361,6 +365,35 @@ fn sigv4_fields(
         key,
         extra_conditions,
     )
+}
+
+fn sigv4_fields_at_time(bucket: &str, key: &str, timestamp: u64) -> Vec<(String, String)> {
+    let (short_date, full_date) = sigv4_dates_at(timestamp);
+    let credential = format!(
+        "{}/{}/{}/s3/aws4_request",
+        CTX.access_key(),
+        short_date,
+        CTX.region()
+    );
+    let conditions = [
+        serde_json::json!({"x-amz-algorithm": "AWS4-HMAC-SHA256"}),
+        serde_json::json!({"x-amz-credential": &credential}),
+        serde_json::json!({"x-amz-date": &full_date}),
+    ];
+    let policy_b64 = make_policy(bucket, key, 3600, &conditions);
+    let signature = sign_policy_v4(&policy_b64, CTX.secret_key(), &short_date, CTX.region());
+
+    vec![
+        ("key".to_string(), key.to_string()),
+        (
+            "x-amz-algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
+        ("x-amz-credential".to_string(), credential),
+        ("x-amz-date".to_string(), full_date),
+        ("policy".to_string(), policy_b64),
+        ("x-amz-signature".to_string(), signature),
+    ]
 }
 
 fn sigv4_fields_for_credentials(
@@ -2677,6 +2710,47 @@ fn test_post_object_missing_signature() {
 }
 
 // ── Policy: expiration ──────────────────────────────────────────────────
+
+#[test]
+fn test_post_object_sigv4_date_does_not_use_header_auth_skew_window() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cases = [
+            ("post-date-past-inside", now - 5 * 60),
+            ("post-date-future-inside", now + 5 * 60),
+            ("post-date-past-outside", now - 20 * 60),
+            ("post-date-future-outside", now + 20 * 60),
+        ];
+
+        for (key, timestamp) in cases {
+            let fields = sigv4_fields_at_time(&bucket, key, timestamp);
+            let field_refs = fields
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            let (status, body) = post_object(
+                &bucket,
+                &field_refs,
+                format!("POST date oracle: {key}").as_bytes(),
+                "date-oracle.txt",
+            );
+            assert_eq!(
+                status, 204,
+                "POST date case {key}: expected 204, got {status}: {body}"
+            );
+        }
+
+        for (key, _) in cases {
+            let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+        }
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
 
 #[test]
 fn test_post_object_expired_policy() {
