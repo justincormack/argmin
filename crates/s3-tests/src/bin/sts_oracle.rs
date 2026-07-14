@@ -778,6 +778,253 @@ fn run_s3_header_session_authentication_probes(
     }
 }
 
+struct S3HeaderScopeProbeSet<'a> {
+    account_id: &'a str,
+    bucket: &'a str,
+    live_credentials: SignedRequestCredentials<'a>,
+    live_security_token: &'a str,
+    live_role_name: &'a str,
+    live_role_session_name: &'a str,
+    other_live_security_token: &'a str,
+    old_credentials: SignedRequestCredentials<'a>,
+    old_security_token: &'a str,
+}
+
+fn assert_s3_list_bucket_access_denied(
+    label: &str,
+    response: &RawResponse,
+    fixture: &S3HeaderScopeProbeSet<'_>,
+) {
+    let response = s3_response_with_sanitized_body(
+        response,
+        fixture.live_credentials.access_key,
+        &[fixture.live_security_token],
+    );
+    let assumed_role_arn = format!(
+        "arn:aws:sts::{}:assumed-role/{}/{}",
+        fixture.account_id, fixture.live_role_name, fixture.live_role_session_name
+    );
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .header("x-amz-bucket-region", fixture.live_credentials.region)
+            .sub("assumed_role_arn", assumed_role_arn)
+            .sub("bucket", fixture.bucket)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>User: {assumed_role_arn} is not authorized to perform: \
+                 s3:ListBucket on resource: \"arn:aws:s3:::{bucket}\" because no \
+                 identity-based policy allows the s3:ListBucket action</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_header_wrong_region_scope(
+    label: &str,
+    response: &RawResponse,
+    wrong_region: &str,
+    expected_region: &str,
+    access_key: &str,
+    security_tokens: &[&str],
+) {
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    let message = format!(
+        "The authorization header is malformed; the region '{wrong_region}' is wrong; \
+         expecting '{expected_region}'"
+    );
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .header("x-amz-bucket-region", expected_region)
+            .body(expected_error::with_region(
+                "AuthorizationHeaderMalformed",
+                &message,
+                expected_region,
+            )),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_header_wrong_service_scope(
+    label: &str,
+    response: &RawResponse,
+    expected_region: &str,
+    access_key: &str,
+    security_tokens: &[&str],
+) {
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .header("x-amz-bucket-region", expected_region)
+            .body(expected_error::with_host_id(
+                "AuthorizationHeaderMalformed",
+                "The authorization header is malformed; incorrect service \"sts\". This endpoint belongs to \"s3\".",
+            )),
+    );
+    println!("{label}: ok");
+}
+
+fn run_s3_header_scope_probes(endpoint: &str, fixture: S3HeaderScopeProbeSet<'_>) {
+    let positive_response = send_signed_request_for_service_with_credentials(
+        "GET",
+        endpoint,
+        b"",
+        [("x-amz-security-token", fixture.live_security_token)],
+        "s3",
+        fixture.live_credentials,
+    );
+    assert_s3_list_bucket_access_denied(
+        "s3-header-scope-live-role-correct-scope",
+        &positive_response,
+        &fixture,
+    );
+
+    let wrong_secret = "0".repeat(40);
+    let wrong_region = if fixture.live_credentials.region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    };
+    for (role_state, credentials, security_token, other_security_token) in [
+        (
+            "live-role",
+            fixture.live_credentials,
+            fixture.live_security_token,
+            fixture.other_live_security_token,
+        ),
+        (
+            "old-session",
+            fixture.old_credentials,
+            fixture.old_security_token,
+            fixture.live_security_token,
+        ),
+    ] {
+        let wrong_region_credentials = SignedRequestCredentials {
+            region: wrong_region,
+            ..credentials
+        };
+        let wrong_region_bad_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..wrong_region_credentials
+        };
+        let wrong_service_bad_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..credentials
+        };
+        for (case, signing_credentials, supplied_token, service) in [
+            (
+                "valid-token-wrong-region",
+                wrong_region_credentials,
+                Some(security_token),
+                "s3",
+            ),
+            (
+                "missing-token-wrong-region",
+                wrong_region_credentials,
+                None,
+                "s3",
+            ),
+            (
+                "mismatched-token-wrong-region",
+                wrong_region_credentials,
+                Some(other_security_token),
+                "s3",
+            ),
+            (
+                "valid-token-wrong-region-bad-signature",
+                wrong_region_bad_signature_credentials,
+                Some(security_token),
+                "s3",
+            ),
+            (
+                "valid-token-wrong-service",
+                credentials,
+                Some(security_token),
+                "sts",
+            ),
+            ("missing-token-wrong-service", credentials, None, "sts"),
+            (
+                "mismatched-token-wrong-service",
+                credentials,
+                Some(other_security_token),
+                "sts",
+            ),
+            (
+                "valid-token-wrong-service-bad-signature",
+                wrong_service_bad_signature_credentials,
+                Some(security_token),
+                "sts",
+            ),
+        ] {
+            let label = format!("s3-header-scope-{role_state}-{case}");
+            let headers = supplied_token
+                .map(|token| vec![("x-amz-security-token", token)])
+                .unwrap_or_default();
+            let response = send_signed_request_for_service_with_credentials(
+                "GET",
+                endpoint,
+                b"",
+                headers,
+                service,
+                signing_credentials,
+            );
+            let presented_tokens = supplied_token.as_slice();
+            if service == "s3" {
+                assert_s3_header_wrong_region_scope(
+                    &label,
+                    &response,
+                    wrong_region,
+                    fixture.live_credentials.region,
+                    signing_credentials.access_key,
+                    presented_tokens,
+                );
+            } else {
+                assert_s3_header_wrong_service_scope(
+                    &label,
+                    &response,
+                    fixture.live_credentials.region,
+                    signing_credentials.access_key,
+                    presented_tokens,
+                );
+            }
+        }
+    }
+
+    let wrong_region_credentials = SignedRequestCredentials {
+        region: wrong_region,
+        ..fixture.live_credentials
+    };
+    let both_wrong = send_signed_request_for_service_with_credentials(
+        "GET",
+        endpoint,
+        b"",
+        [("x-amz-security-token", fixture.live_security_token)],
+        "sts",
+        wrong_region_credentials,
+    );
+    assert_s3_header_wrong_region_scope(
+        "s3-header-scope-live-role-both-wrong",
+        &both_wrong,
+        wrong_region,
+        fixture.live_credentials.region,
+        fixture.live_credentials.access_key,
+        &[fixture.live_security_token],
+    );
+}
+
 struct S3SessionContextProbeSet<'a> {
     credentials: SignedRequestCredentials<'a>,
     security_token: &'a str,
@@ -5071,10 +5318,25 @@ fn main() {
             region: &region,
             tls_ca_pem: None,
         };
+        let post_bucket = required_env("S3_TEST_STS_POST_BUCKET");
         run_s3_header_session_authentication_probes(
             &format!("https://s3.{region}.amazonaws.com/"),
             &account_id,
             S3HeaderSessionProbeSet {
+                live_credentials: recreated_credentials,
+                live_security_token: &recreated_security_token,
+                live_role_name: &recreated_role_name,
+                live_role_session_name: &recreated_role_session_name,
+                other_live_security_token: &other_live_security_token,
+                old_credentials: deleted_credentials,
+                old_security_token: &deleted_security_token,
+            },
+        );
+        run_s3_header_scope_probes(
+            &format!("https://{post_bucket}.s3.{region}.amazonaws.com/"),
+            S3HeaderScopeProbeSet {
+                account_id: &account_id,
+                bucket: &post_bucket,
                 live_credentials: recreated_credentials,
                 live_security_token: &recreated_security_token,
                 live_role_name: &recreated_role_name,
@@ -5097,7 +5359,6 @@ fn main() {
                 old_security_token: &deleted_security_token,
             },
         );
-        let post_bucket = required_env("S3_TEST_STS_POST_BUCKET");
         let recreated_session_arn = required_env("S3_TEST_STS_RECREATED_SESSION_ARN");
         run_s3_session_context_probes(
             &format!("https://{post_bucket}.s3.{region}.amazonaws.com"),

@@ -384,10 +384,17 @@ admission controls plus strict encoded-token and decoded-payload limits.
 The STS route performs its AWS-pinned credential-scope validation before
 entering the shared temporary-credential path: simultaneous region and service
 errors are aggregated in that order, and either individual error precedes STS
-token resolution and HMAC comparison. This placement is STS-specific. Do not
-reuse it to order scope validation against temporary-credential checks in S3
-header, presigned, POST Object, or streaming authentication until each mode's
-collisions are independently pinned.
+token resolution and HMAC comparison. This placement is STS-specific and is
+not evidence for any S3 mode; each S3 mode requires its own collision matrix.
+
+The S3 header-auth route is now independently pinned to perform its own scope
+validation before the specifically probed session-token presence and binding,
+stable issuer-role liveness, and HMAC checks; wrong region wins when region and
+service are both wrong. The matrix does not yet order scope validation against
+empty, malformed, or duplicate signed token headers, so it does not establish
+scope's placement relative to mode-specific token structural validation. These
+results apply only to header SigV4. Presigned, POST Object, and streaming scope
+collisions remain unresolved.
 
 Credential validation should have one common decision path used by STS and S3
 header, presigned, POST Object, and streaming authentication:
@@ -806,8 +813,9 @@ The initial Query-protocol slice completed on 2026-07-13:
 
 Before Phase 0 can satisfy the first-milestone exit condition, it still needs
 to pin expiry-versus-issuer-deletion precedence, the remaining S3
-temporary-credential region/service collisions, permission-policy mutation
-behavior, and the temporary access-key/token envelope decisions.
+presigned/POST/streaming temporary-credential region/service collisions,
+permission-policy mutation behavior, and the temporary access-key/token
+envelope decisions.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
 remain unsupported compatibility gaps and must never be silently ignored.
@@ -1199,7 +1207,8 @@ On the STS route, credential-scope parsing must therefore occur before
 temporary-credential resolution. Only a correctly region- and service-scoped
 STS request proceeds to token opening, token/access-key binding, expiry and
 issuer-liveness checks, and signature comparison. No ordering relative to
-scope validation is inferred here for any S3 authentication mode.
+scope validation is inferred here for any S3 authentication mode; the header
+ordering described next comes only from its separate S3 matrix.
 
 The S3 SigV4 header-authentication slice completed on 2026-07-13 using the
 permissionless recreated-role session as its positive authentication control.
@@ -1220,6 +1229,33 @@ The S3 header path therefore orders token/access-key binding and stable issuer
 liveness before signature comparison, but unlike STS renders those failures as
 `InvalidAccessKeyId`. This result is limited to header SigV4 until the other
 authentication modes are independently pinned.
+
+The S3 header signing-scope slice completed on 2026-07-14 against the fixture's
+existing bucket-specific endpoint. A correctly scoped live session first
+reaches authorization and receives the complete `s3:ListBucket` `AccessDenied`
+golden, so the scope failures cannot pass merely because the target is absent
+or unroutable. Complete response goldens establish that:
+
+- a wrong region returns HTTP 400 `AuthorizationHeaderMalformed`, the exact
+  wrong/expected-region message, the expected `Region` XML element, and the
+  `x-amz-bucket-region` response header
+- service `sts` returns HTTP 400 `AuthorizationHeaderMalformed` with exactly
+  `The authorization header is malformed; incorrect service "sts". This
+  endpoint belongs to "s3".`, omits the `Region` XML element, and retains the
+  `x-amz-bucket-region` header
+- when region and service are both wrong, only the wrong-region response is
+  rendered; this differs from STS, which aggregates both scope messages
+- each scope error precedes session-token presence and binding, stable
+  issuer-role liveness, and HMAC comparison. Live and invalidated sessions with
+  valid, missing, or independently valid mismatched tokens receive the scope
+  error, as does a valid token combined with a bad secret
+
+The S3 header route must therefore validate its credential scope before the
+specifically probed token presence and binding, issuer liveness, and HMAC
+checks. Empty, malformed, and duplicate signed token-header collisions remain
+unpinned, so this does not order scope validation against every mode-specific
+structural token check. It also does not establish the placement or collision
+behavior for presigned, POST Object, or streaming authentication.
 
 The S3 SigV4 presigned-query slice completed on 2026-07-13 against the same
 live and invalidated sessions. A valid `X-Amz-Security-Token` query parameter
@@ -1600,7 +1636,9 @@ confidentiality. No session response or request body may appear in traces.
 4. What is the exact AWS precedence among wrong token, missing token, wrong
    region/service, disabled credential, and expired session? The core header,
    presigned, POST Object, and streaming token/signature collisions are pinned;
-   their remaining region/service/expiry collisions are not.
+   STS and S3 header region/service collisions are now pinned separately.
+   Presigned, POST Object, and streaming scope collisions, disabled-credential
+   collisions, and the remaining expiry collisions are not.
 5. What total Query body and member limits does live STS enforce for the first
    supported parameter set?
 6. Should the first standalone UAT role be injected through a dedicated
