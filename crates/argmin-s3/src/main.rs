@@ -2926,6 +2926,29 @@ fn handle_experimental_raft_peer_rpc_before_ack(
     policy: &ControlPlaneRaftPeerTransportPolicy,
     durability: ExperimentalRaftPeerRpcDurability<'_>,
 ) -> Result<(), ExperimentalRaftPeerRpcWorkerError> {
+    handle_experimental_raft_peer_rpc_with_response_writer(
+        runtime,
+        authority,
+        stream,
+        local_node_id,
+        policy,
+        durability,
+        write_control_plane_raft_peer_transport_frame,
+    )
+}
+
+fn handle_experimental_raft_peer_rpc_with_response_writer<WriteResponse>(
+    runtime: &Handle,
+    authority: &ControlPlaneRaftAuthority,
+    stream: &mut UnixStream,
+    local_node_id: ControlPlaneRaftNodeId,
+    policy: &ControlPlaneRaftPeerTransportPolicy,
+    durability: ExperimentalRaftPeerRpcDurability<'_>,
+    write_response: WriteResponse,
+) -> Result<(), ExperimentalRaftPeerRpcWorkerError>
+where
+    WriteResponse: FnOnce(&mut UnixStream, &[u8]) -> Result<(), ControlPlaneError>,
+{
     ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
     stream
         .set_read_timeout(Some(CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT))
@@ -3015,8 +3038,7 @@ fn handle_experimental_raft_peer_rpc_before_ack(
     )?;
 
     ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
-    write_control_plane_raft_peer_transport_frame(stream, &response_frame)
-        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)
+    write_response(stream, &response_frame).map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)
 }
 
 fn experimental_raft_peer_auth_envelope_identity(
@@ -9409,28 +9431,41 @@ mod tests {
         let failed_response_frame = failed_response_request
             .encode_frame_for_peer(&identity)
             .expect("second peer request should encode");
-        let (mut closed_client_stream, mut second_server_stream) =
+        let (mut second_client_stream, mut second_server_stream) =
             UnixStream::pair().expect("second test UnixStream pair should create");
         write_control_plane_raft_peer_transport_frame(
-            &mut closed_client_stream,
+            &mut second_client_stream,
             &failed_response_frame,
         )
         .expect("second client should write request frame");
-        drop(closed_client_stream);
-        let failed_response = handle_experimental_raft_peer_rpc_before_ack(
+        let failed_response = handle_experimental_raft_peer_rpc_with_response_writer(
             runtime.handle(),
             &authority,
             &mut second_server_stream,
             1,
             &policy,
             ExperimentalRaftPeerRpcDurability::from_context(&durability_context),
+            |_stream, _response_frame| {
+                Err(ControlPlaneError::Io {
+                    context: "write injected failed peer response",
+                    source: io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "injected post-dispatch response failure",
+                    ),
+                })
+            },
         );
         assert!(
             matches!(
-                failed_response,
-                Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))
+                &failed_response,
+                Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(
+                    ControlPlaneError::Io {
+                        context: "write injected failed peer response",
+                        source,
+                    }
+                )) if source.kind() == io::ErrorKind::BrokenPipe
             ),
-            "closed peer should fail the response write: {failed_response:?}"
+            "injected post-dispatch response write should fail: {failed_response:?}"
         );
         assert!(
             checkpoint_experimental_raft_peer_wal_if_due(
