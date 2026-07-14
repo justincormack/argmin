@@ -1619,7 +1619,7 @@ fn experimental_raft_process_restart_replays_post_checkpoint_wal_suffix() {
 }
 
 #[test]
-fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_log_state() {
+fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_state() {
     let bin = argmin_s3_bin();
     let test_dir = TestDir::new("experimental-raft-process-peer-append-wal-crash");
     let cluster_name = format!(
@@ -1767,13 +1767,18 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
         UnixStream::connect(&follower_peer_socket).expect("follower peer socket should connect");
     write_control_plane_raft_peer_transport_frame(&mut peer_stream, &append_frame)
         .expect("append frame should be written to follower peer socket");
+    read_control_plane_raft_peer_transport_frame(
+        &mut peer_stream,
+        ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+    )
+    .expect("fsynced peer WAL append should be acknowledged before bounded checkpointing");
 
     let status = wait_for_process_exit(&mut restarted103, Duration::from_secs(5));
     fs::remove_dir(&follower_checkpoint_tmp_path)
         .expect("follower checkpoint temp-path blocker should be removed after crash");
     assert!(
         !status.success(),
-        "follower should exit after failing the checkpoint-before-peer-response path"
+        "follower should exit after the acknowledged WAL suffix cannot be checkpointed"
     );
     let follower_artifact_after_crash = artifact_only_log_state(&follower_state_path)
         .expect("follower checkpoint artifact should restore after crash");
@@ -1791,7 +1796,7 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
     assert_eq!(
         follower_log_after_crash.last_log_id,
         Some(appended_log_id),
-        "artifact plus WAL must recover the unacknowledged-but-fsynced follower append; before={follower_log_before_crash:?} after={follower_log_after_crash:?} vote_after={follower_vote_after_crash:?}"
+        "artifact plus WAL must recover the acknowledged and fsynced follower append; before={follower_log_before_crash:?} after={follower_log_after_crash:?} vote_after={follower_vote_after_crash:?}"
     );
 
     let mut recovered103 =
@@ -1806,7 +1811,7 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
             .expect("recovered follower artifact plus WAL should expose log state")
             .last_log_id,
         Some(appended_log_id),
-        "recovered follower should retain the WAL-restored unacknowledged append"
+        "recovered follower should retain the WAL-restored acknowledged append"
     );
 }
 

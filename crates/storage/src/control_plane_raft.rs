@@ -1740,6 +1740,30 @@ pub struct ControlPlaneRaftDurabilityMetricSnapshots {
     pub command: observability::ControlPlaneRaftCommandMetricSnapshot,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlPlaneRaftWalMonitorSnapshot {
+    offsets: ControlPlaneRaftWalOffsets,
+    metrics: observability::ControlPlaneRaftWalMetricSnapshot,
+    poisoned: Option<String>,
+}
+
+impl ControlPlaneRaftWalMonitorSnapshot {
+    #[must_use]
+    pub fn offsets(&self) -> ControlPlaneRaftWalOffsets {
+        self.offsets
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> observability::ControlPlaneRaftWalMetricSnapshot {
+        self.metrics
+    }
+
+    #[must_use]
+    pub fn poisoned(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+}
+
 #[derive(Debug, Default)]
 struct ControlPlaneRaftCheckpointMetrics {
     snapshot: Mutex<observability::ControlPlaneRaftCheckpointMetricSnapshot>,
@@ -3770,6 +3794,26 @@ impl ControlPlaneRaftAuthority {
         }
     }
 
+    pub fn durable_wal_monitor_snapshot(
+        &self,
+    ) -> Result<ControlPlaneRaftWalMonitorSnapshot, ControlPlaneError> {
+        let log_store = self
+            .log_store
+            .as_ref()
+            .ok_or_else(|| ControlPlaneError::RpcRemote {
+                message: "OpenRaft WAL monitor requires a retained log store".to_string(),
+            })?;
+        log_store
+            .wal_monitor_snapshot()
+            .map_err(|source| ControlPlaneError::Io {
+                context: "read control-plane OpenRaft WAL monitor snapshot",
+                source,
+            })?
+            .ok_or_else(|| ControlPlaneError::RpcRemote {
+                message: "OpenRaft WAL monitor requires a WAL-backed log store".to_string(),
+            })
+    }
+
     pub async fn initialize_membership(
         &self,
         nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
@@ -5417,6 +5461,38 @@ impl ControlPlaneRaftLogStore {
 
     fn wal_metric_snapshot(&self) -> Option<observability::ControlPlaneRaftWalMetricSnapshot> {
         self.wal.as_ref().map(|wal| wal.metrics.snapshot())
+    }
+
+    fn wal_monitor_snapshot(
+        &self,
+    ) -> Result<Option<ControlPlaneRaftWalMonitorSnapshot>, io::Error> {
+        let poisoned = match self.inner.lock() {
+            Ok(inner) => inner.poisoned.clone(),
+            Err(error) => {
+                let inner = error.into_inner();
+                Some(inner.poisoned.clone().unwrap_or_else(|| {
+                    "control-plane OpenRaft log store mutex poisoned".to_string()
+                }))
+            }
+        };
+        let Some(wal) = &self.wal else {
+            return Ok(None);
+        };
+        // Sample append progress before offsets so an append racing this read is
+        // either represented by both values or remains visible as a suffix on
+        // the next monitor pass.
+        let metrics = wal.metrics.snapshot();
+        let offsets = wal.status_offsets().map_err(|error| {
+            control_plane_error_to_io_error(
+                "read control-plane OpenRaft WAL offsets for monitor",
+                error,
+            )
+        })?;
+        Ok(Some(ControlPlaneRaftWalMonitorSnapshot {
+            offsets,
+            metrics,
+            poisoned,
+        }))
     }
 
     fn restart_artifact_from_inner(
@@ -14581,6 +14657,20 @@ mod tests {
             )
             .await
             .expect_err("ambiguous WAL sync failure should poison the log store");
+
+            let poisoned_monitor = authority
+                .durable_wal_monitor_snapshot()
+                .expect("WAL monitor should remain available after WAL poison");
+            assert!(
+                poisoned_monitor
+                    .poisoned()
+                    .is_some_and(|reason| reason.contains("ambiguous WAL append")),
+                "WAL monitor should expose the poison reason: {poisoned_monitor:?}"
+            );
+            assert!(
+                poisoned_monitor.offsets().clean_len() > 0,
+                "WAL monitor should retain O(1) offset diagnostics after poison"
+            );
 
             let poisoned_status = authority
                 .status()
