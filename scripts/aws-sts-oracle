@@ -236,6 +236,33 @@ wait_for_deleted_role_session_invalid() {
     echo "$label-invalid: ok"
 }
 
+wait_for_streaming_bucket_policy_success() {
+    local attempt empty_body error_file ready=false
+
+    empty_body="$tmpdir/streaming-empty-body"
+    error_file="$tmpdir/streaming-bucket-policy-convergence.err"
+    : >"$empty_body"
+    for ((attempt = 1; attempt <= 15; attempt++)); do
+        if aws_with_session_credentials \
+            "$S3_TEST_STS_RECREATED_ROLE_ACCESS_KEY" \
+            "$S3_TEST_STS_RECREATED_ROLE_SECRET_KEY" \
+            "$S3_TEST_STS_RECREATED_ROLE_SESSION_TOKEN" \
+            s3api put-object \
+            --bucket "$S3_TEST_STS_POST_BUCKET" \
+            --key streaming-policy-convergence \
+            --body "$empty_body" >/dev/null 2>"$error_file"; then
+            ready=true
+            break
+        fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        cat "$error_file" >&2
+        external_s3_test_die "streaming bucket policy did not converge to PutObject success"
+    fi
+    echo "streaming-bucket-policy-success: ok"
+}
+
 declare -a created_role_names=()
 created_bucket=""
 tmpdir=""
@@ -339,7 +366,7 @@ create_assume_role_fixture() {
     local chain_source_identity chain_source_session chain_target_max_duration default_max_duration
     local deleted_role_identity deleted_role_session deleted_role_stable_id identity_decision identity_simulation missing_role_error
     local other_live_access_key other_live_identity other_live_secret_key other_live_session other_live_session_token
-    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix trust_chain_source trust_default_max trust_policy
+    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix streaming_bucket_policy trust_chain_source trust_default_max trust_policy
     primary_identity="$(aws_primary sts get-caller-identity --output json)"
     primary_account="$(jq -er '.Account' <<<"$primary_identity")"
     primary_arn="$(jq -er '.Arn' <<<"$primary_identity")"
@@ -636,6 +663,25 @@ create_assume_role_fixture() {
         external_s3_test_die "recreated-role session has an unexpected caller ARN"
     echo "same-account-recreated-role-session: ok"
     wait_for_deleted_role_session_invalid same-account-old-session-after-role-recreation
+
+    streaming_bucket_policy="$tmpdir/streaming-bucket-policy.json"
+    jq -n \
+        --arg principal "$S3_TEST_STS_DELETED_ROLE_ARN" \
+        --arg resource "arn:aws:s3:::${S3_TEST_STS_POST_BUCKET}/streaming-*" \
+        '{
+            Version: "2012-10-17",
+            Statement: [{
+                Sid: "AllowRecreatedRoleStreamingOracle",
+                Effect: "Allow",
+                Principal: {AWS: $principal},
+                Action: "s3:PutObject",
+                Resource: $resource
+            }]
+        }' >"$streaming_bucket_policy"
+    aws_primary s3api put-bucket-policy \
+        --bucket "$S3_TEST_STS_POST_BUCKET" \
+        --policy "file://${streaming_bucket_policy}"
+    wait_for_streaming_bucket_policy_success
 }
 
 assert_identity_decision() {

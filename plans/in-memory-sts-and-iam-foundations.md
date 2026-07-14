@@ -395,7 +395,14 @@ presigned, POST Object, and streaming authentication:
    header token when present, even when an `X-Amz-Security-Token` query value is
    also present, and fall back to the query value only when no signed header
    token is present
-4. for POST Object, select `x-amz-security-token` only from the multipart form;
+4. for aws-chunked streaming, require `x-amz-security-token` to be covered by
+   the seed request's signed headers; a present unsigned token returns
+   `HeadersNotSigned`. Collapse repeated signed header values only when every
+   value is identical. Conflicting duplicates, in either order, return
+   `InvalidAccessKeyId`; an empty value is equivalent to a missing token, while
+   a malformed non-empty value returns `InvalidToken`. Token shape/binding and
+   issuer liveness precede both seed- and chunk-signature verification
+5. for POST Object, select `x-amz-security-token` only from the multipart form;
    its matching POST-policy condition follows the existing validation rules.
    Credential extraction accepts duplicate form-token fields only when every
    value is identical, while retaining their multiplicity for later POST-policy
@@ -407,17 +414,17 @@ presigned, POST Object, and streaming authentication:
    its presence selects the non-POST authentication route, which rejects the
    request as `AccessDenied` with `No AWSAccessKey was presented.` before POST
    form-token, token decoding, issuer-liveness, or policy-signature validation
-5. if the access key ID resolves to a stored long-lived credential, use the
+6. if the access key ID resolves to a stored long-lived credential, use the
    static path and preserve AWS's post-signature unexpected-token behavior
-6. otherwise, require and AEAD-open the selected effective session token
-7. validate the embedded access key ID against the SigV4 credential in constant
+7. otherwise, require and AEAD-open the selected effective session token
+8. validate the embedded access key ID against the SigV4 credential in constant
    time and check credential-domain binding
-8. check embedded expiry at the AWS-pinned boundary and resolve only the
+9. check embedded expiry at the AWS-pinned boundary and resolve only the
    embedded stable issuer-role ID, rejecting a deleted issuer as
    `InvalidClientTokenId`; both checks precede signature comparison, but their
    relative order remains unresolved
-9. verify SigV4 with the embedded secret access key
-10. return an immutable authenticated-session value containing the structured
+10. verify SigV4 with the embedded secret access key
+11. return an immutable authenticated-session value containing the structured
    token identity and session-policy context
 
 Streaming must plug its AWS-pinned selection rules into step 2 rather than
@@ -785,8 +792,8 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The optional `AssumeRole` security-context parameters, the S3 streaming token
-matrix, expiry-versus-issuer-deletion precedence,
+The optional `AssumeRole` security-context parameters,
+expiry-versus-issuer-deletion precedence,
 trust/permission-policy mutation precedence, session-principal context, and
 `aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
 condition.
@@ -1137,8 +1144,45 @@ session header token produce the same response when combined with a valid form
 token and bad policy signature. Header-presence routing therefore precedes
 header-token decoding, issuer-liveness validation, form-token selection, and
 POST policy-signature comparison. With the empty, malformed, and duplicate form
-matrix pinned, the remaining independently unpinned S3 temporary credential
-mode is aws-chunked streaming.
+matrix pinned, aws-chunked streaming was the remaining independently unpinned
+S3 temporary credential mode.
+
+The S3 aws-chunked session-authentication slice completed on 2026-07-14. The
+primary user applies a self-cleaning bucket policy granting only the recreated
+role `s3:PutObject` on the fixture bucket's `streaming-*` keys, and the fixture
+proves that grant has converged with the temporary credential before running
+the raw oracle. A live role session with a signed token, valid seed signature,
+and valid chunk chain completes the upload. The exact HTTP 200 golden includes
+the request and host IDs, SSE-S3, ETag, CRC64NVME checksum, and full-object
+checksum-type headers. A bad first chunk signature reaches the complete
+`SignatureDoesNotMatch` golden: AWS echoes the chunk string to sign and
+provided chunk signature while retaining the seed request's canonical request
+and byte encodings.
+
+A missing or empty token returns `InvalidAccessKeyId`; a malformed non-empty
+token returns HTTP 400 `InvalidToken` and echoes the rejected value in
+`Token-0`; and an independently valid but mismatched token returns
+`InvalidAccessKeyId`. Each token error wins over both a bad seed signature and
+a bad first-chunk signature. A present but unsigned token returns
+`HeadersNotSigned` before credential, seed-signature, or chunk-signature
+validation: the same result wins over a bad seed signature, a bad first-chunk
+signature, and invalidated old-session credentials, including when invalidation
+and a bad seed collide. Two identical signed token headers collapse to one
+effective credential and therefore complete the upload or reach
+`SignatureDoesNotMatch` at the deliberately corrupted seed or first chunk.
+Conflicting signed token headers return `InvalidAccessKeyId` in both value
+orders, with valid or bad seed signatures, and also win over a bad first-chunk
+signature.
+
+After deletion and same-name role recreation, the old role session returns
+`InvalidAccessKeyId` with its correct token, a missing token, or a mismatched
+live token. Stable issuer invalidation also wins over bad seed and bad chunk
+signatures. Streaming token selection, token/access-key binding, and stable
+issuer liveness therefore feed the shared credential-validity pipeline before
+the seed signature is accepted and before a streaming signing context is
+constructed. The streaming slice completes the independently pinned S3
+temporary-credential modes; region/service/expiry collisions remain separate
+Phase 0 questions.
 
 During this slice, one newly created role produced one successful STS
 assumption followed immediately by `AccessDenied` for the same request. The
@@ -1388,11 +1432,10 @@ confidentiality. No session response or request body may appear in traces.
    must it also recognize the legacy global endpoint signing rules immediately?
 3. Which existing identity/policy types can be generalized without making S3
    bucket-policy code less explicit?
-4. What is the exact AWS precedence among wrong token, missing token, bad
-   signature, wrong region/service, disabled credential, and expired session on
-   streaming mode? The core header, presigned, and POST Object token/signature
-   collisions are pinned; their remaining
-   region/service/expiry collisions are not.
+4. What is the exact AWS precedence among wrong token, missing token, wrong
+   region/service, disabled credential, and expired session? The core header,
+   presigned, POST Object, and streaming token/signature collisions are pinned;
+   their remaining region/service/expiry collisions are not.
 5. What total Query body and member limits does live STS enforce for the first
    supported parameter set?
 6. Should the first standalone UAT role be injected through a dedicated

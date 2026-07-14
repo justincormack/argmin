@@ -4,9 +4,13 @@
 //! binary: Argmin does not expose STS yet, and the repository's local test
 //! suite must remain green while Phase 0 pins the AWS wire contract.
 
-use std::{env, time::Duration};
+use std::{
+    env,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use aws_smithy_types::{date_time::Format as DateTimeFormat, DateTime};
+use ring::hmac;
 use s3_tests::{
     build_test_agent, post_object_raw_to_test_endpoint_with_headers, presign_url_with_credentials,
     send_signed_request_for_service_with_credentials,
@@ -1717,6 +1721,804 @@ fn run_s3_post_session_authentication_probes(
     }
 }
 
+const STREAMING_PAYLOAD_HASH: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+const STREAMING_DATA: &[u8] = b"STS streaming oracle";
+
+#[derive(Clone, Copy)]
+enum S3StreamingTokens<'a> {
+    Missing,
+    One(&'a str),
+    Two(&'a str, &'a str),
+}
+
+impl<'a> S3StreamingTokens<'a> {
+    fn values(self) -> [Option<&'a str>; 2] {
+        match self {
+            Self::Missing => [None, None],
+            Self::One(token) => [Some(token), None],
+            Self::Two(first, second) => [Some(first), Some(second)],
+        }
+    }
+
+    fn canonical_value(self) -> Option<String> {
+        match self {
+            Self::Missing => None,
+            Self::One(token) => Some(token.to_string()),
+            Self::Two(first, second) => Some(format!("{first},{second}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum S3StreamingAuthExpected {
+    Success,
+    HeadersNotSigned,
+    InvalidAccessKey,
+    InvalidToken,
+    SeedSignatureMismatch,
+    ChunkSignatureMismatch,
+}
+
+#[derive(Clone, Copy)]
+struct S3StreamingProbe<'a> {
+    label: &'a str,
+    credentials: SignedRequestCredentials<'a>,
+    tokens: S3StreamingTokens<'a>,
+    sign_token_header: bool,
+    bad_chunk_signature: bool,
+    expected: S3StreamingAuthExpected,
+}
+
+struct S3StreamingSessionProbeSet<'a> {
+    live_credentials: SignedRequestCredentials<'a>,
+    live_security_token: &'a str,
+    other_live_security_token: &'a str,
+    old_credentials: SignedRequestCredentials<'a>,
+    old_security_token: &'a str,
+}
+
+struct S3StreamingSignature {
+    authorization: String,
+    amz_date: String,
+    canonical_request: String,
+    scope: String,
+    seed_signature: String,
+    signing_key: Vec<u8>,
+}
+
+struct S3StreamingResult {
+    response: RawResponse,
+    signature: S3StreamingSignature,
+    first_chunk_signature: String,
+}
+
+fn streaming_days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
+}
+
+fn streaming_now_parts() -> (String, String) {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before the Unix epoch")
+        .as_secs();
+    let days = seconds / 86_400;
+    let (year, month, day) = streaming_days_to_ymd(days);
+    let time_of_day = seconds % 86_400;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    let long = format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z");
+    let short = long[..8].to_string();
+    (long, short)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn streaming_hmac(key: &[u8], value: &str) -> String {
+    hex_lower(hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), value.as_bytes()).as_ref())
+}
+
+fn sign_s3_streaming_request(
+    endpoint: &str,
+    path: &str,
+    decoded_length: usize,
+    credentials: SignedRequestCredentials<'_>,
+    tokens: S3StreamingTokens<'_>,
+    sign_token_header: bool,
+) -> S3StreamingSignature {
+    let parsed_endpoint = url::Url::parse(endpoint)
+        .unwrap_or_else(|error| panic!("invalid S3 streaming endpoint: {error}"));
+    let host = parsed_endpoint
+        .host_str()
+        .map(|host| {
+            parsed_endpoint
+                .port()
+                .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"))
+        })
+        .expect("S3 streaming endpoint has no host");
+    let (amz_date, date) = streaming_now_parts();
+    let decoded_length = decoded_length.to_string();
+    let mut headers = vec![
+        ("content-encoding", "aws-chunked".to_string()),
+        ("host", host),
+        ("x-amz-content-sha256", STREAMING_PAYLOAD_HASH.to_string()),
+        ("x-amz-date", amz_date.clone()),
+        ("x-amz-decoded-content-length", decoded_length),
+    ];
+    if sign_token_header {
+        if let Some(value) = tokens.canonical_value() {
+            headers.push(("x-amz-security-token", value));
+        }
+    }
+    headers.sort_by_key(|(name, _)| *name);
+    let signed_headers = headers
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(";");
+    let header_refs = headers
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect::<Vec<_>>();
+    let canonical_headers = auth::canonical::canonical_headers(&header_refs);
+    let canonical_request = auth::canonical::canonical_request(
+        "PUT",
+        path,
+        "",
+        &canonical_headers,
+        &signed_headers,
+        STREAMING_PAYLOAD_HASH,
+    );
+    let scope = format!("{date}/{}/s3/aws4_request", credentials.region);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        auth::canonical::sha256_hex(canonical_request.as_bytes())
+    );
+    let secret = auth::SecretKey::new(credentials.secret_key.to_string());
+    let signing_key = auth::sigv4::derive_signing_key(&secret, &date, credentials.region, "s3");
+    let seed_signature = streaming_hmac(signing_key.as_ref(), &string_to_sign);
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={seed_signature}",
+        credentials.access_key
+    );
+    S3StreamingSignature {
+        authorization,
+        amz_date,
+        canonical_request,
+        scope,
+        seed_signature,
+        signing_key: signing_key.as_ref().to_vec(),
+    }
+}
+
+fn s3_streaming_chunk_signature(
+    signature: &S3StreamingSignature,
+    previous_signature: &str,
+    data: &[u8],
+) -> String {
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+        signature.amz_date,
+        signature.scope,
+        previous_signature,
+        auth::canonical::sha256_hex(b""),
+        auth::canonical::sha256_hex(data)
+    );
+    streaming_hmac(&signature.signing_key, &string_to_sign)
+}
+
+fn build_s3_streaming_body(
+    signature: &S3StreamingSignature,
+    data: &[u8],
+    bad_chunk_signature: bool,
+) -> (Vec<u8>, String) {
+    let valid_chunk_signature =
+        s3_streaming_chunk_signature(signature, &signature.seed_signature, data);
+    let presented_chunk_signature = if bad_chunk_signature {
+        "0".repeat(64)
+    } else {
+        valid_chunk_signature.clone()
+    };
+    let terminal_signature =
+        s3_streaming_chunk_signature(signature, &presented_chunk_signature, b"");
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "{:x};chunk-signature={presented_chunk_signature}\r\n",
+            data.len()
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(data);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("0;chunk-signature={terminal_signature}\r\n\r\n").as_bytes());
+    (body, presented_chunk_signature)
+}
+
+fn send_s3_streaming_probe(
+    endpoint: &str,
+    bucket: &str,
+    probe: S3StreamingProbe<'_>,
+) -> S3StreamingResult {
+    let path = format!("/{bucket}/{}", probe.label);
+    let signature = sign_s3_streaming_request(
+        endpoint,
+        &path,
+        STREAMING_DATA.len(),
+        probe.credentials,
+        probe.tokens,
+        probe.sign_token_header,
+    );
+    let (body, first_chunk_signature) =
+        build_s3_streaming_body(&signature, STREAMING_DATA, probe.bad_chunk_signature);
+    let url = format!("{endpoint}{path}");
+    let mut request = build_test_agent(endpoint, None, Duration::from_secs(120))
+        .put(&url)
+        .header("authorization", &signature.authorization)
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-content-sha256", STREAMING_PAYLOAD_HASH)
+        .header("x-amz-date", &signature.amz_date)
+        .header(
+            "x-amz-decoded-content-length",
+            STREAMING_DATA.len().to_string(),
+        );
+    for token in probe.tokens.values().into_iter().flatten() {
+        request = request.header("x-amz-security-token", token);
+    }
+    let mut response = request.send(&body).expect("streaming AWS transport error");
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("streaming AWS response header is valid UTF-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let (body, body_read_error) = match response.body_mut().read_to_string() {
+        Ok(body) => (body, None),
+        Err(error) => (String::new(), Some(error.to_string())),
+    };
+    S3StreamingResult {
+        response: RawResponse {
+            status: response.status().as_u16(),
+            headers,
+            body,
+            body_read_error,
+        },
+        signature,
+        first_chunk_signature,
+    }
+}
+
+fn assert_s3_streaming_success(probe: S3StreamingProbe<'_>, result: &S3StreamingResult) {
+    assert_shape(
+        probe.label,
+        &result.response,
+        &shape()
+            .status(200)
+            .header("x-amz-id-2", "{host_id}")
+            .header("x-amz-request-id", "{request_id}")
+            .header("x-amz-server-side-encryption", "AES256")
+            .header("etag", "{etag}")
+            .header("x-amz-checksum-crc64nvme", "C5AeGMhd5F4=")
+            .header("x-amz-checksum-type", "FULL_OBJECT")
+            .body_empty(),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn assert_s3_streaming_invalid_token(
+    probe: S3StreamingProbe<'_>,
+    result: &S3StreamingResult,
+    security_tokens: &[&str],
+) {
+    let rejected_token = required_xml_text(&result.response, "Token-0", probe.label);
+    assert!(
+        security_tokens
+            .iter()
+            .any(|security_token| *security_token == rejected_token),
+        "{}: S3 echoed an unexpected rejected token",
+        probe.label
+    );
+    let response = s3_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    assert_shape(
+        probe.label,
+        &response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .body(expected_error::invalid_token(
+                "The provided token is malformed or otherwise invalid.",
+                "SESSION_TOKEN",
+            )),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn assert_s3_streaming_seed_signature_mismatch(
+    probe: S3StreamingProbe<'_>,
+    result: &S3StreamingResult,
+    security_tokens: &[&str],
+) {
+    assert_s3_signature_mismatch(
+        probe.label,
+        &result.response,
+        probe.credentials,
+        security_tokens,
+        Some(&result.signature.amz_date),
+        Some(&result.signature.seed_signature),
+        |_| result.signature.canonical_request.clone(),
+    );
+}
+
+fn assert_s3_streaming_chunk_signature_mismatch(
+    probe: S3StreamingProbe<'_>,
+    result: &S3StreamingResult,
+    security_tokens: &[&str],
+) {
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+        result.signature.amz_date,
+        result.signature.scope,
+        result.signature.seed_signature,
+        auth::canonical::sha256_hex(b""),
+        auth::canonical::sha256_hex(STREAMING_DATA)
+    );
+    assert!(
+        required_xml_text(&result.response, "AWSAccessKeyId", probe.label)
+            == probe.credentials.access_key,
+        "{}: S3 did not echo the session access key",
+        probe.label,
+    );
+    assert!(
+        required_xml_text(&result.response, "StringToSign", probe.label) == string_to_sign,
+        "{}: S3 did not echo the chunk string to sign",
+        probe.label,
+    );
+    assert!(
+        required_xml_text(&result.response, "StringToSignBytes", probe.label)
+            == spaced_hex(&string_to_sign),
+        "{}: StringToSignBytes does not encode the chunk string to sign",
+        probe.label,
+    );
+    assert!(
+        required_xml_text(&result.response, "SignatureProvided", probe.label)
+            == result.first_chunk_signature,
+        "{}: S3 did not echo the bad chunk signature",
+        probe.label,
+    );
+    assert!(
+        required_xml_text(&result.response, "CanonicalRequest", probe.label)
+            == result.signature.canonical_request,
+        "{}: S3 did not echo the seed canonical request",
+        probe.label,
+    );
+    assert!(
+        required_xml_text(&result.response, "CanonicalRequestBytes", probe.label)
+            == spaced_hex(&result.signature.canonical_request),
+        "{}: CanonicalRequestBytes does not encode the seed canonical request",
+        probe.label,
+    );
+
+    let response = s3_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    let sanitized_string_to_sign = sanitize_s3_text(
+        &string_to_sign,
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    let sanitized_string_to_sign_bytes = sanitize_s3_text(
+        &spaced_hex(&string_to_sign),
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    let sanitized_canonical_request = sanitize_s3_text(
+        &result.signature.canonical_request,
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    let sanitized_canonical_request_bytes = sanitize_s3_text(
+        &spaced_hex(&result.signature.canonical_request),
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    assert_shape(
+        probe.label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("string_to_sign", sanitized_string_to_sign)
+            .sub("signature", &result.first_chunk_signature)
+            .sub("string_to_sign_bytes", sanitized_string_to_sign_bytes)
+            .sub("canonical_request", sanitized_canonical_request)
+            .sub("canonical_request_bytes", sanitized_canonical_request_bytes)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>SignatureDoesNotMatch</Code>\
+                 <Message>The request signature we calculated does not match the signature you provided. Check your key and signing method.</Message>\
+                 <AWSAccessKeyId>SESSION_ACCESS_KEY</AWSAccessKeyId>\
+                 <StringToSign>{string_to_sign}</StringToSign>\
+                 <SignatureProvided>{signature}</SignatureProvided>\
+                 <StringToSignBytes>{string_to_sign_bytes}</StringToSignBytes>\
+                 <CanonicalRequest>{canonical_request}</CanonicalRequest>\
+                 <CanonicalRequestBytes>{canonical_request_bytes}</CanonicalRequestBytes>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn run_s3_streaming_session_authentication_probes(
+    endpoint: &str,
+    bucket: &str,
+    fixture: S3StreamingSessionProbeSet<'_>,
+) {
+    let wrong_secret = "0".repeat(40);
+    let malformed_security_token = "malformed-session-token";
+    let live_bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..fixture.live_credentials
+    };
+    let old_bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..fixture.old_credentials
+    };
+    let probes = [
+        S3StreamingProbe {
+            label: "streaming-live-valid",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::Success,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-valid-token-bad-chunk-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: true,
+            expected: S3StreamingAuthExpected::ChunkSignatureMismatch,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-missing-token-valid-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::Missing,
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-empty-token-valid-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(""),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-malformed-token-valid-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(malformed_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidToken,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-mismatched-token-valid-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(fixture.other_live_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-identical-duplicate-token-valid-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::Two(
+                fixture.live_security_token,
+                fixture.live_security_token,
+            ),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::Success,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-conflicting-duplicate-token-valid-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::Two(
+                fixture.live_security_token,
+                fixture.other_live_security_token,
+            ),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-conflicting-duplicate-token-reversed-valid-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::Two(
+                fixture.other_live_security_token,
+                fixture.live_security_token,
+            ),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-valid-token-unsigned",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: false,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::HeadersNotSigned,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-missing-token-bad-chunk-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::Missing,
+            sign_token_header: true,
+            bad_chunk_signature: true,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-empty-token-bad-chunk-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(""),
+            sign_token_header: true,
+            bad_chunk_signature: true,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-malformed-token-bad-chunk-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(malformed_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: true,
+            expected: S3StreamingAuthExpected::InvalidToken,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-mismatched-token-bad-chunk-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(fixture.other_live_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: true,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-identical-duplicate-token-bad-chunk-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::Two(
+                fixture.live_security_token,
+                fixture.live_security_token,
+            ),
+            sign_token_header: true,
+            bad_chunk_signature: true,
+            expected: S3StreamingAuthExpected::ChunkSignatureMismatch,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-conflicting-duplicate-token-bad-chunk-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::Two(
+                fixture.live_security_token,
+                fixture.other_live_security_token,
+            ),
+            sign_token_header: true,
+            bad_chunk_signature: true,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-valid-token-unsigned-bad-chunk-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: false,
+            bad_chunk_signature: true,
+            expected: S3StreamingAuthExpected::HeadersNotSigned,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-valid-token-bad-seed-signature",
+            credentials: live_bad_signature_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::SeedSignatureMismatch,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-valid-token-unsigned-bad-seed-signature",
+            credentials: live_bad_signature_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: false,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::HeadersNotSigned,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-missing-token-bad-seed-signature",
+            credentials: live_bad_signature_credentials,
+            tokens: S3StreamingTokens::Missing,
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-empty-token-bad-seed-signature",
+            credentials: live_bad_signature_credentials,
+            tokens: S3StreamingTokens::One(""),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-malformed-token-bad-seed-signature",
+            credentials: live_bad_signature_credentials,
+            tokens: S3StreamingTokens::One(malformed_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidToken,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-mismatched-token-bad-seed-signature",
+            credentials: live_bad_signature_credentials,
+            tokens: S3StreamingTokens::One(fixture.other_live_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-identical-duplicate-token-bad-seed-signature",
+            credentials: live_bad_signature_credentials,
+            tokens: S3StreamingTokens::Two(
+                fixture.live_security_token,
+                fixture.live_security_token,
+            ),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::SeedSignatureMismatch,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-conflicting-duplicate-token-bad-seed-signature",
+            credentials: live_bad_signature_credentials,
+            tokens: S3StreamingTokens::Two(
+                fixture.other_live_security_token,
+                fixture.live_security_token,
+            ),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-live-conflicting-duplicate-token-reversed-bad-seed-signature",
+            credentials: live_bad_signature_credentials,
+            tokens: S3StreamingTokens::Two(
+                fixture.live_security_token,
+                fixture.other_live_security_token,
+            ),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-old-session-valid",
+            credentials: fixture.old_credentials,
+            tokens: S3StreamingTokens::One(fixture.old_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-old-session-valid-token-unsigned",
+            credentials: fixture.old_credentials,
+            tokens: S3StreamingTokens::One(fixture.old_security_token),
+            sign_token_header: false,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::HeadersNotSigned,
+        },
+        S3StreamingProbe {
+            label: "streaming-old-session-valid-token-unsigned-bad-seed-signature",
+            credentials: old_bad_signature_credentials,
+            tokens: S3StreamingTokens::One(fixture.old_security_token),
+            sign_token_header: false,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::HeadersNotSigned,
+        },
+        S3StreamingProbe {
+            label: "streaming-old-session-missing-token-valid-signature",
+            credentials: fixture.old_credentials,
+            tokens: S3StreamingTokens::Missing,
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-old-session-mismatched-token-valid-signature",
+            credentials: fixture.old_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-old-session-valid-token-bad-seed-signature",
+            credentials: old_bad_signature_credentials,
+            tokens: S3StreamingTokens::One(fixture.old_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+        S3StreamingProbe {
+            label: "streaming-old-session-valid-token-bad-chunk-signature",
+            credentials: fixture.old_credentials,
+            tokens: S3StreamingTokens::One(fixture.old_security_token),
+            sign_token_header: true,
+            bad_chunk_signature: true,
+            expected: S3StreamingAuthExpected::InvalidAccessKey,
+        },
+    ];
+
+    for probe in probes {
+        let result = send_s3_streaming_probe(endpoint, bucket, probe);
+        let sensitive_tokens = probe
+            .tokens
+            .values()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        match probe.expected {
+            S3StreamingAuthExpected::Success => assert_s3_streaming_success(probe, &result),
+            S3StreamingAuthExpected::HeadersNotSigned => assert_s3_headers_not_signed(
+                probe.label,
+                &result.response,
+                probe.credentials.access_key,
+                &sensitive_tokens,
+            ),
+            S3StreamingAuthExpected::InvalidAccessKey => assert_s3_invalid_access_key(
+                probe.label,
+                &result.response,
+                probe.credentials.access_key,
+                &sensitive_tokens,
+            ),
+            S3StreamingAuthExpected::InvalidToken => {
+                assert_s3_streaming_invalid_token(probe, &result, &sensitive_tokens);
+            }
+            S3StreamingAuthExpected::SeedSignatureMismatch => {
+                assert_s3_streaming_seed_signature_mismatch(probe, &result, &sensitive_tokens);
+            }
+            S3StreamingAuthExpected::ChunkSignatureMismatch => {
+                assert_s3_streaming_chunk_signature_mismatch(probe, &result, &sensitive_tokens);
+            }
+        }
+    }
+}
+
 fn assert_error_probe(
     label: &str,
     response: &RawResponse,
@@ -3180,6 +3982,17 @@ fn main() {
                 old_security_token: &deleted_security_token,
             },
         );
+        run_s3_streaming_session_authentication_probes(
+            &format!("https://s3.{region}.amazonaws.com"),
+            &post_bucket,
+            S3StreamingSessionProbeSet {
+                live_credentials: recreated_credentials,
+                live_security_token: &recreated_security_token,
+                other_live_security_token: &other_live_security_token,
+                old_credentials: deleted_credentials,
+                old_security_token: &deleted_security_token,
+            },
+        );
         run_session_authentication_probes(
             &endpoint,
             &account_id,
@@ -3204,9 +4017,47 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        s3_post_response_with_sanitized_body, s3_response_with_sanitized_body, spaced_hex,
+        s3_post_response_with_sanitized_body, s3_response_with_sanitized_body,
+        sign_s3_streaming_request, spaced_hex, S3StreamingTokens,
     };
-    use s3_tests::RawResponse;
+    use s3_tests::{RawResponse, SignedRequestCredentials};
+
+    #[test]
+    fn streaming_signer_canonicalizes_duplicate_tokens_in_wire_order() {
+        let credentials = SignedRequestCredentials {
+            access_key: "ARGMINSESSIONACCESSKEY",
+            secret_key: "secret",
+            region: "eu-central-1",
+            tls_ca_pem: None,
+        };
+        let signed = sign_s3_streaming_request(
+            "https://s3.eu-central-1.amazonaws.com",
+            "/bucket/key",
+            21,
+            credentials,
+            S3StreamingTokens::Two("first-token", "second-token"),
+            true,
+        );
+
+        assert!(signed
+            .canonical_request
+            .contains("x-amz-security-token:first-token,second-token\n"));
+        assert!(signed.authorization.contains(
+            "SignedHeaders=content-encoding;host;x-amz-content-sha256;x-amz-date;\
+             x-amz-decoded-content-length;x-amz-security-token"
+        ));
+
+        let unsigned = sign_s3_streaming_request(
+            "https://s3.eu-central-1.amazonaws.com",
+            "/bucket/key",
+            21,
+            credentials,
+            S3StreamingTokens::One("unsigned-token"),
+            false,
+        );
+        assert!(!unsigned.canonical_request.contains("security-token"));
+        assert!(!unsigned.authorization.contains("security-token"));
+    }
 
     #[test]
     fn s3_response_sanitization_removes_literal_and_encoded_credentials() {
