@@ -15595,7 +15595,7 @@ mod tests {
         fs::create_dir_all(config.socket_path.parent().unwrap()).unwrap();
         fs::set_permissions(
             config.socket_path.parent().unwrap(),
-            fs::Permissions::from_mode(0o2700),
+            fs::Permissions::from_mode(0o1700),
         )
         .unwrap();
 
@@ -15603,7 +15603,7 @@ mod tests {
 
         assert!(matches!(
             err,
-            StorageNodeServerError::SocketDirectoryNotPrivate { mode: 0o2700, .. }
+            StorageNodeServerError::SocketDirectoryNotPrivate { mode: 0o1700, .. }
         ));
         let _ = fs::set_permissions(
             config.socket_path.parent().unwrap(),

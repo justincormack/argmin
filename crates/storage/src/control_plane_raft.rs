@@ -9531,7 +9531,7 @@ mod tests {
     use std::future::Future;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     };
     use std::thread;
@@ -10414,14 +10414,10 @@ mod tests {
         append_raft_artifact_checksum(frame);
     }
 
-    static RAFT_UNIX_SOCKET_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    fn raft_unix_socket_path(test_name: &str) -> PathBuf {
-        let sequence = RAFT_UNIX_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "argmin-control-plane-raft-{test_name}-{}-{sequence}.sock",
-            std::process::id()
-        ))
+    fn raft_unix_socket_path(test_name: &str) -> (test_util::TempDir, PathBuf) {
+        let socket_dir = test_util::tempdir();
+        let socket_path = socket_dir.path().join(format!("{test_name}.sock"));
+        (socket_dir, socket_path)
     }
 
     struct TestUnixPeerListener {
@@ -11581,7 +11577,7 @@ mod tests {
     #[test]
     fn control_plane_raft_unix_peer_network_vote_round_trips_framed_identity() {
         ControlPlaneRaftTypeConfig::run(async {
-            let socket_path = raft_unix_socket_path("vote-round-trip");
+            let (_socket_dir, socket_path) = raft_unix_socket_path("vote-round-trip");
             let listener = UnixListener::bind(&socket_path).unwrap();
             let limits = ControlPlaneRaftPeerTransportLimits {
                 max_frame_bytes: 4096,
@@ -11669,7 +11665,7 @@ mod tests {
     #[test]
     fn control_plane_raft_unix_peer_network_vote_round_trips_authenticated_response() {
         ControlPlaneRaftTypeConfig::run(async {
-            let socket_path = raft_unix_socket_path("vote-auth-round-trip");
+            let (_socket_dir, socket_path) = raft_unix_socket_path("vote-auth-round-trip");
             let listener = UnixListener::bind(&socket_path).unwrap();
             let limits = ControlPlaneRaftPeerTransportLimits {
                 max_frame_bytes: 4096,
@@ -11773,7 +11769,7 @@ mod tests {
     #[test]
     fn control_plane_raft_unix_peer_network_rejects_unauthenticated_response_when_auth_required() {
         ControlPlaneRaftTypeConfig::run(async {
-            let socket_path = raft_unix_socket_path("vote-unauth-response");
+            let (_socket_dir, socket_path) = raft_unix_socket_path("vote-unauth-response");
             let listener = UnixListener::bind(&socket_path).unwrap();
             let limits = ControlPlaneRaftPeerTransportLimits {
                 max_frame_bytes: 4096,
@@ -11861,8 +11857,10 @@ mod tests {
     fn control_plane_openraft_unix_peer_two_node_client_write_replicates_to_follower() {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
-            let node1_socket = raft_unix_socket_path("two-node-replication-node-1");
-            let node2_socket = raft_unix_socket_path("two-node-replication-node-2");
+            let (_node1_socket_dir, node1_socket) =
+                raft_unix_socket_path("two-node-replication-node-1");
+            let (_node2_socket_dir, node2_socket) =
+                raft_unix_socket_path("two-node-replication-node-2");
             let cluster_name = "control-plane-raft-unix-peer-two-node-replication-test";
             let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
                 cluster_name,
@@ -11972,7 +11970,7 @@ mod tests {
     #[test]
     fn control_plane_raft_unix_peer_network_read_eof_is_unreachable() {
         ControlPlaneRaftTypeConfig::run(async {
-            let socket_path = raft_unix_socket_path("vote-eof");
+            let (_socket_dir, socket_path) = raft_unix_socket_path("vote-eof");
             let listener = UnixListener::bind(&socket_path).unwrap();
             let limits = ControlPlaneRaftPeerTransportLimits {
                 max_frame_bytes: 4096,
@@ -12026,7 +12024,7 @@ mod tests {
     #[test]
     fn control_plane_raft_unix_peer_network_stalled_peer_does_not_block_runtime() {
         ControlPlaneRaftTypeConfig::run(async {
-            let socket_path = raft_unix_socket_path("vote-stalled");
+            let (_socket_dir, socket_path) = raft_unix_socket_path("vote-stalled");
             let listener = UnixListener::bind(&socket_path).unwrap();
             let limits = ControlPlaneRaftPeerTransportLimits {
                 max_frame_bytes: 4096,
@@ -12090,7 +12088,7 @@ mod tests {
     #[test]
     fn control_plane_raft_unix_peer_snapshot_read_eof_is_unreachable() {
         ControlPlaneRaftTypeConfig::run(async {
-            let socket_path = raft_unix_socket_path("snapshot-eof");
+            let (_socket_dir, socket_path) = raft_unix_socket_path("snapshot-eof");
             let listener = UnixListener::bind(&socket_path).unwrap();
             let limits = ControlPlaneRaftPeerTransportLimits {
                 max_frame_bytes: 8192,
