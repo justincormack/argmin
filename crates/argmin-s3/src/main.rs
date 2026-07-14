@@ -3273,8 +3273,10 @@ fn store_experimental_raft_durable_restart_artifact(
             .expect("experimental OpenRaft durable checkpoint mutex poisoned")
     });
     let artifact_existed = path.exists();
+    let checkpoint =
+        block_on_control_plane_raft(runtime, authority.capture_durable_restart_checkpoint())?;
     let committed_timestamp_high_water_ms =
-        block_on_control_plane_raft(runtime, authority.store_durable_restart_artifact(path))?;
+        authority.persist_durable_restart_checkpoint(checkpoint, path)?;
     let binding = authority.authority_clock_checkpoint_binding();
     if !artifact_existed && load_authority_clock_restart_checkpoint(path, binding)?.is_none() {
         store_authority_clock_restart_checkpoint(
@@ -7192,6 +7194,8 @@ mod tests {
         const PG_COUNT: u32 = 116;
         const RETAINED_HISTORY_EPOCHS: usize = 256;
         const STEADY_HEARTBEAT_ROUNDS: u64 = 64;
+        const CONCURRENT_CHECKPOINT_COUNT: u64 = 8;
+        const CONCURRENT_HEARTBEAT_ROUNDS: u64 = 16;
         const HEARTBEAT_LEASE_MS: u64 = 10_000;
         const MAX_AMORTIZED_DURABLE_BYTES_PER_SECOND: u64 = 1024 * 1024;
 
@@ -7713,8 +7717,134 @@ mod tests {
             RETAINED_HISTORY_EPOCHS
         );
 
+        let post_extension_status = harness
+            .control_plane
+            .runtime_map_status(now_ms)
+            .expect("post-extension compact status should warm its checkpoint marker");
+        assert_eq!(
+            post_extension_status
+                .lease_renewal()
+                .expect("post-extension status should renew its lease")
+                .content_digest(),
+            content_digest
+        );
+        now_ms += 1;
+        let concurrent_applied_before = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("pre-concurrent-checkpoint status should read")
+            .applied();
+        let concurrent_offsets_before = durable_wal_offsets(&harness);
+        let concurrent_metrics_before = harness.authority.durability_metric_snapshots();
+        let concurrent_start = Arc::new(std::sync::Barrier::new(2));
+        let checkpoint_start = Arc::clone(&concurrent_start);
+        let checkpoint_runtime = harness.runtime.handle().clone();
+        let checkpoint_authority = Arc::clone(&harness.authority);
+        let checkpoint_path = harness
+            .control_plane
+            .durable_artifact_path
+            .clone()
+            .expect("durable release harness should retain an artifact path");
+        let checkpoint_lock = harness
+            .control_plane
+            .durable_checkpoint_lock
+            .clone()
+            .expect("durable release harness should retain a checkpoint lock");
+        let checkpoint_thread = thread::spawn(move || {
+            checkpoint_start.wait();
+            let started = Instant::now();
+            for _ in 0..CONCURRENT_CHECKPOINT_COUNT {
+                store_experimental_raft_durable_restart_artifact(
+                    &checkpoint_runtime,
+                    &checkpoint_authority,
+                    &checkpoint_path,
+                    Some(&checkpoint_lock),
+                )
+                .expect("concurrent production-shaped checkpoint should persist");
+            }
+            started.elapsed()
+        });
+
+        concurrent_start.wait();
+        let mut concurrent_heartbeat_us_max = 0_u64;
+        let mut concurrent_status_us_max = 0_u64;
+        for _ in 0..CONCURRENT_HEARTBEAT_ROUNDS {
+            let snapshot = harness
+                .control_plane
+                .current_snapshot()
+                .expect("concurrent heartbeat state should read");
+            let observed_epoch = snapshot.cluster_epoch();
+            for node_id in 0..STORAGE_NODE_COUNT {
+                let pg_observations =
+                    active_primary_observations(&snapshot, node_id, metadata_proof);
+                let heartbeat_started = Instant::now();
+                harness
+                    .control_plane
+                    .refresh_node_heartbeat(
+                        heartbeat(
+                            node_id,
+                            &endpoints[usize::try_from(node_id).unwrap()],
+                            observed_epoch,
+                            pg_observations,
+                        ),
+                        now_ms,
+                    )
+                    .expect("heartbeat should remain available during checkpoint persistence");
+                concurrent_heartbeat_us_max = concurrent_heartbeat_us_max.max(
+                    u64::try_from(heartbeat_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+                now_ms += 1;
+            }
+            let status_started = Instant::now();
+            let status = harness
+                .control_plane
+                .runtime_map_status(now_ms)
+                .expect("compact status should remain available during checkpoint persistence");
+            concurrent_status_us_max = concurrent_status_us_max
+                .max(u64::try_from(status_started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            assert_eq!(status.pg_routes(), PG_COUNT as usize);
+            assert_eq!(status.active_serving_pg_routes(), PG_COUNT as usize);
+            assert_eq!(
+                status
+                    .lease_renewal()
+                    .expect("concurrent compact status should renew its lease")
+                    .content_digest(),
+                content_digest
+            );
+            now_ms += 1;
+        }
+        let concurrent_checkpoint_elapsed = checkpoint_thread
+            .join()
+            .expect("concurrent checkpoint worker should finish");
+        let concurrent_metrics_after = harness.authority.durability_metric_snapshots();
+        assert_eq!(
+            harness
+                .control_plane
+                .block_on(harness.authority.status())
+                .expect("post-concurrent-checkpoint status should read")
+                .applied(),
+            concurrent_applied_before,
+            "checkpoint persistence and covered traffic must not append Raft commands"
+        );
+        assert_eq!(durable_wal_offsets(&harness), concurrent_offsets_before);
+        assert_eq!(
+            concurrent_metrics_after
+                .checkpoint
+                .store_total
+                .checked_sub(concurrent_metrics_before.checkpoint.store_total)
+                .expect("concurrent checkpoint count must advance monotonically"),
+            CONCURRENT_CHECKPOINT_COUNT
+        );
+        assert_eq!(
+            concurrent_metrics_after.wal, concurrent_metrics_before.wal,
+            "checkpoint persistence and covered traffic must not append or sync WAL records"
+        );
+        let concurrent_checkpoint_us =
+            u64::try_from(concurrent_checkpoint_elapsed.as_micros()).unwrap_or(u64::MAX);
+
         eprintln!(
-            "control_plane_write_amplification_release pgs={PG_COUNT} retained_epochs={RETAINED_HISTORY_EPOCHS} storage_nodes={STORAGE_NODE_COUNT} steady_heartbeats={steady_heartbeat_requests} compact_status_reads={STEADY_HEARTBEAT_ROUNDS} wal_monitor_polls={monitor_poll_total} wal_monitor_poll_us_total={monitor_poll_us_total} wal_monitor_poll_us_max={monitor_poll_us_max} steady_checkpoint_stores=0 steady_checkpoint_syncs=0 steady_wal_appends=0 steady_wal_syncs=0 horizon_probe_heartbeats={horizon_probe_heartbeats} checkpoint_stores={checkpoint_store_delta} checkpoint_file_syncs={checkpoint_file_sync_delta} checkpoint_directory_syncs={checkpoint_directory_sync_delta} checkpoint_bytes={checkpoint_bytes} horizon_wal_appends={wal_append_delta} horizon_wal_file_syncs={wal_file_sync_delta} horizon_wal_directory_syncs={wal_directory_sync_delta} horizon_wal_bytes_appended={wal_bytes_appended} horizon_wal_offset_advance={wal_offset_advance} horizon_extension_interval_ms={extension_interval_ms} amortized_durable_bytes_per_second={amortized_durable_bytes_per_second}",
+            "control_plane_write_amplification_release pgs={PG_COUNT} retained_epochs={RETAINED_HISTORY_EPOCHS} storage_nodes={STORAGE_NODE_COUNT} steady_heartbeats={steady_heartbeat_requests} compact_status_reads={STEADY_HEARTBEAT_ROUNDS} wal_monitor_polls={monitor_poll_total} wal_monitor_poll_us_total={monitor_poll_us_total} wal_monitor_poll_us_max={monitor_poll_us_max} steady_checkpoint_stores=0 steady_checkpoint_syncs=0 steady_wal_appends=0 steady_wal_syncs=0 horizon_probe_heartbeats={horizon_probe_heartbeats} checkpoint_stores={checkpoint_store_delta} checkpoint_file_syncs={checkpoint_file_sync_delta} checkpoint_directory_syncs={checkpoint_directory_sync_delta} checkpoint_bytes={checkpoint_bytes} horizon_wal_appends={wal_append_delta} horizon_wal_file_syncs={wal_file_sync_delta} horizon_wal_directory_syncs={wal_directory_sync_delta} horizon_wal_bytes_appended={wal_bytes_appended} horizon_wal_offset_advance={wal_offset_advance} horizon_extension_interval_ms={extension_interval_ms} amortized_durable_bytes_per_second={amortized_durable_bytes_per_second} concurrent_checkpoints={CONCURRENT_CHECKPOINT_COUNT} concurrent_checkpoint_us={concurrent_checkpoint_us} concurrent_heartbeats={} concurrent_heartbeat_us_max={concurrent_heartbeat_us_max} concurrent_status_reads={CONCURRENT_HEARTBEAT_ROUNDS} concurrent_status_us_max={concurrent_status_us_max}",
+            CONCURRENT_HEARTBEAT_ROUNDS * u64::from(STORAGE_NODE_COUNT),
         );
 
         harness.shutdown();
@@ -9573,6 +9703,86 @@ mod tests {
             .block_on(authority.shutdown())
             .expect("WAL-backed authority should shut down");
         let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn experimental_raft_captured_checkpoint_persists_outside_state_machine_boundary() {
+        let state_dir = short_unix_socket_test_dir("captured-checkpoint-isolation");
+        let state_path = state_dir.0.path().join("control-plane.state");
+        let mut harness = experimental_raft_durable_wal_test_harness(
+            "captured-checkpoint-state-machine-isolation",
+            &state_path,
+        );
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-checkpoint-isolation-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![0];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("checkpoint-isolation authority should bootstrap");
+        let checkpoint = harness
+            .control_plane
+            .block_on(harness.authority.capture_durable_restart_checkpoint())
+            .expect("restart checkpoint should capture before holding the state machine");
+        let state_path = harness
+            .control_plane
+            .durable_artifact_path
+            .as_ref()
+            .expect("durable harness should retain an artifact path")
+            .as_ref()
+            .clone();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let runtime_handle = harness.runtime.handle().clone();
+        let boundary_authority = Arc::clone(&harness.authority);
+        let boundary_thread = thread::spawn(move || {
+            runtime_handle
+                .block_on(
+                    boundary_authority
+                        .raft()
+                        .with_state_machine(move |_state_machine| {
+                            entered_tx
+                                .send(())
+                                .expect("state-machine boundary entry should signal");
+                            Box::pin(async move {
+                                release_rx
+                                    .recv()
+                                    .expect("state-machine boundary release should arrive");
+                            })
+                        }),
+                )
+                .expect("state-machine boundary should remain available");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("state-machine boundary should be held");
+
+        let (persist_tx, persist_rx) = std::sync::mpsc::channel();
+        let persist_authority = Arc::clone(&harness.authority);
+        let persist_thread = thread::spawn(move || {
+            let result =
+                persist_authority.persist_durable_restart_checkpoint(checkpoint, &state_path);
+            persist_tx
+                .send(result)
+                .expect("checkpoint persistence result should be observed");
+        });
+        let persist_result = persist_rx.recv_timeout(Duration::from_secs(2));
+        release_tx
+            .send(())
+            .expect("state-machine boundary should release");
+        boundary_thread
+            .join()
+            .expect("state-machine boundary thread should finish");
+        persist_thread
+            .join()
+            .expect("checkpoint persistence thread should finish");
+        persist_result
+            .expect("captured checkpoint persistence must not wait for the state machine")
+            .expect("captured checkpoint should persist");
+
+        harness.shutdown();
     }
 
     #[test]

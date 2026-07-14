@@ -1729,6 +1729,8 @@ pub struct ControlPlaneRaftAuthority {
             RuntimeMapContentCertificate,
         )>,
     >,
+    checkpoint_instance: Arc<()>,
+    checkpoint_publication: Mutex<Option<ControlPlaneRaftCheckpointPosition>>,
     checkpoint_metrics: Arc<ControlPlaneRaftCheckpointMetrics>,
     command_metrics: Arc<ControlPlaneRaftCommandMetrics>,
 }
@@ -3729,6 +3731,8 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
+            checkpoint_instance: Arc::new(()),
+            checkpoint_publication: Mutex::new(None),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
             command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
@@ -3750,6 +3754,8 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
+            checkpoint_instance: Arc::new(()),
+            checkpoint_publication: Mutex::new(None),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
             command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
@@ -3772,6 +3778,8 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
+            checkpoint_instance: Arc::new(()),
+            checkpoint_publication: Mutex::new(None),
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
             command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
         }
@@ -4464,14 +4472,77 @@ impl ControlPlaneRaftAuthority {
         &self,
         path: &Path,
     ) -> Result<Option<u64>, ControlPlaneError> {
-        let artifact = self.capture_durable_restart_artifact().await?;
-        let wal_replay_offset = artifact.wal_replay_offset;
-        let committed_timestamp_high_water_ms = artifact
+        let checkpoint = self.capture_durable_restart_checkpoint().await?;
+        self.persist_durable_restart_checkpoint(checkpoint, path)
+    }
+
+    pub async fn capture_durable_restart_checkpoint(
+        &self,
+    ) -> Result<ControlPlaneRaftCapturedRestartCheckpoint, ControlPlaneError> {
+        Ok(ControlPlaneRaftCapturedRestartCheckpoint {
+            artifact: self.capture_durable_restart_artifact().await?,
+            authority_instance: Arc::clone(&self.checkpoint_instance),
+        })
+    }
+
+    pub fn persist_durable_restart_checkpoint(
+        &self,
+        checkpoint: ControlPlaneRaftCapturedRestartCheckpoint,
+        path: &Path,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        if !Arc::ptr_eq(&checkpoint.authority_instance, &self.checkpoint_instance) {
+            return Err(ControlPlaneError::RpcRemote {
+                message:
+                    "captured OpenRaft restart checkpoint belongs to another authority instance"
+                        .to_string(),
+            });
+        }
+        let position = ControlPlaneRaftCheckpointPosition::for_artifact(&checkpoint.artifact);
+        let mut last_publication =
+            self.checkpoint_publication
+                .lock()
+                .map_err(|_| ControlPlaneError::RpcRemote {
+                    message: "OpenRaft checkpoint publication mutex poisoned".to_string(),
+                })?;
+        if let Some(previous) = *last_publication {
+            position.validate_at_or_after(previous)?;
+        }
+        if let Some(wal_status) = self
+            .log_store
+            .as_ref()
+            .map(ControlPlaneRaftLogStore::wal_monitor_snapshot)
+            .transpose()
+            .map_err(|source| ControlPlaneError::Io {
+                context: "validate captured OpenRaft checkpoint against current WAL",
+                source,
+            })?
+            .flatten()
+        {
+            if position.wal_replay_offset < wal_status.offsets().base_offset() {
+                return Err(ControlPlaneError::RpcRemote {
+                    message: format!(
+                        "captured OpenRaft restart checkpoint WAL offset {} precedes the current WAL base offset {}",
+                        position.wal_replay_offset,
+                        wal_status.offsets().base_offset()
+                    ),
+                });
+            }
+        }
+
+        let wal_replay_offset = checkpoint.artifact.wal_replay_offset;
+        let committed_timestamp_high_water_ms = checkpoint
+            .artifact
             .state_machine
             .inner
             .snapshot()
             .max_committed_timestamp_ms();
-        artifact.store_durable_artifact_with_metrics(path, Some(&self.checkpoint_metrics))?;
+        // Reserve the monotonic publication position before filesystem mutation.
+        // A failed or ambiguous write may have replaced the artifact, so allowing
+        // an older captured token afterward would reintroduce rollback.
+        *last_publication = Some(position);
+        checkpoint
+            .artifact
+            .store_durable_artifact_with_metrics(path, Some(&self.checkpoint_metrics))?;
         if let Some(log_store) = &self.log_store {
             let compact_started = Instant::now();
             let result = log_store.compact_wal_through(wal_replay_offset);
@@ -5271,6 +5342,81 @@ pub struct ControlPlaneRaftRestartArtifact {
     wal_replay_offset: u64,
     log_store: ControlPlaneRaftLogStoreRestartArtifact,
     state_machine: ControlPlaneRaftStateMachineRestartArtifact,
+}
+
+pub struct ControlPlaneRaftCapturedRestartCheckpoint {
+    artifact: ControlPlaneRaftRestartArtifact,
+    authority_instance: Arc<()>,
+}
+
+impl ControlPlaneRaftCapturedRestartCheckpoint {
+    #[cfg(test)]
+    #[must_use]
+    fn wal_replay_offset(&self) -> u64 {
+        self.artifact.wal_replay_offset
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ControlPlaneRaftCheckpointPosition {
+    wal_replay_offset: u64,
+    last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+}
+
+impl ControlPlaneRaftCheckpointPosition {
+    fn for_artifact(artifact: &ControlPlaneRaftRestartArtifact) -> Self {
+        Self {
+            wal_replay_offset: artifact.wal_replay_offset,
+            last_applied: artifact.state_machine.last_applied,
+        }
+    }
+
+    fn validate_at_or_after(self, previous: Self) -> Result<(), ControlPlaneError> {
+        if self.wal_replay_offset < previous.wal_replay_offset {
+            return Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "captured OpenRaft restart checkpoint WAL offset {} precedes the last publication offset {}",
+                    self.wal_replay_offset, previous.wal_replay_offset
+                ),
+            });
+        }
+        match (previous.last_applied, self.last_applied) {
+            (Some(previous), None) => Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "captured OpenRaft restart checkpoint has no applied log ID after publishing {previous}"
+                ),
+            }),
+            (Some(previous), Some(candidate)) if candidate.index < previous.index => {
+                Err(ControlPlaneError::RpcRemote {
+                    message: format!(
+                        "captured OpenRaft restart checkpoint applied index {} precedes the last publication index {}",
+                        candidate.index, previous.index
+                    ),
+                })
+            }
+            (Some(previous), Some(candidate))
+                if candidate.index == previous.index && candidate != previous =>
+            {
+                Err(ControlPlaneError::RpcRemote {
+                    message: format!(
+                        "captured OpenRaft restart checkpoint applied log ID {candidate} conflicts with the last publication log ID {previous} at the same index"
+                    ),
+                })
+            }
+            (Some(previous), Some(candidate))
+                if candidate.index > previous.index
+                    && candidate.leader_id.term < previous.leader_id.term =>
+            {
+                Err(ControlPlaneError::RpcRemote {
+                    message: format!(
+                        "captured OpenRaft restart checkpoint applied term {} regresses from the last publication term {}",
+                        candidate.leader_id.term, previous.leader_id.term
+                    ),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -14035,6 +14181,189 @@ mod tests {
             artifact
                 .restore_with_wal_file(test_raft_wal_file(&wal_path, "test-cluster", 1))
                 .expect("checkpoint artifact should restore after WAL compaction");
+
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_captured_checkpoint_preserves_post_capture_wal_suffix() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let artifact_path = tmp.path().join("raft.state");
+            let wal_path = tmp.path().join("raft.wal");
+            let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+            let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                ControlPlaneRaftLogStoreRestartArtifact::default(),
+                wal.clone(),
+            )
+            .expect("WAL-backed log store should initialize");
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config("control-plane-raft-captured-checkpoint-suffix-test"),
+                UnreachableRaftNetworkFactory,
+                log_store.clone(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let authority = ControlPlaneRaftAuthority::new_with_log_store(
+                raft,
+                log_store.clone(),
+                "test-cluster",
+            );
+            authority
+                .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+                .await
+                .unwrap();
+            wait_for_local_leader(authority.raft(), "captured checkpoint suffix leadership").await;
+
+            let checkpoint = authority
+                .capture_durable_restart_checkpoint()
+                .await
+                .expect("restart checkpoint should capture");
+            let replay_offset = checkpoint.wal_replay_offset();
+            authority.shutdown().await.unwrap();
+
+            let suffix_vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(7, 1);
+            let mut suffix_store = log_store;
+            RaftLogStorage::save_vote(&mut suffix_store, &suffix_vote)
+                .await
+                .expect("post-capture vote should append to the WAL suffix");
+            let suffix_end = wal.clean_len().expect("suffix WAL length should read");
+            assert!(suffix_end > replay_offset);
+
+            authority
+                .persist_durable_restart_checkpoint(checkpoint, &artifact_path)
+                .expect("captured checkpoint should persist and compact its WAL prefix");
+            assert_eq!(
+                authority
+                    .durable_wal_monitor_snapshot()
+                    .expect("compacted WAL monitor snapshot should read")
+                    .offsets(),
+                ControlPlaneRaftWalOffsets {
+                    base_offset: replay_offset,
+                    clean_len: suffix_end,
+                }
+            );
+
+            let artifact =
+                ControlPlaneRaftRestartArtifact::load_durable_artifact(&artifact_path).unwrap();
+            let (restored_log_store, _) = artifact
+                .restore_with_wal_file(test_raft_wal_file(&wal_path, "test-cluster", 1))
+                .expect("checkpoint plus post-capture WAL suffix should restore");
+            assert_eq!(
+                restored_log_store.persisted_vote().unwrap(),
+                Some(suffix_vote)
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_checkpoint_rejects_stale_capture_before_publication() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let artifact_path = tmp.path().join("raft.state");
+            let wal_path = tmp.path().join("raft.wal");
+            let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
+            let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                ControlPlaneRaftLogStoreRestartArtifact::default(),
+                wal,
+            )
+            .expect("WAL-backed log store should initialize");
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config("control-plane-raft-stale-captured-checkpoint-test"),
+                UnreachableRaftNetworkFactory,
+                log_store.clone(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let authority =
+                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster");
+            authority
+                .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+                .await
+                .unwrap();
+            wait_for_local_leader(authority.raft(), "stale captured checkpoint leadership").await;
+
+            let stale = authority
+                .capture_durable_restart_checkpoint()
+                .await
+                .expect("older restart checkpoint should capture");
+            let rejected = authority
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(99),
+                    availability: NodeAvailabilityState::Healthy,
+                })
+                .await
+                .expect("deterministically rejected command should commit");
+            assert!(matches!(
+                rejected.outcome(),
+                ControlPlaneRaftCommandOutcome::Rejected(ControlPlaneError::UnknownNode {
+                    node_id: 99
+                })
+            ));
+            let current = authority
+                .capture_durable_restart_checkpoint()
+                .await
+                .expect("newer restart checkpoint should capture");
+            authority
+                .persist_durable_restart_checkpoint(current, &artifact_path)
+                .expect("newer restart checkpoint should publish");
+            let artifact_before_stale = fs::read(&artifact_path).unwrap();
+            let offsets_before_stale = authority.durable_wal_monitor_snapshot().unwrap().offsets();
+
+            let error = authority
+                .persist_durable_restart_checkpoint(stale, &artifact_path)
+                .expect_err("older captured checkpoint must not replace a newer publication");
+            assert!(
+                error.to_string().contains("precedes the last publication"),
+                "unexpected stale-checkpoint error: {error}"
+            );
+            assert_eq!(fs::read(&artifact_path).unwrap(), artifact_before_stale);
+            assert_eq!(
+                authority.durable_wal_monitor_snapshot().unwrap().offsets(),
+                offsets_before_stale
+            );
+
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_checkpoint_rejects_capture_from_another_authority() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let artifact_path = tmp.path().join("foreign.state");
+            fs::write(&artifact_path, b"unchanged").unwrap();
+            let log_store = ControlPlaneRaftLogStore::empty();
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config("control-plane-raft-foreign-captured-checkpoint-test"),
+                UnreachableRaftNetworkFactory,
+                log_store.clone(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let authority =
+                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster");
+            let checkpoint = authority
+                .capture_durable_restart_checkpoint()
+                .await
+                .expect("restart checkpoint should capture");
+            let foreign_authority = ControlPlaneRaftAuthority::new(authority.raft().clone());
+
+            let error = foreign_authority
+                .persist_durable_restart_checkpoint(checkpoint, &artifact_path)
+                .expect_err("another authority instance must reject the captured checkpoint");
+            assert!(
+                error.to_string().contains("another authority instance"),
+                "unexpected foreign-checkpoint error: {error}"
+            );
+            assert_eq!(fs::read(&artifact_path).unwrap(), b"unchanged");
 
             authority.shutdown().await.unwrap();
         });

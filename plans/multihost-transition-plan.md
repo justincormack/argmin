@@ -11181,8 +11181,31 @@ Required production shape and implementation order:
    `scripts/ci-control-plane-release` and prints its accounting on success.
    This closes the steady-heartbeat and bounded-horizon measurement gate. The
    separate ordinary peer-RPC acknowledgement blocker in items 5 and 6 is now
-   closed by the bounded WAL-suffix slice below; periodic checkpoint cost and
-   load validation remain open.
+   closed by the bounded WAL-suffix slice below. Periodic checkpoint isolation
+   and load validation are now also executable: checkpoint capture clones one
+   consistent state-machine/log boundary through the async Raft API, then the
+   dedicated process checkpoint thread performs artifact encoding, file and
+   directory sync, and WAL prefix compaction synchronously after leaving the
+   Tokio runtime. A deterministic regression holds the state-machine boundary
+   while the captured artifact is persisted, proving the I/O phase does not
+   re-enter that boundary. A second regression appends a WAL record after
+   capture, persists and compacts the older boundary, and proves restart
+   recovers the post-capture suffix. The production-shaped gate now runs eight
+   forced checkpoints concurrently with 48 covered heartbeats and 16 compact
+   status reads over the same 116-PG, 256-epoch state; it requires all serving
+   operations to succeed, the applied log and WAL offsets to remain unchanged,
+   exactly eight checkpoint stores, and zero WAL append/sync deltas, while
+   reporting checkpoint and request latency maxima.
+   The public split boundary is authority-instance-bound and internally
+   serialized. Before any artifact encoding or filesystem mutation,
+   persistence rejects a token captured by another authority, a WAL replay
+   offset below the current WAL base or last attempted publication, an applied
+   index rollback, a same-index/full-log-ID mismatch, or an applied-term
+   regression. It reserves the accepted position before mutation because a
+   failed artifact rename or parent sync can be ambiguous. Regressions prove a
+   stale token cannot overwrite a newer artifact or alter its compacted WAL,
+   and that even a second wrapper around the same Raft handle cannot publish a
+   token it did not capture.
 4. Persist logical durable commands incrementally. The single-authority
    compatibility path must either append versioned/checksummed durable deltas
    to an fsync'd, identity-bound journal and replay them over the latest
@@ -11689,6 +11712,16 @@ Phase 12.4 progress:
   and 256 retained epochs and reports its cumulative/maximum poll duration.
   The existing WAL crash test remains the recovery guarantee for process loss
   anywhere after fsync.
+- Split periodic OpenRaft checkpointing into an asynchronous immutable capture
+  and a synchronous persistence phase. The authority captures the state
+  machine before the retained log/WAL offset and validates that replay pair;
+  the process helper then leaves the Tokio runtime before encoding, syncing,
+  and compacting on its dedicated checkpoint thread. Post-capture WAL records
+  remain a replayable suffix after compaction. Focused regressions prove the
+  persistence phase completes while the state-machine boundary is held and
+  that checkpoint-plus-suffix restart retains a mutation appended after
+  capture. The production-shaped release gate exercises the same split under
+  concurrent heartbeat/status traffic and exports the measured maxima.
 - Removed retained-WAL frame replay from the replicated-authority status hot
   path. WAL-backed status now reads only the CRC-protected file header and file
   length to report base/clean offsets, while checkpoint/restart replay still

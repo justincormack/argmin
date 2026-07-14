@@ -7,6 +7,9 @@ cd "$ROOT"
 
 echo "== release control-plane invariant boundary =="
 cargo nextest run --release -p storage \
+    control_plane_raft_checkpoint_rejects_capture_from_another_authority \
+    control_plane_raft_checkpoint_rejects_stale_capture_before_publication \
+    control_plane_raft_captured_checkpoint_preserves_post_capture_wal_suffix \
     command_apply_rejects_invalid_snapshot_before_publication \
     direct_snapshot_commit_validates_control_plane_invariants \
     open_validates_control_plane_invariants_before_saving \
@@ -17,6 +20,7 @@ cargo nextest run --release -p storage \
 echo
 echo "== release control-plane write-amplification boundary =="
 cargo nextest run --release -p argmin-s3 --bin argmin-s3 \
+    experimental_raft_captured_checkpoint_persists_outside_state_machine_boundary \
     experimental_raft_production_shaped_heartbeat_write_amplification_gate \
     experimental_raft_peer_vote_acks_from_wal_then_bounded_checkpoint_compacts \
     experimental_raft_wal_monitor_does_not_enter_state_machine \
