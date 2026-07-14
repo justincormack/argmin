@@ -2749,6 +2749,9 @@ struct AssumeRoleProbeSet<'a> {
     role_name: &'a str,
     default_max_role_arn: &'a str,
     default_max_role_name: &'a str,
+    external_id: &'a str,
+    external_id_role_arn: &'a str,
+    external_id_role_name: &'a str,
     role_session_name: &'a str,
 }
 
@@ -2764,6 +2767,9 @@ fn run_assume_role_probes(
         role_name,
         default_max_role_arn,
         default_max_role_name,
+        external_id,
+        external_id_role_arn,
+        external_id_role_name,
         role_session_name,
     } = fixture;
     let missing_role_arn = format!("{role_arn}-missing");
@@ -2777,6 +2783,11 @@ fn run_assume_role_probes(
     let decomposed_1025_role_arn = "e\u{301}".repeat(1025);
     let long_session_name = "a".repeat(65);
     let max_session_name = "b".repeat(64);
+    let max_external_id = "e".repeat(1224);
+    let overlong_external_id = "e".repeat(1225);
+    let overlong_invalid_external_id = "!".repeat(1225);
+    let multibyte_external_id = "é".repeat(613);
+    let supplementary_external_id = "😀".repeat(613);
     let unknown_role_message = format!(
         "User: {caller_arn} is not authorized to perform: sts:AssumeRole on resource: {missing_role_arn}"
     );
@@ -2800,6 +2811,15 @@ fn run_assume_role_probes(
     assert_eq!(decomposed_1025_role_arn.len(), 3075);
     assert_eq!(decomposed_1025_role_arn.chars().count(), 2050);
     assert_eq!(decomposed_1025_role_arn.encode_utf16().count(), 2050);
+    assert_eq!(max_external_id.len(), 1224);
+    assert_eq!(overlong_external_id.len(), 1225);
+    assert_eq!(overlong_invalid_external_id.len(), 1225);
+    assert_eq!(multibyte_external_id.len(), 1226);
+    assert_eq!(multibyte_external_id.chars().count(), 613);
+    assert_eq!(multibyte_external_id.encode_utf16().count(), 613);
+    assert_eq!(supplementary_external_id.len(), 2452);
+    assert_eq!(supplementary_external_id.chars().count(), 613);
+    assert_eq!(supplementary_external_id.encode_utf16().count(), 1226);
 
     let max_bmp_role_message = format!("{max_bmp_role_arn} is invalid");
     let overlong_bmp_role_message = format!(
@@ -2813,6 +2833,19 @@ fn run_assume_role_probes(
     );
     let decomposed_1025_role_message = format!(
         "1 validation error detected: Value '{decomposed_1025_role_arn}' at 'roleArn' failed to satisfy constraint: Member must have length less than or equal to 2048"
+    );
+    let external_id_pattern = r"[\w+=,.@:\/-]*";
+    let overlong_external_id_message = format!(
+        "1 validation error detected: Value '{overlong_external_id}' at 'externalId' failed to satisfy constraint: Member must have length less than or equal to 1224"
+    );
+    let overlong_invalid_external_id_message = format!(
+        "2 validation errors detected: Value '{overlong_invalid_external_id}' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: {external_id_pattern}; Value '{overlong_invalid_external_id}' at 'externalId' failed to satisfy constraint: Member must have length less than or equal to 1224"
+    );
+    let multibyte_external_id_message = format!(
+        "1 validation error detected: Value '{multibyte_external_id}' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: {external_id_pattern}"
+    );
+    let supplementary_external_id_message = format!(
+        "1 validation error detected: Value '{supplementary_external_id}' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: {external_id_pattern}"
     );
 
     for (label, value, message) in [
@@ -3016,6 +3049,65 @@ fn run_assume_role_probes(
         Some(&long_session_message),
     );
 
+    for (label, value, message) in [
+        (
+            "assume-role-empty-external-id",
+            "",
+            "1 validation error detected: Value '' at 'externalId' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "assume-role-short-external-id",
+            "a",
+            "1 validation error detected: Value 'a' at 'externalId' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "assume-role-invalid-external-id",
+            "bad value",
+            r"1 validation error detected: Value 'bad value' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@:\/-]*",
+        ),
+        (
+            "assume-role-short-invalid-external-id",
+            "!",
+            r"2 validation errors detected: Value '!' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@:\/-]*; Value '!' at 'externalId' failed to satisfy constraint: Member must have length greater than or equal to 2",
+        ),
+        (
+            "assume-role-overlong-external-id",
+            overlong_external_id.as_str(),
+            overlong_external_id_message.as_str(),
+        ),
+        (
+            "assume-role-overlong-invalid-external-id",
+            overlong_invalid_external_id.as_str(),
+            overlong_invalid_external_id_message.as_str(),
+        ),
+        (
+            "assume-role-multibyte-external-id-length-units",
+            multibyte_external_id.as_str(),
+            multibyte_external_id_message.as_str(),
+        ),
+        (
+            "assume-role-supplementary-external-id-length-units",
+            supplementary_external_id.as_str(),
+            supplementary_external_id_message.as_str(),
+        ),
+    ] {
+        assert_assume_role_error(
+            label,
+            endpoint,
+            credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", role_arn),
+                ("RoleSessionName", role_session_name),
+                ("ExternalId", value),
+            ],
+            400,
+            "ValidationError",
+            Some(message),
+        );
+    }
+
     for (label, value, code, message) in [
         (
             "assume-role-empty-duration",
@@ -3134,6 +3226,115 @@ fn run_assume_role_probes(
             },
         );
     }
+    for (label, external_id) in [
+        ("assume-role-min-external-id", "ab"),
+        (
+            "assume-role-all-allowed-external-id-characters",
+            "azAZ09_+=,.@:/-",
+        ),
+        ("assume-role-max-external-id", max_external_id.as_str()),
+    ] {
+        assert_assume_role_request_success(
+            label,
+            endpoint,
+            credentials,
+            &[
+                ("Action", "AssumeRole"),
+                ("Version", "2011-06-15"),
+                ("RoleArn", role_arn),
+                ("RoleSessionName", role_session_name),
+                ("ExternalId", external_id),
+            ],
+            AssumeRoleSuccess {
+                account_id,
+                role_name,
+                role_session_name,
+                duration_seconds: 3600,
+            },
+        );
+    }
+    let external_id_denied_message = format!(
+        "User: {caller_arn} is not authorized to perform: sts:AssumeRole on resource: {external_id_role_arn}"
+    );
+    assert_assume_role_request_success(
+        "assume-role-external-id-trust-match",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", external_id_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("ExternalId", external_id),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name: external_id_role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+    );
+    for (label, external_id_parameter) in [
+        ("assume-role-external-id-trust-missing", None),
+        (
+            "assume-role-external-id-trust-mismatch",
+            Some("wrong-external-id"),
+        ),
+    ] {
+        let mut parameters = vec![
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", external_id_role_arn),
+            ("RoleSessionName", role_session_name),
+        ];
+        if let Some(value) = external_id_parameter {
+            parameters.push(("ExternalId", value));
+        }
+        assert_assume_role_error(
+            label,
+            endpoint,
+            credentials,
+            &parameters,
+            403,
+            "AccessDenied",
+            Some(&external_id_denied_message),
+        );
+    }
+    assert_assume_role_request_success(
+        "assume-role-duplicate-external-id-trust-match-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", external_id_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("ExternalId", external_id),
+            ("ExternalId", "wrong-external-id"),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name: external_id_role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+    );
+    assert_assume_role_error(
+        "assume-role-duplicate-external-id-trust-mismatch-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", external_id_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("ExternalId", "wrong-external-id"),
+            ("ExternalId", external_id),
+        ],
+        403,
+        "AccessDenied",
+        Some(&external_id_denied_message),
+    );
     for (label, duration, duration_seconds) in [
         ("assume-role-min-duration", "900", 900),
         ("assume-role-max-duration", "43200", 43200),
@@ -3244,6 +3445,43 @@ fn run_assume_role_probes(
         "ValidationError",
         Some(
             r"1 validation error detected: Value 'bad/name' at 'roleSessionName' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*",
+        ),
+    );
+    assert_assume_role_request_success(
+        "assume-role-duplicate-external-id-valid-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+            ("ExternalId", "valid-external-id"),
+            ("ExternalId", "bad value"),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name,
+            role_session_name,
+            duration_seconds: 3600,
+        },
+    );
+    assert_assume_role_error(
+        "assume-role-duplicate-external-id-invalid-first",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+            ("ExternalId", "bad value"),
+            ("ExternalId", "valid-external-id"),
+        ],
+        400,
+        "ValidationError",
+        Some(
+            r"1 validation error detected: Value 'bad value' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@:\/-]*",
         ),
     );
     assert_assume_role_request_success(
@@ -3846,6 +4084,9 @@ fn main() {
         let role_name = required_env("S3_TEST_STS_ROLE_NAME");
         let default_max_role_arn = required_env("S3_TEST_STS_DEFAULT_MAX_ROLE_ARN");
         let default_max_role_name = required_env("S3_TEST_STS_DEFAULT_MAX_ROLE_NAME");
+        let external_id = required_env("S3_TEST_STS_EXTERNAL_ID");
+        let external_id_role_arn = required_env("S3_TEST_STS_EXTERNAL_ID_ROLE_ARN");
+        let external_id_role_name = required_env("S3_TEST_STS_EXTERNAL_ID_ROLE_NAME");
         let role_session_name = required_env("S3_TEST_STS_ROLE_SESSION_NAME");
         run_assume_role_probes(
             &endpoint,
@@ -3857,6 +4098,9 @@ fn main() {
                 role_name: &role_name,
                 default_max_role_arn: &default_max_role_arn,
                 default_max_role_name: &default_max_role_name,
+                external_id: &external_id,
+                external_id_role_arn: &external_id_role_arn,
+                external_id_role_name: &external_id_role_name,
                 role_session_name: &role_session_name,
             },
         );

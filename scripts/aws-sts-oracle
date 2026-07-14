@@ -185,6 +185,32 @@ wait_for_assume_role_success() {
     echo "$label-sts-success: ok"
 }
 
+wait_for_external_id_assume_role_success() {
+    local label="$1"
+    local role_arn="$2"
+    local external_id="$3"
+    local attempt consecutive_successes=0 ready=false
+
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if aws_primary sts assume-role \
+            --role-arn "$role_arn" \
+            --role-session-name convergence-check \
+            --external-id "$external_id" >/dev/null 2>&1; then
+            ((consecutive_successes += 1))
+            if ((consecutive_successes == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_successes=0
+        fi
+        sleep 2
+    done
+    [[ "$ready" == true ]] || \
+        external_s3_test_die "$label did not converge to STS success"
+    echo "$label-sts-success: ok"
+}
+
 wait_for_assume_role_denied() {
     local label="$1"
     local aws_command="$2"
@@ -366,7 +392,7 @@ create_assume_role_fixture() {
     local chain_source_identity chain_source_session chain_target_max_duration default_max_duration
     local deleted_role_identity deleted_role_session deleted_role_stable_id identity_decision identity_simulation missing_role_error
     local other_live_access_key other_live_identity other_live_secret_key other_live_session other_live_session_token
-    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix streaming_bucket_policy trust_chain_source trust_default_max trust_policy
+    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix streaming_bucket_policy trust_chain_source trust_default_max trust_external_id trust_policy
     primary_identity="$(aws_primary sts get-caller-identity --output json)"
     primary_account="$(jq -er '.Account' <<<"$primary_identity")"
     primary_arn="$(jq -er '.Arn' <<<"$primary_identity")"
@@ -400,6 +426,9 @@ create_assume_role_fixture() {
     export S3_TEST_STS_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_ROLE_NAME}"
     export S3_TEST_STS_DEFAULT_MAX_ROLE_NAME="default-max-${role_suffix}"
     export S3_TEST_STS_DEFAULT_MAX_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_DEFAULT_MAX_ROLE_NAME}"
+    export S3_TEST_STS_EXTERNAL_ID="argmin-sts-oracle-external-id"
+    export S3_TEST_STS_EXTERNAL_ID_ROLE_NAME="external-id-${role_suffix}"
+    export S3_TEST_STS_EXTERNAL_ID_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_EXTERNAL_ID_ROLE_NAME}"
     export S3_TEST_STS_CHAIN_SOURCE_SESSION_NAME="chaining-source"
     export S3_TEST_STS_CHAIN_TARGET_SESSION_NAME="chaining-target"
     export S3_TEST_STS_CHAIN_TARGET_ROLE_NAME="chain-target-${role_suffix}"
@@ -495,6 +524,31 @@ create_assume_role_fixture() {
             "temporary STS oracle role has unexpected default maximum session duration $default_max_duration"
     echo "same-account-default-max-duration: ok"
 
+    assert_identity_decision \
+        same-account-external-id \
+        aws_primary \
+        "$primary_arn" \
+        "$S3_TEST_STS_EXTERNAL_ID_ROLE_ARN" \
+        implicitDeny
+    trust_external_id="$tmpdir/trust-external-id.json"
+    jq -n \
+        --arg principal "$primary_arn" \
+        --arg external_id "$S3_TEST_STS_EXTERNAL_ID" \
+        '{
+            Version: "2012-10-17",
+            Statement: [{
+                Effect: "Allow",
+                Principal: {AWS: $principal},
+                Action: "sts:AssumeRole",
+                Condition: {StringEquals: {"sts:ExternalId": $external_id}}
+            }]
+        }' >"$trust_external_id"
+    create_scoped_role \
+        "$S3_TEST_STS_EXTERNAL_ID_ROLE_NAME" \
+        /argmin-sts-oracle/same-account/ \
+        "$trust_external_id" \
+        "$S3_TEST_STS_EXTERNAL_ID_ROLE_ARN"
+
     trust_chain_source="$tmpdir/trust-chain-source.json"
     jq -n --arg principal "$S3_TEST_STS_ROLE_ARN" '{
         Version: "2012-10-17",
@@ -549,6 +603,10 @@ create_assume_role_fixture() {
         same-account-default-max-role \
         aws_primary \
         "$S3_TEST_STS_DEFAULT_MAX_ROLE_ARN"
+    wait_for_external_id_assume_role_success \
+        same-account-external-id-role \
+        "$S3_TEST_STS_EXTERNAL_ID_ROLE_ARN" \
+        "$S3_TEST_STS_EXTERNAL_ID"
 
     chain_source_session="$(aws_primary sts assume-role \
         --role-arn "$S3_TEST_STS_ROLE_ARN" \

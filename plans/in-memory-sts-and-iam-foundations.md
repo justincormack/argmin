@@ -792,7 +792,7 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-The optional `AssumeRole` security-context parameters,
+The remaining optional `AssumeRole` security-context parameters,
 expiry-versus-issuer-deletion precedence,
 trust/permission-policy mutation precedence, session-principal context, and
 `aws:TokenIssueTime` behavior remain before Phase 0 can satisfy its exit
@@ -947,11 +947,51 @@ matrix establishes that:
 The first implementation-facing core can therefore parse and validate
 `RoleArn`, `RoleSessionName`, and optional `DurationSeconds` from the Query
 request without guessed behavior. This does not authorize silently ignoring
-known optional `AssumeRole` inputs: session policy/policy ARNs, external ID,
-source identity, tags/transitive tags, MFA fields, and provided contexts still
-need explicit AWS-backed scope decisions. The one-hour role-chaining limit also
-remains separate from the API-level and configured-role duration bounds pinned
-here.
+known optional `AssumeRole` inputs: session policy/policy ARNs, source identity,
+tags/transitive tags, MFA fields, and provided contexts still need explicit
+AWS-backed scope decisions. External ID parsing and trust-policy evaluation are
+pinned by the following slice. The one-hour role-chaining limit also remains
+separate from the API-level and configured-role duration bounds pinned here.
+
+The `ExternalId` validation and trust-policy slice completed on 2026-07-14.
+The exact AWS-backed matrix establishes that:
+
+- omission remains valid; present values must contain 2 through 1,224
+  characters and match `[\w+=,.@:\/-]*`
+- `azAZ09_+=,.@:/-` succeeds, pinning letters, digits, underscore, and every
+  punctuation character admitted by the rendered pattern
+- the two- and 1,224-character ASCII boundaries succeed with the ordinary
+  no-session-policy response shape: `ExternalId` is not echoed and
+  `PackedPolicySize` remains absent
+- empty, one-character, space-containing, and 1,225-character values receive
+  the exact single-error `ValidationError` shapes for the violated constraint
+- when pattern and length both fail, AWS returns an exact two-error response
+  with the pattern failure first and the minimum- or maximum-length failure
+  second; this is pinned with one and 1,225 exclamation marks
+- length is counted in decoded Unicode scalar values, not UTF-8 bytes or UTF-16
+  units: 613 `é` characters occupy 1,226 bytes but receive only the pattern
+  error, and 613 supplementary characters occupy 2,452 bytes and 1,226 UTF-16
+  units but likewise receive only the pattern error
+- duplicate `ExternalId` parameter validation uses the first wire value: a
+  valid first value followed by an invalid value succeeds, while the reversed
+  order returns the invalid first value's exact pattern error
+- a separate uniquely named same-account role has an exact
+  `StringEquals`/`sts:ExternalId` trust condition; IAM policy simulation first
+  proves that the caller has no applicable identity-policy grant, then the
+  fixture requires three consecutive successful assumptions with the expected
+  external ID before running the response matrix
+- the expected external ID succeeds with the ordinary exact response shape;
+  omission or a different shape-valid value receives the same exact
+  `AccessDenied` response for the target role
+- duplicate values also use the first wire value during trust evaluation: the
+  expected value followed by the wrong value succeeds, while the reverse order
+  receives `AccessDenied`
+
+The unconditioned role isolates fixed-schema validation, while the conditioned
+role pins the security meaning of the selected value. Local support must carry
+that selected value in typed request context and evaluate it as
+`sts:ExternalId` in the role trust policy; accepting and ignoring the parameter
+would fail the oracle.
 
 The configured role-maximum slice completed on 2026-07-13. A second unique
 same-account role is left at IAM's default 3,600-second maximum. The fixture
