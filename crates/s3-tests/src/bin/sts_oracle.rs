@@ -6632,8 +6632,99 @@ struct RoutingPathProbe {
     s3_control: S3ControlPathResult,
 }
 
+struct AccountIdHeaderProbe<'a> {
+    label: &'static str,
+    headers: Vec<(&'static str, &'a str)>,
+}
+
+#[derive(Clone, Copy)]
+enum AccountIdOperation {
+    List,
+    Tag,
+    Untag,
+}
+
+fn account_id_header_probes(account_id: &str) -> Vec<AccountIdHeaderProbe<'_>> {
+    let wrong_account_id = if account_id == "000000000000" {
+        "111111111111"
+    } else {
+        "000000000000"
+    };
+    vec![
+        AccountIdHeaderProbe {
+            label: "correct",
+            headers: vec![("x-amz-account-id", account_id)],
+        },
+        AccountIdHeaderProbe {
+            label: "missing",
+            headers: vec![],
+        },
+        AccountIdHeaderProbe {
+            label: "empty",
+            headers: vec![("x-amz-account-id", "")],
+        },
+        AccountIdHeaderProbe {
+            label: "wrong",
+            headers: vec![("x-amz-account-id", wrong_account_id)],
+        },
+        AccountIdHeaderProbe {
+            label: "malformed-short",
+            headers: vec![("x-amz-account-id", "1")],
+        },
+        AccountIdHeaderProbe {
+            label: "malformed-alpha",
+            headers: vec![("x-amz-account-id", "not-an-account")],
+        },
+        AccountIdHeaderProbe {
+            label: "duplicate-identical",
+            headers: vec![
+                ("x-amz-account-id", account_id),
+                ("x-amz-account-id", account_id),
+            ],
+        },
+        AccountIdHeaderProbe {
+            label: "duplicate-correct-wrong",
+            headers: vec![
+                ("x-amz-account-id", account_id),
+                ("x-amz-account-id", wrong_account_id),
+            ],
+        },
+        AccountIdHeaderProbe {
+            label: "duplicate-wrong-correct",
+            headers: vec![
+                ("x-amz-account-id", wrong_account_id),
+                ("x-amz-account-id", account_id),
+            ],
+        },
+    ]
+}
+
 fn assert_empty_bad_path_request(label: &str, response: &RawResponse) {
     assert_shape(label, response, &shape().status(400).body_empty());
+}
+
+fn assert_list_tags_for_resource_success(label: &str, response: &RawResponse) {
+    assert_shape(
+        label,
+        response,
+        &shape()
+            .status(200)
+            .headers(id_headers())
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <ListTagsForResourceResult xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">\
+                 <Tags><Tag><Key>routing-key</Key><Value>routing-value</Value></Tag></Tags>\
+                 </ListTagsForResourceResult>",
+            ),
+    );
+}
+
+fn assert_s3_control_write_success(label: &str, response: &RawResponse) {
+    assert_shape(
+        label,
+        response,
+        &shape().status(204).headers(id_headers()).body_empty(),
+    );
 }
 
 fn assert_s3_control_signature_mismatch(
@@ -7291,6 +7382,42 @@ fn run_cross_service_routing_probes(
         }
         println!("{s3_control_label}: ok");
     }
+
+    for probe in account_id_header_probes(account_id) {
+        let sts_label = format!("routing-account-id-sts-{}", probe.label);
+        let sts_response = send_signed_request_for_service_with_credentials(
+            "GET",
+            &format!("{sts_endpoint}{tags_path}"),
+            b"",
+            probe.headers.iter().copied(),
+            "sts",
+            credentials,
+        );
+        assert_sts_unknown_operation(&sts_label, &sts_response, false);
+        println!("{sts_label}: ok");
+
+        let s3_control_label = format!("routing-account-id-s3-control-{}", probe.label);
+        let s3_control_response = send_signed_request_for_service_with_credentials(
+            "GET",
+            &format!("{s3_control_endpoint}{tags_path}"),
+            b"",
+            probe.headers.iter().copied(),
+            "s3",
+            credentials,
+        );
+        assert_s3_control_error(
+            &s3_control_label,
+            &s3_control_response,
+            S3ControlError {
+                status: 404,
+                code: "NoSuchResource",
+                message: "The specified resource doesn't exist.",
+                detail: "",
+                allow: None,
+            },
+        );
+        println!("{s3_control_label}: ok");
+    }
 }
 
 fn run_list_tags_for_resource_success_probe(
@@ -7321,20 +7448,79 @@ fn run_list_tags_for_resource_success_probe(
         "s3",
         credentials,
     );
-    assert_shape(
+    assert_list_tags_for_resource_success(
         "routing-list-tags-existing-s3-control",
         &s3_control_response,
-        &shape()
-            .status(200)
-            .headers(id_headers())
-            .body(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                 <ListTagsForResourceResult xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">\
-                 <Tags><Tag><Key>routing-key</Key><Value>routing-value</Value></Tag></Tags>\
-                 </ListTagsForResourceResult>",
-            ),
     );
     println!("routing-list-tags-existing-s3-control: ok");
+
+    let tag_body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags><Tag><Key>routing-key</Key><Value>routing-value</Value></Tag></Tags></TagResourceRequest>";
+    for probe in account_id_header_probes(account_id) {
+        for operation in [
+            AccountIdOperation::List,
+            AccountIdOperation::Tag,
+            AccountIdOperation::Untag,
+        ] {
+            let (operation_label, method, request_path, body, content_type) = match operation {
+                AccountIdOperation::List => ("list", "GET", path.clone(), b"".as_slice(), None),
+                AccountIdOperation::Tag => (
+                    "tag",
+                    "POST",
+                    path.clone(),
+                    tag_body.as_slice(),
+                    Some("application/xml"),
+                ),
+                AccountIdOperation::Untag => (
+                    "untag",
+                    "DELETE",
+                    format!("{path}?tagKeys=account-id-probe"),
+                    b"".as_slice(),
+                    None,
+                ),
+            };
+            let mut headers = probe.headers.clone();
+            if let Some(content_type) = content_type {
+                headers.push(("content-type", content_type));
+            }
+
+            let sts_label = format!(
+                "routing-existing-account-id-sts-{operation_label}-{}",
+                probe.label
+            );
+            let sts_response = send_signed_request_for_service_with_credentials(
+                method,
+                &format!("{sts_endpoint}{request_path}"),
+                body,
+                headers.iter().copied(),
+                "sts",
+                credentials,
+            );
+            assert_sts_unknown_operation(&sts_label, &sts_response, false);
+            println!("{sts_label}: ok");
+
+            let s3_control_label = format!(
+                "routing-existing-account-id-s3-control-{operation_label}-{}",
+                probe.label
+            );
+            let s3_control_response = send_signed_request_for_service_with_credentials(
+                method,
+                &format!("{s3_control_endpoint}{request_path}"),
+                body,
+                headers.iter().copied(),
+                "s3",
+                credentials,
+            );
+            match operation {
+                AccountIdOperation::List => {
+                    assert_list_tags_for_resource_success(&s3_control_label, &s3_control_response)
+                }
+                AccountIdOperation::Tag | AccountIdOperation::Untag => {
+                    assert_s3_control_write_success(&s3_control_label, &s3_control_response);
+                }
+            }
+            println!("{s3_control_label}: ok");
+        }
+    }
 }
 
 fn main() {

@@ -1901,9 +1901,38 @@ are valid-signature probes. They pin routing and response shapes but do not yet
 order path parsing or percent validation against authentication; those
 collisions remain part of the signing-service/signature slice.
 
-The remaining account-ID variants, signing-service and bad-signature
-collisions, malformed operation bodies, and local Host/SNI trust-boundary cases
-remain required before the Phase 4 service refactor.
+The account-ID-header slice completed on 2026-07-15. It sends correct, missing,
+empty, wrong 12-digit, malformed short, malformed alphabetic,
+duplicate-identical, and duplicate-conflicting `x-amz-account-id` headers in
+both conflicting wire orders. The raw signer now canonicalizes repeated signed
+headers correctly:
+the signed-header name appears once and its values are comma-joined in wire
+order. The duplicate results are therefore valid-signature observations, not
+artifacts of the earlier test helper.
+
+The default read-only matrix uses a nonexistent bucket ARN. Every header form
+returns the same STS `404 <UnknownOperationException/>` and S3 Control `404
+NoSuchResource` shapes as the correct-header control. Because resource absence
+could mask later validation, the mutating fixture repeats every header form
+against its existing tagged bucket for all three initial typed operations:
+
+| Operation | `AwsRegionalSts` | `AwsRegionalS3Control` | Local `SharedRegional` selection |
+| --- | --- | --- | --- |
+| `GET` / `ListTagsForResource` | `404 <UnknownOperationException/>` | `200` exact tag-list success | S3 Control; ignore this header |
+| idempotent `POST` / `TagResource` of the existing tag | `404 <UnknownOperationException/>` | `204` with only the normal request-ID headers | S3 Control; ignore this header |
+| idempotent `DELETE` / `UntagResource` of an absent probe key | `404 <UnknownOperationException/>` | `204` with only the normal request-ID headers | S3 Control; ignore this header |
+
+The account-specific AWS S3 Control authority accepts every tested header form,
+including absence and conflicting duplicates. The initial shared listener must
+therefore not introduce a header validation error that these AWS operations do
+not have. Its configured `SharedRegional` endpoint kind and reserved path
+select S3 Control; authenticated identity and the resource determine account
+authority, while `x-amz-account-id` is ignored for these three operations. An
+arbitrary header value must never select another account or endpoint kind.
+
+The remaining signing-service and bad-signature collisions, malformed
+operation bodies, and local Host/SNI trust-boundary cases remain required
+before the Phase 4 service refactor.
 The narrow current local `TagResource`/`UntagResource` routes still inherit the
 ordinary S3 listener's transport and are therefore a documented temporary gap;
 the typed Phase 4 endpoint refactor must remove that gap rather than inventing
@@ -2191,8 +2220,8 @@ body may appear in traces.
    validation, authentication, and STS Query classification on both the AWS STS
    and S3 Control endpoint kinds? The routing-boundary matrix and explicit
    `SharedRegional` mapping above have pinned the root-Query,
-   versioned-path/form/query, bounded HTTP-method, and path/percent/ARN
-   near-miss rows. The remaining account-ID, signing/authentication, and body
+   versioned-path/form/query, bounded HTTP-method, path/percent/ARN near-miss,
+   and account-ID-header rows. The remaining signing/authentication and body
    rows must be completed, and the local authority/SNI matrix must enforce the
    endpoint-kind trust boundary, before the typed service refactor.
 

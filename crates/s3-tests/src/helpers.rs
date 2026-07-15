@@ -1249,6 +1249,25 @@ where
     )
 }
 
+fn canonicalize_request_headers(headers: &mut [(String, String)]) -> (String, String) {
+    headers.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut signed_header_names = Vec::new();
+    for (name, _) in headers.iter() {
+        if signed_header_names.last().copied() != Some(name.as_str()) {
+            signed_header_names.push(name.as_str());
+        }
+    }
+    let signed_headers = signed_header_names.join(";");
+    let header_refs = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let canonical_headers = auth::canonical::canonical_headers(&header_refs);
+
+    (signed_headers, canonical_headers)
+}
+
 #[derive(Clone, Copy)]
 struct PresignSettings<'a> {
     service: &'a str,
@@ -1301,17 +1320,7 @@ where
     for (name, value) in extra_headers {
         request_headers.push((name.as_ref().to_lowercase(), value.as_ref().to_string()));
     }
-    request_headers.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let signed_headers = request_headers
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(";");
-    let canonical_headers: String = request_headers
-        .iter()
-        .map(|(name, value)| format!("{name}:{value}\n"))
-        .collect();
+    let (signed_headers, canonical_headers) = canonicalize_request_headers(&mut request_headers);
     let credential = format!(
         "{}/{}/{}/{}/aws4_request",
         credentials.access_key, date_stamp, credentials.region, settings.service
@@ -1869,17 +1878,7 @@ where
     for (name, value) in extra_headers {
         request_headers.push((name.as_ref().to_lowercase(), value.as_ref().to_string()));
     }
-    request_headers.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let signed_headers = request_headers
-        .iter()
-        .map(|(name, _)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(";");
-    let canonical_headers: String = request_headers
-        .iter()
-        .map(|(name, value)| format!("{name}:{value}\n"))
-        .collect();
+    let (signed_headers, canonical_headers) = canonicalize_request_headers(&mut request_headers);
     let canonical_request =
         format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
@@ -2599,6 +2598,28 @@ pub fn is_sdk_stream_disconnect_or_status<E: std::fmt::Debug>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_signing_combines_duplicate_header_values_in_wire_order() {
+        let mut headers = vec![
+            ("x-two".to_string(), "last".to_string()),
+            ("x-one".to_string(), " first   value ".to_string()),
+            ("x-one".to_string(), "second".to_string()),
+        ];
+
+        let (signed_headers, canonical_headers) = canonicalize_request_headers(&mut headers);
+
+        assert_eq!(signed_headers, "x-one;x-two");
+        assert_eq!(canonical_headers, "x-one:first value,second\nx-two:last\n");
+        assert_eq!(
+            headers,
+            [
+                ("x-one".to_string(), " first   value ".to_string()),
+                ("x-one".to_string(), "second".to_string()),
+                ("x-two".to_string(), "last".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn copy_source_with_version_uses_strict_percent_encoding_for_version_id() {
