@@ -187,6 +187,7 @@ fn list_multipart_uploads_empty() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 1000,
@@ -238,6 +239,7 @@ fn list_multipart_uploads_returns_created() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 1000,
@@ -251,8 +253,13 @@ fn list_multipart_uploads_returns_created() {
     assert_eq!(result.uploads[1].key, "beta");
     assert_eq!(result.uploads[1].upload_id, r2.upload_id);
     assert!(!result.is_truncated);
-    assert_eq!(result.next_key_marker.as_deref(), Some("beta"));
-    assert_eq!(result.next_upload_id_marker, Some(r2.upload_id));
+    assert_eq!(
+        result.next_marker,
+        Some(ListMultipartUploadsNextMarker::Upload {
+            key: "beta".to_string(),
+            upload_id: r2.upload_id,
+        })
+    );
 }
 
 #[test]
@@ -311,6 +318,7 @@ fn list_multipart_uploads_reports_stored_owner_and_initiator() {
                 None,
             ),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 1000,
@@ -879,6 +887,7 @@ fn list_multipart_uploads_sorted_by_key_then_initiated() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 1000,
@@ -956,6 +965,7 @@ fn list_multipart_uploads_pagination() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 2,
@@ -965,31 +975,34 @@ fn list_multipart_uploads_pagination() {
     assert!(page1.is_truncated);
     assert_eq!(page1.uploads[0].key, "a");
     assert_eq!(page1.uploads[1].key, "b");
-    assert!(page1.next_key_marker.is_some());
-    assert!(page1.next_upload_id_marker.is_some());
+    let Some(ListMultipartUploadsNextMarker::Upload {
+        key: page1_key_marker,
+        upload_id: page1_upload_id_marker,
+    }) = page1.next_marker.as_ref()
+    else {
+        panic!("truncated upload page must end at an upload marker");
+    };
 
     // Page 2: use markers from page 1.
     let page2 = coord
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
-            key_marker: page1.next_key_marker.as_deref(),
-            upload_id_marker: page1
-                .next_upload_id_marker
-                .clone()
-                .map(UploadId::try_from)
-                .transpose()
-                .unwrap(),
+            delimiter: None,
+            key_marker: Some(page1_key_marker),
+            upload_id_marker: Some(page1_upload_id_marker.clone()),
             max_uploads: 2,
         })
         .unwrap();
     assert_eq!(page2.uploads.len(), 1);
     assert!(!page2.is_truncated);
     assert_eq!(page2.uploads[0].key, "c");
-    assert_eq!(page2.next_key_marker.as_deref(), Some("c"));
     assert_eq!(
-        page2.next_upload_id_marker,
-        Some(page2.uploads[0].upload_id.clone())
+        page2.next_marker,
+        Some(ListMultipartUploadsNextMarker::Upload {
+            key: "c".to_string(),
+            upload_id: page2.uploads[0].upload_id.clone(),
+        })
     );
 }
 
@@ -1064,6 +1077,7 @@ fn list_multipart_uploads_prefix_filter() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: Some("photos/"),
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 1000,
@@ -1101,6 +1115,7 @@ fn list_multipart_uploads_max_zero() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 0,
@@ -1119,6 +1134,7 @@ fn list_multipart_uploads_requires_bucket() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("no-such-bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 1000,
@@ -1143,6 +1159,7 @@ fn authorize_list_multipart_uploads_rejects_non_owner_requester() {
                 None,
             ),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 1000,
@@ -1190,6 +1207,7 @@ fn list_multipart_uploads_bucket_policy_allow_applies() {
                 None,
             ),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 1000,
@@ -1549,6 +1567,7 @@ fn list_multipart_uploads_same_key_pagination() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 2,
@@ -1560,24 +1579,34 @@ fn list_multipart_uploads_same_key_pagination() {
     assert_eq!(page1.uploads[1].key, "key");
     // Initiation time ordering.
     assert!(page1.uploads[0].initiated <= page1.uploads[1].initiated);
+    let Some(ListMultipartUploadsNextMarker::Upload {
+        key: page1_key_marker,
+        upload_id: page1_upload_id_marker,
+    }) = page1.next_marker.as_ref()
+    else {
+        panic!("truncated upload page must end at an upload marker");
+    };
 
     // Page 2: use markers from page 1 — should get remaining upload.
     let page2 = coord
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
-            key_marker: page1.next_key_marker.as_deref(),
-            upload_id_marker: page1.next_upload_id_marker.clone(),
+            delimiter: None,
+            key_marker: Some(page1_key_marker),
+            upload_id_marker: Some(page1_upload_id_marker.clone()),
             max_uploads: 2,
         })
         .unwrap();
     assert_eq!(page2.uploads.len(), 1);
     assert!(!page2.is_truncated);
     assert_eq!(page2.uploads[0].key, "key");
-    assert_eq!(page2.next_key_marker.as_deref(), Some("key"));
     assert_eq!(
-        page2.next_upload_id_marker,
-        Some(page2.uploads[0].upload_id.clone())
+        page2.next_marker,
+        Some(ListMultipartUploadsNextMarker::Upload {
+            key: "key".to_string(),
+            upload_id: page2.uploads[0].upload_id.clone(),
+        })
     );
 
     // All 3 upload IDs should be covered across both pages.
@@ -3066,6 +3095,7 @@ fn abort_multipart_upload_success() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 100,
@@ -3333,6 +3363,7 @@ fn list_requests_reject_oversized_user_supplied_keys() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
             prefix: Some(oversized.as_str()),
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 100,

@@ -2470,23 +2470,10 @@ impl S3Response {
     /// Build a response for `ListMultipartUploads` (200 OK, XML body).
     #[must_use]
     pub fn list_multipart_uploads(
-        bucket: &str,
-        prefix: Option<&str>,
-        key_marker: Option<&str>,
-        upload_id_marker: Option<&str>,
-        encoding_type: Option<&str>,
-        max_uploads: u32,
+        request: xml::RenderedListMultipartUploadsRequest<'_>,
         result: &xml::RenderedListMultipartUploadsResult,
     ) -> Self {
-        let body = xml::list_multipart_uploads_xml(
-            bucket,
-            prefix,
-            key_marker,
-            upload_id_marker,
-            encoding_type,
-            max_uploads,
-            result,
-        );
+        let body = xml::list_multipart_uploads_xml(request, result);
         Self::new(200).chunked_xml_body(body)
     }
 

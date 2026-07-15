@@ -90,8 +90,7 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
             request: ListMultipartUploadsReq {
                 bucket: req.bucket.clone(),
                 prefix: req.prefix.clone(),
-                key_marker: req.key_marker.clone(),
-                upload_id_marker: req.upload_id_marker.clone(),
+                page_start: req.page_start.clone(),
                 max_uploads: req.max_uploads,
             },
         };

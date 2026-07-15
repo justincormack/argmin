@@ -4012,9 +4012,18 @@ pub struct CreateMultipartUploadOutcome<T> {
 pub struct ListMultipartUploadsReq {
     pub bucket: BucketName,
     pub prefix: Option<ObjectKey>,
-    pub key_marker: Option<ObjectKey>,
-    pub upload_id_marker: Option<UploadId>,
+    pub page_start: Option<ListMultipartUploadsPageStart>,
     pub max_uploads: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListMultipartUploadsPageStart {
+    After {
+        key_marker: ObjectKey,
+        upload_id_marker: Option<UploadId>,
+    },
+    /// Internal inclusive page start used to jump over a common prefix.
+    At(ObjectKey),
 }
 
 /// Response from listing multipart uploads.
@@ -4028,6 +4037,15 @@ pub struct ListMultipartUploadsResp {
 #[derive(Debug, Clone)]
 pub struct ListedBucketMultipartUploads {
     pub uploads: Vec<MultipartUploadRecord>,
+    pub common_prefixes: Vec<ObjectKey>,
+    pub is_truncated: bool,
+    pub next_marker: Option<MultipartUploadListMarker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartUploadListMarker {
+    Upload { key: ObjectKey, upload_id: UploadId },
+    CommonPrefix(ObjectKey),
 }
 
 /// Request to list parts of a multipart upload.

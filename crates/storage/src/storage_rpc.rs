@@ -28,9 +28,9 @@ use crate::{
         CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
         EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepBuckets,
         LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
-        ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
-        ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsResp,
-        ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
+        ListMultipartUploadsPageStart, ListMultipartUploadsReq, ListMultipartUploadsResp,
+        ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp,
+        ListPartsResp, ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
         ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionFingerprint,
         MultipartCompletionPreflight, MultipartCompletionReplay, MultipartCompletionSnapshot,
         MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
@@ -324,7 +324,12 @@ const STORAGE_RPC_MAX_LIST_OBJECT_VERSIONS_REQUEST_PAYLOAD_LEN: usize =
         + 4;
 const STORAGE_RPC_MAX_LIST_MULTIPART_UPLOADS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
-        + 2 * (1 + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN)
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_OBJECT_KEY_LEN
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_OBJECT_KEY_LEN
         + 1
         + 4
         + UPLOAD_ID_LEN
@@ -7401,15 +7406,25 @@ pub(crate) fn encode_list_multipart_uploads_request(
         &mut out,
         request.request.prefix.as_ref().map(|key| key.as_str()),
     );
-    put_optional_string(
-        &mut out,
-        request.request.key_marker.as_ref().map(|key| key.as_str()),
-    );
-    match request.request.upload_id_marker.as_ref() {
+    match request.request.page_start.as_ref() {
         None => put_u8(&mut out, 0),
-        Some(upload_id) => {
+        Some(ListMultipartUploadsPageStart::After {
+            key_marker,
+            upload_id_marker,
+        }) => {
             put_u8(&mut out, 1);
-            put_string(&mut out, upload_id.as_str());
+            put_string(&mut out, key_marker.as_str());
+            match upload_id_marker {
+                None => put_u8(&mut out, 0),
+                Some(upload_id) => {
+                    put_u8(&mut out, 1);
+                    put_string(&mut out, upload_id.as_str());
+                }
+            }
+        }
+        Some(ListMultipartUploadsPageStart::At(key)) => {
+            put_u8(&mut out, 2);
+            put_string(&mut out, key.as_str());
         }
     }
     put_u32(&mut out, request.request.max_uploads);
@@ -7421,11 +7436,27 @@ pub(crate) fn decode_list_multipart_uploads_request(
 ) -> Result<StorageRpcListMultipartUploadsRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let route = decoder.read_bucket_pg_request()?;
+    let bucket = decoder.read_bucket_name()?;
+    let prefix = decoder.read_optional_object_key()?;
+    let page_start = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(ListMultipartUploadsPageStart::After {
+            key_marker: decoder.read_object_key()?,
+            upload_id_marker: decoder.read_optional_upload_id()?,
+        }),
+        2 => Some(ListMultipartUploadsPageStart::At(
+            decoder.read_object_key()?,
+        )),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid multipart upload list page-start tag",
+            ))
+        }
+    };
     let request = ListMultipartUploadsReq {
-        bucket: decoder.read_bucket_name()?,
-        prefix: decoder.read_optional_object_key()?,
-        key_marker: decoder.read_optional_object_key()?,
-        upload_id_marker: decoder.read_optional_upload_id()?,
+        bucket,
+        prefix,
+        page_start,
         max_uploads: decoder.read_u32()?,
     };
     decoder.finish()?;
@@ -19304,6 +19335,52 @@ mod tests {
     }
 
     #[test]
+    fn maximum_multipart_upload_list_request_fits_request_frame_cap() {
+        let request = StorageRpcListMultipartUploadsRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            request: ListMultipartUploadsReq {
+                bucket: BucketName::try_from("b".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap(),
+                prefix: Some(
+                    ObjectKey::try_from("p".repeat(STORAGE_RPC_MAX_OBJECT_KEY_LEN)).unwrap(),
+                ),
+                page_start: Some(ListMultipartUploadsPageStart::After {
+                    key_marker: ObjectKey::try_from("k".repeat(STORAGE_RPC_MAX_OBJECT_KEY_LEN))
+                        .unwrap(),
+                    upload_id_marker: Some(UploadId::try_from("u".repeat(UPLOAD_ID_LEN)).unwrap()),
+                }),
+                max_uploads: STORAGE_RPC_MAX_LIST_PAGE_ITEMS,
+            },
+        };
+        let payload = encode_list_multipart_uploads_request(&request).unwrap();
+        assert_eq!(
+            payload.len(),
+            STORAGE_RPC_MAX_LIST_MULTIPART_UPLOADS_REQUEST_PAYLOAD_LEN
+        );
+
+        let encoded = encode_storage_rpc_frame(
+            11,
+            StorageRpcMessageKind::ObjectMultipartUploadListPage,
+            &payload,
+        )
+        .unwrap();
+        let decoded = read_storage_rpc_request_frame_from(&mut Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded.payload, payload);
+        let decoded_request = decode_list_multipart_uploads_request(&decoded.payload).unwrap();
+        assert_eq!(decoded_request.request.bucket, request.request.bucket);
+        assert_eq!(decoded_request.request.prefix, request.request.prefix);
+        assert_eq!(
+            decoded_request.request.page_start,
+            request.request.page_start
+        );
+        assert_eq!(
+            decoded_request.request.max_uploads,
+            request.request.max_uploads
+        );
+    }
+
+    #[test]
     fn bucket_delete_coordination_max_record_requests_fit_kind_caps() {
         let bucket = BucketName::try_from("a".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap();
         let cluster_epoch = ClusterEpoch::INITIAL;
@@ -19708,8 +19785,10 @@ mod tests {
             request: ListMultipartUploadsReq {
                 bucket,
                 prefix: Some(prefix),
-                key_marker: Some(key_marker.clone()),
-                upload_id_marker: Some(upload_id.clone()),
+                page_start: Some(ListMultipartUploadsPageStart::After {
+                    key_marker: key_marker.clone(),
+                    upload_id_marker: Some(upload_id.clone()),
+                }),
                 max_uploads: 11,
             },
         };
@@ -19720,12 +19799,25 @@ mod tests {
         assert_eq!(decoded.pg_id, uploads.pg_id);
         assert_eq!(decoded.request.bucket, uploads.request.bucket);
         assert_eq!(decoded.request.prefix, uploads.request.prefix);
-        assert_eq!(decoded.request.key_marker, uploads.request.key_marker);
-        assert_eq!(
-            decoded.request.upload_id_marker,
-            uploads.request.upload_id_marker
-        );
+        assert_eq!(decoded.request.page_start, uploads.request.page_start);
         assert_eq!(decoded.request.max_uploads, uploads.request.max_uploads);
+
+        let at_uploads = StorageRpcListMultipartUploadsRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(3),
+            request: ListMultipartUploadsReq {
+                bucket: BucketName::try_from("bucket").unwrap(),
+                prefix: None,
+                page_start: Some(ListMultipartUploadsPageStart::At(
+                    ObjectKey::try_from("prefix/next").unwrap(),
+                )),
+                max_uploads: 11,
+            },
+        };
+        let bytes = encode_list_multipart_uploads_request(&at_uploads).unwrap();
+        let decoded = decode_list_multipart_uploads_request(&bytes).unwrap();
+        assert_eq!(decoded.request.page_start, at_uploads.request.page_start);
 
         let response = StorageRpcListMultipartUploadsResponse {
             response: ListMultipartUploadsResp {

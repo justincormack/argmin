@@ -4346,6 +4346,7 @@ fn list_multipart_uploads_paginates_global_order_when_smallest_keys_are_on_last_
             .list_multipart_uploads(&ListMultipartUploadsRequest {
                 bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
                 prefix: None,
+                delimiter: None,
                 key_marker: key_marker.as_deref(),
                 upload_id_marker: upload_id_marker.clone(),
                 max_uploads: 2,
@@ -4359,10 +4360,12 @@ fn list_multipart_uploads_paginates_global_order_when_smallest_keys_are_on_last_
         if !page.is_truncated {
             break;
         }
-        key_marker = page.next_key_marker;
-        upload_id_marker = page.next_upload_id_marker;
-        assert!(key_marker.is_some());
-        assert!(upload_id_marker.is_some());
+        let Some(ListMultipartUploadsNextMarker::Upload { key, upload_id }) = page.next_marker
+        else {
+            panic!("truncated upload page must end at an upload marker");
+        };
+        key_marker = Some(key);
+        upload_id_marker = Some(upload_id);
         assert!(actual.len() <= expected.len());
     }
 
@@ -9411,6 +9414,7 @@ fn list_multipart_uploads_with_sparse_pg_topology() {
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 1000,

@@ -1135,6 +1135,7 @@ impl SameKeyUploadHarness {
                     None,
                 ),
                 prefix: None,
+                delimiter: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: u32::MAX,
@@ -1744,6 +1745,7 @@ fn assert_multipart_head_tail_trace_matches_model(
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: BucketRequest::new(trusted_bucket_name(TRACE_BUCKET), test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: u32::MAX,
@@ -2219,6 +2221,7 @@ fn completing_newer_same_key_upload_overwrites_older_visible_payload_and_clears_
         .list_multipart_uploads(&ListMultipartUploadsRequest {
             bucket: BucketRequest::new(trusted_bucket_name(TRACE_BUCKET), test_requester(), None),
             prefix: None,
+            delimiter: None,
             key_marker: None,
             upload_id_marker: None,
             max_uploads: u32::MAX,

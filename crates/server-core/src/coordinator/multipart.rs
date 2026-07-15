@@ -49,7 +49,8 @@ use super::request_types::{
 };
 use super::response_types::{
     BeginStreamPartResult, CompleteMultipartUploadResult, CreateMultipartUploadResult,
-    ListMultipartUploadsResult, ListPartsResult, MultipartUploadEntry, PartEntry, UploadPartResult,
+    ListMultipartUploadsNextMarker, ListMultipartUploadsResult, ListPartsResult,
+    MultipartUploadEntry, PartEntry, UploadPartResult,
 };
 use super::{
     compute_checksum, optional_list_object_key, Coordinator, MAX_MULTIPART_PARTS, MIN_PART_SIZE,
@@ -1103,6 +1104,7 @@ impl Coordinator {
             req.max_uploads
         );
         let prefix = req.prefix;
+        let delimiter = req.delimiter;
         let key_marker = req.key_marker;
         let upload_id_marker = req.upload_id_marker.as_ref();
         let max_uploads = req.max_uploads;
@@ -1112,44 +1114,39 @@ impl Coordinator {
         if max_uploads == 0 {
             return Ok(ListMultipartUploadsResult {
                 uploads: Vec::new(),
+                common_prefixes: Vec::new(),
                 is_truncated: false,
-                next_key_marker: None,
-                next_upload_id_marker: None,
+                next_marker: None,
             });
         }
 
-        let storage::ListedBucketMultipartUploads {
-            uploads: mut all_uploads,
-        } = self
+        let listed = self
             .storage_node()
             .list_multipart_uploads_for_bucket(
                 &bucket,
                 optional_list_object_key(prefix)?.as_ref(),
+                delimiter,
                 optional_list_object_key(key_marker)?.as_ref(),
                 upload_id_marker,
                 max_uploads,
             )
             .map_err(Self::map_object_pg_action_error)?;
 
-        all_uploads.sort_by(|a, b| {
-            a.key
-                .cmp(&b.key)
-                .then(a.initiated_at.cmp(&b.initiated_at))
-                .then(a.upload_id.cmp(&b.upload_id))
-        });
+        let next_marker = match listed.next_marker {
+            Some(storage::MultipartUploadListMarker::Upload { key, upload_id }) => {
+                Some(ListMultipartUploadsNextMarker::Upload {
+                    key: key.to_string(),
+                    upload_id,
+                })
+            }
+            Some(storage::MultipartUploadListMarker::CommonPrefix(_)) => {
+                Some(ListMultipartUploadsNextMarker::CommonPrefix)
+            }
+            None => None,
+        };
 
-        let max = max_uploads as usize;
-        let is_truncated = all_uploads.len() > max;
-        all_uploads.truncate(max);
-
-        // AWS reports both next markers for the final returned upload on every
-        // nonempty page, independently of IsTruncated.
-        let (next_key_marker, next_upload_id_marker) =
-            all_uploads.last().map_or((None, None), |upload| {
-                (Some(upload.key.to_string()), Some(upload.upload_id.clone()))
-            });
-
-        let uploads = all_uploads
+        let uploads = listed
+            .uploads
             .into_iter()
             .map(|u| MultipartUploadEntry {
                 key: u.key.to_string(),
@@ -1161,12 +1158,17 @@ impl Coordinator {
                 checksum_type: u.checksum.map(MultipartChecksumConfig::checksum_type),
             })
             .collect();
+        let common_prefixes = listed
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| prefix.to_string())
+            .collect();
 
         Ok(ListMultipartUploadsResult {
             uploads,
-            is_truncated,
-            next_key_marker,
-            next_upload_id_marker,
+            common_prefixes,
+            is_truncated: listed.is_truncated,
+            next_marker,
         })
     }
 

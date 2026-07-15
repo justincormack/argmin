@@ -187,12 +187,13 @@ fn parse_u32_or_default<S: AsRef<str>>(
 }
 
 fn parse_optional_upload_id_marker(raw: Option<&str>) -> Result<Option<UploadId>, ServerError> {
-    raw.map(|value| {
-        UploadId::try_from(value).map_err(|_| ServerError::InvalidArgument {
-            reason: "Invalid uploadId marker".to_string(),
+    raw.filter(|value| !value.is_empty())
+        .map(|value| {
+            UploadId::try_from(value).map_err(|_| ServerError::InvalidArgument {
+                reason: "Invalid uploadId marker".to_string(),
+            })
         })
-    })
-    .transpose()
+        .transpose()
 }
 
 fn canned_acl_and_header_grants_conflict() -> ServerError {
@@ -1299,6 +1300,15 @@ impl HttpFrontend {
         &self,
         result: crate::coordinator::ListMultipartUploadsResult,
     ) -> xml::RenderedListMultipartUploadsResult {
+        let (next_key_marker, next_upload_id_marker) = match result.next_marker {
+            Some(crate::coordinator::ListMultipartUploadsNextMarker::Upload { key, upload_id }) => {
+                (Some(key), Some(upload_id.to_string()))
+            }
+            Some(crate::coordinator::ListMultipartUploadsNextMarker::CommonPrefix) => {
+                (Some(String::new()), Some(String::new()))
+            }
+            None => (None, None),
+        };
         let uploads = result
             .uploads
             .into_iter()
@@ -1327,11 +1337,10 @@ impl HttpFrontend {
             .collect();
         xml::RenderedListMultipartUploadsResult {
             uploads,
+            common_prefixes: result.common_prefixes,
             is_truncated: result.is_truncated,
-            next_key_marker: result.next_key_marker,
-            next_upload_id_marker: result
-                .next_upload_id_marker
-                .map(|upload_id| upload_id.to_string()),
+            next_key_marker,
+            next_upload_id_marker,
         }
     }
 
@@ -3100,6 +3109,7 @@ impl HttpFrontend {
             }
             S3Operation::ListMultipartUploads { bucket } => {
                 let prefix = req.query_param_lossy("prefix");
+                let delimiter = req.query_param_lossy("delimiter");
                 let key_marker = req.query_param_lossy("key-marker");
                 let upload_id_marker = req.query_param_lossy("upload-id-marker");
                 let parsed_upload_id_marker =
@@ -3114,6 +3124,7 @@ impl HttpFrontend {
                     &crate::coordinator::ListMultipartUploadsRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         prefix: prefix.as_deref(),
+                        delimiter: delimiter.as_deref(),
                         key_marker: key_marker.as_deref(),
                         upload_id_marker: parsed_upload_id_marker,
                         max_uploads,
@@ -3121,12 +3132,15 @@ impl HttpFrontend {
                 )?;
                 let rendered = self.render_multipart_uploads(result);
                 Ok(S3Response::list_multipart_uploads(
-                    bucket.as_str(),
-                    prefix.as_deref(),
-                    key_marker.as_deref(),
-                    upload_id_marker.as_deref(),
-                    encoding_type.as_deref(),
-                    max_uploads,
+                    xml::RenderedListMultipartUploadsRequest {
+                        bucket: bucket.as_str(),
+                        prefix: prefix.as_deref(),
+                        delimiter: delimiter.as_deref(),
+                        key_marker: key_marker.as_deref(),
+                        upload_id_marker: upload_id_marker.as_deref(),
+                        encoding_type: encoding_type.as_deref(),
+                        max_uploads,
+                    },
                     &rendered,
                 ))
             }

@@ -163,13 +163,127 @@ fn object_and_multipart_listing_select_global_first_page_at_production_cap_volum
     );
 
     let listed_uploads = cluster
-        .list_multipart_uploads_for_bucket(&bucket, None, None, None, MAX_KEYS)
-        .unwrap()
+        .list_multipart_uploads_for_bucket(&bucket, None, None, None, None, MAX_KEYS)
+        .unwrap();
+    assert!(listed_uploads.is_truncated);
+    let expected_last_upload = &expected_smallest_pg_uploads[MAX_KEYS as usize - 1];
+    assert_eq!(
+        listed_uploads.next_marker,
+        Some(crate::MultipartUploadListMarker::Upload {
+            key: expected_last_upload.0.clone(),
+            upload_id: expected_last_upload.1.clone(),
+        })
+    );
+    let listed_uploads = listed_uploads
         .uploads
         .into_iter()
         .map(|upload| (upload.key, upload.upload_id))
         .collect::<Vec<_>>();
-    assert_eq!(listed_uploads, expected_smallest_pg_uploads);
+    assert_eq!(
+        listed_uploads,
+        expected_smallest_pg_uploads[..MAX_KEYS as usize]
+    );
+}
+
+#[test]
+fn multipart_upload_delimiter_pagination_merges_common_prefix_across_pgs() {
+    let tmp = test_util::tempdir();
+    let node_id = NodeId::new(0);
+    let map =
+        LocalClusterMap::open(tmp.path(), &[node_id], &[0, 1, 2], EcShape { k: 1, m: 0 }).unwrap();
+    let bucket = crate::BucketName::try_from("multipart-delimiter-bucket".to_string()).unwrap();
+    let node = map.node(node_id).unwrap().storage_node();
+    let topology = node.pg_topology();
+    let first_key = key_for_object_pg(topology, &bucket, 0, "a-root-");
+    let first_upload_id = upload_id_from_label("delimiterfirst");
+    let prefix_key_one = key_for_object_pg(topology, &bucket, 1, "dir/one-");
+    let prefix_key_two = key_for_object_pg(topology, &bucket, 2, "dir/two-");
+    let last_key = key_for_object_pg(topology, &bucket, 0, "z-root-");
+    let last_upload_id = upload_id_from_label("delimiterlast");
+
+    node.get_pg(0)
+        .unwrap()
+        .test_insert_listing_multipart_uploads(
+            &bucket,
+            &[
+                (first_key.clone(), first_upload_id.clone()),
+                (last_key.clone(), last_upload_id.clone()),
+            ],
+        )
+        .unwrap();
+    node.get_pg(1)
+        .unwrap()
+        .test_insert_listing_multipart_uploads(
+            &bucket,
+            &[(prefix_key_one, upload_id_from_label("delimiterprefixone"))],
+        )
+        .unwrap();
+    node.get_pg(2)
+        .unwrap()
+        .test_insert_listing_multipart_uploads(
+            &bucket,
+            &[(prefix_key_two, upload_id_from_label("delimiterprefixtwo"))],
+        )
+        .unwrap();
+
+    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let first = cluster
+        .list_multipart_uploads_for_bucket(&bucket, None, Some("/"), None, None, 1)
+        .unwrap();
+    assert_eq!(first.uploads.len(), 1);
+    assert_eq!(first.uploads[0].key, first_key);
+    assert!(first.common_prefixes.is_empty());
+    assert!(first.is_truncated);
+    assert_eq!(
+        first.next_marker,
+        Some(crate::MultipartUploadListMarker::Upload {
+            key: first_key.clone(),
+            upload_id: first_upload_id.clone(),
+        })
+    );
+
+    let second = cluster
+        .list_multipart_uploads_for_bucket(
+            &bucket,
+            None,
+            Some("/"),
+            Some(&first_key),
+            Some(&first_upload_id),
+            1,
+        )
+        .unwrap();
+    assert!(second.uploads.is_empty());
+    assert_eq!(
+        second
+            .common_prefixes
+            .iter()
+            .map(crate::ObjectKey::as_str)
+            .collect::<Vec<_>>(),
+        ["dir/"]
+    );
+    assert!(second.is_truncated);
+    let common_prefix = second.common_prefixes[0].clone();
+    assert_eq!(
+        second.next_marker,
+        Some(crate::MultipartUploadListMarker::CommonPrefix(
+            common_prefix.clone()
+        ))
+    );
+
+    let third = cluster
+        .list_multipart_uploads_for_bucket(&bucket, None, Some("/"), Some(&common_prefix), None, 1)
+        .unwrap();
+    assert_eq!(third.uploads.len(), 1);
+    assert_eq!(third.uploads[0].key, last_key);
+    assert!(third.common_prefixes.is_empty());
+    assert!(!third.is_truncated);
+    assert_eq!(
+        third.next_marker,
+        Some(crate::MultipartUploadListMarker::Upload {
+            key: last_key,
+            upload_id: last_upload_id,
+        })
+    );
 }
 
 #[test]
@@ -223,7 +337,7 @@ fn composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering() {
     ));
 
     let err = cluster
-        .list_multipart_uploads_for_bucket(&bucket, None, None, None, 100)
+        .list_multipart_uploads_for_bucket(&bucket, None, None, None, None, 100)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -273,7 +387,7 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
 
     let multipart_hook = install_expiry_hook();
     let multipart_error = cluster
-        .list_multipart_uploads_for_bucket(&bucket, None, None, None, 100)
+        .list_multipart_uploads_for_bucket(&bucket, None, None, None, None, 100)
         .unwrap_err();
     assert!(matches!(
         multipart_error,

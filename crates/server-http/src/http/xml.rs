@@ -1159,9 +1159,21 @@ pub struct RenderedMultipartUploadEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedListMultipartUploadsResult {
     pub uploads: Vec<RenderedMultipartUploadEntry>,
+    pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_key_marker: Option<String>,
     pub next_upload_id_marker: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RenderedListMultipartUploadsRequest<'a> {
+    pub bucket: &'a str,
+    pub prefix: Option<&'a str>,
+    pub delimiter: Option<&'a str>,
+    pub key_marker: Option<&'a str>,
+    pub upload_id_marker: Option<&'a str>,
+    pub encoding_type: Option<&'a str>,
+    pub max_uploads: u32,
 }
 
 fn append_canonical_owner_xml(xml: &mut String, element: &str, owner: &RenderedCanonicalUser) {
@@ -4879,14 +4891,18 @@ pub fn complete_multipart_upload_xml(
 #[must_use]
 #[allow(clippy::format_push_string)]
 pub fn list_multipart_uploads_xml(
-    bucket: &str,
-    prefix: Option<&str>,
-    key_marker: Option<&str>,
-    upload_id_marker: Option<&str>,
-    encoding_type: Option<&str>,
-    max_uploads: u32,
+    request: RenderedListMultipartUploadsRequest<'_>,
     result: &RenderedListMultipartUploadsResult,
 ) -> String {
+    let RenderedListMultipartUploadsRequest {
+        bucket,
+        prefix,
+        delimiter,
+        key_marker,
+        upload_id_marker,
+        encoding_type,
+        max_uploads,
+    } = request;
     let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -4897,6 +4913,14 @@ pub fn list_multipart_uploads_xml(
         xml.push_str("<Prefix>");
         xml.push_str(&xml_escape_list_value(&encode_value(p, encoding_type)));
         xml.push_str("</Prefix>");
+    }
+    if let Some(delimiter) = delimiter {
+        xml.push_str("<Delimiter>");
+        xml.push_str(&xml_escape_list_value(&encode_value(
+            delimiter,
+            encoding_type,
+        )));
+        xml.push_str("</Delimiter>");
     }
     xml.push_str("<KeyMarker>");
     if let Some(km) = key_marker {
@@ -4961,6 +4985,11 @@ pub fn list_multipart_uploads_xml(
             ));
         }
         xml.push_str("</Upload>");
+    }
+    for prefix in &result.common_prefixes {
+        xml.push_str("<CommonPrefixes><Prefix>");
+        xml.push_str(&xml_escape_list_value(&encode_value(prefix, encoding_type)));
+        xml.push_str("</Prefix></CommonPrefixes>");
     }
     xml.push_str("</ListMultipartUploadsResult>");
     xml
@@ -7682,15 +7711,28 @@ mod tests {
 
     // ── ListMultipartUploads XML tests ───────────────────────────────
 
+    fn list_multipart_uploads_request(bucket: &str) -> RenderedListMultipartUploadsRequest<'_> {
+        RenderedListMultipartUploadsRequest {
+            bucket,
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            upload_id_marker: None,
+            encoding_type: None,
+            max_uploads: 1000,
+        }
+    }
+
     #[test]
     fn list_multipart_uploads_xml_empty() {
         let result = RenderedListMultipartUploadsResult {
             uploads: vec![],
+            common_prefixes: vec![],
             is_truncated: false,
             next_key_marker: None,
             next_upload_id_marker: None,
         };
-        let xml = list_multipart_uploads_xml("mybucket", None, None, None, None, 1000, &result);
+        let xml = list_multipart_uploads_xml(list_multipart_uploads_request("mybucket"), &result);
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
         assert!(!xml.contains("<Prefix"));
         assert!(xml.contains("<KeyMarker></KeyMarker>"));
@@ -7737,12 +7779,18 @@ mod tests {
                     checksum_type: Some(checksum::ChecksumType::Composite),
                 },
             ],
+            common_prefixes: vec![],
             is_truncated: false,
             next_key_marker: None,
             next_upload_id_marker: None,
         };
-        let xml =
-            list_multipart_uploads_xml("mybucket", Some("file"), None, None, None, 1000, &result);
+        let xml = list_multipart_uploads_xml(
+            RenderedListMultipartUploadsRequest {
+                prefix: Some("file"),
+                ..list_multipart_uploads_request("mybucket")
+            },
+            &result,
+        );
         assert!(xml.contains("<Prefix>file</Prefix>"));
         assert!(xml.contains("<Key>file1.txt</Key>"));
         assert!(xml.contains("<UploadId>id1</UploadId>"));
@@ -7776,17 +7824,18 @@ mod tests {
                 checksum_algorithm: None,
                 checksum_type: None,
             }],
+            common_prefixes: vec![],
             is_truncated: true,
             next_key_marker: Some("key1".to_string()),
             next_upload_id_marker: Some("uid1".to_string()),
         };
         let xml = list_multipart_uploads_xml(
-            "mybucket",
-            None,
-            Some("marker"),
-            Some("uid-marker"),
-            None,
-            1,
+            RenderedListMultipartUploadsRequest {
+                key_marker: Some("marker"),
+                upload_id_marker: Some("uid-marker"),
+                max_uploads: 1,
+                ..list_multipart_uploads_request("mybucket")
+            },
             &result,
         );
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
@@ -7815,11 +7864,12 @@ mod tests {
                 checksum_algorithm: None,
                 checksum_type: None,
             }],
+            common_prefixes: vec![],
             is_truncated: false,
             next_key_marker: None,
             next_upload_id_marker: None,
         };
-        let xml = list_multipart_uploads_xml("mybucket", None, None, None, None, 1000, &result);
+        let xml = list_multipart_uploads_xml(list_multipart_uploads_request("mybucket"), &result);
         assert!(xml.contains("<Key>key&amp;&lt;&gt;</Key>"));
         assert!(xml.contains("<UploadId>id&quot;'</UploadId>"));
         assert!(xml.contains("<Owner><ID>"));
@@ -7844,17 +7894,20 @@ mod tests {
                 checksum_algorithm: None,
                 checksum_type: None,
             }],
+            common_prefixes: vec![],
             is_truncated: true,
             next_key_marker: Some("next <>&\"+".to_string()),
             next_upload_id_marker: Some("upload/id+marker".to_string()),
         };
         let xml = list_multipart_uploads_xml(
-            "mybucket",
-            Some("prefix <>&\"+"),
-            Some("marker <>&\"+"),
-            Some("upload/id+marker"),
-            Some("url"),
-            1,
+            RenderedListMultipartUploadsRequest {
+                prefix: Some("prefix <>&\"+"),
+                key_marker: Some("marker <>&\"+"),
+                upload_id_marker: Some("upload/id+marker"),
+                encoding_type: Some("url"),
+                max_uploads: 1,
+                ..list_multipart_uploads_request("mybucket")
+            },
             &result,
         );
         assert!(xml.contains("<EncodingType>url</EncodingType>"));
@@ -7864,6 +7917,30 @@ mod tests {
         assert!(xml.contains("<Key>key+%3C%3E%26%22%2B</Key>"));
         assert!(xml.contains("<UploadIdMarker>upload/id+marker</UploadIdMarker>"));
         assert!(xml.contains("<NextUploadIdMarker>upload/id+marker</NextUploadIdMarker>"));
+    }
+
+    #[test]
+    fn list_multipart_uploads_xml_renders_encoded_common_prefix_and_empty_markers() {
+        let result = RenderedListMultipartUploadsResult {
+            uploads: vec![],
+            common_prefixes: vec!["dir name/".to_string()],
+            is_truncated: true,
+            next_key_marker: Some(String::new()),
+            next_upload_id_marker: Some(String::new()),
+        };
+        let xml = list_multipart_uploads_xml(
+            RenderedListMultipartUploadsRequest {
+                delimiter: Some("/"),
+                encoding_type: Some("url"),
+                max_uploads: 1,
+                ..list_multipart_uploads_request("mybucket")
+            },
+            &result,
+        );
+        assert!(xml.contains("<Delimiter>/</Delimiter>"));
+        assert!(xml.contains("<CommonPrefixes><Prefix>dir+name/</Prefix></CommonPrefixes>"));
+        assert!(xml.contains("<NextKeyMarker></NextKeyMarker>"));
+        assert!(xml.contains("<NextUploadIdMarker></NextUploadIdMarker>"));
     }
 
     fn test_owner_identity(principal: &str) -> crate::coordinator::OwnerIdentity {

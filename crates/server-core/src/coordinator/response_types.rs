@@ -484,7 +484,13 @@ pub struct MultipartUploadEntry {
 #[derive(Debug)]
 pub struct ListMultipartUploadsResult {
     pub uploads: Vec<MultipartUploadEntry>,
+    pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
-    pub next_key_marker: Option<String>,
-    pub next_upload_id_marker: Option<UploadId>,
+    pub next_marker: Option<ListMultipartUploadsNextMarker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListMultipartUploadsNextMarker {
+    Upload { key: String, upload_id: UploadId },
+    CommonPrefix,
 }

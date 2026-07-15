@@ -749,6 +749,7 @@ pub struct ListPartsRequest<'a> {
 pub struct ListMultipartUploadsRequest<'a> {
     pub bucket: BucketRequest<'a>,
     pub prefix: Option<&'a str>,
+    pub delimiter: Option<&'a str>,
     pub key_marker: Option<&'a str>,
     pub upload_id_marker: Option<UploadId>,
     pub max_uploads: u32,

@@ -3876,6 +3876,147 @@ fn test_list_multipart_uploads_same_key_ordering_markers_and_terminal_states() {
 }
 
 #[test]
+fn test_list_multipart_uploads_delimiter_pagination() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let mut created = Vec::new();
+        for key in ["a-root", "dir/one", "dir/two", "z-root"] {
+            let upload = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .send_retrying_operation_aborted("S3 operation during multipart test")
+                .await
+                .unwrap();
+            created.push((key, upload.upload_id().unwrap().to_string()));
+        }
+
+        let first = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .delimiter("/")
+            .max_uploads(1)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(first.delimiter(), Some("/"));
+        assert_eq!(first.uploads().len(), 1);
+        assert_eq!(first.uploads()[0].key(), Some("a-root"));
+        assert!(first.common_prefixes().is_empty());
+        assert_eq!(first.is_truncated(), Some(true));
+        assert_eq!(first.next_key_marker(), Some("a-root"));
+        assert_eq!(first.next_upload_id_marker(), Some(created[0].1.as_str()));
+
+        let second = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .delimiter("/")
+            .key_marker(first.next_key_marker().unwrap())
+            .upload_id_marker(first.next_upload_id_marker().unwrap())
+            .max_uploads(1)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert!(second.uploads().is_empty());
+        assert_eq!(second.common_prefixes().len(), 1);
+        assert_eq!(second.common_prefixes()[0].prefix(), Some("dir/"));
+        assert_eq!(second.is_truncated(), Some(true));
+        assert_eq!(second.next_key_marker(), Some(""));
+        assert_eq!(second.next_upload_id_marker(), Some(""));
+
+        let returned_markers = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .delimiter("/")
+            .key_marker(second.next_key_marker().unwrap())
+            .upload_id_marker(second.next_upload_id_marker().unwrap())
+            .max_uploads(1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(returned_markers.key_marker(), Some(""));
+        assert_eq!(returned_markers.upload_id_marker(), Some(""));
+        assert_eq!(returned_markers.uploads().len(), 1);
+        assert_eq!(returned_markers.uploads()[0].key(), Some("a-root"));
+        assert!(returned_markers.common_prefixes().is_empty());
+        assert_eq!(returned_markers.is_truncated(), Some(true));
+        assert_eq!(returned_markers.next_key_marker(), Some("a-root"));
+        assert_eq!(
+            returned_markers.next_upload_id_marker(),
+            Some(created[0].1.as_str())
+        );
+
+        let third = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .delimiter("/")
+            .key_marker(second.common_prefixes()[0].prefix().unwrap())
+            .max_uploads(1)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(third.uploads().len(), 1);
+        assert_eq!(third.uploads()[0].key(), Some("z-root"));
+        assert!(third.common_prefixes().is_empty());
+        assert_eq!(third.is_truncated(), Some(false));
+        assert_eq!(third.next_key_marker(), Some("z-root"));
+        assert_eq!(third.next_upload_id_marker(), Some(created[3].1.as_str()));
+
+        let full = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .delimiter("/")
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(
+            full.uploads()
+                .iter()
+                .map(|upload| upload.key().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-root", "z-root"]
+        );
+        assert_eq!(full.common_prefixes().len(), 1);
+        assert_eq!(full.common_prefixes()[0].prefix(), Some("dir/"));
+        assert_eq!(full.is_truncated(), Some(false));
+        assert_eq!(full.next_key_marker(), Some("z-root"));
+        assert_eq!(full.next_upload_id_marker(), Some(created[3].1.as_str()));
+
+        let common_prefix_only = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .prefix("d")
+            .delimiter("/")
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert!(common_prefix_only.uploads().is_empty());
+        assert_eq!(common_prefix_only.common_prefixes().len(), 1);
+        assert_eq!(
+            common_prefix_only.common_prefixes()[0].prefix(),
+            Some("dir/")
+        );
+        assert_eq!(common_prefix_only.is_truncated(), Some(false));
+        assert_eq!(common_prefix_only.next_key_marker(), Some(""));
+        assert_eq!(common_prefix_only.next_upload_id_marker(), Some(""));
+
+        for (key, upload_id) in created {
+            client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send_retrying_operation_aborted("S3 operation during multipart test")
+                .await
+                .unwrap();
+        }
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_list_multipart_uploads_max_uploads_above_aws_limit_is_clamped() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;

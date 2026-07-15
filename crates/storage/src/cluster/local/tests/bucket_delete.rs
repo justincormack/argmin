@@ -2209,7 +2209,7 @@ fn composite_multipart_and_lifecycle_scans_fan_out_to_routed_pg_primaries() {
     );
 
     let mut listed_uploads = cluster
-        .list_multipart_uploads_for_bucket(&upload_bucket, None, None, None, 100)
+        .list_multipart_uploads_for_bucket(&upload_bucket, None, None, None, None, 100)
         .unwrap()
         .uploads;
     listed_uploads.sort_by(|left, right| left.key.cmp(&right.key));

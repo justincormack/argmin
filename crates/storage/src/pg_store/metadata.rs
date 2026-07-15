@@ -9552,8 +9552,16 @@ impl PgMetadataStore for PgStore {
             }
         }
 
-        if let Some(ref key_marker) = req.key_marker {
-            if let Some(uid_marker) = req.upload_id_marker.as_ref().map(UploadId::as_str) {
+        if let Some(ListMultipartUploadsPageStart::At(start_at)) = req.page_start.as_ref() {
+            where_clauses.push(format!("key >= ?{param_idx}"));
+            params_vec.push(Box::new(start_at.clone()));
+            param_idx += 1;
+        } else if let Some(ListMultipartUploadsPageStart::After {
+            key_marker,
+            upload_id_marker,
+        }) = req.page_start.as_ref()
+        {
+            if let Some(uid_marker) = upload_id_marker.as_ref().map(UploadId::as_str) {
                 // Resume after (key_marker, initiated_at of marker, uid_marker).
                 // Use a subquery to resolve the marker's initiated_at so the
                 // cursor is consistent with the (key, initiated_at, upload_id)

@@ -297,8 +297,7 @@ impl SharedStorageNode {
             let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
                 bucket: bucket.clone(),
                 prefix: None,
-                key_marker: None,
-                upload_id_marker: None,
+                page_start: None,
                 max_uploads: 1,
             })?;
             if !uploads.uploads.is_empty() {

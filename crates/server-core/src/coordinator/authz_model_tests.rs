@@ -9465,6 +9465,7 @@ mod phase9_harness {
                 .authorize_list_multipart_uploads(&ListMultipartUploadsRequest {
                     bucket: bucket_request,
                     prefix: None,
+                    delimiter: None,
                     key_marker: None,
                     upload_id_marker: None,
                     max_uploads: 1000,

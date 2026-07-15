@@ -86,8 +86,7 @@ fn unix_multipart_upload_list_response_requires_final_upload_marker_identity() {
     let req = ListMultipartUploadsReq {
         bucket,
         prefix: None,
-        key_marker: None,
-        upload_id_marker: None,
+        page_start: None,
         max_uploads: 1,
     };
     let mut response = ListMultipartUploadsResp {

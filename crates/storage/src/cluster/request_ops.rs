@@ -909,6 +909,19 @@ struct VersionCursor {
     next_page_start: Option<ListVersionsPageStart>,
 }
 
+struct MultipartUploadCursor {
+    pg_id: u32,
+    uploads: Vec<MultipartUploadRecord>,
+    next_index: usize,
+    next_page_start: Option<ListMultipartUploadsPageStart>,
+}
+
+impl MultipartUploadCursor {
+    fn current(&self) -> Option<&MultipartUploadRecord> {
+        self.uploads.get(self.next_index)
+    }
+}
+
 struct BoundedSmallestRecords<K, V> {
     capacity: usize,
     records: BTreeMap<K, V>,
@@ -6376,8 +6389,7 @@ impl super::StorageCluster {
                         &ListMultipartUploadsReq {
                             bucket: bucket.clone(),
                             prefix: None,
-                            key_marker: None,
-                            upload_id_marker: None,
+                            page_start: None,
                             max_uploads: 1,
                         },
                     )
@@ -7338,8 +7350,12 @@ impl super::StorageCluster {
                     &ListMultipartUploadsReq {
                         bucket: bucket.clone(),
                         prefix: None,
-                        key_marker: key_marker.clone(),
-                        upload_id_marker: upload_id_marker.clone(),
+                        page_start: key_marker.clone().map(|key_marker| {
+                            ListMultipartUploadsPageStart::After {
+                                key_marker,
+                                upload_id_marker: upload_id_marker.clone(),
+                            }
+                        }),
                         max_uploads: INTERNAL_LIST_PAGE_SIZE,
                     },
                 )?;
@@ -12281,35 +12297,250 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         prefix: Option<&ObjectKey>,
+        delimiter: Option<&str>,
         key_marker: Option<&ObjectKey>,
         upload_id_marker: Option<&UploadId>,
         max_uploads: u32,
     ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
-        let mut smallest = BoundedSmallestRecords::new((max_uploads as usize).saturating_add(1));
-        for pg_id in self.metadata_pg_ids() {
+        if max_uploads == 0 {
+            return Ok(ListedBucketMultipartUploads {
+                uploads: Vec::new(),
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_marker: None,
+            });
+        }
+
+        let fetch_limit = max_uploads.saturating_add(1);
+        let prefix = prefix.cloned();
+        let key_marker = key_marker.cloned();
+        let upload_id_marker = upload_id_marker.cloned();
+        let delimiter = delimiter.filter(|delimiter| !delimiter.is_empty());
+
+        if delimiter.is_none() {
+            let max = max_uploads as usize;
+            let mut smallest = BoundedSmallestRecords::new(max.saturating_add(1));
+            for pg_id in self.metadata_pg_ids() {
+                let resp = self.list_multipart_uploads_page(
+                    pg_id,
+                    &ListMultipartUploadsReq {
+                        bucket: bucket.clone(),
+                        prefix: prefix.clone(),
+                        page_start: key_marker.clone().map(|key_marker| {
+                            ListMultipartUploadsPageStart::After {
+                                key_marker,
+                                upload_id_marker: upload_id_marker.clone(),
+                            }
+                        }),
+                        max_uploads: fetch_limit,
+                    },
+                )?;
+                #[cfg(any(test, feature = "test-hooks"))]
+                self.maybe_run_after_object_listing_pg_complete_hook(pg_id);
+                for upload in resp.uploads {
+                    let order = (
+                        upload.key.clone(),
+                        upload.initiated_at,
+                        upload.upload_id.clone(),
+                    );
+                    smallest.insert(order, upload);
+                }
+            }
+            let mut uploads = smallest.into_values();
+            let is_truncated = uploads.len() > max;
+            uploads.truncate(max);
+            let next_marker = uploads
+                .last()
+                .map(|upload| MultipartUploadListMarker::Upload {
+                    key: upload.key.clone(),
+                    upload_id: upload.upload_id.clone(),
+                });
+            return Ok(ListedBucketMultipartUploads {
+                uploads,
+                common_prefixes: Vec::new(),
+                is_truncated,
+                next_marker,
+            });
+        }
+
+        let prefix_str = prefix.as_ref().map_or("", ObjectKey::as_str);
+        let delimiter = delimiter.expect("checked above");
+        let fetch_uploads_page = |cursor: &mut MultipartUploadCursor,
+                                  start: Option<ListMultipartUploadsPageStart>|
+         -> Result<(), ObjectPgActionError> {
             let resp = self.list_multipart_uploads_page(
-                pg_id,
+                cursor.pg_id,
                 &ListMultipartUploadsReq {
                     bucket: bucket.clone(),
-                    prefix: prefix.cloned(),
-                    key_marker: key_marker.cloned(),
-                    upload_id_marker: upload_id_marker.cloned(),
-                    max_uploads: max_uploads.saturating_add(1),
+                    prefix: prefix.clone(),
+                    page_start: start,
+                    max_uploads: fetch_limit,
                 },
             )?;
-            #[cfg(any(test, feature = "test-hooks"))]
-            self.maybe_run_after_object_listing_pg_complete_hook(pg_id);
-            for upload in resp.uploads {
-                let order = (
-                    upload.key.clone(),
-                    upload.initiated_at,
-                    upload.upload_id.clone(),
-                );
-                smallest.insert(order, upload);
+            cursor.uploads = resp.uploads;
+            cursor.next_index = 0;
+            cursor.next_page_start = if resp.is_truncated {
+                resp.next_key_marker
+                    .map(|key_marker| ListMultipartUploadsPageStart::After {
+                        key_marker,
+                        upload_id_marker: resp.next_upload_id_marker,
+                    })
+            } else {
+                None
+            };
+            Ok(())
+        };
+
+        let refill_cursor =
+            |cursor: &mut MultipartUploadCursor| -> Result<(), ObjectPgActionError> {
+                while cursor.current().is_none() {
+                    let Some(next_start) = cursor.next_page_start.clone() else {
+                        break;
+                    };
+                    fetch_uploads_page(cursor, Some(next_start))?;
+                }
+                Ok(())
+            };
+
+        let jump_cursor_to = |cursor: &mut MultipartUploadCursor,
+                              start: ListMultipartUploadsPageStart|
+         -> Result<(), ObjectPgActionError> {
+            cursor.uploads.clear();
+            cursor.next_index = 0;
+            cursor.next_page_start = Some(start);
+            refill_cursor(cursor)
+        };
+
+        let skip_cursor_prefix = |cursor: &mut MultipartUploadCursor,
+                                  common_prefix: &str|
+         -> Result<(), ObjectPgActionError> {
+            while cursor
+                .current()
+                .is_some_and(|upload| upload.key.as_str().starts_with(common_prefix))
+            {
+                cursor.next_index += 1;
+                refill_cursor(cursor)?;
             }
+            Ok(())
+        };
+
+        let initial_start =
+            key_marker
+                .clone()
+                .map(|key_marker| ListMultipartUploadsPageStart::After {
+                    key_marker,
+                    upload_id_marker,
+                });
+        let mut cursors = Vec::new();
+        for pg_id in self.metadata_pg_ids() {
+            let mut cursor = MultipartUploadCursor {
+                pg_id,
+                uploads: Vec::new(),
+                next_index: 0,
+                next_page_start: None,
+            };
+            fetch_uploads_page(&mut cursor, initial_start.clone())?;
+            cursors.push(cursor);
         }
+
+        let max = max_uploads as usize;
+        let mut uploads = Vec::new();
+        let mut common_prefixes = Vec::new();
+        let mut is_truncated = false;
+        let mut next_marker = None;
+        let mut active_common_prefix = key_marker.as_ref().and_then(|marker| {
+            let after_prefix = marker.as_str().strip_prefix(prefix_str)?;
+            after_prefix
+                .ends_with(delimiter)
+                .then(|| (marker.clone(), crate::object_key_prefix_upper_bound(marker)))
+        });
+
+        while let Some((cursor_index, _)) = cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(cursor_index, cursor)| {
+                cursor.current().map(|upload| (cursor_index, upload))
+            })
+            .min_by(|(left_index, left), (right_index, right)| {
+                left.key
+                    .cmp(&right.key)
+                    .then_with(|| left.initiated_at.cmp(&right.initiated_at))
+                    .then_with(|| left.upload_id.cmp(&right.upload_id))
+                    .then_with(|| left_index.cmp(right_index))
+            })
+        {
+            let current_key = cursors[cursor_index]
+                .current()
+                .expect("selected cursor should have a current upload")
+                .key
+                .clone();
+            if let Some((ref common_prefix, ref upper_bound)) = active_common_prefix {
+                if current_key.as_str().starts_with(common_prefix.as_str()) {
+                    if let Some(upper_bound) = upper_bound.clone() {
+                        jump_cursor_to(
+                            &mut cursors[cursor_index],
+                            ListMultipartUploadsPageStart::At(upper_bound),
+                        )?;
+                    } else {
+                        skip_cursor_prefix(&mut cursors[cursor_index], common_prefix.as_str())?;
+                    }
+                    continue;
+                }
+                active_common_prefix = None;
+            }
+
+            if let Some(common_prefix) =
+                crate::object_key_common_prefix(&current_key, prefix_str, delimiter)
+            {
+                let upper_bound = crate::object_key_prefix_upper_bound(&common_prefix);
+                active_common_prefix = Some((common_prefix.clone(), upper_bound.clone()));
+                if key_marker
+                    .as_ref()
+                    .is_some_and(|marker| common_prefix.as_str() <= marker.as_str())
+                {
+                    if let Some(upper_bound) = upper_bound {
+                        jump_cursor_to(
+                            &mut cursors[cursor_index],
+                            ListMultipartUploadsPageStart::At(upper_bound),
+                        )?;
+                    } else {
+                        skip_cursor_prefix(&mut cursors[cursor_index], common_prefix.as_str())?;
+                    }
+                    continue;
+                }
+                if uploads.len() + common_prefixes.len() >= max {
+                    is_truncated = true;
+                    break;
+                }
+                next_marker = Some(MultipartUploadListMarker::CommonPrefix(
+                    common_prefix.clone(),
+                ));
+                common_prefixes.push(common_prefix);
+                continue;
+            }
+
+            if uploads.len() + common_prefixes.len() >= max {
+                is_truncated = true;
+                break;
+            }
+            let current = cursors[cursor_index]
+                .current()
+                .expect("selected cursor should have a current upload")
+                .clone();
+            next_marker = Some(MultipartUploadListMarker::Upload {
+                key: current.key.clone(),
+                upload_id: current.upload_id.clone(),
+            });
+            uploads.push(current);
+            cursors[cursor_index].next_index += 1;
+            refill_cursor(&mut cursors[cursor_index])?;
+        }
+
         Ok(ListedBucketMultipartUploads {
-            uploads: smallest.into_values(),
+            uploads,
+            common_prefixes,
+            is_truncated,
+            next_marker,
         })
     }
 

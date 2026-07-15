@@ -2606,8 +2606,7 @@ fn mpu_list_uploads_pagination() {
         .list_multipart_uploads(&ListMultipartUploadsReq {
             bucket: bucket_name("bkt"),
             prefix: None,
-            key_marker: None,
-            upload_id_marker: None,
+            page_start: None,
             max_uploads: 2,
         })
         .unwrap();
@@ -2621,8 +2620,12 @@ fn mpu_list_uploads_pagination() {
         .list_multipart_uploads(&ListMultipartUploadsReq {
             bucket: bucket_name("bkt"),
             prefix: None,
-            key_marker: resp.next_key_marker,
-            upload_id_marker: resp.next_upload_id_marker,
+            page_start: resp.next_key_marker.map(|key_marker| {
+                ListMultipartUploadsPageStart::After {
+                    key_marker,
+                    upload_id_marker: resp.next_upload_id_marker,
+                }
+            }),
             max_uploads: 2,
         })
         .unwrap();
@@ -2669,8 +2672,7 @@ fn mpu_list_uploads_with_prefix() {
         .list_multipart_uploads(&ListMultipartUploadsReq {
             bucket: bucket_name("bkt"),
             prefix: Some(object_key("photos/")),
-            key_marker: None,
-            upload_id_marker: None,
+            page_start: None,
             max_uploads: 100,
         })
         .unwrap();
@@ -2703,8 +2705,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
         .list_multipart_uploads(&ListMultipartUploadsReq {
             bucket: bucket_name("bkt"),
             prefix: None,
-            key_marker: None,
-            upload_id_marker: None,
+            page_start: None,
             max_uploads: 2,
         })
         .unwrap();
@@ -2719,8 +2720,12 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
         .list_multipart_uploads(&ListMultipartUploadsReq {
             bucket: bucket_name("bkt"),
             prefix: None,
-            key_marker: resp.next_key_marker,
-            upload_id_marker: resp.next_upload_id_marker,
+            page_start: resp.next_key_marker.map(|key_marker| {
+                ListMultipartUploadsPageStart::After {
+                    key_marker,
+                    upload_id_marker: resp.next_upload_id_marker,
+                }
+            }),
             max_uploads: 2,
         })
         .unwrap();
@@ -2774,8 +2779,10 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
         .list_multipart_uploads(&ListMultipartUploadsReq {
             bucket: bucket_name("bkt"),
             prefix: None,
-            key_marker: Some(object_key("key")),
-            upload_id_marker: Some(multipart_upload_id("u-y")),
+            page_start: Some(ListMultipartUploadsPageStart::After {
+                key_marker: object_key("key"),
+                upload_id_marker: Some(multipart_upload_id("u-y")),
+            }),
             max_uploads: 10,
         })
         .unwrap();
@@ -8480,8 +8487,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         .list_multipart_uploads(&ListMultipartUploadsReq {
             bucket: bucket_name("bucket"),
             prefix: None,
-            key_marker: None,
-            upload_id_marker: None,
+            page_start: None,
             max_uploads: 10,
         })
         .unwrap();
