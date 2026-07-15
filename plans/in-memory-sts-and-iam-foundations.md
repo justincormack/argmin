@@ -462,8 +462,8 @@ header, presigned, POST Object, and streaming authentication:
    time and check credential-domain binding
 9. check embedded expiry at the AWS-pinned boundary and resolve only the
    embedded stable issuer-role ID, rejecting a deleted issuer as
-   `InvalidClientTokenId`; both checks precede signature comparison, but their
-   relative order remains unresolved
+   `InvalidClientTokenId`; expiry precedes issuer-role liveness, and both checks
+   precede signature comparison
 10. verify SigV4 with the embedded secret access key
 11. return an immutable authenticated-session value containing the structured
    token identity and session-policy context
@@ -483,11 +483,11 @@ therefore establish credential validity before signature comparison. The
 pre-signature lookup must expose only stable issuer identity/liveness, not role
 authorization state.
 
-The existing AWS observations establish separately that expiry and deleted-role
-liveness each win over signature mismatch. They do not establish which wins
-when an expired session's issuer has also been deleted. Keep that collision
-explicitly unresolved until a probe waits through AWS's 900-second minimum
-session lifetime; do not infer an order from the independently observed cases.
+AWS observations establish that expiry and deleted-role liveness each win over
+signature mismatch. The combined-state oracle additionally establishes that
+expiry wins when the session has expired and its stable issuer role has been
+deleted. This ordering is shared by STS and every initial S3 temporary-
+credential authentication mode.
 
 At the authorization boundary, resolve current trust-independent role
 permission state, then combine it with the authenticated session policy and
@@ -838,8 +838,8 @@ The initial Query-protocol slice completed on 2026-07-13:
   `text/xml` response type, and request-ID agreement
 
 Before Phase 0 can satisfy the first-milestone exit condition, it still needs
-to pin expiry-versus-issuer-deletion precedence, permission-policy mutation
-behavior, and the temporary access-key/token envelope decisions.
+to pin permission-policy mutation behavior and settle the temporary access-key/
+token envelope decisions.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
 remain unsupported compatibility gaps and must never be silently ignored.
@@ -1171,8 +1171,7 @@ STS 2011 namespace and complete semantic header/body shapes. This establishes
 that token presence, token/access-key binding, and stable issuer-role liveness
 are credential-validity checks before SigV4 comparison; mutable trust and
 permission policies remain authorization inputs rather than authentication
-inputs. Expiry-versus-issuer-deletion precedence is not established by this
-matrix and remains an explicit Phase 0 question.
+inputs. The later expiry/deletion slice orders expiry before issuer liveness.
 
 The session-principal context and trust-mutation slice completed on 2026-07-14.
 It uses the permissionless recreated-role session and a self-cleaning bucket
@@ -1484,8 +1483,36 @@ chunk-signature comparison. The invalidated-session cases collide liveness
 with correct and bad seed signatures and correct and bad first-chunk
 signatures. Together with the earlier header, presigned-query, and POST Object
 matrices, region/service scope placement is now pinned independently for every
-initial S3 temporary-credential authentication mode. Expiry collisions remain
-a separate Phase 0 question.
+initial S3 temporary-credential authentication mode. Expiry collisions were
+handled by the separate slice described next.
+
+The expiry-versus-issuer-deletion slice completed on 2026-07-15. A dedicated
+permissionless same-account role issues both AWS's minimum 900-second session
+and a separate 3,600-second liveness control. While the issuer still exists,
+the fixture polls the short session until AWS itself returns three consecutive
+`ExpiredToken` responses, avoiding any host-clock assumption. It then deletes
+the issuer and requires three consecutive `InvalidClientTokenId` responses
+from the still-unexpired control through STS. Before testing the expired
+credential through S3, the oracle independently requires three consecutive
+`InvalidAccessKeyId` responses from that same control through header,
+presigned-query, POST Object, and aws-chunked streaming authentication. These
+mode-specific gates prove that each S3 issuer-liveness view has converged after
+the deletion rather than allowing `ExpiredToken` to mask a stale live-role
+view.
+The long-running fixture is explicitly selected with
+`./scripts/aws-sts-oracle --expiry`; ordinary `--assume-role` runs do not wait
+through the minimum session lifetime.
+
+Complete goldens establish that the expired-and-deleted session returns STS
+HTTP 403 `ExpiredToken` with exactly `The security token included in the
+request is expired`, for both correct and bad signatures. S3 header,
+presigned-query, POST Object, and aws-chunked streaming authentication all
+return HTTP 400 `ExpiredToken` with exactly `The provided token has expired.`
+and echo the expired credential in `Token-0`; assertions sanitize that value
+before comparing or reporting failures. The S3 result wins over a bad request
+or POST-policy signature, and streaming expiry wins over both a bad seed
+signature and a bad first-chunk signature. Expiry therefore precedes stable
+issuer-role liveness, which in turn precedes signature verification.
 
 During this slice, one newly created role produced one successful STS
 assumption followed immediately by `AccessDenied` for the same request. The
@@ -1742,8 +1769,9 @@ confidentiality. No session response or request body may appear in traces.
    presigned, POST Object, and streaming token/signature collisions are pinned;
    STS, S3 header, S3 presigned-query, and S3 POST Object region/service
    collisions are now pinned separately, as are streaming region/service
-   collisions. Disabled-credential collisions and the remaining expiry
-   collisions are not.
+   collisions. Expiry versus issuer deletion is pinned independently for STS
+   and every initial S3 mode. Disabled-credential collisions and expiry
+   collisions with missing, mismatched, or wrong-scope inputs are not.
 5. What total Query body and member limits does live STS enforce for the first
    supported parameter set?
 6. Should the first standalone UAT role be injected through a dedicated

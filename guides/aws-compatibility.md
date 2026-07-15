@@ -51,12 +51,16 @@ instead pin how S3 rejects token inputs supplied with static credentials.
 
 Ad hoc AWS validation on 2026-07-07 with expired `GetSessionToken`
 credentials showed that S3 returns `ExpiredToken` before signature mismatch for
-header SigV4, presigned SigV4, and POST Object SigV4, even when the request
-signature is deliberately corrupted. Until Argmin supports STS locally, this
-ordering is documented here rather than pinned by a committed AWS-facing test.
-The local auth code should still preserve the AWS ordering: credential expiry is
-checked before signature comparison, while unexpected security-token inputs for
-static credentials are checked after signature comparison.
+header SigV4, presigned SigV4, and POST Object SigV4. The temporary Phase 0 STS
+oracle subsequently pinned the same ordering for an expired `AssumeRole`
+session across those modes and aws-chunked streaming. It also proved that
+expiry wins after the stable issuer role has been deleted: an independent
+still-unexpired session first returned three consecutive `InvalidAccessKeyId`
+responses through each S3 authentication mode, proving deletion convergence
+before the expired-session collisions. Issuer-role liveness itself wins over
+signature comparison. The local auth pipeline must preserve that order;
+unexpected security-token inputs for static credentials remain a separate
+post-signature check.
 
 ### Delete-then-recreate bucket name reuse may require retry
 

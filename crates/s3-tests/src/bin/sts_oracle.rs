@@ -387,20 +387,10 @@ fn s3_response_with_sanitized_body(
     }
 }
 
-fn assert_s3_invalid_access_key(
-    label: &str,
-    response: &RawResponse,
-    access_key: &str,
-    security_tokens: &[&str],
-) {
-    assert!(
-        required_xml_text(response, "AWSAccessKeyId", label) == access_key,
-        "{label}: S3 did not echo the session access key"
-    );
-    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+fn assert_s3_invalid_access_key_shape(label: &str, response: &RawResponse) {
     assert_shape(
         label,
-        &response,
+        response,
         &shape()
             .status(403)
             .headers(error_response_headers())
@@ -413,6 +403,20 @@ fn assert_s3_invalid_access_key(
             ),
     );
     println!("{label}: ok");
+}
+
+fn assert_s3_invalid_access_key(
+    label: &str,
+    response: &RawResponse,
+    access_key: &str,
+    security_tokens: &[&str],
+) {
+    assert!(
+        required_xml_text(response, "AWSAccessKeyId", label) == access_key,
+        "{label}: S3 did not echo the session access key"
+    );
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    assert_s3_invalid_access_key_shape(label, &response);
 }
 
 fn assert_s3_signature_mismatch<F>(
@@ -1977,6 +1981,7 @@ struct S3PostSessionProbeSet<'a> {
 #[derive(Clone, Copy)]
 enum S3PostAuthExpected {
     AccessDenied,
+    ExpiredToken,
     InvalidAccessKey,
     InvalidToken,
     NoAccessKeyPresented,
@@ -2198,21 +2203,7 @@ fn assert_s3_post_invalid_access_key(
         security_tokens,
         &result.policy,
     );
-    assert_shape(
-        probe.label,
-        &response,
-        &shape()
-            .status(403)
-            .headers(error_response_headers())
-            .body(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                 <Error><Code>InvalidAccessKeyId</Code>\
-                 <Message>The AWS Access Key Id you provided does not exist in our records.</Message>\
-                 <AWSAccessKeyId>SESSION_ACCESS_KEY</AWSAccessKeyId>\
-                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
-            ),
-    );
-    println!("{}: ok", probe.label);
+    assert_s3_invalid_access_key_shape(probe.label, &response);
 }
 
 fn assert_s3_post_no_access_key_presented(
@@ -2268,6 +2259,55 @@ fn assert_s3_post_invalid_token(
             )),
     );
     println!("{}: ok", probe.label);
+}
+
+fn assert_s3_expired_token_shape(label: &str, response: &RawResponse) {
+    assert_shape(
+        label,
+        response,
+        &shape().status(400).headers(error_response_headers()).body(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>ExpiredToken</Code>\
+                 <Message>The provided token has expired.</Message>\
+                 <Token-0>SESSION_TOKEN</Token-0>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+        ),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_expired_token(
+    label: &str,
+    response: &RawResponse,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+) {
+    assert!(
+        required_xml_text(response, "Token-0", label) == security_token,
+        "{label}: S3 did not echo the expired session token"
+    );
+    let response =
+        s3_response_with_sanitized_body(response, credentials.access_key, &[security_token]);
+    assert_s3_expired_token_shape(label, &response);
+}
+
+fn assert_s3_post_expired_token(
+    probe: S3PostProbe<'_>,
+    result: &S3PostResult,
+    security_token: &str,
+) {
+    assert!(
+        required_xml_text(&result.response, "Token-0", probe.label) == security_token,
+        "{}: S3 did not echo the expired session token",
+        probe.label
+    );
+    let response = s3_post_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        &[security_token],
+        &result.policy,
+    );
+    assert_s3_expired_token_shape(probe.label, &response);
 }
 
 fn assert_s3_post_signature_mismatch(
@@ -2637,6 +2677,11 @@ fn run_s3_post_session_authentication_probes(
                     &assumed_role_arn,
                     &sensitive_tokens,
                 );
+            }
+            S3PostAuthExpected::ExpiredToken => {
+                let expired_token = form_tokens[0]
+                    .expect("ExpiredToken POST probe must present a form session token");
+                assert_s3_post_expired_token(probe, &result, expired_token);
             }
             S3PostAuthExpected::InvalidAccessKey => {
                 assert_s3_post_invalid_access_key(probe, &result, &sensitive_tokens);
@@ -5962,6 +6007,254 @@ fn run_session_authentication_probes(
     }
 }
 
+fn wait_for_s3_invalid_access_key_convergence<F>(label: &str, access_key: &str, mut send: F)
+where
+    F: FnMut() -> (RawResponse, RawResponse),
+{
+    let mut consecutive_invalid = 0;
+    let mut last_status = 0;
+    let mut last_code = None;
+    for attempt in 1..=30 {
+        let (response, sanitized_response) = send();
+        last_status = response.status;
+        last_code = xml_tag_text(&response.body, "Code").map(str::to_string);
+        if response.status == 403 && last_code.as_deref() == Some("InvalidAccessKeyId") {
+            consecutive_invalid += 1;
+            if consecutive_invalid == 3 {
+                assert!(
+                    required_xml_text(&response, "AWSAccessKeyId", label) == access_key,
+                    "{label}: S3 did not echo the liveness-control access key"
+                );
+                assert_s3_invalid_access_key_shape(label, &sanitized_response);
+                return;
+            }
+        } else {
+            consecutive_invalid = 0;
+        }
+        if attempt < 30 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    panic!(
+        "{label}: S3 did not converge to three consecutive InvalidAccessKeyId responses; \
+         last status was {last_status}, last code was {}",
+        last_code.as_deref().unwrap_or("missing")
+    );
+}
+
+fn run_s3_deleted_issuer_convergence_probes(
+    s3_endpoint: &str,
+    bucket: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+) {
+    wait_for_s3_invalid_access_key_convergence(
+        "s3-header-expiry-liveness-control-after-delete",
+        credentials.access_key,
+        || {
+            let response = send_signed_request_for_service_with_credentials(
+                "GET",
+                s3_endpoint,
+                b"",
+                [("x-amz-security-token", security_token)],
+                "s3",
+                credentials,
+            );
+            let sanitized = s3_response_with_sanitized_body(
+                &response,
+                credentials.access_key,
+                &[security_token],
+            );
+            (response, sanitized)
+        },
+    );
+
+    wait_for_s3_invalid_access_key_convergence(
+        "s3-presigned-expiry-liveness-control-after-delete",
+        credentials.access_key,
+        || {
+            let presigned = build_s3_root_presigned_request(
+                s3_endpoint,
+                credentials,
+                Some(security_token),
+                None,
+            );
+            let response = fetch_s3_presigned_request(s3_endpoint, &presigned, None);
+            let sanitized = s3_response_with_sanitized_body(
+                &response,
+                credentials.access_key,
+                &[security_token],
+            );
+            (response, sanitized)
+        },
+    );
+
+    wait_for_s3_invalid_access_key_convergence(
+        "s3-post-expiry-liveness-control-after-delete",
+        credentials.access_key,
+        || {
+            let probe = S3PostProbe {
+                label: "s3-post-expiry-liveness-control-after-delete",
+                credentials,
+                policy_token: Some(security_token),
+                form_tokens: S3PostFormTokens::One(security_token),
+                header_token: None,
+                expected: S3PostAuthExpected::InvalidAccessKey,
+            };
+            let result = send_s3_post_probe(s3_endpoint, bucket, probe);
+            let sanitized = s3_post_response_with_sanitized_body(
+                &result.response,
+                credentials.access_key,
+                &[security_token],
+                &result.policy,
+            );
+            (result.response, sanitized)
+        },
+    );
+
+    wait_for_s3_invalid_access_key_convergence(
+        "streaming-expiry-liveness-control-after-delete",
+        credentials.access_key,
+        || {
+            let result = send_s3_streaming_request(
+                s3_endpoint,
+                bucket,
+                S3StreamingRequest {
+                    label: "streaming-expiry-liveness-control-after-delete",
+                    credentials,
+                    tokens: S3StreamingTokens::One(security_token),
+                    sign_token_header: true,
+                    bad_chunk_signature: false,
+                    service: "s3",
+                },
+            );
+            let sanitized = s3_response_with_sanitized_body(
+                &result.response,
+                credentials.access_key,
+                &[security_token],
+            );
+            (result.response, sanitized)
+        },
+    );
+}
+
+fn run_expired_deleted_session_probes(
+    sts_endpoint: &str,
+    s3_endpoint: &str,
+    bucket: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+) {
+    let wrong_secret = "0".repeat(40);
+    let bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..credentials
+    };
+    let sts_expired_message = "The security token included in the request is expired";
+
+    for (label, signing_credentials) in [
+        ("session-auth-expired-deleted-valid", credentials),
+        (
+            "session-auth-expired-deleted-bad-signature",
+            bad_signature_credentials,
+        ),
+    ] {
+        let response =
+            send_get_caller_identity(sts_endpoint, signing_credentials, Some(security_token));
+        assert_error_probe(
+            label,
+            &response,
+            403,
+            STS_XMLNS,
+            "ExpiredToken",
+            Some(sts_expired_message),
+        );
+        println!("{label}: ok");
+    }
+
+    for (label, signing_credentials) in [
+        ("s3-header-auth-expired-deleted-valid", credentials),
+        (
+            "s3-header-auth-expired-deleted-bad-signature",
+            bad_signature_credentials,
+        ),
+    ] {
+        let response = send_signed_request_for_service_with_credentials(
+            "GET",
+            s3_endpoint,
+            b"",
+            [("x-amz-security-token", security_token)],
+            "s3",
+            signing_credentials,
+        );
+        assert_s3_expired_token(label, &response, signing_credentials, security_token);
+    }
+
+    for (label, signing_credentials) in [
+        ("s3-presigned-auth-expired-deleted-valid", credentials),
+        (
+            "s3-presigned-auth-expired-deleted-bad-signature",
+            bad_signature_credentials,
+        ),
+    ] {
+        let presigned = build_s3_root_presigned_request(
+            s3_endpoint,
+            signing_credentials,
+            Some(security_token),
+            None,
+        );
+        let response = fetch_s3_presigned_request(s3_endpoint, &presigned, None);
+        assert_s3_expired_token(label, &response, signing_credentials, security_token);
+    }
+
+    for (label, signing_credentials) in [
+        ("s3-post-auth-expired-deleted-valid", credentials),
+        (
+            "s3-post-auth-expired-deleted-bad-signature",
+            bad_signature_credentials,
+        ),
+    ] {
+        let probe = S3PostProbe {
+            label,
+            credentials: signing_credentials,
+            policy_token: Some(security_token),
+            form_tokens: S3PostFormTokens::One(security_token),
+            header_token: None,
+            expected: S3PostAuthExpected::ExpiredToken,
+        };
+        let result = send_s3_post_probe(s3_endpoint, bucket, probe);
+        assert_s3_post_expired_token(probe, &result, security_token);
+    }
+
+    for (label, signing_credentials, bad_chunk_signature) in [
+        ("streaming-expired-deleted-valid", credentials, false),
+        (
+            "streaming-expired-deleted-bad-seed-signature",
+            bad_signature_credentials,
+            false,
+        ),
+        (
+            "streaming-expired-deleted-bad-chunk-signature",
+            credentials,
+            true,
+        ),
+    ] {
+        let result = send_s3_streaming_request(
+            s3_endpoint,
+            bucket,
+            S3StreamingRequest {
+                label,
+                credentials: signing_credentials,
+                tokens: S3StreamingTokens::One(security_token),
+                sign_token_header: true,
+                bad_chunk_signature,
+                service: "s3",
+            },
+        );
+        assert_s3_expired_token(label, &result.response, signing_credentials, security_token);
+    }
+}
+
 struct CrossAccountProbeSet<'a> {
     caller_arn: &'a str,
     role_session_name: &'a str,
@@ -6457,6 +6750,42 @@ fn main() {
                 old_security_token: &deleted_security_token,
             },
         );
+
+        if let Ok(expired_deleted_access_key) = env::var("S3_TEST_STS_EXPIRED_DELETED_ACCESS_KEY") {
+            let expiry_liveness_access_key = required_env("S3_TEST_STS_EXPIRY_LIVENESS_ACCESS_KEY");
+            let expiry_liveness_secret_key = required_env("S3_TEST_STS_EXPIRY_LIVENESS_SECRET_KEY");
+            let expiry_liveness_security_token =
+                required_env("S3_TEST_STS_EXPIRY_LIVENESS_SESSION_TOKEN");
+            let expiry_liveness_credentials = SignedRequestCredentials {
+                access_key: &expiry_liveness_access_key,
+                secret_key: &expiry_liveness_secret_key,
+                region: &region,
+                tls_ca_pem: None,
+            };
+            let expired_deleted_secret_key = required_env("S3_TEST_STS_EXPIRED_DELETED_SECRET_KEY");
+            let expired_deleted_security_token =
+                required_env("S3_TEST_STS_EXPIRED_DELETED_SESSION_TOKEN");
+            let expired_deleted_credentials = SignedRequestCredentials {
+                access_key: &expired_deleted_access_key,
+                secret_key: &expired_deleted_secret_key,
+                region: &region,
+                tls_ca_pem: None,
+            };
+            let s3_endpoint = format!("https://s3.{region}.amazonaws.com");
+            run_s3_deleted_issuer_convergence_probes(
+                &s3_endpoint,
+                &post_bucket,
+                expiry_liveness_credentials,
+                &expiry_liveness_security_token,
+            );
+            run_expired_deleted_session_probes(
+                &endpoint,
+                &s3_endpoint,
+                &post_bucket,
+                expired_deleted_credentials,
+                &expired_deleted_security_token,
+            );
+        }
     }
 }
 
