@@ -62,6 +62,16 @@ signature comparison. The local auth pipeline must preserve that order;
 unexpected security-token inputs for static credentials remain a separate
 post-signature check.
 
+The Phase 0 role-policy mutation oracle also established that an already-issued
+role session uses the role's current permission policy for S3 authorization.
+After an inline `PutObject` allow was replaced by an explicit deny, the original
+session remained valid through STS but returned the same explicit
+identity-policy-deny response as sessions issued after the replacement. A bad
+SigV4 signature on that original session returned `SignatureDoesNotMatch`
+instead. Current role permissions must therefore be loaded at the authorization
+boundary after signature verification, not sealed into the session token or
+resolved during authentication.
+
 ### Delete-then-recreate bucket name reuse may require retry
 
 `DeleteBucket` should not be treated as proof that the same bucket name is

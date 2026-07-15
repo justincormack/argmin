@@ -1223,6 +1223,141 @@ fn run_s3_session_context_probes(
     }
 }
 
+struct S3RolePolicyMutationProbeSet<'a> {
+    pre_credentials: SignedRequestCredentials<'a>,
+    pre_security_token: &'a str,
+    pre_assumed_role_arn: &'a str,
+    post_credentials: SignedRequestCredentials<'a>,
+    post_security_token: &'a str,
+    post_assumed_role_arn: &'a str,
+}
+
+fn assert_s3_identity_policy_explicit_deny(
+    label: &str,
+    response: &RawResponse,
+    bucket: &str,
+    assumed_role_arn: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+) {
+    let response =
+        s3_response_with_sanitized_body(response, credentials.access_key, &[security_token]);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("assumed_role_arn", assumed_role_arn)
+            .sub("bucket", bucket)
+            .sub("key", label)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>User: {assumed_role_arn} is not authorized to perform: \
+                 s3:PutObject on resource: \"arn:aws:s3:::{bucket}/{key}\" with an \
+                 explicit deny in an identity-based policy</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_put_signature_mismatch(
+    label: &str,
+    response: &RawResponse,
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+) {
+    let parsed_endpoint = url::Url::parse(endpoint)
+        .unwrap_or_else(|error| panic!("{label}: invalid S3 endpoint: {error}"));
+    let host = parsed_endpoint
+        .host_str()
+        .unwrap_or_else(|| panic!("{label}: S3 endpoint has no host"));
+    let path = parsed_endpoint.path();
+    let empty_payload_hash = auth::canonical::sha256_hex(b"");
+    assert_s3_signature_mismatch(
+        label,
+        response,
+        credentials,
+        &[security_token],
+        None,
+        None,
+        |amz_date| {
+            format!(
+                "PUT\n{path}\n\nhost:{host}\n\
+                 x-amz-content-sha256:{empty_payload_hash}\n\
+                 x-amz-date:{amz_date}\n\
+                 x-amz-security-token:{security_token}\n\n\
+                 host;x-amz-content-sha256;x-amz-date;x-amz-security-token\n\
+                 {empty_payload_hash}"
+            )
+        },
+    );
+}
+
+fn run_s3_role_policy_mutation_probes(
+    endpoint: &str,
+    bucket: &str,
+    fixture: S3RolePolicyMutationProbeSet<'_>,
+) {
+    for (label, credentials, security_token, assumed_role_arn) in [
+        (
+            "role-policy-mutation-pre-session-explicit-deny",
+            fixture.pre_credentials,
+            fixture.pre_security_token,
+            fixture.pre_assumed_role_arn,
+        ),
+        (
+            "role-policy-mutation-post-session-explicit-deny",
+            fixture.post_credentials,
+            fixture.post_security_token,
+            fixture.post_assumed_role_arn,
+        ),
+    ] {
+        let response = send_signed_request_for_service_with_credentials(
+            "PUT",
+            &format!("{endpoint}/{label}"),
+            b"",
+            [("x-amz-security-token", security_token)],
+            "s3",
+            credentials,
+        );
+        assert_s3_identity_policy_explicit_deny(
+            label,
+            &response,
+            bucket,
+            assumed_role_arn,
+            credentials,
+            security_token,
+        );
+    }
+
+    let label = "role-policy-mutation-pre-session-bad-signature";
+    let wrong_secret = "0".repeat(40);
+    let bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..fixture.pre_credentials
+    };
+    let request_endpoint = format!("{endpoint}/{label}");
+    let response = send_signed_request_for_service_with_credentials(
+        "PUT",
+        &request_endpoint,
+        b"",
+        [("x-amz-security-token", fixture.pre_security_token)],
+        "s3",
+        bad_signature_credentials,
+    );
+    assert_s3_put_signature_mismatch(
+        label,
+        &response,
+        &request_endpoint,
+        bad_signature_credentials,
+        fixture.pre_security_token,
+    );
+}
+
 fn build_s3_root_presigned_request(
     endpoint: &str,
     credentials: SignedRequestCredentials<'_>,
@@ -6693,6 +6828,40 @@ fn main() {
                 credentials: recreated_credentials,
                 security_token: &recreated_security_token,
                 assumed_role_arn: &recreated_session_arn,
+            },
+        );
+        let policy_pre_access_key = required_env("S3_TEST_STS_POLICY_MUTATION_PRE_ACCESS_KEY");
+        let policy_pre_secret_key = required_env("S3_TEST_STS_POLICY_MUTATION_PRE_SECRET_KEY");
+        let policy_pre_security_token =
+            required_env("S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_TOKEN");
+        let policy_pre_assumed_role_arn =
+            required_env("S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_ARN");
+        let policy_post_access_key = required_env("S3_TEST_STS_POLICY_MUTATION_POST_ACCESS_KEY");
+        let policy_post_secret_key = required_env("S3_TEST_STS_POLICY_MUTATION_POST_SECRET_KEY");
+        let policy_post_security_token =
+            required_env("S3_TEST_STS_POLICY_MUTATION_POST_SESSION_TOKEN");
+        let policy_post_assumed_role_arn =
+            required_env("S3_TEST_STS_POLICY_MUTATION_POST_SESSION_ARN");
+        run_s3_role_policy_mutation_probes(
+            &format!("https://{post_bucket}.s3.{region}.amazonaws.com"),
+            &post_bucket,
+            S3RolePolicyMutationProbeSet {
+                pre_credentials: SignedRequestCredentials {
+                    access_key: &policy_pre_access_key,
+                    secret_key: &policy_pre_secret_key,
+                    region: &region,
+                    tls_ca_pem: None,
+                },
+                pre_security_token: &policy_pre_security_token,
+                pre_assumed_role_arn: &policy_pre_assumed_role_arn,
+                post_credentials: SignedRequestCredentials {
+                    access_key: &policy_post_access_key,
+                    secret_key: &policy_post_secret_key,
+                    region: &region,
+                    tls_ca_pem: None,
+                },
+                post_security_token: &policy_post_security_token,
+                post_assumed_role_arn: &policy_post_assumed_role_arn,
             },
         );
         let post_fixture = S3PostSessionProbeSet {

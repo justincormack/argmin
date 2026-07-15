@@ -97,7 +97,7 @@ aws_s3api() {
 }
 
 cleanup_stale_sts_oracle_roles() {
-  local age_seconds created_at created_epoch list_error now_epoch role role_count role_name role_path roles_file roles_rows
+  local age_seconds created_at created_epoch inline_policies_file list_error now_epoch policy_name role role_count role_name role_path roles_file roles_rows
 
   roles_file="$tmpdir/sts-oracle-roles.json"
   roles_rows="$tmpdir/sts-oracle-role-rows.txt"
@@ -118,6 +118,8 @@ cleanup_stale_sts_oracle_roles() {
              (.RoleName | startswith("external-id-")) or
              (.RoleName | startswith("source-identity-")) or
              (.RoleName | startswith("chain-target-")) or
+             (.RoleName | startswith("policy-mutation-")) or
+             (.RoleName | startswith("expiry-role-")) or
              (.RoleName | startswith("deleted-role-")))) or
         (.Path == "/argmin-sts-oracle/cross-account/" and
             ((.RoleName | startswith("cross-success-")) or
@@ -143,6 +145,8 @@ cleanup_stale_sts_oracle_roles() {
         /argmin-sts-oracle/same-account/:external-id-* | \
         /argmin-sts-oracle/same-account/:source-identity-* | \
         /argmin-sts-oracle/same-account/:chain-target-* | \
+        /argmin-sts-oracle/same-account/:policy-mutation-* | \
+        /argmin-sts-oracle/same-account/:expiry-role-* | \
         /argmin-sts-oracle/same-account/:deleted-role-* | \
         /argmin-sts-oracle/cross-account/:cross-success-* | \
         /argmin-sts-oracle/cross-account/:cross-trust-denied-* | \
@@ -155,6 +159,24 @@ cleanup_stale_sts_oracle_roles() {
       echo "Kept recent STS oracle role $role_name (${age_seconds}s old)"
       continue
     fi
+
+    inline_policies_file="$tmpdir/sts-oracle-${role_name}-inline-policies.json"
+    if ! aws iam list-role-policies \
+      --role-name "$role_name" \
+      --output json > "$inline_policies_file"; then
+      echo "Failed to list inline policies for stale STS oracle role $role_name" >&2
+      failed=1
+      continue
+    fi
+    while IFS= read -r policy_name; do
+      [[ -n "$policy_name" ]] || continue
+      if ! aws iam delete-role-policy \
+        --role-name "$role_name" \
+        --policy-name "$policy_name"; then
+        echo "Failed to delete inline policy $policy_name from stale STS oracle role $role_name" >&2
+        failed=1
+      fi
+    done < <(jq -r '.PolicyNames[]' "$inline_policies_file")
 
     if aws iam delete-role --role-name "$role_name"; then
       echo "Deleted stale STS oracle role $role_name"

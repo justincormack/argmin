@@ -493,9 +493,11 @@ At the authorization boundary, resolve current trust-independent role
 permission state, then combine it with the authenticated session policy and
 request context. A changed permission policy or authorization-provider failure
 fails closed there. No other mutable role field may move into authentication
-without AWS evidence. Phase 0 probes must still pin policy-change behavior, and
-the matching local tests must inject issuer-liveness and authorization-provider
-failures separately.
+without AWS evidence. The Phase 0 mutation oracle pins current role-policy
+replacement at this boundary: an already-issued session adopts the replacement
+policy after remaining valid through authentication, and a bad signature is
+rejected before the policy deny is evaluated. Matching local tests must inject
+issuer-liveness and authorization-provider failures separately.
 
 The precise error mapping for missing, malformed, wrong-key, tampered, mismatched,
 and expired tokens must come from AWS probes. Existing evidence
@@ -838,16 +840,25 @@ The initial Query-protocol slice completed on 2026-07-13:
   `text/xml` response type, and request-ID agreement
 
 Before Phase 0 can satisfy the first-milestone exit condition, it still needs
-to pin permission-policy mutation behavior and settle the temporary access-key/
-token envelope decisions.
+to settle the temporary access-key/token envelope decisions and explicitly
+disposition the remaining bounded parser and precedence gaps listed below.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
 remain unsupported compatibility gaps and must never be silently ignored.
 
 The role-fixture capability will use the ordinary primary and alternate test
-users, not the owner/root credential. The shared test-user policy grants only
-`CreateRole`, `GetRole`, `UpdateAssumeRolePolicy`, and `DeleteRole` for roles
-under `/argmin-sts-oracle/`. Its identity-policy `sts:AssumeRole` grant covers
+users, not the owner/root credential. The shared test-user policy grants role
+lifecycle and read-only inline-policy inspection/deletion under
+`/argmin-sts-oracle/`. `PutRolePolicy` and `PutRolePermissionsBoundary` are
+available only for uniquely named
+`/argmin-sts-oracle/same-account/policy-mutation-*` roles carrying the exact
+owner-managed `/argmin-s3-tests/sts-oracle-role-boundary`; that boundary limits
+effective identity permissions to `s3:PutObject` in `claude-s3-*` buckets. The
+user cannot remove or replace the boundary, attach managed role policies, or
+use `PassRole`, so the mutation probe does not create a path to broader account
+permissions. The fixture directly requires `AccessDenied` when the primary
+user tries to write the policy to an unbounded oracle role or remove the
+mutation role's boundary. Its identity-policy `sts:AssumeRole` grant covers
 only `/argmin-sts-oracle/cross-account/` roles in any account. Same-account
 roles use `/argmin-sts-oracle/same-account/`, so their successful assumption
 is preceded by an IAM simulation of every inline, attached, and group policy on
@@ -858,11 +869,9 @@ to the calling user's own ARN through `${aws:username}`. AWS requires
 `iam:ListRoles` to use `Resource: "*"`, so the policy grants that read-only
 action separately; the cleanup command sends the `/argmin-sts-oracle/` path
 prefix and applies stricter returned-path and role-name checks before deletion.
-The policy does not grant role-policy attachment or mutation, `PassRole`, or
-any other general IAM administration. The fixture users therefore cannot add
-identity permissions to these roles; roles created solely through this grant
-remain permissionless. These temporary grants should be removed with the
-oracle after Phase 0.
+Every role except the dedicated bounded mutation fixture remains
+permissionless. These temporary grants and the persistent boundary policy
+should be removed with the oracle after Phase 0.
 
 `SimulatePrincipalPolicy` is temporary AWS-oracle fixture validation only. It
 must not appear in the endpoint-neutral `s3-tests` scenario and does not add
@@ -879,13 +888,15 @@ The same-account role-fixture slice now:
 
 - provides `./scripts/aws-apply-test-user-policy`, which uses the primary
   credential only to identify the target user and confines owner/root use to
-  creating or versioning the customer-managed test policy and attaching it
+  creating or versioning the customer-managed test policy and bounded mutation
+  role permissions boundary, and attaching only the test-user policy
 - creates, converges, assumes, and deletes uniquely named
   roles under `role/argmin-sts-oracle/same-account/`, including the
   `path-shape-*`, `default-max-*`, `external-id-*`, `source-identity-*`, and
-  `chain-target-*` fixture families, using the primary test user; it never
-  adopts an existing role, grants none of the roles identity permissions, and
-  normalizes temporary secrets before golden response comparison
+  `chain-target-*` permissionless fixture families plus the boundary-constrained
+  `policy-mutation-*` family, using the primary test user; it never adopts an
+  existing role and normalizes temporary secrets before golden response
+  comparison
 - proves that the IAM role ARN retains `/argmin-sts-oracle/same-account/` while
   its returned STS ARN omits the entire IAM path and retains only the unique
   role name and `path-shape-session` session name
@@ -905,6 +916,8 @@ existence check.
 `./scripts/cleanup` discovers all uniquely named same-account oracle role shapes
 and deletes only those at least one hour old. The age floor prevents a
 periodic cleanup run from deleting another concurrently active oracle fixture.
+Before deleting a stale role, cleanup lists and removes its inline policies;
+the normal oracle trap does the same for every role it successfully created.
 IAM discovery failure is reported and makes the command exit unsuccessfully
 after the existing bucket cleanup has still run; it cannot disable bucket
 recovery.
@@ -1204,9 +1217,32 @@ consecutive iterations, and the complete raw matrix runs only after that
 convergence.
 Current trust policy is therefore an `AssumeRole` issuance input, not an active
 session authentication or resource-authorization input. Stable issuer-role
-liveness remains an authentication requirement as pinned by role deletion;
-current role permission-policy mutation behavior remains a separate open
-question.
+liveness remains an authentication requirement as pinned by role deletion.
+
+The role permission-policy mutation slice completed on 2026-07-15. A unique
+same-account role is created with the owner-managed permissions boundary that
+limits it to `s3:PutObject` in prefixed test buckets. Its inline role policy
+first allows `PutObject` only on `role-policy-mutation-*` keys. The fixture
+requires three successful requests from independently issued sessions and then
+three from one retained pre-mutation session before replacing that same inline
+policy with an explicit deny.
+
+After the replacement round-trips through `GetRolePolicy`, independently
+issued post-mutation sessions must produce three consecutive S3 explicit
+identity-policy denials. The retained post-mutation session then produces
+three more denials. Only after these target-specific convergence controls does
+the retained pre-mutation session prove three consecutive STS
+`GetCallerIdentity` successes followed by three S3 explicit identity-policy
+denials. This distinguishes a live session using current role policy from an
+issuance-time policy snapshot.
+
+Complete raw goldens establish the same explicit identity-policy-deny response
+for both the pre- and post-mutation sessions. The pre-mutation session combined
+with a bad signature instead returns the complete `SignatureDoesNotMatch`
+response. Current role permission policy is therefore resolved at the S3
+authorization boundary after signature verification; it is not sealed into
+the session, consulted during authentication, or permitted to override a bad
+signature.
 
 The STS signing-scope slice completed on 2026-07-14. The existing configured
 regional endpoint success is its positive control. Complete STS response

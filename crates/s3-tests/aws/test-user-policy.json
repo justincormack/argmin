@@ -98,9 +98,26 @@
                 "iam:CreateRole",
                 "iam:DeleteRole",
                 "iam:GetRole",
+                "iam:GetRolePolicy",
+                "iam:ListRolePolicies",
+                "iam:DeleteRolePolicy",
                 "iam:UpdateAssumeRolePolicy"
             ],
             "Resource": "arn:aws:iam::*:role/argmin-sts-oracle/*"
+        },
+        {
+            "Sid": "AllowBoundedTemporaryRolePolicyMutation",
+            "Effect": "Allow",
+            "Action": [
+                "iam:PutRolePermissionsBoundary",
+                "iam:PutRolePolicy"
+            ],
+            "Resource": "arn:aws:iam::*:role/argmin-sts-oracle/same-account/policy-mutation-*",
+            "Condition": {
+                "ArnLike": {
+                    "iam:PermissionsBoundary": "arn:aws:iam::*:policy/argmin-s3-tests/sts-oracle-role-boundary"
+                }
+            }
         },
         {
             "Sid": "AllowListTemporaryStsOracleRoles",

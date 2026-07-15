@@ -65,8 +65,11 @@ region="${region:-${TEST_S3_REGION:-us-east-1}}"
 policy_document="$ROOT/crates/s3-tests/aws/test-user-policy.json"
 policy_path="/argmin-s3-tests/"
 policy_name="test-user-policy"
+boundary_document="$ROOT/crates/s3-tests/aws/sts-oracle-role-boundary.json"
+boundary_name="sts-oracle-role-boundary"
 
 jq empty "$policy_document"
+jq empty "$boundary_document"
 
 aws_with_credentials() {
     local access_key="$1"
@@ -120,53 +123,86 @@ primary_user_prefix="arn:aws:iam::${primary_account}:user/"
 primary_user_name="${primary_arn##*/}"
 [[ -n "$primary_user_name" ]] || external_s3_test_die "primary IAM user name is empty"
 
-policy_arn="arn:aws:iam::${primary_account}:policy${policy_path}${policy_name}"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
-policy_metadata="$tmpdir/policy.json"
-policy_error="$tmpdir/get-policy.err"
-policy_changed=false
+ensured_policy_changed=false
 
-if aws_owner iam get-policy --policy-arn "$policy_arn" >"$policy_metadata" 2>"$policy_error"; then
-    default_version="$(jq -er '.Policy.DefaultVersionId' "$policy_metadata")"
-    remote_document="$tmpdir/remote-policy.json"
-    aws_owner iam get-policy-version \
-        --policy-arn "$policy_arn" \
-        --version-id "$default_version" \
-        --query 'PolicyVersion.Document' \
-        --output json >"$remote_document"
+ensure_managed_policy() {
+    local label="$1"
+    local policy_arn="$2"
+    local managed_policy_name="$3"
+    local managed_policy_path="$4"
+    local managed_policy_document="$5"
+    local default_version oldest_non_default policy_error policy_metadata remote_document version_count versions
 
-    if [[ "$(jq -S -c . "$remote_document")" != "$(jq -S -c . "$policy_document")" ]]; then
-        versions="$tmpdir/versions.json"
-        aws_owner iam list-policy-versions --policy-arn "$policy_arn" >"$versions"
-        version_count="$(jq -er '.Versions | length' "$versions")"
-        if ((version_count >= 5)); then
-            oldest_non_default="$(
-                jq -er \
-                    '[.Versions[] | select(.IsDefaultVersion == false)] | sort_by(.CreateDate) | first | .VersionId' \
-                    "$versions"
-            )"
-            aws_owner iam delete-policy-version \
-                --policy-arn "$policy_arn" \
-                --version-id "$oldest_non_default"
-        fi
-        aws_owner iam create-policy-version \
+    ensured_policy_changed=false
+    policy_metadata="$tmpdir/${label}-policy.json"
+    policy_error="$tmpdir/${label}-get-policy.err"
+    if aws_owner iam get-policy \
+        --policy-arn "$policy_arn" >"$policy_metadata" 2>"$policy_error"; then
+        default_version="$(jq -er '.Policy.DefaultVersionId' "$policy_metadata")"
+        remote_document="$tmpdir/${label}-remote-policy.json"
+        aws_owner iam get-policy-version \
             --policy-arn "$policy_arn" \
-            --policy-document "file://${policy_document}" \
-            --set-as-default >/dev/null
-        policy_changed=true
+            --version-id "$default_version" \
+            --query 'PolicyVersion.Document' \
+            --output json >"$remote_document"
+
+        if [[ "$(jq -S -c . "$remote_document")" != \
+            "$(jq -S -c . "$managed_policy_document")" ]]; then
+            versions="$tmpdir/${label}-versions.json"
+            aws_owner iam list-policy-versions --policy-arn "$policy_arn" >"$versions"
+            version_count="$(jq -er '.Versions | length' "$versions")"
+            if ((version_count >= 5)); then
+                oldest_non_default="$(
+                    jq -er \
+                        '[.Versions[] | select(.IsDefaultVersion == false)] | sort_by(.CreateDate) | first | .VersionId' \
+                        "$versions"
+                )"
+                aws_owner iam delete-policy-version \
+                    --policy-arn "$policy_arn" \
+                    --version-id "$oldest_non_default"
+            fi
+            aws_owner iam create-policy-version \
+                --policy-arn "$policy_arn" \
+                --policy-document "file://${managed_policy_document}" \
+                --set-as-default >/dev/null
+            ensured_policy_changed=true
+        fi
+    elif grep -q 'NoSuchEntity' "$policy_error"; then
+        aws_owner iam create-policy \
+            --policy-name "$managed_policy_name" \
+            --path "$managed_policy_path" \
+            --policy-document "file://${managed_policy_document}" >/dev/null
+        ensured_policy_changed=true
+    else
+        cat "$policy_error" >&2
+        external_s3_test_die "could not inspect managed policy $policy_arn"
     fi
-elif grep -q 'NoSuchEntity' "$policy_error"; then
-    aws_owner iam create-policy \
-        --policy-name "$policy_name" \
-        --path "$policy_path" \
-        --policy-document "file://${policy_document}" >/dev/null
-    policy_changed=true
+}
+
+boundary_arn="arn:aws:iam::${primary_account}:policy${policy_path}${boundary_name}"
+ensure_managed_policy \
+    boundary \
+    "$boundary_arn" \
+    "$boundary_name" \
+    "$policy_path" \
+    "$boundary_document"
+if [[ "$ensured_policy_changed" == true ]]; then
+    echo "updated STS oracle role permissions boundary $boundary_arn"
 else
-    cat "$policy_error" >&2
-    external_s3_test_die "could not inspect managed policy $policy_arn"
+    echo "STS oracle role permissions boundary already current: $boundary_arn"
 fi
+
+policy_arn="arn:aws:iam::${primary_account}:policy${policy_path}${policy_name}"
+ensure_managed_policy \
+    test-user \
+    "$policy_arn" \
+    "$policy_name" \
+    "$policy_path" \
+    "$policy_document"
+policy_changed="$ensured_policy_changed"
 
 aws_owner iam attach-user-policy \
     --user-name "$primary_user_name" \
