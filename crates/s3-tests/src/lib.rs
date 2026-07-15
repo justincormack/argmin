@@ -39,7 +39,7 @@ pub use post_form::{
     sigv4_post_fields_for_credentials_at_epoch, sigv4_post_fields_for_service_with_credentials,
     sigv4_post_sse_c_fields_for_credentials,
 };
-pub use raw_http_client::{Agent, Response};
+pub use raw_http_client::{write_partial_request_and_disconnect, Agent, Response};
 pub use server::TestServer;
 
 use std::sync::LazyLock;

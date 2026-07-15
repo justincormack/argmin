@@ -178,8 +178,15 @@ For each matrix:
   ranges beyond the source size follow authorization. The shared matrix
   includes a successful copy canary and proves every rejected request leaves
   the target upload empty and publishes no object.
-- [ ] Verify failed or interrupted UploadPart and UploadPartCopy requests neither
-  replace a prior valid part nor become visible in ListParts/completion.
+- [x] Verify failed UploadPart and UploadPartCopy replacements, plus an
+  interrupted UploadPart request body, neither replace a prior valid part nor
+  become visible in ListParts/completion. AWS and local retain the original
+  part's ETag and size after a checksum failure, a mid-body transport failure,
+  and an UploadPartCopy source-condition failure; completion with that original
+  ETag publishes its original bytes. UploadPartCopy has no request body to
+  interrupt. Disconnecting while awaiting its response does not establish that
+  the server-side copy failed, so permitted raced outcomes belong to the
+  concurrency matrix below rather than this failed-request invariant.
 
 ### 4. Listing and marker behavior
 

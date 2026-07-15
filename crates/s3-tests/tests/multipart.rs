@@ -22,18 +22,21 @@ use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
     assert_s3_err_code, copy_source_with_version, err_status, is_sdk_stream_disconnect_or_status,
-    object_url, raw_bucket, raw_object_query, send_signed_request,
+    object_url, presign_url, raw_bucket, raw_object_query, send_signed_request,
     send_signed_request_with_credentials,
     shape::{
         assert_shape, error_response_headers, expected_error, shape, xml_response_headers,
         xml_tag_text,
     },
-    unique_bucket, RawResponse, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
+    unique_bucket, write_partial_request_and_disconnect, RawResponse, SendRetryingOperationAborted,
+    SignedRequestCredentials, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 const SLOW_PART_SIZE: usize = 8 * 1024 * 1024;
 const SLOW_PART_CHUNK_SIZE: usize = 64 * 1024;
+const INTERRUPTED_PART_SIZE: usize = 128 * 1024;
+const INTERRUPTED_PART_CHUNK_SIZE: usize = 64 * 1024;
 const CONCURRENT_MULTIPART_OPERATION_ATTEMPTS: usize = 20;
 
 fn assert_invalid_part_number_body_shape(
@@ -2141,6 +2144,146 @@ fn test_upload_part_validation_authorization_precedence() {
             .await
             .unwrap();
         cleanup(&bucket, &[source_key]).await;
+    });
+}
+
+#[test]
+fn test_failed_and_interrupted_part_replacement_preserves_prior_part() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let source_key = "failed-part-replacement-source";
+        let target_key = "failed-part-replacement-target";
+        let original_body = b"original multipart part";
+
+        put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            source_key,
+            b"replacement copy source".to_vec(),
+        )
+        .await;
+        let create =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, target_key).await;
+        let upload_id = create.upload_id().unwrap();
+        let original_part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            target_key,
+            upload_id,
+            1,
+            original_body.to_vec(),
+        )
+        .await;
+        let original_etag = original_part.e_tag().unwrap();
+
+        let checksum_failure = raw_multipart_query(
+            "PUT",
+            &bucket,
+            target_key,
+            &format!("partNumber=1&uploadId={upload_id}"),
+            b"rejected checksum replacement",
+            &[("content-md5", "AAAAAAAAAAAAAAAAAAAAAA==")],
+        );
+        assert_eq!(
+            checksum_failure.status, 400,
+            "failed UploadPart replacement: {checksum_failure:?}"
+        );
+        assert_eq!(
+            xml_tag_text(&checksum_failure.body, "Code"),
+            Some("BadDigest")
+        );
+
+        let interrupted_url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            target_key,
+            Some(&format!(
+                "partNumber=1&uploadId={}",
+                query_encode_value(upload_id)
+            )),
+        );
+        let presigned = presign_url(
+            "PUT",
+            &interrupted_url,
+            Duration::from_secs(900),
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+        let presigned_headers: Vec<_> = presigned.headers().collect();
+        assert!(
+            !presigned_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("host")),
+            "presigned transport headers must omit the Host header already represented by the URI"
+        );
+        let partial_body = vec![b'i'; INTERRUPTED_PART_CHUNK_SIZE];
+        write_partial_request_and_disconnect(
+            "PUT",
+            presigned.uri(),
+            INTERRUPTED_PART_SIZE,
+            &partial_body,
+            &presigned_headers,
+            CTX.tls_ca_pem(),
+        )
+        .await
+        .expect("write and flush partial UploadPart body before disconnecting");
+
+        let copy_failure = raw_multipart_query(
+            "PUT",
+            &bucket,
+            target_key,
+            &format!("partNumber=1&uploadId={upload_id}"),
+            b"",
+            &[
+                ("x-amz-copy-source", &format!("{bucket}/{source_key}")),
+                ("x-amz-copy-source-if-match", "\"0000000000000000\""),
+            ],
+        );
+        assert_eq!(
+            copy_failure.status, 412,
+            "failed UploadPartCopy replacement: {copy_failure:?}"
+        );
+        assert_eq!(
+            xml_tag_text(&copy_failure.body, "Code"),
+            Some("PreconditionFailed")
+        );
+
+        assert_multipart_parts_preserved(
+            &bucket,
+            target_key,
+            upload_id,
+            &[(1, original_body.len() as i64, original_etag)],
+        )
+        .await;
+
+        complete_multipart_upload_retrying_operation_aborted(
+            client,
+            &bucket,
+            target_key,
+            upload_id,
+            original_etag,
+        )
+        .await;
+        let completed = client
+            .get_object()
+            .bucket(&bucket)
+            .key(target_key)
+            .send_retrying_operation_aborted("read object after failed part replacements")
+            .await
+            .unwrap();
+        assert_eq!(
+            completed
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+                .as_ref(),
+            original_body
+        );
+
+        cleanup(&bucket, &[source_key, target_key]).await;
     });
 }
 

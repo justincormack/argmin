@@ -12,6 +12,9 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use rustls::pki_types::{pem::PemObject, CertificateDer};
 use rustls::{ClientConfig, RootCertStore};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 
 type HyperHttpsConnector = HttpsConnector<HyperHttpConnector>;
 type RawHyperClient = HyperClient<HyperHttpsConnector, SdkBody>;
@@ -226,6 +229,114 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Write a deliberately incomplete HTTP request body onto the connection and
+/// disconnect only after the partial body has been flushed.
+pub async fn write_partial_request_and_disconnect(
+    method: &str,
+    uri: &str,
+    declared_content_length: usize,
+    partial_body: &[u8],
+    headers: &[(&str, &str)],
+    tls_ca_pem: Option<&[u8]>,
+) -> Result<(), Error> {
+    if partial_body.len() >= declared_content_length {
+        return Err(Error::new(
+            "partial body must be shorter than the declared Content-Length",
+        ));
+    }
+    let parsed = url::Url::parse(uri).map_err(|err| Error::new(format!("parse URI: {err}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| Error::new("request URI has no host"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| Error::new("request URI has no known port"))?;
+    let uri_host_header = match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let mut supplied_host_headers = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("host"));
+    let supplied_host_header = supplied_host_headers.next().map(|(_, value)| *value);
+    if supplied_host_headers.next().is_some() {
+        return Err(Error::new("raw request contains duplicate Host headers"));
+    }
+    let host_header = match supplied_host_header {
+        Some(value) if value == uri_host_header => value,
+        Some(_) => {
+            return Err(Error::new(
+                "raw request Host header does not match the request URI",
+            ));
+        }
+        None => uri_host_header.as_str(),
+    };
+    let request_target = match parsed.query() {
+        Some(query) => format!("{}?{query}", parsed.path()),
+        None => parsed.path().to_string(),
+    };
+    let mut head = format!(
+        "{method} {request_target} HTTP/1.1\r\nHost: {host_header}\r\nContent-Length: {declared_content_length}\r\nConnection: close\r\n"
+    );
+    for (name, value) in headers {
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            return Err(Error::new("raw request header contains a newline"));
+        }
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+
+    tokio::time::timeout(crate::configured_test_timeout(), async {
+        let stream = TcpStream::connect((host, port))
+            .await
+            .map_err(|err| Error::new(format!("connect raw request: {err}")))?;
+        match parsed.scheme() {
+            "http" => write_partial_request(stream, head.as_bytes(), partial_body).await,
+            "https" => {
+                let _ = rustls::crypto::ring::default_provider().install_default();
+                let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+                    .map_err(|err| Error::new(format!("invalid TLS server name: {err}")))?;
+                let connector = TlsConnector::from(Arc::new(build_tls_client_config(tls_ca_pem)));
+                let stream = connector
+                    .connect(server_name, stream)
+                    .await
+                    .map_err(|err| Error::new(format!("connect raw request TLS: {err}")))?;
+                write_partial_request(stream, head.as_bytes(), partial_body).await
+            }
+            scheme => Err(Error::new(format!(
+                "unsupported raw request URI scheme: {scheme}"
+            ))),
+        }
+    })
+    .await
+    .map_err(|err| Error::new(format!("partial raw request timed out: {err}")))?
+}
+
+async fn write_partial_request<S: AsyncWrite + Unpin>(
+    mut stream: S,
+    head: &[u8],
+    partial_body: &[u8],
+) -> Result<(), Error> {
+    stream
+        .write_all(head)
+        .await
+        .map_err(|err| Error::new(format!("write raw request head: {err}")))?;
+    stream
+        .write_all(partial_body)
+        .await
+        .map_err(|err| Error::new(format!("write raw request partial body: {err}")))?;
+    stream
+        .flush()
+        .await
+        .map_err(|err| Error::new(format!("flush raw request partial body: {err}")))
+}
+
 async fn execute_request(
     client: RawHyperClient,
     timeout: Duration,
@@ -331,6 +442,28 @@ fn build_tls_config_with_custom_ca(tls_ca_pem: &[u8]) -> ClientConfig {
     assert_eq!(
         invalid, 0,
         "custom trust store contains invalid CA certificates"
+    );
+    ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+}
+
+fn build_tls_client_config(tls_ca_pem: Option<&[u8]>) -> ClientConfig {
+    if let Some(tls_ca_pem) = tls_ca_pem {
+        return build_tls_config_with_custom_ca(tls_ca_pem);
+    }
+
+    let mut roots = RootCertStore::empty();
+    let certs = rustls_native_certs::load_native_certs()
+        .expect("load native root certificates for partial raw request");
+    let (valid, invalid) = roots.add_parsable_certificates(certs);
+    assert!(
+        valid > 0,
+        "native trust store must include at least one CA certificate"
+    );
+    assert_eq!(
+        invalid, 0,
+        "native trust store contains invalid CA certificates"
     );
     ClientConfig::builder()
         .with_root_certificates(roots)

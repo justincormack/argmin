@@ -2098,6 +2098,7 @@ dependencies = [
  "observability",
  "ring",
  "rustls",
+ "rustls-native-certs",
  "s3-types",
  "serde_json",
  "server-core",
