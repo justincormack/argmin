@@ -11481,23 +11481,28 @@ Replicated route-change soak cutover:
   their own narrow shared synchronization. Any additional ReadIndex or client
   write performed during dispatch therefore runs without holding a mutex needed
   by another RPC worker or by clock recovery. Replicated wrapper clones also
-  share a narrow response-publication gate: wrapper checkpoint failures, peer
-  checkpoint failures, and the bounded WAL checkpoint monitor all publish
-  durability poison under that gate. Final poison checks and both control-plane
-  and peer response writes use the same gate. Quorum work, command application,
-  checkpointing, and response construction all remain outside it. A response
-  therefore linearizes before poison publication or is suppressed afterward,
-  even when its worker passed an earlier poison check. A stale restored leader returns
-  the explicit routing rejection without serializing unrelated work behind an
-  unavailable quorum. Authority-clock status and recovery use a dedicated derived Unix
-  socket and independently bounded worker pool, so capacity is reserved at
-  connection admission before request bytes are read; ordinary, incomplete, or
-  quorum-blocked connections on the general control-plane socket cannot consume
-  it. Both listeners authenticate and unwrap each request exactly once before
-  any ReadIndex confirmation, and carry the verified response-signing context
-  through routing rejection or dispatch. Invalid credentials therefore cannot
-  trigger quorum work, while authenticated routing failures remain explicit and
-  retryable. Targeted regressions cover bounded stale-leader confirmation,
+  share a narrow response-publication admission gate: wrapper checkpoint
+  failures, peer checkpoint failures, and the bounded WAL checkpoint monitor
+  request exclusive durability-poison publication under that gate. Final
+  poison checks and both control-plane and peer response writes acquire
+  concurrent response permits. Quorum work, command application, checkpointing,
+  and response construction all remain outside it. A response therefore
+  acquires a permit before poison is requested or is suppressed afterward;
+  poison waits for already-permitted writes to finish. Independent socket
+  writes are not serialized behind one another, so abandoned ordinary
+  runtime-map or heartbeat responses cannot consume their one-second write
+  timeouts in front of a dedicated authority-clock recovery response. A stale
+  restored leader returns the explicit routing rejection without serializing
+  unrelated work behind an unavailable quorum. Authority-clock status and
+  recovery use a dedicated derived Unix socket and independently bounded worker
+  pool, so capacity is reserved at connection admission before request bytes are
+  read; ordinary, incomplete, or quorum-blocked connections on the general
+  control-plane socket cannot consume it. Both listeners authenticate and
+  unwrap each request exactly once before any ReadIndex confirmation, and carry
+  the verified response-signing context through routing rejection or dispatch.
+  Invalid credentials therefore cannot trigger quorum work, while authenticated
+  routing failures remain explicit and retryable. Targeted regressions cover
+  bounded stale-leader confirmation,
   independent connection-admission capacity, authentication-before-admission,
   signed routing rejection without duplicate verification, and a recovery
   request completing while an already-admitted ordinary worker remains parked
@@ -11525,6 +11530,21 @@ Replicated route-change soak cutover:
   cannot regain command authority from a stale local view and that the barrier
   cannot pass until quorum authority, current-term clock binding, a newer
   epoch, every renewed lease, and every serving PG hold simultaneously.
+- Add autonomous recovery for the expected clean-leadership-change case rather
+  than making routine Raft election availability depend indefinitely on a CLI
+  invocation. This is narrower than automatic recovery from an arbitrary clock
+  fault: the new local leader must have a valid node/cluster-bound durable clock
+  checkpoint, a healthy current wall/health-clock sample within the configured
+  discontinuity budget, a quorum-confirmed current term and fully applied state,
+  and an unchanged committed timestamp high-water consistent with that evidence.
+  It must advance and durably checkpoint the new authority generation/term
+  before serving, while retaining the predecessor lease-grant horizon and
+  symmetric skew fence. Missing/corrupt evidence, wall-clock regression/jump,
+  source failure, or checkpoint failure remains fail-closed and requires
+  authenticated operator recovery. Keep the explicit admin operation for
+  diagnosis and exceptional recovery. Add election, leader-loss, repeated-term,
+  crash-before-checkpoint, stale-checkpoint, and anomalous-clock regressions
+  before enabling this path.
 - The first replicated soak exposed two failover-only heartbeat invariants.
   A stale-epoch heartbeat after durable lease expiry is no longer eligible for
   the volatile overlay unless the durable base node is administratively

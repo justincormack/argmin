@@ -12,7 +12,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1966,14 +1966,43 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
 
 #[derive(Clone)]
 struct ExperimentalRaftDurabilityPublication {
-    gate: Arc<Mutex<()>>,
+    gate: Arc<(Mutex<ExperimentalRaftDurabilityPublicationState>, Condvar)>,
     poisoned: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct ExperimentalRaftDurabilityPublicationState {
+    active_responses: usize,
+    poison_requested: bool,
+}
+
+struct ExperimentalRaftResponsePublicationPermit<'a> {
+    publication: &'a ExperimentalRaftDurabilityPublication,
+}
+
+impl Drop for ExperimentalRaftResponsePublicationPermit<'_> {
+    fn drop(&mut self) {
+        let (gate, responses_drained) = &*self.publication.gate;
+        let mut state = gate
+            .lock()
+            .expect("experimental OpenRaft response publication mutex poisoned");
+        state.active_responses = state
+            .active_responses
+            .checked_sub(1)
+            .expect("response publication permit count should be positive");
+        if state.active_responses == 0 {
+            responses_drained.notify_all();
+        }
+    }
 }
 
 impl ExperimentalRaftDurabilityPublication {
     fn new() -> Self {
         Self {
-            gate: Arc::new(Mutex::new(())),
+            gate: Arc::new((
+                Mutex::new(ExperimentalRaftDurabilityPublicationState::default()),
+                Condvar::new(),
+            )),
             poisoned: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -1983,29 +2012,55 @@ impl ExperimentalRaftDurabilityPublication {
     }
 
     fn publish_poison(&self, before_publish: impl FnOnce()) {
-        let _publication = self
-            .gate
+        let (gate, responses_drained) = &*self.gate;
+        let mut state = gate
             .lock()
             .expect("experimental OpenRaft response publication mutex poisoned");
+        if state.poison_requested {
+            while !self.poisoned.load(Ordering::Acquire) {
+                state = responses_drained
+                    .wait(state)
+                    .expect("experimental OpenRaft response publication mutex poisoned");
+            }
+            return;
+        }
+        state.poison_requested = true;
+        while state.active_responses != 0 {
+            state = responses_drained
+                .wait(state)
+                .expect("experimental OpenRaft response publication mutex poisoned");
+        }
         before_publish();
         self.poisoned.store(true, Ordering::Release);
+        responses_drained.notify_all();
     }
 
     fn publish<T>(
         &self,
         publish: impl FnOnce() -> Result<T, ControlPlaneError>,
     ) -> Result<T, ControlPlaneError> {
-        let _publication = self
-            .gate
+        let _permit = self.response_publication_permit()?;
+        publish()
+    }
+
+    fn response_publication_permit(
+        &self,
+    ) -> Result<ExperimentalRaftResponsePublicationPermit<'_>, ControlPlaneError> {
+        let (gate, _) = &*self.gate;
+        let mut state = gate
             .lock()
             .expect("experimental OpenRaft response publication mutex poisoned");
-        if self.poisoned.load(Ordering::Acquire) {
+        if state.poison_requested || self.poisoned.load(Ordering::Acquire) {
             return Err(ControlPlaneError::RpcRemote {
                 message: "experimental OpenRaft durable authority was poisoned before response publication"
                     .to_owned(),
             });
         }
-        publish()
+        state.active_responses = state
+            .active_responses
+            .checked_add(1)
+            .expect("response publication permit count overflow");
+        Ok(ExperimentalRaftResponsePublicationPermit { publication: self })
     }
 }
 
@@ -7310,6 +7365,84 @@ mod tests {
             authority,
             control_plane,
         }
+    }
+
+    #[test]
+    fn durability_publication_allows_concurrent_responses_before_exclusive_poison() {
+        let publication = ExperimentalRaftDurabilityPublication::new();
+        let first_publication = publication.clone();
+        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first = thread::spawn(move || {
+            first_publication.publish(|| {
+                first_started_tx
+                    .send(())
+                    .expect("first response should report publication start");
+                release_first_rx
+                    .recv()
+                    .expect("first response should be released");
+                Ok(())
+            })
+        });
+        first_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first response should acquire a publication permit");
+
+        let second_publication = publication.clone();
+        let (second_finished_tx, second_finished_rx) = std::sync::mpsc::channel();
+        let second = thread::spawn(move || {
+            let result = second_publication.publish(|| Ok(()));
+            second_finished_tx
+                .send(())
+                .expect("second response should report completion");
+            result
+        });
+        second_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("an unrelated response must not wait for the first socket write");
+        second
+            .join()
+            .expect("second response worker should exit")
+            .expect("second response should publish");
+
+        let poison_publication = publication.clone();
+        let poisoner = thread::spawn(move || poison_publication.publish_poison(|| {}));
+        let poison_wait_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let poison_requested = publication
+                .gate
+                .0
+                .lock()
+                .expect("response publication state should lock")
+                .poison_requested;
+            if poison_requested {
+                break;
+            }
+            assert!(
+                Instant::now() < poison_wait_deadline,
+                "poison publication should become pending"
+            );
+            thread::yield_now();
+        }
+        assert!(!publication.is_poisoned());
+        let error = publication
+            .publish(|| Ok(()))
+            .expect_err("a response arriving after poison was requested must be suppressed");
+        assert!(error
+            .to_string()
+            .contains("poisoned before response publication"));
+
+        release_first_tx
+            .send(())
+            .expect("first response should resume");
+        first
+            .join()
+            .expect("first response worker should exit")
+            .expect("first response should publish");
+        poisoner
+            .join()
+            .expect("poison publication worker should exit");
+        assert!(publication.is_poisoned());
     }
 
     #[test]
