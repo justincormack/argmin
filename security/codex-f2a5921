@@ -1,0 +1,268 @@
+Multipart completion target lookup precedes authorization
+Link: https://chatgpt.com/codex/cloud/security/findings/d598becc47388191a522e43b3b6cd806?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low (attack path: low)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: f2a5921
+Author: justin@specialbusservice.com
+Created: 14/07/2026, 16:47:34
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+
+Invalid as a new Argmin security finding: this is a duplicate of an explicit
+live-AWS compatibility oracle, and the ordering was deliberately introduced by
+the reported commit rather than bypassing an intended authorization boundary.
+
+Commit `f2a5921` added the endpoint-neutral
+`test_complete_multipart_upload_xml_precedence` regression. It establishes an
+active upload with the primary principal and proves all three relevant live-AWS
+outcomes:
+
+- alternate principal, active upload ID, well-formed XML: `AccessDenied`
+- alternate principal, active upload ID, malformed XML: `MalformedXML`
+- alternate principal, nonexistent upload ID, malformed XML: `NoSuchUpload`
+
+The adjacent `test_multipart_upload_id_authorization_precedence` separately
+pins `AccessDenied` for an active upload ID versus `NoSuchUpload` for an invalid
+ID across UploadPart, CompleteMultipartUpload, ListParts, and
+AbortMultipartUpload. Both tests run unchanged against AWS and Argmin. The
+completed item in `plans/aws-multipart-oracle-hardening-plan.md`, section 1,
+records the same active/nonexistent upload ID, well-formed/malformed XML, and
+primary/alternate-principal cross-product.
+
+AWS therefore resolves whether the key-bound upload ID exists before malformed
+completion XML, while authorization still prevents a well-formed unauthorized
+completion. Moving authorization ahead of this lookup would remove the reported
+oracle but make Argmin observably incompatible with S3. The request cannot read,
+complete, alter, or abort the upload through this path, and practical probing
+requires the exact high-entropy upload ID and key. No code change is required.
+
+# Summary
+Introduced an additional authorization-ordering bug/oracle for malformed CompleteMultipartUpload requests. A similar NoSuchUpload-vs-AccessDenied distinction for well-formed completion requests appears to already exist, but this commit newly performs an unauthorised target lookup before XML parsing and explicitly pins malformed-XML behavior that bypasses the later authorization path.
+For CompleteMultipartUpload, the new code parses uploadId, builds a MultipartObjectRequest, and calls validate_complete_multipart_upload_target before parsing the completion XML and before the normal complete_multipart_upload authorization path. validate_complete_multipart_upload_target only loads the in-progress upload by bucket, key, and upload ID; it does not check the requester, bucket policy, ACLs, or expected bucket owner. As a result, an unauthorized or anonymous requester who can send a malformed body such as '<' can distinguish an active upload for a bucket/key/uploadId from a missing or wrong-key upload: an existing target reaches XML parsing and returns MalformedXML, while a missing target returns NoSuchUpload. This does not allow completing, reading, or modifying objects, and upload IDs are high-entropy, so impact is limited to multipart-upload metadata disclosure and an unauthorized storage lookup.
+
+# Validation
+## Rubric
+- [x] Confirm the CompleteMultipartUpload HTTP path performs upload target validation before XML parsing.
+- [x] Confirm the pre-validation helper only performs bucket/key/uploadId storage lookup and does not authorize the requester.
+- [x] Confirm the normal complete path still denies unauthorized alternate credentials for valid XML.
+- [x] Dynamically reproduce the oracle: unauthorized malformed request returns MalformedXML for an existing target but NoSuchUpload for invalid/wrong-key targets.
+- [x] Attempt crash, valgrind, and debugger validation before relying on code understanding; no crash expected, valgrind unavailable, LLDB trace captured the vulnerable call path.
+## Report
+Validated the finding as a logic/oracle bug. Crash reproduction was attempted via the PoC integration test; it completed successfully without crashing, as expected for an authorization-ordering issue. Valgrind was attempted but is not installed in the container (`bash: command not found: valgrind`). I then used LLDB non-interactively and reproduced the relevant execution path.
+
+Key code evidence: in `crates/server-http/src/http/mod.rs:2925-2959`, `CompleteMultipartUpload` parses `uploadId`, builds a `MultipartObjectRequest`, calls `validate_complete_multipart_upload_target` at lines 2944-2946, returns `NoSuchUpload` at lines 2949-2953, and only then parses XML at lines 2956-2959, where malformed XML returns `MalformedXML`. The helper in `crates/server-core/src/coordinator/multipart.rs:826-837` only calls `load_in_progress_multipart_upload(bucket, key, upload_id)` and does not check requester, policy, ACL, or expected owner. The later authorization gates that would return `AccessDenied` are in `crates/server-core/src/coordinator/authz/acl.rs:720-740` and `crates/server-core/src/coordinator/authz/modern.rs:391-413`, after XML parsing on the normal completion path.
+
+Dynamic PoC evidence: I added `crates/s3-tests/tests/validation_oracle_poc.rs` and ran `cargo test -p s3-tests --test validation_oracle_poc -- --nocapture --test-threads=1`. The test creates a multipart upload as the owner, then sends CompleteMultipartUpload as alternate credentials. Output showed: valid XML + existing upload returned `403 AccessDenied`; malformed body `<` + existing bucket/key/uploadId returned `400 MalformedXML`; malformed body `<` + invalid uploadId returned `404 NoSuchUpload`; malformed body `<` + wrong key but valid uploadId returned `404 NoSuchUpload`. This confirms an unauthorized requester can distinguish an active target from missing/wrong-key targets using malformed XML.
+
+Debugger evidence: LLDB breakpoint at `crates/server-core/src/coordinator/multipart.rs:829` hit inside `validate_complete_multipart_upload_target`, with backtrace showing it was called from `server_http::http::HttpFrontend::dispatch_routed` at `mod.rs:2946`, confirming the unauthorised storage lookup is on the HTTP CompleteMultipartUpload request path before XML parsing/authorization.
+
+# Evidence
+crates/s3-tests/tests/multipart.rs (L1775 to 1813)
+  Note: The added test documents the oracle: alternate credentials are AccessDenied for a valid XML completion, but with malformed XML they receive MalformedXML for a valid upload ID and NoSuchUpload for an invalid one.
+```
+        let authorization_canary = send_signed_request_with_credentials(
+            "POST",
+            &valid_url,
+            &complete_multipart_upload_xml("\"abc\"", 1),
+            [("content-type", "application/xml")],
+            alt_credentials(),
+        );
+        assert_access_denied(&authorization_canary);
+
+        for credentials in [primary_credentials(), alt_credentials()] {
+            let valid_url = object_url(
+                CTX.endpoint(),
+                &bucket,
+                key,
+                Some(&format!("uploadId={valid_upload_id}")),
+            );
+            let valid_response = send_signed_request_with_credentials(
+                "POST",
+                &valid_url,
+                b"<",
+                [("content-type", "application/xml")],
+                credentials,
+            );
+            assert_malformed_xml(&valid_response);
+
+            let invalid_url = object_url(
+                CTX.endpoint(),
+                &bucket,
+                key,
+                Some(&format!("uploadId={invalid_upload_id}")),
+            );
+            let invalid_response = send_signed_request_with_credentials(
+                "POST",
+                &invalid_url,
+                b"<",
+                [("content-type", "application/xml")],
+                credentials,
+            );
+            assert_invalid_upload_id_no_such_upload(&invalid_response, &invalid_upload_id);
+```
+
+crates/server-core/src/coordinator/authz/acl.rs (L720 to 739)
+  Note: The non-BOE authorization check that would reject unauthorized requesters is in the later complete_multipart_upload path, after the new pre-validation and XML parsing.
+```
+        let upload = storage_node
+            .load_in_progress_multipart_upload(bucket, key, upload_id)
+            .map_err(Self::map_object_pg_action_error)?;
+        let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+            PutObjectPolicyContext::default()
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
+                .with_if_match(req.cond.if_match_policy_value())
+                .with_if_none_match(req.cond.if_none_match_policy_value())
+                .with_object_creation_operation(true),
+            &upload,
+        );
+        if !self.requester_can_write_multipart_upload_with_bucket_policy(
+            req.upload.requester(),
+            &bucket_info,
+            bucket_tags.as_deref(),
+            &upload,
+            policy_context,
+            bucket_policy.as_deref(),
+        )? {
+            return Err(ServerError::AccessDenied);
+```
+
+crates/server-core/src/coordinator/authz/modern.rs (L391 to 413)
+  Note: The BOE authorization check is also in the later complete_multipart_upload path and is not reached for malformed XML after the pre-validation succeeds.
+```
+        #[cfg(not(test))]
+        let upload = storage_node
+            .load_in_progress_multipart_upload(bucket, key, upload_id)
+            .map_err(Self::map_object_pg_action_error)?;
+        let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+            PutObjectPolicyContext::default()
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
+                .with_if_match(req.cond.if_match_policy_value())
+                .with_if_none_match(req.cond.if_none_match_policy_value())
+                .with_object_creation_operation(true),
+            &upload,
+        );
+        let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+        if write_multipart_upload_with_bucket_policy(
+            req.upload.requester(),
+            modern_bucket,
+            modern_bucket_tags,
+            &upload,
+            &policy_context,
+            bucket_policy.as_deref(),
+        )? != ModernObjectWriteAuthorization::Allowed
+        {
+            return Err(ServerError::AccessDenied);
+```
+
+crates/server-core/src/coordinator/multipart.rs (L820 to 837)
+  Note: The new validation helper only loads the in-progress multipart upload by bucket/key/uploadId and does not authorize the requester or check bucket policy/ACLs.
+```
+    /// Validate the upload target before parsing a completion body.
+    ///
+    /// AWS resolves a missing or wrong-key upload ID before reporting malformed
+    /// completion XML, while authorization still follows XML validation. The
+    /// full completion path repeats this lookup so a concurrent terminal state
+    /// transition cannot use a stale existence check.
+    pub fn validate_complete_multipart_upload_target(
+        &self,
+        upload: &MultipartObjectRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.storage_node()
+            .load_in_progress_multipart_upload(
+                upload.bucket_name_typed(),
+                upload.key_typed(),
+                upload.upload_id(),
+            )
+            .map(|_| ())
+            .map_err(Self::map_object_pg_action_error)
+```
+
+crates/server-http/src/http/mod.rs (L2925 to 2959)
+  Note: CompleteMultipartUpload now performs the upload target validation before XML parsing; NoSuchUpload is returned immediately, while an existing upload proceeds to MalformedXML handling before normal authorization.
+```
+                let upload_id =
+                    match parse_required_upload_id(req.query_param_lossy("uploadId").as_deref()) {
+                        Ok(upload_id) => upload_id,
+                        Err(ServerError::NoSuchUpload { upload_id }) => {
+                            return Ok(S3Response::complete_multipart_no_such_upload(
+                                &upload_id, &wire_ids,
+                            ));
+                        }
+                        Err(err) => return Err(err),
+                    };
+                let upload_id_text = upload_id.as_str().to_string();
+                let requester = self.requester_from_auth(auth, req);
+                let upload_request = multipart_object_request(
+                    &bucket,
+                    &key,
+                    upload_id,
+                    requester,
+                    expected_bucket_owner,
+                )?;
+                match self
+                    .coordinator
+                    .validate_complete_multipart_upload_target(&upload_request)
+                {
+                    Ok(()) => {}
+                    Err(ServerError::NoSuchUpload { upload_id }) => {
+                        return Ok(S3Response::complete_multipart_no_such_upload(
+                            &upload_id, &wire_ids,
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                }
+                let parts = match xml::parse_complete_multipart_upload_xml(&req.body) {
+                    Ok(parts) => parts,
+                    Err(ServerError::MalformedXML { .. }) => {
+                        return Ok(S3Response::complete_multipart_malformed_xml(&wire_ids));
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at low. Static evidence confirms a real authorization-ordering oracle in the main runtime path: CompleteMultipartUpload performs a storage lookup before XML parsing and before later ACL/policy authorization, and the resulting 400-vs-404 responses reveal whether the exact active upload exists. The path is in scope and network reachable through the argmin-s3 HTTP frontend. However, the impact is limited to multipart upload existence metadata for a precise bucket/key/uploadId; there is no demonstrated read, write, completion, deletion, credential exposure, or availability impact. The uploadId is generated from secure randomness as 128 characters over a 64-character alphabet, so blind discovery is infeasible. Probability times impact therefore supports low severity, not medium/high/critical.
+## Likelihood
+low - The HTTP path is reachable in the product runtime and can be exercised by anonymous or unauthorized requesters where the service is reachable, but practical exploitation is unlikely because it requires the exact active 128-character uploadId plus bucket/key. Blind probing is not credible.
+## Impact
+low - The issue discloses only whether a specific bucket/key/uploadId corresponds to an active in-progress multipart upload. It does not expose object contents, credentials, object metadata beyond existence of the active upload target, or allow mutation/completion/deletion. Upload IDs are high entropy, so the useful attack case requires prior knowledge or leakage of an upload ID.
+## Assumptions
+- No repository deployment manifest proves public internet exposure; the HTTP frontend is a product runtime service and can be made remotely reachable by configuring ARGMIN_LISTEN_ADDR.
+- The attacker can send HTTP requests to the S3-compatible frontend but does not have authorization to complete the victim multipart upload.
+- Practical exploitation requires knowing or obtaining the bucket name, object key, and 128-character multipart upload ID; blind guessing of upload IDs is impractical.
+- This attack-path review used repository artifacts only and did not call external cloud APIs.
+- Reachable argmin-s3 HTTP frontend
+- Active in-progress multipart upload
+- Known bucket name, object key, and uploadId
+- Malformed CompleteMultipartUpload body such as '<'
+- Requester is anonymous or otherwise unauthorized for the target upload
+## Path
+attacker HTTP POST ?uploadId=... body '<' -> router CompleteMultipartUpload -> anonymous/alt requester -> validate_complete_multipart_upload_target(bucket,key,id) before authz -> {exists: 400 MalformedXML, missing: 404 NoSuchUpload} -> upload-existence oracle
+## Path evidence
+- `crates/server-http/src/http/router.rs:657-665` - POST object requests containing the uploadId query parameter are routed to S3Operation::CompleteMultipartUpload.
+- `crates/server-http/src/http/mod.rs:3215-3225` - The HTTP authentication wrapper maps MissingAuth to AuthContext::anonymous, making HTTP dispatch reachable without valid credentials where operation authorization later permits or rejects.
+- `crates/server-http/src/http/mod.rs:2925-2959` - CompleteMultipartUpload parses uploadId, builds MultipartObjectRequest, calls validate_complete_multipart_upload_target, returns NoSuchUpload on failed lookup, and only then parses XML, returning MalformedXML for malformed bodies.
+- `crates/server-core/src/coordinator/multipart.rs:826-837` - validate_complete_multipart_upload_target only calls load_in_progress_multipart_upload(bucket,key,upload_id) and does not check requester, policy, ACL, or expected bucket owner.
+- `crates/server-core/src/coordinator/authz/acl.rs:720-740` - The ACL authorization gate that can return AccessDenied occurs later in the normal complete_multipart_upload path, after the pre-validation and XML parsing path.
+- `crates/server-core/src/coordinator/authz/modern.rs:391-413` - The modern bucket-owner-enforced authorization gate is also in the later completion path and is not reached for malformed XML after successful pre-validation.
+- `crates/server-http/src/http/response.rs:2306-2321` - The oracle is externally observable because complete_multipart_malformed_xml returns HTTP 400 while complete_multipart_no_such_upload returns HTTP 404.
+- `crates/server-core/src/coordinator/multipart.rs:384-398` - Multipart upload IDs are generated from secure random bytes and mapped into a 64-character alphabet.
+- `crates/storage/src/types.rs:287-288` - Upload IDs are 128 characters from a 64-character alphabet, strongly mitigating blind guessing.
+- `crates/argmin-s3/src/config.rs:328-333` - Runtime credentials and listen address are environment driven; default listen address is 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:5480-5497` - The product frontend binds a TCP listener on the configured listen address and optionally enables TLS.
+## Narrative
+The finding is a real, reachable product-runtime issue but its impact is low. The HTTP router treats POST object requests with an uploadId query as CompleteMultipartUpload. The dispatcher then parses the attacker-supplied uploadId, builds a requester from the auth context, and calls validate_complete_multipart_upload_target before XML parsing and before the normal complete_multipart_upload authorization path. That helper only loads an in-progress multipart upload by bucket, key, and uploadId. If it exists, malformed XML returns 400 MalformedXML; if it does not, the response is 404 NoSuchUpload. Missing authentication can become an anonymous AuthContext, so the path is reachable by unauthenticated requests where the frontend is reachable. However, exploitation only discloses whether a specific active multipart upload target exists, does not permit completing, reading, writing, or deleting objects, and requires knowledge of a high-entropy 128-character upload ID.
+## Controls
+- SigV4 authentication is implemented, but MissingAuth is converted to anonymous and the vulnerable lookup occurs before authorization.
+- Bucket policy and ACL authorization exist in the normal complete_multipart_upload path, but are reached only after XML parsing.
+- Multipart upload IDs are 128 characters from a 64-character alphabet generated with ring::rand::SystemRandom.
+- Default listener is localhost 127.0.0.1:9000, though operators can bind to broader interfaces.
+- Request body sizes, max connections, and max in-flight requests are configurable controls for availability, not for this oracle.
+## Blindspots
+- No Kubernetes, Terraform, or load-balancer manifests were found or inspected that would prove whether a typical deployment is public or internal.
+- This stage did not run the validation PoC; it relied on repository code plus provided validation evidence from an earlier stage.
+- Operational logging, proxies, or clients outside the repository could leak upload IDs and make exploitation more practical, but that is not evidenced in the repository artifacts.
