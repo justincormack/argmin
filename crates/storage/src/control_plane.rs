@@ -67,6 +67,7 @@ const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 1 + 4 + 1;
 const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
 const CONTROL_PLANE_RPC_PENDING_RECOVERY_TASK_MIN_LEN: usize = 4 + 4 + 8 + 8 + 8;
 const CONTROL_PLANE_RPC_PENDING_RECOVERY_FAILURE_MIN_LEN: usize = 4 + 1 + 4;
+const CONTROL_PLANE_RPC_NODE_LEASE_DIAGNOSTIC_MIN_LEN: usize = 4 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY: u8 = 1;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED: u8 = 2;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX: u8 = 3;
@@ -5981,6 +5982,22 @@ pub trait ControlPlaneRuntimeMapSource {
         ))
     }
 
+    fn runtime_map_diagnostics_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneError> {
+        let runtime_map = self.runtime_map_snapshot(authority_now_ms)?;
+        let node_leases = runtime_map
+            .nodes()
+            .iter()
+            .map(|node| ControlPlaneRuntimeMapNodeLeaseDiagnostic {
+                node_id: node.node_id(),
+                lease_deadline_ms: None,
+            })
+            .collect();
+        ControlPlaneRuntimeMapDiagnosticSnapshot::new(runtime_map, node_leases)
+    }
+
     fn pending_metadata_command_recoveries(
         &self,
         authority_now_ms: u64,
@@ -6244,6 +6261,72 @@ pub struct ControlPlaneRuntimeMapDiagnostics {
     raft_wal_metrics: observability::ControlPlaneRaftWalMetricSnapshot,
     raft_command_metrics: observability::ControlPlaneRaftCommandMetricSnapshot,
     history_reference_samples: Vec<observability::ControlPlaneHistoryReferenceSample>,
+    node_leases: Vec<ControlPlaneRuntimeMapNodeLeaseDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneRuntimeMapNodeLeaseDiagnostic {
+    node_id: NodeId,
+    lease_deadline_ms: Option<u64>,
+}
+
+impl ControlPlaneRuntimeMapNodeLeaseDiagnostic {
+    #[must_use]
+    pub(crate) fn new(node_id: NodeId, lease_deadline_ms: Option<u64>) -> Self {
+        Self {
+            node_id,
+            lease_deadline_ms,
+        }
+    }
+
+    #[must_use]
+    pub fn node_id(self) -> NodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub fn lease_deadline_ms(self) -> Option<u64> {
+        self.lease_deadline_ms
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRuntimeMapDiagnosticSnapshot {
+    runtime_map: ClusterRuntimeMapSnapshot,
+    node_leases: Vec<ControlPlaneRuntimeMapNodeLeaseDiagnostic>,
+}
+
+impl ControlPlaneRuntimeMapDiagnosticSnapshot {
+    pub(crate) fn new(
+        runtime_map: ClusterRuntimeMapSnapshot,
+        node_leases: Vec<ControlPlaneRuntimeMapNodeLeaseDiagnostic>,
+    ) -> Result<Self, ControlPlaneError> {
+        if node_leases.len() != runtime_map.nodes().len()
+            || !node_leases
+                .iter()
+                .zip(runtime_map.nodes())
+                .all(|(lease, node)| lease.node_id == node.node_id())
+        {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: "control-plane diagnostic node leases do not match runtime-map nodes"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            runtime_map,
+            node_leases,
+        })
+    }
+
+    #[must_use]
+    pub fn runtime_map(&self) -> &ClusterRuntimeMapSnapshot {
+        &self.runtime_map
+    }
+
+    #[must_use]
+    pub fn node_leases(&self) -> &[ControlPlaneRuntimeMapNodeLeaseDiagnostic] {
+        &self.node_leases
+    }
 }
 
 impl ControlPlaneRuntimeMapDiagnostics {
@@ -6284,6 +6367,11 @@ impl ControlPlaneRuntimeMapDiagnostics {
         &self,
     ) -> &[observability::ControlPlaneHistoryReferenceSample] {
         &self.history_reference_samples
+    }
+
+    #[must_use]
+    pub fn node_leases(&self) -> &[ControlPlaneRuntimeMapNodeLeaseDiagnostic] {
+        &self.node_leases
     }
 }
 
@@ -7772,6 +7860,22 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
         let runtime_map = self.snapshot.runtime_map(authority_now_ms)?;
         *cached = Some(RuntimeMapContentCertificate::from_runtime_map(&runtime_map));
         Ok(ControlPlaneRuntimeMapStatus::from_runtime_map(&runtime_map))
+    }
+
+    fn runtime_map_diagnostics_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneError> {
+        let runtime_map = self.snapshot.runtime_map(authority_now_ms)?;
+        let node_leases = self
+            .snapshot
+            .nodes()
+            .map(|node| ControlPlaneRuntimeMapNodeLeaseDiagnostic {
+                node_id: node.node_id(),
+                lease_deadline_ms: node.lease_deadline_ms(),
+            })
+            .collect();
+        ControlPlaneRuntimeMapDiagnosticSnapshot::new(runtime_map, node_leases)
     }
 
     fn pending_metadata_command_recoveries(
@@ -11531,7 +11635,7 @@ where
             };
             let reader = PayloadReader::new(&payload);
             reader.finish()?;
-            let response = match control_plane.runtime_map_snapshot(authority_now_ms) {
+            let response = match control_plane.runtime_map_diagnostics_snapshot(authority_now_ms) {
                 Ok(snapshot) => {
                     let mut response = Vec::new();
                     write_control_plane_runtime_map_diagnostics(&mut response, &snapshot)?;
@@ -12752,8 +12856,9 @@ fn read_runtime_map_status(
 
 fn write_control_plane_runtime_map_diagnostics(
     out: &mut Vec<u8>,
-    runtime_map: &ClusterRuntimeMapSnapshot,
+    diagnostics: &ControlPlaneRuntimeMapDiagnosticSnapshot,
 ) -> Result<(), ControlPlaneError> {
+    let runtime_map = diagnostics.runtime_map();
     write_runtime_map_snapshot(out, runtime_map)?;
     let rpc_metrics = observability::control_plane_rpc_metrics_snapshot();
     write_u32(
@@ -12852,6 +12957,17 @@ fn write_control_plane_runtime_map_diagnostics(
         write_option_u64(out, sample.oldest_live_placement_epoch);
         write_option_u64(out, sample.oldest_durable_backfill_epoch);
         write_option_u64(out, sample.oldest_pending_metadata_command_epoch);
+    }
+    write_u32(
+        out,
+        len_as_u32(
+            diagnostics.node_leases().len(),
+            "control-plane diagnostic node leases",
+        )?,
+    );
+    for node_lease in diagnostics.node_leases() {
+        write_u32(out, node_lease.node_id().as_u32());
+        write_option_u64(out, node_lease.lease_deadline_ms());
     }
     Ok(())
 }
@@ -13035,6 +13151,35 @@ fn read_control_plane_runtime_map_diagnostics(
                 .map(ClusterEpoch::get),
         });
     }
+    let node_lease_count = reader.read_collection_len(
+        "control-plane diagnostic node leases",
+        CONTROL_PLANE_RPC_NODE_LEASE_DIAGNOSTIC_MIN_LEN,
+    )?;
+    if node_lease_count != runtime_map.nodes().len() {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!(
+                "control-plane diagnostic node lease count {node_lease_count} does not match runtime node count {}",
+                runtime_map.nodes().len()
+            ),
+        });
+    }
+    let mut node_leases = Vec::with_capacity(node_lease_count);
+    for expected_node in runtime_map.nodes() {
+        let node_id = NodeId::new(reader.read_u32()?);
+        if node_id != expected_node.node_id() {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane diagnostic node lease names node {}, expected canonical node {}",
+                    node_id.as_u32(),
+                    expected_node.node_id().as_u32()
+                ),
+            });
+        }
+        node_leases.push(ControlPlaneRuntimeMapNodeLeaseDiagnostic {
+            node_id,
+            lease_deadline_ms: reader.read_option_u64()?,
+        });
+    }
     Ok(ControlPlaneRuntimeMapDiagnostics {
         runtime_map,
         rpc_metrics,
@@ -13043,6 +13188,7 @@ fn read_control_plane_runtime_map_diagnostics(
         raft_wal_metrics,
         raft_command_metrics,
         history_reference_samples,
+        node_leases,
     })
 }
 
@@ -25775,6 +25921,10 @@ mod tests {
             kind: ControlPlaneRpcKind::RuntimeMapDiagnostics,
             payload: Vec::new(),
         };
+        let expected_lease_deadline_ms = authority
+            .snapshot()
+            .node(NodeId::new(DIAGNOSTIC_NODE_ID))
+            .and_then(NodeControlRecord::lease_deadline_ms);
 
         let response = build_control_plane_unix_response(&mut authority, request, 2_008).unwrap();
 
@@ -25793,6 +25943,13 @@ mod tests {
         assert_eq!(
             diagnostics.history_reference_samples(),
             &[expected_stale_sample]
+        );
+        assert_eq!(
+            diagnostics.node_leases(),
+            &[ControlPlaneRuntimeMapNodeLeaseDiagnostic::new(
+                NodeId::new(DIAGNOSTIC_NODE_ID),
+                expected_lease_deadline_ms,
+            )]
         );
 
         observability::record_control_plane_history_reference_sample(

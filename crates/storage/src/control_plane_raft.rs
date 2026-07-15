@@ -44,9 +44,10 @@ use placement::NodeId;
 
 use crate::control_plane::{
     AuthorityIncarnation, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneError, ControlPlaneRuntimeMapStatus,
-    NodeAvailabilityState, NodeMembershipState, RuntimeMapContentCertificate,
-    RuntimeMapFreshnessProof,
+    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneError,
+    ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapNodeLeaseDiagnostic,
+    ControlPlaneRuntimeMapStatus, NodeAvailabilityState, NodeMembershipState,
+    RuntimeMapContentCertificate, RuntimeMapFreshnessProof,
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
@@ -4120,15 +4121,37 @@ impl ControlPlaneRaftAuthority {
         result
     }
 
+    /// Returns local serving status only after a ReadIndex round confirms that
+    /// this process still holds authority from the live voter quorum.
+    pub async fn confirmed_linearized_authority_status(
+        &self,
+    ) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
+        let status = self.status().await?;
+        if !status.linearized_authority_serving() {
+            return Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "local OpenRaft authority is not the serving leader: {:?}",
+                    status.linearized_authority_readiness()
+                ),
+            });
+        }
+        self.raft
+            .ensure_linearizable(ReadPolicy::ReadIndex)
+            .await
+            .map_err(|error| ControlPlaneError::RpcRemote {
+                message: format!(
+                    "local OpenRaft authority is not the serving leader: command-authority read-index failed: {error}"
+                ),
+            })?;
+        Ok(status)
+    }
+
     async fn submit_control_plane_command_locked(
         &self,
         mut command: ControlPlaneCommand,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
-        let status = self.status().await?;
-        let authority_term = status
-            .linearized_authority_serving()
-            .then_some(status.current_term())
-            .flatten();
+        let status = self.confirmed_linearized_authority_status().await?;
+        let authority_term = status.current_term();
         let (mut durable_snapshot, durable_applied) = self.durable_snapshot_and_applied().await?;
         let mut overlay_snapshot = match (authority_term, status.applied(), durable_applied) {
             (Some(authority_term), Some(status_applied), Some(durable_applied))
@@ -4261,10 +4284,9 @@ impl ControlPlaneRaftAuthority {
         Ok(Some(next_snapshot))
     }
 
-    pub async fn linearized_runtime_map_snapshot(
+    async fn linearized_control_plane_snapshot(
         &self,
-        issued_at_ms: u64,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+    ) -> Result<(ClusterControlSnapshot, ControlPlaneLogId), ControlPlaneError> {
         let (durable_snapshot, base_applied) =
             control_plane_snapshot_via_openraft_read_index(&self.raft).await?;
         let read_index = control_plane_log_id_from_raft(base_applied).ok_or_else(|| {
@@ -4278,14 +4300,7 @@ impl ControlPlaneRaftAuthority {
             .then_some(status.current_term())
             .flatten()
         else {
-            return durable_snapshot.runtime_map_with_freshness_proof(
-                issued_at_ms,
-                RuntimeMapFreshnessProof::ReadIndex {
-                    authority_incarnation: durable_snapshot.authority_incarnation(),
-                    read_index,
-                    issued_at_ms,
-                },
-            );
+            return Ok((durable_snapshot, read_index));
         };
         let snapshot = if status.applied() == Some(base_applied) {
             self.volatile_heartbeat_overlay_snapshot(authority_term, base_applied)?
@@ -4293,6 +4308,14 @@ impl ControlPlaneRaftAuthority {
         } else {
             durable_snapshot
         };
+        Ok((snapshot, read_index))
+    }
+
+    pub async fn linearized_runtime_map_snapshot(
+        &self,
+        issued_at_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let (snapshot, read_index) = self.linearized_control_plane_snapshot().await?;
         snapshot.runtime_map_with_freshness_proof(
             issued_at_ms,
             RuntimeMapFreshnessProof::ReadIndex {
@@ -4301,6 +4324,31 @@ impl ControlPlaneRaftAuthority {
                 issued_at_ms,
             },
         )
+    }
+
+    pub async fn linearized_runtime_map_diagnostics_snapshot(
+        &self,
+        issued_at_ms: u64,
+    ) -> Result<ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneError> {
+        let (snapshot, read_index) = self.linearized_control_plane_snapshot().await?;
+        let node_leases = snapshot
+            .nodes()
+            .map(|node| {
+                ControlPlaneRuntimeMapNodeLeaseDiagnostic::new(
+                    node.node_id(),
+                    node.lease_deadline_ms(),
+                )
+            })
+            .collect();
+        let runtime_map = snapshot.runtime_map_with_freshness_proof(
+            issued_at_ms,
+            RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation: snapshot.authority_incarnation(),
+                read_index,
+                issued_at_ms,
+            },
+        )?;
+        ControlPlaneRuntimeMapDiagnosticSnapshot::new(runtime_map, node_leases)
     }
 
     pub async fn linearized_runtime_map_status(
@@ -12418,6 +12466,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            wait_for_authority_status_matching(
+                &authority1,
+                Duration::from_secs(1),
+                "Unix-peer two-node leader applies initialization",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
 
             let write = authority1
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -13141,6 +13196,13 @@ mod tests {
             .await
             .unwrap();
         wait_for_local_leader(authority1.raft(), "two-node initialized leadership").await;
+        wait_for_authority_status_matching(
+            &authority1,
+            Duration::from_secs(1),
+            "two-node leader applies initialization",
+            ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+        )
+        .await;
 
         (authority1, authority2)
     }
@@ -13199,6 +13261,13 @@ mod tests {
             .await
             .unwrap();
         wait_for_local_leader(authority1.raft(), "three-node initialized leadership").await;
+        wait_for_authority_status_matching(
+            &authority1,
+            Duration::from_secs(1),
+            "three-node leader applies initialization",
+            ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+        )
+        .await;
 
         (authority1, authority2, authority3)
     }
@@ -13288,6 +13357,13 @@ mod tests {
             .await
             .unwrap();
         wait_for_local_leader(authority1.raft(), "three-voter initialized leadership").await;
+        wait_for_authority_status_matching(
+            &authority1,
+            Duration::from_secs(1),
+            "three-voter leader applies initialization",
+            ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+        )
+        .await;
 
         ThreeVoterAuthorityFixture {
             network,
@@ -14287,6 +14363,13 @@ mod tests {
                 .await
                 .unwrap();
             wait_for_local_leader(authority.raft(), "stale captured checkpoint leadership").await;
+            wait_for_authority_status_matching(
+                &authority,
+                Duration::from_secs(1),
+                "stale captured checkpoint authority applies initialization",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
 
             let stale = authority
                 .capture_durable_restart_checkpoint()
@@ -16345,6 +16428,13 @@ mod tests {
                 .await
                 .unwrap();
             wait_for_local_leader(authority.raft(), "single-node initialization leadership").await;
+            wait_for_authority_status_matching(
+                &authority,
+                Duration::from_secs(1),
+                "single-node authority applies initialization",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
 
             let bootstrap = authority
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -16559,6 +16649,13 @@ mod tests {
                 .await
                 .unwrap();
             wait_for_local_leader(authority.raft(), "single-node read-index leadership").await;
+            wait_for_authority_status_matching(
+                &authority,
+                Duration::from_secs(1),
+                "single-node read-index authority applies initialization",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
 
             let write = authority
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -16657,6 +16754,13 @@ mod tests {
                 .await
                 .unwrap();
             wait_for_local_leader(authority.raft(), "linearized authority trait leadership").await;
+            wait_for_authority_status_matching(
+                &authority,
+                Duration::from_secs(1),
+                "linearized authority applies initialization",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
 
             let handle = ControlPlaneRaftAuthorityHandle::new(Arc::clone(&authority));
             let linearized_authority = handle.as_linearized_authority();
@@ -17414,10 +17518,148 @@ mod tests {
             assert!(matches!(
                 err,
                 ControlPlaneError::RpcRemote { message }
-                    if message.contains("OpenRaft client-write failed")
+                    if message.contains("local OpenRaft authority is not the serving leader")
             ));
 
             authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_restarted_stale_leader_rejects_command_without_quorum() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let ThreeVoterAuthorityFixture {
+                network,
+                config,
+                leader_log_store,
+                third_log_store: _,
+                authority1,
+                authority2,
+                authority3,
+            } = initialized_three_node_voter_authorities(
+                "control-plane-raft-stale-restarted-leader-test",
+                91,
+                92,
+                93,
+            )
+            .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(91), "node-91".to_string()),
+                        (NodeId::new(92), "node-92".to_string()),
+                        (NodeId::new(93), "node-93".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            authority2
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
+                    Duration::from_secs(1),
+                    "second voter applied bootstrap before replacement election",
+                )
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
+                    Duration::from_secs(1),
+                    "third voter applied bootstrap before replacement election",
+                )
+                .await
+                .unwrap();
+
+            let restart_artifact =
+                capture_openraft_restart_artifact(&leader_log_store, &authority1).await;
+            authority1.transfer_leadership_to(92).await.unwrap();
+            authority2
+                .wait_for_current_leader(
+                    92,
+                    Duration::from_secs(1),
+                    "replacement voter observed transferred leadership",
+                )
+                .await
+                .unwrap();
+            wait_for_authority_status_matching(
+                &authority2,
+                Duration::from_secs(1),
+                "replacement voter became serving after transfer",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+            authority1.shutdown().await.unwrap();
+            network.unregister(91);
+
+            let replacement_status = authority2.status().await.unwrap();
+            assert_eq!(replacement_status.current_leader(), Some(92));
+
+            let (restored_log_store, restored_state_machine) = restart_artifact.restore().unwrap();
+            let restored_log_store_for_status = restored_log_store.clone();
+            let restarted_raft =
+                Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                    91,
+                    config,
+                    UnreachableRaftNetworkFactory,
+                    restored_log_store,
+                    restored_state_machine,
+                )
+                .await
+                .unwrap();
+            let restarted_authority = ControlPlaneRaftAuthority::new_with_log_store(
+                restarted_raft,
+                restored_log_store_for_status,
+                "test-cluster",
+            );
+            restarted_authority
+                .wait_for_current_leader(
+                    91,
+                    Duration::from_secs(1),
+                    "stale restarted leader restored its local leadership view",
+                )
+                .await
+                .unwrap();
+            let stale_status = restarted_authority.status().await.unwrap();
+            assert_eq!(stale_status.current_leader(), Some(91));
+            assert!(stale_status.linearized_authority_serving());
+            let before = restarted_authority
+                .current_control_plane_snapshot()
+                .await
+                .unwrap();
+
+            let error = expect_bounded_control_plane_raft_error(
+                restarted_authority.submit_control_plane_command(
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(92),
+                        availability: NodeAvailabilityState::Unavailable,
+                    },
+                ),
+                Duration::from_secs(1),
+                "stale restarted leader rejects command without quorum authority",
+            )
+            .await;
+            assert!(
+                matches!(
+                &error,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("local OpenRaft authority is not the serving leader")
+                        && message.contains("command-authority read-index failed")
+                ),
+                "stale restarted leader returned unexpected error: {error:?}"
+            );
+            assert_eq!(
+                restarted_authority
+                    .current_control_plane_snapshot()
+                    .await
+                    .unwrap(),
+                before
+            );
+
+            restarted_authority.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+            authority3.shutdown().await.unwrap();
         });
     }
 
@@ -17430,6 +17672,25 @@ mod tests {
                 102,
             )
             .await;
+
+            let follower_error = tokio::time::timeout(
+                Duration::from_secs(1),
+                authority2.submit_control_plane_command(
+                    ControlPlaneCommand::BootstrapInitialClusterMap {
+                        nodes: vec![(NodeId::new(102), "node-102".to_string())],
+                        pg_ids: vec![PgId::new(0)],
+                    },
+                ),
+            )
+            .await
+            .expect("follower command submission should fail without waiting for Raft")
+            .unwrap_err();
+            assert!(matches!(
+                follower_error,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("local OpenRaft authority is not the serving leader")
+                        && message.contains("NotLocalLeader")
+            ));
 
             let write = authority1
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -17677,11 +17938,7 @@ mod tests {
                 })
                 .await
                 .unwrap_err();
-            assert!(matches!(
-                old_leader_err,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("OpenRaft client-write failed")
-            ));
+            assert!(old_leader_err.is_control_plane_leader_routing_rejection());
             let old_leader_replace_voters_err = authority1
                 .replace_voters(BTreeSet::from([701]), false)
                 .await
@@ -17945,11 +18202,7 @@ mod tests {
                 "two-node membership test removed voter write",
             )
             .await;
-            assert!(matches!(
-                removed_write_err,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("OpenRaft client-write failed")
-            ));
+            assert!(removed_write_err.is_control_plane_leader_routing_rejection());
 
             let follow_up = expect_bounded_control_plane_raft(
                 authority1.submit_control_plane_command(
@@ -18202,6 +18455,13 @@ mod tests {
             wait_for_local_leader(
                 authority1.raft(),
                 "two-voter cluster initialized before promoted-voter restart",
+            )
+            .await;
+            wait_for_authority_status_matching(
+                &authority1,
+                Duration::from_secs(1),
+                "two-voter leader applies initialization before promoted-voter restart",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
             )
             .await;
 
@@ -19104,11 +19364,7 @@ mod tests {
                 })
                 .await
                 .unwrap_err();
-            assert!(matches!(
-                follower_write_err,
-                ControlPlaneError::RpcRemote { message }
-                    if message.contains("OpenRaft client-write failed")
-            ));
+            assert!(follower_write_err.is_control_plane_leader_routing_rejection());
 
             let (restored_log_store, restored_state_machine) = restart_artifact.restore().unwrap();
             let restored_log_store_for_status = restored_log_store.clone();

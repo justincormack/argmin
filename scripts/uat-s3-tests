@@ -717,19 +717,65 @@ kill_control_plane() {
     done
 }
 
-current_replicated_control_plane_leader() {
+replicated_control_plane_leader=""
+replicated_control_plane_leader_status=""
+
+observe_replicated_control_plane_leader() {
+    local preferred_raft_node_id="${1:-}"
+    replicated_control_plane_leader=""
+    replicated_control_plane_leader_status=""
+    local quorum=$(((${#control_plane_raft_node_ids[@]} / 2) + 1))
+    local highest_term=-1
+    local highest_term_observations=0
+    local raft_node_ids=()
+    if [[ -n "$preferred_raft_node_id" ]]; then
+        raft_node_ids+=("$preferred_raft_node_id")
+    fi
     local raft_node_id
     for raft_node_id in "${control_plane_raft_node_ids[@]}"; do
+        [[ "$raft_node_id" == "$preferred_raft_node_id" ]] || raft_node_ids+=("$raft_node_id")
+    done
+    for raft_node_id in "${raft_node_ids[@]}"; do
         local pid="${control_plane_pids[$raft_node_id]:-}"
         [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || continue
         local status
-        if status="$(control_plane_authority_clock_status_for_node "$raft_node_id" 2>/dev/null)" \
-            && [[ "$status" == *"local_raft_authority_leader=true"* ]]; then
-            echo "$raft_node_id"
-            return 0
+        status="$(control_plane_authority_clock_status_for_node "$raft_node_id" 2>/dev/null)" || continue
+        local current_term
+        current_term="$(authority_clock_status_field "$status" current_raft_term)" || continue
+        [[ "$current_term" =~ ^[0-9]+$ ]] || continue
+        local local_leader
+        local local_serving
+        local_leader="$(authority_clock_status_field "$status" local_raft_authority_leader)" || continue
+        local_serving="$(authority_clock_status_field "$status" local_raft_authority_serving)" || continue
+
+        if ((current_term > highest_term)); then
+            highest_term="$current_term"
+            highest_term_observations=1
+            replicated_control_plane_leader=""
+            replicated_control_plane_leader_status=""
+        elif ((current_term == highest_term)); then
+            ((highest_term_observations += 1))
+        else
+            continue
+        fi
+
+        if [[ "$local_leader" == "true" && "$local_serving" == "true" ]]; then
+            if [[ -n "$replicated_control_plane_leader" ]]; then
+                replicated_control_plane_leader=""
+                replicated_control_plane_leader_status=""
+                return 1
+            fi
+            replicated_control_plane_leader="$raft_node_id"
+            replicated_control_plane_leader_status="$status"
         fi
     done
-    return 1
+    ((highest_term_observations >= quorum)) || return 1
+    [[ -n "$replicated_control_plane_leader" ]]
+}
+
+current_replicated_control_plane_leader() {
+    observe_replicated_control_plane_leader || return 1
+    echo "$replicated_control_plane_leader"
 }
 
 control_plane_authority_clock_status_for_node() {
@@ -754,10 +800,8 @@ authority_clock_status_field() {
 
 fail_if_replicated_control_plane_authority_clock_blocked() {
     ((replicated_control_plane)) || return 0
-    local leader
-    leader="$(current_replicated_control_plane_leader)" || return 0
-    local status
-    status="$(control_plane_authority_clock_status_for_node "$leader" 2>/dev/null)" || return 0
+    observe_replicated_control_plane_leader || return 0
+    local status="$replicated_control_plane_leader_status"
     local established
     established="$(authority_clock_status_field "$status" established)" ||
         die "replicated control-plane authority-clock status omitted established state: $status"
@@ -778,8 +822,9 @@ reestablish_replicated_control_plane_after_term_change() {
     local status=""
     local current_term=""
     for ((attempt = 0; attempt < 200; attempt++)); do
-        if leader="$(current_replicated_control_plane_leader)" \
-            && status="$(control_plane_authority_clock_status_for_node "$leader" 2>/dev/null)"; then
+        if observe_replicated_control_plane_leader "$leader"; then
+            leader="$replicated_control_plane_leader"
+            status="$replicated_control_plane_leader_status"
             current_term="$(authority_clock_status_field "$status" current_raft_term)" ||
                 die "$transition_label authority-clock status omitted current Raft term: $status"
             if [[ "$current_term" =~ ^[0-9]+$ ]] && ((current_term > previous_term)); then
@@ -843,12 +888,13 @@ recover_replicated_control_plane_rejoin_term_if_needed() {
     # for five seconds, leaving an additional convergence interval before
     # ordinary observational readiness polling resumes.
     local stable_observations=0
-    local required_stable_observations=51
-    for ((attempt = 0; attempt < 300; attempt++)); do
-        local leader
-        local status
-        if leader="$(current_replicated_control_plane_leader)" \
-            && status="$(control_plane_authority_clock_status_for_node "$leader" 2>/dev/null)"; then
+    local required_stable_observations=11
+    local leader=""
+    local status=""
+    for ((attempt = 0; attempt < 120; attempt++)); do
+        if observe_replicated_control_plane_leader "$leader"; then
+            leader="$replicated_control_plane_leader"
+            status="$replicated_control_plane_leader_status"
             local current_term
             current_term="$(authority_clock_status_field "$status" current_raft_term)" ||
                 die "rejoined voter status omitted current Raft term: $status"
@@ -877,9 +923,11 @@ recover_replicated_control_plane_rejoin_term_if_needed() {
             fi
         else
             stable_observations=0
+            leader=""
         fi
-        sleep 0.1
+        sleep 0.5
     done
+    [[ -z "$status" ]] || echo "$status" >&2
     die "rejoined voter did not retain an established authority clock in one stable Raft term"
 }
 
@@ -897,15 +945,14 @@ restart_control_plane() {
     if ((replicated_control_plane)); then
         local old_leader
         for ((attempt = 0; attempt < 200; attempt++)); do
-            if old_leader="$(current_replicated_control_plane_leader)"; then
+            if observe_replicated_control_plane_leader; then
+                old_leader="$replicated_control_plane_leader"
                 break
             fi
             sleep 0.1
         done
         [[ -n "${old_leader:-}" ]] || die "could not identify replicated control-plane leader"
-        local old_status
-        old_status="$(control_plane_authority_clock_status_for_node "$old_leader")" ||
-            die "could not read replicated control-plane leader status before restart"
+        local old_status="$replicated_control_plane_leader_status"
         local old_term
         old_term="$(authority_clock_status_field "$old_status" current_raft_term)" ||
             die "replicated control-plane leader status omitted current Raft term: $old_status"
@@ -913,11 +960,20 @@ restart_control_plane() {
             die "replicated control-plane leader status has invalid current Raft term: $old_status"
         [[ "$(authority_clock_status_field "$old_status" established)" == "true" ]] ||
             die "replicated control-plane leader was already clock-blocked before restart: $old_status"
+        local pre_failover_diagnostics
+        pre_failover_diagnostics="$("${server_cmd[@]}" control-plane-runtime-map-diagnostics \
+            "$control_plane_socket_path" 2>/dev/null)" ||
+            die "could not read replicated control-plane diagnostics before leader restart"
         local pre_failover_epoch
-        pre_failover_epoch="$(control_plane_cluster_epoch)" ||
-            die "could not read replicated control-plane epoch before leader restart"
+        pre_failover_epoch="$(runtime_map_diagnostics_summary_field \
+            "$pre_failover_diagnostics" epoch)" ||
+            die "replicated control-plane diagnostics omitted the pre-failover epoch"
         [[ "$pre_failover_epoch" =~ ^[0-9]+$ ]] ||
             die "replicated control-plane returned invalid pre-failover epoch $pre_failover_epoch"
+        local pre_failover_max_node_lease_deadline_ms
+        pre_failover_max_node_lease_deadline_ms="$(runtime_map_max_node_lease_deadline \
+            "$pre_failover_diagnostics")" ||
+            die "replicated control-plane diagnostics omitted a pre-failover storage-node lease"
         local post_failover_min_epoch=$((pre_failover_epoch + 1))
         echo "== argmin-s3 UAT restart replicated control-plane leader $old_leader =="
         kill_control_plane_node "$old_leader"
@@ -930,11 +986,13 @@ restart_control_plane() {
         # Bind clock authority only after all three voters are back so the
         # resumed storage heartbeats cannot retain the interim term binding.
         recover_replicated_control_plane_rejoin_term_if_needed "$replacement_term"
-        # Do not accept the still-serving pre-failover map. The predecessor
-        # horizon can keep it valid briefly before lease expiry starts peering;
-        # wait for that transition and subsequent heartbeat convergence to
-        # publish a newer epoch with every PG serving.
-        wait_for_control_plane_runtime_map_ready 30 "$post_failover_min_epoch"
+        # Do not accept the still-serving pre-failover map. Epoch movement can
+        # come from unrelated expiry or peering commands while every PG still
+        # depends on predecessor-term leases. Require every storage node to
+        # renew beyond the greatest predecessor deadline in the same snapshot
+        # that reports every PG serving.
+        wait_for_control_plane_runtime_map_ready 30 "$post_failover_min_epoch" \
+            "$pre_failover_max_node_lease_deadline_ms"
         return
     fi
     echo "== argmin-s3 UAT restart control-plane =="
@@ -1091,29 +1149,146 @@ control_plane_node_aligned_epoch() {
 wait_for_control_plane_runtime_map_ready() {
     local deadline_seconds="$1"
     local min_epoch="${2:-1}"
+    local renewed_after_deadline_ms="${3:-}"
     local start
     start="$(date +%s)"
     while true; do
         fail_if_replicated_control_plane_authority_clock_blocked
-        local map_status
-        if map_status="$("${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" 2>/dev/null)"; then
-            if control_plane_runtime_map_status_ready "$map_status" "$min_epoch"; then
+        if [[ -n "$renewed_after_deadline_ms" ]]; then
+            local diagnostics
+            local renewed_epoch
+            if diagnostics="$("${server_cmd[@]}" control-plane-runtime-map-diagnostics \
+                "$control_plane_socket_path" 2>/dev/null)" \
+                && renewed_epoch="$(runtime_map_diagnostics_renewed_ready_epoch \
+                    "$diagnostics" "$min_epoch" "$renewed_after_deadline_ms")"; then
+                echo "== argmin-s3 UAT control-plane runtime map ready at epoch $renewed_epoch with all storage-node leases renewed beyond $renewed_after_deadline_ms ms =="
+                control_plane_runtime_map_ready_epoch="$renewed_epoch"
+                return 0
+            fi
+        else
+            local map_status
+            if map_status="$("${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" 2>/dev/null)" \
+                && control_plane_runtime_map_status_ready "$map_status" "$min_epoch"; then
                 return 0
             fi
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
-            local final_map_status
-            if final_map_status="$("${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" 2>&1)"; then
-                if control_plane_runtime_map_status_ready "$final_map_status" "$min_epoch"; then
+            if [[ -n "$renewed_after_deadline_ms" ]]; then
+                local final_diagnostics
+                final_diagnostics="$("${server_cmd[@]}" control-plane-runtime-map-diagnostics \
+                    "$control_plane_socket_path" 2>&1)" || true
+                printf '%s\n' "$final_diagnostics" >&2
+            else
+                local final_map_status
+                if final_map_status="$("${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" 2>&1)" \
+                    && control_plane_runtime_map_status_ready "$final_map_status" "$min_epoch"; then
                     return 0
                 fi
+                printf '%s\n' "$final_map_status" >&2
             fi
-            printf '%s\n' "$final_map_status" >&2
             tail -n 120 "$control_plane_state_path" >&2 || true
+            if [[ -n "$renewed_after_deadline_ms" ]]; then
+                die "timed out waiting for control-plane runtime map readiness at or after epoch $min_epoch with every storage-node lease renewed beyond $renewed_after_deadline_ms ms"
+            fi
             die "timed out waiting for control-plane runtime map readiness at or after epoch $min_epoch"
         fi
-        sleep 0.1
+        if [[ -n "$renewed_after_deadline_ms" ]]; then
+            sleep 0.5
+        else
+            sleep 0.1
+        fi
     done
+}
+
+runtime_map_diagnostics_summary_field() {
+    local diagnostics="$1"
+    local wanted_field="$2"
+    awk -v wanted_field="$wanted_field" '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                split($i, fields, "=")
+                if (fields[1] == wanted_field) {
+                    print fields[2]
+                    exit
+                }
+            }
+        }
+    ' <<<"$diagnostics"
+}
+
+runtime_map_max_node_lease_deadline() {
+    local diagnostics="$1"
+    awk -v expected_count="$ARGMIN_LOCAL_NODE_COUNT" '
+        $1 ~ /^node_id=/ {
+            deadline = ""
+            for (i = 1; i <= NF; i++) {
+                split($i, fields, "=")
+                if (fields[1] == "lease_deadline_ms") {
+                    deadline = fields[2]
+                    break
+                }
+            }
+            if (deadline !~ /^[0-9]+$/) {
+                bad = 1
+                next
+            }
+            count += 1
+            if (maximum == "" || deadline + 0 > maximum + 0) {
+                maximum = deadline
+            }
+        }
+        END {
+            if (count == expected_count && bad != 1 && maximum != "") {
+                print maximum
+            } else {
+                exit 1
+            }
+        }
+    ' <<<"$diagnostics"
+}
+
+runtime_map_diagnostics_renewed_ready_epoch() {
+    local diagnostics="$1"
+    local min_epoch="$2"
+    local renewed_after_deadline_ms="$3"
+    awk \
+        -v expected_nodes="$ARGMIN_LOCAL_NODE_COUNT" \
+        -v expected_pgs="$ARGMIN_PG_COUNT" \
+        -v min_epoch="$min_epoch" \
+        -v renewed_after="$renewed_after_deadline_ms" '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                split($i, fields, "=")
+                if (fields[1] == "epoch") epoch = fields[2]
+                if (fields[1] == "pg_routes") pg_routes = fields[2]
+                if (fields[1] == "active_serving_pg_routes") active_routes = fields[2]
+            }
+        }
+        $1 ~ /^node_id=/ {
+            deadline = ""
+            for (i = 1; i <= NF; i++) {
+                split($i, fields, "=")
+                if (fields[1] == "lease_deadline_ms") {
+                    deadline = fields[2]
+                    break
+                }
+            }
+            if (deadline !~ /^[0-9]+$/ || deadline + 0 <= renewed_after + 0) {
+                bad_node = 1
+            }
+            nodes += 1
+        }
+        END {
+            if (epoch ~ /^[0-9]+$/ && epoch + 0 >= min_epoch + 0 \
+                && pg_routes + 0 == expected_pgs + 0 \
+                && active_routes + 0 == expected_pgs + 0 \
+                && nodes + 0 == expected_nodes + 0 && bad_node != 1) {
+                print epoch
+            } else {
+                exit 1
+            }
+        }
+    ' <<<"$diagnostics"
 }
 
 control_plane_runtime_map_status_ready() {

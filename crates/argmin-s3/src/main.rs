@@ -1587,7 +1587,7 @@ fn format_control_plane_runtime_map_diagnostics(
     diagnostics: &storage::control_plane::ControlPlaneRuntimeMapDiagnostics,
 ) -> String {
     format_control_plane_runtime_map_diagnostics_parts(
-        diagnostics.runtime_map(),
+        (diagnostics.runtime_map(), diagnostics.node_leases()),
         diagnostics.rpc_metrics(),
         diagnostics.snapshot_metrics(),
         diagnostics.raft_checkpoint_metrics(),
@@ -1598,7 +1598,10 @@ fn format_control_plane_runtime_map_diagnostics(
 }
 
 fn format_control_plane_runtime_map_diagnostics_parts(
-    runtime_map: &ClusterRuntimeMapSnapshot,
+    runtime_map: (
+        &ClusterRuntimeMapSnapshot,
+        &[storage::control_plane::ControlPlaneRuntimeMapNodeLeaseDiagnostic],
+    ),
     rpc_metrics: &[observability::ControlPlaneRpcMetricSample],
     snapshot: observability::ControlPlaneSnapshotMetricSnapshot,
     raft_checkpoint: observability::ControlPlaneRaftCheckpointMetricSnapshot,
@@ -1606,6 +1609,7 @@ fn format_control_plane_runtime_map_diagnostics_parts(
     raft_command: observability::ControlPlaneRaftCommandMetricSnapshot,
     history_reference_samples: &[observability::ControlPlaneHistoryReferenceSample],
 ) -> String {
+    let (runtime_map, node_leases) = runtime_map;
     let active_serving_pg_routes = runtime_map
         .pg_routes()
         .iter()
@@ -1637,12 +1641,17 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         let history_references = history_reference_samples
             .iter()
             .find(|sample| sample.node_id == node.node_id().as_u32());
+        let lease_deadline_ms = node_leases
+            .iter()
+            .find(|lease| lease.node_id() == node.node_id())
+            .and_then(|lease| lease.lease_deadline_ms());
         output.push('\n');
         output.push_str(&format!(
-            "node_id={} incarnation={} endpoint={} storage_history_floor_epoch={} history_report_observed_epoch={} history_report_validation_epoch={} history_report_accepted_at_ms={} history_live_payload_epoch={} history_durable_backfill_epoch={} history_pending_metadata_command_epoch={}",
+            "node_id={} incarnation={} endpoint={} lease_deadline_ms={} storage_history_floor_epoch={} history_report_observed_epoch={} history_report_validation_epoch={} history_report_accepted_at_ms={} history_live_payload_epoch={} history_durable_backfill_epoch={} history_pending_metadata_command_epoch={}",
             node.node_id().as_u32(),
             node.node_incarnation(),
             node.endpoint(),
+            format_optional_u64(lease_deadline_ms),
             format_optional_epoch(node.cluster_map_history_floor_epoch()),
             format_optional_u64(history_references.map(|sample| sample.observed_epoch)),
             format_optional_u64(history_references.map(|sample| sample.validation_epoch)),
@@ -2032,12 +2041,7 @@ impl ExperimentalRaftControlPlane {
             #[cfg(not(test))]
             return Ok((supplied_now_ms, None));
         }
-        let status = self.block_on(self.authority.status())?;
-        if !status.local_leader() {
-            return Err(ControlPlaneError::RpcRemote {
-                message: "local OpenRaft authority is not the serving leader".to_string(),
-            });
-        }
+        let status = self.block_on(self.authority.confirmed_linearized_authority_status())?;
         let max_committed_timestamp_ms = self.current_snapshot()?.max_committed_timestamp_ms();
         let mut authority_clock = self
             .authority_clock
@@ -2213,6 +2217,21 @@ impl ControlPlaneRuntimeMapSource for ExperimentalRaftControlPlane {
         )?;
         self.checkpoint_successful_linearized_read()?;
         Ok(status)
+    }
+
+    fn runtime_map_diagnostics_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneError>
+    {
+        self.ensure_not_durably_poisoned()?;
+        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
+        let diagnostics = self.block_on(
+            self.authority
+                .linearized_runtime_map_diagnostics_snapshot(authority_now_ms),
+        )?;
+        self.checkpoint_successful_linearized_read()?;
+        Ok(diagnostics)
     }
 }
 
@@ -3779,13 +3798,7 @@ fn control_plane_lease_expiry_error_is_clock_wait(error: &ControlPlaneError) -> 
 }
 
 fn experimental_raft_error_is_non_local_leader(error: &ControlPlaneError) -> bool {
-    matches!(
-        error,
-        ControlPlaneError::RpcRemote { message }
-            if message == "local OpenRaft authority is not the serving leader"
-                || (message.contains("OpenRaft client-write failed")
-                    && message.contains("has to forward request to"))
-    )
+    error.is_control_plane_leader_routing_rejection()
 }
 
 fn experimental_raft_lease_expiry_error_is_transient(error: &ControlPlaneError) -> bool {
@@ -6418,6 +6431,18 @@ mod tests {
         assert!(experimental_raft_error_is_non_local_leader(
             &ControlPlaneError::RpcRemote {
                 message: "local OpenRaft authority is not the serving leader".to_string(),
+            }
+        ));
+        assert!(experimental_raft_error_is_non_local_leader(
+            &ControlPlaneError::RpcRemote {
+                message: "local OpenRaft authority is not the serving leader: NotLocalLeader"
+                    .to_string(),
+            }
+        ));
+        assert!(experimental_raft_error_is_non_local_leader(
+            &ControlPlaneError::RpcRemote {
+                message: "local OpenRaft authority is not the serving leader: command-authority read-index failed: not enough for a quorum"
+                    .to_string(),
             }
         ));
         assert!(experimental_raft_error_is_non_local_leader(
@@ -12365,6 +12390,14 @@ mod tests {
             .set_pg_acting_set(PgId::new(3), vec![NodeId::new(2)])
             .unwrap();
         let floor_epoch = authority.snapshot().cluster_epoch();
+        let history_references = storage::PgClusterMapHistoryRouteReferences::try_from_iter([
+            storage::PgClusterMapHistoryRouteReference::new(
+                storage::PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+                floor_epoch,
+                PgId::new(3),
+            ),
+        ])
+        .unwrap();
         authority
             .submit_node_heartbeat(
                 NodeHeartbeat {
@@ -12373,21 +12406,59 @@ mod tests {
                     endpoint: "node-2.sock".to_owned(),
                     observed_epoch: floor_epoch,
                     requested_lease_duration_ms: 1_000,
-                    cluster_map_history_route_references:
-                        storage::PgClusterMapHistoryRouteReferences::try_from_iter([
-                            storage::PgClusterMapHistoryRouteReference::new(
-                                storage::PgClusterMapHistoryRouteReferenceKind::LivePlacement,
-                                floor_epoch,
-                                PgId::new(3),
-                            ),
-                        ])
-                        .unwrap(),
+                    cluster_map_history_route_references: history_references.clone(),
                     pg_observations: Vec::new(),
                 },
                 1_000,
             )
             .unwrap();
-        let runtime_map = authority.snapshot().runtime_map(1_000).unwrap();
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        let metadata_proof = PgMetadataProof {
+            applied_log_index: 1,
+            applied_log_hash: 2,
+            state_digest: 3,
+        };
+        authority
+            .submit_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(2),
+                    node_incarnation: 7,
+                    endpoint: "node-2.sock".to_owned(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: history_references.clone(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(3),
+                        state: PgState::Peering,
+                        metadata_proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                1_001,
+            )
+            .unwrap();
+        authority.complete_ready_pg_peerings(1_001).unwrap();
+        let active_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .submit_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(2),
+                    node_incarnation: 7,
+                    endpoint: "node-2.sock".to_owned(),
+                    observed_epoch: active_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: history_references,
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(3),
+                        state: PgState::Active,
+                        metadata_proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                1_002,
+            )
+            .unwrap();
+        let diagnostic_snapshot = authority.runtime_map_diagnostics_snapshot(1_002).unwrap();
 
         let rpc_metrics = [observability::ControlPlaneRpcMetricSample {
             kind: observability::ControlPlaneRpcMetricKind::RefreshNodeHeartbeat,
@@ -12400,7 +12471,10 @@ mod tests {
             response_write_us_max: 15,
         }];
         let diagnostics = format_control_plane_runtime_map_diagnostics_parts(
-            &runtime_map,
+            (
+                diagnostic_snapshot.runtime_map(),
+                diagnostic_snapshot.node_leases(),
+            ),
             &rpc_metrics,
             observability::ControlPlaneSnapshotMetricSnapshot {
                 save_total: 7,
@@ -12490,7 +12564,7 @@ mod tests {
         );
         assert!(
             diagnostics.contains(&format!(
-                "node_id=2 incarnation=7 endpoint=node-2.sock storage_history_floor_epoch={}",
+                "node_id=2 incarnation=7 endpoint=node-2.sock lease_deadline_ms=2002 storage_history_floor_epoch={}",
                 floor_epoch.get()
             )),
             "{diagnostics}"

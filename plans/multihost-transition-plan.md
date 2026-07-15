@@ -11461,12 +11461,33 @@ Replicated route-change soak cutover:
   established term has stayed stable for five seconds, which exceeds the
   configured three-second maximum election timeout and leaves a convergence
   interval; every newer term resets that window and repeats the strict fence
-  validation before recovery.
+  validation before recovery. The stability observer reuses the statuses that
+  identify the leader, samples at 500 ms, and requires a quorum of reachable
+  voters to report the same highest term before selecting that term's serving
+  leader. A restarted former leader can briefly restore a lower-term local
+  serving view before hearing from the live quorum; that process-local view is
+  not cluster authority. The observer must also not turn the five-second safety
+  window into a 100 ms duplicate admin-RPC load generator. Retained-history
+  soak runs showed that trusting the stale local view could send work to the
+  wrong process and saturate the bounded control-plane RPC worker pool.
+  Lease-bearing process work and command submission therefore require both
+  full applied-through-committed local readiness and a successful OpenRaft
+  ReadIndex quorum confirmation before entering snapshot or Raft write work.
+  A stale restored leader returns the explicit routing rejection instead of
+  retaining the process authority mutex while waiting for an unavailable
+  quorum.
   Standalone restart likewise has to resume from its durable clock checkpoint;
   the soak does not hide missing or invalid restart evidence with an admin
   reset. After recovery, the failover barrier requires a fully serving runtime
-  map in an epoch newer than the pre-failover map, so a briefly valid old lease
-  horizon cannot let the test proceed into the later expiry/peering window.
+  map in an epoch newer than the pre-failover map, and every configured storage
+  node's effective lease deadline must exceed the greatest deadline observed
+  before failover. These deadlines are carried only in the authenticated
+  diagnostic response, not in the serving runtime-map wire format. Epoch
+  movement alone is insufficient
+  because unrelated expiry or peering commands can advance it while PGs still
+  serve under the predecessor horizon. The combined diagnostic-snapshot check
+  proves the new term has crossed that horizon, renewed all storage-node
+  leases, and returned every PG to serving before route traffic resumes.
 - The first replicated soak exposed two failover-only heartbeat invariants.
   A stale-epoch heartbeat after durable lease expiry is no longer eligible for
   the volatile overlay unless the durable base node is administratively
