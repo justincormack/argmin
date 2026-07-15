@@ -251,6 +251,8 @@ fn list_multipart_uploads_returns_created() {
     assert_eq!(result.uploads[1].key, "beta");
     assert_eq!(result.uploads[1].upload_id, r2.upload_id);
     assert!(!result.is_truncated);
+    assert_eq!(result.next_key_marker.as_deref(), Some("beta"));
+    assert_eq!(result.next_upload_id_marker, Some(r2.upload_id));
 }
 
 #[test]
@@ -984,6 +986,11 @@ fn list_multipart_uploads_pagination() {
     assert_eq!(page2.uploads.len(), 1);
     assert!(!page2.is_truncated);
     assert_eq!(page2.uploads[0].key, "c");
+    assert_eq!(page2.next_key_marker.as_deref(), Some("c"));
+    assert_eq!(
+        page2.next_upload_id_marker,
+        Some(page2.uploads[0].upload_id.clone())
+    );
 }
 
 #[test]
@@ -1567,6 +1574,11 @@ fn list_multipart_uploads_same_key_pagination() {
     assert_eq!(page2.uploads.len(), 1);
     assert!(!page2.is_truncated);
     assert_eq!(page2.uploads[0].key, "key");
+    assert_eq!(page2.next_key_marker.as_deref(), Some("key"));
+    assert_eq!(
+        page2.next_upload_id_marker,
+        Some(page2.uploads[0].upload_id.clone())
+    );
 
     // All 3 upload IDs should be covered across both pages.
     let mut seen: Vec<UploadId> = page1
@@ -3900,7 +3912,7 @@ fn list_parts_basic() {
     assert_eq!(result.parts[2].part_number, 5);
     assert_eq!(result.parts[0].size, 5); // "data1"
     assert!(!result.is_truncated);
-    assert!(result.next_part_number_marker.is_none());
+    assert_eq!(result.next_part_number_marker, Some(5));
 }
 
 #[test]
@@ -3956,6 +3968,7 @@ fn list_parts_pagination() {
     assert_eq!(page2.parts[0].part_number, 3);
     assert_eq!(page2.parts[1].part_number, 4);
     assert!(!page2.is_truncated);
+    assert_eq!(page2.next_part_number_marker, Some(4));
 }
 
 #[test]

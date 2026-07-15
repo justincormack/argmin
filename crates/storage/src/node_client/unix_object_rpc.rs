@@ -230,26 +230,16 @@ pub(super) fn validate_list_multipart_uploads_response(
         response.is_truncated,
         response.next_key_marker.as_ref(),
         response.next_upload_id_marker.as_ref(),
+        response.uploads.last(),
     ) {
-        (false, None, None) => {}
-        (false, _, _) => {
+        (_, Some(key_marker), Some(upload_id_marker), Some(upload))
+            if key_marker == &upload.key && upload_id_marker == &upload.upload_id => {}
+        (false, None, None, None) => {}
+        _ => {
             return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
                 "validate multipart upload list response",
-                "non-truncated multipart upload list response has next marker".to_string(),
+                "multipart upload list response markers do not match the final upload".to_string(),
             )));
-        }
-        (true, Some(key_marker), Some(upload_id_marker))
-            if response.uploads.last().is_some_and(|upload| {
-                key_marker == &upload.key && upload_id_marker == &upload.upload_id
-            }) => {}
-        (true, _, _) => {
-            return Err(BucketSnapshotLoadError::Store(
-                client.rpc_payload_error(
-                    "validate multipart upload list response",
-                    "truncated multipart upload list response marker does not match last upload"
-                        .to_string(),
-                ),
-            ));
         }
     }
     Ok(())

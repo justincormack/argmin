@@ -1058,7 +1058,7 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
         response: crate::types::ListPartsResp {
             parts: vec![part.clone()],
             is_truncated: false,
-            next_part_number_marker: None,
+            next_part_number_marker: Some(1),
         },
     };
     client
@@ -1103,7 +1103,7 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
         })
     ));
     let mut bad_listed = listed.clone();
-    bad_listed.response.next_part_number_marker = Some(1);
+    bad_listed.response.next_part_number_marker = Some(2);
     let err = client
         .validate_listed_multipart_parts_response(&bad_listed, &authorized_upload, None, 1)
         .unwrap_err();
@@ -1129,10 +1129,26 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
     ));
     let mut truncated_listed = listed.clone();
     truncated_listed.response.is_truncated = true;
-    truncated_listed.response.next_part_number_marker = Some(1);
     client
         .validate_listed_multipart_parts_response(&truncated_listed, &authorized_upload, None, 1)
         .unwrap();
+    let mut missing_marker_listed = listed.clone();
+    missing_marker_listed.response.next_part_number_marker = None;
+    let err = client
+        .validate_listed_multipart_parts_response(
+            &missing_marker_listed,
+            &authorized_upload,
+            None,
+            1,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            operation: "validate multipart parts list response",
+            ..
+        })
+    ));
     let zero_page_listed = ListedMultipartParts {
         upload: upload.clone(),
         response: crate::types::ListPartsResp {
@@ -1143,6 +1159,12 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
     };
     client
         .validate_listed_multipart_parts_response(&zero_page_listed, &authorized_upload, None, 0)
+        .unwrap();
+    client
+        .validate_listed_multipart_parts_response(&zero_page_listed, &authorized_upload, Some(7), 1)
+        .unwrap();
+    client
+        .validate_listed_multipart_parts_response(&zero_page_listed, &authorized_upload, Some(7), 0)
         .unwrap();
     let mut bad_zero_page_listed = zero_page_listed.clone();
     bad_zero_page_listed.response.is_truncated = true;

@@ -83,7 +83,7 @@ impl PgStore {
                          (upload_id, bucket, key, initiated_at, metadata_blob, \
                           system_metadata_blob, owner_principal, owner_canonical_id, \
                           initiator_principal, initiator_canonical_id, object_generation_id) \
-                         VALUES (?1, ?2, ?3, ?4, X'', X'', ?5, ?6, ?5, ?6, ?4)",
+                         VALUES (?1, ?2, ?3, 1, X'', X'', ?5, ?6, ?5, ?6, ?4)",
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "prepare test listing multipart uploads",
@@ -9713,13 +9713,12 @@ impl PgMetadataStore for PgStore {
             uploads.truncate(req.max_uploads as usize);
         }
 
-        let (next_key_marker, next_upload_id_marker) = if is_truncated {
-            uploads.last().map_or((None, None), |u| {
-                (Some(u.key.clone()), Some(u.upload_id.clone()))
-            })
-        } else {
-            (None, None)
-        };
+        // AWS reports both next markers for the final returned upload on every
+        // nonempty page, independently of IsTruncated.
+        let (next_key_marker, next_upload_id_marker) =
+            uploads.last().map_or((None, None), |upload| {
+                (Some(upload.key.clone()), Some(upload.upload_id.clone()))
+            });
 
         Ok(ListMultipartUploadsResp {
             uploads,
@@ -10022,7 +10021,7 @@ impl PgMetadataStore for PgStore {
             return Ok(ListPartsResp {
                 parts: Vec::new(),
                 is_truncated: false,
-                next_part_number_marker: Some(req.part_number_marker.unwrap_or(0)),
+                next_part_number_marker: Some(0),
             });
         }
 
@@ -10079,11 +10078,10 @@ impl PgMetadataStore for PgStore {
             parts.truncate(req.max_parts as usize);
         }
 
-        let next_part_number_marker = if is_truncated {
-            parts.last().map(|p| p.part_number)
-        } else {
-            None
-        };
+        // AWS always includes NextPartNumberMarker. It is zero when no parts
+        // were returned and otherwise names the final part in this page,
+        // independently of IsTruncated and the request marker.
+        let next_part_number_marker = Some(parts.last().map_or(0, |part| part.part_number));
 
         Ok(ListPartsResp {
             parts,

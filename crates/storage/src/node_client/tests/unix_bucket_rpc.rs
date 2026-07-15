@@ -72,7 +72,7 @@ fn unix_object_version_list_response_requires_truncated_marker_identity() {
 }
 
 #[test]
-fn unix_multipart_upload_list_response_requires_truncated_marker_identity() {
+fn unix_multipart_upload_list_response_requires_final_upload_marker_identity() {
     let client = test_unix_storage_node_client();
     let bucket = crate::tests::bucket_name("mpu-list-marker-bucket");
     let key = crate::tests::object_key("mpu-list-marker-key");
@@ -92,7 +92,7 @@ fn unix_multipart_upload_list_response_requires_truncated_marker_identity() {
     };
     let mut response = ListMultipartUploadsResp {
         uploads: vec![upload],
-        is_truncated: true,
+        is_truncated: false,
         next_key_marker: Some(key.clone()),
         next_upload_id_marker: None,
     };
@@ -102,8 +102,28 @@ fn unix_multipart_upload_list_response_requires_truncated_marker_identity() {
         Some(UploadId::try_from("v".repeat(crate::UPLOAD_ID_LEN)).unwrap());
     assert!(validate_list_multipart_uploads_response(&client, &response, &req).is_err());
 
-    response.next_upload_id_marker = Some(upload_id);
+    response.next_upload_id_marker = Some(upload_id.clone());
     validate_list_multipart_uploads_response(&client, &response, &req).unwrap();
+
+    response.is_truncated = true;
+    validate_list_multipart_uploads_response(&client, &response, &req).unwrap();
+
+    let mut empty = ListMultipartUploadsResp {
+        uploads: Vec::new(),
+        is_truncated: false,
+        next_key_marker: None,
+        next_upload_id_marker: None,
+    };
+    validate_list_multipart_uploads_response(&client, &empty, &req).unwrap();
+
+    empty.next_key_marker = Some(key);
+    empty.next_upload_id_marker = Some(upload_id);
+    assert!(validate_list_multipart_uploads_response(&client, &empty, &req).is_err());
+
+    empty.next_key_marker = None;
+    empty.next_upload_id_marker = None;
+    empty.is_truncated = true;
+    assert!(validate_list_multipart_uploads_response(&client, &empty, &req).is_err());
 }
 
 fn test_bucket_info(

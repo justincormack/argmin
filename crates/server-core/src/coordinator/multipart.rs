@@ -1142,15 +1142,12 @@ impl Coordinator {
         let is_truncated = all_uploads.len() > max;
         all_uploads.truncate(max);
 
-        let (next_key_marker, next_upload_id_marker) = if is_truncated {
-            if let Some(last) = all_uploads.last() {
-                (Some(last.key.to_string()), Some(last.upload_id.clone()))
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
+        // AWS reports both next markers for the final returned upload on every
+        // nonempty page, independently of IsTruncated.
+        let (next_key_marker, next_upload_id_marker) =
+            all_uploads.last().map_or((None, None), |upload| {
+                (Some(upload.key.to_string()), Some(upload.upload_id.clone()))
+            });
 
         let uploads = all_uploads
             .into_iter()

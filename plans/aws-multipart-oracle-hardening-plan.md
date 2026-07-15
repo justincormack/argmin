@@ -190,11 +190,15 @@ For each matrix:
 
 ### 4. Listing and marker behavior
 
-- [ ] Expand ListParts limits, markers, ordering, overwritten-part metadata,
+- [x] Expand ListParts limits, markers, ordering, overwritten-part metadata,
   checksum fields, and active/terminal upload states.
 - [ ] Expand ListMultipartUploads ordering and pagination across same-key uploads,
   prefixes, delimiters, encoding, duplicate timestamps, completion, abort, and
   concurrent state changes.
+  Same-key creation ordering, two-marker continuation, non-truncated next
+  markers, prefix/encoding behavior, duplicate-timestamp tie-breaking, and
+  completion/abort removal are covered. Delimiter/common-prefix pagination and
+  the lifecycle race matrix remain.
 - [ ] Pin malformed and duplicate listing parameters and authorization/error
   precedence with positive list canaries.
 

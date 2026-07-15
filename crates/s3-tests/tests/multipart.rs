@@ -3716,6 +3716,166 @@ fn test_list_multipart_uploads_pagination_and_markers() {
 }
 
 #[test]
+fn test_list_multipart_uploads_same_key_ordering_markers_and_terminal_states() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let same_key = "same-key-order";
+
+        let mut created = Vec::new();
+        for key in ["a-before", same_key, same_key, same_key, "z-after"] {
+            let upload = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .send_retrying_operation_aborted("S3 operation during multipart test")
+                .await
+                .unwrap();
+            created.push((key, upload.upload_id().unwrap().to_string()));
+        }
+
+        let all = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(
+            all.uploads()
+                .iter()
+                .map(|upload| upload.key().unwrap())
+                .collect::<Vec<_>>(),
+            ["a-before", same_key, same_key, same_key, "z-after"]
+        );
+        assert_eq!(
+            all.uploads()[1..4]
+                .iter()
+                .map(|upload| upload.upload_id().unwrap())
+                .collect::<Vec<_>>(),
+            created[1..4]
+                .iter()
+                .map(|(_, upload_id)| upload_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(all.uploads()[1..4]
+            .windows(2)
+            .all(|pair| pair[0].initiated().unwrap() <= pair[1].initiated().unwrap()));
+        assert_eq!(all.is_truncated(), Some(false));
+        assert_eq!(all.next_key_marker(), Some("z-after"));
+        assert_eq!(all.next_upload_id_marker(), Some(created[4].1.as_str()));
+
+        let first_page = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .prefix(same_key)
+            .max_uploads(2)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(first_page.uploads().len(), 2);
+        assert_eq!(first_page.is_truncated(), Some(true));
+        assert_eq!(first_page.next_key_marker(), Some(same_key));
+        assert_eq!(
+            first_page.next_upload_id_marker(),
+            Some(created[2].1.as_str())
+        );
+
+        let second_page = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .prefix(same_key)
+            .key_marker(first_page.next_key_marker().unwrap())
+            .upload_id_marker(first_page.next_upload_id_marker().unwrap())
+            .max_uploads(2)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(second_page.uploads().len(), 1);
+        assert_eq!(
+            second_page.uploads()[0].upload_id(),
+            Some(created[3].1.as_str())
+        );
+        assert_eq!(second_page.is_truncated(), Some(false));
+        assert_eq!(second_page.next_key_marker(), Some(same_key));
+        assert_eq!(
+            second_page.next_upload_id_marker(),
+            Some(created[3].1.as_str())
+        );
+
+        let after_key = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .key_marker(same_key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(after_key.uploads().len(), 1);
+        assert_eq!(after_key.uploads()[0].key(), Some("z-after"));
+        assert_eq!(after_key.next_key_marker(), Some("z-after"));
+        assert_eq!(
+            after_key.next_upload_id_marker(),
+            Some(created[4].1.as_str())
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(same_key)
+            .upload_id(&created[1].1)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let completed_part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            same_key,
+            &created[2].1,
+            1,
+            b"completed-body".to_vec(),
+        )
+        .await;
+        complete_multipart_upload_retrying_operation_aborted(
+            client,
+            &bucket,
+            same_key,
+            &created[2].1,
+            completed_part.e_tag().unwrap(),
+        )
+        .await;
+
+        let one_active = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .prefix(same_key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(one_active.uploads().len(), 1);
+        assert_eq!(
+            one_active.uploads()[0].upload_id(),
+            Some(created[3].1.as_str())
+        );
+        assert_eq!(one_active.next_key_marker(), Some(same_key));
+        assert_eq!(
+            one_active.next_upload_id_marker(),
+            Some(created[3].1.as_str())
+        );
+
+        for index in [0, 3, 4] {
+            client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(created[index].0)
+                .upload_id(&created[index].1)
+                .send_retrying_operation_aborted("S3 operation during multipart test")
+                .await
+                .unwrap();
+        }
+        cleanup(&bucket, &[same_key]).await;
+    });
+}
+
+#[test]
 fn test_list_multipart_uploads_max_uploads_above_aws_limit_is_clamped() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -4339,6 +4499,204 @@ fn test_list_parts_pagination_with_checksums() {
 }
 
 // ── Error cases ─────────────────────────────────────────────────────
+
+#[test]
+fn test_list_parts_sparse_markers_ordering_and_overwrite() {
+    use aws_sdk_s3::types::ChecksumAlgorithm;
+
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "list-parts-sparse-overwrite";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let original = upload_part_with_crc32_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            &upload_id,
+            2,
+            b"original-part-two".to_vec(),
+        )
+        .await;
+        let original_etag = original.e_tag().unwrap().to_string();
+        let before_overwrite = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let original_last_modified = *before_overwrite.parts()[0]
+            .last_modified()
+            .expect("listed part should have LastModified");
+
+        // ListParts timestamps have one-second precision. Ensure the replacement
+        // is observably newer so the oracle can distinguish stale metadata.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        upload_part_with_crc32_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            &upload_id,
+            10,
+            b"part-ten".to_vec(),
+        )
+        .await;
+        upload_part_with_crc32_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            &upload_id,
+            7,
+            b"part-seven".to_vec(),
+        )
+        .await;
+        let replacement_body = b"replacement-part-two-is-longer".to_vec();
+        let replacement = upload_part_with_crc32_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            &upload_id,
+            2,
+            replacement_body.clone(),
+        )
+        .await;
+        let replacement_etag = replacement.e_tag().unwrap().to_string();
+        let replacement_checksum = replacement.checksum_crc32().unwrap().to_string();
+        assert_ne!(replacement_etag, original_etag);
+
+        let all = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(all.part_number_marker(), Some("0"));
+        assert_eq!(all.max_parts(), Some(1000));
+        assert_eq!(all.is_truncated(), Some(false));
+        assert_eq!(all.next_part_number_marker(), Some("10"));
+        assert_eq!(
+            all.parts()
+                .iter()
+                .map(|part| part.part_number().unwrap())
+                .collect::<Vec<_>>(),
+            [2, 7, 10]
+        );
+
+        let listed_replacement = &all.parts()[0];
+        assert_eq!(listed_replacement.e_tag(), Some(replacement_etag.as_str()));
+        assert_eq!(
+            listed_replacement.size(),
+            Some(replacement_body.len() as i64)
+        );
+        assert_eq!(
+            listed_replacement.checksum_crc32(),
+            Some(replacement_checksum.as_str())
+        );
+        assert!(
+            listed_replacement
+                .last_modified()
+                .expect("listed replacement should have LastModified")
+                .secs()
+                > original_last_modified.secs()
+        );
+        assert!(all.parts()[1].checksum_crc32().is_some());
+        assert!(all.parts()[2].checksum_crc32().is_some());
+        assert_eq!(all.checksum_algorithm(), Some(&ChecksumAlgorithm::Crc32));
+
+        let first_page = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .max_parts(1)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(first_page.parts()[0].part_number(), Some(2));
+        assert_eq!(first_page.is_truncated(), Some(true));
+        assert_eq!(first_page.next_part_number_marker(), Some("2"));
+
+        let between_parts = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number_marker("3")
+            .max_parts(1)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(between_parts.parts()[0].part_number(), Some(7));
+        assert_eq!(between_parts.is_truncated(), Some(true));
+        assert_eq!(between_parts.next_part_number_marker(), Some("7"));
+
+        let exact_marker = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number_marker("7")
+            .max_parts(1)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert_eq!(exact_marker.parts()[0].part_number(), Some(10));
+        assert_eq!(exact_marker.is_truncated(), Some(false));
+        assert_eq!(exact_marker.next_part_number_marker(), Some("10"));
+
+        let after_last = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number_marker("10")
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert!(after_last.parts().is_empty());
+        assert_eq!(after_last.is_truncated(), Some(false));
+        assert_eq!(after_last.next_part_number_marker(), Some("0"));
+
+        let zero_after_marker = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number_marker("7")
+            .max_parts(0)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        assert!(zero_after_marker.parts().is_empty());
+        assert_eq!(zero_after_marker.is_truncated(), Some(false));
+        assert_eq!(zero_after_marker.next_part_number_marker(), Some("0"));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
 
 #[test]
 fn test_complete_multipart_no_such_upload() {

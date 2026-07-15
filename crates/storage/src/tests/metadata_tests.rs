@@ -2572,6 +2572,7 @@ fn mpu_list_parts_pagination() {
     assert!(!resp.is_truncated);
     assert_eq!(resp.parts.len(), 1);
     assert_eq!(resp.parts[0].part_number, 5);
+    assert_eq!(resp.next_part_number_marker, Some(5));
 }
 
 #[test]
@@ -2628,6 +2629,11 @@ fn mpu_list_uploads_pagination() {
     assert!(!resp.is_truncated);
     assert_eq!(resp.uploads.len(), 1);
     assert_eq!(resp.uploads[0].key, "c");
+    assert_eq!(
+        resp.next_key_marker.as_ref().map(ObjectKey::as_str),
+        Some("c")
+    );
+    assert_eq!(resp.next_upload_id_marker, Some(multipart_upload_id("u3")));
 }
 
 #[test]
@@ -2679,27 +2685,18 @@ fn mpu_list_uploads_with_prefix() {
 fn mpu_list_uploads_same_key_multiple_upload_ids() {
     let (_dir, store) = make_pg_store();
 
-    // Three uploads for the same key
-    for uid in ["u-a", "u-b", "u-c"] {
-        store
-            .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: multipart_upload_id(uid),
-                bucket: bucket_name("bkt"),
-                key: object_key("same-key"),
-                tags: None,
-                metadata_blob: vec![].into(),
-                system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                initiator: test_owner(),
-
-                owner: test_owner(),
-                acl_grants: AclGrants::default(),
-                public_read: false,
-                object_lock: ObjectLockState::default(),
-                checksum: None,
-                encryption: ObjectEncryption::None,
-            })
-            .unwrap();
-    }
+    // Insert out of upload-ID order with one shared initiation timestamp. The
+    // final upload-ID tie-break makes this ordering and its cursor deterministic.
+    store
+        .test_insert_listing_multipart_uploads(
+            &bucket_name("bkt"),
+            &[
+                (object_key("same-key"), multipart_upload_id("u-c")),
+                (object_key("same-key"), multipart_upload_id("u-a")),
+                (object_key("same-key"), multipart_upload_id("u-b")),
+            ],
+        )
+        .unwrap();
 
     // Page 1: max_uploads=2
     let resp = store
@@ -2730,6 +2727,14 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
     assert!(!resp2.is_truncated);
     assert_eq!(resp2.uploads.len(), 1);
     assert_eq!(resp2.uploads[0].upload_id, multipart_upload_id("u-c"));
+    assert_eq!(
+        resp2.next_key_marker.as_ref().map(ObjectKey::as_str),
+        Some("same-key")
+    );
+    assert_eq!(
+        resp2.next_upload_id_marker,
+        Some(multipart_upload_id("u-c"))
+    );
 }
 
 #[test]

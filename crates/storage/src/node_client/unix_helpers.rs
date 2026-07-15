@@ -509,24 +509,13 @@ impl UnixStorageNodeClient {
             listed.response.next_part_number_marker,
             listed.response.parts.last(),
         ) {
-            (false, None, _) => {}
-            (false, Some(next_marker), None)
-                if max_parts == 0 && next_marker == part_number_marker.unwrap_or(0) => {}
-            (false, Some(_), _) => {
+            (_, Some(next_marker), Some(last)) if next_marker == last.part_number => {}
+            (false, Some(0), None) => {}
+            _ => {
                 return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                     context,
-                    "non-truncated multipart parts response has next marker".to_string(),
+                    "multipart parts response marker does not match the final part".to_string(),
                 )));
-            }
-            (true, Some(next_marker), Some(last)) if next_marker == last.part_number => {}
-            (true, _, _) => {
-                return Err(ObjectPgActionError::Store(
-                    self.rpc_payload_error(
-                        context,
-                        "truncated multipart parts response marker does not match last part"
-                            .to_string(),
-                    ),
-                ));
             }
         }
         Ok(())
