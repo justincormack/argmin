@@ -11847,6 +11847,24 @@ Phase 12.4 progress:
   could leave the authority PG `Active`. Pending identities are now validated
   on every observation, and any valid pending evidence for an authority-Active
   PG triggers the same atomic fence regardless of the node-reported PG state.
+  Two later soak failures exposed a storage-RPC boundary missing from the
+  original in-memory recovery regression. A fully applied bucket-PG command
+  could retain its primary pending slot, while partially applied object-PG
+  commands could leave replicas behind; in both cases the current Peering map
+  carried the exact historical recovery authorization. Recovery failed before
+  command inspection because the primary critical-section session acquired its
+  PG lock with the historical command epoch, while the lock-acquire handler
+  accepted only the storage node's current epoch. Historical lock acquisition
+  now requires a retained Active route, a current Peering route, a live bounded
+  runtime-map lease, and an authorization naming the local node as that
+  historical route's reporting primary. The subsequent command RPCs continue
+  to enforce the exact epoch, log index, and checksum, so acquiring the lock
+  does not broaden mutation authority. Real Unix storage-node regressions prove
+  both terminal-slot cleanup and partial-replica convergence. A property test
+  varies zero, partial, and full pre-application; bucket-PG and object-PG
+  commands; and unrelated global epoch gaps before recovery. This complements
+  the control-plane heartbeat lifecycle model with executable coverage of the
+  storage-node admission boundary that soak had been reaching slowly.
   A later soak exposed a cross-PG epoch interleaving outside the first model:
   an unrelated PG transition bumped the global epoch and correctly cleared all
   node PG observations between an admin preflight and an overlapping Active PG

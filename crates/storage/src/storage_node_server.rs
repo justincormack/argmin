@@ -10437,14 +10437,19 @@ impl StorageNodeConnectionHandler {
         session: &mut StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
+        let route_validation = if request.cluster_epoch < self.config.cluster_epoch {
+            self.validate_metadata_command_recovery_primary_lock(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+            )
+        } else {
             self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) =
-            self.validate_primary_pg(request.pg_id, "metadata command critical section")
-        {
+                .and_then(|()| {
+                    self.validate_primary_pg(request.pg_id, "metadata command critical section")
+                })
+        };
+        if let Err(error) = route_validation {
             return encode_storage_rpc_error_response(&error);
         }
         if let Err(error) = session.acquire_metadata_command_pg_lock(
@@ -10456,6 +10461,35 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         Ok(encode_storage_rpc_success_response(&[]))
+    }
+
+    fn validate_metadata_command_recovery_primary_lock(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route_for_metadata_command_recovery(node_id, cluster_epoch, pg_id)?;
+        self.require_current_route_map_valid_rpc()?;
+        let authorized = self.config.pending_metadata_command_recoveries.iter().any(
+            |(authorized_pg_id, recovery)| {
+                *authorized_pg_id == pg_id
+                    && recovery.reporting_node_id() == self.config.node_id
+                    && recovery.pending().cluster_epoch() == cluster_epoch
+            },
+        );
+        if authorized {
+            return Ok(());
+        }
+        Err(StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::StaleShardLocation,
+            message: format!(
+                "historical metadata command critical section for PG {} at epoch {} is not authorized for primary node {} by the current runtime map",
+                pg_id.get(),
+                cluster_epoch.get(),
+                self.config.node_id.as_u32()
+            ),
+        })
     }
 
     fn metadata_command_pg_lock_release_response(
@@ -17640,9 +17674,19 @@ mod tests {
         let join = thread::spawn(move || server.accept_one().unwrap());
 
         let mut client = UnixStream::connect(socket_path).unwrap();
-        let insert_response = send_frame(
+        let lock_response = send_frame(
             &mut client,
             1,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        let insert_response = send_frame(
+            &mut client,
+            2,
             StorageRpcMessageKind::MetadataCommandPendingSlotInsert,
             encode_metadata_command_pending_slot_request(
                 &StorageRpcMetadataCommandPendingSlotRequest {
@@ -17657,7 +17701,7 @@ mod tests {
         );
         let apply_response = send_frame(
             &mut client,
-            2,
+            3,
             StorageRpcMessageKind::MetadataCommandApplyAndRecord,
             encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
                 node_id: NodeId::new(7),
@@ -17669,6 +17713,12 @@ mod tests {
         );
         drop(client);
         join.join().unwrap();
+
+        let lock_error = decode_storage_rpc_response_payload(&lock_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(lock_error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(lock_error.message.contains("not authorized"));
 
         let insert_error = decode_storage_rpc_response_payload(&insert_response.payload)
             .unwrap()
@@ -17728,9 +17778,19 @@ mod tests {
         let join = thread::spawn(move || server.accept_one().unwrap());
 
         let mut client = UnixStream::connect(socket_path).unwrap();
-        let response = send_frame(
+        let lock_response = send_frame(
             &mut client,
             1,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        let response = send_frame(
+            &mut client,
+            2,
             StorageRpcMessageKind::MetadataCommandApplyAndRecord,
             encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
                 node_id: NodeId::new(7),
@@ -17742,7 +17802,7 @@ mod tests {
         );
         let unlisted_response = send_frame(
             &mut client,
-            2,
+            3,
             StorageRpcMessageKind::MetadataCommandApplyAndRecord,
             encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
                 node_id: NodeId::new(7),
@@ -17752,9 +17812,22 @@ mod tests {
             })
             .unwrap(),
         );
+        let release_response = send_frame(
+            &mut client,
+            4,
+            StorageRpcMessageKind::MetadataCommandPgLockRelease,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
         drop(client);
         join.join().unwrap();
 
+        decode_storage_rpc_response_payload(&lock_response.payload)
+            .unwrap()
+            .unwrap();
         let payload = decode_storage_rpc_response_payload(&response.payload)
             .unwrap()
             .unwrap();
@@ -17774,6 +17847,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(unlisted_error.code, StorageRpcErrorCode::StaleShardLocation);
         assert!(unlisted_error.message.contains("not authorized"));
+        decode_storage_rpc_response_payload(&release_response.payload)
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
