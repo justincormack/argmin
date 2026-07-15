@@ -7055,8 +7055,9 @@ Status:
   authority persists the epoch/map/incarnation tuple before issuing leases and
   bumps both authority incarnation and cluster epoch on restart so previous
   authority instances cannot reuse fencing tokens. This is intentionally still
-  single-authority; Phase 12 can replace the store/authority implementation
-  behind the same control-plane boundary with replicated consensus.
+  single-authority; Phase 12 can add a replicated-consensus implementation
+  behind the same control-plane boundary for replicated mode while retaining
+  this implementation for standalone.
 - Added authority-side heartbeat failure detection. Expired heartbeat leases
   mark nodes temporarily `Unavailable`, clear the stale lease, bump and persist a
   new cluster epoch once per transition, and return the affected nodes so the
@@ -9402,11 +9403,16 @@ Exit criteria:
 
 ## Phase 12: Replicated Control Plane
 
-Replace the Phase 11 single-authority, file-backed control-plane manager with a
-real replicated control plane. Phase 11 already established the state shape,
-fencing rules, runtime-map publication path, retained history, metadata-transfer
-markers, and storage-node heartbeat contract. Phase 12 should preserve those
-semantics while making the authority itself replicated and linearizable.
+Add a real replicated control plane and require it for replicated deployment
+mode, whether all failure domains are local disks or span multiple hosts. The
+Phase 11 single-authority, file-backed manager remains the supported standalone
+authority and the deterministic compatibility oracle; the replicated
+implementation replaces it whenever the deployment claims authority-storage or
+data redundancy.
+Phase 11 already established the state shape, fencing rules, runtime-map
+publication path, retained history, metadata-transfer markers, and storage-node
+heartbeat contract. Phase 12 should preserve those semantics while making the
+redundant authority linearizable.
 
 Because bucket metadata is now PG-sharded, this control plane should remain
 small. Its initial authoritative scope should be:
@@ -9445,8 +9451,9 @@ Phase 12.1 starting slice:
   perform file I/O, Raft I/O, RPC, or apply-time clock reads.
 - adapt `SingleAuthorityControlPlane` to call the command-apply boundary while
   preserving the Phase 11 API and file-backed test harness. This keeps the
-  single-authority implementation as the compatibility oracle for the later
-  replicated implementation.
+  single-authority implementation as the non-replicated authority for the
+  supported standalone deployment profile, as well as the compatibility oracle
+  for the later replicated implementation.
 - add replay/snapshot tests at this boundary before wiring OpenRaft: command
   sequence replay equals the final snapshot, corrupt/incompatible command
   decode fails closed, retained-history floors and metadata-transfer fences
@@ -10207,10 +10214,10 @@ Phase 12.2 proposed scope:
   storage-node heartbeat refresh, runtime-map refresh, acting-set admin, and
   metadata-transfer admin changes.
 - Keep multi-process Raft networking, authenticated remote control-plane RPC,
-  production cutover from the single authority, lease-read optimization, and
+  replicated-mode production cutover, lease-read optimization, and
   upgrade/migration compatibility out of 12.2. Continue using OpenRaft
-  `ReadIndex` for serving runtime maps until the monotonic-clock and lease-read
-  design is specified.
+  `ReadIndex` for serving
+  runtime maps until the monotonic-clock and lease-read design is specified.
 - Keep `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` temporary during this slice, or
   replace it with a clearer experimental durable-Raft mode flag if the
   process-mode selection needs to distinguish in-memory from durable storage.
@@ -10319,16 +10326,16 @@ Phase 12.2 closeout:
   RPC, and deterministic semantic rejection replay without state mutation.
 - Remaining Phase 12 work deliberately starts after this slice: multi-process
   Raft networking, authenticated control-plane/storage/frontend RPC identity,
-  production cutover from the single-authority path, monotonic-clock and lease-
-  read semantics, upgrade/migration compatibility, and removing or replacing
-  the temporary `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` flag.
+  replicated-mode production cutover, monotonic-clock and lease-read semantics,
+  upgrade/migration compatibility, and removing or replacing the temporary
+  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` flag.
 
 Phase 12.3 proposed scope:
 
 - Move the experimental durable OpenRaft authority from single-process,
   single-node operation to a multi-process control-plane Raft cluster. Keep the
-  slice experimental and do not cut production traffic over from the existing
-  single-authority path.
+  slice experimental and do not cut replicated-mode production traffic over
+  from the existing single-authority path.
 - Define the control-plane Raft peer RPC boundary for OpenRaft append-entries,
   vote, and install-snapshot traffic. Frames must be bounded, versioned or
   otherwise fail-closed for incompatible peers, have explicit timeouts, and
@@ -10668,8 +10675,9 @@ Phase 12.3 closeout:
   vote/log WAL plus checkpoint compaction model for production scale, complete
   the monotonic-clock and lease-read design, add authenticated peer identity for
   non-local or production transports, design dynamic configured peer-policy
-  evolution, cut production traffic over from the single-authority path, and
-  remove or replace `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
+  evolution, cut replicated-mode production traffic over from the
+  single-authority path, and remove or replace
+  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
 Critical production blocker: control-plane write amplification and history size
 
@@ -11077,7 +11085,7 @@ Required production shape and implementation order:
    starts enabled but `Suspect` and must re-establish observed health. The
    existing `MarkNodeAvailability` command remains the transitional
    administrative API in this slice. Both fields are still included in every
-   committed snapshot. The single-authority compatibility path now takes the
+   committed snapshot. The non-replicated single-authority path now takes the
    first bounded volatile-renewal step: after deterministic heartbeat
    validation, a heartbeat whose deadline is already covered by the committed
    horizon may update only process-local heartbeat/lease times, observed epoch,
@@ -11504,10 +11512,10 @@ Phase 12.4 proposed scope:
   failures, retry-confirmation outcomes, and poison reasons through the
   existing status/debug surfaces. These diagnostics should be available without
   granting access to raw state-machine internals.
-- Keep out of scope for 12.4: production cutover from the single-authority
-  path, dynamic configured peer-policy/membership evolution, production
-  mandatory-auth cutover policy for every Unix control-plane path, upgrade
-  compatibility for pre-release artifacts, TCP/non-local control-plane
+- Keep out of scope for 12.4: replicated-mode production cutover, dynamic
+  configured peer-policy/membership evolution,
+  replicated-mode mandatory-auth enforcement for every Unix control-plane path,
+  upgrade compatibility for pre-release artifacts, TCP/non-local control-plane
   transport, config-file based secret distribution/rotation, and removing
   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
@@ -11534,49 +11542,327 @@ Phase 12.4 exit criteria:
   timestamp high-water, peer-auth failures, retry-confirmation outcomes, and
   poison reasons.
 - Phase 12.4 may close only with the bounded incremental ordinary-peer
-  acknowledgement path; production cutover remains blocked until the remaining
-  compact-history, split-refresh, and quantitative write/load gates above pass.
+  acknowledgement path; replicated-mode production cutover remains blocked
+  until the remaining compact-history, split-refresh, and quantitative
+  write/load gates above pass.
+
+Supported deployment modes, replicated topologies, and gating:
+
+- Treat deployment architecture as an explicit runtime configuration contract,
+  not as a Cargo feature and not as an inference from whichever process-role or
+  endpoint fields happen to be present. The production-shaped config-file work
+  should introduce a closed `deployment.mode` choice of `standalone` or
+  `replicated`. Startup must reject combinations that violate the selected mode
+  rather than silently falling back to a weaker authority, placement,
+  durability, or authentication model.
+- **Standalone** is a supported non-redundant profile for S3-compatible
+  development, CI, disposable stores, caches, and other cases where loss of one
+  host or disk may lose the service and its data. It has one host, one storage
+  root/storage identity, and an explicit `EC 1+0` shape so the configuration
+  does not imply redundancy that does not exist. It may use an embedded or
+  separately persisted `SingleAuthorityControlPlane`; it does not need Raft.
+  Select these guarantees through `deployment.mode=standalone`. Replace the
+  current `LegacyLocal` process-role name with a topology name such as
+  `all-in-one` or `embedded`; do not rename the role to `Standalone`, because
+  deployment guarantees and process topology are separate dimensions.
+- **Replicated** is one architecture with one set of authority, EC, durability,
+  identity, and release requirements. Configuration declares the failure-domain
+  level whose loss the deployment tolerates, initially `disk` for a single-host
+  appliance topology or `host` for a multihost topology, and a failure count
+  `f`. The first supported shape has `f = 1`, requires `m >= 1`, and rejects
+  `EC k+0`. In general, replicated mode requires `m >= f`, all `k + m` shards of
+  every PG on distinct eligible domains at the selected level, and at least
+  `2f + 1` Raft voters whose WAL, snapshot, and restart state occupy distinct
+  eligible authority failure domains at that level. Startup, placement, map
+  publication, and membership changes must reject configurations that cannot
+  preserve at least `k` shards and a Raft quorum after loss of any `f` declared
+  domains.
+- The **single-host appliance topology** uses `deployment.mode=replicated` with
+  disk failure domains. Each disk has a distinct storage-node identity and
+  storage root, and Raft voters use distinct disks. It provides disk/process
+  redundancy but not host availability: losing or suspending the host still
+  stops the appliance. Unix sockets are the normal initial transport, but TCP
+  endpoints are valid and useful while preparing to expand beyond the host.
+- The **multihost topology** uses the same replicated mode and invariants with
+  host failure domains. Shards and Raft voters are separated across eligible
+  hosts, and any internal RPC crossing a host boundary uses TCP. This is the
+  primary reliable scale-out shape and claims continued data and control-plane
+  availability after the configured number of host failures.
+- Authentication is mandatory for every replicated-mode internal RPC,
+  including Unix sockets. Filesystem ownership and permissions remain useful
+  transport hardening, but are not an alternative identity model and do not
+  justify a second unauthenticated appliance configuration. Every TCP/non-local
+  internal transport is likewise authenticated-only. Standalone may retain an
+  explicit unauthenticated local Unix mode because it makes no distributed or
+  redundant trust claim.
+- Define one **replicated-authority production cutover gate**. Replicated mode
+  must pass the compact-history and split-refresh invariants, quantitative
+  heartbeat/checkpoint/WAL write-amplification bounds, restart/WAL/snapshot
+  recovery and poison tests, lease/clock and read-index safety gates,
+  replicated-authority observability, and full authenticated authority
+  composition tests. It must also pass transport-independent storage RPC auth
+  and authorization tests over Unix before the local replicated topology is
+  supported. TCP and cross-host data-plane tests are additional gates when the
+  configured topology spans hosts, not a different authority profile.
+- The replicated storage RPC authentication boundary must authenticate cluster
+  identity, source role and process/node identity, target storage-node identity,
+  operation kind, and request/response direction before dispatch. Authorization
+  must bind the authenticated caller to the requested PG/shard route and epoch
+  and reject wrong-role, wrong-target, stale-route, or cross-cluster traffic
+  before storage mutation. Frames require integrity, replay/freshness bounds
+  appropriate to each operation and strict payload limits before allocation.
+  Non-local transports additionally require confidentiality for credentials,
+  object data, and metadata. The implementation should reuse the shared
+  identity/auth primitives where their role model fits, but data-plane storage
+  authorization remains an explicit replicated-mode prerequisite rather than
+  being implied by control-plane auth.
+- Keep process topology orthogonal to deployment safety. `frontend`,
+  `storage-node`, `control-plane`, and `combined` describe which roles a process
+  hosts; they do not by themselves establish standalone or replicated
+  guarantees, or select disk versus host failure domains. In particular,
+  `combined` must not become an implicit weaker deployment mode, and a
+  multi-process layout on one host must not be described as host-redundant.
+- Do not Cargo-feature-gate the supported deployment modes. They must
+  be available from the standard binary and exercised by standard CI so a mode
+  cannot silently rot behind an uncommon build. Cargo features remain
+  appropriate for fault injection, `test-hooks`, local debug endpoints, and a
+  temporarily unfinished implementation that cannot yet be advertised as
+  supported. Remove the temporary implementation gate once that mode reaches
+  its release criteria instead of retaining parallel production binaries.
+- Keep test-only compatibility mechanisms distinct from supported local
+  deployments. In-process fake networks, static-map shortcuts, fault
+  injection, and deliberately weakened protocol paths belong behind
+  `cfg(test)` or the existing `test-hooks` feature. Standard replicated-mode
+  tests use authenticated helpers even over Unix sockets; unauthenticated Unix
+  is limited to explicit standalone coverage and narrowly scoped negative tests.
+- Add a release matrix for every supported mode and topology. Standalone runs
+  the full S3 behavior suite plus persistence/restart tests with one storage
+  identity and no claimed redundancy. The local replicated topology runs real
+  authenticated multi-process Unix control-plane and storage RPC over multiple
+  independent storage roots, EC placement across disk identities, rejection of
+  `m=0` and insufficient-domain configurations, individual
+  storage-node/disk loss and restart, repair, and loss of each disk in turn,
+  including a disk that holds the current local Raft leader or another voter.
+  Model/property tests must prove that removal of any set of up to the declared
+  `f` disk domains leaves at least `k` shards for every PG. Process tests must
+  prove the surviving local voters preserve quorum/state and that the restored
+  voter catches up before serving. The multihost topology runs authenticated
+  multi-process Raft/TCP coverage for leader and follower loss, snapshot
+  catch-up, rejection of `m=0` and insufficient-domain configurations,
+  host-aware placement, route changes, and restart/failure soaks.
+  Model/property tests must prove that
+  removal of any set of up to the declared `f` host domains leaves at least `k`
+  shards for every PG and preserves the configured authority quorum. It must
+  also exercise authenticated storage RPC with tampered, unauthenticated,
+  wrong-cluster, wrong-role, wrong-source/target, replayed, stale-epoch,
+  oversized, truncated, disconnected, and response-loss requests, proving
+  fail-closed mutation and safe idempotent retry where allowed. Shared
+  differential/model tests must apply the same command sequences through
+  `SingleAuthorityControlPlane` and the Raft state machine and require identical
+  snapshots, semantic rejections, and recovery behavior.
+- Make local-to-multihost expansion an explicit replicated-mode evolution, not
+  an artifact-format migration or a deployment-mode replacement. Once dynamic
+  storage expansion and Raft membership changes exist, an operator may enable
+  authenticated TCP endpoints while still on one host, add remote storage nodes
+  and Raft learners, relocate shards and promote voters under the existing disk
+  failure-domain contract, then prepare a host-level policy only after every PG
+  and the voter set satisfy the host-level `f` invariant.
+- Store the active failure-domain level/tolerance, monotonic topology generation,
+  canonical topology manifest and digest, and activation membership certificate
+  in replicated control-plane state. The manifest maps every configured storage
+  node and authority voter to its hierarchical host/disk failure-domain identity
+  and endpoint identity; deterministic placement validation must not consult
+  process-local config. A local config edit must never activate a stronger
+  policy.
+- Expansion uses a staged committed-command protocol. `PrepareTopologyPolicy`
+  records the proposed next generation, level/tolerance, and canonical
+  manifest/digest but leaves the active policy unchanged and clears any prior
+  prepared-ack set.
+  Every participating authority and storage node then installs and
+  authentically reports that exact prepared generation/digest. Convert each
+  accepted report into a rare committed `AcknowledgePreparedTopology` command
+  bound to the authenticated principal, node/authority incarnation, prepared
+  generation, and manifest digest; do not rely on leader-local acknowledgement
+  memory. Nodes that are missing or report a conflicting local topology are
+  fenced from serving and acting sets. The leader finally submits
+  `ActivateTopologyPolicy` containing the expected active and prepared
+  generations/digests and cluster epoch, plus the expected full OpenRaft
+  membership log id `(term,node,index)` and a canonical digest of that
+  membership's voters and node identities.
+- Keep OpenRaft membership validation outside the pure
+  `ClusterControlSnapshot + ControlPlaneCommand` apply boundary. Immediately
+  before delegating a committed activation entry to that boundary, the OpenRaft
+  state-machine wrapper compares the command's expected membership log id and
+  digest with the full applied `StoredMembership` reconstructed from the same log
+  prefix. A mismatch is a deterministic rejected command: the control-plane
+  snapshot and topology generation do not change, while the replicated applied
+  cursor advances. On a match, the wrapper also requires committed prepared
+  acknowledgements for every voter in that membership. Inner apply requires
+  committed prepared acknowledgements for every storage node used by the
+  proposed acting sets, revalidates PG placement, records the membership
+  certificate, and atomically advances topology generation and cluster epoch.
+- Add replicated membership-authorization state to the OpenRaft state-machine
+  wrapper, outside `ClusterControlSnapshot` but included in wrapper snapshots
+  and durable restart validation. This state includes both pending
+  authorization/progress and the latest completed membership-transition
+  certificate, plus a single durable certified-membership-head selector that
+  identifies the activation, in-progress stage, or completed certificate that
+  currently proves `last_membership`. Before invoking native OpenRaft membership
+  change, commit a wrapper-level `AuthorizeRaftMembershipChange` request
+  containing a unique
+  authorization id, the exact active topology generation/manifest digest, the
+  source full membership log id and canonical digest, the exact canonical target
+  membership, and the expected ordered joint/final membership payload digests.
+  Wrapper apply accepts only one authorization at a time, requires its source to
+  match the currently certified membership head, and validates every proposed
+  transition stage against the active failure-domain policy before persisting it.
+- Every native OpenRaft `EntryPayload::Membership` entry, except the separately
+  validated index-zero bootstrap membership, must consume the next stage of that
+  committed authorization. Before publishing the entry as applied, the wrapper
+  requires the authorization's topology generation/digest and source membership
+  to match current state, requires the exact expected joint/final payload, and
+  revalidates the resulting voter placement against the active topology policy.
+  Each applied stage records its full membership log id and payload digest in
+  pending progress. When the exact final membership becomes effective, wrapper
+  apply atomically writes a completed transition certificate containing the
+  authorization id, topology generation/manifest digest, source full membership
+  log id and digest, final full membership log id, and target membership digest,
+  then clears pending authorization. An unauthorized or mismatched committed
+  native membership entry is a fatal replicated-state invariant violation:
+  poison the authority and expose no serving state, because a state machine
+  cannot undo a membership entry after consensus has committed it.
+- Once a topology policy is active, snapshot/restart validation accepts
+  `SnapshotMeta.last_membership` only when its exact full log id and canonical
+  payload digest match the record selected by the durable certified-membership
+  head: the topology activation certificate when no later transition stage is
+  effective, the exact applied stage recorded by an in-progress authorized
+  transition, or the final membership in the latest completed transition
+  certificate. Activation, each native authorized stage, and final completion
+  update that selector atomically with their other wrapper state; a stale
+  retained certificate is never an alternative match. At authorization and
+  completion time the source must match the then-current certified head; after
+  compaction the newly persisted completed certificate becomes the
+  self-contained head. A merely higher-index, policy-valid membership is not
+  evidence of authorization and fails before snapshot mutation. This exact rule
+  applies equally to cached snapshots, received snapshot install, durable
+  artifact restart, and compacted prefixes; pre-activation bootstrap snapshots
+  remain subject to the separate index-zero bootstrap validation.
+- Serialize topology activation, membership authorization, and the subsequent
+  OpenRaft membership API call through one leader-side replicated-membership
+  coordinator, and make the raw membership API inaccessible to other Argmin
+  call paths. `ActivateTopologyPolicy` deterministically rejects while any
+  membership authorization is pending. This closes both log orders: membership
+  completed before activation is checked by activation's full membership proof;
+  activation before authorization causes authorization to validate against the
+  new topology generation; and authorization before activation blocks activation
+  until the exact native transition completes. Safety rests on the committed
+  authorization and wrapper checks, not the local lock.
+- Leadership change releases the local coordinator. A new leader reconstructs
+  pending authorization/progress from applied wrapper state and may resume only
+  the exact remaining authorized transition. A committed
+  `CancelRaftMembershipAuthorization` wrapper request may clear it only when the
+  source full membership is still current and no native membership stage has
+  applied; once a joint stage applies, the authorized final stage must complete
+  or the authority remains fail-closed.
+- Bind runtime maps, serving leases, heartbeat reports, and storage RPC route
+  proofs to the committed topology generation. Activation invalidates the old
+  generation's serving authority and may expose the stronger host-level claim
+  only after the prior-generation lease/symmetric-skew fence has completed.
+  Authorities or storage nodes whose local topology config does not match the
+  committed digest remain non-serving; stale frontends and storage nodes reject
+  mismatched-generation traffic instead of continuing under a mixed policy.
+  Each intermediate configuration retains its previously committed guarantee,
+  so changing a label, endpoint, or one process config can never upgrade the
+  cluster-wide safety claim. Add deterministic command/replay tests for stale
+  and same-index/different-term-or-node membership proofs, membership digest
+  mismatch, missing/stale/wrong-incarnation preparation acknowledgements, racing
+  membership entries in both log orders, unauthorized native membership poison,
+  joint/final payload mismatch, pending-authorization snapshot/restart, completed
+  transition certificate restart, forged higher-index policy-valid but
+  uncertified snapshot membership, and cursor advancement after activation
+  rejection. In particular, cover activation followed by a previously raced
+  membership request and prove it cannot commit without a new-generation
+  authorization. Add process coverage for mixed configs, delayed old maps,
+  leadership transfer, crash, and restart before/after prepare, acknowledgement,
+  authorization, membership transition, and activation before this expansion
+  path is supported.
+- Replace `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` during production-mode
+  cleanup with the deployment mode plus an explicit authority/peer
+  configuration validated for that mode. Do not replace it with another
+  boolean that conflates the supported single-authority standalone profile with
+  test-only compatibility or permits replicated mode to run without Raft.
 
 Post-12.4 sequencing for TCP transport and production-shaped config:
 
 - Resolve the critical control-plane write-amplification and history-size
-  blocker above before production cutover. TCP/auth/config work may proceed in
-  parallel, but it must not cause the expensive checkpoint/heartbeat shape to
-  become the production default by accident.
+  blocker above before replicated-mode production cutover. TCP/auth/config work
+  may proceed in parallel, but it must not cause the expensive
+  checkpoint/heartbeat shape to become the production default by accident.
 - Add shared authenticated test helpers first, in
   [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
-  so process and UAT tests can opt into authenticated Unix sockets without
-  duplicating scoped-credential setup.
-- Convert representative standard Unix multi-node/UAT paths to authenticated
-  mode. Unix sockets remain allowed in both authenticated and explicitly
-  unauthenticated local/test configurations while they are the main process
-  test transport, but the default multi-node coverage should exercise auth.
+  so all replicated process and UAT tests can configure authenticated Unix
+  sockets without duplicating scoped-credential setup.
+- Convert standard Unix multi-node/UAT paths to authenticated mode. Unix sockets
+  remain the main local replicated and process-test transport, but replicated
+  mode has no unauthenticated opt-out. Keep unauthenticated Unix coverage only
+  for standalone and explicit auth-rejection tests.
 - Do the Raft naming cleanup as a dedicated production-cutover slice, not
   piecemeal during WAL/auth work. That slice should remove or replace
   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`, rename process/log/test labels and
   `ExperimentalRaftControlPlane`-style wrappers only once the replicated
   control-plane mode is no longer experimental, and update docs/security
   references together.
-- Lock the transport policy before adding TCP: TCP/non-local control-plane
-  transports are authenticated-only. A TCP Raft peer, control-plane admin,
-  storage-node heartbeat, or frontend runtime-map listener must reject startup
-  without the required scoped credentials. There should be no unauthenticated
-  TCP mode.
-- Introduce a control-plane configuration-file surface with the TCP transport
-  slice rather than continuing to grow flat env vars. The first file format
-  should cover cluster identity, transport listeners, static peer endpoints,
-  scoped credential ids/versions and secret references, rotation windows, auth
-  requirement modes, and the existing restart-artifact/peer-policy identity
-  checks. Env vars may remain as test overrides and local shortcuts.
+- Lock the transport policy before adding TCP: every TCP/non-local internal
+  transport is authenticated-only. A TCP Raft peer, control-plane admin,
+  storage-node heartbeat, frontend runtime-map listener, or storage data-plane
+  listener/client must reject startup without the required scoped credentials.
+  There should be no unauthenticated TCP mode.
+- Introduce an internal cluster configuration-file surface with the TCP
+  transport slices rather than continuing to grow flat env vars. The first file
+  format should cover deployment mode, cluster identity, selected failure-domain
+  level and tolerance, hierarchical host/disk identities, control-plane and
+  storage transport listeners, Raft and storage-node endpoints, scoped
+  role/principal credential ids/versions and secret references, rotation
+  windows, auth requirement modes for standalone only, and the existing
+  restart-artifact/peer-policy identity checks. Env vars may remain as test
+  overrides and local shortcuts.
+- Add a **transport-independent storage RPC authentication and authorization
+  slice before TCP**. Define a bounded/versioned envelope over the existing
+  storage RPC payload and response frames, bind cluster/source/target identity,
+  operation kind and direction, topology generation, PG/shard route and epoch,
+  request or command identity, and operation-specific freshness/replay fields,
+  and authorize the authenticated role before storage dispatch or mutation.
+  Keep the authorization matrix explicit for frontend/coordinator,
+  storage-node/repair, and maintenance operations rather than treating a valid
+  MAC as permission for every storage RPC.
+- Wire that storage auth boundary into Unix clients/listeners first and make it
+  mandatory in replicated mode. Add shared credential/test helpers and negative
+  coverage for every storage RPC operation family: missing/malformed auth,
+  wrong cluster/role/source/target, wrong operation or direction, stale topology
+  generation/route/epoch, replay outside the operation's idempotency contract,
+  tampered request/response, oversized/truncated frames, and rejection before
+  mutation. Standalone may explicitly opt out on local Unix; replicated Unix
+  must fail startup when required storage credentials are absent.
 - Add TCP Raft peer transport as a distinct multihost slice after the config
   file/auth-helper work. TCP is not just an auth change: it affects peer
   addressing, listener lifecycle, connection retry/backoff, source/target
   identity binding, and operational deployment shape. It must reuse the shared
   auth envelope and fail closed before OpenRaft dispatch.
+- Add TCP storage-node transport as a subsequent data-plane slice that reuses
+  the exact authenticated storage RPC envelope, authorization matrix, and
+  dispatch boundary already enforced on Unix. This slice enables multihost
+  replicated topologies without changing operation semantics and adds TCP
+  addressing, listener lifecycle, connection management/backoff, endpoint
+  discovery, frame and in-flight bounds, confidentiality, streaming behavior,
+  and ambiguous-response retry rules. Authenticated Unix storage RPC remains the
+  transport for local replicated topologies and process tests; TCP must not
+  introduce a second auth or authorization implementation.
 - Defer dynamic configured peer-policy updates and formal admin API
   restructuring unless the TCP/config-file work exposes a concrete ambiguity.
-  Admin API formalization is likely a later production-readiness slice, not a
-  prerequisite for the first authenticated TCP transport.
+  Dynamic Raft membership and storage expansion are prerequisites for the
+  supported local-to-multihost evolution above, but not for the first static
+  authenticated TCP transport. Admin API formalization is likely a later
+  production-readiness slice.
 
 Phase 12.4 progress:
 
@@ -11947,8 +12233,10 @@ Phase 12.4 progress:
    - introduce a linearized command/read trait boundary that the existing
      single-authority implementation and the new replicated implementation can
      both satisfy;
-   - keep the file-backed single-authority implementation for focused tests and
-     local debugging until the replicated path fully replaces it.
+   - keep the file-backed single-authority implementation as the supported
+     standalone authority and as the focused-test/differential oracle; require
+     the replicated implementation for replicated mode rather than replacing
+     single authority in every deployment.
 3. select and integrate the consensus mechanism:
    - use a small Raft-style replicated log for a 3-5 node control-plane group;
    - make the replicated log contain logical control-plane commands, not SQLite
