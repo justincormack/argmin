@@ -162,8 +162,13 @@ For each matrix:
   Pin UploadPartCopy's shared numeric/duplicate rules and its distinct
   no-XML-declaration error shape. Assert the accepted first duplicate is the
   part stored and that missing `partNumber` publishes no object.
-- [ ] Pin zero-byte parts, 5 MiB minus one/exactly 5 MiB non-final parts, final
+- [x] Pin zero-byte parts, 5 MiB minus one/exactly 5 MiB non-final parts, final
   part exceptions, overwritten parts, and maximum-part completion behavior.
+  AWS applies the minimum only to the selected non-final parts and uses the
+  latest upload for an overwritten part number. A lone part numbered 10,000
+  completes successfully. A 10,000-entry manifest proceeds to part lookup,
+  while 10,001 entries fail first with AWS's exact `InvalidArgument` response;
+  the count boundary is tested without transferring 10,000 full-size parts.
 - [ ] Cross invalid part numbers/ranges/checksums with invalid upload IDs and
   unauthorized principals to establish error precedence and non-publication.
 - [ ] Verify failed or interrupted UploadPart and UploadPartCopy requests neither

@@ -336,6 +336,9 @@ pub enum ServerError {
     #[error("complete multipart checksum header {header_name} is invalid")]
     CompleteMultipartChecksumHeaderInvalid { header_name: String },
 
+    #[error("CompleteMultipartUpload contains more than 10000 parts")]
+    CompleteMultipartTooManyParts,
+
     #[error("CompleteMultipartUpload If-Match value is empty")]
     CompleteMultipartEmptyIfMatch,
 
@@ -607,7 +610,9 @@ impl ServerError {
             Self::CompleteMultipartMissingPartChecksum { .. }
             | Self::CompleteMultipartChecksumHeaderInvalid { .. }
             | Self::CompleteMultipartExpectedSizeHeaderInvalid { .. } => "InvalidRequest",
-            Self::CompleteMultipartEmptyIfMatch => "InvalidArgument",
+            Self::CompleteMultipartEmptyIfMatch | Self::CompleteMultipartTooManyParts => {
+                "InvalidArgument"
+            }
             Self::UploadPartCopyInvalidRange { .. } => "InvalidArgument",
             Self::UploadPartCopyPreconditionFailed { .. } => "PreconditionFailed",
             Self::EntityTooSmall { .. } => "EntityTooSmall",
@@ -696,6 +701,7 @@ impl ServerError {
             | Self::CompleteMultipartMissingPartChecksum { .. }
             | Self::CompleteMultipartChecksumHeaderInvalid { .. }
             | Self::CompleteMultipartEmptyIfMatch
+            | Self::CompleteMultipartTooManyParts
             | Self::CompleteMultipartExpectedSizeHeaderInvalid { .. }
             | Self::UploadPartCopyInvalidRange { .. }
             | Self::InvalidEncryptionAlgorithmError { .. } => 400,

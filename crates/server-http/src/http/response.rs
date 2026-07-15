@@ -449,6 +449,9 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::CompleteMultipartChecksumHeaderInvalid { header_name } => {
             format!("Value for {header_name} header is invalid.")
         }
+        ServerError::CompleteMultipartTooManyParts => {
+            "The CompleteMultipartUpload reqeust contains for than 10000 parts.".to_string()
+        }
         ServerError::CompleteMultipartEmptyIfMatch => {
             "The value provided for the If-Match query parameter cannot be empty for this API."
                 .to_string()
@@ -1259,6 +1262,16 @@ impl S3Response {
             ServerError::CompleteMultipartChecksumHeaderInvalid { header_name } => {
                 let body = xml::complete_multipart_checksum_header_invalid_error_xml(
                     header_name,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::CompleteMultipartTooManyParts => {
+                let body = xml::invalid_argument_error_xml_no_decl(
+                    &client_error_message(err),
+                    "CompleteMultipartUpload",
+                    Some("CompleteMultipartUpload"),
                     request_id,
                     host_id,
                 );

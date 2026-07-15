@@ -15662,7 +15662,7 @@ fn complete_multipart_too_many_parts() {
             sse_customer: None,
         })
         .unwrap_err();
-    assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    assert!(matches!(err, ServerError::CompleteMultipartTooManyParts));
 }
 
 // ── shard planning unit tests ──────────────────────────────────────

@@ -591,12 +591,7 @@ impl Coordinator {
                 });
             }
             if parts.len() > MAX_MULTIPART_PARTS {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "part list exceeds maximum of {MAX_MULTIPART_PARTS} parts, got {}",
-                        parts.len()
-                    ),
-                });
+                return Err(ServerError::CompleteMultipartTooManyParts);
             }
             for window in parts.windows(2) {
                 if window[0].part_number >= window[1].part_number {

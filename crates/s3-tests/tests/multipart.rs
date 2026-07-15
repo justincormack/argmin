@@ -4007,6 +4007,284 @@ fn test_multipart_part_too_small() {
 }
 
 #[test]
+fn test_multipart_part_size_boundary_and_final_exception() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "part-size-boundary";
+        let create = create_multipart_upload_retrying_operation_aborted(client, &bucket, key).await;
+        let upload_id = create.upload_id().unwrap();
+
+        let below_minimum = vec![b'a'; PART_SIZE - 1];
+        let part_one = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            below_minimum.clone(),
+        )
+        .await;
+        let part_two =
+            upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 2, Vec::new())
+                .await;
+
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part_one.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part_two.e_tag().unwrap())
+                            .part_number(2)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("complete with a part one byte below the minimum")
+            .await;
+        assert_s3_err_code(&result, "EntityTooSmall");
+        assert_multipart_parts_preserved(
+            &bucket,
+            key,
+            upload_id,
+            &[
+                (1, (PART_SIZE - 1) as i64, part_one.e_tag().unwrap()),
+                (2, 0, part_two.e_tag().unwrap()),
+            ],
+        )
+        .await;
+
+        // The same part is accepted when it is the last part selected for
+        // completion. Parts uploaded after it need not be included.
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part_one.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("complete with a sub-minimum final part")
+            .await
+            .unwrap();
+        assert_object_contents_and_etag(&bucket, key, complete.e_tag().unwrap(), &below_minimum)
+            .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_multipart_overwritten_part_size_controls_completion() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "overwritten-part-size";
+        let create = create_multipart_upload_retrying_operation_aborted(client, &bucket, key).await;
+        let upload_id = create.upload_id().unwrap();
+
+        upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            vec![b'a'; PART_SIZE],
+        )
+        .await;
+        let zero_part_one =
+            upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 1, Vec::new())
+                .await;
+        let zero_part_two =
+            upload_part_retrying_operation_aborted(client, &bucket, key, upload_id, 2, Vec::new())
+                .await;
+
+        let completion = |part_one_etag: &str| {
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .e_tag(part_one_etag)
+                        .part_number(1)
+                        .build(),
+                )
+                .parts(
+                    CompletedPart::builder()
+                        .e_tag(zero_part_two.e_tag().unwrap())
+                        .part_number(2)
+                        .build(),
+                )
+                .build()
+        };
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(completion(zero_part_one.e_tag().unwrap()))
+            .send_retrying_operation_aborted(
+                "complete after overwriting a valid part with zero bytes",
+            )
+            .await;
+        assert_s3_err_code(&result, "EntityTooSmall");
+        assert_multipart_parts_preserved(
+            &bucket,
+            key,
+            upload_id,
+            &[
+                (1, 0, zero_part_one.e_tag().unwrap()),
+                (2, 0, zero_part_two.e_tag().unwrap()),
+            ],
+        )
+        .await;
+
+        let replacement = vec![b'b'; PART_SIZE];
+        let replacement_part_one = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            upload_id,
+            1,
+            replacement.clone(),
+        )
+        .await;
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(completion(replacement_part_one.e_tag().unwrap()))
+            .send_retrying_operation_aborted("complete after replacing a zero-byte non-final part")
+            .await
+            .unwrap();
+        assert_object_contents_and_etag(&bucket, key, complete.e_tag().unwrap(), &replacement)
+            .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_maximum_part_count() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let maximum_number_key = "maximum-part-number";
+        let create =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, maximum_number_key)
+                .await;
+        let maximum_number_upload_id = create.upload_id().unwrap();
+        let maximum_number_part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            maximum_number_key,
+            maximum_number_upload_id,
+            10_000,
+            b"maximum part number".to_vec(),
+        )
+        .await;
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(maximum_number_key)
+            .upload_id(maximum_number_upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(maximum_number_part.e_tag().unwrap())
+                            .part_number(10_000)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("complete with only part number 10000")
+            .await
+            .unwrap();
+        assert_object_contents_and_etag(
+            &bucket,
+            maximum_number_key,
+            complete.e_tag().unwrap(),
+            b"maximum part number",
+        )
+        .await;
+
+        let key = "maximum-part-count";
+        let create = create_multipart_upload_retrying_operation_aborted(client, &bucket, key).await;
+        let upload_id = create.upload_id().unwrap();
+
+        let completion_body = |part_count: u32| {
+            let mut body = String::from("<CompleteMultipartUpload>");
+            for part_number in 1..=part_count {
+                body.push_str(&format!(
+                    "<Part><PartNumber>{part_number}</PartNumber><ETag>\"00000000000000000000000000000000\"</ETag></Part>"
+                ));
+            }
+            body.push_str("</CompleteMultipartUpload>");
+            body
+        };
+
+        let at_limit = raw_complete_upload(&bucket, key, upload_id, &completion_body(10_000), &[]);
+        assert!(
+            at_limit.status == 400 || at_limit.status == 200,
+            "at-limit response: {at_limit:?}"
+        );
+        assert_eq!(xml_tag_text(&at_limit.body, "Code"), Some("InvalidPart"));
+        assert_eq!(xml_tag_text(&at_limit.body, "UploadId"), Some(upload_id));
+        assert_eq!(
+            xml_tag_text(&at_limit.body, "ETag"),
+            Some("00000000000000000000000000000000")
+        );
+        let rejected_part = xml_tag_text(&at_limit.body, "PartNumber")
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert!((1..=10_000).contains(&rejected_part));
+
+        let above_limit =
+            raw_complete_upload(&bucket, key, upload_id, &completion_body(10_001), &[]);
+        assert_shape(
+            "CompleteMultipartUpload above maximum part count",
+            &above_limit,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::invalid_argument_with_value_no_decl(
+                    "The CompleteMultipartUpload reqeust contains for than 10000 parts.",
+                    "CompleteMultipartUpload",
+                    "CompleteMultipartUpload",
+                ),
+            ),
+        );
+        assert_multipart_parts_preserved(&bucket, key, upload_id, &[]).await;
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send_retrying_operation_aborted("abort maximum-part-count oracle upload")
+            .await
+            .unwrap();
+        cleanup(&bucket, &[maximum_number_key]).await;
+    });
+}
+
+#[test]
 fn test_upload_part_invalid_part_number_exceeds_max() {
     s3_tests::run(async {
         let client = CTX.client();
