@@ -14,6 +14,7 @@ use ring::hmac;
 use s3_tests::{
     build_test_agent, post_object_raw_to_test_endpoint_with_headers,
     presign_url_for_service_with_credentials, send_signed_request_for_service_with_credentials,
+    send_signed_request_to_endpoint_for_service_with_credentials,
     shape::{
         assert_shape, assert_shape_with_request_id_validator, error_response_headers,
         expected_error, id_headers, response_header_value, shape, xml_tag_text, ShapeSpec,
@@ -6612,6 +6613,29 @@ struct RoutingMethodProbe<'a> {
     s3_control: S3ControlMethodResult,
 }
 
+enum StsPathResult {
+    UnknownOperation,
+    EmptyBadRequest,
+}
+
+enum S3ControlPathResult {
+    NoSuchResource,
+    InvalidUri(String),
+    EmptyBadRequest,
+}
+
+struct RoutingPathProbe {
+    label: &'static str,
+    wire_path: String,
+    signed_path: Option<String>,
+    sts: StsPathResult,
+    s3_control: S3ControlPathResult,
+}
+
+fn assert_empty_bad_path_request(label: &str, response: &RawResponse) {
+    assert_shape(label, response, &shape().status(400).body_empty());
+}
+
 fn assert_s3_control_signature_mismatch(
     label: &str,
     response: &RawResponse,
@@ -7056,6 +7080,217 @@ fn run_cross_service_routing_probes(
         },
     );
     println!("routing-options-cors-s3-control: ok");
+
+    let raw_resource = format!("arn:aws:s3:::claude-s3-sts-routing-{unique:x}");
+    let path_probes = vec![
+        RoutingPathProbe {
+            label: "tags-no-resource",
+            wire_path: "/v20180820/tags".to_string(),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri("tags".to_string()),
+        },
+        RoutingPathProbe {
+            label: "tags-empty-resource",
+            wire_path: "/v20180820/tags/".to_string(),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri("tags/".to_string()),
+        },
+        RoutingPathProbe {
+            label: "tags-extra-segment",
+            wire_path: format!("{tags_path}/unexpected"),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri(format!("tags/{raw_resource}/unexpected")),
+        },
+        RoutingPathProbe {
+            label: "tag-singular",
+            wire_path: format!("/v20180820/tag/{resource}"),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri(format!("tag/{raw_resource}")),
+        },
+        RoutingPathProbe {
+            label: "tags-prefix-suffix",
+            wire_path: format!("/v20180820/tagsx/{resource}"),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri(format!("tagsx/{raw_resource}")),
+        },
+        RoutingPathProbe {
+            label: "wrong-version",
+            wire_path: format!("/v20180819/tags/{resource}"),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri(format!("/v20180819/tags/{resource}")),
+        },
+        RoutingPathProbe {
+            label: "uppercase-version",
+            wire_path: format!("/V20180820/tags/{resource}"),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri(format!("/V20180820/tags/{resource}")),
+        },
+        RoutingPathProbe {
+            label: "double-leading-slash",
+            wire_path: format!("//v20180820/tags/{resource}"),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri(format!("//v20180820/tags/{resource}")),
+        },
+        RoutingPathProbe {
+            label: "encoded-path-separator",
+            wire_path: format!("/v20180820/tags%2F{resource}"),
+            signed_path: Some(tags_path.clone()),
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::NoSuchResource,
+        },
+        RoutingPathProbe {
+            label: "unencoded-valid-arn",
+            wire_path: format!("/v20180820/tags/{raw_resource}"),
+            signed_path: Some(tags_path.clone()),
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::NoSuchResource,
+        },
+        RoutingPathProbe {
+            label: "malformed-percent-bare",
+            wire_path: "/v20180820/tags/%".to_string(),
+            signed_path: None,
+            sts: StsPathResult::EmptyBadRequest,
+            s3_control: S3ControlPathResult::EmptyBadRequest,
+        },
+        RoutingPathProbe {
+            label: "malformed-percent-short",
+            wire_path: "/v20180820/tags/%2".to_string(),
+            signed_path: None,
+            sts: StsPathResult::EmptyBadRequest,
+            s3_control: S3ControlPathResult::EmptyBadRequest,
+        },
+        RoutingPathProbe {
+            label: "malformed-percent-hex",
+            wire_path: "/v20180820/tags/%GG".to_string(),
+            signed_path: None,
+            sts: StsPathResult::EmptyBadRequest,
+            s3_control: S3ControlPathResult::EmptyBadRequest,
+        },
+        RoutingPathProbe {
+            label: "invalid-utf8-percent",
+            wire_path: "/v20180820/tags/%FF".to_string(),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri("/v20180820/tags/%FF".to_string()),
+        },
+        RoutingPathProbe {
+            label: "malformed-arn",
+            wire_path: "/v20180820/tags/not-an-arn".to_string(),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri("tags/not-an-arn".to_string()),
+        },
+        RoutingPathProbe {
+            label: "empty-bucket-arn",
+            wire_path: "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3A".to_string(),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri("tags/arn:aws:s3:::".to_string()),
+        },
+        RoutingPathProbe {
+            label: "wrong-service-arn",
+            wire_path: format!("/v20180820/tags/arn%3Aaws%3Aiam%3A%3A{account_id}%3Arole%2Fprobe"),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri(format!(
+                "tags/arn:aws:iam::{account_id}:role/probe"
+            )),
+        },
+        RoutingPathProbe {
+            label: "object-arn",
+            wire_path: format!("{tags_path}%2Fobject"),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri(format!("tags/{raw_resource}/object")),
+        },
+        RoutingPathProbe {
+            label: "double-encoded-arn",
+            wire_path: format!("/v20180820/tags/{}", resource.replace('%', "%25")),
+            signed_path: None,
+            sts: StsPathResult::UnknownOperation,
+            s3_control: S3ControlPathResult::InvalidUri(format!("tags/{resource}")),
+        },
+    ];
+    for probe in path_probes {
+        let signed_path = probe.signed_path.as_deref().unwrap_or(&probe.wire_path);
+        if probe.signed_path.is_some() {
+            assert_ne!(
+                probe.wire_path, signed_path,
+                "routing-path-{}: normalized signing path must differ from the wire path",
+                probe.label
+            );
+        }
+
+        let sts_label = format!("routing-path-sts-{}", probe.label);
+        let sts_response = send_signed_request_to_endpoint_for_service_with_credentials(
+            "GET",
+            &format!("{sts_endpoint}{}", probe.wire_path),
+            &format!("{sts_endpoint}{signed_path}"),
+            b"",
+            [("x-amz-account-id", account_id)],
+            "sts",
+            credentials,
+        );
+        match probe.sts {
+            StsPathResult::UnknownOperation => {
+                assert_sts_unknown_operation(&sts_label, &sts_response, false);
+            }
+            StsPathResult::EmptyBadRequest => {
+                assert_empty_bad_path_request(&sts_label, &sts_response);
+            }
+        }
+        println!("{sts_label}: ok");
+
+        let s3_control_label = format!("routing-path-s3-control-{}", probe.label);
+        let s3_control_response = send_signed_request_to_endpoint_for_service_with_credentials(
+            "GET",
+            &format!("{s3_control_endpoint}{}", probe.wire_path),
+            &format!("{s3_control_endpoint}{signed_path}"),
+            b"",
+            [("x-amz-account-id", account_id)],
+            "s3",
+            credentials,
+        );
+        match probe.s3_control {
+            S3ControlPathResult::NoSuchResource => assert_s3_control_error(
+                &s3_control_label,
+                &s3_control_response,
+                S3ControlError {
+                    status: 404,
+                    code: "NoSuchResource",
+                    message: "The specified resource doesn't exist.",
+                    detail: "",
+                    allow: None,
+                },
+            ),
+            S3ControlPathResult::InvalidUri(uri) => {
+                let detail = format!("<URI>{uri}</URI>");
+                assert_s3_control_error(
+                    &s3_control_label,
+                    &s3_control_response,
+                    S3ControlError {
+                        status: 400,
+                        code: "InvalidURI",
+                        message: "Couldn't parse the specified URI.",
+                        detail: &detail,
+                        allow: None,
+                    },
+                );
+            }
+            S3ControlPathResult::EmptyBadRequest => {
+                assert_empty_bad_path_request(&s3_control_label, &s3_control_response);
+            }
+        }
+        println!("{s3_control_label}: ok");
+    }
 }
 
 fn run_list_tags_for_resource_success_probe(

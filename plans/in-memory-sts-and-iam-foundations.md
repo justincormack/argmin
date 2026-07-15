@@ -1869,9 +1869,41 @@ against authentication. The raw test client now accepts arbitrary valid HTTP
 method tokens so these named extension methods are sent on the wire rather than
 approximated with a recognized method.
 
-The remaining path/percent/ARN near misses, account-ID variants,
-signing-service collisions, malformed operation bodies, and local Host/SNI
-trust-boundary cases remain required before the Phase 4 service refactor.
+The path, percent-decoding, and resource-ARN near-miss slice completed on
+2026-07-15. It sends the same read-only, correctly signed GET and account-ID
+header to both endpoint families for 19 request targets. Complete normalized
+headers and bodies establish:
+
+| Request-target group | `AwsRegionalSts` | `AwsRegionalS3Control` | Local `SharedRegional` selection |
+| --- | --- | --- | --- |
+| Encoded path separator `tags%2F<encoded-arn>` and a valid ARN sent with literal colons | `404 <UnknownOperationException/>` | `404 NoSuchResource` | S3 Control |
+| Bare, truncated, or non-hex percent triplet (`%`, `%2`, `%GG`) | outer HTTP `400`, empty body, no STS request IDs | outer HTTP `400`, empty body, no S3 request IDs | S3 Control outer-error shape |
+| Missing or empty resource, extra path segment, singular `tag`, `tagsx`, wrong or case-mismatched version, doubled leading slash, percent-decoded invalid UTF-8, malformed/empty/wrong-service/object ARN, and double-encoded ARN | `404 <UnknownOperationException/>` | `400 InvalidURI` with the exact target-dependent `<URI>` value | S3 Control |
+
+The valid ARN spellings require a deliberate distinction between the wire
+target and SigV4 canonical target. AWS treats `%2F` between `tags` and the ARN
+as a path separator, and percent-encodes literal ARN colons when it constructs
+the canonical path. Signing the normalized canonical path while preserving the
+original wire spelling succeeds and reaches `NoSuchResource`; signing the raw
+spelling instead produces only a signer-induced `SignatureDoesNotMatch` and is
+not routing evidence.
+
+The `InvalidURI` detail also pins the decode boundary. For the exact
+`/v20180820/` prefix, AWS removes that version prefix and percent-decodes one
+layer in `<URI>`; a double-encoded ARN therefore remains singly encoded.
+Wrong-version, case-mismatched-version, doubled-leading-slash, and invalid
+UTF-8 targets retain their full encoded path instead. Malformed percent
+triplets do not reach either service's XML renderer at all.
+
+For the named bounded rows, `SharedRegional` deliberately selects the S3
+Control observation instead of falling through to STS or ordinary S3. These
+are valid-signature probes. They pin routing and response shapes but do not yet
+order path parsing or percent validation against authentication; those
+collisions remain part of the signing-service/signature slice.
+
+The remaining account-ID variants, signing-service and bad-signature
+collisions, malformed operation bodies, and local Host/SNI trust-boundary cases
+remain required before the Phase 4 service refactor.
 The narrow current local `TagResource`/`UntagResource` routes still inherit the
 ordinary S3 listener's transport and are therefore a documented temporary gap;
 the typed Phase 4 endpoint refactor must remove that gap rather than inventing
@@ -2159,9 +2191,10 @@ body may appear in traces.
    validation, authentication, and STS Query classification on both the AWS STS
    and S3 Control endpoint kinds? The routing-boundary matrix and explicit
    `SharedRegional` mapping above have pinned the root-Query,
-   versioned-path/form/query, and bounded HTTP-method rows. The remaining
-   bounded rows must be completed, and the local authority/SNI matrix must
-   enforce the endpoint-kind trust boundary, before the typed service refactor.
+   versioned-path/form/query, bounded HTTP-method, and path/percent/ARN
+   near-miss rows. The remaining account-ID, signing/authentication, and body
+   rows must be completed, and the local authority/SNI matrix must enforce the
+   endpoint-kind trust boundary, before the typed service refactor.
 
 ## Definition Of The First Usable Milestone
 
