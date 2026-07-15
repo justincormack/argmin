@@ -609,7 +609,7 @@ fn create_bucket_rehydrates_durable_pending_slot_after_reopen() {
 }
 
 #[test]
-fn bucket_acl_rehydration_preserves_completed_multipart_sequence_after_reopen() {
+fn bucket_acl_rehydration_preserves_multipart_completion_barrier_sequence_after_reopen() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -627,7 +627,7 @@ fn bucket_acl_rehydration_preserves_completed_multipart_sequence_after_reopen() 
         create_test_bucket(&cluster, &bucket);
         assert_eq!(
             cluster
-                .test_reserve_completed_multipart_upload_order(&bucket)
+                .test_establish_multipart_completion_barrier(&bucket)
                 .unwrap(),
             1
         );
@@ -639,7 +639,7 @@ fn bucket_acl_rehydration_preserves_completed_multipart_sequence_after_reopen() 
             .unwrap();
         let current =
             crate::traits::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &bucket).unwrap();
-        assert_eq!(current.completed_multipart_upload_sequence, 1);
+        assert_eq!(current.multipart_completion_barrier_sequence, 1);
         let command_id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
             pg_id,
@@ -689,7 +689,7 @@ fn bucket_acl_rehydration_preserves_completed_multipart_sequence_after_reopen() 
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         let row = crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
-        assert_eq!(row.completed_multipart_upload_sequence, 1);
+        assert_eq!(row.multipart_completion_barrier_sequence, 1);
         assert!(row.public_read);
         assert!(!row.public_write);
         assert!(pg
@@ -1186,7 +1186,7 @@ fn metadata_command_log_state_survives_local_cluster_reopen() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
-    let bucket = {
+    let (bucket, command) = {
         let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
         let topology = map
             .node(NodeId::new(0))
@@ -1201,14 +1201,13 @@ fn metadata_command_log_state_survives_local_cluster_reopen() {
         cluster
             .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
             .unwrap();
-        bucket
+        (bucket, command)
     };
 
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
     set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
     cluster
         .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
         .unwrap();

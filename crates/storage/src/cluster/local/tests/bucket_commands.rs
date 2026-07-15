@@ -1341,7 +1341,7 @@ fn put_bucket_acl_command_retry_reuses_pending_partial_replica_command() {
 }
 
 #[test]
-fn bucket_acl_drains_pending_completed_multipart_sequence_command() {
+fn bucket_acl_drains_pending_multipart_completion_barrier_command() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1368,10 +1368,10 @@ fn bucket_acl_drains_pending_completed_multipart_sequence_command() {
             pg_id,
             map.test_next_metadata_command_log_index(pg_id),
         ),
-        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-            AdvanceCompletedMultipartUploadSequenceCommand {
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+            AdvanceMultipartCompletionBarrierCommand {
                 bucket: bucket.clone(),
-                completion_order: 7,
+                barrier_sequence: 7,
             },
         ),
     );
@@ -1384,14 +1384,14 @@ fn bucket_acl_drains_pending_completed_multipart_sequence_command() {
     let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
         move |_node_id, command| {
             match command.payload() {
-                MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance)
+                MetadataCommandPayload::AdvanceMultipartCompletionBarrier(advance)
                     if advance.bucket == hook_bucket
                         && apply_count_hook.fetch_add(1, Ordering::SeqCst) == 1 =>
                 {
                     return Err(StoreError::Io {
-                        context: "injected completed multipart sequence apply failure",
+                        context: "injected multipart completion barrier sequence apply failure",
                         source: std::io::Error::other(
-                            "injected completed multipart sequence apply failure",
+                            "injected multipart completion barrier sequence apply failure",
                         ),
                     });
                 }
@@ -1408,7 +1408,7 @@ fn bucket_acl_drains_pending_completed_multipart_sequence_command() {
         matches!(
             err,
             crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected completed multipart sequence apply failure",
+                context: "injected multipart completion barrier sequence apply failure",
                 ..
             })
         ),
@@ -1437,7 +1437,7 @@ fn bucket_acl_drains_pending_completed_multipart_sequence_command() {
         assert_eq!(info.acl_grants, updated.acl_grants);
         assert!(info.public_read);
         assert!(!info.public_write);
-        assert_eq!(info.completed_multipart_upload_sequence, 7);
+        assert_eq!(info.multipart_completion_barrier_sequence, 7);
     }
 }
 

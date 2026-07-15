@@ -528,7 +528,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::BucketWriteReservationRelease
         | StorageRpcMessageKind::DirectPutCommitSnapshotLoad
         | StorageRpcMessageKind::DirectPutCommitCommandBuild
-        | StorageRpcMessageKind::CompletedMultipartOrderCommandBuild
+        | StorageRpcMessageKind::MultipartCompletionBarrierCommandBuild
         | StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad
         | StorageRpcMessageKind::ObjectStreamPutCommitCommandBuild
         | StorageRpcMessageKind::ObjectStreamPartFinalizeSnapshotLoad
@@ -540,7 +540,6 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad
         | StorageRpcMessageKind::ObjectMultipartCompletionSnapshotLoad
         | StorageRpcMessageKind::ObjectMultipartCompletionPreflightLoad
-        | StorageRpcMessageKind::ObjectCompletedMultipartUploadsList
         | StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate
         | StorageRpcMessageKind::BucketWriteDrainBegin
         | StorageRpcMessageKind::BucketWriteDrainClear
@@ -553,7 +552,6 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::BucketDeleteBeginRoots
         | StorageRpcMessageKind::BucketDeleteFinalizeClaimGet
         | StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire
-        | StorageRpcMessageKind::BucketDeleteFinalizeCompletedMultipartProgress
         | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
         | StorageRpcMessageKind::BucketMarkDeletingCommandBuild
         | StorageRpcMessageKind::BucketWriteDrainExists
@@ -959,14 +957,6 @@ mod tests {
         assert_eq!(
             listing_probe_admission_class(2),
             UnixStorageNodeRpcAdmissionClass::List
-        );
-    }
-
-    #[test]
-    fn completed_multipart_cleanup_listing_uses_completion_admission_class() {
-        assert_eq!(
-            storage_rpc_admission_class(StorageRpcMessageKind::ObjectCompletedMultipartUploadsList),
-            UnixStorageNodeRpcAdmissionClass::Completion
         );
     }
 

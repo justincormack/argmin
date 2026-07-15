@@ -221,15 +221,6 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         target: StreamUploadTarget::PutObject,
         encryption: ObjectEncryption::None,
     };
-    let completed_upload = CompletedMultipartUploadRecord {
-        upload_id: crate::tests::multipart_upload_id("mutCompletedRpc"),
-        bucket: bucket.clone(),
-        key: crate::tests::object_key("object-mutation-completed-key"),
-        completion_order: 7,
-        completed_at: 11,
-        initiator: OwnerIdentity::from_principal("owner"),
-        owner: OwnerIdentity::from_principal("owner"),
-    };
     let generation_id = GenerationId::new(19).unwrap();
     let reclaim_generation_id = GenerationId::new(21).unwrap();
     let segment = ObjectSegmentRecord {
@@ -288,25 +279,6 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         )
         .unwrap();
         PgMetadataStore::create_stream_upload(&*pg, &listed_stream_request).unwrap();
-        pg.connection()
-            .execute(
-                "INSERT INTO completed_multipart_uploads \
-                 (upload_id, bucket, key, completion_order, completed_at, \
-                  owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    completed_upload.upload_id.as_str(),
-                    completed_upload.bucket.as_str(),
-                    completed_upload.key.as_str(),
-                    completed_upload.completion_order as i64,
-                    completed_upload.completed_at as i64,
-                    completed_upload.owner.principal.as_str(),
-                    completed_upload.owner.canonical_id.as_str(),
-                    completed_upload.initiator.principal.as_str(),
-                    completed_upload.initiator.canonical_id.as_str(),
-                ],
-            )
-            .unwrap();
         pg.put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -328,7 +300,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..19)
+    let server_threads: Vec<_> = (0..18)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -404,16 +376,6 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         == listed_stream_request.session_id
         && upload.bucket == listed_stream_request.bucket
         && upload.key == listed_stream_request.key));
-    let completed_uploads =
-        ObjectMutationMetadataNodeClient::list_completed_multipart_upload_records_for_bucket_page(
-            &client,
-            PgId::new(0),
-            &bucket,
-            None,
-            10,
-        )
-        .unwrap();
-    assert_eq!(completed_uploads.records, vec![completed_upload.clone()]);
     let reclaim_root = ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
         &client,
         PgId::new(0),
@@ -1227,15 +1189,22 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
         .unwrap();
     let err = client
         .validate_multipart_management_lookup_response(
-            &MultipartUploadManagementLookup::Completed(CompletedMultipartUploadRecord {
+            &MultipartUploadManagementLookup::Replay(Box::new(crate::MultipartCompletionReplay {
                 upload_id,
                 bucket,
                 key: crate::tests::object_key("wrong-completed-key"),
-                completion_order: 1,
-                completed_at: 2,
-                initiator: OwnerIdentity::from_principal("owner"),
-                owner: OwnerIdentity::from_principal("owner"),
-            }),
+                fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0x66; 32]),
+                version_id: VersionId::Null,
+                etag: ObjectEtag::MultipartComposite {
+                    crc64: [0; 8],
+                    parts: std::num::NonZeroU32::new(1).unwrap(),
+                },
+                size: 1,
+                last_modified: 2,
+                tags: None,
+                system_metadata_blob: None,
+                encryption: ObjectEncryption::None,
+            })),
             &upload.bucket,
             &upload.key,
             &upload.upload_id,
@@ -2211,6 +2180,7 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         bucket: bucket.clone(),
         key: key.clone(),
         upload_id: upload_id.clone(),
+        completion_fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0x55; 32]),
         versioning: BucketVersioningState::Enabled,
         owner: OwnerIdentity::from_principal("owner"),
         acl_grants: AclGrants::default(),
@@ -2255,6 +2225,7 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         ),
         MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
             upload_id: upload_id.clone(),
+            completion_fingerprint: request.completion_fingerprint,
             bucket_write_reservation: proof.clone(),
             object: PutLiveObjectReq {
                 bucket: bucket.clone(),
@@ -2284,9 +2255,6 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
             stream_uploads: Vec::new(),
             stream_upload_segments: Vec::new(),
             write_sequence: 1,
-            completion_order: 2,
-            completed_at_millis: 3,
-            initiator: OwnerIdentity::from_principal("owner"),
             last_modified_millis: 3,
             stale_payload: None,
         })),
@@ -2297,7 +2265,6 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         request: &request,
         version_id,
         expected_object_parts: &expected_object_parts,
-        completion_order: 2,
         bucket_write_reservation: &proof,
     };
     client
@@ -2361,7 +2328,6 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         request: &missing_cleanup_request,
         version_id,
         expected_object_parts: &expected_object_parts,
-        completion_order: 2,
         bucket_write_reservation: &proof,
     };
     let err = client
@@ -2412,7 +2378,6 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         request: &null_request,
         version_id: VersionId::Null,
         expected_object_parts: &null_expected_object_parts,
-        completion_order: 2,
         bucket_write_reservation: &proof,
     };
     let mut stale_payload = command.payload().clone();

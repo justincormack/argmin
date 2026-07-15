@@ -954,7 +954,7 @@ fn object_delete_metadata_command_partial_apply_reopens_and_releases_bucket_writ
 }
 
 #[test]
-fn completed_multipart_order_drains_same_pg_object_command_with_cleanup_hooks() {
+fn multipart_completion_barrier_drains_same_pg_object_command_with_cleanup_hooks() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1028,10 +1028,10 @@ fn completed_multipart_order_drains_same_pg_object_command_with_cleanup_hooks() 
     assert!(pending_metadata_command_for_test(&map, PgId::new(pg_id), &bucket).is_some());
     assert!(cluster.try_take_reclaim_work().is_none());
 
-    let completion_order = cluster
-        .test_reserve_completed_multipart_upload_order(&bucket)
+    let barrier_sequence = cluster
+        .test_establish_multipart_completion_barrier(&bucket)
         .unwrap();
-    assert_eq!(completion_order, 1);
+    assert_eq!(barrier_sequence, 1);
     assert!(pending_metadata_command_for_test(&map, PgId::new(pg_id), &bucket).is_none());
     assert!(matches!(
         cluster.try_take_reclaim_work(),
@@ -1060,12 +1060,12 @@ fn completed_multipart_order_drains_same_pg_object_command_with_cleanup_hooks() 
         )
         .unwrap());
         let info = crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
-        assert_eq!(info.completed_multipart_upload_sequence, completion_order);
+        assert_eq!(info.multipart_completion_barrier_sequence, barrier_sequence);
     }
 }
 
 #[test]
-fn completed_multipart_order_drains_other_bucket_sequence_without_stealing_order() {
+fn multipart_completion_barrier_drains_other_bucket_sequence_without_stealing_order() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1087,7 +1087,7 @@ fn completed_multipart_order_drains_other_bucket_sequence_without_stealing_order
 
     assert_eq!(
         cluster
-            .test_reserve_completed_multipart_upload_order(&bucket_b)
+            .test_establish_multipart_completion_barrier(&bucket_b)
             .unwrap(),
         1
     );
@@ -1095,10 +1095,10 @@ fn completed_multipart_order_drains_other_bucket_sequence_without_stealing_order
     let pg_id = PgId::new(1);
     let command = MetadataCommandEnvelope::new(
         cluster.next_metadata_command_id(pg_id).unwrap(),
-        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-            AdvanceCompletedMultipartUploadSequenceCommand {
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+            AdvanceMultipartCompletionBarrierCommand {
                 bucket: bucket_a.clone(),
-                completion_order: 1,
+                barrier_sequence: 1,
             },
         ),
     );
@@ -1106,7 +1106,7 @@ fn completed_multipart_order_drains_other_bucket_sequence_without_stealing_order
 
     assert_eq!(
         cluster
-            .test_reserve_completed_multipart_upload_order(&bucket_b)
+            .test_establish_multipart_completion_barrier(&bucket_b)
             .unwrap(),
         2
     );
@@ -1117,8 +1117,8 @@ fn completed_multipart_order_drains_other_bucket_sequence_without_stealing_order
             crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket_a).unwrap();
         let bucket_b_info =
             crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket_b).unwrap();
-        assert_eq!(bucket_a_info.completed_multipart_upload_sequence, 1);
-        assert_eq!(bucket_b_info.completed_multipart_upload_sequence, 2);
+        assert_eq!(bucket_a_info.multipart_completion_barrier_sequence, 1);
+        assert_eq!(bucket_b_info.multipart_completion_barrier_sequence, 2);
     }
     assert_clean_metadata_command_stream(&map, &[1]);
 }

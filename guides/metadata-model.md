@@ -58,7 +58,7 @@ The target canonical state includes:
 - reclaim records and reclaim manifests
 - durable allocators and counters that affect future visible metadata, such as
   object version counters, bucket execution generations, write sequences, and
-  completed multipart pruning order
+  the fixed-size multipart completion barrier sequence
 
 The current
 [multihost transition Phase 7](../plans/multihost-transition-plan.md#phase-7-metadata-model-integrity-and-divergence-policy)
@@ -67,7 +67,6 @@ command-owned durable serving, in-progress, and cleanup metadata:
 
 - `bucket_subresources`
 - `buckets`
-- `completed_multipart_uploads`
 - `multipart_part_segments`, including staging rows
 - `multipart_parts`
 - `multipart_reclaim_part_segments`
@@ -136,12 +135,12 @@ encodings.
 | `PutBucketProperty` | Storage-shaped | command-owned bucket row | post-mutation command-owned bucket row plus property effect group | matching command-owned bucket row post-image converges |
 | `PutBucketSubresource` | Storage-shaped | bucket row generation | bucket subresource row, generation mirrors | matching subresource effect converges |
 | `MarkBucketDeleting` | Storage-shaped | drained command-owned bucket row | post-mutation deleting bucket row | matching deleting bucket row post-image converges |
-| `AdvanceCompletedMultipartUploadSequence` | Storage-shaped | bucket completed-MPU sequence | advances bucket completed-MPU sequence to the command order | matching bucket/order converges |
 | `ReserveObjectGeneration` | Storage-shaped | object generation allocators and live/reclaim/reservation rows | generation reservation row | matching reservation id converges |
 | `ReleaseObjectGeneration` | Storage-shaped | generation reservation row | removes reservation row | missing matching reservation is idempotent |
 | `ReserveObjectVersion` | Storage-shaped | object version counter and existing object versions | advances the per-key object version counter to the reserved version | matching bucket/key/version converges |
 | `CommitDirectPutObject` | Storage-shaped | object row, reserved version/write-sequence state, reservation row | object row, segment manifest, stale reclaim rows | matching object generation/reservation converges |
-| `CommitMultipartObject` | Storage-shaped | MPU rows, part rows, reserved object version, reserved completed-MPU order, object state | object row, part manifest, selected segment rows, completed-MPU row, stale reclaim rows | matching upload completion converges |
+| `AdvanceMultipartCompletionBarrier` | Storage-shaped | bucket row and exact multipart bucket-write reservation proof | advances one fixed-size bucket barrier sequence | matching or later sequence converges; no upload identity is retained |
+| `CommitMultipartObject` | Storage-shaped | MPU rows, part rows, reserved object version, established multipart completion barrier, object state | object row with completion replay identity/fingerprint, part manifest, selected segment rows, stale reclaim rows | matching upload completion converges while replay remains scoped to the object version |
 | `DeleteObjectVersion` | Storage-shaped | exact object version row | removes version, writes reclaim metadata for live payload | matching version/generation converges |
 | `InsertDeleteMarker` | Storage-shaped | reserved object version/write-sequence state | delete marker row, optional stale reclaim metadata | matching bucket/key marker insertion converges |
 | `PutObjectMetadata` | Storage-shaped | exact object version row | post-mutation live object metadata row | matching live object post-image converges |
@@ -152,7 +151,6 @@ encodings.
 | `CreateMultipartUpload` | Storage-shaped | object generation allocators and reservation rows | multipart upload row and generation reservation row | matching upload row converges |
 | `AbortMultipartUpload` | Storage-shaped | upload row, part rows, staged part segments | upload/part metadata cleanup rows | matching upload abort converges |
 | `DeleteObjectPayloadReclaim` | Storage-shaped | reclaim root and manifest rows | removes reclaim metadata | matching reclaim root converges |
-| `DeleteCompletedMultipartUpload` | Storage-shaped | exact completed-MPU tombstone row | removes completed-MPU tombstone row | missing matching tombstone is idempotent |
 
 For row-shaped create commands, retry matching is exact over the stored row
 published by the command. Matching only the original request fields is not
@@ -184,11 +182,12 @@ only.
 Bucket metadata commands keep the AWS-facing operation split at the storage API
 boundary, but the durable command carries the command-owned bucket-table
 post-image. Local runtime columns such as write-drain counters are not part of
-bucket command checksums, preimage equality, or retry matching. The
-completed-MPU order sequence is command-owned: ordinary bucket-row post-image
+bucket command checksums, preimage equality, or retry matching. The multipart
+completion barrier sequence is command-owned: ordinary bucket-row post-image
 commands preserve its current value, and multipart completion advances it
-through `AdvanceCompletedMultipartUploadSequence` before publishing the object
-completion command. Bucket property commands also carry the storage property
+through `AdvanceMultipartCompletionBarrier` before publishing the object
+completion command. It is one fixed-size synchronization scalar, not per-upload
+history. Bucket property commands also carry the storage property
 group being changed so replay can validate that only the intended bucket-row
 columns changed. Raw bucket encryption columns are part of the row image;
 matching only the effective encryption behavior is not exact

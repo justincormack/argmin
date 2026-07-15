@@ -141,8 +141,6 @@ pub struct BucketScopedTestHooks {
     pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_bucket_delete_finalize_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_bucket_delete_finalize: Option<Arc<dyn Fn() + Send + Sync>>,
-    pub before_completed_multipart_prune:
-        Option<Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -251,30 +249,6 @@ pub(crate) fn maybe_run_after_bucket_delete_finalize_hook(bucket: &BucketName) {
 
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) fn maybe_run_after_bucket_delete_finalize_hook(_: &BucketName) {}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn maybe_run_before_completed_multipart_prune_hook(
-    bucket: &BucketName,
-) -> Result<(), ObjectPgActionError> {
-    let hooks = BUCKET_SCOPED_TEST_HOOKS
-        .get_or_init(|| Mutex::new(BucketScopedTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks.target.as_ref().is_some_and(|target| target == bucket) {
-        if let Some(hook) = hooks.before_completed_multipart_prune {
-            hook()?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(any(test, feature = "test-hooks")))]
-pub(crate) fn maybe_run_before_completed_multipart_prune_hook(
-    _: &BucketName,
-) -> Result<(), ObjectPgActionError> {
-    Ok(())
-}
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn maybe_run_after_direct_put_metadata_publish_hook(

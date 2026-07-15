@@ -532,13 +532,27 @@ impl PgStore {
         let ownership_controls = Self::parse_ownership_controls(row.get(15)?, 15)?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(26)?,
-                row.get::<_, Option<u8>>(27)?,
-                row.get::<_, Option<i64>>(28)?,
+                row.get::<_, i64>(27)?,
+                row.get::<_, Option<u8>>(28)?,
                 row.get::<_, Option<i64>>(29)?,
+                row.get::<_, Option<i64>>(30)?,
             ),
-            [26, 27, 28, 29],
+            [27, 28, 29, 30],
         )?;
+        let multipart_upload_id_key = row
+            .get::<_, Vec<u8>>(23)?
+            .try_into()
+            .map(MultipartUploadIdKey::from_bytes)
+            .map_err(|bytes: Vec<u8>| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    23,
+                    rusqlite::types::Type::Blob,
+                    Box::from(format!(
+                        "multipart_upload_id_key must be 32 bytes, got {}",
+                        bytes.len()
+                    )),
+                )
+            })?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketInfo {
             name: row.get(0)?,
@@ -566,21 +580,22 @@ impl PgStore {
             bucket_lifecycle_generation: row.get::<_, i64>(20)? as u64,
             bucket_execution_generation: row.get::<_, i64>(21)? as u64,
             bucket_incarnation_generation: row.get::<_, i64>(22)? as u64,
-            bucket_abac_enabled: row.get::<_, i64>(23)? != 0,
+            multipart_upload_id_key,
+            bucket_abac_enabled: row.get::<_, i64>(24)? != 0,
             encryption: BucketEncryptionConfig {
                 default_encryption: row
-                    .get::<_, Option<u8>>(24)?
+                    .get::<_, Option<u8>>(25)?
                     .map(|value| {
                         ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                24,
+                                25,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid default_encryption_type: {value}")),
                             )
                         })
                     })
                     .transpose()?,
-                sse_c_blocked: row.get::<_, i64>(25)? != 0,
+                sse_c_blocked: row.get::<_, i64>(26)? != 0,
             }
             .effective(),
         })
@@ -605,13 +620,27 @@ impl PgStore {
         let ownership_controls = Self::parse_ownership_controls(row.get(15)?, 15)?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(25)?,
-                row.get::<_, Option<u8>>(26)?,
-                row.get::<_, Option<i64>>(27)?,
+                row.get::<_, i64>(26)?,
+                row.get::<_, Option<u8>>(27)?,
                 row.get::<_, Option<i64>>(28)?,
+                row.get::<_, Option<i64>>(29)?,
             ),
-            [25, 26, 27, 28],
+            [26, 27, 28, 29],
         )?;
+        let multipart_upload_id_key = row
+            .get::<_, Vec<u8>>(21)?
+            .try_into()
+            .map(MultipartUploadIdKey::from_bytes)
+            .map_err(|bytes: Vec<u8>| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    21,
+                    rusqlite::types::Type::Blob,
+                    Box::from(format!(
+                        "multipart_upload_id_key must be 32 bytes, got {}",
+                        bytes.len()
+                    )),
+                )
+            })?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketRecord {
             name: row.get(0)?,
@@ -637,22 +666,23 @@ impl PgStore {
             bucket_lifecycle_generation: row.get::<_, i64>(18)? as u64,
             bucket_execution_generation: row.get::<_, i64>(19)? as u64,
             bucket_incarnation_generation: row.get::<_, i64>(20)? as u64,
-            completed_multipart_upload_sequence: row.get::<_, i64>(21)? as u64,
-            bucket_abac_enabled: row.get::<_, i64>(22)? != 0,
+            multipart_upload_id_key,
+            multipart_completion_barrier_sequence: row.get::<_, i64>(22)? as u64,
+            bucket_abac_enabled: row.get::<_, i64>(23)? != 0,
             encryption: BucketEncryptionConfig {
                 default_encryption: row
-                    .get::<_, Option<u8>>(23)?
+                    .get::<_, Option<u8>>(24)?
                     .map(|value| {
                         ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                23,
+                                24,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid default_encryption_type: {value}")),
                             )
                         })
                     })
                     .transpose()?,
-                sse_c_blocked: row.get::<_, i64>(24)? != 0,
+                sse_c_blocked: row.get::<_, i64>(25)? != 0,
             },
         })
     }

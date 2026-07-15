@@ -1048,45 +1048,6 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         Ok(response.record)
     }
 
-    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        next_pg_index: u32,
-    ) -> Result<u32, BucketSnapshotLoadError> {
-        let request = StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest {
-            bucket: StorageRpcBucketRequest {
-                node_id: self.node_id,
-                cluster_epoch: self.cluster_epoch,
-                pg_id,
-                bucket: bucket.clone(),
-            },
-            bucket_incarnation_generation,
-            next_pg_index,
-        };
-        let payload = encode_bucket_delete_finalize_completed_multipart_progress_request(&request);
-        let response = self.rpc_request_bucket_snapshot(
-            StorageRpcMessageKind::BucketDeleteFinalizeCompletedMultipartProgress,
-            payload,
-        )?;
-        let response =
-            decode_bucket_delete_finalize_completed_multipart_progress_response(&response)
-                .map_err(|error| {
-                    BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                        "decode bucket delete finalize completed multipart progress response",
-                        error.to_string(),
-                    ))
-                })?;
-        if response.next_pg_index < next_pg_index {
-            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate bucket delete finalize completed multipart progress response",
-                "progress response regressed requested cursor".to_string(),
-            )));
-        }
-        Ok(response.next_pg_index)
-    }
-
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: PgId,
@@ -2366,88 +2327,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         })
     }
 
-    fn list_completed_multipart_upload_records_for_bucket_page(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        upload_id_marker: Option<&UploadId>,
-        limit: u32,
-    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError> {
-        let request = StorageRpcCompletedMultipartUploadsListRequest {
-            bucket: StorageRpcBucketRequest {
-                node_id: self.node_id,
-                cluster_epoch: self.cluster_epoch,
-                pg_id,
-                bucket: bucket.clone(),
-            },
-            upload_id_marker: upload_id_marker.cloned(),
-            limit,
-        };
-        let payload =
-            encode_completed_multipart_uploads_list_request(&request).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "encode completed multipart upload list request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::ObjectCompletedMultipartUploadsList,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response =
-            decode_completed_multipart_uploads_list_response(&response).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "decode completed multipart upload list response",
-                    error.to_string(),
-                ))
-            })?;
-        if response.records.len() > limit as usize {
-            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate completed multipart upload list response",
-                "response exceeded requested page limit".to_string(),
-            )));
-        }
-        for record in &response.records {
-            if &record.bucket != bucket {
-                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "validate completed multipart upload list response",
-                    "record bucket does not match request".to_string(),
-                )));
-            }
-            if upload_id_marker.is_some_and(|marker| record.upload_id.as_str() <= marker.as_str()) {
-                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "validate completed multipart upload list response",
-                    "record is not after requested marker".to_string(),
-                )));
-            }
-        }
-        if response
-            .records
-            .windows(2)
-            .any(|pair| pair[0].upload_id.as_str() >= pair[1].upload_id.as_str())
-        {
-            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate completed multipart upload list response",
-                "records are not strictly ordered by upload id".to_string(),
-            )));
-        }
-        if response.next_upload_id_marker.as_ref()
-            != response.records.last().map(|record| &record.upload_id)
-            && response.next_upload_id_marker.is_some()
-        {
-            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate completed multipart upload list response",
-                "next marker does not match the last returned record".to_string(),
-            )));
-        }
-        Ok(CompletedMultipartUploadRecordPage {
-            records: response.records,
-            next_upload_id_marker: response.next_upload_id_marker,
-        })
-    }
-
     fn payload_reclaim_exists(
         &self,
         pg_id: PgId,
@@ -3016,7 +2895,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             ),
             request: request.request.clone(),
             version_id: request.version_id,
-            completion_order: request.completion_order,
             bucket_write_reservation: request.bucket_write_reservation.clone(),
         };
         let payload =

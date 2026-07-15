@@ -16,9 +16,9 @@ use super::{
 };
 use crate::metadata_command::{
     BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
-    CommitMultipartObjectCommand, CommitStreamPartCommand, DeleteCompletedMultipartUploadCommand,
-    DeleteFinalizedBucketCommand, DeleteObjectPayloadReclaimCommand, DeleteObjectVersionTarget,
-    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    CommitMultipartObjectCommand, CommitStreamPartCommand, DeleteFinalizedBucketCommand,
+    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionTarget, MetadataCommandAcceptance,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
     ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
     PutObjectMetadataMutation, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
 };
@@ -44,7 +44,6 @@ const BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG: usize = 16;
 const BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_FINALIZE_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_EXACT_BUCKET_PENDING_PROBE_PARALLELISM: usize = 8;
-const COMPLETED_MULTIPART_CLEANUP_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS: u64 = 1_000;
 const BUCKET_DELETE_DRAIN_LEASE_MILLIS: u64 = BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS + 5_000;
 const BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT: &str =
@@ -229,11 +228,8 @@ pub type BucketDeleteExactDrainStartTestHook =
     Arc<dyn Fn(bool, u32) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type BucketDeleteCompletedMultipartCleanupPgTestHook =
-    Arc<dyn Fn(u32) -> Result<(), StoreError> + Send + Sync>;
-
 #[cfg(test)]
-type CompletedMultipartOrderCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
+type MultipartCompletionBarrierCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
@@ -295,14 +291,9 @@ static BEFORE_BUCKET_DELETE_EXACT_DRAIN_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteExactDrainStartTestHook>>,
 > = OnceLock::new();
 
-#[cfg(any(test, feature = "test-hooks"))]
-static BEFORE_BUCKET_DELETE_COMPLETED_MULTIPART_CLEANUP_PG_HOOKS: OnceLock<
-    Mutex<HashMap<usize, BucketDeleteCompletedMultipartCleanupPgTestHook>>,
-> = OnceLock::new();
-
 #[cfg(test)]
-static BEFORE_COMPLETED_MULTIPART_ORDER_COMMAND_ID_HOOKS: OnceLock<
-    Mutex<HashMap<usize, CompletedMultipartOrderCommandIdTestHook>>,
+static BEFORE_MULTIPART_COMPLETION_BARRIER_COMMAND_ID_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MultipartCompletionBarrierCommandIdTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -370,13 +361,8 @@ pub struct BucketDeleteExactDrainStartTestHookGuard {
     scope_id: usize,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketDeleteCompletedMultipartCleanupPgTestHookGuard {
-    scope_id: usize,
-}
-
 #[cfg(test)]
-pub(crate) struct CompletedMultipartOrderCommandIdTestHookGuard {
+pub(crate) struct MultipartCompletionBarrierCommandIdTestHookGuard {
     scope_id: usize,
 }
 
@@ -523,22 +509,10 @@ impl Drop for BucketDeleteExactDrainStartTestHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-impl Drop for BucketDeleteCompletedMultipartCleanupPgTestHookGuard {
-    fn drop(&mut self) {
-        let hooks = BEFORE_BUCKET_DELETE_COMPLETED_MULTIPART_CLEANUP_PG_HOOKS
-            .get_or_init(|| Mutex::new(HashMap::new()));
-        hooks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.scope_id);
-    }
-}
-
 #[cfg(test)]
-impl Drop for CompletedMultipartOrderCommandIdTestHookGuard {
+impl Drop for MultipartCompletionBarrierCommandIdTestHookGuard {
     fn drop(&mut self) {
-        let hooks = BEFORE_COMPLETED_MULTIPART_ORDER_COMMAND_ID_HOOKS
+        let hooks = BEFORE_MULTIPART_COMPLETION_BARRIER_COMMAND_ID_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -757,26 +731,9 @@ fn maybe_run_before_bucket_delete_exact_drain_hook(
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-fn maybe_run_before_bucket_delete_completed_multipart_cleanup_pg_hook(
-    _scope_id: usize,
-    _pg_id: u32,
-) -> Result<(), StoreError> {
-    let hook = BEFORE_BUCKET_DELETE_COMPLETED_MULTIPART_CLEANUP_PG_HOOKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&_scope_id)
-        .cloned();
-    if let Some(hook) = hook {
-        hook(_pg_id)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
-fn maybe_run_before_completed_multipart_order_command_id_hook(_scope_id: usize) {
-    let hook = BEFORE_COMPLETED_MULTIPART_ORDER_COMMAND_ID_HOOKS
+fn maybe_run_before_multipart_completion_barrier_command_id_hook(_scope_id: usize) {
+    let hook = BEFORE_MULTIPART_COMPLETION_BARRIER_COMMAND_ID_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -828,8 +785,8 @@ fn metadata_command_apply_test_context(
             Some(command.bucket.clone()),
             None,
         ),
-        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => (
-            MetadataCommandApplyTestKind::AdvanceCompletedMultipartUploadSequence,
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(command) => (
+            MetadataCommandApplyTestKind::AdvanceMultipartCompletionBarrier,
             Some(command.bucket.clone()),
             None,
         ),
@@ -907,11 +864,6 @@ fn metadata_command_apply_test_context(
             MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim,
             Some(command.bucket.clone()),
             Some(command.key.clone()),
-        ),
-        MetadataCommandPayload::DeleteCompletedMultipartUpload(command) => (
-            MetadataCommandApplyTestKind::DeleteCompletedMultipartUpload,
-            Some(command.record.bucket.clone()),
-            Some(command.record.key.clone()),
         ),
     };
     MetadataCommandApplyTestContext {
@@ -1253,32 +1205,18 @@ impl super::StorageCluster {
         BucketDeleteExactDrainStartTestHookGuard { scope_id }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_bucket_delete_completed_multipart_cleanup_pg_hook(
-        &self,
-        hook: BucketDeleteCompletedMultipartCleanupPgTestHook,
-    ) -> BucketDeleteCompletedMultipartCleanupPgTestHookGuard {
-        let scope_id = self.metadata_command_apply_test_hook_scope_id();
-        let slot = BEFORE_BUCKET_DELETE_COMPLETED_MULTIPART_CLEANUP_PG_HOOKS
-            .get_or_init(|| Mutex::new(HashMap::new()));
-        slot.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(scope_id, hook);
-        BucketDeleteCompletedMultipartCleanupPgTestHookGuard { scope_id }
-    }
-
     #[cfg(test)]
-    pub(crate) fn test_install_before_completed_multipart_order_command_id_hook(
+    pub(crate) fn test_install_before_multipart_completion_barrier_command_id_hook(
         &self,
-        hook: CompletedMultipartOrderCommandIdTestHook,
-    ) -> CompletedMultipartOrderCommandIdTestHookGuard {
+        hook: MultipartCompletionBarrierCommandIdTestHook,
+    ) -> MultipartCompletionBarrierCommandIdTestHookGuard {
         let scope_id = self.metadata_command_apply_test_hook_scope_id();
-        let slot = BEFORE_COMPLETED_MULTIPART_ORDER_COMMAND_ID_HOOKS
+        let slot = BEFORE_MULTIPART_COMPLETION_BARRIER_COMMAND_ID_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         slot.lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
-        CompletedMultipartOrderCommandIdTestHookGuard { scope_id }
+        MultipartCompletionBarrierCommandIdTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -2233,7 +2171,7 @@ impl super::StorageCluster {
         Ok(())
     }
 
-    fn drain_pending_completed_multipart_sequence_command_with_work_budget(
+    fn drain_pending_multipart_completion_barrier_command_with_work_budget(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
@@ -2429,7 +2367,7 @@ impl super::StorageCluster {
         }
     }
 
-    fn finish_pending_command_for_completed_multipart_order(
+    fn finish_pending_command_for_multipart_completion_barrier(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
@@ -2460,8 +2398,7 @@ impl super::StorageCluster {
             | MetadataCommandPayload::PutBucketSubresource(_)
             | MetadataCommandPayload::MarkBucketDeleting(_)
             | MetadataCommandPayload::DeleteFinalizedBucket(_)
-            | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
-            | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => self
+            | MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) => self
                 .drain_bucket_pg_pending_metadata_command_with_work_budget(
                     pg_id,
                     command,
@@ -5002,8 +4939,7 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::PutBucketProperty(_)
                     | MetadataCommandPayload::PutBucketSubresource(_)
                     | MetadataCommandPayload::DeleteFinalizedBucket(_)
-                    | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
-                    | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
+                    | MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) => {
                         Self::emit_bucket_delete_begin_loop_step(
                             bucket,
                             pg_id,
@@ -6296,7 +6232,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         bucket_pg_id: u32,
-        bucket_incarnation_generation: u64,
+        _bucket_incarnation_generation: u64,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
         loop {
@@ -6378,13 +6314,6 @@ impl super::StorageCluster {
             );
             return Ok(BucketDeleteFinalizeOutcome::Pending);
         }
-
-        self.delete_completed_multipart_uploads_for_bucket(
-            bucket,
-            bucket_pg_id,
-            bucket_incarnation_generation,
-            work_budget,
-        )?;
 
         self.delete_bucket_from_acting_set(PgId::new(bucket_pg_id), bucket)
     }
@@ -6499,288 +6428,6 @@ impl super::StorageCluster {
         Ok(())
     }
 
-    fn delete_completed_multipart_uploads_for_bucket(
-        &self,
-        bucket: &BucketName,
-        bucket_pg_id: u32,
-        bucket_incarnation_generation: u64,
-        work_budget: &mut super::RequestWorkBudget,
-    ) -> Result<(), BucketWriteDrainError> {
-        let mut metadata_pg_ids = self.metadata_pg_ids();
-        metadata_pg_ids.sort_unstable();
-        let metadata_pg_count = u32::try_from(metadata_pg_ids.len()).map_err(|_| {
-            BucketWriteDrainError::Store(StoreError::StorageRpc {
-                node_id: 0,
-                operation: "bucket delete finalize completed multipart cleanup",
-                code: StorageRpcErrorCode::Internal,
-                message: "metadata PG count exceeds u32".to_string(),
-            })
-        })?;
-        let mut next_pg_index = self
-            .record_bucket_delete_finalize_completed_multipart_next_pg_index(
-                bucket,
-                bucket_pg_id,
-                bucket_incarnation_generation,
-                0,
-            )?;
-        if next_pg_index > metadata_pg_count {
-            return Err(BucketWriteDrainError::Store(StoreError::StorageRpc {
-                node_id: 0,
-                operation: "bucket delete finalize completed multipart cleanup",
-                code: StorageRpcErrorCode::Internal,
-                message: format!(
-                    "completed multipart cleanup cursor {next_pg_index} exceeds metadata PG count {metadata_pg_count}"
-                ),
-            }));
-        }
-
-        let start_pg_index = usize::try_from(next_pg_index).map_err(|source| {
-            BucketWriteDrainError::Store(StoreError::StorageRpc {
-                node_id: 0,
-                operation: "bucket delete finalize completed multipart cleanup",
-                code: StorageRpcErrorCode::Internal,
-                message: format!(
-                    "completed multipart cleanup cursor {next_pg_index} does not fit usize: {source}"
-                ),
-            })
-        })?;
-        for (pg_index, raw_pg_id) in metadata_pg_ids.into_iter().enumerate().skip(start_pg_index) {
-            #[cfg(any(test, feature = "test-hooks"))]
-            maybe_run_before_bucket_delete_completed_multipart_cleanup_pg_hook(
-                self.metadata_command_apply_test_hook_scope_id(),
-                raw_pg_id,
-            )?;
-            let pg_id = PgId::new(raw_pg_id);
-            let node = self
-                .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-            let mut upload_id_marker = None;
-            loop {
-                work_budget.check("completed multipart cleanup listing budget exhausted")?;
-                if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-                    match self.drain_pending_metadata_command_pg_slot_with_work_budget(
-                        pg_id,
-                        bucket,
-                        &command,
-                        work_budget,
-                    ) {
-                        Ok(()) => {
-                            upload_id_marker = None;
-                            continue;
-                        }
-                        Err(BucketSnapshotLoadError::Store(
-                            StoreError::MetadataCommandContention { .. },
-                        )) => continue,
-                        Err(error) => {
-                            return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
-                        }
-                    }
-                }
-                let page = node
-                    .object_mutation_metadata_client()
-                    .list_completed_multipart_upload_records_for_bucket_page(
-                        pg_id,
-                        bucket,
-                        upload_id_marker.as_ref(),
-                        INTERNAL_LIST_PAGE_SIZE,
-                    )
-                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-                let next_upload_id_marker = page.next_upload_id_marker;
-                for record in page.records {
-                    self.delete_completed_multipart_upload_record_with_command(
-                        pg_id,
-                        record,
-                        work_budget,
-                    )
-                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-                }
-                match next_upload_id_marker {
-                    Some(next) => upload_id_marker = Some(next),
-                    None => break,
-                }
-            }
-            next_pg_index = self.record_bucket_delete_finalize_completed_multipart_next_pg_index(
-                bucket,
-                bucket_pg_id,
-                bucket_incarnation_generation,
-                u32::try_from(pg_index + 1).map_err(|source| {
-                    BucketWriteDrainError::Store(StoreError::StorageRpc {
-                        node_id: 0,
-                        operation: "bucket delete finalize completed multipart cleanup",
-                        code: StorageRpcErrorCode::Internal,
-                        message: format!(
-                            "completed multipart cleanup next PG index does not fit u32: {source}"
-                        ),
-                    })
-                })?,
-            )?;
-            if next_pg_index > metadata_pg_count {
-                return Err(BucketWriteDrainError::Store(StoreError::StorageRpc {
-                    node_id: 0,
-                    operation: "bucket delete finalize completed multipart cleanup",
-                    code: StorageRpcErrorCode::Internal,
-                    message: format!(
-                        "completed multipart cleanup cursor {next_pg_index} exceeds metadata PG count {metadata_pg_count}"
-                    ),
-                }));
-            }
-        }
-        Ok(())
-    }
-
-    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
-        &self,
-        bucket: &BucketName,
-        bucket_pg_id: u32,
-        bucket_incarnation_generation: u64,
-        next_pg_index: u32,
-    ) -> Result<u32, BucketWriteDrainError> {
-        let bucket_store = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
-        bucket_store
-            .bucket_write_reservation_client()
-            .record_bucket_delete_finalize_completed_multipart_next_pg_index(
-                PgId::new(bucket_pg_id),
-                bucket,
-                bucket_incarnation_generation,
-                next_pg_index,
-            )
-            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
-    }
-
-    fn completed_multipart_upload_records_for_bucket<E>(
-        &self,
-        bucket: &BucketName,
-        work_budget: &mut super::RequestWorkBudget,
-    ) -> Result<Vec<(PgId, CompletedMultipartUploadRecord)>, E>
-    where
-        E: From<StoreError> + From<MetadataError>,
-    {
-        let mut records = Vec::<(PgId, CompletedMultipartUploadRecord)>::new();
-        for raw_pg_id in self.metadata_pg_ids() {
-            let pg_id = PgId::new(raw_pg_id);
-            let node = self
-                .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-            let mut upload_id_marker = None;
-            loop {
-                work_budget.check("completed multipart cleanup listing budget exhausted")?;
-                let page = node
-                    .object_mutation_metadata_client()
-                    .list_completed_multipart_upload_records_for_bucket_page(
-                        pg_id,
-                        bucket,
-                        upload_id_marker.as_ref(),
-                        INTERNAL_LIST_PAGE_SIZE,
-                    )
-                    .map_err(|error| match error {
-                        BucketSnapshotLoadError::Store(error) => E::from(error),
-                        BucketSnapshotLoadError::Metadata(error) => E::from(error),
-                    })?;
-                records.extend(page.records.into_iter().map(|record| (pg_id, record)));
-                match page.next_upload_id_marker {
-                    Some(next) => upload_id_marker = Some(next),
-                    None => break,
-                }
-            }
-        }
-        Ok(records)
-    }
-
-    fn delete_completed_multipart_upload_record_with_command(
-        &self,
-        pg_id: PgId,
-        record: CompletedMultipartUploadRecord,
-        work_budget: &mut super::RequestWorkBudget,
-    ) -> Result<(), BucketSnapshotLoadError> {
-        loop {
-            work_budget.check("completed multipart cleanup command budget exhausted")?;
-            let (command, clear_pending_on_zero_apply) = if let Some(command) =
-                self.pending_metadata_command_for_bucket(pg_id, &record.bucket)?
-            {
-                if self.drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
-                    pg_id,
-                    &record.bucket,
-                    &command,
-                    work_budget,
-                )? {
-                    continue;
-                }
-                match command.payload() {
-                    MetadataCommandPayload::DeleteCompletedMultipartUpload(delete)
-                        if delete.record == record =>
-                    {
-                        (command, false)
-                    }
-                    MetadataCommandPayload::DeleteCompletedMultipartUpload(_) => {
-                        let _ = self.drain_bucket_pg_pending_metadata_command_with_work_budget(
-                            pg_id,
-                            &command,
-                            false,
-                            work_budget,
-                        )?;
-                        continue;
-                    }
-                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
-                            pg_id,
-                            &command,
-                            work_budget,
-                        )?;
-                        continue;
-                    }
-                    _ => {
-                        self.drain_pending_metadata_command_pg_slot_with_work_budget(
-                            pg_id,
-                            &record.bucket,
-                            &command,
-                            work_budget,
-                        )?;
-                        continue;
-                    }
-                }
-            } else {
-                let Some(command_id) = self
-                    .next_bucket_metadata_command_id_or_drain_with_work_budget(
-                        pg_id,
-                        &record.bucket,
-                        work_budget,
-                    )?
-                else {
-                    continue;
-                };
-                let command = MetadataCommandEnvelope::new(
-                    command_id,
-                    MetadataCommandPayload::DeleteCompletedMultipartUpload(Box::new(
-                        DeleteCompletedMultipartUploadCommand {
-                            record: record.clone(),
-                        },
-                    )),
-                );
-                if !self.try_set_bucket_pg_pending_command_or_retry_with_work_budget(
-                    pg_id,
-                    &record.bucket,
-                    &command,
-                    work_budget,
-                )? {
-                    continue;
-                }
-                (command, true)
-            };
-            let outcome = self.finish_pending_metadata_command_to_acting_set_with_work_budget(
-                pg_id,
-                &command,
-                clear_pending_on_zero_apply,
-                work_budget,
-            )?;
-            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
-                continue;
-            }
-            return Ok(());
-        }
-    }
-
     pub fn head_bucket_info(
         &self,
         bucket: &BucketName,
@@ -6873,8 +6520,8 @@ impl super::StorageCluster {
                         }
                         (command, false)
                     }
-                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
+                    MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) => {
+                        self.drain_pending_multipart_completion_barrier_command_with_work_budget(
                             pg_id,
                             &command,
                             &mut work_budget,
@@ -7067,8 +6714,8 @@ impl super::StorageCluster {
                         }
                         (command, false)
                     }
-                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
+                    MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) => {
+                        self.drain_pending_multipart_completion_barrier_command_with_work_budget(
                             pg_id,
                             &command,
                             &mut work_budget,
@@ -7180,8 +6827,8 @@ impl super::StorageCluster {
                         }
                         (command, false)
                     }
-                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
+                    MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) => {
+                        self.drain_pending_multipart_completion_barrier_command_with_work_budget(
                             pg_id,
                             &command,
                             &mut work_budget,
@@ -7315,8 +6962,8 @@ impl super::StorageCluster {
                     {
                         (command, false)
                     }
-                    MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
-                        self.drain_pending_completed_multipart_sequence_command_with_work_budget(
+                    MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) => {
+                        self.drain_pending_multipart_completion_barrier_command_with_work_budget(
                             pg_id,
                             &command,
                             &mut work_budget,
@@ -7414,110 +7061,6 @@ impl super::StorageCluster {
                         pg_id.get()
                     ),
                 }));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn prune_completed_multipart_uploads_for_bucket_with_limit(
-        &self,
-        bucket: &BucketName,
-        keep: usize,
-    ) -> Result<(), ObjectPgActionError> {
-        crate::node::maybe_run_before_completed_multipart_prune_hook(bucket)?;
-
-        let mut work_budget = super::RequestWorkBudget::new(
-            std::time::Duration::from_millis(COMPLETED_MULTIPART_CLEANUP_WORK_BUDGET_MILLIS),
-            None,
-        )
-        .for_operation("completed_multipart_cleanup")
-        .for_pg(PgId::new(self.bucket_metadata_pg_id(bucket)));
-        if keep == 0 {
-            return self.delete_all_completed_multipart_uploads_for_bucket_as_object_action(
-                bucket,
-                &mut work_budget,
-            );
-        }
-
-        let mut uploads = self
-            .completed_multipart_upload_records_for_bucket::<ObjectPgActionError>(
-                bucket,
-                &mut work_budget,
-            )?;
-        uploads.sort_by(|(left_pg, left), (right_pg, right)| {
-            right
-                .completion_order
-                .cmp(&left.completion_order)
-                .then_with(|| left_pg.get().cmp(&right_pg.get()))
-                .then_with(|| left.upload_id.as_str().cmp(right.upload_id.as_str()))
-        });
-        for (pg_id, record) in uploads.into_iter().skip(keep) {
-            self.delete_completed_multipart_upload_record_with_command(
-                pg_id,
-                record,
-                &mut work_budget,
-            )
-            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-        }
-        Ok(())
-    }
-
-    fn delete_all_completed_multipart_uploads_for_bucket_as_object_action(
-        &self,
-        bucket: &BucketName,
-        work_budget: &mut super::RequestWorkBudget,
-    ) -> Result<(), ObjectPgActionError> {
-        for raw_pg_id in self.metadata_pg_ids() {
-            let pg_id = PgId::new(raw_pg_id);
-            let node = self
-                .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-            let mut upload_id_marker = None;
-            loop {
-                work_budget.check("completed multipart cleanup listing budget exhausted")?;
-                if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-                    match self.drain_pending_metadata_command_pg_slot_with_work_budget(
-                        pg_id,
-                        bucket,
-                        &command,
-                        work_budget,
-                    ) {
-                        Ok(()) => {
-                            upload_id_marker = None;
-                            continue;
-                        }
-                        Err(BucketSnapshotLoadError::Store(
-                            StoreError::MetadataCommandContention { .. },
-                        )) => continue,
-                        Err(error) => {
-                            return Err(super::bucket_snapshot_error_to_object_pg_action_error(
-                                error,
-                            ));
-                        }
-                    }
-                }
-                let page = node
-                    .object_mutation_metadata_client()
-                    .list_completed_multipart_upload_records_for_bucket_page(
-                        pg_id,
-                        bucket,
-                        upload_id_marker.as_ref(),
-                        INTERNAL_LIST_PAGE_SIZE,
-                    )
-                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                let next_upload_id_marker = page.next_upload_id_marker;
-                for record in page.records {
-                    self.delete_completed_multipart_upload_record_with_command(
-                        pg_id,
-                        record,
-                        work_budget,
-                    )
-                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                }
-                match next_upload_id_marker {
-                    Some(next) => upload_id_marker = Some(next),
-                    None => break,
-                }
             }
         }
         Ok(())
@@ -11968,7 +11511,13 @@ impl super::StorageCluster {
         }
     }
 
-    fn reserve_completed_multipart_upload_order(
+    /// Replicate the bucket-write dependency before publishing completion on the object PG.
+    ///
+    /// The returned sequence is only an idempotence token for the bucket-PG command; replay
+    /// semantics are stored with the completed object version. A barrier already pending on
+    /// entry is drained as contention and never satisfies the current reservation, because the
+    /// command intentionally carries no reservation identity.
+    fn establish_multipart_completion_barrier(
         &self,
         bucket: &BucketName,
         completion_target_context: &str,
@@ -11982,7 +11531,7 @@ impl super::StorageCluster {
             .bucket_metadata_client()
             .clone();
         loop {
-            work_budget.check("completed multipart order reservation budget exhausted")?;
+            work_budget.check("multipart completion barrier reservation budget exhausted")?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
@@ -11995,10 +11544,9 @@ impl super::StorageCluster {
                 {
                     continue;
                 }
-                if let MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) =
+                if let MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) =
                     command.payload()
                 {
-                    let completion_order = advance.completion_order;
                     match self
                         .drain_bucket_pg_pending_metadata_command_with_work_budget(
                             pg_id,
@@ -12008,18 +11556,16 @@ impl super::StorageCluster {
                         )
                         .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                     {
-                        super::PendingMetadataCommandOutcome::Applied => {
-                            return Ok(completion_order);
-                        }
+                        super::PendingMetadataCommandOutcome::Applied => continue,
                         super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                             return Err(super::conflicting_pending_object_metadata_command(
-                                "retryable partial pending completed multipart order command",
+                                "retryable partial pending multipart completion barrier command",
                             ));
                         }
                         super::PendingMetadataCommandOutcome::Abandoned => continue,
                     }
                 }
-                match self.finish_pending_command_for_completed_multipart_order(
+                match self.finish_pending_command_for_multipart_completion_barrier(
                     pg_id,
                     &command,
                     work_budget,
@@ -12027,7 +11573,7 @@ impl super::StorageCluster {
                     super::PendingMetadataCommandOutcome::Applied => continue,
                     super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                         return Err(super::conflicting_pending_object_metadata_command(
-                            "retryable partial pending completed multipart dependency command",
+                            "retryable partial pending multipart completion barrier dependency command",
                         ));
                     }
                     super::PendingMetadataCommandOutcome::Abandoned => continue,
@@ -12035,7 +11581,7 @@ impl super::StorageCluster {
             }
 
             #[cfg(test)]
-            maybe_run_before_completed_multipart_order_command_id_hook(
+            maybe_run_before_multipart_completion_barrier_command_id_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
             );
             let Some(command_id) = self
@@ -12048,8 +11594,8 @@ impl super::StorageCluster {
             else {
                 continue;
             };
-            let (completion_order, command) = bucket_metadata_client
-                .build_advance_completed_multipart_upload_sequence_command(
+            let (barrier_sequence, command) = bucket_metadata_client
+                .build_advance_multipart_completion_barrier_command(
                     pg_id,
                     bucket,
                     command_id,
@@ -12074,7 +11620,7 @@ impl super::StorageCluster {
                 true,
                 work_budget,
             ) {
-                Ok(super::PendingMetadataCommandOutcome::Applied) => return Ok(completion_order),
+                Ok(super::PendingMetadataCommandOutcome::Applied) => return Ok(barrier_sequence),
                 Ok(
                     super::PendingMetadataCommandOutcome::Abandoned
                     | super::PendingMetadataCommandOutcome::RetryPartialExactConflict,
@@ -12089,7 +11635,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_reserve_completed_multipart_upload_order(
+    pub(crate) fn test_establish_multipart_completion_barrier(
         &self,
         bucket: &BucketName,
     ) -> Result<u64, ObjectPgActionError> {
@@ -12097,7 +11643,7 @@ impl super::StorageCluster {
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
             None,
         )
-        .for_operation("test_completed_multipart_order")
+        .for_operation("test_multipart_completion_barrier")
         .for_pg(PgId::new(self.bucket_metadata_pg_id(bucket)));
         let reservation = self
             .acquire_completion_durable_bucket_write_reservation(
@@ -12107,7 +11653,7 @@ impl super::StorageCluster {
             )
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         let proof = BucketWriteReservationProof::from(&reservation.record);
-        let result = self.reserve_completed_multipart_upload_order(
+        let result = self.establish_multipart_completion_barrier(
             bucket,
             "test-completed-multipart-order",
             &proof,
@@ -12203,7 +11749,6 @@ impl super::StorageCluster {
     pub fn complete_multipart_upload_commit_serialized(
         &self,
         mut req: CompleteMultipartCommitRequest,
-        keep_completed_uploads: usize,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
         let bucket = req.bucket.clone();
         let key = req.key.clone();
@@ -12252,15 +11797,12 @@ impl super::StorageCluster {
                         &key,
                         &upload_id,
                         generation_id,
+                        req.completion_fingerprint,
                         &req.part_records,
                     ) {
                         let outcome = Self::complete_multipart_outcome_from_command(commit);
                         release_bucket_write_proof!()?;
                         self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
-                        self.prune_completed_multipart_uploads_for_bucket_with_limit(
-                            &bucket,
-                            keep_completed_uploads,
-                        )?;
                         return Ok(outcome);
                     }
                 }
@@ -12304,18 +11846,17 @@ impl super::StorageCluster {
             } else {
                 VersionId::Null
             };
-            let completion_order = match self.reserve_completed_multipart_upload_order(
+            // Replicate the bucket-write dependency before the object-PG commit. This advances
+            // one fixed-size scalar and never allocates or retains per-upload terminal records.
+            if let Err(error) = self.establish_multipart_completion_barrier(
                 &bucket,
                 key.as_str(),
                 &bucket_write_reservation,
                 &mut work_budget,
             ) {
-                Ok(completion_order) => completion_order,
-                Err(error) => {
-                    release_bucket_write_proof!()?;
-                    return Err(error);
-                }
-            };
+                release_bucket_write_proof!()?;
+                return Err(error);
+            }
             let expected_object_parts = complete_multipart_expected_object_parts(
                 &req,
                 version_id,
@@ -12328,7 +11869,6 @@ impl super::StorageCluster {
                     request: &req,
                     version_id,
                     expected_object_parts: &expected_object_parts,
-                    completion_order,
                     bucket_write_reservation: &bucket_write_reservation,
                 },
             ) {
@@ -12404,6 +11944,7 @@ impl super::StorageCluster {
                                     &key,
                                     &upload_id,
                                     generation_id,
+                                    req.completion_fingerprint,
                                     &req.part_records,
                                 ) && commit.bucket_write_reservation == bucket_write_reservation
                         ),
@@ -12423,10 +11964,6 @@ impl super::StorageCluster {
             let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() else {
                 unreachable!("new complete multipart command changed payload kind");
             };
-            self.prune_completed_multipart_uploads_for_bucket_with_limit(
-                &bucket,
-                keep_completed_uploads,
-            )?;
             return Ok(Self::complete_multipart_outcome_from_command(commit));
         }
     }

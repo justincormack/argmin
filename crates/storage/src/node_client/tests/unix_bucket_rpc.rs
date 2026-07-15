@@ -132,6 +132,7 @@ fn test_bucket_info(
         bucket_lifecycle_generation: 0,
         bucket_execution_generation: 1,
         bucket_incarnation_generation: 1,
+        multipart_upload_id_key: crate::types::MultipartUploadIdKey::from_bytes([1; 32]),
         bucket_abac_enabled: false,
         encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
     }
@@ -226,7 +227,7 @@ fn unix_create_bucket_build_response_rejects_mismatched_identity() {
 }
 
 #[test]
-fn unix_completed_multipart_order_build_response_rejects_mismatched_identity() {
+fn unix_multipart_completion_barrier_build_response_rejects_mismatched_identity() {
     let tmp = test_util::tempdir();
     let client = UnixStorageNodeClient::new(
         NodeId::new(7),
@@ -242,61 +243,67 @@ fn unix_completed_multipart_order_build_response_rejects_mismatched_identity() {
     );
     let command = MetadataCommandEnvelope::new(
         command_id,
-        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-            AdvanceCompletedMultipartUploadSequenceCommand {
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+            AdvanceMultipartCompletionBarrierCommand {
                 bucket: wrong_bucket,
-                completion_order: 3,
+                barrier_sequence: 3,
             },
         ),
     );
 
     let err = client
-        .validate_completed_multipart_order_command_build_response(3, command, &bucket, command_id)
+        .validate_multipart_completion_barrier_command_build_response(
+            3, command, &bucket, command_id,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            operation: "validate completed multipart order command build response",
+            operation: "validate multipart completion barrier command build response",
             ..
         })
     ));
 
     let command = MetadataCommandEnvelope::new(
         command_id,
-        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-            AdvanceCompletedMultipartUploadSequenceCommand {
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+            AdvanceMultipartCompletionBarrierCommand {
                 bucket: bucket.clone(),
-                completion_order: 0,
+                barrier_sequence: 0,
             },
         ),
     );
     let err = client
-        .validate_completed_multipart_order_command_build_response(0, command, &bucket, command_id)
+        .validate_multipart_completion_barrier_command_build_response(
+            0, command, &bucket, command_id,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            operation: "validate completed multipart order command build response",
+            operation: "validate multipart completion barrier command build response",
             ..
         })
     ));
 
     let command = MetadataCommandEnvelope::new(
         command_id,
-        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-            AdvanceCompletedMultipartUploadSequenceCommand {
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+            AdvanceMultipartCompletionBarrierCommand {
                 bucket: bucket.clone(),
-                completion_order: 4,
+                barrier_sequence: 4,
             },
         ),
     );
     let err = client
-        .validate_completed_multipart_order_command_build_response(3, command, &bucket, command_id)
+        .validate_multipart_completion_barrier_command_build_response(
+            3, command, &bucket, command_id,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
-            operation: "validate completed multipart order command build response",
+            operation: "validate multipart completion barrier command build response",
             ..
         })
     ));
@@ -1878,7 +1885,7 @@ fn unix_bucket_metadata_client_loads_bucket_snapshot_pair() {
 }
 
 #[test]
-fn unix_bucket_metadata_client_builds_completed_multipart_order_command() {
+fn unix_bucket_metadata_client_builds_multipart_completion_barrier_command() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
     let bucket = crate::tests::bucket_name("completed-order-rpc");
@@ -1933,8 +1940,8 @@ fn unix_bucket_metadata_client_builds_completed_multipart_order_command() {
         MetadataCommandLogIndex::new(1).unwrap(),
     );
 
-    let (completion_order, command) =
-        BucketMetadataNodeClient::build_advance_completed_multipart_upload_sequence_command(
+    let (barrier_sequence, command) =
+        BucketMetadataNodeClient::build_advance_multipart_completion_barrier_command(
             &client,
             PgId::new(0),
             &bucket,
@@ -1944,12 +1951,12 @@ fn unix_bucket_metadata_client_builds_completed_multipart_order_command() {
         )
         .unwrap();
 
-    assert_eq!(completion_order, 1);
+    assert_eq!(barrier_sequence, 1);
     assert_eq!(command.id(), command_id);
     match command.payload() {
-        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) => {
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(advance) => {
             assert_eq!(advance.bucket, bucket);
-            assert_eq!(advance.completion_order, completion_order);
+            assert_eq!(advance.barrier_sequence, barrier_sequence);
         }
         other => panic!("unexpected command payload: {other:?}"),
     }

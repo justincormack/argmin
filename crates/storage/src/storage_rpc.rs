@@ -24,16 +24,17 @@ use crate::{
         BucketState, BucketSubresourceAux, BucketSubresourceKind, BucketWriteDrainRecord,
         BucketWriteDrainState, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes,
         ChecksumType, ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitCleanup,
-        CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
-        CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DeleteMarkerRecord,
-        DirectPutCommitStorageSnapshot, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
-        GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
-        LifecycleSweepRootSource, ListMultipartUploadsReq, ListMultipartUploadsResp,
-        ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp,
-        ListPartsResp, ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
-        ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionPreflight,
-        MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
-        MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+        CompleteMultipartCommitRequest, CreateBucketConfig, CreateMultipartUploadReq,
+        CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
+        EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepBuckets,
+        LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
+        ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
+        ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsResp,
+        ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
+        ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionFingerprint,
+        MultipartCompletionPreflight, MultipartCompletionReplay, MultipartCompletionSnapshot,
+        MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+        MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadIdKey,
         MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption,
         ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout, ObjectLockState,
         ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
@@ -313,8 +314,6 @@ const STORAGE_RPC_MAX_STREAM_UPLOADS_LIST_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1 + 4 + SESSION_ID_LEN + 4;
 const STORAGE_RPC_MAX_STREAM_UPLOADS_PG_LIST_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1 + 4 + SESSION_ID_LEN + 4;
-const STORAGE_RPC_MAX_COMPLETED_MULTIPART_UPLOADS_LIST_REQUEST_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1 + 4 + UPLOAD_ID_LEN + 4;
 const STORAGE_RPC_MAX_LIST_OBJECTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 3 * (1 + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN) + 4;
 const STORAGE_RPC_MAX_LIST_OBJECT_VERSIONS_REQUEST_PAYLOAD_LEN: usize =
@@ -525,7 +524,7 @@ const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
         + 4
         + STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN
         + 12;
-const STORAGE_RPC_MAX_COMPLETED_MULTIPART_ORDER_COMMAND_BUILD_PAYLOAD_LEN: usize =
+const STORAGE_RPC_MAX_MULTIPART_COMPLETION_BARRIER_COMMAND_BUILD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 8
         + 4
@@ -634,7 +633,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketSnapshotPairLoad = 42,
     DirectPutCommitSnapshotLoad = 43,
     DirectPutCommitCommandBuild = 44,
-    CompletedMultipartOrderCommandBuild = 45,
+    MultipartCompletionBarrierCommandBuild = 45,
     ObjectReadAuthSubjectLoad = 46,
     ObjectReadSnapshotLoad = 47,
     ObjectTagsForSubjectLoad = 48,
@@ -695,7 +694,6 @@ pub(crate) enum StorageRpcMessageKind {
     BucketMarkDeletingCommandBuild = 103,
     BucketWriteDrainExists = 104,
     ObjectStreamUploadsList = 105,
-    ObjectCompletedMultipartUploadsList = 106,
     ObjectPayloadReclaimExists = 107,
     ObjectBucketPayloadReclaimRoot = 108,
     ObjectPayloadReclaimRoot = 109,
@@ -718,7 +716,6 @@ pub(crate) enum StorageRpcMessageKind {
     BucketDeleteAttemptOutcomeGet = 157,
     BucketDeleteBeginRoots = 158,
     BucketDeleteFinalizeClaimGet = 159,
-    BucketDeleteFinalizeCompletedMultipartProgress = 161,
     BucketWriteDrainHeartbeat = 124,
     MetadataCommandRetainedLogHashes = 125,
     MetadataCommandRetainedLogEntries = 126,
@@ -894,7 +891,9 @@ impl StorageRpcMessageKind {
             Self::BucketSnapshotPairLoad => "bucket snapshot pair load",
             Self::DirectPutCommitSnapshotLoad => "direct PUT commit snapshot load",
             Self::DirectPutCommitCommandBuild => "direct PUT commit command build",
-            Self::CompletedMultipartOrderCommandBuild => "completed multipart order command build",
+            Self::MultipartCompletionBarrierCommandBuild => {
+                "multipart completion barrier command build"
+            }
             Self::ObjectReadAuthSubjectLoad => "object read auth subject load",
             Self::ObjectReadSnapshotLoad => "object read snapshot load",
             Self::ObjectTagsForSubjectLoad => "object tags for subject load",
@@ -960,9 +959,6 @@ impl StorageRpcMessageKind {
             Self::BucketDeleteFinalizeClaimGet => "bucket delete finalize claim get",
             Self::BucketDeleteFinalizeClaimAcquire => "bucket delete finalize claim acquire",
             Self::BucketDeleteFinalizeClaimRelease => "bucket delete finalize claim release",
-            Self::BucketDeleteFinalizeCompletedMultipartProgress => {
-                "bucket delete finalize completed multipart progress"
-            }
             Self::BucketMetadataControlPendingMatch => "bucket metadata control pending match",
             Self::BucketMetadataControlCommandBuild => "bucket metadata control command build",
             Self::BucketSubresourceGet => "bucket subresource get",
@@ -981,7 +977,6 @@ impl StorageRpcMessageKind {
             Self::BucketMarkDeletingCommandBuild => "bucket mark deleting command build",
             Self::ObjectStreamUploadsList => "object stream uploads list",
             Self::ObjectStreamUploadsPgList => "object stream uploads PG list",
-            Self::ObjectCompletedMultipartUploadsList => "object completed multipart uploads list",
             Self::ObjectPayloadReclaimExists => "object payload reclaim exists",
             Self::ObjectBucketPayloadReclaimRoot => "object bucket payload reclaim root",
             Self::ObjectPayloadReclaimRoot => "object payload reclaim root",
@@ -1073,7 +1068,7 @@ impl StorageRpcMessageKind {
             42 => Ok(Self::BucketSnapshotPairLoad),
             43 => Ok(Self::DirectPutCommitSnapshotLoad),
             44 => Ok(Self::DirectPutCommitCommandBuild),
-            45 => Ok(Self::CompletedMultipartOrderCommandBuild),
+            45 => Ok(Self::MultipartCompletionBarrierCommandBuild),
             46 => Ok(Self::ObjectReadAuthSubjectLoad),
             47 => Ok(Self::ObjectReadSnapshotLoad),
             48 => Ok(Self::ObjectTagsForSubjectLoad),
@@ -1134,7 +1129,6 @@ impl StorageRpcMessageKind {
             103 => Ok(Self::BucketMarkDeletingCommandBuild),
             104 => Ok(Self::BucketWriteDrainExists),
             105 => Ok(Self::ObjectStreamUploadsList),
-            106 => Ok(Self::ObjectCompletedMultipartUploadsList),
             107 => Ok(Self::ObjectPayloadReclaimExists),
             108 => Ok(Self::ObjectBucketPayloadReclaimRoot),
             109 => Ok(Self::ObjectPayloadReclaimRoot),
@@ -1157,7 +1151,6 @@ impl StorageRpcMessageKind {
             158 => Ok(Self::BucketDeleteBeginRoots),
             159 => Ok(Self::BucketDeleteFinalizeClaimGet),
             160 => Ok(Self::ObjectPayloadReclaimClaimGet),
-            161 => Ok(Self::BucketDeleteFinalizeCompletedMultipartProgress),
             124 => Ok(Self::BucketWriteDrainHeartbeat),
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
@@ -1457,18 +1450,6 @@ pub(crate) struct StorageRpcBucketDeleteFinalizeClaimRecordRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) record: BucketDeleteFinalizeClaimRecord,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest {
-    pub(crate) bucket: StorageRpcBucketRequest,
-    pub(crate) bucket_incarnation_generation: u64,
-    pub(crate) next_pg_index: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse {
-    pub(crate) next_pg_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1894,19 +1875,6 @@ pub(crate) struct StorageRpcStreamUploadsListResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcCompletedMultipartUploadsListRequest {
-    pub(crate) bucket: StorageRpcBucketRequest,
-    pub(crate) upload_id_marker: Option<UploadId>,
-    pub(crate) limit: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcCompletedMultipartUploadsListResponse {
-    pub(crate) records: Vec<CompletedMultipartUploadRecord>,
-    pub(crate) next_upload_id_marker: Option<UploadId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcStreamSegmentAppendPrepareRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) request: PrepareStreamUploadSegmentAppendReq,
@@ -2007,7 +1975,6 @@ pub(crate) struct StorageRpcCompleteMultipartCommandBuildRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) request: CompleteMultipartCommitRequest,
     pub(crate) version_id: VersionId,
-    pub(crate) completion_order: u64,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
@@ -2488,7 +2455,7 @@ pub(crate) struct StorageRpcCreateBucketCommandBuildResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcCompletedMultipartOrderCommandBuildRequest {
+pub(crate) struct StorageRpcMultipartCompletionBarrierCommandBuildRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
@@ -2499,8 +2466,8 @@ pub(crate) struct StorageRpcCompletedMultipartOrderCommandBuildRequest {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct StorageRpcCompletedMultipartOrderCommandBuildResponse {
-    pub(crate) completion_order: u64,
+pub(crate) struct StorageRpcMultipartCompletionBarrierCommandBuildResponse {
+    pub(crate) barrier_sequence: u64,
     pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
 }
 
@@ -3605,8 +3572,8 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::BucketCreateCommandBuild => {
             STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::CompletedMultipartOrderCommandBuild => {
-            STORAGE_RPC_MAX_COMPLETED_MULTIPART_ORDER_COMMAND_BUILD_PAYLOAD_LEN
+        StorageRpcMessageKind::MultipartCompletionBarrierCommandBuild => {
+            STORAGE_RPC_MAX_MULTIPART_COMPLETION_BARRIER_COMMAND_BUILD_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectReadAuthSubjectLoad => {
             STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN
@@ -3655,9 +3622,6 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ObjectStreamUploadsPgList => {
             STORAGE_RPC_MAX_STREAM_UPLOADS_PG_LIST_REQUEST_PAYLOAD_LEN
-        }
-        StorageRpcMessageKind::ObjectCompletedMultipartUploadsList => {
-            STORAGE_RPC_MAX_COMPLETED_MULTIPART_UPLOADS_LIST_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
@@ -3773,9 +3737,6 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease => {
             STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN
-        }
-        StorageRpcMessageKind::BucketDeleteFinalizeCompletedMultipartProgress => {
-            STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 16
         }
         StorageRpcMessageKind::BucketMetadataControlPendingMatch
         | StorageRpcMessageKind::BucketMetadataControlCommandBuild
@@ -4070,35 +4031,6 @@ pub(crate) fn decode_stream_uploads_pg_list_request(
         cluster_epoch,
         pg_id,
         session_id_marker,
-        limit,
-    })
-}
-
-pub(crate) fn encode_completed_multipart_uploads_list_request(
-    request: &StorageRpcCompletedMultipartUploadsListRequest,
-) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    validate_cleanup_list_limit(request.limit)?;
-    let mut out = encode_bucket_request(&request.bucket);
-    put_optional_string(
-        &mut out,
-        request.upload_id_marker.as_ref().map(UploadId::as_str),
-    );
-    put_u32(&mut out, request.limit);
-    Ok(out)
-}
-
-pub(crate) fn decode_completed_multipart_uploads_list_request(
-    bytes: &[u8],
-) -> Result<StorageRpcCompletedMultipartUploadsListRequest, StorageRpcPayloadError> {
-    let mut decoder = StorageRpcDecoder::new(bytes);
-    let bucket = decoder.read_bucket_request()?;
-    let upload_id_marker = decoder.read_optional_upload_id()?;
-    let limit = decoder.read_u32()?;
-    validate_cleanup_list_limit(limit)?;
-    decoder.finish()?;
-    Ok(StorageRpcCompletedMultipartUploadsListRequest {
-        bucket,
-        upload_id_marker,
         limit,
     })
 }
@@ -5551,57 +5483,6 @@ pub(crate) fn decode_stream_uploads_list_response(
     })
 }
 
-pub(crate) fn encode_completed_multipart_uploads_list_response(
-    response: &StorageRpcCompletedMultipartUploadsListResponse,
-) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    let count = u32::try_from(response.records.len()).map_err(|_| {
-        StorageRpcPayloadError::PayloadTooLarge {
-            len: response.records.len(),
-            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
-        }
-    })?;
-    if count > STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS {
-        return Err(StorageRpcPayloadError::PayloadTooLarge {
-            len: count as usize,
-            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
-        });
-    }
-    let mut out = Vec::new();
-    put_u32(&mut out, count);
-    for record in &response.records {
-        put_completed_multipart_upload_record(&mut out, record);
-    }
-    put_optional_string(
-        &mut out,
-        response
-            .next_upload_id_marker
-            .as_ref()
-            .map(UploadId::as_str),
-    );
-    Ok(out)
-}
-
-pub(crate) fn decode_completed_multipart_uploads_list_response(
-    bytes: &[u8],
-) -> Result<StorageRpcCompletedMultipartUploadsListResponse, StorageRpcPayloadError> {
-    let mut decoder = StorageRpcDecoder::new(bytes);
-    let count = decoder.read_limited_bounded_remaining_count(
-        1,
-        "completed multipart upload record count exceeds payload",
-        STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS,
-    )?;
-    let mut records = Vec::new();
-    for _ in 0..count {
-        records.push(decoder.read_completed_multipart_upload_record()?);
-    }
-    let next_upload_id_marker = decoder.read_optional_upload_id()?;
-    decoder.finish()?;
-    Ok(StorageRpcCompletedMultipartUploadsListResponse {
-        records,
-        next_upload_id_marker,
-    })
-}
-
 pub(crate) fn encode_stream_upload_segments_response(
     response: &StorageRpcStreamUploadSegmentsResponse,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -6098,7 +5979,6 @@ pub(crate) fn encode_complete_multipart_command_build_request(
     let mut out = encode_object_request(&request.object);
     put_complete_multipart_commit_request(&mut out, &request.request);
     put_u64(&mut out, request.version_id.to_u64());
-    put_u64(&mut out, request.completion_order);
     put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
     Ok(out)
 }
@@ -6110,7 +5990,6 @@ pub(crate) fn decode_complete_multipart_command_build_request(
     let object = decoder.read_rpc_object_request()?;
     let request = decoder.read_complete_multipart_commit_request()?;
     let version_id = VersionId::from_u64(decoder.read_u64()?);
-    let completion_order = decoder.read_u64()?;
     let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
     decoder.finish()?;
     validate_complete_multipart_request_identity(&object, &request)?;
@@ -6123,7 +6002,6 @@ pub(crate) fn decode_complete_multipart_command_build_request(
         object,
         request,
         version_id,
-        completion_order,
         bucket_write_reservation,
     })
 }
@@ -6741,8 +6619,8 @@ pub(crate) fn decode_create_bucket_command_build_request(
     })
 }
 
-pub(crate) fn encode_completed_multipart_order_command_build_request(
-    request: &StorageRpcCompletedMultipartOrderCommandBuildRequest,
+pub(crate) fn encode_multipart_completion_barrier_command_build_request(
+    request: &StorageRpcMultipartCompletionBarrierCommandBuildRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
     if request.command_id.cluster_epoch() != request.cluster_epoch
         || request.command_id.pg_id() != request.pg_id
@@ -6759,12 +6637,12 @@ pub(crate) fn encode_completed_multipart_order_command_build_request(
             != Some(request.completion_target_context.as_str())
     {
         return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "bucket write reservation proof must match completed multipart order request",
+            "bucket write reservation proof must match multipart completion barrier request",
         ));
     }
     if request.completion_target_context.len() > STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN {
         return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "completed multipart order target context exceeds maximum length",
+            "multipart completion barrier target context exceeds maximum length",
         ));
     }
     let mut out = encode_bucket_request(&StorageRpcBucketRequest {
@@ -6779,9 +6657,9 @@ pub(crate) fn encode_completed_multipart_order_command_build_request(
     Ok(out)
 }
 
-pub(crate) fn decode_completed_multipart_order_command_build_request(
+pub(crate) fn decode_multipart_completion_barrier_command_build_request(
     bytes: &[u8],
-) -> Result<StorageRpcCompletedMultipartOrderCommandBuildRequest, StorageRpcPayloadError> {
+) -> Result<StorageRpcMultipartCompletionBarrierCommandBuildRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
@@ -6794,7 +6672,7 @@ pub(crate) fn decode_completed_multipart_order_command_build_request(
     let completion_target_context = decoder.read_string_with_limit(
         STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN,
         StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "completed multipart order target context exceeds maximum length",
+            "multipart completion barrier target context exceeds maximum length",
         ),
     )?;
     let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
@@ -6807,10 +6685,10 @@ pub(crate) fn decode_completed_multipart_order_command_build_request(
             != Some(completion_target_context.as_str())
     {
         return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "bucket write reservation proof must match completed multipart order request",
+            "bucket write reservation proof must match multipart completion barrier request",
         ));
     }
-    Ok(StorageRpcCompletedMultipartOrderCommandBuildRequest {
+    Ok(StorageRpcMultipartCompletionBarrierCommandBuildRequest {
         node_id,
         cluster_epoch,
         pg_id,
@@ -7100,24 +6978,24 @@ pub(crate) fn decode_create_bucket_command_build_response(
     Ok(StorageRpcCreateBucketCommandBuildResponse { outcome })
 }
 
-pub(crate) fn encode_completed_multipart_order_command_build_response(
-    response: &StorageRpcCompletedMultipartOrderCommandBuildResponse,
+pub(crate) fn encode_multipart_completion_barrier_command_build_response(
+    response: &StorageRpcMultipartCompletionBarrierCommandBuildResponse,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    put_u64(&mut out, response.completion_order);
+    put_u64(&mut out, response.barrier_sequence);
     put_bytes(&mut out, &response.command.command_bytes());
     out
 }
 
-pub(crate) fn decode_completed_multipart_order_command_build_response(
+pub(crate) fn decode_multipart_completion_barrier_command_build_response(
     bytes: &[u8],
-) -> Result<StorageRpcCompletedMultipartOrderCommandBuildResponse, StorageRpcPayloadError> {
+) -> Result<StorageRpcMultipartCompletionBarrierCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let completion_order = decoder.read_u64()?;
+    let barrier_sequence = decoder.read_u64()?;
     let command = decoder.read_metadata_command_envelope_bytes()?;
     decoder.finish()?;
-    Ok(StorageRpcCompletedMultipartOrderCommandBuildResponse {
-        completion_order,
+    Ok(StorageRpcMultipartCompletionBarrierCommandBuildResponse {
+        barrier_sequence,
         command,
     })
 }
@@ -11820,51 +11698,6 @@ pub(crate) fn decode_bucket_delete_finalize_claim_record_request(
     })
 }
 
-pub(crate) fn encode_bucket_delete_finalize_completed_multipart_progress_request(
-    request: &StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest,
-) -> Vec<u8> {
-    let mut out = encode_bucket_request(&request.bucket);
-    put_u64(&mut out, request.bucket_incarnation_generation);
-    put_u32(&mut out, request.next_pg_index);
-    out
-}
-
-pub(crate) fn decode_bucket_delete_finalize_completed_multipart_progress_request(
-    bytes: &[u8],
-) -> Result<StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest, StorageRpcPayloadError>
-{
-    let mut decoder = StorageRpcDecoder::new(bytes);
-    let bucket = decoder.read_bucket_request()?;
-    let bucket_incarnation_generation = decoder.read_u64()?;
-    let next_pg_index = decoder.read_u32()?;
-    decoder.finish()?;
-    Ok(
-        StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest {
-            bucket,
-            bucket_incarnation_generation,
-            next_pg_index,
-        },
-    )
-}
-
-pub(crate) fn encode_bucket_delete_finalize_completed_multipart_progress_response(
-    response: &StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    put_u32(&mut out, response.next_pg_index);
-    out
-}
-
-pub(crate) fn decode_bucket_delete_finalize_completed_multipart_progress_response(
-    bytes: &[u8],
-) -> Result<StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse, StorageRpcPayloadError>
-{
-    let mut decoder = StorageRpcDecoder::new(bytes);
-    let next_pg_index = decoder.read_u32()?;
-    decoder.finish()?;
-    Ok(StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse { next_pg_index })
-}
-
 pub(crate) fn encode_optional_checksum_metadata(checksum: Option<&ChecksumBytes>) -> Vec<u8> {
     let mut out = Vec::new();
     match checksum {
@@ -13172,30 +13005,60 @@ impl<'a> StorageRpcDecoder<'a> {
     }
 
     fn read_bucket_info(&mut self) -> Result<BucketInfo, StorageRpcPayloadError> {
+        let name = self.read_bucket_name()?;
+        let owner_principal = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN,
+            StorageRpcPayloadError::InvalidResponseEnvelope("owner principal is too large"),
+        )?;
+        let owner_canonical_id = self.read_canonical_user_id()?;
+        let created_at = self.read_u64()?;
+        let region = self.read_u16()?;
+        let state = self.read_bucket_state()?;
+        let versioning = self.read_bucket_versioning_state()?;
+        let object_lock = self.read_bucket_object_lock_config()?;
+        let acl_grants = self.read_acl_grants()?;
+        let public_read = self.read_bool()?;
+        let public_write = self.read_bool()?;
+        let public_access_block = self.read_optional_public_access_block_config()?;
+        let ownership_controls = self.read_optional_bucket_ownership_controls()?;
+        let bucket_policy_present = self.read_bool()?;
+        let bucket_policy_public = self.read_bool()?;
+        let bucket_policy_generation = self.read_u64()?;
+        let bucket_lifecycle_present = self.read_bool()?;
+        let bucket_lifecycle_generation = self.read_u64()?;
+        let bucket_execution_generation = self.read_u64()?;
+        let bucket_incarnation_generation = self.read_u64()?;
+        let multipart_upload_id_key = self
+            .read_bytes()?
+            .try_into()
+            .map(MultipartUploadIdKey::from_bytes)
+            .map_err(|_| {
+                StorageRpcPayloadError::InvalidResponseEnvelope(
+                    "multipart upload ID key must be 32 bytes",
+                )
+            })?;
         Ok(BucketInfo {
-            name: self.read_bucket_name()?,
-            owner_principal: self.read_string_with_limit(
-                STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN,
-                StorageRpcPayloadError::InvalidResponseEnvelope("owner principal is too large"),
-            )?,
-            owner_canonical_id: self.read_canonical_user_id()?,
-            created_at: self.read_u64()?,
-            region: self.read_u16()?,
-            state: self.read_bucket_state()?,
-            versioning: self.read_bucket_versioning_state()?,
-            object_lock: self.read_bucket_object_lock_config()?,
-            acl_grants: self.read_acl_grants()?,
-            public_read: self.read_bool()?,
-            public_write: self.read_bool()?,
-            public_access_block: self.read_optional_public_access_block_config()?,
-            ownership_controls: self.read_optional_bucket_ownership_controls()?,
-            bucket_policy_present: self.read_bool()?,
-            bucket_policy_public: self.read_bool()?,
-            bucket_policy_generation: self.read_u64()?,
-            bucket_lifecycle_present: self.read_bool()?,
-            bucket_lifecycle_generation: self.read_u64()?,
-            bucket_execution_generation: self.read_u64()?,
-            bucket_incarnation_generation: self.read_u64()?,
+            name,
+            owner_principal,
+            owner_canonical_id,
+            created_at,
+            region,
+            state,
+            versioning,
+            object_lock,
+            acl_grants,
+            public_read,
+            public_write,
+            public_access_block,
+            ownership_controls,
+            bucket_policy_present,
+            bucket_policy_public,
+            bucket_policy_generation,
+            bucket_lifecycle_present,
+            bucket_lifecycle_generation,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+            multipart_upload_id_key,
             bucket_abac_enabled: self.read_bool()?,
             encryption: self.read_effective_bucket_encryption_config()?,
         })
@@ -13866,20 +13729,6 @@ impl<'a> StorageRpcDecoder<'a> {
         })
     }
 
-    fn read_completed_multipart_upload_record(
-        &mut self,
-    ) -> Result<CompletedMultipartUploadRecord, StorageRpcPayloadError> {
-        Ok(CompletedMultipartUploadRecord {
-            upload_id: self.read_upload_id()?,
-            bucket: self.read_bucket_name()?,
-            key: self.read_object_key()?,
-            completion_order: self.read_u64()?,
-            completed_at: self.read_u64()?,
-            initiator: self.read_owner_identity()?,
-            owner: self.read_owner_identity()?,
-        })
-    }
-
     fn read_multipart_completion_snapshot(
         &mut self,
     ) -> Result<MultipartCompletionSnapshot, StorageRpcPayloadError> {
@@ -13948,14 +13797,42 @@ impl<'a> StorageRpcDecoder<'a> {
             1 => Ok(MultipartUploadManagementLookup::NonInProgress(Box::new(
                 self.read_multipart_upload_record()?,
             ))),
-            2 => Ok(MultipartUploadManagementLookup::Completed(
-                self.read_completed_multipart_upload_record()?,
-            )),
+            2 => Ok(MultipartUploadManagementLookup::Replay(Box::new(
+                self.read_multipart_completion_replay()?,
+            ))),
             3 => Ok(MultipartUploadManagementLookup::Missing),
             _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
                 "invalid multipart management lookup tag",
             )),
         }
+    }
+
+    fn read_multipart_completion_replay(
+        &mut self,
+    ) -> Result<MultipartCompletionReplay, StorageRpcPayloadError> {
+        let upload_id = self.read_upload_id()?;
+        let bucket = self.read_bucket_name()?;
+        let key = self.read_object_key()?;
+        let fingerprint = MultipartCompletionFingerprint::from_bytes(
+            self.read_bytes()?.try_into().map_err(|_| {
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "multipart completion replay fingerprint must be 32 bytes",
+                )
+            })?,
+        );
+        Ok(MultipartCompletionReplay {
+            upload_id,
+            bucket,
+            key,
+            fingerprint,
+            version_id: VersionId::from_u64(self.read_u64()?),
+            etag: self.read_object_etag()?,
+            size: self.read_u64()?,
+            last_modified: self.read_u64()?,
+            tags: self.read_optional_serialized_tag_set()?,
+            system_metadata_blob: self.read_optional_serialized_system_metadata_blob()?,
+            encryption: self.read_object_encryption()?,
+        })
     }
 
     fn read_stream_upload_command_record(
@@ -14088,6 +13965,13 @@ impl<'a> StorageRpcDecoder<'a> {
         let bucket = self.read_bucket_name()?;
         let key = self.read_object_key()?;
         let upload_id = self.read_upload_id()?;
+        let completion_fingerprint = MultipartCompletionFingerprint::from_bytes(
+            self.read_bytes()?.try_into().map_err(|_| {
+                StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "multipart completion fingerprint must be 32 bytes",
+                )
+            })?,
+        );
         let versioning = self.read_bucket_versioning_state()?;
         let owner = self.read_owner_identity()?;
         let acl_grants = self.read_acl_grants()?;
@@ -14126,6 +14010,7 @@ impl<'a> StorageRpcDecoder<'a> {
             bucket,
             key,
             upload_id,
+            completion_fingerprint,
             versioning,
             owner,
             acl_grants,
@@ -15481,6 +15366,7 @@ fn put_bucket_info(out: &mut Vec<u8>, info: &BucketInfo) {
     put_u64(out, info.bucket_lifecycle_generation);
     put_u64(out, info.bucket_execution_generation);
     put_u64(out, info.bucket_incarnation_generation);
+    put_bytes(out, info.multipart_upload_id_key.as_bytes());
     put_bool(out, info.bucket_abac_enabled);
     put_u8(out, info.encryption.default_encryption as u8);
     put_bool(out, info.encryption.sse_c_blocked);
@@ -16064,6 +15950,7 @@ fn put_complete_multipart_commit_request(
     put_string(out, request.bucket.as_str());
     put_string(out, request.key.as_str());
     put_string(out, request.upload_id.as_str());
+    put_bytes(out, request.completion_fingerprint.as_bytes());
     put_u8(out, request.versioning as u8);
     put_owner_identity(out, &request.owner);
     put_string(out, &request.acl_grants.serialized());
@@ -16318,17 +16205,24 @@ fn put_multipart_upload_record(out: &mut Vec<u8>, record: &MultipartUploadRecord
     put_object_encryption(out, &record.encryption);
 }
 
-fn put_completed_multipart_upload_record(
-    out: &mut Vec<u8>,
-    record: &CompletedMultipartUploadRecord,
-) {
+fn put_multipart_completion_replay(out: &mut Vec<u8>, record: &MultipartCompletionReplay) {
     put_string(out, record.upload_id.as_str());
     put_string(out, record.bucket.as_str());
     put_string(out, record.key.as_str());
-    put_u64(out, record.completion_order);
-    put_u64(out, record.completed_at);
-    put_owner_identity(out, &record.initiator);
-    put_owner_identity(out, &record.owner);
+    put_bytes(out, record.fingerprint.as_bytes());
+    put_u64(out, record.version_id.to_u64());
+    put_object_etag(out, record.etag);
+    put_u64(out, record.size);
+    put_u64(out, record.last_modified);
+    put_optional_string(out, record.tags.as_ref().map(|tags| tags.as_str()));
+    put_optional_bytes(
+        out,
+        record
+            .system_metadata_blob
+            .as_ref()
+            .map(|metadata| metadata.as_slice()),
+    );
+    put_object_encryption(out, &record.encryption);
 }
 
 fn put_multipart_completion_snapshot(out: &mut Vec<u8>, snapshot: &MultipartCompletionSnapshot) {
@@ -16383,9 +16277,9 @@ fn put_multipart_upload_management_lookup(
             put_u8(out, 1);
             put_multipart_upload_record(out, upload);
         }
-        MultipartUploadManagementLookup::Completed(completed) => {
+        MultipartUploadManagementLookup::Replay(replay) => {
             put_u8(out, 2);
-            put_completed_multipart_upload_record(out, completed);
+            put_multipart_completion_replay(out, replay);
         }
         MultipartUploadManagementLookup::Missing => put_u8(out, 3),
     }
@@ -16909,7 +16803,7 @@ mod tests {
 
     use crate::{
         metadata_command::{
-            AdvanceCompletedMultipartUploadSequenceCommand, CreateBucketCommand,
+            AdvanceMultipartCompletionBarrierCommand, CreateBucketCommand,
             MarkBucketDeletingCommand, MetadataCommandEnvelope, MetadataCommandId,
             MetadataCommandLogIndex, MetadataCommandPayload,
         },
@@ -20393,24 +20287,6 @@ mod tests {
                 limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
             })
         );
-
-        let completed_request = StorageRpcCompletedMultipartUploadsListRequest {
-            bucket: StorageRpcBucketRequest {
-                node_id: NodeId::new(7),
-                cluster_epoch: ClusterEpoch::INITIAL,
-                pg_id: PgId::new(3),
-                bucket,
-            },
-            upload_id_marker: Some(crate::tests::multipart_upload_id("cleanup-list-marker")),
-            limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1,
-        };
-        assert_eq!(
-            encode_completed_multipart_uploads_list_request(&completed_request),
-            Err(StorageRpcPayloadError::PayloadTooLarge {
-                len: (STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1) as usize,
-                limit: STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize,
-            })
-        );
     }
 
     #[test]
@@ -20419,17 +20295,6 @@ mod tests {
         put_u32(&mut bytes, STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1);
         assert!(matches!(
             decode_stream_uploads_list_response(&bytes),
-            Err(StorageRpcPayloadError::PayloadTooLarge {
-                len,
-                limit,
-            }) if len == (STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1) as usize
-                && limit == STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS as usize
-        ));
-
-        let mut bytes = Vec::new();
-        put_u32(&mut bytes, STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS + 1);
-        assert!(matches!(
-            decode_completed_multipart_uploads_list_response(&bytes),
             Err(StorageRpcPayloadError::PayloadTooLarge {
                 len,
                 limit,
@@ -20912,7 +20777,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_multipart_order_command_build_request_and_response_round_trip() {
+    fn multipart_completion_barrier_command_build_request_and_response_round_trip() {
         let bucket = BucketName::try_from("completed-order-bucket").unwrap();
         let command_id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -20926,7 +20791,7 @@ mod tests {
             target_context: Some("object-key".to_string()),
             ..test_bucket_write_reservation_proof()
         };
-        let request = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+        let request = StorageRpcMultipartCompletionBarrierCommandBuildRequest {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::INITIAL,
             pg_id: PgId::new(3),
@@ -20936,59 +20801,59 @@ mod tests {
             bucket_write_reservation,
         };
 
-        let bytes = encode_completed_multipart_order_command_build_request(&request).unwrap();
-        let decoded = decode_completed_multipart_order_command_build_request(&bytes).unwrap();
+        let bytes = encode_multipart_completion_barrier_command_build_request(&request).unwrap();
+        let decoded = decode_multipart_completion_barrier_command_build_request(&bytes).unwrap();
         assert_eq!(decoded, request);
 
-        let wrong_route = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+        let wrong_route = StorageRpcMultipartCompletionBarrierCommandBuildRequest {
             pg_id: PgId::new(4),
             ..request.clone()
         };
         assert_eq!(
-            encode_completed_multipart_order_command_build_request(&wrong_route),
+            encode_multipart_completion_barrier_command_build_request(&wrong_route),
             Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
                 "command id route must match request route"
             ))
         );
 
-        let wrong_proof = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+        let wrong_proof = StorageRpcMultipartCompletionBarrierCommandBuildRequest {
             bucket_write_reservation: test_bucket_write_reservation_proof(),
             ..request.clone()
         };
         assert_eq!(
-            encode_completed_multipart_order_command_build_request(&wrong_proof),
+            encode_multipart_completion_barrier_command_build_request(&wrong_proof),
             Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-                "bucket write reservation proof must match completed multipart order request"
+                "bucket write reservation proof must match multipart completion barrier request"
             ))
         );
 
-        let wrong_target = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+        let wrong_target = StorageRpcMultipartCompletionBarrierCommandBuildRequest {
             completion_target_context: "other-key".to_string(),
             ..request.clone()
         };
         assert_eq!(
-            encode_completed_multipart_order_command_build_request(&wrong_target),
+            encode_multipart_completion_barrier_command_build_request(&wrong_target),
             Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-                "bucket write reservation proof must match completed multipart order request"
+                "bucket write reservation proof must match multipart completion barrier request"
             ))
         );
 
         let command = MetadataCommandEnvelope::new(
             command_id,
-            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-                AdvanceCompletedMultipartUploadSequenceCommand {
+            MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+                AdvanceMultipartCompletionBarrierCommand {
                     bucket: bucket.clone(),
-                    completion_order: 11,
+                    barrier_sequence: 11,
                 },
             ),
         );
-        let response = StorageRpcCompletedMultipartOrderCommandBuildResponse {
-            completion_order: 11,
+        let response = StorageRpcMultipartCompletionBarrierCommandBuildResponse {
+            barrier_sequence: 11,
             command,
         };
-        let bytes = encode_completed_multipart_order_command_build_response(&response);
-        let decoded = decode_completed_multipart_order_command_build_response(&bytes).unwrap();
-        assert_eq!(decoded.completion_order, 11);
+        let bytes = encode_multipart_completion_barrier_command_build_response(&response);
+        let decoded = decode_multipart_completion_barrier_command_build_response(&bytes).unwrap();
+        assert_eq!(decoded.barrier_sequence, 11);
         assert_eq!(decoded.command, response.command);
     }
 
@@ -21101,6 +20966,7 @@ mod tests {
             bucket_lifecycle_generation: 13,
             bucket_execution_generation: 17,
             bucket_incarnation_generation: 19,
+            multipart_upload_id_key: MultipartUploadIdKey::from_bytes([1; 32]),
             bucket_abac_enabled: true,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }

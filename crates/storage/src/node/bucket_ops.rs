@@ -327,12 +327,6 @@ impl SharedStorageNode {
             return Ok(BucketDeleteFinalizeOutcome::Pending);
         }
 
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.get_pg(pg_id)?;
-            PgMetadataStore::delete_completed_multipart_uploads_for_bucket(&*pg, bucket)?;
-            Ok::<(), BucketWriteDrainError>(())
-        })?;
-
         match self.delete_bucket_metadata(bucket) {
             Ok(()) => {
                 self.finish_bucket_delete_finalize_work(bucket);

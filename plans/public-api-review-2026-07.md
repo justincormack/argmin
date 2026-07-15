@@ -828,7 +828,7 @@ steps it performs.
   explicit `matches_stream_session` helper for pending stream terminalization;
   request/retry paths continue to use generation-aware `matches_request`.
 
-- [ ] **S5. MPU-cleanup resume cursor is a positional index, not a PG id.**
+- [x] **S5. MPU-cleanup resume cursor is a positional index, not a PG id.**
   `delete_completed_multipart_uploads_for_bucket`
   (`cluster/request_ops.rs:6178-6196`) persists `next_pg_index`
   into the call-time-sorted `metadata_pg_ids()`. Since the review a bounds
@@ -839,10 +839,10 @@ steps it performs.
   It is a real topology-resize hazard: if the metadata PG set changes between
   crash and resume, the index silently re-targets different PGs, skipping
   cleanup on some. Track this under
-  `plans/storage-topology-resize-plan.md` H5. A resize-safe fix should persist
-  a semantic cursor such as last-completed `PgId` plus topology generation, or
-  make the cleanup phase generation-scoped and restartable from zero when the
-  PG set changes.
+  `plans/storage-topology-resize-plan.md` H5. Superseded by the tombstone-free
+  multipart replay design: completed-upload rows, the cross-PG cleanup scan,
+  and its persisted resume cursor have been removed. Replay state now lives on
+  retained object versions, so no completed-MPU cleanup cursor exists.
 
 - [x] **S6. Route-map validity is a storage routing freshness contract, not a
   generic option cleanup.** `route_map_valid_until_ms: Option<u64>` uses
@@ -1445,14 +1445,14 @@ each is one refactor away from a panic:
 
   Resolution: documented the admission authority on the proofless/optional
   metadata commands. `AppendStreamSegment` and `AbortStreamUpload` are
-  authorized by the stream session row, `DeleteCompletedMultipartUpload` by
-  exact completed-upload row identity, and
-  `AdvanceCompletedMultipartUploadSequence` by a CompleteMultipartUpload bucket
-  write reservation proof at command-build time. The sequence command itself
-  remains proofless because it does not release or own the bucket reservation,
-  but local and Unix command-build requests now carry and validate the proof,
-  including `operation_kind == "complete-multipart-upload"` and the expected
-  object target context, before allocating the completion order.
+  authorized by the stream session row. The later tombstone-free multipart
+  replay rework removed `DeleteCompletedMultipartUpload` and replaced
+  `AdvanceCompletedMultipartUploadSequence` with
+  `AdvanceMultipartCompletionBarrier`. The barrier command advances only a
+  fixed-size bucket scalar and remains proofless because it does not release or
+  own the bucket reservation; local and Unix command-build requests carry and
+  validate the CompleteMultipartUpload reservation proof, including its
+  operation kind and object target, before advancing that scalar.
 - [ ] `ReserveObjectGenerationCommand::matches_request` (renamed from
   `ReserveObjectVersionCommand` since the review; finding applies verbatim)
   has a `generation_id` field but `matches_request` ignores it, matching on

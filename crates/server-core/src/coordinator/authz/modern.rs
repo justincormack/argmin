@@ -374,24 +374,90 @@ impl Coordinator {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
         #[cfg(test)]
-        let upload = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
-            storage_node
+        let lookup = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
+            let upload = storage_node
                 .try_load_in_progress_multipart_upload(bucket, key, upload_id)
-                .map_err(Self::map_object_pg_action_error)
-                .and_then(|upload| {
-                    upload.ok_or_else(|| ServerError::InternalError {
-                        reason: "multipart complete auth lookup would block".to_string(),
-                    })
-                })?
+                .map_err(Self::map_object_pg_action_error)?
+                .ok_or_else(|| ServerError::InternalError {
+                    reason: "multipart complete auth lookup would block".to_string(),
+                })?;
+            storage::MultipartUploadManagementLookup::InProgress(Box::new(upload))
         } else {
             storage_node
-                .load_in_progress_multipart_upload(bucket, key, upload_id)
+                .lookup_multipart_upload_management(bucket, key, upload_id)
                 .map_err(Self::map_object_pg_action_error)?
         };
         #[cfg(not(test))]
-        let upload = storage_node
-            .load_in_progress_multipart_upload(bucket, key, upload_id)
+        let lookup = storage_node
+            .lookup_multipart_upload_management(bucket, key, upload_id)
             .map_err(Self::map_object_pg_action_error)?;
+        let upload = match lookup {
+            storage::MultipartUploadManagementLookup::InProgress(upload) => *upload,
+            storage::MultipartUploadManagementLookup::Replay(replay) => {
+                let replay = *replay;
+                if !bucket_info
+                    .multipart_upload_id_key
+                    .authenticates(bucket, key, upload_id)
+                {
+                    return Err(ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                }
+                let policy_context = PutObjectPolicyContext::default()
+                    .with_sse_customer_algorithm(
+                        req.sse_customer.map(SseCustomerRequest::algorithm),
+                    )
+                    .with_if_match(req.cond.if_match_policy_value())
+                    .with_if_none_match(req.cond.if_none_match_policy_value())
+                    .with_object_creation_operation(true)
+                    .with_managed_encryption(replay.encryption.managed_encryption_algorithm());
+                let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
+                if put_object_authorization_with_bucket_policy(
+                    req.upload.requester(),
+                    modern_bucket,
+                    modern_bucket_tags,
+                    key.as_str(),
+                    ModernWriteAction::PutObject,
+                    &policy_context,
+                    bucket_policy.as_deref(),
+                )? != ModernObjectWriteAuthorization::Allowed
+                {
+                    return Err(ServerError::AccessDenied);
+                }
+                Self::ensure_sse_c_allowed(
+                    &bucket_info,
+                    replay.encryption.uses_sse_customer_headers(),
+                )?;
+                self.resume_write_encryption(
+                    &replay.encryption,
+                    req.sse_customer,
+                    SseCustomerSegmentScope::object(),
+                    false,
+                )?;
+                return Ok(AuthorizedCompleteMultipartUpload::Replay {
+                    bucket_info: bucket_info.into_inner(),
+                    key: key.clone(),
+                    replay,
+                });
+            }
+            storage::MultipartUploadManagementLookup::NonInProgress(_)
+            | storage::MultipartUploadManagementLookup::Missing => {
+                if bucket_info
+                    .multipart_upload_id_key
+                    .authenticates(bucket, key, upload_id)
+                    && !Self::requester_can_manage_authenticated_multipart_upload_id(
+                        req.upload.requester(),
+                        &bucket_info,
+                        upload_id,
+                    )
+                {
+                    return Err(ServerError::AccessDenied);
+                }
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+        };
         let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
             PutObjectPolicyContext::default()
                 .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm))
@@ -420,12 +486,14 @@ impl Coordinator {
             false,
         )?;
 
-        Ok(AuthorizedCompleteMultipartUpload {
+        Ok(AuthorizedCompleteMultipartUpload::InProgress {
             bucket_info: bucket_info.into_inner(),
             bucket: req.upload.bucket_name_typed().clone(),
             key: req.upload.key_typed().clone(),
             upload_id: upload.upload_id.clone(),
-            upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            upload: Box::new(storage::AuthorizedMultipartUploadRecord::assume_authorized(
+                upload,
+            )),
             multipart_write_encryption,
         })
     }
@@ -1279,6 +1347,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }

@@ -18352,16 +18352,13 @@ mod tests {
             crate::metadata_command::MetadataCommandId::new(
                 ClusterEpoch::INITIAL,
                 PgId::new(31),
-                crate::metadata_command::MetadataCommandLogIndex::new(u64::from(seed) + 1)
-                    .unwrap(),
+                crate::metadata_command::MetadataCommandLogIndex::new(u64::from(seed) + 1).unwrap(),
             ),
-            crate::metadata_command::MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-                crate::metadata_command::AdvanceCompletedMultipartUploadSequenceCommand {
-                    bucket: crate::BucketName::try_from(format!(
-                        "runtime-refresh-command-{seed}"
-                    ))
-                    .unwrap(),
-                    completion_order: u64::from(seed),
+            crate::metadata_command::MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+                crate::metadata_command::AdvanceMultipartCompletionBarrierCommand {
+                    bucket: crate::BucketName::try_from(format!("runtime-refresh-command-{seed}"))
+                        .unwrap(),
+                    barrier_sequence: u64::from(seed),
                 },
             ),
         )

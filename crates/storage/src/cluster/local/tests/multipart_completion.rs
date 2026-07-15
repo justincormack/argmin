@@ -702,7 +702,7 @@ fn multipart_completion_command_publishes_streamed_part_segments_to_all_acting_n
     req.expected_cleanup = completion_snapshot.cleanup;
 
     let outcome = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
     expected_segment.version_id = outcome.version_id.to_u64();
 
@@ -879,7 +879,7 @@ fn multipart_completion_over_standard_object_reopens_with_valid_digest() {
     );
 
     let outcome = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
     assert!(
         matches!(
@@ -957,7 +957,7 @@ fn multipart_completion_rejects_stale_selected_part_row() {
     );
 
     let err = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap_err();
     assert!(
         matches!(
@@ -1005,7 +1005,7 @@ fn non_current_epoch_multipart_completion_fails_closed_without_mutation() {
             .unwrap();
 
     let err = stale_cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap_err();
     assert!(
         matches!(
@@ -1211,7 +1211,7 @@ fn control_plane_peering_multipart_completion_old_primary_fails_closed_without_m
     )
     .unwrap();
     let err = old_primary_cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap_err();
     assert!(
         matches!(
@@ -1306,12 +1306,6 @@ fn control_plane_peering_multipart_completion_old_primary_fails_closed_without_m
                 .unwrap()
                 .is_empty(),
             "old-primary multipart completion must leave no bucket write reservation on node {node_id:?}"
-        );
-        assert!(
-            crate::PgMetadataStore::get_completed_multipart_upload(&*pg, &req.upload_id)
-                .unwrap()
-                .is_none(),
-            "old-primary multipart completion must not publish completed-upload state on node {node_id:?}"
         );
     }
 }
@@ -1445,7 +1439,7 @@ fn versioned_direct_put_and_multipart_completion_allocate_versions_via_command_s
 
     let multipart_cluster = Arc::clone(&cluster);
     let multipart_thread = std::thread::spawn(move || {
-        multipart_cluster.complete_multipart_upload_commit_serialized(multipart_req, 16)
+        multipart_cluster.complete_multipart_upload_commit_serialized(multipart_req)
     });
 
     {
@@ -1821,7 +1815,7 @@ fn stream_upload_part_create_rejects_raced_multipart_completion() {
 }
 
 #[test]
-fn multipart_completion_order_is_bucket_primary_serialized_across_object_pgs() {
+fn multipart_barrier_sequence_is_bucket_primary_serialized_across_object_pgs() {
     #[derive(Default)]
     struct CompletionRaceState {
         first_at_apply: bool,
@@ -1888,9 +1882,8 @@ fn multipart_completion_order_is_bucket_primary_serialized_across_object_pgs() {
     ));
 
     let cluster_a = Arc::clone(&cluster);
-    let first = std::thread::spawn(move || {
-        cluster_a.complete_multipart_upload_commit_serialized(req_a, 16)
-    });
+    let first =
+        std::thread::spawn(move || cluster_a.complete_multipart_upload_commit_serialized(req_a));
 
     {
         let (lock, cvar) = &*race_state;
@@ -1905,10 +1898,8 @@ fn multipart_completion_order_is_bucket_primary_serialized_across_object_pgs() {
     }
 
     let cluster_b = Arc::clone(&cluster);
-    let second_upload_id = req_b.upload_id.clone();
-    let second = std::thread::spawn(move || {
-        cluster_b.complete_multipart_upload_commit_serialized(req_b, 16)
-    });
+    let second =
+        std::thread::spawn(move || cluster_b.complete_multipart_upload_commit_serialized(req_b));
 
     {
         let (lock, cvar) = &*race_state;
@@ -1928,25 +1919,6 @@ fn multipart_completion_order_is_bucket_primary_serialized_across_object_pgs() {
 
     assert_eq!(first_outcome.version_id, crate::VersionId::Null);
     assert_eq!(second_outcome.version_id, crate::VersionId::Null);
-    let mut orders = vec![
-        completed_multipart_order_on_node(
-            &map,
-            NodeId::new(0),
-            object_pg_a,
-            &bucket,
-            &upload_id_from_label("bucketordera"),
-        ),
-        completed_multipart_order_on_node(
-            &map,
-            NodeId::new(0),
-            object_pg_b,
-            &bucket,
-            &second_upload_id,
-        ),
-    ];
-    orders.sort_unstable();
-    assert_eq!(orders, vec![1, 2]);
-
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
         let bucket_pg = node
@@ -1954,7 +1926,7 @@ fn multipart_completion_order_is_bucket_primary_serialized_across_object_pgs() {
             .unwrap();
         assert_eq!(
             bucket_pg
-                .completed_multipart_upload_sequence_for_bucket(&bucket)
+                .multipart_completion_barrier_sequence_for_bucket(&bucket)
                 .unwrap(),
             2,
             "node {node_id:?} did not catch up bucket completed MPU order"
@@ -2013,7 +1985,7 @@ fn multipart_completion_zero_apply_failure_retains_pending_command_for_retry() {
     ));
 
     let err = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap_err();
     assert!(
         matches!(
@@ -2041,7 +2013,7 @@ fn multipart_completion_zero_apply_failure_retains_pending_command_for_retry() {
     }
 
     let outcome = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     assert_streamed_multipart_completion_on_acting_nodes(
@@ -2114,7 +2086,7 @@ fn multipart_completion_partial_apply_reopens_and_converges() {
     ));
 
     let err = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap_err();
     assert!(
         matches!(
@@ -2271,7 +2243,7 @@ fn multipart_completion_command_id_race_drains_winner_and_resnapshots_stale_payl
     let hook_slot_installed = Arc::clone(&slot_installed);
     let hook_guard = first_cluster.test_install_before_metadata_command_apply_hook(Arc::new(
         move |_node_id, command| {
-            let MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance) =
+            let MetadataCommandPayload::AdvanceMultipartCompletionBarrier(advance) =
                 command.payload()
             else {
                 return Ok(());
@@ -2294,7 +2266,7 @@ fn multipart_completion_command_id_race_drains_winner_and_resnapshots_stale_payl
     ));
 
     let outcome = first_cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
     drop(hook_guard);
 
@@ -2321,7 +2293,7 @@ fn multipart_completion_command_id_race_drains_winner_and_resnapshots_stale_payl
 }
 
 #[test]
-fn multipart_completion_retries_partial_bucket_order_command() {
+fn multipart_completion_retries_partial_bucket_barrier_command() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -2349,7 +2321,7 @@ fn multipart_completion_retries_partial_bucket_order_command() {
     let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
         move |node_id, command| {
             match command.payload() {
-                MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance)
+                MetadataCommandPayload::AdvanceMultipartCompletionBarrier(advance)
                     if advance.bucket == hook_bucket
                         && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
@@ -2366,7 +2338,7 @@ fn multipart_completion_retries_partial_bucket_order_command() {
     ));
 
     let err = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap_err();
     assert!(
         matches!(
@@ -2382,23 +2354,19 @@ fn multipart_completion_retries_partial_bucket_order_command() {
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
-        "partial bucket-PG order command must remain pending"
+        "partial bucket-PG barrier command must remain pending"
     );
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(2), &bucket).is_none(),
-        "object-PG completion must not publish before order command converges"
+        "object-PG completion must not publish before the barrier command converges"
     );
 
     let outcome = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
 
     assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
     assert!(pending_metadata_command_for_test(&map, PgId::new(2), &bucket).is_none());
-    assert_eq!(
-        completed_multipart_order_on_node(&map, NodeId::new(0), 2, &bucket, &req.upload_id),
-        1
-    );
     assert_streamed_multipart_completion_on_acting_nodes(
         &map,
         &node_ids,
@@ -2410,13 +2378,16 @@ fn multipart_completion_retries_partial_bucket_order_command() {
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         let info = crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
-        assert_eq!(info.completed_multipart_upload_sequence, 1);
+        assert_eq!(
+            info.multipart_completion_barrier_sequence, 2,
+            "retry reservation must establish a fresh barrier after draining the partial command on node {node_id:?}"
+        );
     }
     assert_clean_metadata_command_stream(&map, &[1, 2]);
 }
 
 #[test]
-fn completed_multipart_order_command_id_race_drains_winner_and_retries() {
+fn multipart_completion_barrier_command_id_race_drains_winner_and_retries() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -2438,7 +2409,7 @@ fn completed_multipart_order_command_id_race_drains_winner_and_retries() {
     let hook_bucket = bucket.clone();
     let hook_once = Arc::new(AtomicBool::new(true));
     let hook_once_for_closure = Arc::clone(&hook_once);
-    let _hook_guard = cluster.test_install_before_completed_multipart_order_command_id_hook(
+    let _hook_guard = cluster.test_install_before_multipart_completion_barrier_command_id_hook(
         Arc::new(move || {
             if !hook_once_for_closure.swap(false, Ordering::SeqCst) {
                 return;
@@ -2446,10 +2417,10 @@ fn completed_multipart_order_command_id_race_drains_winner_and_retries() {
             let pg_id = PgId::new(1);
             let command = MetadataCommandEnvelope::new(
                 contender.next_metadata_command_id(pg_id).unwrap(),
-                MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-                    AdvanceCompletedMultipartUploadSequenceCommand {
+                MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+                    AdvanceMultipartCompletionBarrierCommand {
                         bucket: hook_bucket.clone(),
-                        completion_order: 1,
+                        barrier_sequence: 1,
                     },
                 ),
             );
@@ -2457,17 +2428,17 @@ fn completed_multipart_order_command_id_race_drains_winner_and_retries() {
         }),
     );
 
-    let completion_order = cluster
-        .test_reserve_completed_multipart_upload_order(&bucket)
+    let barrier_sequence = cluster
+        .test_establish_multipart_completion_barrier(&bucket)
         .unwrap();
 
     assert!(!hook_once.load(Ordering::SeqCst));
-    assert_eq!(completion_order, 2);
+    assert_eq!(barrier_sequence, 2);
     assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         let info = crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
-        assert_eq!(info.completed_multipart_upload_sequence, 2);
+        assert_eq!(info.multipart_completion_barrier_sequence, 2);
     }
     assert_clean_metadata_command_stream(&map, &[1]);
 }
@@ -2507,7 +2478,7 @@ fn multipart_completion_drains_matching_pending_completion() {
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending_completion);
 
     let outcome = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
 
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
@@ -2545,8 +2516,8 @@ fn multipart_completion_drains_matching_pending_completion() {
         let info =
             crate::traits::PgMetadataStore::head_bucket_record_raw(&*bucket_pg, &bucket).unwrap();
         assert_eq!(
-            info.completed_multipart_upload_sequence, 1,
-            "same-upload completion retry must not allocate a second order on node {node_id:?}"
+            info.multipart_completion_barrier_sequence, 0,
+            "manually injected matching completion must not allocate a barrier on node {node_id:?}"
         );
     }
     assert_clean_metadata_command_stream(&map, &[bucket_pg_id, object_pg]);
@@ -2590,35 +2561,19 @@ fn multipart_completion_pending_install_conflict_with_matching_completion_return
     let hook_map = Arc::clone(&map);
     let hook_bucket = bucket.clone();
     let hook_command_template = pending_completion.clone();
-    let hook_bucket_pg_id = bucket_pg_id;
     let hook_ran_for_closure = Arc::clone(&hook_ran);
     let _hook_guard =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
                 return;
             }
-            let bucket_primary = hook_map
-                .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(hook_bucket_pg_id))
-                .unwrap();
-            let bucket_pg = bucket_primary
-                .storage_node()
-                .get_pg(hook_bucket_pg_id)
-                .unwrap();
-            let completion_order = bucket_pg
-                .completed_multipart_upload_sequence_for_bucket(&hook_bucket)
-                .unwrap();
-            drop(bucket_pg);
-            let mut payload = hook_command_template.payload().clone();
-            let MetadataCommandPayload::CommitMultipartObject(commit) = &mut payload else {
-                panic!("test command must be a multipart completion");
-            };
-            commit.completion_order = completion_order;
+            let payload = hook_command_template.payload().clone();
             let hook_command = MetadataCommandEnvelope::new(hook_command_template.id(), payload);
             insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &hook_command);
         }));
 
     let outcome = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
 
     assert!(hook_ran.load(Ordering::SeqCst));
@@ -2691,7 +2646,7 @@ fn multipart_completion_drains_other_upload_same_key_and_resnapshots_stale_paylo
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending_first_completion);
 
     let second_outcome = cluster
-        .complete_multipart_upload_commit_serialized(second_req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(second_req.clone())
         .unwrap();
 
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
@@ -2705,26 +2660,6 @@ fn multipart_completion_drains_other_upload_same_key_and_resnapshots_stale_paylo
         second_outcome.stale_payload
     );
     second_segment.version_id = crate::VersionId::Null.to_u64();
-    assert_eq!(
-        completed_multipart_order_on_node(
-            &map,
-            NodeId::new(0),
-            object_pg,
-            &bucket,
-            &first_req.upload_id
-        ),
-        1
-    );
-    assert_eq!(
-        completed_multipart_order_on_node(
-            &map,
-            NodeId::new(0),
-            object_pg,
-            &bucket,
-            &second_req.upload_id
-        ),
-        2
-    );
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
         let object_pg_store = node.get_pg(object_pg).unwrap();
@@ -2780,7 +2715,10 @@ fn multipart_completion_drains_other_upload_same_key_and_resnapshots_stale_paylo
         let info =
             crate::traits::PgMetadataStore::head_bucket_record_raw(&*bucket_pg_store, &bucket)
                 .unwrap();
-        assert_eq!(info.completed_multipart_upload_sequence, 2);
+        assert_eq!(
+            info.multipart_completion_barrier_sequence, 1,
+            "only the non-injected completion should allocate a barrier on node {node_id:?}"
+        );
     }
     let mut first_readback = Vec::new();
     cluster
@@ -2807,7 +2745,7 @@ fn multipart_completion_drains_other_upload_same_key_and_resnapshots_stale_paylo
         &bucket,
         &key,
         &first_req.upload_id,
-        TerminalMultipartOutcome::Completed,
+        TerminalMultipartOutcome::SupersededCompletion,
     );
     assert_terminal_multipart_upload_invariants(
         &map,
@@ -2902,7 +2840,7 @@ fn multipart_completion_drains_pending_abort_before_completing() {
     );
 
     let err = cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap_err();
     assert!(
         matches!(
@@ -2924,10 +2862,6 @@ fn multipart_completion_drains_pending_abort_before_completing() {
             crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
             Err(crate::MetadataError::ObjectNotFound)
         ));
-        assert!(pg
-            .list_completed_multipart_uploads_for_bucket(bucket.as_str())
-            .unwrap()
-            .is_empty());
     }
     for shard_index in 0..ec_shape.k + ec_shape.m {
         assert!(

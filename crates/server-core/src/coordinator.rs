@@ -230,7 +230,6 @@ use crate::system_metadata::SystemMetadata;
 use storage::object_key_hash;
 
 const TRACE_TARGET: &str = "server_core";
-const COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT: usize = 10_000;
 
 /// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
 pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
@@ -627,6 +626,7 @@ mod bucket_fast_path_cache_tests {
             bucket_lifecycle_generation: 0,
             bucket_execution_generation: 0,
             bucket_incarnation_generation: 0,
+            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
             bucket_abac_enabled: false,
             tags: storage::BucketFastPathTags::NotApplicable,
             encryption: storage::EffectiveBucketEncryptionConfig::default(),

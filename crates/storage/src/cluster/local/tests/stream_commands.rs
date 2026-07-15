@@ -4033,9 +4033,6 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
     let (req, mut expected_segment) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "completewinsfinalize");
     let pg_id = PgId::new(2);
-    let completion_order = cluster
-        .test_reserve_completed_multipart_upload_order(&bucket)
-        .unwrap();
 
     let session_id = crate::SessionId::try_from("5a".repeat(16)).unwrap();
     let upload = cluster
@@ -4139,8 +4136,6 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                 .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
                 .unwrap();
             let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-            let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &hook_req.upload_id)
-                .expect("seeded upload is still in progress");
             let parts_count =
                 std::num::NonZeroU32::new(u32::try_from(hook_req.part_records.len()).unwrap())
                     .unwrap();
@@ -4180,6 +4175,7 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                 MetadataCommandPayload::CommitMultipartObject(Box::new(
                     CommitMultipartObjectCommand {
                         upload_id: hook_req.upload_id.clone(),
+                        completion_fingerprint: hook_req.completion_fingerprint,
                         bucket_write_reservation: hook_proof.clone(),
                         object: crate::PutLiveObjectReq {
                             bucket: hook_bucket.clone(),
@@ -4211,9 +4207,6 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                         )],
                         stream_upload_segments,
                         write_sequence,
-                        completion_order,
-                        completed_at_millis: last_modified_millis,
-                        initiator: upload.initiator.clone(),
                         last_modified_millis,
                         stale_payload: None,
                     },

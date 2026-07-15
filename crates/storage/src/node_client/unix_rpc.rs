@@ -3319,7 +3319,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         )
     }
 
-    fn build_advance_completed_multipart_upload_sequence_command(
+    fn build_advance_multipart_completion_barrier_command(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
@@ -3327,7 +3327,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         completion_target_context: &str,
         bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
-        let request = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+        let request = StorageRpcMultipartCompletionBarrierCommandBuildRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
             pg_id,
@@ -3336,29 +3336,29 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             completion_target_context: completion_target_context.to_string(),
             bucket_write_reservation: bucket_write_reservation.clone(),
         };
-        let payload =
-            encode_completed_multipart_order_command_build_request(&request).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "encode completed multipart order command build request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::CompletedMultipartOrderCommandBuild,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response = decode_completed_multipart_order_command_build_response(&response).map_err(
+        let payload = encode_multipart_completion_barrier_command_build_request(&request).map_err(
             |error| {
                 BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "decode completed multipart order command build response",
+                    "encode multipart completion barrier command build request",
                     error.to_string(),
                 ))
             },
         )?;
-        self.validate_completed_multipart_order_command_build_response(
-            response.completion_order,
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::MultipartCompletionBarrierCommandBuild,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_multipart_completion_barrier_command_build_response(&response)
+            .map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode multipart completion barrier command build response",
+                    error.to_string(),
+                ))
+            })?;
+        self.validate_multipart_completion_barrier_command_build_response(
+            response.barrier_sequence,
             response.command,
             bucket,
             command_id,

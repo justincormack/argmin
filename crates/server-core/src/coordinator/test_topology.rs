@@ -25,15 +25,6 @@ pub(crate) fn object_data_pg_id(
     )
 }
 
-pub(crate) fn object_pgs_differ(
-    coord: &Coordinator,
-    bucket: &str,
-    key_a: &str,
-    key_b: &str,
-) -> bool {
-    object_pg_id(coord, bucket, key_a) != object_pg_id(coord, bucket, key_b)
-}
-
 pub(crate) fn find_key_with_object_pg_distinct_from(
     coord: &Coordinator,
     bucket: &str,

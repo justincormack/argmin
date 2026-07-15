@@ -49,7 +49,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         config: &CreateBucketConfig<'_>,
     ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError>;
 
-    fn build_advance_completed_multipart_upload_sequence_command(
+    fn build_advance_multipart_completion_barrier_command(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
@@ -298,14 +298,6 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
-
-    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        next_pg_index: u32,
-    ) -> Result<u32, BucketSnapshotLoadError>;
 
     fn get_lifecycle_sweep_roots(
         &self,
@@ -585,14 +577,6 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         limit: u32,
     ) -> Result<StreamUploadRecordPage, ObjectPgActionError>;
 
-    fn list_completed_multipart_upload_records_for_bucket_page(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        upload_id_marker: Option<&UploadId>,
-        limit: u32,
-    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError>;
-
     fn payload_reclaim_exists(
         &self,
         pg_id: PgId,
@@ -825,7 +809,6 @@ pub(crate) struct BuildCompleteMultipartObjectCommandReq<'a> {
     pub(crate) request: &'a CompleteMultipartCommitRequest,
     pub(crate) version_id: VersionId,
     pub(crate) expected_object_parts: &'a [ObjectPartRecord],
-    pub(crate) completion_order: u64,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
 
@@ -1480,7 +1463,7 @@ pub(crate) trait StorageNodeClient:
         config: &CreateBucketConfig<'_>,
     ) -> Result<CreateBucketCommandBuild, BucketSnapshotLoadError>;
 
-    fn build_advance_completed_multipart_upload_sequence_command(
+    fn build_advance_multipart_completion_barrier_command(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
@@ -1941,14 +1924,6 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
 
-    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        next_pg_index: u32,
-    ) -> Result<u32, BucketSnapshotLoadError>;
-
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: PgId,
@@ -1995,14 +1970,6 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
-
-    fn list_completed_multipart_upload_records_for_bucket_page(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        upload_id_marker: Option<&UploadId>,
-        limit: u32,
-    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError>;
 
     fn try_acquire_object_payload_lease(
         &self,

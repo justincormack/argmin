@@ -31,19 +31,18 @@ use crate::metadata_command::{
     abandoned_command_log_bytes, decode_metadata_command_envelope,
     decode_metadata_command_log_entry_header, metadata_command_log_hash,
     AbortMultipartUploadCommand, AbortStreamUploadCommand,
-    AdvanceCompletedMultipartUploadSequenceCommand, AppendStreamSegmentCommand,
-    BucketPropertyEffect, BucketRecord, BucketSubresourceMutation, BucketWriteReservationProof,
+    AdvanceMultipartCompletionBarrierCommand, AppendStreamSegmentCommand, BucketPropertyEffect,
+    BucketRecord, BucketSubresourceMutation, BucketWriteReservationProof,
     CommitDirectPutObjectCommand, CommitMultipartObjectCommand, CommitStreamPartCommand,
     CreateBucketCommand, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-    DeleteCompletedMultipartUploadCommand, DeleteObjectPayloadReclaimCommand,
-    DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-    MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
-    MetadataCommandId, MetadataCommandLogEntryKind, MetadataCommandLogHashRangeEntry,
-    MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
-    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
-    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
-    PutBucketVersioningCommand, PutObjectMetadataCommand, ReleaseObjectGenerationCommand,
-    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
+    InsertDeleteMarkerCommand, MarkBucketDeletingCommand, MetadataCommandAcceptance,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogEntryKind,
+    MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex, MetadataCommandLogRangeEntry,
+    MetadataCommandLogRangeEntryKind, MetadataCommandPayload, MetadataCommandReplicaState,
+    ObjectPayloadReclaimCommand, PutBucketAclCommand, PutBucketPropertyCommand,
+    PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
+    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::schema::init_pg_schema;
 use crate::traits::{
@@ -78,7 +77,7 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
-       bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+       bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, multipart_upload_id_key, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets";
 const BUCKET_INFO_BY_NAME_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
@@ -86,13 +85,13 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
-       bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+       bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, multipart_upload_id_key, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets WHERE name = ?1";
 
 const BUCKET_RECORD_BY_NAME_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
-       bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, \
+       bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, multipart_upload_id_key, multipart_completion_barrier_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, \
        object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets WHERE name = ?1";
 

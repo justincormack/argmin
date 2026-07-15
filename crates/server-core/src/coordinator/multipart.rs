@@ -4,8 +4,52 @@ use storage::{
     GenerationId, MultipartPartRecord, MultipartPartSegmentRecord, ObjectKey,
     PreparedStreamPartCommit, SerializedMetadataBlob, SerializedSystemMetadataBlob,
     SerializedTagSet, SessionId, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget,
-    UploadId, UploadState, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+    UploadId, UploadState,
 };
+
+fn multipart_completion_fingerprint(
+    req: &CompleteMultipartUploadRequest<'_>,
+) -> storage::MultipartCompletionFingerprint {
+    fn update_bytes(context: &mut ring::digest::Context, bytes: &[u8]) {
+        context.update(&(bytes.len() as u64).to_be_bytes());
+        context.update(bytes);
+    }
+
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"argmin complete multipart request v1\0");
+    context.update(&(req.parts.len() as u64).to_be_bytes());
+    for part in req.parts {
+        context.update(&part.part_number.to_be_bytes());
+        update_bytes(&mut context, part.etag.as_bytes());
+        match &part.checksum {
+            None => context.update(&[0]),
+            Some(checksum) => {
+                context.update(&[1]);
+                update_bytes(&mut context, checksum.algorithm().as_str().as_bytes());
+                update_bytes(&mut context, checksum.expected_bytes());
+            }
+        }
+    }
+    match req.claimed_checksum {
+        None => context.update(&[0]),
+        Some(checksum) => {
+            context.update(&[1]);
+            update_bytes(&mut context, checksum.algorithm().as_str().as_bytes());
+            update_bytes(&mut context, checksum.encoded_value().as_bytes());
+        }
+    }
+    match req.expected_object_size {
+        None => context.update(&[0]),
+        Some(size) => {
+            context.update(&[1]);
+            context.update(&size.to_be_bytes());
+        }
+    }
+    let digest = context.finish();
+    let mut fingerprint = [0u8; 32];
+    fingerprint.copy_from_slice(digest.as_ref());
+    storage::MultipartCompletionFingerprint::from_bytes(fingerprint)
+}
 
 use super::authz_results::{
     AuthorizedAbortMultipartUpload, AuthorizedCompleteMultipartUpload,
@@ -23,8 +67,8 @@ use super::response_types::{
     ListMultipartUploadsResult, ListPartsResult, MultipartUploadEntry, PartEntry, UploadPartResult,
 };
 use super::{
-    compute_checksum, optional_list_object_key, Coordinator,
-    COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT, MAX_MULTIPART_PARTS, MIN_PART_SIZE, TRACE_TARGET,
+    compute_checksum, optional_list_object_key, Coordinator, MAX_MULTIPART_PARTS, MIN_PART_SIZE,
+    TRACE_TARGET,
 };
 #[cfg(test)]
 use super::{
@@ -404,20 +448,6 @@ impl Coordinator {
             req.object.bucket_name(),
             req.object.key
         );
-        let rng = ring::rand::SystemRandom::new();
-        let mut id_bytes = [0u8; UPLOAD_ID_LEN];
-        ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
-            ServerError::InternalError {
-                reason: "failed to generate upload ID".to_string(),
-            }
-        })?;
-        let upload_id: String = id_bytes
-            .iter()
-            .map(|byte| UPLOAD_ID_ALPHABET[(byte & 0x3f) as usize] as char)
-            .collect();
-        let typed_upload_id =
-            UploadId::try_from(upload_id).expect("generated multipart upload ID is valid");
-
         let metadata_blob = req.metadata.serialize()?;
         let system_metadata_blob = req.system_metadata.serialize()?;
         let request = BucketHandleRequest::new()
@@ -450,6 +480,15 @@ impl Coordinator {
                         &bucket_handle,
                         existing_object.as_ref(),
                     )?;
+                    let typed_upload_id = authorized
+                        .bucket_info
+                        .multipart_upload_id_key
+                        .issue(
+                            &authorized.bucket,
+                            &authorized.key,
+                            &authorized.initiator.principal,
+                        )
+                        .map_err(|reason| ServerError::InternalError { reason })?;
                     let create = CreateMultipartUploadReq {
                         upload_id: typed_upload_id.clone(),
                         bucket: authorized.bucket.clone(),
@@ -467,10 +506,11 @@ impl Coordinator {
                         checksum: authorized.checksum,
                         encryption: authorized.write_encryption.object_encryption(),
                     };
-                    Ok::<_, ServerError>((authorized, create))
+                    Ok::<_, ServerError>(((authorized, typed_upload_id), create))
                 },
             )
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)??;
+        let (authorized, typed_upload_id) = authorized;
         let AuthorizedCreateMultipartUpload {
             bucket_info,
             key,
@@ -510,14 +550,60 @@ impl Coordinator {
         );
         let mut stale_commit_retries = 0usize;
         'retry_stale_commit_snapshot: loop {
-            let AuthorizedCompleteMultipartUpload {
-                bucket_info,
-                bucket,
-                key,
-                upload_id,
-                upload,
-                multipart_write_encryption,
-            } = self.authorize_complete_multipart_upload_with_storage_node(&storage_node, req)?;
+            let authorized =
+                self.authorize_complete_multipart_upload_with_storage_node(&storage_node, req)?;
+            let (bucket_info, bucket, key, upload_id, upload, multipart_write_encryption) =
+                match authorized {
+                    AuthorizedCompleteMultipartUpload::InProgress {
+                        bucket_info,
+                        bucket,
+                        key,
+                        upload_id,
+                        upload,
+                        multipart_write_encryption,
+                    } => (
+                        bucket_info,
+                        bucket,
+                        key,
+                        upload_id,
+                        upload,
+                        multipart_write_encryption,
+                    ),
+                    AuthorizedCompleteMultipartUpload::Replay {
+                        bucket_info,
+                        key,
+                        replay,
+                    } => {
+                        if replay.fingerprint != multipart_completion_fingerprint(req) {
+                            return Err(ServerError::NoSuchUpload {
+                                upload_id: replay.upload_id.to_string(),
+                            });
+                        }
+                        let system_metadata = replay
+                            .system_metadata_blob
+                            .as_ref()
+                            .map(|metadata| SystemMetadata::deserialize(metadata.as_slice()))
+                            .transpose()?
+                            .unwrap_or_default();
+                        let checksum = system_metadata.checksum();
+                        let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
+                            &bucket_info,
+                            key.as_str(),
+                            replay.tags.as_deref(),
+                            replay.size,
+                            replay.last_modified,
+                        )?;
+                        return Ok(CompleteMultipartUploadResult {
+                            etag: replay.etag.format(),
+                            version_id: replay.version_id,
+                            managed_encryption: replay.encryption.managed_encryption_algorithm(),
+                            checksum_algorithm: checksum.map(|checksum| checksum.algorithm()),
+                            checksum_type: checksum.and_then(|checksum| checksum.checksum_type()),
+                            checksum_value: checksum.map(|checksum| checksum.value().to_string()),
+                            lifecycle_expiration,
+                        });
+                    }
+                };
             let parts = req.parts;
             let claimed_checksum = req.claimed_checksum;
             let expected_object_size = req.expected_object_size;
@@ -810,6 +896,7 @@ impl Coordinator {
                     bucket: bucket.clone(),
                     key: key.clone(),
                     upload_id: upload_id.clone(),
+                    completion_fingerprint: multipart_completion_fingerprint(req),
                     versioning: bucket_info.versioning,
                     owner: upload.owner.clone(),
                     acl_grants: upload.acl_grants.clone(),
@@ -830,7 +917,6 @@ impl Coordinator {
                     selected_streaming_segments: completion_snapshot.selected_streaming_segments,
                     expected_cleanup: completion_snapshot.cleanup,
                 },
-                COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
             ) {
                 Ok(outcome) => outcome,
                 Err(storage::ObjectPgActionError::StaleMultipartCompletionSnapshot)
@@ -885,14 +971,33 @@ impl Coordinator {
         &self,
         upload: &MultipartObjectRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.storage_node()
-            .load_in_progress_multipart_upload(
-                upload.bucket_name_typed(),
-                upload.key_typed(),
-                upload.upload_id(),
-            )
-            .map(|_| ())
-            .map_err(Self::map_object_pg_action_error)
+        match self.storage_node().load_in_progress_multipart_upload(
+            upload.bucket_name_typed(),
+            upload.key_typed(),
+            upload.upload_id(),
+        ) {
+            Ok(_) => Ok(()),
+            Err(storage::ObjectPgActionError::Metadata(storage::MetadataError::NoSuchUpload {
+                ..
+            })) => {
+                let bucket_info = self.checked_active_bucket_summary_for(
+                    upload.bucket_name_typed(),
+                    upload.expected_bucket_owner(),
+                )?;
+                if bucket_info.multipart_upload_id_key.authenticates(
+                    upload.bucket_name_typed(),
+                    upload.key_typed(),
+                    upload.upload_id(),
+                ) {
+                    Ok(())
+                } else {
+                    Err(ServerError::NoSuchUpload {
+                        upload_id: upload.upload_id().to_string(),
+                    })
+                }
+            }
+            Err(error) => Err(Self::map_object_pg_action_error(error)),
+        }
     }
 
     /// Abort an in-progress multipart upload.
@@ -910,7 +1015,7 @@ impl Coordinator {
             req.upload_id()
         );
         match self.authorize_abort_multipart_upload_with_storage_node(&storage_node, req)? {
-            AuthorizedAbortMultipartUpload::Completed => Ok(()),
+            AuthorizedAbortMultipartUpload::Terminal => Ok(()),
             AuthorizedAbortMultipartUpload::InProgress { upload } => {
                 if self
                     .read_runtime_for_storage_node(std::sync::Arc::clone(&storage_node))

@@ -134,6 +134,8 @@ CREATE TABLE IF NOT EXISTS objects (
         object_lock_retain_until IS NULL OR object_lock_retain_until > 0
     ),
     object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2)),
+    multipart_completion_upload_id TEXT,
+    multipart_completion_fingerprint BLOB,
     became_noncurrent_at INTEGER CHECK (
         became_noncurrent_at IS NULL OR became_noncurrent_at > 0
     ),
@@ -141,6 +143,13 @@ CREATE TABLE IF NOT EXISTS objects (
     CHECK (etag_kind IN (0, 1)),
     CHECK (data_layout IN (0, 1)),
     CHECK (encryption_type IN (0, 1, 2)),
+    CHECK (
+        (multipart_completion_upload_id IS NULL AND multipart_completion_fingerprint IS NULL)
+        OR
+        (status = 0
+         AND multipart_completion_upload_id IS NOT NULL AND length(multipart_completion_upload_id) = 128
+         AND multipart_completion_fingerprint IS NOT NULL AND length(multipart_completion_fingerprint) = 32)
+    ),
     CHECK (
         (status = 0 AND (
             generation_id IS NOT NULL AND generation_id > 0 AND
@@ -203,25 +212,6 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     ),
     object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2))
 ) STRICT";
-
-/// Completed multipart uploads retained for AbortMultipartUpload semantics.
-const CREATE_COMPLETED_MULTIPART_UPLOADS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS completed_multipart_uploads (
-    upload_id        TEXT PRIMARY KEY,
-    bucket           TEXT NOT NULL,
-    key              TEXT NOT NULL,
-    completion_order INTEGER NOT NULL CHECK (completion_order > 0),
-    completed_at     INTEGER NOT NULL,
-    owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
-    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
-    initiator_principal TEXT NOT NULL CHECK (length(initiator_principal) BETWEEN 1 AND 256),
-    initiator_canonical_id TEXT NOT NULL CHECK (length(initiator_canonical_id) IN (32, 64))
-) STRICT";
-
-/// Index for pruning old completed multipart tombstones per bucket.
-const CREATE_COMPLETED_MULTIPART_UPLOADS_BUCKET_ORDER_INDEX: &str = "\
-CREATE INDEX IF NOT EXISTS idx_completed_multipart_uploads_bucket_order \
-    ON completed_multipart_uploads (bucket, completion_order)";
 
 /// Index for listing multipart uploads by bucket/key.
 const CREATE_MPU_BUCKET_KEY_INDEX: &str = "\
@@ -543,6 +533,10 @@ CREATE INDEX IF NOT EXISTS idx_objects_versions ON objects (bucket, key, version
 const CREATE_OBJECTS_WRITE_SEQUENCE_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_objects_write_sequence ON objects (bucket, key, write_sequence DESC)";
 
+const CREATE_OBJECTS_MULTIPART_COMPLETION_UPLOAD_INDEX: &str = "\
+CREATE UNIQUE INDEX IF NOT EXISTS idx_objects_multipart_completion_upload \
+ON objects (multipart_completion_upload_id) WHERE multipart_completion_upload_id IS NOT NULL";
+
 /// Bucket metadata table.
 const CREATE_BUCKETS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS buckets (
@@ -567,8 +561,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),
     bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_execution_generation >= 0),
     bucket_incarnation_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_incarnation_generation >= 0),
-    completed_multipart_upload_sequence INTEGER NOT NULL DEFAULT 0 CHECK (completed_multipart_upload_sequence >= 0),
-    bucket_delete_finalize_completed_multipart_next_pg_index INTEGER NOT NULL DEFAULT 0 CHECK (bucket_delete_finalize_completed_multipart_next_pg_index >= 0),
+    multipart_upload_id_key BLOB NOT NULL CHECK (length(multipart_upload_id_key) = 32),
+    multipart_completion_barrier_sequence INTEGER NOT NULL DEFAULT 0 CHECK (multipart_completion_barrier_sequence >= 0),
     bucket_abac_enabled INTEGER NOT NULL DEFAULT 0 CHECK (bucket_abac_enabled IN (0, 1)),
     default_encryption_type INTEGER CHECK (
         default_encryption_type IS NULL OR default_encryption_type IN (1)
@@ -779,9 +773,8 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_OBJECTS_LIST_INDEX, [])?;
     conn.execute(CREATE_OBJECTS_VERSIONS_INDEX, [])?;
     conn.execute(CREATE_OBJECTS_WRITE_SEQUENCE_INDEX, [])?;
+    conn.execute(CREATE_OBJECTS_MULTIPART_COMPLETION_UPLOAD_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_UPLOADS_TABLE, [])?;
-    conn.execute(CREATE_COMPLETED_MULTIPART_UPLOADS_TABLE, [])?;
-    conn.execute(CREATE_COMPLETED_MULTIPART_UPLOADS_BUCKET_ORDER_INDEX, [])?;
     conn.execute(CREATE_MPU_BUCKET_KEY_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_PARTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_PARTS_TABLE, [])?;
@@ -1299,6 +1292,22 @@ mod tests {
             non_strict_tables.is_empty(),
             "all schema tables should be STRICT; non-strict tables: {non_strict_tables:?}"
         );
+    }
+
+    #[test]
+    fn multipart_terminal_history_has_no_standalone_table() {
+        let conn = in_memory_schema();
+        let table_count: u32 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_list \
+                 WHERE schema = 'main' AND type = 'table' \
+                   AND name = 'completed_multipart_uploads'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(table_count, 0);
     }
 
     #[test]

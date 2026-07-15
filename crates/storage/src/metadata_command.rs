@@ -10,17 +10,18 @@ use crate::types::{
     AbortMultipartUploadCleanup, BucketAclSummary, BucketEncryptionConfig, BucketName,
     BucketObjectOwnership, BucketOwnershipControls, BucketState, BucketSubresourceAux,
     BucketSubresourceKind, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes,
-    ChecksumType, ClusterEpoch, CompletedMultipartUploadRecord, CreateBucketConfig,
-    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, EtagKind, GenerationId,
-    LiveObjectRecord, ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-    MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType,
-    ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimKind,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-    OwnerIdentity, PgId, PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
+    ChecksumType, ClusterEpoch, CreateBucketConfig, CreateMultipartUploadReq,
+    CreateStreamUploadReq, EcShape, EtagKind, GenerationId, LiveObjectRecord,
+    ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionFingerprint,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadIdKey,
+    MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey,
+    ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimKind, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PgId,
+    PublicAccessBlockConfig, PutLiveObjectReq, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, SessionId, StorageClass,
     StreamUploadCommandRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-    TerminalStreamCleanupRecord, UploadId, UploadState, VersionId,
+    TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, MULTIPART_UPLOAD_ID_KEY_LEN,
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
@@ -46,8 +47,7 @@ const METADATA_COMMAND_CREATE_MULTIPART_UPLOAD: u16 = 16;
 const METADATA_COMMAND_ABORT_MULTIPART_UPLOAD: u16 = 17;
 const METADATA_COMMAND_COMMIT_STREAM_PART: u16 = 18;
 const METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM: u16 = 19;
-const METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD: u16 = 20;
-const METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE: u16 = 21;
+const METADATA_COMMAND_ADVANCE_MULTIPART_COMPLETION_BARRIER: u16 = 21;
 const METADATA_COMMAND_RESERVE_OBJECT_VERSION: u16 = 22;
 const METADATA_COMMAND_MARK_BUCKET_DELETING: u16 = 23;
 const METADATA_COMMAND_DELETE_FINALIZED_BUCKET: u16 = 24;
@@ -189,7 +189,10 @@ pub struct BucketRecord {
     pub(crate) bucket_lifecycle_generation: u64,
     pub(crate) bucket_execution_generation: u64,
     pub(crate) bucket_incarnation_generation: u64,
-    pub(crate) completed_multipart_upload_sequence: u64,
+    pub(crate) multipart_upload_id_key: MultipartUploadIdKey,
+    /// Fixed-size synchronization state advanced before each object-PG multipart commit.
+    /// It does not identify or retain completed uploads.
+    pub(crate) multipart_completion_barrier_sequence: u64,
     pub(crate) bucket_abac_enabled: bool,
     pub(crate) encryption: BucketEncryptionConfig,
 }
@@ -202,6 +205,7 @@ impl BucketRecord {
     ) -> Result<Self, String> {
         let name = BucketName::try_from(config.name.to_string())
             .map_err(|reason| format!("invalid bucket name in create bucket command: {reason}"))?;
+        let multipart_upload_id_key = MultipartUploadIdKey::generate()?;
         Ok(Self {
             name,
             owner_principal: config.owner_principal.to_string(),
@@ -221,7 +225,8 @@ impl BucketRecord {
             bucket_lifecycle_generation: 0,
             bucket_execution_generation,
             bucket_incarnation_generation: bucket_execution_generation,
-            completed_multipart_upload_sequence: 0,
+            multipart_upload_id_key,
+            multipart_completion_barrier_sequence: 0,
             bucket_abac_enabled: false,
             encryption: BucketEncryptionConfig {
                 default_encryption: None,
@@ -231,8 +236,15 @@ impl BucketRecord {
     }
 
     pub(crate) fn matches_create_config(&self, config: &CreateBucketConfig<'_>) -> bool {
-        Self::from_create_config(config, self.created_at, self.bucket_execution_generation)
-            .is_ok_and(|expected| expected.command_metadata_eq(self))
+        self.name.as_str() == config.name
+            && self.owner_principal == config.owner_principal
+            && self.owner_canonical_id == *config.owner_canonical_id
+            && self.acl_grants == *config.acl_grants
+            && self.public_read == config.public_read
+            && self.public_write == config.public_write
+            && self.versioning == config.versioning
+            && self.object_lock == config.object_lock
+            && self.ownership_controls == Some(config.ownership_controls)
     }
 
     pub(crate) fn with_execution_generation(mut self, generation: u64) -> Self {
@@ -298,8 +310,7 @@ pub(crate) enum MetadataCommandPayload {
     CreateMultipartUpload(Box<CreateMultipartUploadCommand>),
     AbortMultipartUpload(Box<AbortMultipartUploadCommand>),
     DeleteObjectPayloadReclaim(Box<DeleteObjectPayloadReclaimCommand>),
-    DeleteCompletedMultipartUpload(Box<DeleteCompletedMultipartUploadCommand>),
-    AdvanceCompletedMultipartUploadSequence(AdvanceCompletedMultipartUploadSequenceCommand),
+    AdvanceMultipartCompletionBarrier(AdvanceMultipartCompletionBarrierCommand),
 }
 
 impl MetadataCommandPayload {
@@ -332,11 +343,8 @@ impl MetadataCommandPayload {
             Self::CreateMultipartUpload(_) => METADATA_COMMAND_CREATE_MULTIPART_UPLOAD,
             Self::AbortMultipartUpload(_) => METADATA_COMMAND_ABORT_MULTIPART_UPLOAD,
             Self::DeleteObjectPayloadReclaim(_) => METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM,
-            Self::DeleteCompletedMultipartUpload(_) => {
-                METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD
-            }
-            Self::AdvanceCompletedMultipartUploadSequence(_) => {
-                METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE
+            Self::AdvanceMultipartCompletionBarrier(_) => {
+                METADATA_COMMAND_ADVANCE_MULTIPART_COMPLETION_BARRIER
             }
         }
     }
@@ -365,8 +373,7 @@ impl MetadataCommandPayload {
             Self::CreateMultipartUpload(create) => &create.upload.bucket,
             Self::AbortMultipartUpload(abort) => &abort.bucket,
             Self::DeleteObjectPayloadReclaim(reclaim) => &reclaim.bucket,
-            Self::DeleteCompletedMultipartUpload(delete) => &delete.record.bucket,
-            Self::AdvanceCompletedMultipartUploadSequence(advance) => &advance.bucket,
+            Self::AdvanceMultipartCompletionBarrier(advance) => &advance.bucket,
         }
     }
 }
@@ -395,11 +402,8 @@ fn metadata_command_payload_kind_name(kind_id: u16) -> Option<&'static str> {
         METADATA_COMMAND_CREATE_MULTIPART_UPLOAD => Some("CreateMultipartUpload"),
         METADATA_COMMAND_ABORT_MULTIPART_UPLOAD => Some("AbortMultipartUpload"),
         METADATA_COMMAND_DELETE_OBJECT_PAYLOAD_RECLAIM => Some("DeleteObjectPayloadReclaim"),
-        METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD => {
-            Some("DeleteCompletedMultipartUpload")
-        }
-        METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE => {
-            Some("AdvanceCompletedMultipartUploadSequence")
+        METADATA_COMMAND_ADVANCE_MULTIPART_COMPLETION_BARRIER => {
+            Some("AdvanceMultipartCompletionBarrier")
         }
         _ => None,
     }
@@ -721,6 +725,7 @@ impl CommitDirectPutObjectCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitMultipartObjectCommand {
     pub(crate) upload_id: UploadId,
+    pub(crate) completion_fingerprint: MultipartCompletionFingerprint,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
     pub(crate) object: PutLiveObjectReq,
     pub(crate) parts: Vec<ObjectPartRecord>,
@@ -730,9 +735,6 @@ pub(crate) struct CommitMultipartObjectCommand {
     pub(crate) stream_uploads: Vec<TerminalStreamCleanupRecord>,
     pub(crate) stream_upload_segments: Vec<StreamUploadSegmentRecord>,
     pub(crate) write_sequence: u64,
-    pub(crate) completion_order: u64,
-    pub(crate) completed_at_millis: u64,
-    pub(crate) initiator: OwnerIdentity,
     pub(crate) last_modified_millis: u64,
     pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
 }
@@ -744,12 +746,14 @@ impl CommitMultipartObjectCommand {
         key: &ObjectKey,
         upload_id: &UploadId,
         generation_id: GenerationId,
+        completion_fingerprint: MultipartCompletionFingerprint,
         parts: &[MultipartPartRecord],
     ) -> bool {
         self.object.bucket == *bucket
             && self.object.key == *key
             && self.upload_id == *upload_id
             && self.object.generation_id == generation_id
+            && self.completion_fingerprint == completion_fingerprint
             && self
                 .parts
                 .iter()
@@ -1109,17 +1113,14 @@ pub(crate) struct AbortMultipartUploadCommand {
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
-/// Authorized by exact completed-upload row identity during internal completed-MPU cleanup.
+/// Bucket-PG barrier authorized by CompleteMultipartUpload's bucket write reservation proof.
+///
+/// The monotonic sequence makes replicated application idempotent without retaining any
+/// per-upload terminal state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DeleteCompletedMultipartUploadCommand {
-    pub(crate) record: CompletedMultipartUploadRecord,
-}
-
-/// Authorized at build time by CompleteMultipartUpload's bucket write reservation proof.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AdvanceCompletedMultipartUploadSequenceCommand {
+pub(crate) struct AdvanceMultipartCompletionBarrierCommand {
     pub(crate) bucket: BucketName,
-    pub(crate) completion_order: u64,
+    pub(crate) barrier_sequence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1350,11 +1351,8 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
             encode_delete_object_payload_reclaim(&mut out, command);
         }
-        MetadataCommandPayload::DeleteCompletedMultipartUpload(command) => {
-            encode_delete_completed_multipart_upload(&mut out, command);
-        }
-        MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => {
-            encode_advance_completed_multipart_upload_sequence(&mut out, command);
+        MetadataCommandPayload::AdvanceMultipartCompletionBarrier(command) => {
+            encode_advance_multipart_completion_barrier(&mut out, command);
         }
     }
     out
@@ -1482,6 +1480,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             }
             METADATA_COMMAND_COMMIT_MULTIPART_OBJECT => {
                 self.skip_str()?;
+                self.read_bytes()?;
                 self.skip_put_live_object()?;
                 self.skip_repeated(Self::skip_object_part)?;
                 self.skip_repeated(Self::skip_multipart_part_segment)?;
@@ -1490,9 +1489,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_repeated(Self::skip_terminal_stream_cleanup)?;
                 self.skip_repeated(Self::skip_stream_upload_segment)?;
                 self.read_u64()?;
-                self.read_u64()?;
-                self.read_u64()?;
-                self.skip_owner_identity()?;
                 self.read_u64()?;
                 self.skip_optional_stale_payload()?;
                 self.skip_required_bucket_write_reservation_proof()
@@ -1568,10 +1564,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.skip_object_payload_reclaim()?;
                 self.skip_object_payload_reclaim_claim_proof()
             }
-            METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD => {
-                self.skip_completed_multipart_upload()
-            }
-            METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE => {
+            METADATA_COMMAND_ADVANCE_MULTIPART_COMPLETION_BARRIER => {
                 self.skip_str()?;
                 self.read_u64()?;
                 Ok(())
@@ -1679,6 +1672,9 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 Ok(MetadataCommandPayload::CommitMultipartObject(Box::new(
                     CommitMultipartObjectCommand {
                         upload_id: self.read_upload_id()?,
+                        completion_fingerprint: MultipartCompletionFingerprint::from_bytes(
+                            self.read_fixed_bytes("multipart completion fingerprint")?,
+                        ),
                         object: self.read_put_live_object()?,
                         parts: self.read_repeated(Self::read_object_part)?,
                         selected_streaming_segments: self
@@ -1690,9 +1686,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         stream_upload_segments: self
                             .read_repeated(Self::read_stream_upload_segment)?,
                         write_sequence: self.read_u64()?,
-                        completion_order: self.read_u64()?,
-                        completed_at_millis: self.read_u64()?,
-                        initiator: self.read_owner_identity()?,
                         last_modified_millis: self.read_u64()?,
                         stale_payload: self.read_optional_stale_payload()?,
                         bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
@@ -1804,21 +1797,14 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     )),
                 ))
             }
-            METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD => {
-                Ok(MetadataCommandPayload::DeleteCompletedMultipartUpload(
-                    Box::new(DeleteCompletedMultipartUploadCommand {
-                        record: self.read_completed_multipart_upload()?,
-                    }),
+            METADATA_COMMAND_ADVANCE_MULTIPART_COMPLETION_BARRIER => {
+                Ok(MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+                    AdvanceMultipartCompletionBarrierCommand {
+                        bucket: self.read_bucket_name()?,
+                        barrier_sequence: self.read_u64()?,
+                    },
                 ))
             }
-            METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE => Ok(
-                MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-                    AdvanceCompletedMultipartUploadSequenceCommand {
-                        bucket: self.read_bucket_name()?,
-                        completion_order: self.read_u64()?,
-                    },
-                ),
-            ),
             _ => Err(format!(
                 "pending metadata command payload kind {kind_id} does not have a typed decoder yet"
             )),
@@ -2035,6 +2021,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.read_u64()?;
         self.read_u64()?;
+        self.read_bytes()?;
         self.read_u64()?;
         self.skip_bool()?;
         self.skip_bucket_encryption()
@@ -2062,7 +2049,10 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             bucket_lifecycle_generation: self.read_u64()?,
             bucket_execution_generation: self.read_u64()?,
             bucket_incarnation_generation: self.read_u64()?,
-            completed_multipart_upload_sequence: self.read_u64()?,
+            multipart_upload_id_key: MultipartUploadIdKey::from_bytes(
+                self.read_fixed_bytes::<MULTIPART_UPLOAD_ID_KEY_LEN>("multipart upload ID key")?,
+            ),
+            multipart_completion_barrier_sequence: self.read_u64()?,
             bucket_abac_enabled: self.read_bool()?,
             encryption: self.read_bucket_encryption()?,
         })
@@ -2476,30 +2466,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             object_lock: self.read_object_lock_state()?,
             checksum: self.read_optional_multipart_checksum_config()?,
             encryption: self.read_object_encryption()?,
-        })
-    }
-
-    fn skip_completed_multipart_upload(&mut self) -> Result<(), String> {
-        self.skip_str()?;
-        self.skip_str()?;
-        self.skip_str()?;
-        self.read_u64()?;
-        self.read_u64()?;
-        self.skip_owner_identity()?;
-        self.skip_owner_identity()
-    }
-
-    fn read_completed_multipart_upload(
-        &mut self,
-    ) -> Result<CompletedMultipartUploadRecord, String> {
-        Ok(CompletedMultipartUploadRecord {
-            upload_id: self.read_upload_id()?,
-            bucket: self.read_bucket_name()?,
-            key: self.read_object_key()?,
-            completion_order: self.read_u64()?,
-            completed_at: self.read_u64()?,
-            initiator: self.read_owner_identity()?,
-            owner: self.read_owner_identity()?,
         })
     }
 
@@ -3180,6 +3146,7 @@ fn encode_commit_direct_put_object(out: &mut Vec<u8>, command: &CommitDirectPutO
 
 fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartObjectCommand) {
     put_str(out, command.upload_id.as_str());
+    put_bytes(out, command.completion_fingerprint.as_bytes());
     encode_put_live_object(out, &command.object);
     put_u32(out, command.parts.len() as u32);
     for part in &command.parts {
@@ -3206,9 +3173,6 @@ fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartOb
         encode_stream_upload_segment(out, segment);
     }
     put_u64(out, command.write_sequence);
-    put_u64(out, command.completion_order);
-    put_u64(out, command.completed_at_millis);
-    encode_owner_identity(out, &command.initiator);
     put_u64(out, command.last_modified_millis);
     match &command.stale_payload {
         None => put_u8(out, 0),
@@ -3357,29 +3321,12 @@ fn encode_delete_object_payload_reclaim(
     encode_object_payload_reclaim_claim_proof(out, &command.reclaim_claim);
 }
 
-fn encode_delete_completed_multipart_upload(
+fn encode_advance_multipart_completion_barrier(
     out: &mut Vec<u8>,
-    command: &DeleteCompletedMultipartUploadCommand,
-) {
-    encode_completed_multipart_upload(out, &command.record);
-}
-
-fn encode_advance_completed_multipart_upload_sequence(
-    out: &mut Vec<u8>,
-    command: &AdvanceCompletedMultipartUploadSequenceCommand,
+    command: &AdvanceMultipartCompletionBarrierCommand,
 ) {
     put_str(out, command.bucket.as_str());
-    put_u64(out, command.completion_order);
-}
-
-fn encode_completed_multipart_upload(out: &mut Vec<u8>, record: &CompletedMultipartUploadRecord) {
-    put_str(out, record.upload_id.as_str());
-    put_str(out, record.bucket.as_str());
-    put_str(out, record.key.as_str());
-    put_u64(out, record.completion_order);
-    put_u64(out, record.completed_at);
-    encode_owner_identity(out, &record.initiator);
-    encode_owner_identity(out, &record.owner);
+    put_u64(out, command.barrier_sequence);
 }
 
 fn encode_object_payload_reclaim(out: &mut Vec<u8>, reclaim: &ObjectPayloadReclaimCommand) {
@@ -3535,7 +3482,8 @@ fn encode_bucket_record(out: &mut Vec<u8>, bucket: &BucketRecord) {
     put_u64(out, bucket.bucket_lifecycle_generation);
     put_u64(out, bucket.bucket_execution_generation);
     put_u64(out, bucket.bucket_incarnation_generation);
-    put_u64(out, bucket.completed_multipart_upload_sequence);
+    put_bytes(out, bucket.multipart_upload_id_key.as_bytes());
+    put_u64(out, bucket.multipart_completion_barrier_sequence);
     put_bool(out, bucket.bucket_abac_enabled);
     encode_bucket_encryption(out, bucket.encryption);
 }
@@ -3988,7 +3936,7 @@ mod tests {
     fn test_bucket_record(name: &str, generation: u64) -> BucketRecord {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
-        BucketRecord::from_create_config(
+        let mut bucket = BucketRecord::from_create_config(
             &CreateBucketConfig {
                 name,
                 owner_principal: "owner",
@@ -4005,7 +3953,9 @@ mod tests {
             123,
             generation,
         )
-        .unwrap()
+        .unwrap();
+        bucket.multipart_upload_id_key = MultipartUploadIdKey::from_bytes([0x42; 32]);
+        bucket
     }
 
     fn assert_applied_log_decoder_accepts(envelope: &MetadataCommandEnvelope) {
@@ -4230,6 +4180,7 @@ mod tests {
             ),
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
                 upload_id: UploadId::try_from("u".repeat(128)).unwrap(),
+                completion_fingerprint: MultipartCompletionFingerprint::from_bytes([0x33; 32]),
                 bucket_write_reservation: proof.clone(),
                 object: PutLiveObjectReq {
                     bucket,
@@ -4259,9 +4210,6 @@ mod tests {
                 stream_uploads: Vec::new(),
                 stream_upload_segments: Vec::new(),
                 write_sequence: 1,
-                completion_order: 1,
-                completed_at_millis: 2,
-                initiator: OwnerIdentity::from_principal("owner"),
                 last_modified_millis: 2,
                 stale_payload: None,
             })),
@@ -4448,7 +4396,7 @@ mod tests {
     fn metadata_command_canonical_encoding_is_stable() {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
-        let command = CreateBucketCommand::from_config(
+        let mut command = CreateBucketCommand::from_config(
             &CreateBucketConfig {
                 name: "bucket",
                 owner_principal: "owner",
@@ -4466,6 +4414,7 @@ mod tests {
             7,
         )
         .unwrap();
+        command.bucket.multipart_upload_id_key = MultipartUploadIdKey::from_bytes([0x42; 32]);
         let id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
             PgId::new(3),
@@ -4481,7 +4430,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0xc7ef32eb11d5a029);
+        assert_eq!(envelope.checksum_crc64(), 0x034161504946527a);
     }
 
     #[test]
@@ -4569,7 +4518,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xded2b526e07e9315);
+        assert_eq!(envelope.checksum_crc64(), 0xabea88907d2d7469);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4597,16 +4546,17 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xfc8eac70d3d68f6e);
+        assert_eq!(envelope.checksum_crc64(), 0x73fc69c5ca05bb59);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
     }
 
     #[test]
-    fn bucket_command_encoding_preserves_completed_multipart_sequence() {
+    fn bucket_command_encoding_preserves_multipart_completion_barrier_sequence() {
         let mut current = test_bucket_record("bucket", 13);
-        current.completed_multipart_upload_sequence = 11;
+        current.multipart_completion_barrier_sequence = 11;
+        let duplicate_current = current.clone();
 
         let command = PutBucketAclCommand::from_bucket(
             current,
@@ -4616,7 +4566,7 @@ mod tests {
                 public_write: false,
             },
         );
-        assert_eq!(command.bucket.completed_multipart_upload_sequence, 11);
+        assert_eq!(command.bucket.multipart_completion_barrier_sequence, 11);
 
         let id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -4625,8 +4575,6 @@ mod tests {
         );
         let envelope =
             MetadataCommandEnvelope::new(id, MetadataCommandPayload::PutBucketAcl(command));
-        let mut duplicate_current = test_bucket_record("bucket", 13);
-        duplicate_current.completed_multipart_upload_sequence = 11;
         let duplicate = MetadataCommandEnvelope::new(
             id,
             MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
@@ -4663,7 +4611,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x64a9505966a649eb);
+        assert_eq!(envelope.checksum_crc64(), 0x5585ffd2108a4cc5);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4744,13 +4692,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x16f1db0b7267a5b8,
-                0xb4e05ca696704066,
-                0x8a5b37afaa0a55a6,
-                0x615b0ab251f082b6,
-                0x1b0b799a9d4141e7,
-                0xca47a94065b4d9aa,
-                0xde1bfe2304c5beb8,
+                0xf4c75767017499eb,
+                0x5fd79a5c96e861b7,
+                0x0baee4dbd191dd4a,
+                0xcb9279e0016e0b8e,
+                0xeccd43b1f4e1a3fd,
+                0xef85c47dadb328ac,
+                0x879943356a97ba06,
             ]
         );
     }
@@ -5109,6 +5057,7 @@ mod tests {
             })),
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
                 upload_id: upload_id.clone(),
+                completion_fingerprint: MultipartCompletionFingerprint::from_bytes([0x44; 32]),
                 bucket_write_reservation: bucket_write_reservation.clone(),
                 object: multipart_object,
                 parts: vec![part],
@@ -5129,9 +5078,6 @@ mod tests {
                 }],
                 stream_upload_segments: vec![stream_segment.clone()],
                 write_sequence: 43,
-                completion_order: 12,
-                completed_at_millis: 556,
-                initiator: OwnerIdentity::from_principal("initiator"),
                 last_modified_millis: 557,
                 stale_payload: Some(multipart_reclaim.clone()),
             })),
@@ -5386,23 +5332,10 @@ mod tests {
                 14,
                 7,
             )),
-            MetadataCommandPayload::DeleteCompletedMultipartUpload(Box::new(
-                DeleteCompletedMultipartUploadCommand {
-                    record: CompletedMultipartUploadRecord {
-                        upload_id,
-                        bucket,
-                        key,
-                        completion_order: 12,
-                        completed_at: 556,
-                        initiator: OwnerIdentity::from_principal("initiator"),
-                        owner: OwnerIdentity::from_principal("owner"),
-                    },
-                },
-            )),
-            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-                AdvanceCompletedMultipartUploadSequenceCommand {
+            MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+                AdvanceMultipartCompletionBarrierCommand {
                     bucket: BucketName::try_from("bucket".to_string()).unwrap(),
-                    completion_order: 13,
+                    barrier_sequence: 13,
                 },
             ),
         ];
@@ -5432,7 +5365,7 @@ mod tests {
                 0x3acf49df359790d4,
                 0x0cb6bb404ef4656f,
                 0x8bd4d497a7b4d97a,
-                0x9ba51e11e7657215,
+                0x9da7eb766650947b,
                 0xf9892eeff816b2dd,
                 0xf21cb0547df33874,
                 0x0ca679e24ed84eef,
@@ -5456,8 +5389,7 @@ mod tests {
                 0x48a90205c35a066d,
                 0x5cdc2de0c4471422,
                 0x0064ce32b63977cd,
-                0xe90eb2bd8985577a,
-                0xedf2c0cac1495b32,
+                0x1946524188e07bbb,
             ]
         );
     }

@@ -22,7 +22,7 @@ use crate::types::{
     DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, StorageClass, StreamUploadPartSnapshot,
 };
-use crate::{CompletedMultipartUploadRecord, RouteMapValidity};
+use crate::RouteMapValidity;
 
 fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
     StorageNodeProcessConfig {
@@ -51,7 +51,7 @@ fn private_socket_dir(path: &std::path::Path) {
 }
 
 #[test]
-fn completed_multipart_order_rejects_non_completion_bucket_write_reservation() {
+fn multipart_completion_barrier_rejects_non_completion_bucket_write_reservation() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
     let bucket = crate::tests::bucket_name("completed-order-wrong-proof-bucket");
@@ -98,7 +98,7 @@ fn completed_multipart_order_rejects_non_completion_bucket_write_reservation() {
         MetadataCommandLogIndex::new(1).unwrap(),
     );
     let proof = BucketWriteReservationProof::from(&reservation);
-    let err = BucketMetadataNodeClient::build_advance_completed_multipart_upload_sequence_command(
+    let err = BucketMetadataNodeClient::build_advance_multipart_completion_barrier_command(
         &client,
         PgId::new(0),
         &bucket,

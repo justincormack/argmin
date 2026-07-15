@@ -137,17 +137,6 @@ impl Coordinator {
         self.authorize_put_object_write_with_storage_node(storage_node, req)
     }
 
-    #[cfg(test)]
-    pub(super) fn prune_completed_multipart_uploads_for_bucket_with_limit(
-        &self,
-        bucket: &BucketName,
-        keep: usize,
-    ) -> Result<(), ServerError> {
-        self.storage_node()
-            .prune_completed_multipart_uploads_for_bucket_with_limit(bucket, keep)
-            .map_err(Coordinator::map_object_pg_action_error)
-    }
-
     pub(super) fn bucket_summary(info: BucketInfo) -> BucketSummary {
         Self::bucket_summary_ref(&info)
     }
@@ -170,6 +159,7 @@ impl Coordinator {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+            multipart_upload_id_key: info.multipart_upload_id_key().clone(),
             bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }
@@ -190,6 +180,7 @@ impl Coordinator {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+            multipart_upload_id_key: info.multipart_upload_id_key,
             bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }
@@ -215,6 +206,7 @@ impl Coordinator {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+            multipart_upload_id_key: info.multipart_upload_id_key,
             bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }

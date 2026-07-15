@@ -2068,7 +2068,443 @@ fn test_abort_multipart_upload_after_bucket_delete_and_recreate_fails() {
     });
 }
 
+#[test]
+fn test_multipart_terminal_retries() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let completed_key = "terminal-retry-completed";
+        let aborted_key = "terminal-retry-aborted";
+
+        let (_, completed_upload_id) = raw_create_upload(&bucket, completed_key, &[]);
+        let (_, completed_etag) = raw_upload_part(
+            &bucket,
+            completed_key,
+            &completed_upload_id,
+            1,
+            b"completed body",
+            &[],
+        );
+        let completed_body = single_part_complete_body(&completed_etag);
+        let completed = raw_complete_upload(
+            &bucket,
+            completed_key,
+            &completed_upload_id,
+            &completed_body,
+            &[],
+        );
+        assert_eq!(completed.status, 200, "initial completion: {completed:?}");
+        let completed_result_etag = xml_tag_text(&completed.body, "ETag")
+            .expect("initial completion result must contain an ETag");
+
+        let (_, aborted_upload_id) = raw_create_upload(&bucket, aborted_key, &[]);
+        let (_, aborted_etag) = raw_upload_part(
+            &bucket,
+            aborted_key,
+            &aborted_upload_id,
+            1,
+            b"aborted body",
+            &[],
+        );
+        let aborted_body = single_part_complete_body(&aborted_etag);
+        let aborted = raw_multipart_query(
+            "DELETE",
+            &bucket,
+            aborted_key,
+            &format!("uploadId={aborted_upload_id}"),
+            b"",
+            &[],
+        );
+        assert_eq!(aborted.status, 204, "initial abort: {aborted:?}");
+
+        let changed_completion_body =
+            single_part_complete_body("\"00000000000000000000000000000000\"");
+        let changed_completion = raw_complete_upload(
+            &bucket,
+            completed_key,
+            &completed_upload_id,
+            &changed_completion_body,
+            &[],
+        );
+        assert_invalid_upload_id_no_such_upload(&changed_completion, &completed_upload_id);
+
+        let probe = |completed_replays: bool, aborts_are_idempotent: bool| {
+            let complete_completed = raw_complete_upload(
+                &bucket,
+                completed_key,
+                &completed_upload_id,
+                &completed_body,
+                &[],
+            );
+            if completed_replays {
+                assert_eq!(
+                    complete_completed.status, 200,
+                    "completion retry: {complete_completed:?}"
+                );
+                assert_eq!(
+                    xml_tag_text(&complete_completed.body, "ETag"),
+                    Some(completed_result_etag)
+                );
+            } else {
+                assert_invalid_upload_id_no_such_upload(&complete_completed, &completed_upload_id);
+            }
+
+            let abort_completed = raw_multipart_query(
+                "DELETE",
+                &bucket,
+                completed_key,
+                &format!("uploadId={completed_upload_id}"),
+                b"",
+                &[],
+            );
+            if aborts_are_idempotent {
+                assert_eq!(abort_completed.status, 204, "{abort_completed:?}");
+            } else {
+                assert_invalid_upload_id_no_such_upload(&abort_completed, &completed_upload_id);
+            }
+
+            let complete_completed_after_abort = raw_complete_upload(
+                &bucket,
+                completed_key,
+                &completed_upload_id,
+                &completed_body,
+                &[],
+            );
+            if completed_replays {
+                assert_eq!(
+                    complete_completed_after_abort.status, 200,
+                    "completion retry after abort retry: {complete_completed_after_abort:?}"
+                );
+                assert_eq!(
+                    xml_tag_text(&complete_completed_after_abort.body, "ETag"),
+                    Some(completed_result_etag)
+                );
+            } else {
+                assert_invalid_upload_id_no_such_upload(
+                    &complete_completed_after_abort,
+                    &completed_upload_id,
+                );
+            }
+
+            let complete_aborted =
+                raw_complete_upload(&bucket, aborted_key, &aborted_upload_id, &aborted_body, &[]);
+            assert_invalid_upload_id_no_such_upload(&complete_aborted, &aborted_upload_id);
+
+            let abort_aborted = raw_multipart_query(
+                "DELETE",
+                &bucket,
+                aborted_key,
+                &format!("uploadId={aborted_upload_id}"),
+                b"",
+                &[],
+            );
+            if aborts_are_idempotent {
+                assert_eq!(abort_aborted.status, 204, "{abort_aborted:?}");
+            } else {
+                assert_invalid_upload_id_no_such_upload(&abort_aborted, &aborted_upload_id);
+            }
+
+            let complete_aborted_after_abort =
+                raw_complete_upload(&bucket, aborted_key, &aborted_upload_id, &aborted_body, &[]);
+            assert_invalid_upload_id_no_such_upload(
+                &complete_aborted_after_abort,
+                &aborted_upload_id,
+            );
+        };
+
+        probe(true, true);
+        let completed_object = client
+            .get_object()
+            .bucket(&bucket)
+            .key(completed_key)
+            .send_retrying_operation_aborted("get completed object after terminal retries")
+            .await
+            .unwrap();
+        assert_eq!(
+            completed_object.body.collect().await.unwrap().into_bytes(),
+            &b"completed body"[..]
+        );
+        assert_s3_err_code(
+            &client
+                .get_object()
+                .bucket(&bucket)
+                .key(aborted_key)
+                .send_retrying_operation_aborted("get aborted upload key after terminal retries")
+                .await,
+            "NoSuchKey",
+        );
+
+        put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            completed_key,
+            b"completed overwrite".to_vec(),
+        )
+        .await;
+        put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            aborted_key,
+            b"aborted overwrite".to_vec(),
+        )
+        .await;
+        probe(false, true);
+        let malformed_xml =
+            raw_complete_upload(&bucket, completed_key, &completed_upload_id, "<", &[]);
+        assert_malformed_xml(&malformed_xml);
+        let malformed_expected_size = raw_complete_upload(
+            &bucket,
+            completed_key,
+            &completed_upload_id,
+            &completed_body,
+            &[("x-amz-mp-object-size", "bad")],
+        );
+        assert_eq!(
+            malformed_expected_size.status, 400,
+            "malformed expected-size header after overwrite: {malformed_expected_size:?}"
+        );
+        assert_eq!(
+            xml_tag_text(&malformed_expected_size.body, "Code"),
+            Some("InvalidRequest")
+        );
+        for (key, expected) in [
+            (completed_key, &b"completed overwrite"[..]),
+            (aborted_key, &b"aborted overwrite"[..]),
+        ] {
+            let object = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send_retrying_operation_aborted("get overwritten terminal retry object")
+                .await
+                .unwrap();
+            assert_eq!(object.body.collect().await.unwrap().into_bytes(), expected);
+        }
+
+        delete_object_retrying_operation_aborted(client, &bucket, completed_key).await;
+        delete_object_retrying_operation_aborted(client, &bucket, aborted_key).await;
+        probe(false, true);
+        for key in [completed_key, aborted_key] {
+            assert_s3_err_code(
+                &client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send_retrying_operation_aborted("get deleted terminal retry object")
+                    .await,
+                "NoSuchKey",
+            );
+        }
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+        s3_tests::create_bucket_retrying_reuse(client, &bucket)
+            .await
+            .unwrap();
+        probe(false, false);
+        let uploads = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list uploads after terminal bucket recreation")
+            .await
+            .unwrap();
+        assert!(uploads.uploads().is_empty());
+        let objects = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list objects after terminal bucket recreation")
+            .await
+            .unwrap();
+        assert!(objects.contents().is_empty());
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
 // ── ListMultipartUploads ────────────────────────────────────────────
+
+#[test]
+fn test_multipart_terminal_completion_replay_versioned_history() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "terminal-retry-versioned";
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
+
+        let (_, upload_id) = raw_create_upload(&bucket, key, &[]);
+        let (_, part_etag) = raw_upload_part(
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            b"versioned completed body",
+            &[],
+        );
+        let completion_body = single_part_complete_body(&part_etag);
+        let completed = raw_complete_upload(&bucket, key, &upload_id, &completion_body, &[]);
+        assert_eq!(completed.status, 200, "initial completion: {completed:?}");
+        let completed_etag = xml_tag_text(&completed.body, "ETag")
+            .expect("versioned completion result must contain an ETag")
+            .to_string();
+        let completed_version_id =
+            s3_tests::shape::response_header_value(&completed, "x-amz-version-id")
+                .expect("versioned completion result must contain x-amz-version-id")
+                .to_string();
+
+        let assert_replay = |expected: bool, history: &str| {
+            let replay = raw_complete_upload(&bucket, key, &upload_id, &completion_body, &[]);
+            if expected {
+                assert_eq!(replay.status, 200, "{history}: {replay:?}");
+                assert_eq!(
+                    xml_tag_text(&replay.body, "ETag"),
+                    Some(completed_etag.as_str()),
+                    "{history}: {replay:?}"
+                );
+                assert_eq!(
+                    s3_tests::shape::response_header_value(&replay, "x-amz-version-id"),
+                    Some(completed_version_id.as_str()),
+                    "{history}: {replay:?}"
+                );
+            } else {
+                assert_invalid_upload_id_no_such_upload(&replay, &upload_id);
+            }
+        };
+
+        assert_replay(true, "immediate versioned replay");
+
+        let later =
+            put_object_retrying_operation_aborted(client, &bucket, key, b"later version".to_vec())
+                .await;
+        let later_version_id = later
+            .version_id()
+            .expect("versioned overwrite must return a VersionId")
+            .to_string();
+        assert_replay(true, "replay after later version");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&later_version_id)
+            .send_retrying_operation_aborted("delete later version during replay oracle")
+            .await
+            .unwrap();
+        assert_replay(true, "replay after completed version becomes current again");
+
+        let delete_marker = delete_object_retrying_operation_aborted(client, &bucket, key).await;
+        assert!(delete_marker.delete_marker().unwrap_or(false));
+        let delete_marker_version_id = delete_marker
+            .version_id()
+            .expect("versioned delete must return a delete-marker VersionId")
+            .to_string();
+        assert_replay(true, "replay while delete marker is current");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&delete_marker_version_id)
+            .send_retrying_operation_aborted("delete marker during replay oracle")
+            .await
+            .unwrap();
+        assert_replay(true, "replay after delete marker removal");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&completed_version_id)
+            .send_retrying_operation_aborted("delete completed version during replay oracle")
+            .await
+            .unwrap();
+        assert_replay(false, "replay after completed version deletion");
+
+        s3_tests::cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_multipart_terminal_completion_replay_obeys_current_explicit_deny() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "terminal-retry-current-policy";
+
+        let (_, upload_id) = raw_create_upload(&bucket, key, &[]);
+        let (_, part_etag) =
+            raw_upload_part(&bucket, key, &upload_id, 1, b"policy replay body", &[]);
+        let completion_body = single_part_complete_body(&part_etag);
+        let completed = raw_complete_upload(&bucket, key, &upload_id, &completion_body, &[]);
+        assert_eq!(completed.status, 200, "initial completion: {completed:?}");
+        let replay = raw_complete_upload(&bucket, key, &upload_id, &completion_body, &[]);
+        assert_eq!(replay.status, 200, "pre-policy replay canary: {replay:?}");
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/{key}")
+            }]
+        });
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.to_string())
+            .send_retrying_operation_aborted("install terminal replay explicit deny")
+            .await
+            .unwrap();
+
+        let mut denied = false;
+        for attempt in 0..60 {
+            let response = raw_complete_upload(&bucket, key, &upload_id, &completion_body, &[]);
+            match response.status {
+                403 => {
+                    assert_access_denied(&response);
+                    denied = true;
+                    break;
+                }
+                200 if attempt + 1 < 60 => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                _ => panic!("terminal replay did not converge to explicit deny: {response:?}"),
+            }
+        }
+        assert!(
+            denied,
+            "terminal replay must observe the current explicit deny"
+        );
+
+        client
+            .delete_bucket_policy()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("remove terminal replay explicit deny")
+            .await
+            .unwrap();
+        let mut allowed = false;
+        for attempt in 0..60 {
+            let response = raw_complete_upload(&bucket, key, &upload_id, &completion_body, &[]);
+            match response.status {
+                200 => {
+                    allowed = true;
+                    break;
+                }
+                403 if attempt + 1 < 60 => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                _ => panic!("terminal replay did not recover after policy removal: {response:?}"),
+            }
+        }
+        assert!(allowed, "terminal replay must recover after policy removal");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
 
 #[test]
 fn test_list_multipart_uploads_empty() {

@@ -157,19 +157,14 @@ Needed work:
 
 ### H5. Durable cleanup cursors that encode PG position
 
-`DeleteBucket` completed-MPU finalization currently persists
-`bucket_delete_finalize_completed_multipart_next_pg_index`, an index into the
-call-time-sorted `metadata_pg_ids()`. This is safe only if the PG set is stable. If PGs
-are added or removed between attempts, the index can retarget different PGs or skip work.
-
-This is the public API review S5 issue. The fix for a resizable topology should be to
-persist a semantic cursor such as last-completed `PgId` plus the topology generation, or
-make the cleanup phase generation-scoped and restartable from zero when the PG set
-changes.
+The original public API review S5 case was `DeleteBucket` completed-MPU
+finalization's positional PG cursor. The tombstone-free multipart replay design removed
+the completed-upload table, cross-PG cleanup scan, and cursor, so that specific hazard is
+resolved. The same positional-cursor audit still applies to the remaining cleanup and
+worker paths below.
 
 Known related cursors to audit:
 
-- `bucket_delete_finalize_completed_multipart_next_pg_index`
 - `post_reservation_next_object_pg_id`
 - object-payload reclaim scan markers
 - lifecycle sweep markers

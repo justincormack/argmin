@@ -563,14 +563,12 @@ impl UnixStorageNodeClient {
                 }
                 Ok(())
             }
-            MultipartUploadManagementLookup::Completed(completed) => {
-                if completed.bucket != *bucket
-                    || completed.key != *key
-                    || completed.upload_id != *upload_id
+            MultipartUploadManagementLookup::Replay(replay) => {
+                if replay.bucket != *bucket || replay.key != *key || replay.upload_id != *upload_id
                 {
                     return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                         context,
-                        "completed lookup identity does not match request".to_string(),
+                        "completion replay identity does not match request".to_string(),
                     )));
                 }
                 Ok(())
@@ -1160,6 +1158,7 @@ impl UnixStorageNodeClient {
             &request.request.key,
             &request.request.upload_id,
             request.request.generation_id,
+            request.request.completion_fingerprint,
             &request.request.part_records,
         ) || commit.object.version_id != request.version_id
             || commit.object.owner != request.request.owner
@@ -1173,7 +1172,6 @@ impl UnixStorageNodeClient {
             || commit.object.system_metadata_blob != request.request.system_metadata_blob
             || commit.object.object_lock != request.request.object_lock
             || commit.object.encryption != request.request.encryption
-            || commit.completion_order != request.completion_order
             || commit.bucket_write_reservation != *request.bucket_write_reservation
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
@@ -1994,36 +1992,36 @@ impl UnixStorageNodeClient {
         }
     }
 
-    pub(super) fn validate_completed_multipart_order_command_build_response(
+    pub(super) fn validate_multipart_completion_barrier_command_build_response(
         &self,
-        completion_order: u64,
+        barrier_sequence: u64,
         command: MetadataCommandEnvelope,
         bucket: &BucketName,
         command_id: MetadataCommandId,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
         if command.id() != command_id {
             return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate completed multipart order command build response",
+                "validate multipart completion barrier command build response",
                 "response command id does not match request".to_string(),
             )));
         }
-        if completion_order == 0 {
+        if barrier_sequence == 0 {
             return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate completed multipart order command build response",
+                "validate multipart completion barrier command build response",
                 "response completion order must not be zero".to_string(),
             )));
         }
         match command.payload() {
-            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(advance)
-                if advance.bucket == *bucket && advance.completion_order == completion_order => {}
+            MetadataCommandPayload::AdvanceMultipartCompletionBarrier(advance)
+                if advance.bucket == *bucket && advance.barrier_sequence == barrier_sequence => {}
             _ => {
                 return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "validate completed multipart order command build response",
+                    "validate multipart completion barrier command build response",
                     "response command payload does not match request".to_string(),
                 )))
             }
         }
-        Ok((completion_order, command))
+        Ok((barrier_sequence, command))
     }
 
     pub(super) fn validate_bucket_metadata_control_command_build_response(

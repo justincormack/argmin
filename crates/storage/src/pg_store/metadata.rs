@@ -297,6 +297,13 @@ impl PgStore {
                 source: e,
             }
         })?;
+        let multipart_upload_id_key =
+            MultipartUploadIdKey::generate().map_err(|reason| MetadataError::Db {
+                context: "create bucket (generate multipart upload ID key)",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                    reason,
+                ))),
+            })?;
         self.with_immediate_txn(
             "create bucket (begin txn)",
             "create bucket (commit txn)",
@@ -317,8 +324,8 @@ impl PgStore {
                 };
                 match store.conn.execute(
                     "INSERT INTO buckets \
-                     (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, ownership_controls_mode, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation, bucket_incarnation_generation) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, ?16, ?17)",
+                     (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, ownership_controls_mode, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years, bucket_execution_generation, bucket_incarnation_generation, multipart_upload_id_key) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                     params![
                         config.name,
                         config.owner_principal,
@@ -337,6 +344,7 @@ impl PgStore {
                         object_lock_default_years,
                         generation as i64,
                         generation as i64,
+                        multipart_upload_id_key.as_bytes().as_slice(),
                     ],
                 ) {
                     Ok(_) => Ok(()),
@@ -362,12 +370,12 @@ impl PgStore {
                 "bucket created_at exceeds i64",
             )),
         })?;
-        let completed_multipart_upload_sequence =
-            i64::try_from(bucket.completed_multipart_upload_sequence).map_err(|_| {
+        let multipart_completion_barrier_sequence =
+            i64::try_from(bucket.multipart_completion_barrier_sequence).map_err(|_| {
                 MetadataError::Db {
-                    context: "create bucket record (encode completed multipart sequence)",
+                    context: "create bucket record (encode multipart completion barrier sequence)",
                     source: rusqlite::Error::ToSqlConversionFailure(Box::from(
-                        "bucket completed multipart sequence exceeds i64",
+                        "bucket multipart completion barrier sequence exceeds i64",
                     )),
                 }
             })?;
@@ -400,8 +408,8 @@ impl PgStore {
                 )?;
                 match store.conn.execute(
                     "INSERT INTO buckets \
-                     (name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, completed_multipart_upload_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+                     (name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, bucket_policy_public, bucket_policy_generation, bucket_lifecycle_generation, bucket_execution_generation, bucket_incarnation_generation, multipart_upload_id_key, multipart_completion_barrier_sequence, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
                     params![
                         bucket.name.as_str(),
                         &bucket.owner_principal,
@@ -424,7 +432,8 @@ impl PgStore {
                         bucket.bucket_lifecycle_generation as i64,
                         bucket.bucket_execution_generation as i64,
                         bucket.bucket_incarnation_generation as i64,
-                        completed_multipart_upload_sequence,
+                        bucket.multipart_upload_id_key.as_bytes().as_slice(),
+                        multipart_completion_barrier_sequence,
                         i32::from(bucket.bucket_abac_enabled),
                         bucket.encryption.default_encryption.map(|value| value as u8),
                         i32::from(bucket.encryption.sse_c_blocked),
@@ -759,8 +768,8 @@ impl PgStore {
             MetadataCommandPayload::DeleteFinalizedBucket(delete) => {
                 self.apply_delete_finalized_bucket_command(delete)
             }
-            MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => {
-                self.apply_advance_completed_multipart_upload_sequence_command(command)
+            MetadataCommandPayload::AdvanceMultipartCompletionBarrier(command) => {
+                self.apply_advance_multipart_completion_barrier_command(command)
             }
             MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
                 self.apply_reserve_object_generation_command(reservation)
@@ -806,9 +815,6 @@ impl PgStore {
             }
             MetadataCommandPayload::DeleteObjectPayloadReclaim(command) => {
                 self.apply_delete_object_payload_reclaim_command(command)
-            }
-            MetadataCommandPayload::DeleteCompletedMultipartUpload(command) => {
-                self.apply_delete_completed_multipart_upload_command(command)
             }
         }
     }
@@ -1045,15 +1051,6 @@ impl PgStore {
         if deleted != 0 {
             self.conn
                 .execute(
-                    "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
-                    params![name.as_str()],
-                )
-                .map_err(|source| MetadataError::Db {
-                    context: "delete finalized bucket (delete completed MPU records)",
-                    source,
-                })?;
-            self.conn
-                .execute(
                     "DELETE FROM object_version_counters WHERE bucket = ?1",
                     params![name.as_str()],
                 )
@@ -1106,13 +1103,13 @@ impl PgStore {
         )
     }
 
-    fn apply_advance_completed_multipart_upload_sequence_command(
+    fn apply_advance_multipart_completion_barrier_command(
         &self,
-        command: &AdvanceCompletedMultipartUploadSequenceCommand,
+        command: &AdvanceMultipartCompletionBarrierCommand,
     ) -> Result<(), MetadataError> {
-        self.advance_completed_multipart_upload_sequence_for_bucket(
+        self.advance_multipart_completion_barrier_for_bucket(
             &command.bucket,
-            command.completion_order,
+            command.barrier_sequence,
         )
     }
 
@@ -1382,6 +1379,24 @@ impl PgStore {
                     command.write_sequence,
                     command.last_modified_millis,
                 )?;
+                store
+                    .conn
+                    .execute(
+                        "UPDATE objects \
+                         SET multipart_completion_upload_id = ?1, multipart_completion_fingerprint = ?2 \
+                         WHERE bucket = ?3 AND key = ?4 AND version_id = ?5",
+                        params![
+                            command.upload_id.as_str(),
+                            command.completion_fingerprint.as_bytes().as_slice(),
+                            &command.object.bucket,
+                            &command.object.key,
+                            command.object.version_id.to_u64() as i64,
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "commit multipart object command (record replay identity)",
+                        source,
+                    })?;
                 store.delete_multipart_part_segments_direct(
                     &command.object.bucket,
                     &command.object.key,
@@ -1394,7 +1409,6 @@ impl PgStore {
                     &command.object,
                     &command.selected_streaming_segments,
                 )?;
-                store.insert_completed_multipart_upload_in_open_txn(command)?;
                 store.release_multipart_completion_reservation_in_open_txn(command)?;
                 for session in &command.stream_uploads {
                     store.delete_stream_upload_in_open_txn(&session.session_id)?;
@@ -1442,6 +1456,11 @@ impl PgStore {
             || stored.owner != command.object.owner
             || stored.acl_grants != command.object.acl_grants
             || stored.public_read != command.object.public_read
+            || self.multipart_completion_identity(
+                &command.object.bucket,
+                &command.object.key,
+                command.object.version_id,
+            )? != Some((command.upload_id.clone(), command.completion_fingerprint))
         {
             return Ok(false);
         }
@@ -1465,6 +1484,110 @@ impl PgStore {
             }
         }
         Ok(streaming_segments == command.selected_streaming_segments)
+    }
+
+    fn multipart_completion_identity(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<Option<(UploadId, MultipartCompletionFingerprint)>, MetadataError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT multipart_completion_upload_id, multipart_completion_fingerprint \
+                 FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| MetadataError::Db {
+                context: "read multipart completion identity",
+                source,
+            })?;
+        let Some((upload_id, fingerprint)) = row else {
+            return Ok(None);
+        };
+        match (upload_id, fingerprint) {
+            (None, None) => Ok(None),
+            (Some(upload_id), Some(fingerprint)) => {
+                let upload_id = UploadId::try_from(upload_id).map_err(|_| MetadataError::Db {
+                    context: "read multipart completion identity (invalid upload ID)",
+                    source: rusqlite::Error::InvalidQuery,
+                })?;
+                let fingerprint: [u8; 32] =
+                    fingerprint.try_into().map_err(|_| MetadataError::Db {
+                        context: "read multipart completion identity (invalid fingerprint)",
+                        source: rusqlite::Error::InvalidQuery,
+                    })?;
+                Ok(Some((
+                    upload_id,
+                    MultipartCompletionFingerprint::from_bytes(fingerprint),
+                )))
+            }
+            _ => Err(MetadataError::Db {
+                context: "read multipart completion identity (incomplete pair)",
+                source: rusqlite::Error::InvalidQuery,
+            }),
+        }
+    }
+
+    pub fn get_multipart_completion_replay(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Option<MultipartCompletionReplay>, MetadataError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT version_id, multipart_completion_fingerprint \
+                 FROM objects \
+                 WHERE bucket = ?1 AND key = ?2 AND multipart_completion_upload_id = ?3",
+                params![bucket, key, upload_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|source| MetadataError::Db {
+                context: "read multipart completion replay identity",
+                source,
+            })?;
+        let Some((version_id, fingerprint)) = row else {
+            return Ok(None);
+        };
+        let version_id =
+            VersionId::from_u64(version_id.try_into().map_err(|_| MetadataError::Db {
+                context: "read multipart completion replay (invalid version ID)",
+                source: rusqlite::Error::InvalidQuery,
+            })?);
+        let fingerprint: [u8; 32] = fingerprint.try_into().map_err(|_| MetadataError::Db {
+            context: "read multipart completion replay (invalid fingerprint)",
+            source: rusqlite::Error::InvalidQuery,
+        })?;
+        let StoredObject::Live(object) = self.get_object_version(bucket, key, version_id)? else {
+            return Err(MetadataError::Db {
+                context: "read multipart completion replay (delete marker)",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        };
+        Ok(Some(MultipartCompletionReplay {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            fingerprint: MultipartCompletionFingerprint::from_bytes(fingerprint),
+            version_id,
+            etag: object.etag,
+            size: object.size,
+            last_modified: object.last_modified,
+            tags: object.tags,
+            system_metadata_blob: object.system_metadata_blob,
+            encryption: object.encryption,
+        }))
     }
 
     fn insert_multipart_part_segments_in_open_txn(
@@ -1544,59 +1667,30 @@ impl PgStore {
         Ok(())
     }
 
-    fn insert_completed_multipart_upload_in_open_txn(
-        &self,
-        command: &CommitMultipartObjectCommand,
-    ) -> Result<(), MetadataError> {
-        let initiator = &command.initiator;
-        self.conn
-            .execute(
-                "INSERT OR REPLACE INTO completed_multipart_uploads \
-                 (upload_id, bucket, key, completion_order, completed_at, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    command.upload_id.as_str(),
-                    &command.object.bucket,
-                    &command.object.key,
-                    command.completion_order as i64,
-                    command.completed_at_millis as i64,
-                    &command.object.owner.principal,
-                    command.object.owner.canonical_id.as_str(),
-                    initiator.principal.as_str(),
-                    initiator.canonical_id.as_str(),
-                ],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "commit multipart object command (insert completed upload)",
-                source: e,
-            })?;
-        Ok(())
-    }
-
-    pub(crate) fn advance_completed_multipart_upload_sequence_for_bucket(
+    pub(crate) fn advance_multipart_completion_barrier_for_bucket(
         &self,
         bucket: &BucketName,
-        completion_order: u64,
+        barrier_sequence: u64,
     ) -> Result<(), MetadataError> {
-        let completion_order = i64::try_from(completion_order).map_err(|_| MetadataError::Db {
+        let barrier_sequence = i64::try_from(barrier_sequence).map_err(|_| MetadataError::Db {
             context: "commit multipart object command (completion order overflow)",
             source: rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Integer,
-                Box::from("completion_order exceeds SQLite integer range"),
+                Box::from("barrier_sequence exceeds SQLite integer range"),
             ),
         })?;
         let updated = self
             .conn
             .execute(
                 "UPDATE buckets \
-                 SET completed_multipart_upload_sequence = \
+                 SET multipart_completion_barrier_sequence = \
                      CASE \
-                         WHEN completed_multipart_upload_sequence < ?2 THEN ?2 \
-                         ELSE completed_multipart_upload_sequence \
+                         WHEN multipart_completion_barrier_sequence < ?2 THEN ?2 \
+                         ELSE multipart_completion_barrier_sequence \
                      END \
                  WHERE name = ?1",
-                params![bucket, completion_order],
+                params![bucket, barrier_sequence],
             )
             .map_err(|e| MetadataError::Db {
                 context: "commit multipart object command (advance completed upload sequence)",
@@ -1865,22 +1959,6 @@ impl PgStore {
         }?;
         self.clear_object_payload_reclaim_claim_if_matches_in_open_txn(command)
             .map(|_| ())
-    }
-
-    fn apply_delete_completed_multipart_upload_command(
-        &self,
-        command: &DeleteCompletedMultipartUploadCommand,
-    ) -> Result<(), MetadataError> {
-        match PgMetadataStore::get_completed_multipart_upload(self, &command.record.upload_id)? {
-            Some(existing) if existing == command.record => {
-                self.delete_completed_multipart_upload(&command.record.upload_id)
-            }
-            Some(_) => Err(MetadataError::Db {
-                context: "delete completed multipart upload command row mismatch",
-                source: rusqlite::Error::InvalidQuery,
-            }),
-            None => Ok(()),
-        }
     }
 
     fn apply_delete_object_version_command(
@@ -3988,168 +4066,25 @@ impl PgStore {
         Ok(())
     }
 
-    pub(crate) fn completed_multipart_upload_sequence_for_bucket(
+    pub(crate) fn multipart_completion_barrier_sequence_for_bucket(
         &self,
         bucket: &BucketName,
     ) -> Result<u64, MetadataError> {
         let bucket = bucket.as_str();
         self.query_row_cached_metadata(
-            "SELECT completed_multipart_upload_sequence FROM buckets WHERE name = ?1",
+            "SELECT multipart_completion_barrier_sequence FROM buckets WHERE name = ?1",
             params![bucket],
-            "read completed multipart upload sequence",
+            "read multipart completion barrier sequence",
             |row| row.get::<_, i64>(0),
         )?
         .try_into()
         .map_err(|_| MetadataError::Db {
-            context: "decode completed multipart upload sequence",
+            context: "decode multipart completion barrier sequence",
             source: rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Integer,
-                Box::from("negative completed multipart upload sequence"),
+                Box::from("negative multipart completion barrier sequence"),
             ),
-        })
-    }
-
-    pub fn list_completed_multipart_uploads_for_bucket(
-        &self,
-        bucket: &str,
-    ) -> Result<Vec<(UploadId, u64)>, MetadataError> {
-        self.list_completed_multipart_upload_records_for_bucket(bucket)
-            .map(|records| {
-                records
-                    .into_iter()
-                    .map(|record| (record.upload_id, record.completion_order))
-                    .collect()
-            })
-    }
-
-    pub(crate) fn list_completed_multipart_upload_records_for_bucket(
-        &self,
-        bucket: &str,
-    ) -> Result<Vec<CompletedMultipartUploadRecord>, MetadataError> {
-        let mut stmt = self
-            .conn
-            .prepare_cached(
-                "SELECT upload_id, bucket, key, completion_order, completed_at, \
-                        owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id \
-                 FROM completed_multipart_uploads \
-                 WHERE bucket = ?1",
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "prepare list completed multipart uploads for bucket",
-                source: e,
-            })?;
-        let rows = stmt
-            .query_map(params![bucket], |row| {
-                Self::completed_multipart_upload_record_from_row(row)
-            })
-            .map_err(|e| MetadataError::Db {
-                context: "query list completed multipart uploads for bucket",
-                source: e,
-            })?;
-        let mut uploads = Vec::new();
-        for row in rows {
-            uploads.push(row.map_err(|e| MetadataError::Db {
-                context: "row list completed multipart uploads for bucket",
-                source: e,
-            })?);
-        }
-        Ok(uploads)
-    }
-
-    pub(crate) fn list_completed_multipart_upload_records_for_bucket_page(
-        &self,
-        bucket: &BucketName,
-        upload_id_marker: Option<&UploadId>,
-        limit: u32,
-    ) -> Result<CompletedMultipartUploadRecordPage, MetadataError> {
-        let fetch_limit = i64::from(limit) + 1;
-        let (sql, params_vec): (
-            &str,
-            Vec<Box<dyn rusqlite::types::ToSql>>,
-        ) = match upload_id_marker {
-            Some(marker) => (
-                "SELECT upload_id, bucket, key, completion_order, completed_at, \
-                        owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id \
-                 FROM completed_multipart_uploads \
-                 WHERE bucket = ?1 AND upload_id > ?2 \
-                 ORDER BY upload_id ASC LIMIT ?3",
-                vec![
-                    Box::new(bucket.clone()),
-                    Box::new(marker.clone()),
-                    Box::new(fetch_limit),
-                ],
-            ),
-            None => (
-                "SELECT upload_id, bucket, key, completion_order, completed_at, \
-                        owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id \
-                 FROM completed_multipart_uploads \
-                 WHERE bucket = ?1 \
-                 ORDER BY upload_id ASC LIMIT ?2",
-                vec![Box::new(bucket.clone()), Box::new(fetch_limit)],
-            ),
-        };
-        let params = rusqlite::params_from_iter(params_vec.iter());
-        let mut stmt = self
-            .conn
-            .prepare_cached(sql)
-            .map_err(|e| MetadataError::Db {
-                context: "prepare list completed multipart uploads for bucket page",
-                source: e,
-            })?;
-        let rows = stmt
-            .query_map(params, Self::completed_multipart_upload_record_from_row)
-            .map_err(|e| MetadataError::Db {
-                context: "query list completed multipart uploads for bucket page",
-                source: e,
-            })?;
-        let mut records = Vec::new();
-        for row in rows {
-            records.push(row.map_err(|e| MetadataError::Db {
-                context: "row list completed multipart uploads for bucket page",
-                source: e,
-            })?);
-        }
-        let next_upload_id_marker = if records.len() > limit as usize {
-            records.pop();
-            records.last().map(|record| record.upload_id.clone())
-        } else {
-            None
-        };
-        Ok(CompletedMultipartUploadRecordPage {
-            records,
-            next_upload_id_marker,
-        })
-    }
-
-    fn completed_multipart_upload_record_from_row(
-        row: &rusqlite::Row<'_>,
-    ) -> Result<CompletedMultipartUploadRecord, rusqlite::Error> {
-        let completion_order = row.get::<_, i64>(3)?.try_into().map_err(|_| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3,
-                rusqlite::types::Type::Integer,
-                Box::from("negative completion order"),
-            )
-        })?;
-        let completed_at = row.get::<_, i64>(4)?.try_into().map_err(|_| {
-            rusqlite::Error::FromSqlConversionFailure(
-                4,
-                rusqlite::types::Type::Integer,
-                Box::from("negative completed_at"),
-            )
-        })?;
-        let owner = Self::parse_owner_identity(row, 5, 6, "owner_principal", "owner_canonical_id")?;
-        let initiator =
-            Self::parse_owner_identity(row, 7, 8, "initiator_principal", "initiator_canonical_id")?;
-        Ok(CompletedMultipartUploadRecord {
-            upload_id: row.get(0)?,
-            bucket: row.get(1)?,
-            key: row.get(2)?,
-            completion_order,
-            completed_at,
-            initiator,
-            owner,
         })
     }
 
@@ -4759,19 +4694,6 @@ impl PgStore {
         }
 
         Ok(())
-    }
-
-    fn delete_completed_multipart_upload(&self, upload_id: &UploadId) -> Result<(), MetadataError> {
-        self.conn
-            .execute(
-                "DELETE FROM completed_multipart_uploads WHERE upload_id = ?1",
-                params![upload_id.as_str()],
-            )
-            .map(|_| ())
-            .map_err(|e| MetadataError::Db {
-                context: "delete completed multipart upload",
-                source: e,
-            })
     }
 }
 
@@ -8839,74 +8761,6 @@ impl PgMetadataStore for PgStore {
         )
     }
 
-    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
-        &self,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        next_pg_index: u32,
-    ) -> Result<u32, MetadataError> {
-        let bucket_incarnation_generation =
-            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
-                context: "record bucket delete finalize completed MPU progress incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
-            })?;
-        let next_pg_index = i64::from(next_pg_index);
-        self.with_immediate_txn(
-            "record bucket delete finalize completed MPU progress (begin txn)",
-            "record bucket delete finalize completed MPU progress (commit txn)",
-            |store| {
-                let updated = store
-                    .conn
-                    .execute(
-                        "UPDATE buckets \
-                         SET bucket_delete_finalize_completed_multipart_next_pg_index = CASE \
-                               WHEN bucket_delete_finalize_completed_multipart_next_pg_index < ?3 THEN ?3 \
-                               ELSE bucket_delete_finalize_completed_multipart_next_pg_index \
-                             END \
-                         WHERE name = ?1 AND bucket_incarnation_generation = ?2 AND state = ?4",
-                        params![
-                            bucket,
-                            bucket_incarnation_generation,
-                            next_pg_index,
-                            BucketState::Deleting as u8,
-                        ],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "record bucket delete finalize completed MPU progress",
-                        source,
-                    })?;
-                if updated == 0 {
-                    return Err(bucket_not_found(bucket.as_str()));
-                }
-                let stored: i64 = store
-                    .conn
-                    .query_row(
-                        "SELECT bucket_delete_finalize_completed_multipart_next_pg_index \
-                         FROM buckets \
-                         WHERE name = ?1 AND bucket_incarnation_generation = ?2 AND state = ?3",
-                        params![
-                            bucket,
-                            bucket_incarnation_generation,
-                            BucketState::Deleting as u8,
-                        ],
-                        |row| row.get(0),
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "load bucket delete finalize completed MPU progress",
-                        source,
-                    })?;
-                u32::try_from(stored).map_err(|source| MetadataError::Db {
-                    context: "parse bucket delete finalize completed MPU progress",
-                    source: rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Integer,
-                        Box::new(source),
-                    ),
-                })
-            },
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(
         &self,
@@ -9665,43 +9519,6 @@ impl PgMetadataStore for PgStore {
                 Err(err)
             }
         }
-    }
-
-    fn get_completed_multipart_upload(
-        &self,
-        upload_id: &UploadId,
-    ) -> Result<Option<CompletedMultipartUploadRecord>, MetadataError> {
-        self.conn
-            .query_row(
-                "SELECT upload_id, bucket, key, completion_order, completed_at, \
-                 owner_principal, owner_canonical_id, \
-                 initiator_principal, initiator_canonical_id \
-                 FROM completed_multipart_uploads WHERE upload_id = ?1",
-                params![upload_id.as_str()],
-                Self::completed_multipart_upload_record_from_row,
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get completed multipart upload",
-                source: e,
-            })
-    }
-
-    #[cfg(test)]
-    fn delete_completed_multipart_uploads_for_bucket(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<(), MetadataError> {
-        self.conn
-            .execute(
-                "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
-                params![bucket],
-            )
-            .map(|_| ())
-            .map_err(|e| MetadataError::Db {
-                context: "delete completed multipart uploads for bucket",
-                source: e,
-            })
     }
 
     fn list_multipart_uploads(
@@ -10478,10 +10295,10 @@ impl PgMetadataStore for PgStore {
     }
 
     #[cfg(test)]
+    #[cfg(test)]
     fn complete_multipart_commit(
         &self,
         upload_id: &UploadId,
-        completion_order: u64,
         obj: &CommitMultipartReq,
         parts: &[ObjectPartRecord],
     ) -> Result<CompleteMultipartCommitCleanup, MetadataError> {
@@ -10824,33 +10641,7 @@ impl PgMetadataStore for PgStore {
                 )?;
             }
 
-            // 8. Record this upload as completed so AbortMultipartUpload can
-            //    remain idempotently successful for the exact completed upload_id.
-            let (initiator_principal, initiator_canonical_id): (String, String) =
-                self.conn.query_row(
-                    "SELECT initiator_principal, initiator_canonical_id \
-                     FROM multipart_uploads WHERE upload_id = ?1",
-                    params![upload_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
-            self.conn.execute(
-                "INSERT OR REPLACE INTO completed_multipart_uploads \
-                 (upload_id, bucket, key, completion_order, completed_at, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    upload_id,
-                    obj.bucket,
-                    obj.key,
-                    completion_order as i64,
-                    now as i64,
-                    obj.owner.principal,
-                    obj.owner.canonical_id.as_str(),
-                    initiator_principal,
-                    initiator_canonical_id,
-                ],
-            )?;
-
-            // 9. Release the durable generation reservation now that the
+            // 8. Release the durable generation reservation now that the
             //    generation is visible on the committed object row.
             let released = self.conn.execute(
                 "DELETE FROM object_generation_reservations \
@@ -10866,7 +10657,7 @@ impl PgMetadataStore for PgStore {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
             }
 
-            // 10. Delete in-progress upload + parts (CASCADE).
+            // 9. Delete in-progress upload + parts (CASCADE).
             self.conn.execute(
                 "DELETE FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id],

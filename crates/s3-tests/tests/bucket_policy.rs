@@ -14611,6 +14611,26 @@ fn test_bucket_policy_upload_part_and_complete_allow_same_account_non_initiator_
         )
         .await;
 
+        eventually_ok_with_retry(
+            "Replay CompleteMultipartUpload by same-account non-initiator with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                second_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                            .build(),
+                    )
+                    .send()
+            },
+        )
+        .await;
+
         let object = get_object_eventually(client, &bucket, key).await;
         let body = object.body.collect().await.unwrap().into_bytes();
         assert_eq!(body.as_ref(), vec![b'y'; 1024].as_slice());
@@ -14681,6 +14701,26 @@ fn test_bucket_policy_boe_upload_part_and_complete_allow_same_account_non_initia
 
         eventually_ok_with_retry(
             "BOE CompleteMultipartUpload by same-account non-initiator with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                second_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                            .build(),
+                    )
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "BOE replay CompleteMultipartUpload by same-account non-initiator with PutObject only",
             60,
             std::time::Duration::from_millis(500),
             || {

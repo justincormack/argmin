@@ -50,7 +50,7 @@ for the current local security suite.
 | --- | --- | --- | --- |
 | `security/codex-2f977e8` Pending direct PUT can resurrect deleted objects | fixed in `1a4ff75` | `cargo nextest run -p storage object_delete_drains_pending_direct_put_commit_before_delete` | The finding was valid for `2f977e8`; object deletes now drain pending object metadata commands before observing or deleting current object state. |
 | `security/codex-d403b97` Unguarded stream-create pending commands can be lost | fixed in `1cc2543` | `cargo nextest run -p storage pending_metadata_command_insert_rejects_existing_without_overwrite stream_put_create_drains_unrelated_pending_create_before_new_session` | Pending metadata command insertion now rejects collisions without overwrite; stream-create drains the existing pending command and releases the losing reservation before retry/error. |
-| `security/codex-60b27a2` Completed-MPU prune poisons metadata digest | fixed in `022cbee` | `cargo nextest run -p storage completed_multipart_prune_partial_command_retries_and_preserves_digest` | Completed-MPU tombstone pruning and bucket-finalization cleanup now delete tombstones through a row-shaped metadata command applied to the owning PG acting set. |
+| `security/codex-60b27a2` Completed-MPU prune poisons metadata digest | fixed in `022cbee`; mechanism later removed | `cargo nextest run -p storage multipart_terminal_history_has_no_standalone_table` | The original pruning fix was valid, but completed-upload rows and pruning were subsequently replaced by authenticated IDs and object-version-scoped replay state. |
 
 ## Stateful Multipart, Reclaim, Lifecycle, and Object Lock
 
@@ -58,7 +58,7 @@ for the current local security suite.
 | --- | --- | --- | --- |
 | `security/codex-1f0908f` Race in stream segment append can delete committed shards | fixed | `./scripts/security-tests stateful` | Covered by duplicate-append race regressions. |
 | `security/codex-470aa8a` Streaming UploadPart reuploads leave orphaned shard data | fixed | `./scripts/security-tests stateful` | Covered by streamed part reupload/orphan cleanup tests. |
-| `security/codex-b6ecc5a` Completed multipart upload tombstones accumulate indefinitely | fixed | `./scripts/security-tests stateful` | Covered by multipart cleanup and reclaim regressions. |
+| `security/codex-b6ecc5a` Completed multipart upload tombstones accumulate indefinitely | fixed by removal | `cargo nextest run -p storage multipart_terminal_history_has_no_standalone_table` | Completed/aborted upload history is not stored. Exact completion replay is scoped to the retained object version, and abort idempotence uses authenticated upload IDs. |
 | `security/codex-ecef3a4` Unbounded reclaim queue allows memory exhaustion via reads | fixed | `./scripts/security-tests stateful` | Covered by reclaim queue and payload-lease regressions. |
 | `security/codex-a09a766` Lifecycle sweep bypasses object-lock retention checks | invalid | `./scripts/security-tests lifecycle` | Invalid finding; retained here so object-lock/lifecycle retention coverage stays visible. |
 | `security/codex-cd48ea6` Object Lock headers accept past retention dates | fixed | `./scripts/security-tests lifecycle` | Covered by object-lock retention validation regressions. |

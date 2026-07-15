@@ -506,7 +506,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
-    fn build_advance_completed_multipart_upload_sequence_command(
+    fn build_advance_multipart_completion_barrier_command(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
@@ -514,7 +514,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         completion_target_context: &str,
         bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::build_advance_completed_multipart_upload_sequence_command(
+        <Self as StorageNodeClient>::build_advance_multipart_completion_barrier_command(
             self,
             pg_id,
             bucket,
@@ -894,22 +894,6 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::bucket_delete_finalize_claim(self, pg_id, bucket)
-    }
-
-    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        next_pg_index: u32,
-    ) -> Result<u32, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::record_bucket_delete_finalize_completed_multipart_next_pg_index(
-            self,
-            pg_id,
-            bucket,
-            bucket_incarnation_generation,
-            next_pg_index,
-        )
     }
 
     fn get_lifecycle_sweep_roots(
@@ -1310,22 +1294,6 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
-    fn list_completed_multipart_upload_records_for_bucket_page(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        upload_id_marker: Option<&UploadId>,
-        limit: u32,
-    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::list_completed_multipart_upload_records_for_bucket_page(
-            self,
-            pg_id,
-            bucket,
-            upload_id_marker,
-            limit,
-        )
-    }
-
     fn payload_reclaim_exists(
         &self,
         pg_id: PgId,
@@ -1616,21 +1584,6 @@ impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {
 }
 
 impl StorageNodeClient for LocalStorageNodeClient {
-    fn list_completed_multipart_upload_records_for_bucket_page(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        upload_id_marker: Option<&UploadId>,
-        limit: u32,
-    ) -> Result<CompletedMultipartUploadRecordPage, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(pg.list_completed_multipart_upload_records_for_bucket_page(
-            bucket,
-            upload_id_marker,
-            limit,
-        )?)
-    }
-
     fn try_acquire_object_payload_lease(
         &self,
         bucket: &BucketName,
@@ -2018,7 +1971,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         )))
     }
 
-    fn build_advance_completed_multipart_upload_sequence_command(
+    fn build_advance_multipart_completion_barrier_command(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
@@ -2047,29 +2000,30 @@ impl StorageNodeClient for LocalStorageNodeClient {
             bucket_write_reservation,
         )?;
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        let current_order = pg.completed_multipart_upload_sequence_for_bucket(bucket)?;
-        let completion_order = current_order
-            .checked_add(1)
-            .ok_or_else(|| MetadataError::Db {
-                context: "reserve completed multipart upload order overflow",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
-                    "completed multipart upload sequence overflow",
-                )),
-            })?;
-        i64::try_from(completion_order).map_err(|_| MetadataError::Db {
-            context: "reserve completed multipart upload order overflow",
+        let current_sequence = pg.multipart_completion_barrier_sequence_for_bucket(bucket)?;
+        let barrier_sequence =
+            current_sequence
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::Db {
+                    context: "reserve multipart completion barrier overflow",
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                        "multipart completion barrier sequence overflow",
+                    )),
+                })?;
+        i64::try_from(barrier_sequence).map_err(|_| MetadataError::Db {
+            context: "reserve multipart completion barrier overflow",
             source: rusqlite::Error::ToSqlConversionFailure(Box::from(
-                "completed multipart upload sequence exceeds SQLite integer range",
+                "multipart completion barrier sequence exceeds SQLite integer range",
             )),
         })?;
         Ok((
-            completion_order,
+            barrier_sequence,
             MetadataCommandEnvelope::new(
                 command_id,
-                MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
-                    AdvanceCompletedMultipartUploadSequenceCommand {
+                MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+                    AdvanceMultipartCompletionBarrierCommand {
                         bucket: bucket.clone(),
-                        completion_order,
+                        barrier_sequence,
                     },
                 ),
             ),
@@ -2688,10 +2642,8 @@ impl StorageNodeClient for LocalStorageNodeClient {
             Err(error) => return Err(error.into()),
         }
 
-        if let Some(completed) = pg.get_completed_multipart_upload(upload_id)? {
-            if completed.bucket == *bucket && completed.key == *key {
-                return Ok(MultipartUploadManagementLookup::Completed(completed));
-            }
+        if let Some(completed) = pg.get_multipart_completion_replay(bucket, key, upload_id)? {
+            return Ok(MultipartUploadManagementLookup::Replay(Box::new(completed)));
         }
         Ok(MultipartUploadManagementLookup::Missing)
     }
@@ -3626,7 +3578,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
         }
 
         let last_modified_millis = crate::clock::current_time_millis();
-        let completed_at_millis = last_modified_millis;
         let write_sequence =
             pg.next_object_write_sequence(complete.bucket.as_str(), complete.key.as_str())?;
         let stale_payload = if request.version_id.is_null() {
@@ -3648,6 +3599,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             command_id,
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
                 upload_id: complete.upload_id.clone(),
+                completion_fingerprint: complete.completion_fingerprint,
                 bucket_write_reservation: request.bucket_write_reservation.clone(),
                 object: PutLiveObjectReq {
                     bucket: complete.bucket.clone(),
@@ -3677,9 +3629,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 stream_uploads: cleanup.stream_uploads,
                 stream_upload_segments: cleanup.stream_upload_segments,
                 write_sequence,
-                completion_order: request.completion_order,
-                completed_at_millis,
-                initiator: upload.initiator.clone(),
                 last_modified_millis,
                 stale_payload,
             })),
@@ -3861,24 +3810,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::bucket_delete_finalize_claim(&*pg)?)
-    }
-
-    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        next_pg_index: u32,
-    ) -> Result<u32, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(
-            PgMetadataStore::record_bucket_delete_finalize_completed_multipart_next_pg_index(
-                &*pg,
-                bucket,
-                bucket_incarnation_generation,
-                next_pg_index,
-            )?,
-        )
     }
 
     fn get_lifecycle_sweep_roots(

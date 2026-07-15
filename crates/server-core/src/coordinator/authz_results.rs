@@ -305,13 +305,20 @@ pub(super) struct AuthorizedUploadPartCopy {
 }
 
 #[derive(Debug)]
-pub(super) struct AuthorizedCompleteMultipartUpload {
-    pub(super) bucket_info: BucketSummary,
-    pub(super) bucket: BucketName,
-    pub(super) key: ObjectKey,
-    pub(super) upload_id: UploadId,
-    pub(super) upload: AuthorizedMultipartUploadRecord,
-    pub(super) multipart_write_encryption: ActiveWriteEncryption,
+pub(super) enum AuthorizedCompleteMultipartUpload {
+    InProgress {
+        bucket_info: BucketSummary,
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: UploadId,
+        upload: Box<AuthorizedMultipartUploadRecord>,
+        multipart_write_encryption: ActiveWriteEncryption,
+    },
+    Replay {
+        bucket_info: BucketSummary,
+        key: ObjectKey,
+        replay: storage::MultipartCompletionReplay,
+    },
 }
 
 #[derive(Debug)]
@@ -319,7 +326,7 @@ pub(super) enum AuthorizedAbortMultipartUpload {
     InProgress {
         upload: Box<AuthorizedMultipartUploadRecord>,
     },
-    Completed,
+    Terminal,
 }
 
 #[derive(Debug)]

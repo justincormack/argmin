@@ -151,6 +151,17 @@ struct BucketPolicyActionAuthorization<'a> {
 }
 
 #[derive(Clone, Copy)]
+pub(super) struct AuthenticatedMultipartWriteAuthorization<'a> {
+    requester: &'a Requester,
+    bucket: &'a BucketSummary,
+    bucket_tags: Option<&'a [(String, String)]>,
+    key: &'a ObjectKey,
+    upload_id: &'a storage::UploadId,
+    policy_context: PutObjectPolicyContext<'a>,
+    policy: Option<&'a auth::BucketPolicy>,
+}
+
+#[derive(Clone, Copy)]
 enum ExistingObjectTagsMode {
     Available,
     Unavailable,
@@ -756,14 +767,17 @@ impl Coordinator {
             || Self::requester_matches_owner_identity(requester, &upload.initiator)
     }
 
-    pub(super) fn requester_can_manage_completed_multipart_upload(
+    pub(super) fn requester_can_manage_authenticated_multipart_upload_id(
         requester: &Requester,
         bucket: &BucketSummary,
-        upload: &storage::CompletedMultipartUploadRecord,
+        upload_id: &storage::UploadId,
     ) -> bool {
         Self::requester_can_bucket_owner_account_admin(requester, bucket)
-            || Self::requester_matches_owner_identity(requester, &upload.owner)
-            || Self::requester_matches_owner_identity(requester, &upload.initiator)
+            || requester.principal_opt().is_some_and(|principal| {
+                bucket
+                    .multipart_upload_id_key
+                    .was_issued_for_principal(upload_id, principal)
+            })
     }
 
     pub(super) fn requester_can_write_multipart_upload(
@@ -803,6 +817,35 @@ impl Coordinator {
                 ),
             },
             upload.key.as_str(),
+        )
+    }
+
+    pub(super) fn requester_can_write_authenticated_multipart_upload_id_with_bucket_policy(
+        &self,
+        authorization: AuthenticatedMultipartWriteAuthorization<'_>,
+    ) -> Result<bool, ServerError> {
+        self.requester_can_put_object_action_with_bucket_policy(
+            BucketPolicyActionAuthorization {
+                request: BucketPolicyRequestContext {
+                    requester: authorization.requester,
+                    bucket: authorization.bucket,
+                    bucket_tags: authorization.bucket_tags,
+                    action: auth::PolicyAction::PutObject,
+                    policy_context: authorization.policy_context,
+                    policy: authorization.policy,
+                },
+                default_allowed: Self::requester_can_object_write(
+                    authorization.requester,
+                    authorization.bucket,
+                    &authorization.bucket.acl_grants,
+                    Self::effective_public_write(authorization.bucket),
+                ) && Self::requester_can_manage_authenticated_multipart_upload_id(
+                    authorization.requester,
+                    authorization.bucket,
+                    authorization.upload_id,
+                ),
+            },
+            authorization.key.as_str(),
         )
     }
 

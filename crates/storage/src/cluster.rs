@@ -296,7 +296,7 @@ pub enum MetadataCommandApplyTestKind {
     PutBucketSubresource,
     MarkBucketDeleting,
     DeleteFinalizedBucket,
-    AdvanceCompletedMultipartUploadSequence,
+    AdvanceMultipartCompletionBarrier,
     ReserveObjectGeneration,
     ReleaseObjectGeneration,
     ReserveObjectVersion,
@@ -312,7 +312,6 @@ pub enum MetadataCommandApplyTestKind {
     CreateMultipartUpload,
     AbortMultipartUpload,
     DeleteObjectPayloadReclaim,
-    DeleteCompletedMultipartUpload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2687,8 +2686,7 @@ impl StorageCluster {
                 | MetadataCommandPayload::PutBucketSubresource(_)
                 | MetadataCommandPayload::MarkBucketDeleting(_)
                 | MetadataCommandPayload::DeleteFinalizedBucket(_)
-                | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
-                | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_)
+                | MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_)
         )
     }
 

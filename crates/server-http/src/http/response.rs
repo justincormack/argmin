@@ -3493,6 +3493,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         };
@@ -3618,6 +3619,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }];

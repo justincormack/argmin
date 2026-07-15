@@ -2288,6 +2288,7 @@ fn test_bucket_list_info(
         bucket_lifecycle_generation: 0,
         bucket_execution_generation: 1,
         bucket_incarnation_generation: 1,
+        multipart_upload_id_key: crate::MultipartUploadIdKey::from_bytes([1; 32]),
         bucket_abac_enabled: false,
         encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
     }
@@ -5503,7 +5504,7 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
     )
     .unwrap();
     let err = old_primary_cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap_err();
     assert!(
         matches!(
@@ -5604,16 +5605,6 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
             .unwrap()
             .is_empty(),
             "old-primary Unix multipart completion must leave no bucket-write reservation on node {:?}",
-            config.node_id
-        );
-        assert!(
-            crate::PgMetadataStore::get_completed_multipart_upload(
-                &*bucket_pg_store,
-                &req.upload_id,
-            )
-            .unwrap()
-            .is_none(),
-            "old-primary Unix multipart completion must not publish completed-upload state on node {:?}",
             config.node_id
         );
     }
@@ -8679,7 +8670,7 @@ fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutat
             .unwrap();
 
     let err = stale_cluster
-        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap_err();
     assert!(
         matches!(

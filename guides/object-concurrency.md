@@ -37,17 +37,16 @@ metadata paths (for example, `DeleteBucket` emptiness checks).
 10. Shard payload must become visible only after durable shard files exist; raw shard files may exist before metadata publication, but reads must treat metadata rows as the visibility boundary.
 11. Mixed bucket+object metadata operations must lock PGs in global ascending PG
     ID order when more than one PG is held.
-12. `CompleteMultipartUpload` tombstone publication order must match actual completion publication order for the bucket, not wall-clock ties or request arrival order.
-13. `CompleteMultipartUpload` must serialize bucket-scoped tombstone publication
-    through the bucket-PG metadata command stream by publishing an
-    `AdvanceCompletedMultipartUploadSequence` command before the object-PG
-    completion command.
-14. Completion-order allocation must be durable and storage-node owned; request
-    paths must not use process-local multipart-completion mutexes for
+12. `CompleteMultipartUpload` must replicate its bucket-write dependency through
+    the bucket-PG command stream before publishing the object-PG completion, via
+    `AdvanceMultipartCompletionBarrier`.
+13. The multipart completion barrier must be durable and storage-node owned;
+    request paths must not use process-local multipart-completion mutexes for
     correctness.
-15. Bucket-scoped tombstone pruning must order rows by the durable
-    bucket-global completion order allocated through that command stream.
-16. `CompleteMultipartUpload` must remain compatible with AWS abort semantics for completed uploads: abort of the exact completed upload ID must still succeed after overwrite/delete until the bounded tombstone retention policy prunes it.
+14. The barrier may advance one fixed-size bucket scalar, but must not retain
+    per-upload completion or abort history.
+15. Exact completion replay metadata must publish atomically with the completed
+    object version, and disappear only when that version is replaced or removed.
 
 ## Required Coordinator APIs
 
@@ -68,14 +67,17 @@ lock helpers for:
 - metadata/session PG finalize lock orchestration
 - transactional finalize that commits metadata and removes staging rows together
 
-For multipart completion ordering, use:
+For multipart completion publication, use:
 
-- the storage-cluster completed-MPU order reservation path, which publishes an
-  `AdvanceCompletedMultipartUploadSequence` bucket-PG metadata command before
-  constructing the object-PG completion command
+- the storage-cluster completion barrier, which publishes an
+  `AdvanceMultipartCompletionBarrier` bucket-PG metadata command under the
+  current completion reservation before constructing the object-PG completion
+  command; a barrier left pending by an earlier reservation is drained before
+  a fresh barrier is allocated
 - the storage-node-owned metadata command serialization boundary for both the
-  bucket-PG order command and object-PG completion command
-- `Coordinator::prune_completed_multipart_uploads_for_bucket_with_limit(...)`
+  bucket-PG barrier command and object-PG completion command
+- object-version-scoped replay metadata; never add terminal upload history or
+  a pruning path
 
 Do not open-code this pattern in object paths:
 
@@ -106,12 +108,10 @@ Do not open-code this pattern in object paths:
   treating orphan files as live payload.
 - Without transactional finalize cleanup, stale staging rows can leak or race
   with retries/recovery.
-- Without durable bucket-PG command-stream completion ordering, concurrent
-  completes in one bucket can publish tombstones out of order and immediately
-  prune the wrong just-completed upload.
+- Without the durable bucket-PG completion barrier, replicated object-PG commit
+  recovery can observe a half-published bucket-write dependency.
 - Without storage-node-owned command serialization, multiple frontend processes
-  can observe each other's half-complete completion-order/object-publication
-  windows.
+  can observe each other's half-complete barrier/object-publication windows.
 - Without shared reservation wrappers and explicit error-path review, fallible
   operations can leak bucket write reservations or release the wrong error
   shape.
@@ -131,10 +131,11 @@ Do not open-code this pattern in object paths:
 7. Are external ETag/checksum semantics unchanged?
 8. For streamed writes, is the visibility boundary still metadata publication rather than raw shard-file presence?
 9. For bucket+object mixed operations, is lock order explicit and ascending by PG ID?
-10. For `CompleteMultipartUpload`, is tombstone publication serialized through
-   the bucket-PG metadata command stream, with completion order allocated
-   durably before the object-PG completion command is built?
-11. For bounded completed-upload retention, does prune order come from the durable bucket-global completion order rather than timestamp or upload-ID tie breakers?
+10. For `CompleteMultipartUpload`, is the bucket-write dependency replicated
+    through a fresh `AdvanceMultipartCompletionBarrier` under the current
+    reservation before the object-PG completion command is built?
+11. Is exact replay metadata still atomically scoped to the completed object
+    version, with no per-upload terminal history or cleanup path?
 12. If this change touches reservations, drains, guards, or storage critical sections:
    - is acquisition and release owned by a shared helper rather than open-coded?
    - does every fallible path (`?`, early return, closure error) still release?

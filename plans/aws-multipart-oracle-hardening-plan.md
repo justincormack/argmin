@@ -66,30 +66,43 @@ For each matrix:
   documented compatibility policy that permits Argmin's `InvalidRequest`.
 - [x] Probe retries after successful completion and after abort, including object
   overwrite/delete and bucket delete/recreate histories. AWS replays the exact
-  successful completion while its published object generation remains current,
-  but returns `NoSuchUpload` for a changed manifest or after overwrite/delete.
+  successful completion while its published object version remains retained,
+  but returns `NoSuchUpload` for a changed manifest or after an unversioned
+  overwrite/delete.
   Abort is idempotent for completed and aborted upload IDs and does not consume
   a completed upload's exact replay. These terminal retries remain valid until
   bucket deletion/recreation, which makes every operation on the old IDs return
   `NoSuchUpload`.
-- [ ] Extend the terminal-retry oracle matrix to versioned and suspended
-  buckets. Probe a later object version, delete markers, removal of the delete
-  marker, deletion of the completed version, and a later multipart completion
-  of the same key. Pin whether an exact completion retry remains valid and which
-  `versionId` and response metadata AWS replays in every history.
-- [ ] Probe terminal completion retries after the initiator's current
+- [x] Extend the terminal-retry oracle matrix to versioned buckets. A completed
+  version remains the exact-replay target across later versions and delete
+  markers, including removal of the delete marker, and ceases to replay only
+  when that completed version is explicitly deleted. The replay returns the
+  original ETag and `x-amz-version-id`.
+- [ ] Probe otherwise exact terminal completion retries with changed request
+  conditions, aggregate-checksum headers, and `x-amz-mp-object-size`. Cross
+  absent, matching, mismatched, and malformed values on AWS first, then pin the
+  same endpoint-neutral matrix locally, including response precedence and proof
+  that no object version or upload state is mutated.
+- [ ] Probe the corresponding terminal-retry histories in a suspended bucket,
+  including later writes, delete markers, delete-marker removal, deletion of the
+  completed null/non-null version, and a later multipart completion of the same
+  key.
+- [x] Probe terminal completion retries after the initiator's current
   `s3:PutObject` permission is removed and under an explicit deny, with positive
-  policy canaries before each transition. Unless AWS proves a terminal-replay
-  exception, an authenticated replay must traverse the same current bucket/IAM
-  policy authorization as an in-progress completion; possession of a valid
-  upload ID and retained initiator/owner claims establishes identity, not
-  authorization.
-- [ ] Cross malformed completion XML and malformed checksum/expected-size
-  headers with a completed upload whose published object has subsequently been
-  overwritten or deleted. Pin that the request-layer target preflight treats
-  only an AWS-applicable completion replay as existing, so `NoSuchUpload` wins
-  before body and completion-header validation once replay eligibility ends.
-- [ ] Replace terminal multipart tombstones with a storage model proportional to
+  policy canaries before each transition. AWS applies the current policy: an
+  explicit deny rejects the replay, and removing it restores the replay. AWS
+  also permits an exact replay by a same-account non-initiator that is currently
+  granted `s3:PutObject`, in both ACL and bucket-owner-enforced buckets.
+  Authenticated upload identity therefore establishes the target but does not
+  replace current completion authorization.
+- [x] Cross malformed completion XML and malformed expected-size headers with a
+  completed upload whose published object has subsequently been
+  overwritten. AWS still reports `MalformedXML` or `InvalidRequest` before
+  `NoSuchUpload`: request-layer preflight recognizes an authenticated issued ID
+  independently of whether a retained completion replay still exists. The full
+  valid completion path performs the replay lookup and returns `NoSuchUpload`
+  when no retained replay is applicable.
+- [x] Replace terminal multipart tombstones with a storage model proportional to
   active uploads and live object versions, not historical multipart activity.
   Per-bucket retention limits are not acceptable: multipart is the ordinary
   object-write path, so even a fixed limit such as 10,000 records per bucket
@@ -102,10 +115,11 @@ For each matrix:
   - Keep exact-completion replay data with the object version produced by the
     completion: the authenticated upload identity, completion-manifest digest,
     and response fields not otherwise derivable from the object metadata.
-    Replay succeeds only for the AWS-selected applicable object version and an
-    exact manifest match. Both request preflight and full completion must use
-    the same replay-eligibility rule, while the full path repeats the lookup to
-    close overwrite/delete races.
+    Replay succeeds only while the completed object version is retained and the
+    manifest matches exactly. Request preflight authenticates the issued ID
+    without requiring replay state, preserving AWS's XML/header validation
+    precedence; the full path separately loads the retained replay and repeats
+    the lookup to close deletion races.
   - For an authenticated issued ID with no applicable completion replay,
     CompleteMultipartUpload returns `NoSuchUpload`; AbortMultipartUpload remains
     idempotently successful after either completion or abort without retaining
@@ -117,7 +131,13 @@ For each matrix:
     terminal rows, plus restart and bucket delete/recreate tests for upload-ID
     authentication and replay state. No pruning or cleanup mechanism may be
     required to maintain the storage bound.
-- [ ] Once the tombstone-free implementation matches the shared AWS/local
+  - Preserve the replicated cross-PG completion dependency with
+    `AdvanceMultipartCompletionBarrier`. It advances one fixed-size scalar on
+    the bucket row before object-PG publication and retains no upload identity
+    or terminal history. Because the command contains no reservation identity,
+    a retry first drains any barrier left pending by an earlier reservation and
+    then advances a fresh barrier validated against its current reservation.
+- [x] Once the tombstone-free implementation matches the shared AWS/local
   matrix, replace the compatibility-guide exception for terminal hidden-resource
   denial with the authenticated-ID and object-scoped replay invariants.
 

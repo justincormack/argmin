@@ -1279,7 +1279,7 @@ fn low_level_put_object_stream_create_bounds_durable_delete_drain_wait() {
 }
 
 #[test]
-fn metadata_state_digest_covers_completed_multipart_order_sequence() {
+fn metadata_state_digest_covers_multipart_completion_barrier_sequence() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1308,11 +1308,11 @@ fn metadata_state_digest_covers_completed_multipart_order_sequence() {
             .get_pg(1)
             .unwrap();
         node_zero_pg
-            .advance_completed_multipart_upload_sequence_for_bucket(&allocated_bucket, 7)
+            .advance_multipart_completion_barrier_for_bucket(&allocated_bucket, 7)
             .unwrap();
         assert_eq!(
             node_zero_pg
-                .completed_multipart_upload_sequence_for_bucket(&allocated_bucket)
+                .multipart_completion_barrier_sequence_for_bucket(&allocated_bucket)
                 .unwrap(),
             7
         );

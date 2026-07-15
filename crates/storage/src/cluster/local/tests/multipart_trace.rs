@@ -507,30 +507,28 @@ fn complete_multipart_trace_upload(
         .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
     let size = upload.parts.iter().map(|part| part.size).sum();
     cluster
-        .complete_multipart_upload_commit_serialized(
-            crate::CompleteMultipartCommitRequest {
-                bucket: bucket.clone(),
-                key: upload.key.clone(),
-                upload_id: upload.upload_id.clone(),
-                versioning: crate::BucketVersioningState::Disabled,
-                owner: upload_row.owner,
-                acl_grants: upload_row.acl_grants,
-                public_read: upload_row.public_read,
-                generation_id: upload_row.object_generation_id,
-                size,
-                etag_crc64: [0x51; 8],
-                tags: upload_row.tags,
-                metadata_blob: Some(upload_row.metadata_blob),
-                system_metadata_blob: Some(upload_row.system_metadata_blob),
-                object_lock: upload_row.object_lock,
-                encryption: upload_row.encryption,
-                expected_stale_payload_source: completion_snapshot.stale_payload_source,
-                part_records: upload.parts.clone(),
-                selected_streaming_segments: completion_snapshot.selected_streaming_segments,
-                expected_cleanup: completion_snapshot.cleanup,
-            },
-            16,
-        )
+        .complete_multipart_upload_commit_serialized(crate::CompleteMultipartCommitRequest {
+            bucket: bucket.clone(),
+            key: upload.key.clone(),
+            upload_id: upload.upload_id.clone(),
+            completion_fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0x22; 32]),
+            versioning: crate::BucketVersioningState::Disabled,
+            owner: upload_row.owner,
+            acl_grants: upload_row.acl_grants,
+            public_read: upload_row.public_read,
+            generation_id: upload_row.object_generation_id,
+            size,
+            etag_crc64: [0x51; 8],
+            tags: upload_row.tags,
+            metadata_blob: Some(upload_row.metadata_blob),
+            system_metadata_blob: Some(upload_row.system_metadata_blob),
+            object_lock: upload_row.object_lock,
+            encryption: upload_row.encryption,
+            expected_stale_payload_source: completion_snapshot.stale_payload_source,
+            part_records: upload.parts.clone(),
+            selected_streaming_segments: completion_snapshot.selected_streaming_segments,
+            expected_cleanup: completion_snapshot.cleanup,
+        })
         .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
     assert_terminal_multipart_upload_invariants(
         map,

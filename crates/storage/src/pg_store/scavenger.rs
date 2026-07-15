@@ -1354,8 +1354,7 @@ impl PgStore {
             | MetadataCommandPayload::PutObjectMetadata(_)
             | MetadataCommandPayload::CreateStreamUpload(_)
             | MetadataCommandPayload::CreateMultipartUpload(_)
-            | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
-            | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {}
+            | MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) => {}
         }
         Ok(())
     }

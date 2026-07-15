@@ -2572,8 +2572,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
             let upload_id = crate::tests::multipart_upload_id("commit-fail-complete-mpu-upload");
             let obj = test_commit_multipart_req(bucket.clone(), key.clone());
             let parts = vec![test_object_part(bucket, key, VersionId::Null, 1)];
-            PgMetadataStore::complete_multipart_commit(store, &upload_id, 1, &obj, &parts)
-                .map(|_| ())
+            PgMetadataStore::complete_multipart_commit(store, &upload_id, &obj, &parts).map(|_| ())
         },
     );
 
@@ -3274,7 +3273,6 @@ fn metadata_state_digest_table_inventory_is_explicit() {
         vec![
             ("bucket_subresources", MetadataDigestFilter::AllRows),
             ("buckets", MetadataDigestFilter::AllRows),
-            ("completed_multipart_uploads", MetadataDigestFilter::AllRows),
             ("multipart_part_segments", MetadataDigestFilter::AllRows),
             ("multipart_parts", MetadataDigestFilter::AllRows),
             (
@@ -6154,48 +6152,6 @@ fn metadata_state_digest_covers_multipart_upload_and_part_state() {
                 .execute(
                     "UPDATE multipart_parts SET checksum = ?1 WHERE upload_id = ?2",
                     params![b"checksum".as_slice(), upload_id.as_str()],
-                )
-                .unwrap();
-        },
-    );
-}
-
-#[test]
-fn metadata_state_digest_covers_completed_multipart_uploads() {
-    assert_metadata_state_digest_covers_mutation(
-        |store| {
-            let owner = test_owner();
-            let upload_id = UploadId::new("c".repeat(UPLOAD_ID_LEN)).unwrap();
-            let bucket = trusted_bucket_name("digest-bucket");
-            let key = trusted_object_key("object");
-            store
-                .conn
-                .execute(
-                    "INSERT INTO completed_multipart_uploads \
-                     (upload_id, bucket, key, completion_order, completed_at, \
-                      owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        upload_id.as_str(),
-                        bucket.as_str(),
-                        key.as_str(),
-                        1_i64,
-                        103_i64,
-                        owner.principal.as_str(),
-                        owner.canonical_id.as_str(),
-                        owner.principal.as_str(),
-                        owner.canonical_id.as_str(),
-                    ],
-                )
-                .unwrap();
-        },
-        |store| {
-            let upload_id = UploadId::new("c".repeat(UPLOAD_ID_LEN)).unwrap();
-            store
-                .conn
-                .execute(
-                    "UPDATE completed_multipart_uploads SET completion_order = ?1 WHERE upload_id = ?2",
-                    params![2_i64, upload_id.as_str()],
                 )
                 .unwrap();
         },

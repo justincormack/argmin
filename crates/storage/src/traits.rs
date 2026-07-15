@@ -648,14 +648,6 @@ pub(crate) trait PgMetadataStore {
         &self,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, MetadataError>;
 
-    /// Advance completed-MPU cleanup progress for one deleting bucket incarnation.
-    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
-        &self,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        next_pg_index: u32,
-    ) -> Result<u32, MetadataError>;
-
     /// Acquire a durable lifecycle sweep claim for one bucket incarnation.
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(
@@ -756,19 +748,6 @@ pub(crate) trait PgMetadataStore {
     #[cfg(test)]
     fn delete_multipart_upload(&self, upload_id: &UploadId) -> Result<(), MetadataError>;
 
-    /// Get a completed multipart upload record retained for abort semantics.
-    fn get_completed_multipart_upload(
-        &self,
-        upload_id: &UploadId,
-    ) -> Result<Option<CompletedMultipartUploadRecord>, MetadataError>;
-
-    /// Delete all completed multipart upload records for a bucket.
-    #[cfg(test)]
-    fn delete_completed_multipart_uploads_for_bucket(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<(), MetadataError>;
-
     /// List multipart uploads for a bucket with pagination.
     fn list_multipart_uploads(
         &self,
@@ -851,13 +830,12 @@ pub(crate) trait PgMetadataStore {
     /// 4. Insert new `object_parts` manifest rows
     /// 5. Reparent only selected streamed part segments to the object version
     /// 6. Delete omitted streamed part segment rows and return omitted payloads for shard cleanup
-    /// 7. Record the completed upload for AbortMultipartUpload semantics
-    /// 8. Delete the `multipart_uploads` + `multipart_parts` rows
+    /// 7. Delete the `multipart_uploads` + `multipart_parts` rows
+    #[cfg(test)]
     #[cfg(test)]
     fn complete_multipart_commit(
         &self,
         upload_id: &UploadId,
-        completion_order: u64,
         obj: &CommitMultipartReq,
         parts: &[ObjectPartRecord],
     ) -> Result<CompleteMultipartCommitCleanup, MetadataError>;

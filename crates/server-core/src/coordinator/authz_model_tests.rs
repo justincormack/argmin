@@ -2393,6 +2393,7 @@ mod harness {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }
@@ -3873,6 +3874,7 @@ mod phase4_harness {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            multipart_upload_id_key: storage::MultipartUploadIdKey::from_bytes([1; 32]),
             bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }
@@ -7813,13 +7815,18 @@ mod phase7a_model {
                         expected: MultipartOutcome::Allow,
                     },
                     Self {
-                        name: "write-paths-see-completed-upload-as-no-such-upload",
+                        name: "only-completion-replays-a-completed-upload",
                         action,
                         upload: MultipartUploadShape::CrossAccountObjectWriter,
                         requester: Phase7aRequesterShape::Initiator,
                         policy: MultipartPolicyShape::AllowRequesterPutObject,
                         target_completed_upload: true,
-                        expected: MultipartOutcome::NoSuchUpload,
+                        expected: match action {
+                            MultipartWriteAction::BeginStreamPart => MultipartOutcome::NoSuchUpload,
+                            MultipartWriteAction::CompleteMultipartUpload => {
+                                MultipartOutcome::Allow
+                            }
+                        },
                     },
                 ]);
             }

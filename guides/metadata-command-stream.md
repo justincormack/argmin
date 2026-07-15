@@ -170,7 +170,7 @@ Current production pending-command publishers:
 | --- | --- | --- | --- |
 | `create_bucket_with_config_and_load_info` | `CreateBucket` | `ApplyValidated` | Drain competing PG slot during pending-slot checks and command-id allocation; exact-row apply handles idempotence/conflict. |
 | `begin_bucket_delete` | `MarkBucketDeleting` | `SnapshotSensitive` | Rebuild from current bucket/delete preconditions after contention. |
-| `delete_completed_multipart_upload_record_with_command` | `DeleteCompletedMultipartUpload` | `ApplyValidated` | Drain competing PG slot during pending-slot checks and command-id allocation; delete is exact tombstone cleanup. |
+| `establish_multipart_completion_barrier` | `AdvanceMultipartCompletionBarrier` | `ApplyValidated` | Drain competing bucket-PG slots, then validate the exact completion bucket-write proof and replicate a fresh monotonic scalar before publishing the object-PG completion. A pre-existing barrier is contention rather than proof for the current reservation because the command carries no reservation identity. No terminal upload row is created. |
 | `put_bucket_versioning_and_load_info` | `PutBucketVersioning` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
 | `put_bucket_acl_and_load_info` | `PutBucketAcl` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
 | `put_bucket_property_command_and_load_info` | `PutBucketProperty` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
@@ -196,8 +196,8 @@ Current production pending-command publishers:
 | `create_multipart_upload` | `CreateMultipartUpload` | `SnapshotSensitive` | Rerun authorization/object snapshot after contention. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `begin_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target and rerun the caller action against fresh MPU state using the request-entry authorization snapshot/capability after contention. The command carries the request-entry bucket-write reservation proof and releases it only after convergence. |
 | `create_upload_part_stream_session` | `CreateStreamUpload` | `SnapshotSensitive` | Revalidate MPU/session target after contention. The low-level UploadPartCopy path acquires a durable bucket-write reservation before publishing the session command and releases it only after convergence. |
-| `reserve_completed_multipart_upload_order` | `AdvanceCompletedMultipartUploadSequence` | `AllocatorCleanup` | Serialize through the bucket-PG slot; a later object-PG command must be derived from a terminal reservation. |
-| `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `MatchingOutcomeRetry` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG order after unrelated contention. If the contender is the same completion request, finish that exact command through the matching-pending branch and return its computed outcome. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
+| `establish_multipart_completion_barrier` | `AdvanceMultipartCompletionBarrier` | `AllocatorCleanup` | Serialize through the bucket-PG slot; the later object-PG command may proceed only after the fixed-size barrier command converges. |
+| `complete_multipart_upload_commit_serialized` | `CommitMultipartObject` | `MatchingOutcomeRetry` | Rebuild completion parts, cleanup snapshot, stale payload, and bucket-PG barrier after unrelated contention. If the contender is the same completion request, finish that exact command through the matching-pending branch and return its computed outcome. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `finalize_upload_part_stream` | `CommitStreamPart` | `TerminalSessionRetry` | Rebuild stream session, MPU row, staged segments, and displaced part refs after unrelated contention. If an equivalent terminal command wins the pending slot, restart without draining so the matching branch can finish it. The command carries a durable bucket-write reservation proof and terminal convergence releases it before removing the pending slot. |
 | `abort_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild upload, part, active stream session, staged segment, and cleanup snapshots after unrelated contention. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
 | `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild authorized upload cleanup snapshot after unrelated contention and compare the current upload row to the authorized row before install. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
@@ -242,12 +242,12 @@ silently bypass the snapshot-sensitive restart rules.
 ## Multipart Command-Stream Invariants
 
 Phase 9.3 owns multipart upload lifecycle serialization. Multipart commands are
-still PG-local commands: the bucket PG can own completed-upload order
-allocation, while the object PG owns upload, part, stream session, object
-publication, and terminal cleanup rows. Multi-PG multipart flows must derive
-later commands only from terminal earlier commands; they must not leave two PGs
-with ambiguous pending slots where either PG cannot determine whether the
-request should converge or restart.
+still PG-local commands: the bucket PG owns the fixed-size completion barrier,
+while the object PG owns upload, part, stream session, object publication, and
+cleanup rows. Multi-PG multipart flows must derive later commands only from
+terminal earlier commands; they must not leave two PGs with ambiguous pending
+slots where either PG cannot determine whether the request should converge or
+restart.
 
 Command-owned multipart metadata includes:
 
@@ -256,13 +256,14 @@ Command-owned multipart metadata includes:
 - `multipart_part_segments`
 - `stream_uploads`
 - `stream_upload_segments`
-- `completed_multipart_uploads`
-- `buckets.completed_multipart_upload_sequence`
+- object-row multipart completion upload identity and request fingerprint
+- `buckets.multipart_completion_barrier_sequence`
 
-For one upload id, the command stream must make exactly one terminal lifecycle
-outcome visible: the upload is still in progress, completed, or aborted. Once a
-complete or abort command is terminal, no active UploadPart stream session or
-staged stream segment for that upload may remain valid. Cleanup of active
+For one upload ID, the command stream must make at most one active lifecycle
+outcome visible: an in-progress upload row or completion replay attached to its
+published object version. Abort leaves neither. Once a complete or abort command
+is terminal, no active UploadPart stream session or staged stream segment for
+that upload may remain valid. Cleanup of active
 UploadPart stream sessions, staged stream segments, omitted parts, displaced
 part segments, and UploadPartCopy staged copied segments must be carried by the
 terminal command or by explicit retry/scavenger records. Later cleanup must not
@@ -362,10 +363,9 @@ outcome is only valid after an exact matching predicate has succeeded.
 | `put_bucket_property_command_and_load_info` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
 | `put_bucket_subresource_command_and_load_info` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Request retries re-enter the bucket snapshot path. |
 | `begin_bucket_delete` | bucket PG | Partial exact-command conflicts are retryable only after validating exact command bytes plus matching `previous_log_hash` and `log_hash` across applied rows. Divergent same-index rows fail closed. | Bucket deletion is special because a failed finish can make the bucket visible as `Deleting` and allow a queued finalizer to remove it before an SDK retry. |
-| `delete_completed_multipart_upload_record_with_command` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | Used as cleanup after completed MPU retention decisions. |
-| `reserve_completed_multipart_upload_order` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | The returned order must come from a terminal bucket-PG command. |
-| `drain_pending_metadata_command_pg_slot` and `drain_pending_completed_multipart_sequence_command` | bucket PG drain | Fail closed on unsafe finish conflicts. | These are generic drain helpers; they must not hide divergent command-log state from the caller. |
-| `finish_pending_command_for_completed_multipart_order` | bucket/object PG drain | Follows the command family finisher. | Multi-PG MPU completion must not hold ambiguous pending state across PGs; Phase 9.3 pins the multipart serialization rules. |
+| `establish_multipart_completion_barrier` | bucket PG | Fail closed after partial apply; zero-apply command may be abandoned. | The returned idempotence sequence must come from a fresh terminal bucket-PG barrier built after all pre-existing pending commands are drained under the current request. |
+| `drain_pending_metadata_command_pg_slot` and `drain_pending_multipart_completion_barrier_command` | bucket PG drain | Fail closed on unsafe finish conflicts. | These are generic drain helpers; they must not hide divergent command-log state from the caller. |
+| `finish_pending_command_for_multipart_completion_barrier` | bucket/object PG drain | Follows the command family finisher. | Multi-PG MPU completion must not hold ambiguous pending state across PGs; Phase 9.3 pins the multipart serialization rules. |
 
 The boundary script inventories production uses of
 `MetadataCommandLogConflict` and `metadata_command_log_conflict_matches`.
@@ -439,9 +439,9 @@ Phase 9.2 defines PG-local command streams. It does not provide cross-PG
 transactions.
 
 Some request flows already sequence commands across more than one PG. For
-example, multipart completion can reserve completed-upload order on the bucket
-PG and then commit object metadata on the object PG. These flows must use a
-deterministic PG order and explicit retry cleanup. They must not leave
+example, multipart completion establishes its bucket-PG barrier and then commits
+object metadata on the object PG. These flows must use a deterministic PG order
+and explicit retry cleanup. They must not leave
 ambiguous pending slots on multiple PGs where either PG cannot decide whether
 to converge or abandon its own command independently.
 

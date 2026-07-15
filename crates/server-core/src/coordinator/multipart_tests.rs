@@ -5,10 +5,7 @@ use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
 use std::sync::Arc;
-use storage::{
-    install_bucket_scoped_test_hooks, BucketScopedTestHooks, EcShape, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord,
-};
+use storage::{EcShape, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord};
 
 fn create_bucket_with_explicit_writer_grant(
     coord: &Coordinator,
@@ -3367,8 +3364,8 @@ fn abort_multipart_upload_idempotent() {
         ))
         .unwrap();
 
-    // Second abort: upload is already deleted, returns UploadNotFound.
-    let err = coord
+    // AWS treats AbortMultipartUpload as idempotently successful for an issued ID.
+    coord
         .abort_multipart_upload(&multipart_object_request_with_expected_owner(
             "bucket",
             "key",
@@ -3376,11 +3373,7 @@ fn abort_multipart_upload_idempotent() {
             test_requester(),
             None,
         ))
-        .unwrap_err();
-    assert!(
-        matches!(err, ServerError::NoSuchUpload { .. }),
-        "expected UploadNotFound on second abort, got {err:?}"
-    );
+        .unwrap();
 }
 
 #[test]
@@ -3614,91 +3607,6 @@ fn abort_completed_multipart_upload_after_overwrite_succeeds() {
         })
         .unwrap();
     assert_eq!(object.body.read_all().unwrap(), b"second");
-}
-
-#[test]
-fn completed_multipart_tombstone_prune_limit_is_global_across_object_pgs() {
-    let tmp = test_util::tempdir();
-    let coord = setup_coordinator_with_pg_count(tmp.path(), METADATA_FANOUT_TEST_PG_COUNT);
-    coord
-        .create_bucket_for_owner("default-owner", "bucket", false)
-        .unwrap();
-
-    let older_key = find_key_with_object_pg_eq_bucket_pg(&coord, "bucket", "bucket-pg");
-    let newer_key = find_key_with_object_pg_ne_bucket_pg(&coord, "bucket", "other-pg");
-    assert!(object_pgs_differ(&coord, "bucket", &older_key, &newer_key));
-
-    let (older_upload_id, older_parts) =
-        create_upload_with_parts(&coord, "bucket", &older_key, &[(1, b"older")]);
-    coord
-        .complete_multipart_upload(&CompleteMultipartUploadRequest {
-            upload: multipart_object_request_with_expected_owner(
-                "bucket",
-                &older_key,
-                &older_upload_id,
-                test_requester(),
-                None,
-            ),
-            parts: &older_parts,
-            claimed_checksum: None,
-
-            expected_object_size: None,
-
-            cond: &WriteCondition::default(),
-
-            sse_customer: None,
-        })
-        .unwrap();
-
-    let (newer_upload_id, newer_parts) =
-        create_upload_with_parts(&coord, "bucket", &newer_key, &[(1, b"newer")]);
-    coord
-        .complete_multipart_upload(&CompleteMultipartUploadRequest {
-            upload: multipart_object_request_with_expected_owner(
-                "bucket",
-                &newer_key,
-                &newer_upload_id,
-                test_requester(),
-                None,
-            ),
-            parts: &newer_parts,
-            claimed_checksum: None,
-
-            expected_object_size: None,
-
-            cond: &WriteCondition::default(),
-
-            sse_customer: None,
-        })
-        .unwrap();
-
-    coord
-        .prune_completed_multipart_uploads_for_bucket_with_limit(&trusted_bucket_name("bucket"), 1)
-        .unwrap();
-
-    let err = coord
-        .abort_multipart_upload(&multipart_object_request_with_expected_owner(
-            "bucket",
-            &older_key,
-            &older_upload_id,
-            test_requester(),
-            None,
-        ))
-        .unwrap_err();
-    assert!(
-        matches!(err, ServerError::NoSuchUpload { .. }),
-        "expected NoSuchUpload for globally pruned tombstone, got {err:?}"
-    );
-
-    coord
-        .abort_multipart_upload(&multipart_object_request_with_expected_owner(
-            "bucket",
-            &newer_key,
-            &newer_upload_id,
-            test_requester(),
-            None,
-        ))
-        .unwrap();
 }
 
 #[test]
@@ -8899,200 +8807,6 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
             object: object_version_request_with_expected_owner(
                 "bucket",
                 "key",
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: NO_READ,
-        })
-        .unwrap();
-    assert_eq!(object.body.read_all().unwrap(), data1);
-}
-
-#[test]
-fn complete_multipart_upload_prune_failure_still_cleans_omitted_streamed_part() {
-    let _serial = STORAGE_TEST_HOOK_SERIAL
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap();
-    let dir = test_util::tempdir();
-    let coord = setup_coordinator(dir.path());
-    let bucket_name = "bucket-prune-failure-omitted-cleanup";
-    let key_name = "key";
-    coord
-        .create_bucket_for_owner("default-owner", bucket_name, false)
-        .unwrap();
-
-    let mpu = coord
-        .create_multipart_upload(&CreateMultipartUploadRequest {
-            object: object_request_with_expected_owner(
-                bucket_name,
-                key_name,
-                test_requester(),
-                None,
-            ),
-            metadata: &MetadataBlob::new(),
-            system_metadata: &SystemMetadata::EMPTY,
-            tags: None,
-            checksum: None,
-            acl: NO_PUT_OBJECT_ACL.into(),
-            encryption: WriteEncryptionRequest::none(),
-            object_lock: ObjectLockState::default(),
-            policy_context: PutObjectPolicyContext::default(),
-        })
-        .unwrap();
-
-    let session1 = begin_stream_part_test(&coord, bucket_name, key_name, &mpu.upload_id, 1)
-        .unwrap()
-        .session_id;
-    let session2 = begin_stream_part_test(&coord, bucket_name, key_name, &mpu.upload_id, 2)
-        .unwrap()
-        .session_id;
-    let data1 = b"selected streamed part";
-    let data2 = b"omitted streamed part";
-    coord
-        .append_plaintext_stream_segment_for_test(bucket_name, key_name, &session1, 0, data1)
-        .unwrap();
-    coord
-        .append_plaintext_stream_segment_for_test(bucket_name, key_name, &session2, 0, data2)
-        .unwrap();
-
-    let part1 = coord
-        .finalize_stream_part(FinalizeStreamPartRequest {
-            upload: multipart_object_request(
-                bucket_name,
-                key_name,
-                &mpu.upload_id,
-                test_requester(),
-            ),
-            session_id: &session1,
-            part_number: 1,
-            crc64: checksum::crc64::checksum(data1),
-            total_size: data1.len() as u64,
-            claimed_checksum: None,
-            computed_checksum: None,
-        })
-        .unwrap();
-    coord
-        .finalize_stream_part(FinalizeStreamPartRequest {
-            upload: multipart_object_request(
-                bucket_name,
-                key_name,
-                &mpu.upload_id,
-                test_requester(),
-            ),
-            session_id: &session2,
-            part_number: 2,
-            crc64: checksum::crc64::checksum(data2),
-            total_size: data2.len() as u64,
-            claimed_checksum: None,
-            computed_checksum: None,
-        })
-        .unwrap();
-
-    let bucket = trusted_bucket_name(bucket_name);
-    let key = trusted_object_key(key_name);
-    let before_segments = coord
-        .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
-        .unwrap();
-    let part2_segments: Vec<_> = before_segments
-        .iter()
-        .filter(|segment| segment.part_number == 2)
-        .cloned()
-        .collect();
-    assert_eq!(part2_segments.len(), 1);
-    let part2_shards: Vec<_> = part2_segments
-        .iter()
-        .flat_map(|segment| {
-            (0..(segment.ec_k + segment.ec_m)).map(|shard_index| {
-                (
-                    segment.data_pg_id,
-                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), shard_index),
-                )
-            })
-        })
-        .collect();
-
-    let _prune_hook = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
-        target: Some(bucket.clone()),
-        before_completed_multipart_prune: Some(Arc::new(|| {
-            Err(storage::ObjectPgActionError::InvalidRequest {
-                reason: "injected completed multipart prune failure".to_string(),
-            })
-        })),
-        ..BucketScopedTestHooks::default()
-    });
-
-    let err = coord
-        .complete_multipart_upload(&CompleteMultipartUploadRequest {
-            upload: multipart_object_request_with_expected_owner(
-                bucket_name,
-                key_name,
-                &mpu.upload_id,
-                test_requester(),
-                None,
-            ),
-            parts: &[CompletePart {
-                part_number: 1,
-                etag: part1.etag.clone(),
-                checksum: None,
-            }],
-            claimed_checksum: None,
-            expected_object_size: None,
-            cond: &WriteCondition::default(),
-            sse_customer: None,
-        })
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            ServerError::InvalidRequest { ref reason }
-                if reason == "injected completed multipart prune failure"
-        ),
-        "expected injected prune failure, got {err:?}"
-    );
-
-    let after_segments = coord
-        .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
-        .unwrap();
-    assert!(
-        after_segments
-            .iter()
-            .all(|segment| segment.part_number != 2),
-        "omitted part segment rows must be deleted even when prune fails"
-    );
-    for (pg_id, shard_key) in &part2_shards {
-        assert!(
-            !coord
-                .storage_node()
-                .test_shard_exists(*pg_id, shard_key)
-                .unwrap(),
-            "omitted part shard metadata should be deleted even when prune fails"
-        );
-    }
-    for segment in &part2_segments {
-        assert_payload_shard_files_state(
-            &coord,
-            segment.data_pg_id,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-            &segment.segment_okh,
-            segment.segment_vid,
-            false,
-            "omitted streamed part after prune failure",
-        );
-    }
-
-    let object = coord
-        .get_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                bucket_name,
-                key_name,
                 None,
                 test_requester(),
                 None,

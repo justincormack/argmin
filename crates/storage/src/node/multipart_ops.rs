@@ -269,10 +269,8 @@ impl SharedStorageNode {
             Err(error) => return Err(error.into()),
         }
 
-        if let Some(completed) = pg.get_completed_multipart_upload(upload_id)? {
-            if completed.bucket == *bucket && completed.key == *key {
-                return Ok(MultipartUploadManagementLookup::Completed(completed));
-            }
+        if let Some(completed) = pg.get_multipart_completion_replay(bucket, key, upload_id)? {
+            return Ok(MultipartUploadManagementLookup::Replay(Box::new(completed)));
         }
         Ok(MultipartUploadManagementLookup::Missing)
     }

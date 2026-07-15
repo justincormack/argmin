@@ -192,8 +192,9 @@ DeleteBucket response boundary:
 
 - visible object versions and in-progress multipart uploads
 - payload reclaim roots
-- completed multipart-upload idempotence rows that must be pruned before the
-  bucket row is removed
+
+Completion replay does not add a separate finalization blocker: it is stored on
+the completed object version and disappears when that version is removed.
 
 Missing local queue wakeups are therefore performance issues, not correctness
 issues. A worker can make progress by polling/listing deleting buckets and
