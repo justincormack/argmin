@@ -299,10 +299,11 @@ Current narrow exception:
 - AWS itself expects those operations on the account-prefixed control-plane
   host `https://{account_id}.s3-control.{region}.amazonaws.com`
 - Argmin does not yet enforce that distinct AWS `s3-control` `Host` /
-  endpoint shape for those operations and still accepts them on the ordinary
-  S3 endpoint
-- this is a temporary compatibility compromise and may be tightened later once
-  the dedicated `s3-control` routing surface exists locally
+  endpoint shape or AWS's documented HTTPS-only S3 Control transport for those
+  operations and still accepts them on the ordinary S3 endpoint, including an
+  ordinary plain-HTTP listener
+- this is a temporary compatibility compromise that will be removed when the
+  dedicated typed `s3-control` routing surface exists locally
 
 Unsupported URL/addressing forms include:
 
@@ -454,8 +455,9 @@ Current narrow exception:
 - AWS-pinned control-plane behavior uses the account-prefixed host
   `https://{account_id}.s3-control.{region}.amazonaws.com`
 - locally they are still accepted on the ordinary S3 endpoint without distinct
-  `s3-control` host validation
-- this is intentionally temporary and may be tightened later
+  `s3-control` host or HTTPS-only transport validation
+- this is intentionally temporary and will be removed by the typed
+  `s3-control` routing work
 
 In practice, any AWS behavior that depends on `s3-control` APIs, endpoint
 routing, or control-plane state such as `TagResource` / `UntagResource` should

@@ -176,6 +176,8 @@ References:
 - <https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html>
 - <https://docs.aws.amazon.com/STS/latest/APIReference/API_Credentials.html>
 - <https://docs.aws.amazon.com/STS/latest/APIReference/CommonParameters.html>
+- <https://docs.aws.amazon.com/general/latest/gr/sts.html>
+- <https://docs.aws.amazon.com/general/latest/gr/s3.html>
 - <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_identifiers.html>
 - <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_elements_principal.html>
 - <https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-keys.html>
@@ -686,7 +688,13 @@ endpoint classification:
 
 For the first slice, STS uses the same bound address, port, TLS configuration,
 admission control, request IDs, and worker pool as S3. A custom AWS SDK STS
-endpoint URL can therefore point at the existing S3 endpoint.
+endpoint URL can therefore point at the existing S3 endpoint when that listener
+uses TLS. AWS documents ordinary S3 regional endpoints as supporting HTTP and
+HTTPS, but documents both S3 Control and STS endpoints as HTTPS-only. The
+shared listener may continue serving ordinary S3 over plain HTTP only when the
+S3 Control and STS service routes are disabled; enabling either service requires
+a TLS listener. This transport rule is part of endpoint classification and must
+be checked before service authentication or operation parsing.
 
 Represent the origin of classification explicitly as a typed endpoint kind,
 not as an inferred string inside an operation parser. The oracle has distinct
@@ -1832,6 +1840,18 @@ Control returns HTTP 200 with only the two normal AWS request-ID headers and no
 `ListTagsForResource` success and its distinct response renderer; the Phase 4
 refactor must not implement it as an alias for the normal S3 tagging operation.
 
+The endpoint-transport review completed on 2026-07-15. AWS's endpoint tables
+list ordinary S3 regional endpoints as HTTP and HTTPS, but list S3 Control and
+STS as HTTPS-only. A safe unsigned live check found that the regional STS HTTP
+request timed out from the probe host, while an account-prefixed S3 Control
+HTTP request reached an AWS frontend and returned its normal unauthenticated
+`AccessDenied` envelope. No live credential was sent over HTTP, so the latter
+does not establish support for authenticated S3 Control operations and does
+not override the documented endpoint contract. The temporary AWS oracle now
+parses and requires HTTPS URLs for both endpoint families before loading
+credentials into its request signer; the shell wrapper independently rejects
+plaintext overrides before exporting credentials.
+
 The extension-method probes also observed that this outer AWS frontend can
 emit an unpadded uppercase hexadecimal `x-amz-request-id` shorter than the
 ordinary fixed-width S3 shape (15 and 16 characters were observed). Those two
@@ -1852,6 +1872,10 @@ approximated with a recognized method.
 The remaining path/percent/ARN near misses, account-ID variants,
 signing-service collisions, malformed operation bodies, and local Host/SNI
 trust-boundary cases remain required before the Phase 4 service refactor.
+The narrow current local `TagResource`/`UntagResource` routes still inherit the
+ordinary S3 listener's transport and are therefore a documented temporary gap;
+the typed Phase 4 endpoint refactor must remove that gap rather than inventing
+an operation-level HTTP error without an AWS transport contract.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations
@@ -1922,8 +1946,10 @@ involved.
   account-ID/signing/body/query collision goldens and the committed
   `SharedRegional` mapping above pin its pre-authentication and post-
   authentication boundaries, and after local Host/authority/SNI tests prove
-  attacker-controlled authority cannot change endpoint kind; then add bounded
-  Query protocol parsing
+  attacker-controlled authority cannot change endpoint kind; require the
+  configured listener to use TLS before enabling S3 Control or STS, while
+  preserving plain-HTTP support for an S3-only listener; then add bounded Query
+  protocol parsing
 - introduce typed S3 Control `ListTagsForResource`, `TagResource`, and
   `UntagResource` operations during that refactor, preserving their distinct
   authorization actions and wire renderers
@@ -2019,6 +2045,9 @@ in-memory role through AWS-compatible public APIs.
 ### Local integration tests
 
 - issue then immediately use temporary credentials on another worker
+- reject configuration that enables S3 Control or STS on a plain-HTTP listener;
+  run their endpoint-neutral conformance scenarios over the local TLS listener,
+  while retaining separate ordinary-S3 HTTP coverage
 - hold routed requests constant while varying `Host`/authority and prove
   `SharedRegional` is unchanged or the authority is rejected before service
   classification; cover configured-authority mismatch and TLS SNI/authority
@@ -2101,10 +2130,12 @@ consistent. Silently issuing credentials that work on only some frontends is
 unacceptable.
 
 STS should be disabled by default until the role/policy fixture is explicitly
-configured. Enabling it on plain HTTP is permitted only to the extent the main
-S3 endpoint permits plain HTTP, but documentation must call out that AssumeRole
-responses contain bearer credentials and therefore require TLS for
-confidentiality. No session response or request body may appear in traces.
+configured. Both STS and S3 Control require a TLS listener; startup must reject
+enabling either service on plain HTTP. An S3-only listener may still use plain
+HTTP because ordinary AWS S3 regional endpoints document both HTTP and HTTPS.
+`AssumeRole` responses contain bearer credentials, so this is a hard transport
+invariant rather than a documentation warning. No session response or request
+body may appear in traces.
 
 ## Remaining Decisions To Resolve During Phase 0
 

@@ -127,6 +127,24 @@ fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{name} must be set by scripts/aws-sts-oracle"))
 }
 
+fn validate_https_endpoint(name: &str, endpoint: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(endpoint)
+        .map_err(|error| format!("{name} must be a valid HTTPS URL: {error}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!("{name} must use https://"));
+    }
+    if parsed.host_str().is_none() {
+        return Err(format!("{name} must include a host"));
+    }
+    Ok(())
+}
+
+fn required_https_endpoint(name: &str) -> String {
+    let endpoint = required_env(name);
+    validate_https_endpoint(name, &endpoint).unwrap_or_else(|error| panic!("{error}"));
+    endpoint
+}
+
 fn sts_wire_shape(label: &str, response: &RawResponse) -> ShapeSpec {
     let request_id = response_header_value(response, "x-amzn-requestid")
         .filter(|value| !value.is_empty())
@@ -7085,11 +7103,8 @@ fn run_list_tags_for_resource_success_probe(
 }
 
 fn main() {
-    let endpoint = required_env("S3_TEST_STS_ENDPOINT");
-    assert!(
-        endpoint.starts_with("https://"),
-        "S3_TEST_STS_ENDPOINT must be an HTTPS AWS STS endpoint"
-    );
+    let endpoint = required_https_endpoint("S3_TEST_STS_ENDPOINT");
+    let s3_control_endpoint = required_https_endpoint("S3_TEST_S3_CONTROL_ENDPOINT");
     let access_key = required_env("S3_TEST_ACCESS_KEY");
     let secret_key = required_env("S3_TEST_SECRET_KEY");
     let account_id = required_env("S3_TEST_ACCOUNT_ID");
@@ -7100,7 +7115,6 @@ fn main() {
         region: &region,
         tls_ca_pem: None,
     };
-    let s3_control_endpoint = required_env("S3_TEST_S3_CONTROL_ENDPOINT");
     if let Ok(bucket) = env::var("S3_TEST_STS_POST_BUCKET") {
         run_list_tags_for_resource_success_probe(
             &endpoint,
@@ -7611,9 +7625,39 @@ mod tests {
     use super::{
         s3_post_response_with_sanitized_body, s3_response_with_sanitized_body,
         sign_s3_streaming_request, sign_s3_streaming_request_for_service, spaced_hex,
-        S3StreamingTokens,
+        validate_https_endpoint, S3StreamingTokens,
     };
     use s3_tests::{RawResponse, SignedRequestCredentials};
+
+    #[test]
+    fn aws_oracle_endpoints_require_valid_https_urls() {
+        assert!(validate_https_endpoint(
+            "S3_TEST_STS_ENDPOINT",
+            "https://sts.us-east-1.amazonaws.com"
+        )
+        .is_ok());
+        assert!(validate_https_endpoint(
+            "S3_TEST_S3_CONTROL_ENDPOINT",
+            "https://111122223333.s3-control.us-east-1.amazonaws.com"
+        )
+        .is_ok());
+
+        for (name, endpoint) in [
+            ("S3_TEST_STS_ENDPOINT", "http://sts.us-east-1.amazonaws.com"),
+            (
+                "S3_TEST_S3_CONTROL_ENDPOINT",
+                "http://111122223333.s3-control.us-east-1.amazonaws.com",
+            ),
+            ("S3_TEST_STS_ENDPOINT", "ftp://sts.us-east-1.amazonaws.com"),
+            ("S3_TEST_STS_ENDPOINT", "https://"),
+            ("S3_TEST_STS_ENDPOINT", "not-a-url"),
+        ] {
+            assert!(
+                validate_https_endpoint(name, endpoint).is_err(),
+                "unsafe endpoint unexpectedly accepted: {endpoint}"
+            );
+        }
+    }
 
     #[test]
     fn streaming_signer_canonicalizes_duplicate_tokens_in_wire_order() {

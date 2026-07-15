@@ -34,6 +34,13 @@ Examples:
 EOF
 }
 
+require_https_endpoint() {
+    local label="$1"
+    local value="$2"
+    [[ "$value" == https://?* ]] || \
+        external_s3_test_die "$label oracle endpoint must use https://"
+}
+
 assume_role=false
 cross_account=false
 expiry_collision=false
@@ -66,12 +73,14 @@ while (($#)); do
         --endpoint)
             [[ $# -ge 2 ]] || external_s3_test_die "--endpoint requires a value"
             endpoint="$2"
+            require_https_endpoint STS "$endpoint"
             shift 2
             ;;
         --s3-control-endpoint)
             [[ $# -ge 2 ]] || \
                 external_s3_test_die "--s3-control-endpoint requires a value"
             s3_control_endpoint="$2"
+            require_https_endpoint "S3 Control" "$s3_control_endpoint"
             shift 2
             ;;
         --dotenv)
@@ -105,6 +114,8 @@ endpoint="${endpoint:-https://sts.${region}.amazonaws.com}"
 endpoint="${endpoint%/}"
 s3_control_endpoint="${s3_control_endpoint:-${TEST_AWS_S3_CONTROL_ENDPOINT:-https://${TEST_AWS_PRIMARY_ACCOUNT_ID}.s3-control.${region}.amazonaws.com}}"
 s3_control_endpoint="${s3_control_endpoint%/}"
+require_https_endpoint STS "$endpoint"
+require_https_endpoint "S3 Control" "$s3_control_endpoint"
 
 export S3_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY"
 export S3_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
