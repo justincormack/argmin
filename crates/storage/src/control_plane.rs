@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::num::NonZeroU64;
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,6 +52,7 @@ const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 23;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
@@ -8442,6 +8445,248 @@ impl FencedPgMetadataTransferRuntimeMap {
     }
 }
 
+fn unix_io_timeout_error() -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::TimedOut,
+        "control-plane Unix RPC deadline expired",
+    )
+}
+
+fn unix_io_remaining(deadline: Instant) -> Result<Duration, std::io::Error> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(unix_io_timeout_error());
+    }
+    Ok(remaining)
+}
+
+fn connect_unix_stream_until(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+    unix_io_remaining(deadline)?;
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.contains(&0) {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "control-plane Unix socket path contains NUL",
+        ));
+    }
+
+    // SAFETY: sockaddr_un is a plain C address structure and zero is a valid
+    // initialization before its family and path fields are populated.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if path_bytes.len() >= address.sun_path.len() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "control-plane Unix socket path is too long",
+        ));
+    }
+    address.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX)
+        .expect("AF_UNIX fits the platform socket-family field");
+    // SAFETY: the length check above proves the source plus its zero terminator
+    // fits sun_path, which was zero-initialized.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            path_bytes.len(),
+        );
+    }
+    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        .checked_add(path_bytes.len())
+        .and_then(|len| len.checked_add(1))
+        .and_then(|len| libc::socklen_t::try_from(len).ok())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "control-plane Unix socket address length overflowed",
+            )
+        })?;
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        address.sun_len = u8::try_from(address_len).map_err(|_| {
+            std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "control-plane Unix socket address is too long",
+            )
+        })?;
+    }
+
+    // SAFETY: AF_UNIX/SOCK_STREAM has no additional pointer arguments.
+    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: raw_fd was returned as a new owned descriptor above.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    set_unix_connect_descriptor_flags(&fd)?;
+
+    // SAFETY: address points to an initialized sockaddr_un and address_len
+    // covers exactly its family, path bytes, and zero terminator.
+    let connect_result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            address_len,
+        )
+    };
+    if connect_result != 0 {
+        let error = std::io::Error::last_os_error();
+        let raw_error = error.raw_os_error();
+        if raw_error != Some(libc::EINPROGRESS)
+            && raw_error != Some(libc::EAGAIN)
+            && raw_error != Some(libc::EWOULDBLOCK)
+            && raw_error != Some(libc::EINTR)
+        {
+            return Err(error);
+        }
+        wait_for_unix_connect(&fd, deadline)?;
+    }
+    clear_unix_connect_nonblocking(&fd)?;
+    Ok(UnixStream::from(fd))
+}
+
+fn set_unix_connect_descriptor_flags(fd: &OwnedFd) -> std::io::Result<()> {
+    // SAFETY: fcntl operates on the live descriptor owned by fd.
+    let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFD consumes an integer flag value, not a pointer.
+    if unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_SETFD,
+            descriptor_flags | libc::FD_CLOEXEC,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl operates on the live descriptor owned by fd.
+    let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if status_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL consumes an integer flag value, not a pointer.
+    if unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_SETFL,
+            status_flags | libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn clear_unix_connect_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
+    // SAFETY: fcntl operates on the live descriptor owned by fd.
+    let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if status_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL consumes an integer flag value, not a pointer.
+    if unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_SETFL,
+            status_flags & !libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn wait_for_unix_connect(fd: &OwnedFd, deadline: Instant) -> std::io::Result<()> {
+    loop {
+        let remaining = unix_io_remaining(deadline)?;
+        let timeout_ms = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(u128::try_from(i32::MAX).expect("i32::MAX fits u128"));
+        let timeout_ms = i32::try_from(timeout_ms).expect("poll timeout was clamped to i32::MAX");
+        let mut poll_fd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: poll_fd points to one initialized pollfd for the duration of
+        // the call.
+        let poll_result = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
+        if poll_result == 0 {
+            return Err(unix_io_timeout_error());
+        }
+        if poll_result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+
+        let mut socket_error = 0;
+        let mut socket_error_len = libc::socklen_t::try_from(std::mem::size_of_val(&socket_error))
+            .expect("socket error length fits socklen_t");
+        // SAFETY: both output pointers reference initialized writable values
+        // of the lengths passed to getsockopt.
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&raw mut socket_error).cast(),
+                &raw mut socket_error_len,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if socket_error != 0 {
+            return Err(std::io::Error::from_raw_os_error(socket_error));
+        }
+        return Ok(());
+    }
+}
+
+struct DeadlineUnixStream<'a> {
+    stream: &'a mut UnixStream,
+    deadline: Instant,
+}
+
+impl DeadlineUnixStream<'_> {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        unix_io_remaining(self.deadline)
+    }
+}
+
+impl std::io::Read for DeadlineUnixStream<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(buffer)
+    }
+}
+
+impl std::io::Write for DeadlineUnixStream<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.flush()
+    }
+}
+
 impl UnixControlPlaneClient {
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
@@ -8518,7 +8763,7 @@ impl UnixControlPlaneClient {
         let mut last_routing_error = None;
         for _ in 0..self.socket_paths.len() {
             let response_payload =
-                self.send_request_raw_response_with_read_timeout(kind, payload, read_timeout)?;
+                self.send_request_raw_response_with_timeout(kind, payload, read_timeout)?;
             match decode_control_plane_rpc_response(response_payload) {
                 Err(error) if error.is_control_plane_leader_routing_rejection() => {
                     last_routing_error = Some(error);
@@ -8530,18 +8775,27 @@ impl UnixControlPlaneClient {
         Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
     }
 
-    fn send_request_raw_response_with_read_timeout(
+    fn send_request_raw_response_with_timeout(
         &self,
         kind: ControlPlaneRpcKind,
         payload: &[u8],
-        read_timeout: Duration,
+        io_timeout: Duration,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.send_request_raw_response_until(kind, payload, Instant::now() + io_timeout)
+    }
+
+    fn send_request_raw_response_until(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        deadline: Instant,
     ) -> Result<Vec<u8>, ControlPlaneError> {
         let start = self.preferred_socket_index();
         let mut stream = None;
         let mut last_connect_error = None;
         for offset in 0..self.socket_paths.len() {
             let socket_index = (start + offset) % self.socket_paths.len();
-            match UnixStream::connect(&self.socket_paths[socket_index]) {
+            match connect_unix_stream_until(&self.socket_paths[socket_index], deadline) {
                 Ok(connected) => {
                     self.prefer_socket_index(socket_index);
                     stream = Some(connected);
@@ -8559,18 +8813,10 @@ impl UnixControlPlaneClient {
         let mut stream = stream.ok_or_else(|| {
             last_connect_error.expect("endpoint set is non-empty and every connect failed")
         })?;
-        stream
-            .set_read_timeout(Some(read_timeout))
-            .map_err(|source| ControlPlaneError::Io {
-                context: "set control-plane client read timeout",
-                source,
-            })?;
-        stream
-            .set_write_timeout(Some(CONTROL_PLANE_RPC_IO_TIMEOUT))
-            .map_err(|source| ControlPlaneError::Io {
-                context: "set control-plane client write timeout",
-                source,
-            })?;
+        let mut stream = DeadlineUnixStream {
+            stream: &mut stream,
+            deadline,
+        };
         write_control_plane_rpc_frame(&mut stream, kind, payload)?;
         let (response_kind, response_payload) = read_control_plane_rpc_frame(&mut stream)?;
         if response_kind != kind {
@@ -8691,7 +8937,7 @@ impl UnixControlPlaneClient {
                 };
             }
             let read_timeout = remaining.min(CONTROL_PLANE_RPC_LIVENESS_IO_TIMEOUT);
-            match self.send_request_raw_response_with_read_timeout(kind, payload, read_timeout) {
+            match self.send_request_raw_response_with_timeout(kind, payload, read_timeout) {
                 Ok(payload) => return Ok(payload),
                 Err(error) if error.is_retryable_control_plane_rpc_transport_error() => {
                     let now = Instant::now();
@@ -9275,10 +9521,10 @@ impl AuthenticatedUnixControlPlaneClient {
         &self.credential
     }
 
-    fn send_verified_request_with_endpoint_failover<B, V>(
+    fn send_verified_request_with_endpoint_failover_until<B, V>(
         &self,
         kind: ControlPlaneRpcKind,
-        read_timeout: Duration,
+        deadline: Instant,
         mut build_payload: B,
         mut verify_response: V,
     ) -> Result<Vec<u8>, ControlPlaneError>
@@ -9289,11 +9535,19 @@ impl AuthenticatedUnixControlPlaneClient {
         let mut last_routing_error = None;
         for _ in 0..self.inner.socket_paths.len() {
             let payload = build_payload()?;
-            let response = self.inner.send_request_raw_response_with_read_timeout(
-                kind,
-                &payload,
-                read_timeout,
-            )?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last_routing_error.unwrap_or_else(|| ControlPlaneError::Io {
+                    context: "control-plane RPC endpoint failover deadline",
+                    source: std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        format!("{kind:?} endpoint failover deadline expired"),
+                    ),
+                }));
+            }
+            let response = self
+                .inner
+                .send_request_raw_response_until(kind, &payload, deadline)?;
             let response = verify_response(&response)?;
             match decode_control_plane_rpc_response(response) {
                 Err(error) if error.is_control_plane_leader_routing_rejection() => {
@@ -9371,10 +9625,10 @@ impl AuthenticatedUnixControlPlaneClient {
     ) -> Result<Vec<u8>, ControlPlaneError> {
         // The server signs after dispatch, so verify against a fresh receive-time wall sample.
         // Projecting the request timestamp with elapsed monotonic time diverges after a wall step.
-        self.send_admin_request_with_read_timeout_and_clocks(
+        self.send_admin_request_until_and_clocks(
             kind,
             payload,
-            read_timeout,
+            Instant::now() + read_timeout,
             || Ok(authority_now_ms),
             || Ok(crate::clock::current_time_millis()),
         )
@@ -9395,11 +9649,9 @@ impl AuthenticatedUnixControlPlaneClient {
         for _ in 0..self.inner.socket_paths.len() {
             let request =
                 self.sign_admin_control_plane_request(kind, authority_now_ms()?, payload.clone())?;
-            let response = self.inner.send_request_raw_response_with_read_timeout(
-                kind,
-                &request,
-                read_timeout,
-            )?;
+            let response =
+                self.inner
+                    .send_request_raw_response_with_timeout(kind, &request, read_timeout)?;
             let response =
                 self.verify_admin_control_plane_response(kind, authority_now_ms()?, &response)?;
             match decode_control_plane_rpc_response(response) {
@@ -9413,11 +9665,33 @@ impl AuthenticatedUnixControlPlaneClient {
         Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
     }
 
+    #[cfg(test)]
     fn send_admin_request_with_read_timeout_and_clocks<R, S>(
         &self,
         kind: ControlPlaneRpcKind,
         payload: Vec<u8>,
         read_timeout: Duration,
+        request_authority_now_ms: R,
+        response_authority_now_ms: S,
+    ) -> Result<Vec<u8>, ControlPlaneError>
+    where
+        R: FnMut() -> Result<u64, ControlPlaneError>,
+        S: FnMut() -> Result<u64, ControlPlaneError>,
+    {
+        self.send_admin_request_until_and_clocks(
+            kind,
+            payload,
+            Instant::now() + read_timeout,
+            request_authority_now_ms,
+            response_authority_now_ms,
+        )
+    }
+
+    fn send_admin_request_until_and_clocks<R, S>(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: Vec<u8>,
+        deadline: Instant,
         mut request_authority_now_ms: R,
         mut response_authority_now_ms: S,
     ) -> Result<Vec<u8>, ControlPlaneError>
@@ -9425,9 +9699,9 @@ impl AuthenticatedUnixControlPlaneClient {
         R: FnMut() -> Result<u64, ControlPlaneError>,
         S: FnMut() -> Result<u64, ControlPlaneError>,
     {
-        self.send_verified_request_with_endpoint_failover(
+        self.send_verified_request_with_endpoint_failover_until(
             kind,
-            read_timeout,
+            deadline,
             || {
                 self.sign_admin_control_plane_request(
                     kind,
@@ -9455,9 +9729,9 @@ impl AuthenticatedUnixControlPlaneClient {
         write_pg_id_request(&mut payload, pg_id);
         let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
         let response = loop {
-            match self.send_verified_request_with_endpoint_failover(
+            match self.send_verified_request_with_endpoint_failover_until(
                 ControlPlaneRpcKind::PgRuntimeMapSnapshot,
-                read_timeout,
+                Instant::now() + read_timeout,
                 || {
                     self.sign_admin_control_plane_request(
                         ControlPlaneRpcKind::PgRuntimeMapSnapshot,
@@ -9971,12 +10245,25 @@ impl AuthenticatedUnixControlPlaneClient {
         &self,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        self.authority_clock_status_until(
+            authority_now_ms,
+            Instant::now() + CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT,
+        )
+    }
+
+    fn authority_clock_status_until(
+        &self,
+        authority_now_ms: u64,
+        deadline: Instant,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
         for attempt in 0..self.inner.socket_paths.len() {
-            let payload = self.send_admin_request_with_read_timeout(
+            authority_clock_admin_remaining(deadline)?;
+            let payload = self.send_admin_request_until_and_clocks(
                 ControlPlaneRpcKind::AuthorityClockStatus,
-                authority_now_ms,
                 Vec::new(),
-                CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT,
+                deadline,
+                || Ok(authority_now_ms),
+                || Ok(crate::clock::current_time_millis()),
             )?;
             let mut reader = PayloadReader::new(&payload);
             let status = read_authority_clock_status(&mut reader)?;
@@ -9996,16 +10283,19 @@ impl AuthenticatedUnixControlPlaneClient {
         &self,
         expected: ControlPlaneAuthorityClockStatus,
         authority_now_ms: u64,
+        deadline: Instant,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
         let mut payload = Vec::new();
         write_u64(&mut payload, expected.generation());
         write_option_u64(&mut payload, expected.committed_timestamp_high_water_ms());
         write_option_u64(&mut payload, expected.current_raft_leadership_term());
-        let payload = self.send_admin_request_with_read_timeout(
+        authority_clock_admin_remaining(deadline)?;
+        let payload = self.send_admin_request_until_and_clocks(
             ControlPlaneRpcKind::ReestablishAuthorityClock,
-            authority_now_ms,
             payload,
-            CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT,
+            deadline,
+            || Ok(authority_now_ms),
+            || Ok(crate::clock::current_time_millis()),
         )?;
         let mut reader = PayloadReader::new(&payload);
         let status = read_authority_clock_status(&mut reader)?;
@@ -10018,41 +10308,55 @@ impl AuthenticatedUnixControlPlaneClient {
         authority_now_ms: u64,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
         let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
-        let expected = self.authority_clock_status(retry_clock.now_ms())?;
-        if expected.established() {
-            return Ok(expected);
-        }
-        match self.reestablish_authority_clock_from_status(expected, retry_clock.now_ms()) {
-            Ok(status) => Ok(status),
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                let observed = self.authority_clock_status(retry_clock.now_ms()).map_err(
-                    |status_error| ControlPlaneError::RpcUnconfirmed {
-                        message: format!(
-                            "authority-clock re-establishment response was lost ({error}); status confirmation failed: {status_error}"
-                        ),
-                    },
-                )?;
-                let expected_generation = expected
-                    .generation()
-                    .checked_add(1)
-                    .ok_or(ControlPlaneError::AuthorityClockGenerationOverflow)?;
-                if observed.established()
-                    && observed.generation() == expected_generation
-                    && observed.committed_timestamp_high_water_ms()
-                        == expected.committed_timestamp_high_water_ms()
-                    && observed.current_raft_leadership_term()
-                        == expected.current_raft_leadership_term()
-                {
-                    Ok(observed)
-                } else {
-                    Err(ControlPlaneError::RpcUnconfirmed {
+        let retry_deadline = Instant::now() + CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT;
+        loop {
+            let expected =
+                self.authority_clock_status_until(retry_clock.now_ms(), retry_deadline)?;
+            if expected.established() {
+                return Ok(expected);
+            }
+            match self.reestablish_authority_clock_from_status(
+                expected,
+                retry_clock.now_ms(),
+                retry_deadline,
+            ) {
+                Ok(status) => return Ok(status),
+                Err(error) if error.is_control_plane_leader_routing_rejection() => {
+                    let remaining =
+                        authority_clock_admin_remaining(retry_deadline).map_err(|_| error)?;
+                    std::thread::sleep(
+                        CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF.min(remaining),
+                    );
+                }
+                Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                    let observed = self
+                        .authority_clock_status_until(retry_clock.now_ms(), retry_deadline)
+                        .map_err(|status_error| ControlPlaneError::RpcUnconfirmed {
+                            message: format!(
+                                "authority-clock re-establishment response was lost ({error}); status confirmation failed: {status_error}"
+                            ),
+                        })?;
+                    let expected_generation = expected
+                        .generation()
+                        .checked_add(1)
+                        .ok_or(ControlPlaneError::AuthorityClockGenerationOverflow)?;
+                    if observed.established()
+                        && observed.generation() == expected_generation
+                        && observed.committed_timestamp_high_water_ms()
+                            == expected.committed_timestamp_high_water_ms()
+                        && observed.current_raft_leadership_term()
+                            == expected.current_raft_leadership_term()
+                    {
+                        return Ok(observed);
+                    }
+                    return Err(ControlPlaneError::RpcUnconfirmed {
                         message: format!(
                             "authority-clock re-establishment response was lost ({error}); observed status did not confirm the expected generation and authority state"
                         ),
-                    })
+                    });
                 }
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -10091,11 +10395,9 @@ impl AuthenticatedUnixControlPlaneClient {
             for _ in 0..self.inner.socket_paths.len() {
                 let request =
                     self.sign_read_only_request(kind, authority_now_ms()?, payload.clone())?;
-                let response = self.inner.send_request_raw_response_with_read_timeout(
-                    kind,
-                    &request,
-                    read_timeout,
-                );
+                let response =
+                    self.inner
+                        .send_request_raw_response_with_timeout(kind, &request, read_timeout);
                 let response = match response {
                     Ok(response) => response,
                     Err(error)
@@ -11291,6 +11593,16 @@ fn unconfirmed_raft_admin_trigger(
     }
 }
 
+fn authority_clock_admin_remaining(deadline: Instant) -> Result<Duration, ControlPlaneError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ControlPlaneError::RpcRemote {
+            message: "authority-clock admin operation deadline expired".to_owned(),
+        });
+    }
+    Ok(remaining)
+}
+
 fn metadata_transfer_fence_observable(
     runtime_map: &ClusterRuntimeMapSnapshot,
     pg_id: PgId,
@@ -12411,7 +12723,7 @@ where
 }
 
 fn write_control_plane_rpc_frame(
-    stream: &mut UnixStream,
+    stream: &mut impl std::io::Write,
     kind: ControlPlaneRpcKind,
     payload: &[u8],
 ) -> Result<(), ControlPlaneError> {
@@ -12447,7 +12759,7 @@ fn write_control_plane_rpc_frame(
 }
 
 fn read_control_plane_rpc_frame(
-    stream: &mut UnixStream,
+    stream: &mut impl std::io::Read,
 ) -> Result<(ControlPlaneRpcKind, Vec<u8>), ControlPlaneError> {
     let mut magic = vec![0; CONTROL_PLANE_RPC_MAGIC.len()];
     stream
@@ -21167,6 +21479,81 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_endpoint_failover_rejects_exhausted_aggregate_budget_before_transport() {
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new("unused-test-socket"),
+            frontend_auth_credential("auth-cluster", "frontend-1"),
+        );
+
+        let error = client
+            .send_verified_request_with_endpoint_failover_until(
+                ControlPlaneRpcKind::RuntimeMapStatus,
+                Instant::now() - Duration::from_millis(1),
+                || Ok(Vec::new()),
+                |_| Ok(Vec::new()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::Io { context, source }
+                if context == "control-plane RPC endpoint failover deadline"
+                    && source.kind() == ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn unix_control_plane_connect_rejects_expired_aggregate_budget_before_transport() {
+        let error = connect_unix_stream_until(
+            Path::new("unused-test-socket"),
+            Instant::now() - Duration::from_millis(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn unix_control_plane_frame_io_rechecks_expired_aggregate_budget() {
+        let (mut write_stream, mut write_peer) = UnixStream::pair().unwrap();
+        let mut write_stream = DeadlineUnixStream {
+            stream: &mut write_stream,
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+        let write_error = write_control_plane_rpc_frame(
+            &mut write_stream,
+            ControlPlaneRpcKind::RuntimeMapSnapshot,
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            write_error,
+            ControlPlaneError::Io { context, source }
+                if context == "write control-plane RPC magic"
+                    && source.kind() == ErrorKind::TimedOut
+        ));
+        write_peer.set_nonblocking(true).unwrap();
+        let mut unexpected_byte = [0_u8; 1];
+        assert!(matches!(
+            write_peer.read(&mut unexpected_byte),
+            Err(error) if error.kind() == ErrorKind::WouldBlock
+        ));
+
+        let (mut read_stream, _read_peer) = UnixStream::pair().unwrap();
+        let mut read_stream = DeadlineUnixStream {
+            stream: &mut read_stream,
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+        let read_error = read_control_plane_rpc_frame(&mut read_stream).unwrap_err();
+        assert!(matches!(
+            read_error,
+            ControlPlaneError::Io { context, source }
+                if context == "read control-plane RPC magic"
+                    && source.kind() == ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
     fn authenticated_admission_error_preserves_explicit_routing_rejection() {
         let credential = frontend_auth_credential("auth-cluster", "frontend-1");
         let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
@@ -22223,6 +22610,126 @@ mod tests {
         assert!(status.established());
         let server_status = server.join().unwrap();
         assert_eq!(status, server_status);
+    }
+
+    #[test]
+    fn authenticated_authority_clock_recovery_checks_deadline_before_each_rpc() {
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new("unused-test-socket"),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let expired = Instant::now() - Duration::from_millis(1);
+        let expected = ControlPlaneAuthorityClockStatus {
+            generation: 7,
+            established: false,
+            blocked_reason: Some(ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged),
+            committed_timestamp_high_water_ms: Some(1_000),
+            bound_raft_leadership_term: None,
+            current_raft_leadership_term: Some(3),
+            local_raft_authority_leader: true,
+            local_raft_authority_serving: true,
+        };
+
+        let status_error = client
+            .authority_clock_status_until(2_000, expired)
+            .unwrap_err();
+        let mutation_error = client
+            .reestablish_authority_clock_from_status(expected, 2_000, expired)
+            .unwrap_err();
+
+        assert!(matches!(
+            status_error,
+            ControlPlaneError::RpcRemote { ref message }
+                if message.contains("authority-clock admin operation deadline expired")
+        ));
+        assert!(matches!(
+            mutation_error,
+            ControlPlaneError::RpcRemote { ref message }
+                if message.contains("authority-clock admin operation deadline expired")
+        ));
+    }
+
+    #[test]
+    fn authenticated_authority_clock_recovery_retries_transient_raft_admission_rejection() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let high_water = authority.snapshot().max_committed_timestamp_ms();
+        let wall_ms = high_water.unwrap() + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1;
+        let mut clock = ControlPlaneAuthorityClock::new(high_water, wall_ms, Some(50)).unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            for request_number in 0..4 {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let now_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let response = if request_number == 1 {
+                    assert_eq!(request.kind, ControlPlaneRpcKind::ReestablishAuthorityClock);
+                    let request =
+                        verify_control_plane_unix_request(request, Some(&verifier), now_ms)
+                            .unwrap();
+                    build_control_plane_unix_admission_error_response(
+                        request,
+                        ControlPlaneError::RpcRemote {
+                            message: "local OpenRaft authority is not the serving leader: command-authority read-index timed out after 1s".to_owned(),
+                        },
+                        now_ms,
+                    )
+                    .unwrap()
+                } else {
+                    let expected_kind = if request_number == 3 {
+                        ControlPlaneRpcKind::ReestablishAuthorityClock
+                    } else {
+                        ControlPlaneRpcKind::AuthorityClockStatus
+                    };
+                    assert_eq!(request.kind, expected_kind);
+                    let elapsed_ms = now_ms.saturating_sub(wall_ms);
+                    build_control_plane_authority_clock_admin_response(
+                        &authority,
+                        &mut clock,
+                        request,
+                        Some(&verifier),
+                        ControlPlaneAuthorityClockAdminSample::new(
+                            now_ms,
+                            now_ms,
+                            Some(50u64.saturating_add(elapsed_ms)),
+                        ),
+                        |_, _| Ok(()),
+                        || Ok(now_ms),
+                    )
+                    .unwrap()
+                };
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+            }
+            clock.status(authority.authority_clock_context().unwrap())
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let status = crate::clock::with_time_override(wall_ms, || {
+            client.reestablish_authority_clock(wall_ms)
+        })
+        .unwrap();
+
+        assert!(status.established());
+        assert_eq!(status, server.join().unwrap());
     }
 
     #[test]

@@ -12476,7 +12476,14 @@ Phase 12.4 progress:
      timestamp high-water, and current Raft term still match the operator's
      observation. It rejects followers, stale requests, unavailable health
      clocks, and wall time behind committed time, and advances the generation
-     on success so replay cannot clear a later fault;
+     on success so replay cannot clear a later fault. Signed pre-dispatch
+     leader-routing and ReadIndex rejections are retried within the bounded
+     explicit recovery operation after refreshing that complete expected
+     state; ambiguous response loss remains confirmation-only and is never
+     blindly resubmitted. One absolute operation deadline bounds endpoint
+     connection, request writes, response reads, routing retries,
+     confirmation, and retry backoff; no transport phase receives a fresh
+     timeout after consuming part of that budget;
    - after control-plane restart or leader change, any leader-local lease state
      that is not committed must be treated as expired until re-established
      through the consensus protocol;
