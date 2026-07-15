@@ -3022,6 +3022,17 @@ struct S3StreamingProbe<'a> {
     expected: S3StreamingAuthExpected,
 }
 
+#[derive(Clone, Copy)]
+struct S3StreamingRequest<'a> {
+    label: &'a str,
+    credentials: SignedRequestCredentials<'a>,
+    tokens: S3StreamingTokens<'a>,
+    sign_token_header: bool,
+    bad_chunk_signature: bool,
+    service: &'a str,
+}
+
+#[derive(Clone, Copy)]
 struct S3StreamingSessionProbeSet<'a> {
     live_credentials: SignedRequestCredentials<'a>,
     live_security_token: &'a str,
@@ -3088,6 +3099,7 @@ fn streaming_hmac(key: &[u8], value: &str) -> String {
     hex_lower(hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), value.as_bytes()).as_ref())
 }
 
+#[cfg(test)]
 fn sign_s3_streaming_request(
     endpoint: &str,
     path: &str,
@@ -3095,6 +3107,26 @@ fn sign_s3_streaming_request(
     credentials: SignedRequestCredentials<'_>,
     tokens: S3StreamingTokens<'_>,
     sign_token_header: bool,
+) -> S3StreamingSignature {
+    sign_s3_streaming_request_for_service(
+        endpoint,
+        path,
+        decoded_length,
+        credentials,
+        tokens,
+        sign_token_header,
+        "s3",
+    )
+}
+
+fn sign_s3_streaming_request_for_service(
+    endpoint: &str,
+    path: &str,
+    decoded_length: usize,
+    credentials: SignedRequestCredentials<'_>,
+    tokens: S3StreamingTokens<'_>,
+    sign_token_header: bool,
+    service: &str,
 ) -> S3StreamingSignature {
     let parsed_endpoint = url::Url::parse(endpoint)
         .unwrap_or_else(|error| panic!("invalid S3 streaming endpoint: {error}"));
@@ -3139,13 +3171,13 @@ fn sign_s3_streaming_request(
         &signed_headers,
         STREAMING_PAYLOAD_HASH,
     );
-    let scope = format!("{date}/{}/s3/aws4_request", credentials.region);
+    let scope = format!("{date}/{}/{service}/aws4_request", credentials.region);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         auth::canonical::sha256_hex(canonical_request.as_bytes())
     );
     let secret = auth::SecretKey::new(credentials.secret_key.to_string());
-    let signing_key = auth::sigv4::derive_signing_key(&secret, &date, credentials.region, "s3");
+    let signing_key = auth::sigv4::derive_signing_key(&secret, &date, credentials.region, service);
     let seed_signature = streaming_hmac(signing_key.as_ref(), &string_to_sign);
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={seed_signature}",
@@ -3210,19 +3242,39 @@ fn send_s3_streaming_probe(
     bucket: &str,
     probe: S3StreamingProbe<'_>,
 ) -> S3StreamingResult {
-    let path = format!("/{bucket}/{}", probe.label);
-    let signature = sign_s3_streaming_request(
+    send_s3_streaming_request(
+        endpoint,
+        bucket,
+        S3StreamingRequest {
+            label: probe.label,
+            credentials: probe.credentials,
+            tokens: probe.tokens,
+            sign_token_header: probe.sign_token_header,
+            bad_chunk_signature: probe.bad_chunk_signature,
+            service: "s3",
+        },
+    )
+}
+
+fn send_s3_streaming_request(
+    endpoint: &str,
+    bucket: &str,
+    request: S3StreamingRequest<'_>,
+) -> S3StreamingResult {
+    let path = format!("/{bucket}/{}", request.label);
+    let signature = sign_s3_streaming_request_for_service(
         endpoint,
         &path,
         STREAMING_DATA.len(),
-        probe.credentials,
-        probe.tokens,
-        probe.sign_token_header,
+        request.credentials,
+        request.tokens,
+        request.sign_token_header,
+        request.service,
     );
     let (body, first_chunk_signature) =
-        build_s3_streaming_body(&signature, STREAMING_DATA, probe.bad_chunk_signature);
+        build_s3_streaming_body(&signature, STREAMING_DATA, request.bad_chunk_signature);
     let url = format!("{endpoint}{path}");
-    let mut request = build_test_agent(endpoint, None, Duration::from_secs(120))
+    let mut wire_request = build_test_agent(endpoint, None, Duration::from_secs(120))
         .put(&url)
         .header("authorization", &signature.authorization)
         .header("content-encoding", "aws-chunked")
@@ -3232,10 +3284,12 @@ fn send_s3_streaming_probe(
             "x-amz-decoded-content-length",
             STREAMING_DATA.len().to_string(),
         );
-    for token in probe.tokens.values().into_iter().flatten() {
-        request = request.header("x-amz-security-token", token);
+    for token in request.tokens.values().into_iter().flatten() {
+        wire_request = wire_request.header("x-amz-security-token", token);
     }
-    let mut response = request.send(&body).expect("streaming AWS transport error");
+    let mut response = wire_request
+        .send(&body)
+        .expect("streaming AWS transport error");
     let headers = response
         .headers()
         .iter()
@@ -3770,6 +3824,259 @@ fn run_s3_streaming_session_authentication_probes(
             }
         }
     }
+}
+
+fn assert_s3_streaming_wrong_region_scope(
+    label: &str,
+    response: &RawResponse,
+    wrong_region: &str,
+    expected_region: &str,
+    access_key: &str,
+    security_tokens: &[&str],
+) {
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    let message = format!(
+        "The authorization header is malformed; the region '{wrong_region}' is wrong; \
+         expecting '{expected_region}'"
+    );
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .body(expected_error::with_region(
+                "AuthorizationHeaderMalformed",
+                &message,
+                expected_region,
+            )),
+    );
+    println!("{label}: ok");
+}
+
+fn assert_s3_streaming_wrong_service_scope(
+    label: &str,
+    response: &RawResponse,
+    access_key: &str,
+    security_tokens: &[&str],
+) {
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .body(expected_error::with_host_id(
+                "AuthorizationHeaderMalformed",
+                "The authorization header is malformed; incorrect service \"sts\". This endpoint belongs to \"s3\".",
+            )),
+    );
+    println!("{label}: ok");
+}
+
+fn run_s3_streaming_scope_probes(
+    endpoint: &str,
+    bucket: &str,
+    fixture: S3StreamingSessionProbeSet<'_>,
+) {
+    let wrong_region = if fixture.live_credentials.region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    };
+    let wrong_secret = "0".repeat(40);
+    let malformed_security_token = "malformed-session-token";
+
+    for (scope, service, credentials) in [
+        (
+            "wrong-region",
+            "s3",
+            SignedRequestCredentials {
+                region: wrong_region,
+                ..fixture.live_credentials
+            },
+        ),
+        ("wrong-service", "sts", fixture.live_credentials),
+    ] {
+        let bad_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..credentials
+        };
+        let old_credentials = SignedRequestCredentials {
+            region: credentials.region,
+            ..fixture.old_credentials
+        };
+        let old_bad_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..old_credentials
+        };
+        for (case, request_credentials, tokens, sign_token_header, bad_chunk_signature) in [
+            (
+                "valid",
+                credentials,
+                S3StreamingTokens::One(fixture.live_security_token),
+                true,
+                false,
+            ),
+            (
+                "missing-token",
+                credentials,
+                S3StreamingTokens::Missing,
+                true,
+                false,
+            ),
+            (
+                "empty-token",
+                credentials,
+                S3StreamingTokens::One(""),
+                true,
+                false,
+            ),
+            (
+                "malformed-token",
+                credentials,
+                S3StreamingTokens::One(malformed_security_token),
+                true,
+                false,
+            ),
+            (
+                "mismatched-token",
+                credentials,
+                S3StreamingTokens::One(fixture.other_live_security_token),
+                true,
+                false,
+            ),
+            (
+                "identical-duplicate-token",
+                credentials,
+                S3StreamingTokens::Two(fixture.live_security_token, fixture.live_security_token),
+                true,
+                false,
+            ),
+            (
+                "conflicting-duplicate-token",
+                credentials,
+                S3StreamingTokens::Two(
+                    fixture.live_security_token,
+                    fixture.other_live_security_token,
+                ),
+                true,
+                false,
+            ),
+            (
+                "conflicting-duplicate-token-reversed",
+                credentials,
+                S3StreamingTokens::Two(
+                    fixture.other_live_security_token,
+                    fixture.live_security_token,
+                ),
+                true,
+                false,
+            ),
+            (
+                "unsigned-token",
+                credentials,
+                S3StreamingTokens::One(fixture.live_security_token),
+                false,
+                false,
+            ),
+            (
+                "bad-seed-signature",
+                bad_signature_credentials,
+                S3StreamingTokens::One(fixture.live_security_token),
+                true,
+                false,
+            ),
+            (
+                "bad-chunk-signature",
+                credentials,
+                S3StreamingTokens::One(fixture.live_security_token),
+                true,
+                true,
+            ),
+            (
+                "old-session",
+                old_credentials,
+                S3StreamingTokens::One(fixture.old_security_token),
+                true,
+                false,
+            ),
+            (
+                "old-session-bad-seed-signature",
+                old_bad_signature_credentials,
+                S3StreamingTokens::One(fixture.old_security_token),
+                true,
+                false,
+            ),
+            (
+                "old-session-bad-chunk-signature",
+                old_credentials,
+                S3StreamingTokens::One(fixture.old_security_token),
+                true,
+                true,
+            ),
+        ] {
+            let label = format!("streaming-scope-{scope}-{case}");
+            let result = send_s3_streaming_request(
+                endpoint,
+                bucket,
+                S3StreamingRequest {
+                    label: &label,
+                    credentials: request_credentials,
+                    tokens,
+                    sign_token_header,
+                    bad_chunk_signature,
+                    service,
+                },
+            );
+            let security_tokens = tokens.values().into_iter().flatten().collect::<Vec<_>>();
+            if service == "s3" {
+                assert_s3_streaming_wrong_region_scope(
+                    &label,
+                    &result.response,
+                    wrong_region,
+                    fixture.live_credentials.region,
+                    request_credentials.access_key,
+                    &security_tokens,
+                );
+            } else {
+                assert_s3_streaming_wrong_service_scope(
+                    &label,
+                    &result.response,
+                    request_credentials.access_key,
+                    &security_tokens,
+                );
+            }
+        }
+    }
+
+    let label = "streaming-scope-both-wrong-valid";
+    let both_wrong_credentials = SignedRequestCredentials {
+        region: wrong_region,
+        ..fixture.live_credentials
+    };
+    let tokens = S3StreamingTokens::One(fixture.live_security_token);
+    let result = send_s3_streaming_request(
+        endpoint,
+        bucket,
+        S3StreamingRequest {
+            label,
+            credentials: both_wrong_credentials,
+            tokens,
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            service: "sts",
+        },
+    );
+    assert_s3_streaming_wrong_region_scope(
+        label,
+        &result.response,
+        wrong_region,
+        fixture.live_credentials.region,
+        both_wrong_credentials.access_key,
+        &[fixture.live_security_token],
+    );
 }
 
 fn assert_error_probe(
@@ -6115,16 +6422,22 @@ fn main() {
             &post_bucket,
             post_fixture,
         );
+        let streaming_fixture = S3StreamingSessionProbeSet {
+            live_credentials: recreated_credentials,
+            live_security_token: &recreated_security_token,
+            other_live_security_token: &other_live_security_token,
+            old_credentials: deleted_credentials,
+            old_security_token: &deleted_security_token,
+        };
         run_s3_streaming_session_authentication_probes(
             &format!("https://s3.{region}.amazonaws.com"),
             &post_bucket,
-            S3StreamingSessionProbeSet {
-                live_credentials: recreated_credentials,
-                live_security_token: &recreated_security_token,
-                other_live_security_token: &other_live_security_token,
-                old_credentials: deleted_credentials,
-                old_security_token: &deleted_security_token,
-            },
+            streaming_fixture,
+        );
+        run_s3_streaming_scope_probes(
+            &format!("https://s3.{region}.amazonaws.com"),
+            &post_bucket,
+            streaming_fixture,
         );
         run_session_authentication_probes(
             &endpoint,
@@ -6151,7 +6464,8 @@ fn main() {
 mod tests {
     use super::{
         s3_post_response_with_sanitized_body, s3_response_with_sanitized_body,
-        sign_s3_streaming_request, spaced_hex, S3StreamingTokens,
+        sign_s3_streaming_request, sign_s3_streaming_request_for_service, spaced_hex,
+        S3StreamingTokens,
     };
     use s3_tests::{RawResponse, SignedRequestCredentials};
 
@@ -6190,6 +6504,31 @@ mod tests {
         );
         assert!(!unsigned.canonical_request.contains("security-token"));
         assert!(!unsigned.authorization.contains("security-token"));
+
+        let wrong_service = sign_s3_streaming_request_for_service(
+            "https://s3.eu-central-1.amazonaws.com",
+            "/bucket/key",
+            21,
+            credentials,
+            S3StreamingTokens::One("token"),
+            true,
+            "sts",
+        );
+        let date = &wrong_service.scope[..8];
+        let expected_signing_key = auth::sigv4::derive_signing_key(
+            &auth::SecretKey::new(credentials.secret_key.to_string()),
+            date,
+            credentials.region,
+            "sts",
+        );
+        assert_eq!(
+            wrong_service.scope,
+            format!("{date}/eu-central-1/sts/aws4_request")
+        );
+        assert!(wrong_service.authorization.contains(&format!(
+            "Credential=ARGMINSESSIONACCESSKEY/{date}/eu-central-1/sts/aws4_request"
+        )));
+        assert_eq!(wrong_service.signing_key, expected_signing_key.as_ref());
     }
 
     #[test]

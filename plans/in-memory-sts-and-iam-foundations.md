@@ -411,7 +411,16 @@ issuer-liveness, and policy-signature checks, with wrong region winning when
 region and service are both wrong. Its already-pinned HTTP-token-header
 presence routing occurs earlier still: any probed `x-amz-security-token` HTTP
 header produces `No AWSAccessKey was presented.` before form credential-scope
-parsing. Streaming scope collisions remain unresolved.
+parsing.
+
+The aws-chunked streaming route is independently pinned to validate the
+Authorization-header credential scope before token structure, signature
+coverage, binding, issuer liveness, seed-signature comparison, or chunk-chain
+verification. Its matrix covers missing, empty, malformed, mismatched,
+identical-duplicate, and conflicting-duplicate signed token headers in both
+conflicting orders, plus a present unsigned token, invalidated old sessions,
+bad seed signatures, and bad first-chunk signatures. Wrong region wins when
+region and service are both wrong.
 
 Credential validation should have one common decision path used by STS and S3
 header, presigned, POST Object, and streaming authentication:
@@ -829,8 +838,7 @@ The initial Query-protocol slice completed on 2026-07-13:
   `text/xml` response type, and request-ID agreement
 
 Before Phase 0 can satisfy the first-milestone exit condition, it still needs
-to pin expiry-versus-issuer-deletion precedence, the remaining S3 streaming
-temporary-credential region/service collisions, permission-policy mutation
+to pin expiry-versus-issuer-deletion precedence, permission-policy mutation
 behavior, and the temporary access-key/token envelope decisions.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
@@ -1421,8 +1429,7 @@ header values, each combined with an otherwise valid form credential and token,
 all return the exact HTTP 403 `No AWSAccessKey was presented.` golden for both
 wrong region and wrong service. POST implementations must therefore perform
 header-presence routing before form scope parsing, and scope parsing before the
-probed form credential-validity and signature checks. This does not establish
-aws-chunked streaming scope placement.
+probed form credential-validity and signature checks.
 
 The S3 aws-chunked session-authentication slice completed on 2026-07-14. The
 primary user applies a self-cleaning bucket policy granting only the recreated
@@ -1458,8 +1465,27 @@ signatures. Streaming token selection, token/access-key binding, and stable
 issuer liveness therefore feed the shared credential-validity pipeline before
 the seed signature is accepted and before a streaming signing context is
 constructed. The streaming slice completes the independently pinned S3
-temporary-credential modes; region/service/expiry collisions remain separate
-Phase 0 questions.
+temporary-credential token-selection modes; scope and expiry collisions are
+tracked by separate Phase 0 slices.
+
+The S3 aws-chunked signing-scope slice completed on 2026-07-14. Dedicated exact
+goldens establish that a wrong region or service returns HTTP 400
+`AuthorizationHeaderMalformed` with the same response body as ordinary header
+authentication, but without the `x-amz-bucket-region` response header. The
+wrong-region body includes the expected `Region` element; the wrong-service
+body does not. Wrong region wins when region and service are both wrong.
+
+Both scope errors precede missing, empty, malformed, independently valid but
+mismatched, identical-duplicate, and conflicting-duplicate token headers in
+both conflicting orders. Scope also precedes the streaming-specific
+`HeadersNotSigned` check for a present unsigned token, stable issuer-role
+liveness for an invalidated old session, seed-signature comparison, and first
+chunk-signature comparison. The invalidated-session cases collide liveness
+with correct and bad seed signatures and correct and bad first-chunk
+signatures. Together with the earlier header, presigned-query, and POST Object
+matrices, region/service scope placement is now pinned independently for every
+initial S3 temporary-credential authentication mode. Expiry collisions remain
+a separate Phase 0 question.
 
 During this slice, one newly created role produced one successful STS
 assumption followed immediately by `AccessDenied` for the same request. The
@@ -1715,8 +1741,9 @@ confidentiality. No session response or request body may appear in traces.
    region/service, disabled credential, and expired session? The core header,
    presigned, POST Object, and streaming token/signature collisions are pinned;
    STS, S3 header, S3 presigned-query, and S3 POST Object region/service
-   collisions are now pinned separately. Streaming scope collisions,
-   disabled-credential collisions, and the remaining expiry collisions are not.
+   collisions are now pinned separately, as are streaming region/service
+   collisions. Disabled-credential collisions and the remaining expiry
+   collisions are not.
 5. What total Query body and member limits does live STS enforce for the first
    supported parameter set?
 6. Should the first standalone UAT role be injected through a dedicated
