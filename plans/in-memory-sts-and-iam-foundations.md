@@ -665,28 +665,110 @@ The first public role-management surface comes later through IAM-compatible
 Query APIs. There must be no undocumented production environment-variable
 format that becomes an accidental long-term role database.
 
-### 8. Add logical service routing before S3 routing
+### 8. Generalize the existing S3 Control routing before S3 routing
 
-Add a small HTTP-layer service/endpoint classification step before
-`S3Operation` routing:
+The HTTP router already has a small endpoint-family preclassification: it
+recognizes the S3 Control-style `/v20180820/tags/<resource-arn>` path before
+normal bucket/key parsing and routes `TagResource` and `UntagResource`. The
+external tests give S3 Control its own endpoint URL and sign those requests with
+service `s3`, while the embedded server currently serves them on the shared
+listener and expects the same signing scope. Preserve those behaviors and use
+this existing split as the starting point for an explicit HTTP-layer service/
+endpoint classification:
 
-- normal S3 request: existing path, expected SigV4 service `s3`
-- STS Query request: Query protocol parser, expected service `sts`
-- later IAM Query request: expected service `iam`
+- normal S3 request: existing bucket/key path, expected SigV4 service `s3`
+- S3 Control request: existing versioned resource path and account-ID header
+  rules, expected SigV4 service `s3`
+- STS Query request: Query protocol parser, expected SigV4 service `sts`
+- later IAM Query request: expected SigV4 service `iam`
 
 For the first slice, STS uses the same bound address, port, TLS configuration,
 admission control, request IDs, and worker pool as S3. A custom AWS SDK STS
 endpoint URL can therefore point at the existing S3 endpoint.
 
-Classification must not trust only one attacker-controlled hint. Pin and define
-the interaction among request path, method, content type, `Action`, `Version`,
-Host, and SigV4 credential service. Ambiguous requests must receive the same
-error family AWS uses rather than falling through to an unrelated S3 operation.
+Represent the origin of classification explicitly as a typed endpoint kind,
+not as an inferred string inside an operation parser. The oracle has distinct
+`AwsRegionalSts` and `AwsRegionalS3Control` kinds because those endpoint
+families have different authorities. The initial local server has a
+`SharedRegional` kind because one configured listener/authority serves S3, S3
+Control, and STS. Endpoint kind comes from the configured listener/authority
+mapping plus the parsed request target; an arbitrary `Host` value alone must
+not select a more privileged parser or authentication rule.
 
-Do not fold STS operations into `S3Operation`. Introduce a service-level request
-enum or equivalent so service-specific parsing, auth expectation, response
-format, and errors stay explicit. Host-specific global/regional STS endpoint
-parity can later integrate with
+Classification must not trust only one attacker-controlled hint. Pin and define
+the interaction among the existing versioned S3 Control path, request path,
+method, content type, `x-amz-account-id`, `Action`, `Version`, Host, and SigV4
+credential service. Ambiguous requests must receive the same error family AWS
+uses rather than falling through to an unrelated S3 operation.
+
+Do not fold STS operations into `S3Operation`, and do not leave the existing S3
+Control endpoint operations there once the service boundary is introduced.
+Introduce a service-level request enum or equivalent with typed S3, S3 Control,
+and STS operation payloads so each service's parsing, auth expectation, response
+format, and errors stay explicit. The existing S3 Control scenarios provide
+valid-dispatch and policy-evaluation controls, but they do not pin the routing
+boundary or error precedence. The current implementation selects the HTTP
+method and strictly percent-decodes the versioned resource path before
+authentication, then validates the account ID, ARN semantics, XML or `tagKeys`,
+and authorization afterward. That implementation order is not itself AWS
+evidence and must not be accidentally preserved or changed without an oracle.
+
+Before moving `TagResource` or `UntagResource` out of `S3Operation`, add complete
+AWS-facing routing-boundary goldens for:
+
+- the bounded method set `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `OPTIONS`, and
+  `PATCH` on the versioned tags path, plus representative extension methods
+  `PROPFIND` and `X-ARGMIN-PROBE`
+- malformed percent encoding, empty or malformed resource ARN, and path-shape
+  near misses
+- missing, empty, duplicate-identical, duplicate-conflicting, and wrong
+  `x-amz-account-id` values
+- correct, missing, and wrong SigV4 signing service with valid and bad
+  signatures
+- malformed XML and `tagKeys` inputs collided with authentication failures
+- S3 Control path requests carrying STS `Action`/`Version` parameters or STS
+  form content types, in both valid- and invalid-signature cases
+- STS-shaped requests sent to the S3 Control path and S3 Control-shaped requests
+  sent to the shared-listener STS classifier
+
+Send the identical cross-service collision requests to both the regional AWS
+STS endpoint and the account/region-specific AWS S3 Control endpoint, signing
+and connecting to each endpoint normally so its real authority/Host is part of
+the observation. Record both complete results even when they differ. Before
+Phase 4 implementation, commit a table that maps every collision to the AWS
+endpoint family deliberately emulated by `SharedRegional`; there must be no
+implicit fallback based on whichever parser happens to run first. Ordinary
+unambiguous versioned-tag requests should map to the S3 Control observation and
+ordinary unambiguous Query requests to the STS observation, while every mixed
+case remains unresolved until that table is committed.
+
+The AWS probes do not verify the local Host/authority trust boundary. Add
+separate `SharedRegional` tests that hold method, target, body, query, signing
+scope, and signature constant while varying the HTTP authority among the
+configured authority, an STS-looking name, an S3 Control-looking name, an
+unrelated valid name, and a mismatched configured authority. Also cover missing
+and duplicate `Host` values and an absolute-form request target whose authority
+conflicts with `Host` where the HTTP stack admits those shapes. Each case must
+prove either that the same trusted `SharedRegional` endpoint kind reaches the
+same classifier result or that authority validation rejects the request before
+service classification; changing only attacker-controlled authority text must
+never select `AwsRegionalSts`, `AwsRegionalS3Control`, or another parser.
+
+Keep trusted listener/TLS metadata separate from request headers in the
+classifier API so illegal endpoint-kind construction is not representable. In
+TLS standalone UAT, repeat the fixed-request cases with matching SNI, missing
+SNI where the TLS stack permits it, and SNI/HTTP-authority mismatches against
+the configured certificate/listener names. Assert the configured TLS policy's
+handshake or authority rejection boundary and prove that a mismatched SNI cannot
+change the endpoint kind after connection acceptance.
+
+Those goldens must identify, per endpoint kind, which path/method/decoding
+checks happen before authentication and which account/ARN/body/query checks
+happen after it. The typed service refactor is complete only when it retains the
+selected AWS-pinned ordering and exact response families for `SharedRegional`;
+existing positive scenarios remain regression controls but are not sufficient
+acceptance evidence. Other host-specific global/regional STS endpoint parity
+can later integrate with
 [endpoint-routing-compat-plan.md](endpoint-routing-compat-plan.md); the initial
 same-listener mode should represent one local regional STS endpoint.
 
@@ -1741,7 +1823,13 @@ involved.
 
 ### Phase 4: STS Query endpoint and core `AssumeRole`
 
-- add logical service routing and bounded Query protocol parsing
+- generalize the existing S3 Control endpoint-family routing into typed service
+  and endpoint-kind routing only after the dual-endpoint AWS method/path/
+  account-ID/signing/body/query collision goldens and the committed
+  `SharedRegional` mapping above pin its pre-authentication and post-
+  authentication boundaries, and after local Host/authority/SNI tests prove
+  attacker-controlled authority cannot change endpoint kind; then add bounded
+  Query protocol parsing
 - authenticate STS requests with service name `sts`
 - authorize `AssumeRole` using the AWS-equivalent combination of caller identity
   permissions and the role trust policy
@@ -1834,6 +1922,10 @@ in-memory role through AWS-compatible public APIs.
 ### Local integration tests
 
 - issue then immediately use temporary credentials on another worker
+- hold routed requests constant while varying `Host`/authority and prove
+  `SharedRegional` is unchanged or the authority is rejected before service
+  classification; cover configured-authority mismatch and TLS SNI/authority
+  mismatch in standalone UAT
 - header, presigned, POST Object, and streaming requests
 - missing/wrong/unexpected token matrices with valid and invalid signatures
 - expired session behavior with a deterministic clock
@@ -1934,6 +2026,13 @@ confidentiality. No session response or request body may appear in traces.
 4. Should the first standalone UAT role be injected through a dedicated
    test-only constructor/config object or through explicitly UAT-only
    environment variables?
+5. What exact AWS routing and error precedence applies where the existing S3
+   Control versioned path collides with method/path decoding, account-ID and ARN
+   validation, authentication, and STS Query classification on both the AWS STS
+   and S3 Control endpoint kinds? The routing-boundary matrix and explicit
+   `SharedRegional` mapping above must answer this, and the local authority/SNI
+   matrix must enforce the endpoint-kind trust boundary, before the typed
+   service refactor.
 
 ## Definition Of The First Usable Milestone
 
