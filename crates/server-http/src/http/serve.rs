@@ -21,7 +21,7 @@ use tokio_rustls::TlsAcceptor;
 #[cfg(any(test, feature = "local-debug-endpoints"))]
 use super::request::percent_decode_strict;
 use super::request::{
-    parse_upload_part_query, S3Request, TlsProtocolVersion, TransportSecurity,
+    parse_upload_part_query_raw, S3Request, TlsProtocolVersion, TransportSecurity,
     MAX_BUFFERED_CONTROL_BODY_SIZE,
 };
 use super::response::{S3Response, WireResponseIds};
@@ -163,7 +163,7 @@ enum StreamingWriteOp {
         bucket: BucketName,
         key: String,
         upload_id: String,
-        part_number: u32,
+        part_number: String,
     },
 }
 
@@ -1898,7 +1898,8 @@ fn is_streaming_write(
             Ok(Some(StreamingWriteOp::PutObject { bucket, key }))
         }
         S3Operation::UploadPart { bucket, key } => {
-            let (upload_id, part_number) = parse_upload_part_query(query)?;
+            let (upload_id, part_number) =
+                parse_upload_part_query_raw(query, ServerError::UploadPartMissingUploadId)?;
             Ok(Some(StreamingWriteOp::UploadPart {
                 bucket,
                 key,
@@ -3865,7 +3866,7 @@ async fn handle_streaming_part(
     bucket: BucketName,
     key: String,
     upload_id: String,
-    part_number: u32,
+    part_number: String,
     chunked: ChunkedMode,
     trace: observability::TraceContext,
     wire_ids: WireResponseIds,
@@ -3897,7 +3898,7 @@ async fn handle_streaming_part(
             bucket_clone.as_str(),
             &key_clone,
             &upload_id_clone,
-            part_number,
+            &part_number,
         );
         result.map(|ctx| {
             let ctx = Arc::new(ctx);
@@ -6707,9 +6708,9 @@ Connection: close\r\n\r\n",
                 ref bucket,
                 ref key,
                 ref upload_id,
-                part_number: 3,
+                ref part_number,
                 ..
-            })) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
+            })) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123" && part_number == "3"
         ));
     }
 
@@ -6730,8 +6731,8 @@ Connection: close\r\n\r\n",
                 ref bucket,
                 ref key,
                 ref upload_id,
-                part_number: 3,
-            })) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
+                ref part_number,
+            })) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123" && part_number == "3"
         ));
     }
 
@@ -6763,14 +6764,14 @@ Connection: close\r\n\r\n",
                 ref bucket,
                 ref key,
                 ref upload_id,
-                part_number: 3,
+                ref part_number,
                 ..
-            })) if bucket == "mybucket" && key == "mykey" && upload_id == &invalid_upload_id
+            })) if bucket == "mybucket" && key == "mykey" && upload_id == &invalid_upload_id && part_number == "3"
         ));
     }
 
     #[test]
-    fn streaming_upload_part_invalid_part_number_rejected() {
+    fn streaming_upload_part_invalid_part_number_is_preserved_for_target_validation() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey?partNumber=abc&uploadId=abc123",
@@ -6778,12 +6779,12 @@ Connection: close\r\n\r\n",
         );
         assert!(matches!(
             is_streaming_write(&parts),
-            Err(ServerError::InvalidUploadPartNumber { value }) if value == "abc"
+            Ok(Some(StreamingWriteOp::UploadPart { part_number, .. })) if part_number == "abc"
         ));
     }
 
     #[test]
-    fn streaming_upload_part_zero_part_number_rejected() {
+    fn streaming_upload_part_zero_part_number_is_preserved_for_target_validation() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey?partNumber=0&uploadId=abc123",
@@ -6791,7 +6792,7 @@ Connection: close\r\n\r\n",
         );
         assert!(matches!(
             is_streaming_write(&parts),
-            Err(ServerError::InvalidUploadPartNumber { value }) if value == "0"
+            Ok(Some(StreamingWriteOp::UploadPart { part_number, .. })) if part_number == "0"
         ));
     }
 
@@ -7705,7 +7706,7 @@ Connection: close\r\n\r\n",
         let upload_id_for_worker = upload_id.clone();
         let join = tokio::task::spawn_blocking(move || {
             let ctx = worker_frontend
-                .prepare_streaming_part(&req, "mybucket", "mykey", &upload_id_for_worker, 1)
+                .prepare_streaming_part(&req, "mybucket", "mykey", &upload_id_for_worker, "1")
                 .unwrap();
             let ctx = Arc::new(ctx);
             worker_guard.arm_part(&ctx);

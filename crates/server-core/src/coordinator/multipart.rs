@@ -973,6 +973,24 @@ impl Coordinator {
         }
     }
 
+    /// Resolve an operation that is valid only for an active multipart upload.
+    ///
+    /// AWS performs this lookup before operation-specific part-number, checksum,
+    /// and copy-range validation, but before current-policy authorization.
+    pub fn validate_in_progress_multipart_upload_target(
+        &self,
+        upload: &MultipartObjectRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.storage_node()
+            .load_in_progress_multipart_upload(
+                upload.bucket_name_typed(),
+                upload.key_typed(),
+                upload.upload_id(),
+            )
+            .map(|_| ())
+            .map_err(Self::map_object_pg_action_error)
+    }
+
     /// Abort an in-progress multipart upload.
     ///
     /// Publishes an abort metadata command, best-effort deletes all part shard

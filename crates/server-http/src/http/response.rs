@@ -370,6 +370,9 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::NotModified { .. } => "not modified".to_string(),
         ServerError::SlowDown => "Please reduce your request rate.".to_string(),
         ServerError::BadDigest => "bad digest".to_string(),
+        ServerError::ContentMd5Mismatch => {
+            "The Content-MD5 you specified did not match what we received.".to_string()
+        }
         ServerError::ChecksumDigestMismatch { algorithm } => {
             format!("The {algorithm} you specified did not match the calculated checksum.")
         }

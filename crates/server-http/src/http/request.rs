@@ -413,28 +413,26 @@ pub(crate) fn parse_part_number(value: &str) -> Result<u32, ServerError> {
 }
 
 pub(crate) fn parse_upload_part_query(query_string: &str) -> Result<(String, u32), ServerError> {
-    parse_upload_part_query_with(
-        query_string,
-        ServerError::UploadPartMissingUploadId,
-        |value| ServerError::InvalidUploadPartNumber { value },
-    )
+    let (upload_id, part_number) =
+        parse_upload_part_query_raw(query_string, ServerError::UploadPartMissingUploadId)?;
+    let part_number = parse_upload_part_number_value(&part_number)?;
+    Ok((upload_id, part_number))
 }
 
+#[cfg(test)]
 pub(crate) fn parse_upload_part_copy_query(
     query_string: &str,
 ) -> Result<(String, u32), ServerError> {
-    parse_upload_part_query_with(
-        query_string,
-        ServerError::UploadPartCopyMissingUploadId,
-        |value| ServerError::InvalidUploadPartCopyNumber { value },
-    )
+    let (upload_id, part_number) =
+        parse_upload_part_query_raw(query_string, ServerError::UploadPartCopyMissingUploadId)?;
+    let part_number = parse_upload_part_copy_number_value(&part_number)?;
+    Ok((upload_id, part_number))
 }
 
-fn parse_upload_part_query_with(
+pub(crate) fn parse_upload_part_query_raw(
     query_string: &str,
     missing_upload_id: ServerError,
-    invalid_part_number: impl FnOnce(String) -> ServerError,
-) -> Result<(String, u32), ServerError> {
+) -> Result<(String, String), ServerError> {
     let upload_id = query_param_lossy(query_string, "uploadId")
         .filter(|value| !value.is_empty())
         .ok_or(missing_upload_id)?;
@@ -444,16 +442,32 @@ fn parse_upload_part_query_with(
         }
     })?;
 
-    let value = part_number.as_ref();
-    let parsed = value
+    Ok((upload_id.into_owned(), part_number.into_owned()))
+}
+
+fn parse_upload_part_number_with(
+    value: &str,
+    invalid_part_number: impl FnOnce(String) -> ServerError,
+) -> Result<u32, ServerError> {
+    value
         .parse::<u32>()
         .ok()
         .filter(|part_number| {
             (1..=crate::coordinator::MAX_MULTIPART_PARTS as u32).contains(part_number)
         })
-        .ok_or_else(|| invalid_part_number(value.to_string()))?;
+        .ok_or_else(|| invalid_part_number(value.to_string()))
+}
 
-    Ok((upload_id.into_owned(), parsed))
+pub(crate) fn parse_upload_part_number_value(value: &str) -> Result<u32, ServerError> {
+    parse_upload_part_number_with(value, |value| ServerError::InvalidUploadPartNumber {
+        value,
+    })
+}
+
+pub(crate) fn parse_upload_part_copy_number_value(value: &str) -> Result<u32, ServerError> {
+    parse_upload_part_number_with(value, |value| ServerError::InvalidUploadPartCopyNumber {
+        value,
+    })
 }
 
 /// Percent-decode a string (RFC 3986) into raw bytes. Does NOT treat + as space.

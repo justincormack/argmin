@@ -135,13 +135,14 @@ impl ByteRange {
 /// or open-ended ranges). Returns `(start, end)` inclusive on success.
 /// Malformed values produce `InvalidArgument` to match AWS/Ceph behavior.
 pub fn parse_copy_source_range(header: &str) -> Result<(u64, u64), ServerError> {
+    const MESSAGE: &str = "The x-amz-copy-source-range value must be of the form bytes=first-last where first and last are the zero-based offsets of the first and last bytes to copy";
     let range = ByteRange::parse(header).map_err(|_| ServerError::InvalidArgument {
-        reason: format!("invalid copy source range: {header}"),
+        reason: MESSAGE.to_string(),
     })?;
     match range {
         ByteRange::Range { start, end } => Ok((start, end)),
         _ => Err(ServerError::InvalidArgument {
-            reason: format!("invalid copy source range: {header}"),
+            reason: MESSAGE.to_string(),
         }),
     }
 }

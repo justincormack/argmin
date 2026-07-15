@@ -169,8 +169,15 @@ For each matrix:
   completes successfully. A 10,000-entry manifest proceeds to part lookup,
   while 10,001 entries fail first with AWS's exact `InvalidArgument` response;
   the count boundary is tested without transferring 10,000 full-size parts.
-- [ ] Cross invalid part numbers/ranges/checksums with invalid upload IDs and
+- [x] Cross invalid part numbers/ranges/checksums with invalid upload IDs and
   unauthorized principals to establish error precedence and non-publication.
+  AWS first resolves whether the upload ID names an active upload, ahead of
+  malformed Content-MD5/checksum and incomplete SSE-C headers. For an active
+  upload, syntactically or semantically invalid part numbers and malformed copy
+  ranges precede current-policy authorization; Content-MD5 mismatch and copy
+  ranges beyond the source size follow authorization. The shared matrix
+  includes a successful copy canary and proves every rejected request leaves
+  the target upload empty and publishes no object.
 - [ ] Verify failed or interrupted UploadPart and UploadPartCopy requests neither
   replace a prior valid part nor become visible in ListParts/completion.
 

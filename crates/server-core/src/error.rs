@@ -191,6 +191,9 @@ pub enum ServerError {
     #[error("bad digest")]
     BadDigest,
 
+    #[error("Content-MD5 did not match the request body")]
+    ContentMd5Mismatch,
+
     #[error("checksum digest mismatch for {algorithm}")]
     ChecksumDigestMismatch { algorithm: String },
 
@@ -568,7 +571,9 @@ impl ServerError {
             Self::InvalidRange { .. } => "InvalidRange",
             Self::InvalidPartNumber { .. } => "InvalidPartNumber",
             Self::SlowDown => "SlowDown",
-            Self::BadDigest | Self::ChecksumDigestMismatch { .. } => "BadDigest",
+            Self::BadDigest | Self::ContentMd5Mismatch | Self::ChecksumDigestMismatch { .. } => {
+                "BadDigest"
+            }
             Self::InvalidDigest => "InvalidDigest",
             Self::InvalidSseCustomerKeyMd5
             | Self::MissingSseCustomerAlgorithm
@@ -692,6 +697,7 @@ impl ServerError {
             | Self::GlobalNamespaceHeaderRejectedForAccountRegionalBucket { .. }
             | Self::MaxMessageLengthExceeded { .. }
             | Self::BadDigest
+            | Self::ContentMd5Mismatch
             | Self::ChecksumDigestMismatch { .. }
             | Self::InvalidDigest
             | Self::InvalidSseCustomerKeyMd5

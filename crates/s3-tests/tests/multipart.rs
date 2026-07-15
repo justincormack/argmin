@@ -1827,6 +1827,324 @@ fn test_multipart_upload_id_authorization_precedence() {
 }
 
 #[test]
+fn test_upload_part_validation_authorization_precedence() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let source_key = "part-validation-precedence-source";
+        let canary_key = "part-validation-precedence-canary";
+        let target_key = "part-validation-precedence-target";
+        put_object_retrying_operation_aborted(client, &bucket, source_key, b"copy source".to_vec())
+            .await;
+
+        let canary =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, canary_key).await;
+        let canary_upload_id = canary.upload_id().unwrap();
+        let canary_copy = raw_multipart_query(
+            "PUT",
+            &bucket,
+            canary_key,
+            &format!("partNumber=1&uploadId={canary_upload_id}"),
+            b"",
+            &[("x-amz-copy-source", &format!("{bucket}/{source_key}"))],
+        );
+        assert_eq!(canary_copy.status, 200, "copy canary: {canary_copy:?}");
+        assert_multipart_parts_preserved(
+            &bucket,
+            canary_key,
+            canary_upload_id,
+            &[(
+                1,
+                b"copy source".len() as i64,
+                xml_tag_text(&canary_copy.body, "ETag").unwrap(),
+            )],
+        )
+        .await;
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(canary_key)
+            .upload_id(canary_upload_id)
+            .send_retrying_operation_aborted("abort UploadPartCopy precedence canary")
+            .await
+            .unwrap();
+
+        let target =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, target_key).await;
+        let active_upload_id = target.upload_id().unwrap();
+        let invalid_upload_id = "a".repeat(1025);
+        let body = b"must not become a part";
+        let bad_md5 = "AAAAAAAAAAAAAAAAAAAAAA==";
+        let copy_source = format!("{bucket}/{source_key}");
+
+        for (name, part_number, upload_id, headers, credentials) in [
+            (
+                "UploadPart invalid number active authorized",
+                "0",
+                active_upload_id,
+                Vec::new(),
+                primary_credentials(),
+            ),
+            (
+                "UploadPart invalid number invalid ID authorized",
+                "0",
+                invalid_upload_id.as_str(),
+                Vec::new(),
+                primary_credentials(),
+            ),
+            (
+                "UploadPart nonnumeric number invalid ID authorized",
+                "abc",
+                invalid_upload_id.as_str(),
+                Vec::new(),
+                primary_credentials(),
+            ),
+            (
+                "UploadPart invalid number active unauthorized",
+                "0",
+                active_upload_id,
+                Vec::new(),
+                alt_credentials(),
+            ),
+            (
+                "UploadPart invalid number invalid ID unauthorized",
+                "0",
+                invalid_upload_id.as_str(),
+                Vec::new(),
+                alt_credentials(),
+            ),
+            (
+                "UploadPart bad checksum active authorized",
+                "1",
+                active_upload_id,
+                vec![("content-md5", bad_md5)],
+                primary_credentials(),
+            ),
+            (
+                "UploadPart bad checksum invalid ID authorized",
+                "1",
+                invalid_upload_id.as_str(),
+                vec![("content-md5", bad_md5)],
+                primary_credentials(),
+            ),
+            (
+                "UploadPart malformed Content-MD5 invalid ID authorized",
+                "1",
+                invalid_upload_id.as_str(),
+                vec![("content-md5", "bad")],
+                primary_credentials(),
+            ),
+            (
+                "UploadPart malformed SHA256 checksum invalid ID authorized",
+                "1",
+                invalid_upload_id.as_str(),
+                vec![("x-amz-checksum-sha256", "bad")],
+                primary_credentials(),
+            ),
+            (
+                "UploadPart incomplete SSE-C headers invalid ID authorized",
+                "1",
+                invalid_upload_id.as_str(),
+                vec![("x-amz-server-side-encryption-customer-algorithm", "AES256")],
+                primary_credentials(),
+            ),
+            (
+                "UploadPart bad checksum active unauthorized",
+                "1",
+                active_upload_id,
+                vec![("content-md5", bad_md5)],
+                alt_credentials(),
+            ),
+            (
+                "UploadPart bad checksum invalid ID unauthorized",
+                "1",
+                invalid_upload_id.as_str(),
+                vec![("content-md5", bad_md5)],
+                alt_credentials(),
+            ),
+        ] {
+            let query = format!(
+                "partNumber={part_number}&uploadId={}",
+                query_encode_value(upload_id)
+            );
+            let response = send_signed_request_with_credentials(
+                "PUT",
+                &object_url(CTX.endpoint(), &bucket, target_key, Some(&query)),
+                body,
+                headers,
+                credentials,
+            );
+            let (expected_status, expected_code) = match name {
+                name if name.contains("invalid ID") => (404, "NoSuchUpload"),
+                "UploadPart bad checksum active authorized" => (400, "BadDigest"),
+                "UploadPart bad checksum active unauthorized" => (403, "AccessDenied"),
+                _ => (400, "InvalidArgument"),
+            };
+            assert_eq!(response.status, expected_status, "{name}: {response:?}");
+            assert_eq!(
+                xml_tag_text(&response.body, "Code"),
+                Some(expected_code),
+                "{name}: {response:?}"
+            );
+            if expected_code == "BadDigest" {
+                assert_eq!(
+                    xml_tag_text(&response.body, "Message"),
+                    Some("The Content-MD5 you specified did not match what we received."),
+                    "{name}: {response:?}"
+                );
+            }
+        }
+
+        for (name, part_number, upload_id, range, credentials) in [
+            (
+                "UploadPartCopy invalid number active authorized",
+                "0",
+                active_upload_id,
+                None,
+                primary_credentials(),
+            ),
+            (
+                "UploadPartCopy invalid number invalid ID authorized",
+                "0",
+                invalid_upload_id.as_str(),
+                None,
+                primary_credentials(),
+            ),
+            (
+                "UploadPartCopy nonnumeric number invalid ID authorized",
+                "abc",
+                invalid_upload_id.as_str(),
+                None,
+                primary_credentials(),
+            ),
+            (
+                "UploadPartCopy invalid number active unauthorized",
+                "0",
+                active_upload_id,
+                None,
+                alt_credentials(),
+            ),
+            (
+                "UploadPartCopy invalid number invalid ID unauthorized",
+                "0",
+                invalid_upload_id.as_str(),
+                None,
+                alt_credentials(),
+            ),
+            (
+                "UploadPartCopy malformed range active authorized",
+                "1",
+                active_upload_id,
+                Some("bytes=500-100"),
+                primary_credentials(),
+            ),
+            (
+                "UploadPartCopy malformed range invalid ID authorized",
+                "1",
+                invalid_upload_id.as_str(),
+                Some("bytes=500-100"),
+                primary_credentials(),
+            ),
+            (
+                "UploadPartCopy malformed range active unauthorized",
+                "1",
+                active_upload_id,
+                Some("bytes=500-100"),
+                alt_credentials(),
+            ),
+            (
+                "UploadPartCopy malformed range invalid ID unauthorized",
+                "1",
+                invalid_upload_id.as_str(),
+                Some("bytes=500-100"),
+                alt_credentials(),
+            ),
+            (
+                "UploadPartCopy out-of-bounds range active authorized",
+                "1",
+                active_upload_id,
+                Some("bytes=0-9999"),
+                primary_credentials(),
+            ),
+            (
+                "UploadPartCopy out-of-bounds range invalid ID authorized",
+                "1",
+                invalid_upload_id.as_str(),
+                Some("bytes=0-9999"),
+                primary_credentials(),
+            ),
+            (
+                "UploadPartCopy out-of-bounds range active unauthorized",
+                "1",
+                active_upload_id,
+                Some("bytes=0-9999"),
+                alt_credentials(),
+            ),
+            (
+                "UploadPartCopy out-of-bounds range invalid ID unauthorized",
+                "1",
+                invalid_upload_id.as_str(),
+                Some("bytes=0-9999"),
+                alt_credentials(),
+            ),
+        ] {
+            let query = format!(
+                "partNumber={part_number}&uploadId={}",
+                query_encode_value(upload_id)
+            );
+            let mut headers = vec![("x-amz-copy-source", copy_source.as_str())];
+            if let Some(range) = range {
+                headers.push(("x-amz-copy-source-range", range));
+            }
+            let response = send_signed_request_with_credentials(
+                "PUT",
+                &object_url(CTX.endpoint(), &bucket, target_key, Some(&query)),
+                b"",
+                headers,
+                credentials,
+            );
+            let (expected_status, expected_code) = match name {
+                name if name.contains("invalid ID") => (404, "NoSuchUpload"),
+                "UploadPartCopy out-of-bounds range active unauthorized" => (403, "AccessDenied"),
+                _ => (400, "InvalidArgument"),
+            };
+            assert_eq!(response.status, expected_status, "{name}: {response:?}");
+            assert_eq!(
+                xml_tag_text(&response.body, "Code"),
+                Some(expected_code),
+                "{name}: {response:?}"
+            );
+            if name.contains("malformed range active") {
+                assert_eq!(
+                    xml_tag_text(&response.body, "Message"),
+                    Some("The x-amz-copy-source-range value must be of the form bytes=first-last where first and last are the zero-based offsets of the first and last bytes to copy"),
+                    "{name}: {response:?}"
+                );
+            }
+        }
+
+        assert_multipart_parts_preserved(&bucket, target_key, active_upload_id, &[]).await;
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(target_key)
+            .send_retrying_operation_aborted("check validation precedence non-publication")
+            .await;
+        assert_eq!(err_status(&head), 404, "unexpected target object: {head:?}");
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(target_key)
+            .upload_id(active_upload_id)
+            .send_retrying_operation_aborted("abort validation precedence target")
+            .await
+            .unwrap();
+        cleanup(&bucket, &[source_key]).await;
+    });
+}
+
+#[test]
 fn test_complete_multipart_upload_xml_precedence() {
     s3_tests::run(async {
         let client = CTX.client();

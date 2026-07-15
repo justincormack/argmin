@@ -2880,8 +2880,10 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::UploadPart { bucket, key } => {
-                let (upload_id_raw, part_number) =
-                    request::parse_upload_part_copy_query(req.query_string())?;
+                let (upload_id_raw, part_number_raw) = request::parse_upload_part_query_raw(
+                    req.query_string(),
+                    ServerError::UploadPartCopyMissingUploadId,
+                )?;
                 let upload_id = parse_present_upload_id(upload_id_raw.as_str())?;
                 // Normal UploadPart requests are intercepted in serve.rs and
                 // streamed before they reach dispatch_routed(). Only copy-source
@@ -2892,8 +2894,19 @@ impl HttpFrontend {
                     });
                 };
 
-                let (src_bucket, src_key, src_version_id) = parse_copy_source_header(copy_source)?;
                 let requester = self.requester_from_auth(auth, req);
+                let upload_request = multipart_object_request(
+                    &bucket,
+                    &key,
+                    upload_id,
+                    requester,
+                    expected_bucket_owner,
+                )?;
+                self.coordinator
+                    .validate_in_progress_multipart_upload_target(&upload_request)?;
+                let part_number = request::parse_upload_part_copy_number_value(&part_number_raw)?;
+
+                let (src_bucket, src_key, src_version_id) = parse_copy_source_header(copy_source)?;
                 let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 reject_managed_encryption_read_headers(
@@ -2917,13 +2930,7 @@ impl HttpFrontend {
                             &src_cond,
                             expected_source_bucket_owner(req),
                         ),
-                        upload: multipart_object_request(
-                            &bucket,
-                            &key,
-                            upload_id,
-                            requester,
-                            expected_bucket_owner,
-                        )?,
+                        upload: upload_request,
                         part_number,
                         copy_source_range,
                         policy_context: PutObjectPolicyContext::new(Some(copy_source), None, None),
@@ -4353,7 +4360,7 @@ impl HttpFrontend {
         bucket: &str,
         key: &str,
         upload_id: &str,
-        part_number: u32,
+        part_number: &str,
     ) -> Result<StreamingPartContext, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -4368,20 +4375,8 @@ impl HttpFrontend {
         let auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
         self.enforce_bucket_region_raw(bucket, &auth)?;
 
-        validate_request_checksum_headers(req, false, false, false)?;
-        let content_md5 = ContentMd5Claim::from_request(req)?;
-        let claimed_checksum = extract_checksum_header(req)?;
-        let sse_customer_request = parse_sse_customer_request(req)?;
         let requester = self.requester_from_auth(&auth, req);
         let expected_bucket_owner = expected_bucket_owner(req).map(str::to_string);
-
-        let mut checksum_response: Vec<(String, String)> = Vec::new();
-        for (_, header) in checksum_headers() {
-            if let Some(val) = req.header(header) {
-                checksum_response.push((header.to_string(), val.to_string()));
-            }
-        }
-
         let bucket_name = parse_bucket_name(bucket)?;
         let upload = multipart_object_request(
             &bucket_name,
@@ -4390,6 +4385,21 @@ impl HttpFrontend {
             requester.clone(),
             expected_bucket_owner.as_deref(),
         )?;
+        self.coordinator
+            .validate_in_progress_multipart_upload_target(&upload)?;
+
+        validate_request_checksum_headers(req, false, false, false)?;
+        let content_md5 = ContentMd5Claim::from_request(req)?;
+        let claimed_checksum = extract_checksum_header(req)?;
+        let sse_customer_request = parse_sse_customer_request(req)?;
+        let mut checksum_response: Vec<(String, String)> = Vec::new();
+        for (_, header) in checksum_headers() {
+            if let Some(val) = req.header(header) {
+                checksum_response.push((header.to_string(), val.to_string()));
+            }
+        }
+
+        let part_number = request::parse_upload_part_number_value(part_number)?;
         let binding_upload_id = upload.upload_id().clone();
         let binding_bucket = upload.object.bucket.name.clone();
         let binding_key = upload.object.key.clone();
@@ -5512,7 +5522,7 @@ impl ContentMd5Claim {
         if self.0 == *actual {
             Ok(())
         } else {
-            Err(ServerError::BadDigest)
+            Err(ServerError::ContentMd5Mismatch)
         }
     }
 }
@@ -8494,8 +8504,8 @@ mod tests {
                 bucket: test_bucket_name("mybucket"),
             },
         ) {
-            Err(ServerError::BadDigest) => {}
-            Err(e) => panic!("expected BadDigest, got {e:?}"),
+            Err(ServerError::ContentMd5Mismatch) => {}
+            Err(e) => panic!("expected ContentMd5Mismatch, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -9172,7 +9182,7 @@ mod tests {
     }
 
     #[test]
-    fn upload_part_invalid_part_number() {
+    fn upload_part_invalid_part_number_does_not_hide_missing_upload() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -9183,10 +9193,10 @@ mod tests {
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidUploadPartCopyNumber { value }) => {
-                assert_eq!(value, "abc");
+            Err(ServerError::NoSuchUpload { upload_id }) => {
+                assert_eq!(upload_id, "xyz");
             }
-            Err(e) => panic!("expected InvalidUploadPartCopyNumber, got {e:?}"),
+            Err(e) => panic!("expected NoSuchUpload, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -9210,7 +9220,7 @@ mod tests {
             ],
             b"hello world".to_vec(),
         );
-        match fe.prepare_streaming_part(&req, "mybucket", "mykey", "upload-id", 1) {
+        match fe.prepare_streaming_part(&req, "mybucket", "mykey", "upload-id", "1") {
             Err(ServerError::InvalidRequest { reason }) => {
                 assert_eq!(
                     reason,
@@ -9267,8 +9277,8 @@ mod tests {
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::BadDigest) => {}
-            Err(e) => panic!("expected BadDigest, got {e:?}"),
+            Err(ServerError::ContentMd5Mismatch) => {}
+            Err(e) => panic!("expected ContentMd5Mismatch, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -12053,8 +12063,8 @@ mod tests {
             bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::BadDigest) => {}
-            Err(e) => panic!("expected BadDigest, got {e:?}"),
+            Err(ServerError::ContentMd5Mismatch) => {}
+            Err(e) => panic!("expected ContentMd5Mismatch, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
