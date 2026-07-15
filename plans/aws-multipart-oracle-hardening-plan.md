@@ -64,8 +64,62 @@ For each matrix:
   the aggregate checksum. AWS's repeatable `InternalError` for a valid,
   checksum-configured but non-consecutive part list is covered under the
   documented compatibility policy that permits Argmin's `InvalidRequest`.
-- [ ] Probe retries after successful completion and after abort, including object
-  overwrite/delete and bucket delete/recreate histories.
+- [x] Probe retries after successful completion and after abort, including object
+  overwrite/delete and bucket delete/recreate histories. AWS replays the exact
+  successful completion while its published object generation remains current,
+  but returns `NoSuchUpload` for a changed manifest or after overwrite/delete.
+  Abort is idempotent for completed and aborted upload IDs and does not consume
+  a completed upload's exact replay. These terminal retries remain valid until
+  bucket deletion/recreation, which makes every operation on the old IDs return
+  `NoSuchUpload`.
+- [ ] Extend the terminal-retry oracle matrix to versioned and suspended
+  buckets. Probe a later object version, delete markers, removal of the delete
+  marker, deletion of the completed version, and a later multipart completion
+  of the same key. Pin whether an exact completion retry remains valid and which
+  `versionId` and response metadata AWS replays in every history.
+- [ ] Probe terminal completion retries after the initiator's current
+  `s3:PutObject` permission is removed and under an explicit deny, with positive
+  policy canaries before each transition. Unless AWS proves a terminal-replay
+  exception, an authenticated replay must traverse the same current bucket/IAM
+  policy authorization as an in-progress completion; possession of a valid
+  upload ID and retained initiator/owner claims establishes identity, not
+  authorization.
+- [ ] Cross malformed completion XML and malformed checksum/expected-size
+  headers with a completed upload whose published object has subsequently been
+  overwritten or deleted. Pin that the request-layer target preflight treats
+  only an AWS-applicable completion replay as existing, so `NoSuchUpload` wins
+  before body and completion-header validation once replay eligibility ends.
+- [ ] Replace terminal multipart tombstones with a storage model proportional to
+  active uploads and live object versions, not historical multipart activity.
+  Per-bucket retention limits are not acceptable: multipart is the ordinary
+  object-write path, so even a fixed limit such as 10,000 records per bucket
+  creates a large permanent metadata tax across many buckets.
+  - Generate opaque authenticated upload IDs bound to the bucket, key, and
+    bucket-incarnation generation. Include any initiator/owner claims required
+    by the AWS authorization oracle, and define durable signing-key lifecycle
+    and restart behavior. A mutated ID, an ID used with another key, or an ID
+    from a deleted bucket incarnation must fail validation.
+  - Keep exact-completion replay data with the object version produced by the
+    completion: the authenticated upload identity, completion-manifest digest,
+    and response fields not otherwise derivable from the object metadata.
+    Replay succeeds only for the AWS-selected applicable object version and an
+    exact manifest match. Both request preflight and full completion must use
+    the same replay-eligibility rule, while the full path repeats the lookup to
+    close overwrite/delete races.
+  - For an authenticated issued ID with no applicable completion replay,
+    CompleteMultipartUpload returns `NoSuchUpload`; AbortMultipartUpload remains
+    idempotently successful after either completion or abort without retaining
+    a terminal row. Perform authorization after authenticating the key-bound ID
+    so the existing hidden-resource `AccessDenied` behavior remains possible.
+  - Remove the existing bounded completed-upload tombstone table/path as well as
+    the uncommitted completed/aborted extension. Add storage tests proving that
+    completion, abort, overwrite, and deletion do not accumulate historical
+    terminal rows, plus restart and bucket delete/recreate tests for upload-ID
+    authentication and replay state. No pruning or cleanup mechanism may be
+    required to maintain the storage bound.
+- [ ] Once the tombstone-free implementation matches the shared AWS/local
+  matrix, replace the compatibility-guide exception for terminal hidden-resource
+  denial with the authenticated-ID and object-scoped replay invariants.
 
 ### 3. Part upload and copy boundaries
 
