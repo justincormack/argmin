@@ -347,33 +347,106 @@ concrete in-memory lock or `HashMap` through auth APIs.
 
 ### 4. Use a versioned AEAD session-token envelope
 
-The token should contain a small versioned envelope and an encrypted payload.
-The exact encoding is an implementation decision, but it must include:
+The first format is now fixed rather than being left to Phase 1. The external
+token is the ASCII prefix `ARGST1.` followed by unpadded URL-safe base64 of one
+binary frame. Version 1's frame is, in order:
 
-- format version and sealing-key ID
-- unique random AEAD nonce
-- access key ID and secret access key
-- issued-at and expires-at instants in a canonical integer representation
-- account, role ID, role-session name, and the identity fields needed to
-  reconstruct the assumed-role principal
-- inline session policy and later source identity/session tags/transitive tags
-- any credential-domain binding needed to prevent a token from one Argmin
-  deployment being accepted by another deployment that accidentally shares a
-  key
+- a 16-byte public sealing-key ID
+- a 12-byte AES-GCM nonce
+- the ciphertext
+- the 16-byte AES-GCM authentication tag appended by `ring`
 
-Use an authenticated-encryption primitive already available through `ring`
-unless implementation review identifies a reason to add another dependency.
-The format version, key ID, and credential-domain binding must be authenticated
-as associated data or included inside the authenticated ciphertext. Parsing
-must reject unknown versions, unknown key IDs, nonce/tag truncation, trailing
-bytes, oversized decoded tokens, invalid field encodings, and impossible time
-ranges before constructing a session credential.
+Use `ring::aead::AES_256_GCM`, which is already a production dependency. The
+clear key ID selects a validation key. For the process-local active key, the
+nonce is a random four-byte per-key prefix followed by an atomic unsigned
+64-bit big-endian issuance counter. The prefix, key, and key ID are regenerated
+together at process start, and counter exhaustion fails issuance closed. This
+guarantees nonce uniqueness under that key without storing issued sessions or
+relying on probabilistic nonce-collision tests. The exact ASCII prefix, key ID,
+and nonce are authenticated together with the credential domain as associated
+data.
+Construct that associated data with a fixed binary layout containing the
+literal `argmin:sts:session-token:v1`, the 16-byte credential domain, the
+external prefix, key ID, and nonce; do not authenticate ambiguous concatenated
+strings.
 
-The initial key ring can contain one random process-start key shared by all
-workers. A later configured/persistent key ring should support one active
-issuance key plus overlapping validation-only keys for rotation. Status may
-expose only format version and non-secret key IDs, never raw key material,
-tokens, decoded secrets, or session payloads.
+The encrypted version-1 payload uses this exact fixed order:
+
+1. the 24-byte ASCII session access key ID
+2. the 40-byte ASCII secret access key
+3. issued-at and expires-at as two signed 64-bit big-endian Unix seconds
+4. the 12-byte ASCII account ID
+5. the 24-byte ASCII stable role ID (`ARGR` plus 20 random uppercase
+   alphanumeric characters)
+6. role name and role-session name as separate unsigned 16-bit big-endian byte
+   lengths followed by their UTF-8 bytes
+7. a one-byte source-identity presence tag (`0` or `1`), followed when present
+   by an unsigned 16-bit big-endian byte length and UTF-8 bytes
+
+Every variable-length string is length-prefixed, and every fixed or variable
+field is validated against its typed API bound before the authenticated session
+value is constructed. Version 1 has no generic map, ignored extension area, or
+trailing bytes. Inline session policies, managed policy references, session
+tags, transitive-tag keys, and provided contexts require a new outer format
+version when those Phase 6 features are implemented; they must not be smuggled
+into an unvalidated version 1 extension field. Until then every request
+containing one of those parameters is rejected before issuance.
+
+Bound allocation before base64 decoding. Version 1 accepts at most 21,853 ASCII
+bytes (`ARGST1.` plus the unpadded base64 expansion of a 16,384-byte frame) and
+at most 16,384 decoded frame bytes as defensive decoder limits. Issuance has a
+separate, smaller invariant. Treating each of the three 64-scalar variable
+identity fields as its maximum 256-byte UTF-8 encoding gives a maximum 891-byte
+plaintext, 935-byte frame, and 1,254-byte external token. Define that result as
+`MAX_ISSUED_V1_TOKEN_LEN`; derive it from the field/frame constants and assert it
+after sealing so a future field change cannot silently enlarge issued tokens.
+Exceeding it is an internal invariant failure, never a credential returned to
+the client. Focused tests must construct every version-1 field at its maximum
+accepted encoded size, sign ordinary PutObject and aws-chunked requests with the
+result, and assert that each complete request-header section remains within the
+server's 8,192-byte limit. Presigned-query and POST Object tests must exercise
+the same maximum token through their respective transport. A future envelope
+version may change the issuance ceiling only after AWS parameter-length probes
+and matching header, Query, POST, and streaming transport coverage establish
+that the resulting credentials work in every required authentication mode.
+Compact encoding or compression is a Phase 6 design decision, not permission to
+issue an oversized version-1 token.
+
+Parsing must reject an unknown prefix/version, invalid or non-canonical base64,
+unknown key ID, nonce/tag truncation, authentication failure, trailing bytes,
+oversized encoded or decoded tokens, duplicate/impossible payload state,
+invalid UTF-8 or field encodings, and impossible time ranges before constructing
+a session credential. These failures collapse to one typed invalid-session-
+token result for service-specific AWS error rendering. Unknown key IDs are
+invalid tokens; an unavailable key-ring provider is an internal provider
+failure. Neither path may log the token, plaintext, secret, nonce, tag, or raw
+key material.
+
+The initial key ring contains one process-start 256-bit key, a random 16-byte
+key ID, and a random 16-byte credential domain, shared by all workers in the
+process. A configured ring later contains exactly one active issuance key and
+zero or more validation-only keys with unique 16-byte IDs. Each key object owns
+its nonce prefix and atomic counter for its entire in-process lifetime. Its
+state transition is one-way: `Active -> ValidationOnly -> Removed`. A
+validation-only or removed key ID/key-material pair can never become active
+again, and a new active key always has new key material, key ID, nonce prefix,
+and counter. Rotation changes issuance to that new key immediately while
+retaining the old key for validation. An old validation key must remain until
+the maximum possible expiry of every session it issued; removing it is
+immediate bulk revocation and is never a transparent rotation step. Key-ring
+APIs and configuration validation must make reactivation unrepresentable, and
+tests must cover attempted validation-only and removed-key promotion as well as
+concurrent rotation/issuance. Configured multi-frontend use also requires the
+same explicit credential domain and identity provider on every frontend.
+No configured key may become active for issuance across process restarts or on
+multiple frontends until that later implementation provides a non-repeating
+nonce allocation for the key's entire lifetime; loading it as validation-only
+does not have that constraint.
+Duplicate key IDs, duplicate key material under another ID, no active key,
+malformed key material, or inconsistent domain configuration are startup
+errors. Status may expose only format version, credential-domain ID, non-secret
+key IDs, and active/validation-only state, never raw key material, tokens,
+decoded secrets, or session payloads.
 
 Because issuance stores nothing, there is no issued-session capacity, expiry
 scan, or tombstone requirement. Memory remains bounded by the existing request
@@ -466,7 +539,8 @@ header, presigned, POST Object, and streaming authentication:
    precede signature comparison
 10. verify SigV4 with the embedded secret access key
 11. return an immutable authenticated-session value containing the structured
-   token identity and session-policy context
+   token identity and versioned session context; version 1 has no session
+   policy, while later formats may add the independently validated policy state
 
 Streaming must plug its AWS-pinned selection rules into step 2 rather than
 adding a separate credential-validation pipeline. All presented token values,
@@ -646,12 +720,17 @@ the protocol and fuzzing requirements cleanly.
 Use the repository's existing cryptographic randomness facilities where
 possible. Generation needs:
 
-- SDK-compatible session access key IDs in an Argmin-owned namespace, initially
-  `ARGS` followed by sufficient random uppercase alphanumeric material
-- secret access keys with sufficient entropy and SDK-compatible characters
+- 24-character SDK-compatible session access key IDs: `ARGS` followed by 20
+  uniformly sampled uppercase ASCII letters or decimal digits (more than 103
+  bits of entropy); use rejection sampling rather than biased byte modulo
+- 40-character secret access keys produced as unpadded URL-safe base64 of 30
+  random bytes (240 bits), so the client-visible length matches common SigV4
+  tooling assumptions without using an AWS-owned shape
 - unique AEAD nonces and opaque base64-encoded session envelopes with no
   client-visible fixed-size assumption
-- stable role IDs and unique assumed-role IDs
+- 24-character stable role IDs: `ARGR` plus the same 20-character uniform
+  alphabet; assumed-role IDs are the stable role ID, a colon, and the validated
+  role-session name
 
 Session access key IDs need enough entropy to make collisions negligible without
 an issued-key registry. They must also be checked against stored long-lived keys
@@ -672,7 +751,11 @@ long-lived keys and `ARGS` for session keys. The provider must reject a
 caller-supplied long-lived key in the reserved temporary namespace. This
 prevents a later static-key insertion from shadowing an active stateless session
 credential. Namespace and total-length constants should be centralized rather
-than repeated across IAM, STS, authentication, and tests. A namespace is a
+than repeated across IAM, STS, authentication, and tests. An unresolved
+`ARGS` access key is sufficient to select the temporary-credential error path
+when the token is absent, but the prefix is only a routing hint: it never proves
+issuance or permits authentication without successfully opening and binding the
+token. No self-authenticating access-key encoding is required. A namespace is a
 routing/collision and provenance invariant only; its prefix is not proof that a
 credential was issued by Argmin.
 
@@ -840,8 +923,10 @@ The initial Query-protocol slice completed on 2026-07-13:
   `text/xml` response type, and request-ID agreement
 
 Before Phase 0 can satisfy the first-milestone exit condition, it still needs
-to settle the temporary access-key/token envelope decisions and explicitly
-disposition the remaining bounded parser and precedence gaps listed below.
+to explicitly disposition the remaining bounded Query-parser and credential-
+precedence gaps listed below. The temporary access-key namespace, generation
+shape, session-token envelope, credential-domain binding, and key-overlap
+semantics are now fixed by the completed envelope-design slice.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
 remain unsupported compatibility gaps and must never be silently ignored.
@@ -1244,6 +1329,41 @@ authorization boundary after signature verification; it is not sealed into
 the session, consulted during authentication, or permitted to override a bad
 signature.
 
+The stateless credential-envelope design slice completed on 2026-07-15. The
+Ceph reference confirms the useful property that the issued access key, secret,
+expiry, issuer, and session authorization context can travel in an encrypted
+token without an issued-session database. Argmin deliberately does not copy
+Ceph's fixed-IV unauthenticated AES-CBC construction. Version 1 instead uses
+the `ARGST1.` format and AES-256-GCM frame specified above, with strict size and
+canonical payload bounds and a credential domain authenticated as associated
+data.
+
+Version 1 carries no inline or managed session policy; those unsupported
+parameters remain explicit request errors until Phase 6 pins their character
+limits and introduces a transport-safe later envelope version. The 16,384-byte
+decoded limit is only a defensive decoder allocation bound. Issuance is capped
+at the derived 1,254-byte external-token maximum and must prove its maximum
+field shapes fit the complete 8,192-byte PutObject and aws-chunked header
+sections as well as the presigned and POST transports.
+
+Temporary access key IDs are fixed at `ARGS` plus 20 uniform uppercase
+alphanumeric characters, and secret keys are fixed at 40 URL-safe characters
+generated from 30 random bytes. Static providers reserve and reject the `ARGS`
+namespace. This lets a missing-token request select the AWS-pinned temporary-
+credential error mapping without turning the namespace into authentication:
+only a successfully opened token, constant-time access-key binding, expiry and
+issuer-liveness validation, and SigV4 verification authenticate the session.
+
+The process-local ring has one random active key, key ID, and credential domain
+shared by all workers. The configured-ring contract is also fixed for later
+work: one active issuance key, unique validation-only key IDs, an explicit
+shared domain, irreversible `Active -> ValidationOnly -> Removed` transitions,
+and overlap until every session issued by a retired key has expired. Removing a
+validation key is intentional bulk revocation; an old key is never promoted and
+never receives a reset nonce allocator. This resolves the envelope encoding,
+missing-token routing, and key-overlap questions without adding a production
+dependency.
+
 The STS signing-scope slice completed on 2026-07-14. The existing configured
 regional endpoint success is its positive control. Complete STS response
 goldens establish that:
@@ -1626,8 +1746,9 @@ involved.
 - authorize `AssumeRole` using the AWS-equivalent combination of caller identity
   permissions and the role trust policy
 - validate role/session/duration inputs
-- generate the session credential and seal its authentication/session-policy
-  context without mutating identity state
+- generate the session credential and seal its version-1 authentication/session
+  context without mutating identity state; reject every Phase 6 policy/tag/
+  context parameter explicitly
 - render AWS-shaped success/errors
 - add `aws-sdk-sts` after the normal test-dependency review
 
@@ -1690,10 +1811,15 @@ in-memory role through AWS-compatible public APIs.
 - typed credential/identity invariants
 - AEAD envelope round trips and failure uniformity without exposing token values
 - expiry boundary and injected clock behavior
-- secure generator shapes, nonce uniqueness, access-key binding, and negligible
-  collision assumptions
+- secure generator shapes, concurrent nonce-counter uniqueness and exhaustion,
+  access-key binding, and negligible random identifier collision assumptions
 - unknown version/key ID, wrong key, bit flips, truncation, trailing bytes,
   oversized tokens, invalid timestamps, and cross-domain replay
+- irreversible active/validation-only/removed key transitions, attempted key
+  reactivation, duplicate key material under a new ID, and concurrent issuance
+  during rotation
+- maximum version-1 token issuance through complete header, streaming,
+  presigned-query, and POST Object transport limits
 - Query parser duplicates, decoding, indexing, length/overflow, and malformed
   input
 - XML escaping and golden rendering
@@ -1791,16 +1917,11 @@ S3 endpoint permits plain HTTP, but documentation must call out that AssumeRole
 responses contain bearer credentials and therefore require TLS for
 confidentiality. No session response or request body may appear in traces.
 
-## Open Decisions To Resolve During Phase 0
+## Remaining Decisions To Resolve During Phase 0
 
-1. What exact same-account, cross-account, and path-bearing AWS role fixtures
-   and permission scopes can be added to the external test accounts without
-   broadening the test users' permissions more than needed?
-2. Does the first local endpoint model only configured-region STS behavior, or
-   must it also recognize the legacy global endpoint signing rules immediately?
-3. Which existing identity/policy types can be generalized without making S3
+1. Which existing identity/policy types can be generalized without making S3
    bucket-policy code less explicit?
-4. What is the exact AWS precedence among wrong token, missing token, wrong
+2. What is the exact AWS precedence among wrong token, missing token, wrong
    region/service, disabled credential, and expired session? The core header,
    presigned, POST Object, and streaming token/signature collisions are pinned;
    STS, S3 header, S3 presigned-query, and S3 POST Object region/service
@@ -1808,22 +1929,11 @@ confidentiality. No session response or request body may appear in traces.
    collisions. Expiry versus issuer deletion is pinned independently for STS
    and every initial S3 mode. Disabled-credential collisions and expiry
    collisions with missing, mismatched, or wrong-scope inputs are not.
-5. What total Query body and member limits does live STS enforce for the first
+3. What total Query body and member limits does live STS enforce for the first
    supported parameter set?
-6. Should the first standalone UAT role be injected through a dedicated
+4. Should the first standalone UAT role be injected through a dedicated
    test-only constructor/config object or through explicitly UAT-only
    environment variables?
-7. Which S3 actions form the smallest meaningful identity-policy conformance
-   matrix while still proving that role permissions are real rather than a
-   profile shortcut?
-8. What missing-token error can a stateless implementation reproduce from only
-   the access key ID, and does AWS behavior require a self-authenticating issued
-   access-key format?
-9. Which AEAD and envelope encoding should be the initial format, and what
-   credential-domain value should be authenticated to prevent cross-deployment
-   token reuse?
-10. What key-overlap and retirement semantics are required before configured
-    token keys can be shared by multiple frontend processes?
 
 ## Definition Of The First Usable Milestone
 
@@ -1838,7 +1948,8 @@ The initial milestone is complete only when all of the following are true:
 - a path-bearing IAM role produces a path-free assumed-role session ARN while
   retaining the path in its IAM role ARN and `aws:PrincipalArn` value
 - the session token is a versioned AEAD-sealed, self-contained credential and
-  session-policy envelope; issuance creates no per-session record
+  session-context envelope; issuance creates no per-session record and rejects
+  unsupported session-policy parameters
 - every HTTP worker accepts the new credential immediately through the shared
   key ring and role provider
 - S3 header, presigned, POST, and streaming auth require the exact session token
