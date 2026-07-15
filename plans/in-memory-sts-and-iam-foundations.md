@@ -1971,8 +1971,39 @@ signed headers. It checks the canonical-request and string-to-sign hashes and
 byte encodings, then sanitizes the echoed access key before the complete
 response-shape comparison.
 
-The remaining malformed operation-body collisions and local Host/SNI
-trust-boundary cases remain required before the Phase 4 service refactor.
+The operation-body routing slice completed on 2026-07-15 against the existing
+tagged-bucket fixture, so resource absence cannot mask XML, query-member, or
+authentication ordering. It establishes:
+
+- on the S3 Control endpoint, an empty `TagResource` body is
+  `MissingRequestBodyError`, truncated XML is `MalformedXML`, and a wrong root,
+  missing `Tags`, or empty `Tags` is `InvalidTag` with `At least one tag is
+  required.` Despite the published shape permitting a zero-member tag array,
+  the live bucket operation requires at least one tag
+- correct-service bad HMAC wins before every tested `TagResource` XML error;
+  wrong service wins before the representative truncated-XML error, regardless
+  of whether the HMAC is valid
+- complete absence of `UntagResource`'s required `tagKeys` member is
+  `InvalidTag` before service-scope and HMAC validation. Once the member is
+  present, empty, invalid-character, and 129-character keys reach HMAC first;
+  a valid HMAC then produces the exact common `InvalidTag` validation error
+- a single absent tag key and two distinct repeated absent keys succeed with
+  `204`. Two identical repeated absent keys produce the generic
+  `500 InternalError`; three consecutive requests reproduced that result. A bad
+  HMAC still wins before this backend outcome
+- the regional STS endpoint returns its non-root `UnknownOperation` shape for
+  every body/query-member case with valid or bad HMAC under the correct `sts`
+  signing scope. The alternate `s3` scope is pinned for the representative
+  truncated-XML and missing-`tagKeys` collisions, with both valid and bad HMAC.
+  The local `SharedRegional` mapping remains S3 Control for the reserved
+  versioned path
+
+Every valid-result assertion is an exact response golden. Every
+signature-mismatch assertion reconstructs and validates the complete canonical
+request without printing live credentials. The local Host/SNI trust-boundary
+cases are now the only routing-boundary evidence still required before the
+Phase 4 service refactor.
+
 The narrow current local `TagResource`/`UntagResource` routes still inherit the
 ordinary S3 listener's transport and are therefore a documented temporary gap;
 the typed Phase 4 endpoint refactor must remove that gap rather than inventing
@@ -2261,9 +2292,9 @@ body may appear in traces.
    and S3 Control endpoint kinds? The routing-boundary matrix and explicit
    `SharedRegional` mapping above have pinned the root-Query,
    versioned-path/form/query, bounded HTTP-method, path/percent/ARN near-miss,
-   account-ID-header, and signing/authentication rows. The remaining body rows
-   must be completed, and the local authority/SNI matrix must enforce the
-   endpoint-kind trust boundary, before the typed service refactor.
+   account-ID-header, signing/authentication, and operation-body rows. The local
+   authority/SNI matrix must still enforce the endpoint-kind trust boundary
+   before the typed service refactor.
 
 ## Definition Of The First Usable Milestone
 

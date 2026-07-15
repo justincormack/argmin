@@ -6467,6 +6467,7 @@ fn run_cross_account_probes(
     println!("assume-role-cross-account-success: ok");
 }
 
+#[derive(Clone, Copy)]
 struct S3ControlError<'a> {
     status: u16,
     code: &'a str,
@@ -6667,6 +6668,21 @@ struct RoutingAuthCollisionProbe<'a> {
     headers: Vec<(&'a str, &'a str)>,
     sts: StsAuthCollisionResult,
     s3_control: S3ControlAuthCollisionResult,
+}
+
+#[derive(Clone, Copy)]
+enum S3ControlBodyResult<'a> {
+    Error(S3ControlError<'a>),
+    WriteSuccess,
+}
+
+struct RoutingBodyProbe<'a> {
+    label: &'static str,
+    method: &'static str,
+    query: String,
+    body: &'a [u8],
+    headers: Vec<(&'a str, &'a str)>,
+    s3_control: S3ControlBodyResult<'a>,
 }
 
 fn account_id_header_probes(account_id: &str) -> Vec<AccountIdHeaderProbe<'_>> {
@@ -7724,6 +7740,315 @@ fn run_list_tags_for_resource_success_probe(
         &s3_control_response,
     );
     println!("routing-list-tags-existing-s3-control: ok");
+
+    let overlong_tag_key = "x".repeat(129);
+    let invalid_tag_message = "This request contains a tag key or value that isn't valid. Valid characters include the following: [a-zA-Z+-=._:/]. Tag keys can contain up to 128 characters. Tag values can contain up to 256 characters.";
+    let at_least_one_tag = S3ControlBodyResult::Error(S3ControlError {
+        status: 400,
+        code: "InvalidTag",
+        message: "At least one tag is required.",
+        detail: "",
+        allow: None,
+    });
+    let invalid_tag = S3ControlBodyResult::Error(S3ControlError {
+        status: 400,
+        code: "InvalidTag",
+        message: invalid_tag_message,
+        detail: "",
+        allow: None,
+    });
+    let body_probes = vec![
+        RoutingBodyProbe {
+            label: "tag-empty-body",
+            method: "POST",
+            query: String::new(),
+            body: b"",
+            headers: vec![
+                ("content-type", "application/xml"),
+                ("x-amz-account-id", account_id),
+            ],
+            s3_control: S3ControlBodyResult::Error(S3ControlError {
+                status: 400,
+                code: "MissingRequestBodyError",
+                message: "Request Body is empty",
+                detail: "",
+                allow: None,
+            }),
+        },
+        RoutingBodyProbe {
+            label: "tag-truncated-xml",
+            method: "POST",
+            query: String::new(),
+            body: b"<TagResourceRequest",
+            headers: vec![
+                ("content-type", "application/xml"),
+                ("x-amz-account-id", account_id),
+            ],
+            s3_control: S3ControlBodyResult::Error(S3ControlError {
+                status: 400,
+                code: "MalformedXML",
+                message: "The XML you provided was not well-formed or did not validate against our published schema",
+                detail: "",
+                allow: None,
+            }),
+        },
+        RoutingBodyProbe {
+            label: "tag-wrong-root",
+            method: "POST",
+            query: String::new(),
+            body: b"<WrongRoot/>",
+            headers: vec![
+                ("content-type", "application/xml"),
+                ("x-amz-account-id", account_id),
+            ],
+            s3_control: at_least_one_tag,
+        },
+        RoutingBodyProbe {
+            label: "tag-missing-tags",
+            method: "POST",
+            query: String::new(),
+            body: b"<TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"/>",
+            headers: vec![
+                ("content-type", "application/xml"),
+                ("x-amz-account-id", account_id),
+            ],
+            s3_control: at_least_one_tag,
+        },
+        RoutingBodyProbe {
+            label: "tag-empty-tags",
+            method: "POST",
+            query: String::new(),
+            body: b"<TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags/></TagResourceRequest>",
+            headers: vec![
+                ("content-type", "application/xml"),
+                ("x-amz-account-id", account_id),
+            ],
+            s3_control: at_least_one_tag,
+        },
+        RoutingBodyProbe {
+            label: "untag-missing-tag-keys",
+            method: "DELETE",
+            query: String::new(),
+            body: b"",
+            headers: vec![("x-amz-account-id", account_id)],
+            s3_control: at_least_one_tag,
+        },
+        RoutingBodyProbe {
+            label: "untag-empty-tag-key",
+            method: "DELETE",
+            query: "tagKeys=".to_string(),
+            body: b"",
+            headers: vec![("x-amz-account-id", account_id)],
+            s3_control: invalid_tag,
+        },
+        RoutingBodyProbe {
+            label: "untag-invalid-pattern",
+            method: "DELETE",
+            query: "tagKeys=%21".to_string(),
+            body: b"",
+            headers: vec![("x-amz-account-id", account_id)],
+            s3_control: invalid_tag,
+        },
+        RoutingBodyProbe {
+            label: "untag-overlong-tag-key",
+            method: "DELETE",
+            query: format!("tagKeys={overlong_tag_key}"),
+            body: b"",
+            headers: vec![("x-amz-account-id", account_id)],
+            s3_control: invalid_tag,
+        },
+        RoutingBodyProbe {
+            label: "untag-single-tag-key-control",
+            method: "DELETE",
+            query: "tagKeys=body-probe".to_string(),
+            body: b"",
+            headers: vec![("x-amz-account-id", account_id)],
+            s3_control: S3ControlBodyResult::WriteSuccess,
+        },
+        RoutingBodyProbe {
+            label: "untag-distinct-tag-keys-control",
+            method: "DELETE",
+            query: "tagKeys=body-probe-a&tagKeys=body-probe-b".to_string(),
+            body: b"",
+            headers: vec![("x-amz-account-id", account_id)],
+            s3_control: S3ControlBodyResult::WriteSuccess,
+        },
+        RoutingBodyProbe {
+            label: "untag-identical-tag-keys",
+            method: "DELETE",
+            query: "tagKeys=body-probe&tagKeys=body-probe".to_string(),
+            body: b"",
+            headers: vec![("x-amz-account-id", account_id)],
+            s3_control: S3ControlBodyResult::Error(S3ControlError {
+                status: 500,
+                code: "InternalError",
+                message: "We encountered an internal error. Please try again.",
+                detail: "",
+                allow: None,
+            }),
+        },
+    ];
+    let wrong_secret = "0".repeat(40);
+    let bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..credentials
+    };
+    for probe in &body_probes {
+        let request_target = if probe.query.is_empty() {
+            path.clone()
+        } else {
+            format!("{path}?{}", probe.query)
+        };
+        for (signature, signing_credentials, bad_signature) in [
+            ("valid-signature", credentials, false),
+            ("bad-signature", bad_signature_credentials, true),
+        ] {
+            let sts_label = format!("routing-body-sts-{}-{signature}", probe.label);
+            let sts_response = send_signed_request_for_service_with_credentials(
+                probe.method,
+                &format!("{sts_endpoint}{request_target}"),
+                probe.body,
+                probe.headers.iter().copied(),
+                "sts",
+                signing_credentials,
+            );
+            assert_sts_unknown_operation(&sts_label, &sts_response, false);
+            println!("{sts_label}: ok");
+
+            let s3_control_label = format!("routing-body-s3-control-{}-{signature}", probe.label);
+            let s3_control_response = send_signed_request_for_service_with_credentials(
+                probe.method,
+                &format!("{s3_control_endpoint}{request_target}"),
+                probe.body,
+                probe.headers.iter().copied(),
+                "s3",
+                signing_credentials,
+            );
+            if bad_signature {
+                if probe.method == "DELETE" && probe.query.is_empty() {
+                    match probe.s3_control {
+                        S3ControlBodyResult::Error(expected) => assert_s3_control_error(
+                            &s3_control_label,
+                            &s3_control_response,
+                            expected,
+                        ),
+                        S3ControlBodyResult::WriteSuccess => panic!(
+                            "{s3_control_label}: a missing required query member cannot be a success control"
+                        ),
+                    }
+                } else {
+                    assert_s3_control_signature_mismatch(
+                        &s3_control_label,
+                        &s3_control_response,
+                        S3ControlCanonicalRequest {
+                            method: probe.method,
+                            endpoint: s3_control_endpoint,
+                            path: &path,
+                            canonical_query: &probe.query,
+                            body: probe.body,
+                            headers: &probe.headers,
+                        },
+                        bad_signature_credentials,
+                    );
+                }
+            } else {
+                match probe.s3_control {
+                    S3ControlBodyResult::Error(expected) => {
+                        assert_s3_control_error(&s3_control_label, &s3_control_response, expected);
+                    }
+                    S3ControlBodyResult::WriteSuccess => {
+                        assert_s3_control_write_success(&s3_control_label, &s3_control_response);
+                    }
+                }
+            }
+            println!("{s3_control_label}: ok");
+        }
+    }
+
+    let identical_tag_keys_probe = body_probes
+        .iter()
+        .find(|probe| probe.label == "untag-identical-tag-keys")
+        .expect("identical tag-key convergence probe must exist");
+    for attempt in 1..=3 {
+        let label = format!("routing-body-s3-control-untag-identical-consecutive-{attempt}");
+        let response = send_signed_request_for_service_with_credentials(
+            identical_tag_keys_probe.method,
+            &format!(
+                "{s3_control_endpoint}{path}?{}",
+                identical_tag_keys_probe.query
+            ),
+            identical_tag_keys_probe.body,
+            identical_tag_keys_probe.headers.iter().copied(),
+            "s3",
+            credentials,
+        );
+        match identical_tag_keys_probe.s3_control {
+            S3ControlBodyResult::Error(expected) => {
+                assert_s3_control_error(&label, &response, expected);
+            }
+            S3ControlBodyResult::WriteSuccess => {
+                panic!("{label}: identical tag keys unexpectedly use a success golden");
+            }
+        }
+        println!("{label}: ok");
+    }
+
+    for probe in [
+        body_probes
+            .iter()
+            .find(|probe| probe.label == "tag-truncated-xml")
+            .expect("tag malformed-body scope collision probe must exist"),
+        body_probes
+            .iter()
+            .find(|probe| probe.label == "untag-missing-tag-keys")
+            .expect("untag malformed-query scope collision probe must exist"),
+    ] {
+        let request_target = if probe.query.is_empty() {
+            path.clone()
+        } else {
+            format!("{path}?{}", probe.query)
+        };
+        for (signature, signing_credentials) in [
+            ("valid-signature", credentials),
+            ("bad-signature", bad_signature_credentials),
+        ] {
+            let sts_label = format!("routing-body-scope-sts-{}-{signature}", probe.label);
+            let sts_response = send_signed_request_for_service_with_credentials(
+                probe.method,
+                &format!("{sts_endpoint}{request_target}"),
+                probe.body,
+                probe.headers.iter().copied(),
+                "s3",
+                signing_credentials,
+            );
+            assert_sts_unknown_operation(&sts_label, &sts_response, false);
+            println!("{sts_label}: ok");
+
+            let s3_control_label =
+                format!("routing-body-scope-s3-control-{}-{signature}", probe.label);
+            let s3_control_response = send_signed_request_for_service_with_credentials(
+                probe.method,
+                &format!("{s3_control_endpoint}{request_target}"),
+                probe.body,
+                probe.headers.iter().copied(),
+                "sts",
+                signing_credentials,
+            );
+            if probe.method == "DELETE" && probe.query.is_empty() {
+                match probe.s3_control {
+                    S3ControlBodyResult::Error(expected) => {
+                        assert_s3_control_error(&s3_control_label, &s3_control_response, expected);
+                    }
+                    S3ControlBodyResult::WriteSuccess => panic!(
+                        "{s3_control_label}: a missing required query member cannot be a success control"
+                    ),
+                }
+            } else {
+                assert_s3_control_wrong_service(&s3_control_label, &s3_control_response, "sts");
+            }
+            println!("{s3_control_label}: ok");
+        }
+    }
 
     let tag_body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags><Tag><Key>routing-key</Key><Value>routing-value</Value></Tag></Tags></TagResourceRequest>";
     for probe in account_id_header_probes(account_id) {
