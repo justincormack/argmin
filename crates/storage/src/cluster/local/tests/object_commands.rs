@@ -2253,6 +2253,96 @@ fn lifecycle_suspended_current_expiration_replaces_null_live_on_all_acting_nodes
 }
 
 #[test]
+fn suspended_delete_replaces_null_live_on_all_acting_nodes() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Suspended);
+    let committed =
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"suspended current");
+    assert_eq!(committed.version_id, crate::VersionId::Null);
+
+    let marker = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            crate::OwnerIdentity::from_principal("owner"),
+            |stored| {
+                let live = stored
+                    .and_then(crate::StoredObject::as_live)
+                    .expect("current null object must be live");
+                assert_eq!(live.generation_id, committed.generation_id);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(marker.version_id, crate::VersionId::Null);
+
+    let repeated_marker = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            crate::OwnerIdentity::from_principal("owner"),
+            |stored| {
+                let Some(crate::StoredObject::DeleteMarker(marker)) = stored else {
+                    panic!("current null object must be a delete marker");
+                };
+                assert_eq!(marker.version_id, crate::VersionId::Null);
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated_marker.version_id, crate::VersionId::Null);
+
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        let stored =
+            crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, crate::VersionId::Null)
+                .unwrap();
+        assert!(matches!(stored, crate::StoredObject::DeleteMarker(_)));
+        assert!(crate::PgMetadataStore::payload_reclaim_exists(
+            &*pg,
+            &bucket,
+            &key,
+            committed.generation_id
+        )
+        .unwrap());
+        assert!(
+            crate::PgMetadataStore::get_object_segments(
+                &*pg,
+                &bucket,
+                &key,
+                crate::VersionId::Null,
+            )
+            .unwrap()
+            .is_empty(),
+            "null live segment rows should be removed on node {node_id:?}"
+        );
+    }
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn lifecycle_enabled_current_expiration_reserves_delete_marker_version() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -2433,6 +2523,7 @@ fn lifecycle_noncurrent_and_delete_marker_expiration_use_object_commands() {
         .insert_current_delete_marker_if(
             &bucket,
             &key,
+            crate::BucketVersioningState::Enabled,
             crate::OwnerIdentity::from_principal("owner"),
             |_| Ok::<_, ()>(()),
         )
@@ -2966,6 +3057,7 @@ fn lifecycle_expired_marker_version_list_change_defers_delete() {
         .insert_current_delete_marker_if(
             &bucket,
             &key,
+            crate::BucketVersioningState::Enabled,
             crate::OwnerIdentity::from_principal("owner"),
             |_| Ok::<_, ()>(()),
         )
@@ -3054,10 +3146,16 @@ fn insert_delete_marker_metadata_command_applies_to_all_acting_object_pg_nodes()
     let owner = crate::OwnerIdentity::from_principal("owner");
 
     let marker = cluster
-        .insert_current_delete_marker_if(&bucket, &key, owner.clone(), |stored| {
-            assert!(stored.is_none());
-            Ok::<(), ()>(())
-        })
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            owner.clone(),
+            |stored| {
+                assert!(stored.is_none());
+                Ok::<(), ()>(())
+            },
+        )
         .unwrap()
         .unwrap();
     assert_eq!(marker.version_id, crate::VersionId::from_u64(1));
@@ -3135,7 +3233,13 @@ fn insert_delete_marker_partial_apply_reopens_and_releases_bucket_write_reservat
     ));
 
     let err = cluster
-        .insert_current_delete_marker_if(&bucket, &key, owner.clone(), |_| Ok::<(), ()>(()))
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            owner.clone(),
+            |_| Ok::<(), ()>(()),
+        )
         .unwrap_err();
     assert!(
         matches!(

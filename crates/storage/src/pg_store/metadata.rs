@@ -2076,6 +2076,7 @@ impl PgStore {
                         return Ok(());
                     }
                     Ok(StoredObject::Live(_)) if command.version_id.is_null() => {}
+                    Ok(StoredObject::DeleteMarker(_)) if command.version_id.is_null() => {}
                     Ok(_) => {
                         return Err(MetadataError::Db {
                             context: "insert delete marker command existing object mismatch",

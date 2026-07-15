@@ -87,13 +87,13 @@ impl Coordinator {
                 }
 
                 Ok(DeleteObjectResult {
-                    version_id: VersionId::Null,
+                    version_id: None,
                     delete_marker: false,
                 })
             }
             AuthorizedDeleteObject::SpecificVersionMissing { version_id } => {
                 Ok(DeleteObjectResult {
-                    version_id,
+                    version_id: Some(version_id),
                     delete_marker: false,
                 })
             }
@@ -175,11 +175,11 @@ impl Coordinator {
 
                 match deleted.deleted {
                     storage::DeletedSpecificObjectVersion::Missing => Ok(DeleteObjectResult {
-                        version_id,
+                        version_id: Some(version_id),
                         delete_marker: false,
                     }),
                     storage::DeletedSpecificObjectVersion::DeleteMarker => Ok(DeleteObjectResult {
-                        version_id,
+                        version_id: Some(version_id),
                         delete_marker: true,
                     }),
                     storage::DeletedSpecificObjectVersion::Live {
@@ -207,7 +207,7 @@ impl Coordinator {
                             .enqueue_object_payload_reclaim_for(&bucket, &key, generation_id);
 
                         Ok(DeleteObjectResult {
-                            version_id,
+                            version_id: Some(version_id),
                             delete_marker: false,
                         })
                     }
@@ -226,6 +226,7 @@ impl Coordinator {
                     .insert_current_delete_marker_if(
                         &bucket,
                         &key,
+                        bucket_info.versioning,
                         owner,
                         |stored| -> Result<(), ServerError> {
                             if !self.requester_can_delete_object_with_bucket_policy(
@@ -260,7 +261,7 @@ impl Coordinator {
                     .map_err(Self::map_object_pg_action_error)??;
 
                 Ok(DeleteObjectResult {
-                    version_id: marker.version_id,
+                    version_id: Some(marker.version_id),
                     delete_marker: true,
                 })
             }
@@ -319,7 +320,7 @@ impl Coordinator {
                 Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.to_string(),
-                        version_id: result.version_id,
+                        version_id: result.version_id.unwrap_or(VersionId::Null),
                         delete_marker: result.delete_marker,
                     });
                 }

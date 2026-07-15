@@ -524,6 +524,46 @@ pub fn complete_multipart_checksum_header_invalid_error_xml(
     )
 }
 
+/// Format an invalid CompleteMultipartUpload expected-size header.
+#[must_use]
+pub fn complete_multipart_expected_size_header_invalid_error_xml(
+    value: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>InvalidRequest</Code>\
+         <Message>Value for x-amz-mp-object-size header is invalid: '{}'</Message>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(value),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format CompleteMultipartUpload's unsupported specific If-None-Match shape.
+#[must_use]
+pub fn complete_multipart_if_none_match_not_implemented_error_xml(
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>NotImplemented</Code>\
+         <Message>A header you provided implies functionality that is not implemented</Message>\
+         <Header>If-None-Match</Header>\
+         <additionalMessage>We don't accept the provided value of If-None-Match header for this API</additionalMessage>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an UploadPartCopy invalid range error response.
 #[must_use]
 pub fn upload_part_copy_invalid_range_error_xml(

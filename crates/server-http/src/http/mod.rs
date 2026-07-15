@@ -561,6 +561,24 @@ fn parse_bucket_namespace(
     Ok(namespace)
 }
 
+fn complete_multipart_write_condition_from_headers(
+    req: &S3Request,
+) -> Result<crate::conditional::WriteCondition, ServerError> {
+    if req
+        .header("if-match")
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(ServerError::CompleteMultipartEmptyIfMatch);
+    }
+    if req
+        .header("if-none-match")
+        .is_some_and(|value| value.trim() != "*")
+    {
+        return Err(ServerError::CompleteMultipartIfNoneMatchNotImplemented);
+    }
+    write_condition_from_headers(req)
+}
+
 fn reject_directory_bucket_only_object_features(req: &S3Request) -> Result<(), ServerError> {
     const DIRECTORY_BUCKET_ONLY_OBJECT_HEADERS: [&str; 6] = [
         "x-amz-write-offset-bytes",
@@ -2940,7 +2958,7 @@ impl HttpFrontend {
                 // AWS rejects unsupported conditional-header combinations before
                 // resolving the upload, but evaluates a supported condition only
                 // after all multipart completion validation has succeeded.
-                let cond = write_condition_from_headers(req)?;
+                let cond = complete_multipart_write_condition_from_headers(req)?;
                 let upload_id =
                     match parse_required_upload_id(req.query_param_lossy("uploadId").as_deref()) {
                         Ok(upload_id) => upload_id,
@@ -2981,13 +2999,11 @@ impl HttpFrontend {
                 let expected_object_size = req
                     .header("x-amz-mp-object-size")
                     .map(|value| {
-                        value
-                            .parse::<u64>()
-                            .map_err(|_| ServerError::InvalidRequest {
-                                reason: format!(
-                                    "Value for x-amz-mp-object-size header is invalid: '{value}'"
-                                ),
-                            })
+                        value.parse::<u64>().map_err(|_| {
+                            ServerError::CompleteMultipartExpectedSizeHeaderInvalid {
+                                value: value.to_string(),
+                            }
+                        })
                     })
                     .transpose()?;
                 let parts = match xml::parse_complete_multipart_upload_xml(&req.body) {
@@ -10513,8 +10529,10 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Err(ServerError::CompleteMultipartExpectedSizeHeaderInvalid { value }) => {
+                assert_eq!(value, "not-a-number");
+            }
+            Err(e) => panic!("expected CompleteMultipartExpectedSizeHeaderInvalid, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

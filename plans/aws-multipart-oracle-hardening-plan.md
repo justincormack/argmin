@@ -78,15 +78,29 @@ For each matrix:
   markers, including removal of the delete marker, and ceases to replay only
   when that completed version is explicitly deleted. The replay returns the
   original ETag and `x-amz-version-id`.
-- [ ] Probe otherwise exact terminal completion retries with changed request
-  conditions, aggregate-checksum headers, and `x-amz-mp-object-size`. Cross
-  absent, matching, mismatched, and malformed values on AWS first, then pin the
-  same endpoint-neutral matrix locally, including response precedence and proof
-  that no object version or upload state is mutated.
-- [ ] Probe the corresponding terminal-retry histories in a suspended bucket,
-  including later writes, delete markers, delete-marker removal, deletion of the
-  completed null/non-null version, and a later multipart completion of the same
-  key.
+- [x] Probe otherwise exact terminal completion retries with changed request
+  conditions, aggregate-checksum headers, and `x-amz-mp-object-size`. AWS uses
+  only the completion manifest as replay identity. It ignores syntactically
+  valid matching or mismatching `If-Match`, aggregate-checksum, and expected-size
+  values, and ignores `If-None-Match: *`; malformed values and unsupported
+  specific `If-None-Match` values fail before replay. Successful terminal
+  replays return the original ETag and version ID but omit checksum result
+  fields, even when the original completion supplied aggregate-checksum and
+  expected-size claims. The shared AWS/local matrix pins these response shapes
+  and proves that neither object data, object versions, nor upload state mutate.
+- [x] Probe the corresponding terminal-retry histories in a suspended bucket.
+  A retained numbered completion continues to replay through suspension, null
+  writes, a null delete marker and its removal, and a later null multipart
+  completion. Deleting that numbered version ends only its replay. A completed
+  null version replays only while that exact null object row remains: a later
+  PUT, null delete marker, explicit null-version deletion, or later multipart
+  completion ends the old replay, and removing the delete marker does not
+  resurrect it. The shared matrix also pins the suspended delete marker's
+  `x-amz-version-id: null` response, the same header on explicit null-version
+  deletion, and the replacement/reclamation of the old null payload.
+  Repeating an unversioned delete while that null delete marker is current
+  remains immediately successful and returns the null marker response; local
+  and Unix-client storage regressions pin the no-payload command path.
 - [x] Probe terminal completion retries after the initiator's current
   `s3:PutObject` permission is removed and under an explicit deny, with positive
   policy canaries before each transition. AWS applies the current policy: an

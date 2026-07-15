@@ -449,6 +449,16 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::CompleteMultipartChecksumHeaderInvalid { header_name } => {
             format!("Value for {header_name} header is invalid.")
         }
+        ServerError::CompleteMultipartEmptyIfMatch => {
+            "The value provided for the If-Match query parameter cannot be empty for this API."
+                .to_string()
+        }
+        ServerError::CompleteMultipartIfNoneMatchNotImplemented => {
+            "A header you provided implies functionality that is not implemented".to_string()
+        }
+        ServerError::CompleteMultipartExpectedSizeHeaderInvalid { value } => {
+            format!("Value for x-amz-mp-object-size header is invalid: '{value}'")
+        }
         ServerError::UploadPartCopyInvalidRange {
             source_size, ..
         } => {
@@ -1254,6 +1264,30 @@ impl S3Response {
                 );
                 Self::new(400).chunked_xml_body(body)
             }
+            ServerError::CompleteMultipartEmptyIfMatch => {
+                let body = xml::invalid_argument_error_xml_no_decl(
+                    &client_error_message(err),
+                    "If-Match",
+                    None,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::CompleteMultipartIfNoneMatchNotImplemented => {
+                let body = xml::complete_multipart_if_none_match_not_implemented_error_xml(
+                    request_id, host_id,
+                );
+                Self::new(501)
+                    .header("Cache-Control", "no-store")
+                    .chunked_xml_body(body)
+            }
+            ServerError::CompleteMultipartExpectedSizeHeaderInvalid { value } => {
+                let body = xml::complete_multipart_expected_size_header_invalid_error_xml(
+                    value, request_id, host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
             ServerError::UploadPartCopyInvalidRange {
                 range_header,
                 source_size,
@@ -1786,8 +1820,8 @@ impl S3Response {
     #[must_use]
     pub fn delete_object(result: &DeleteObjectResult) -> Self {
         let mut resp = Self::new(204);
-        if result.version_id.is_versioned() {
-            let vid = format_version_id(result.version_id);
+        if let Some(version_id) = result.version_id {
+            let vid = format_version_id(version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
         if result.delete_marker {
@@ -3413,7 +3447,7 @@ mod tests {
     fn delete_object_response() {
         use crate::coordinator::DeleteObjectResult;
         let result = DeleteObjectResult {
-            version_id: VersionId::Null,
+            version_id: None,
             delete_marker: false,
         };
         let resp = S3Response::delete_object(&result);
@@ -3427,12 +3461,25 @@ mod tests {
     fn delete_object_versioned_with_marker() {
         use crate::coordinator::DeleteObjectResult;
         let result = DeleteObjectResult {
-            version_id: VersionId::from_u64(5),
+            version_id: Some(VersionId::from_u64(5)),
             delete_marker: true,
         };
         let resp = S3Response::delete_object(&result);
         assert_eq!(resp.status_code, 204);
         assert_eq!(find_header(&resp, "x-amz-version-id"), Some("5"));
+        assert_eq!(find_header(&resp, "x-amz-delete-marker"), Some("true"));
+    }
+
+    #[test]
+    fn delete_object_suspended_null_marker_includes_null_version() {
+        use crate::coordinator::DeleteObjectResult;
+        let result = DeleteObjectResult {
+            version_id: Some(VersionId::Null),
+            delete_marker: true,
+        };
+        let resp = S3Response::delete_object(&result);
+        assert_eq!(resp.status_code, 204);
+        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("null"));
         assert_eq!(find_header(&resp, "x-amz-delete-marker"), Some("true"));
     }
 
@@ -3993,6 +4040,63 @@ mod tests {
             "<Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message>"
         ));
         assert!(body.contains("<UploadId>abc</UploadId>"));
+    }
+
+    #[test]
+    fn complete_multipart_empty_if_match_error_matches_aws_shape() {
+        let resp = S3Response::error(
+            &ServerError::CompleteMultipartEmptyIfMatch,
+            "/bucket/key",
+            TEST_HOST_ID,
+        );
+        assert_eq!(resp.status_code, 400);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<Error><Code>InvalidArgument</Code>\
+             <Message>The value provided for the If-Match query parameter cannot be empty for this API.</Message>\
+             <ArgumentName>If-Match</ArgumentName>\
+             <RequestId>request-id</RequestId><HostId>host-id</HostId></Error>"
+        );
+    }
+
+    #[test]
+    fn complete_multipart_if_none_match_error_matches_aws_shape() {
+        let resp = S3Response::error(
+            &ServerError::CompleteMultipartIfNoneMatchNotImplemented,
+            "/bucket/key",
+            TEST_HOST_ID,
+        );
+        assert_eq!(resp.status_code, 501);
+        assert_eq!(find_header(&resp, "Cache-Control"), Some("no-store"));
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<Error><Code>NotImplemented</Code>\
+             <Message>A header you provided implies functionality that is not implemented</Message>\
+             <Header>If-None-Match</Header>\
+             <additionalMessage>We don't accept the provided value of If-None-Match header for this API</additionalMessage>\
+             <RequestId>request-id</RequestId><HostId>host-id</HostId></Error>"
+        );
+    }
+
+    #[test]
+    fn complete_multipart_invalid_expected_size_error_matches_aws_shape() {
+        let resp = S3Response::error(
+            &ServerError::CompleteMultipartExpectedSizeHeaderInvalid {
+                value: "bad<&".to_string(),
+            },
+            "/bucket/key",
+            TEST_HOST_ID,
+        );
+        assert_eq!(resp.status_code, 400);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<Error><Code>InvalidRequest</Code>\
+             <Message>Value for x-amz-mp-object-size header is invalid: 'bad&lt;&amp;'</Message>\
+             <RequestId>request-id</RequestId><HostId>host-id</HostId></Error>"
+        );
     }
 
     #[test]

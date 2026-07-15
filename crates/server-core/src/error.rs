@@ -336,6 +336,15 @@ pub enum ServerError {
     #[error("complete multipart checksum header {header_name} is invalid")]
     CompleteMultipartChecksumHeaderInvalid { header_name: String },
 
+    #[error("CompleteMultipartUpload If-Match value is empty")]
+    CompleteMultipartEmptyIfMatch,
+
+    #[error("CompleteMultipartUpload does not support this If-None-Match value")]
+    CompleteMultipartIfNoneMatchNotImplemented,
+
+    #[error("invalid CompleteMultipartUpload expected object size: {value}")]
+    CompleteMultipartExpectedSizeHeaderInvalid { value: String },
+
     #[error("upload part copy source range invalid: {range_header} for source size {source_size}")]
     UploadPartCopyInvalidRange {
         range_header: String,
@@ -596,7 +605,9 @@ impl ServerError {
             Self::InvalidPart { .. } => "InvalidPart",
             Self::InvalidPartOrder => "InvalidPartOrder",
             Self::CompleteMultipartMissingPartChecksum { .. }
-            | Self::CompleteMultipartChecksumHeaderInvalid { .. } => "InvalidRequest",
+            | Self::CompleteMultipartChecksumHeaderInvalid { .. }
+            | Self::CompleteMultipartExpectedSizeHeaderInvalid { .. } => "InvalidRequest",
+            Self::CompleteMultipartEmptyIfMatch => "InvalidArgument",
             Self::UploadPartCopyInvalidRange { .. } => "InvalidArgument",
             Self::UploadPartCopyPreconditionFailed { .. } => "PreconditionFailed",
             Self::EntityTooSmall { .. } => "EntityTooSmall",
@@ -614,7 +625,8 @@ impl ServerError {
             Self::XAmzContentSHA256Mismatch { .. } => "XAmzContentSHA256Mismatch",
             Self::NotImplemented { .. }
             | Self::HeaderNotImplemented { .. }
-            | Self::QueryParameterNotImplemented { .. } => "NotImplemented",
+            | Self::QueryParameterNotImplemented { .. }
+            | Self::CompleteMultipartIfNoneMatchNotImplemented => "NotImplemented",
             Self::InternalError { .. } => "InternalError",
             Self::IntegrityError { .. } => "InternalError",
             Self::Store(_) => "InternalError",
@@ -683,6 +695,8 @@ impl ServerError {
             | Self::MissingSseCustomerKeyMd5
             | Self::CompleteMultipartMissingPartChecksum { .. }
             | Self::CompleteMultipartChecksumHeaderInvalid { .. }
+            | Self::CompleteMultipartEmptyIfMatch
+            | Self::CompleteMultipartExpectedSizeHeaderInvalid { .. }
             | Self::UploadPartCopyInvalidRange { .. }
             | Self::InvalidEncryptionAlgorithmError { .. } => 400,
             Self::InvalidChunkSize { .. } => 403,
@@ -722,7 +736,8 @@ impl ServerError {
             Self::InvalidPart { .. } | Self::InvalidPartOrder | Self::EntityTooSmall { .. } => 400,
             Self::NotImplemented { .. }
             | Self::HeaderNotImplemented { .. }
-            | Self::QueryParameterNotImplemented { .. } => 501,
+            | Self::QueryParameterNotImplemented { .. }
+            | Self::CompleteMultipartIfNoneMatchNotImplemented => 501,
             Self::InternalError { .. } => 500,
             Self::ObjectTooLarge { .. }
             | Self::MetadataTooLarge

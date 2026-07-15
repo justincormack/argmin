@@ -2428,6 +2428,537 @@ fn test_multipart_terminal_completion_replay_versioned_history() {
 }
 
 #[test]
+fn test_multipart_terminal_completion_replay_suspended_history() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
+
+        let numbered_key = "terminal-retry-suspended-numbered";
+        let (numbered_upload_id, numbered_body, numbered_completion) =
+            raw_complete_single_part_upload(&bucket, numbered_key, b"numbered completion");
+        let numbered_etag = xml_tag_text(&numbered_completion.body, "ETag")
+            .expect("numbered completion must return an ETag")
+            .to_string();
+        let numbered_version_id =
+            s3_tests::shape::response_header_value(&numbered_completion, "x-amz-version-id")
+                .expect("enabled completion must return x-amz-version-id")
+                .to_string();
+
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Suspended,
+        )
+        .await;
+
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &numbered_upload_id,
+            &numbered_body,
+            Some((&numbered_etag, Some(&numbered_version_id))),
+            "numbered completion after suspension",
+        );
+
+        let later_put = put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            numbered_key,
+            b"later suspended put".to_vec(),
+        )
+        .await;
+        assert_eq!(later_put.version_id(), None);
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &numbered_upload_id,
+            &numbered_body,
+            Some((&numbered_etag, Some(&numbered_version_id))),
+            "numbered completion after suspended null write",
+        );
+
+        let delete_marker =
+            delete_object_retrying_operation_aborted(client, &bucket, numbered_key).await;
+        assert!(delete_marker.delete_marker().unwrap_or(false));
+        let delete_marker_version_id = delete_marker
+            .version_id()
+            .expect("suspended delete marker must return a version ID")
+            .to_string();
+        assert_eq!(delete_marker_version_id, "null");
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &numbered_upload_id,
+            &numbered_body,
+            Some((&numbered_etag, Some(&numbered_version_id))),
+            "numbered completion under suspended delete marker",
+        );
+        let repeated_delete_marker =
+            delete_object_retrying_operation_aborted(client, &bucket, numbered_key).await;
+        assert!(repeated_delete_marker.delete_marker().unwrap_or(false));
+        assert_eq!(repeated_delete_marker.version_id(), Some("null"));
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &numbered_upload_id,
+            &numbered_body,
+            Some((&numbered_etag, Some(&numbered_version_id))),
+            "numbered completion under repeated suspended delete marker",
+        );
+        let removed_numbered_marker = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(numbered_key)
+            .version_id(&delete_marker_version_id)
+            .send_retrying_operation_aborted("remove suspended delete marker during replay oracle")
+            .await
+            .unwrap();
+        assert_eq!(removed_numbered_marker.version_id(), Some("null"));
+        assert!(removed_numbered_marker.delete_marker().unwrap_or(false));
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &numbered_upload_id,
+            &numbered_body,
+            Some((&numbered_etag, Some(&numbered_version_id))),
+            "numbered completion after suspended delete-marker removal",
+        );
+
+        let (later_upload_id, later_body, later_completion) =
+            raw_complete_single_part_upload(&bucket, numbered_key, b"later null completion");
+        let later_etag = xml_tag_text(&later_completion.body, "ETag")
+            .expect("suspended completion must return an ETag")
+            .to_string();
+        assert_eq!(
+            s3_tests::shape::response_header_value(&later_completion, "x-amz-version-id"),
+            None
+        );
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &numbered_upload_id,
+            &numbered_body,
+            Some((&numbered_etag, Some(&numbered_version_id))),
+            "numbered completion after later null multipart completion",
+        );
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &later_upload_id,
+            &later_body,
+            Some((&later_etag, None)),
+            "later null multipart completion",
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(numbered_key)
+            .version_id(&numbered_version_id)
+            .send_retrying_operation_aborted(
+                "delete numbered completion during suspended replay oracle",
+            )
+            .await
+            .unwrap();
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &numbered_upload_id,
+            &numbered_body,
+            None,
+            "deleted numbered completion",
+        );
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &later_upload_id,
+            &later_body,
+            Some((&later_etag, None)),
+            "retained null completion after numbered-version deletion",
+        );
+        let deleted_null = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(numbered_key)
+            .version_id("null")
+            .send_retrying_operation_aborted(
+                "delete null completion during suspended replay oracle",
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted_null.version_id(), Some("null"));
+        assert!(!deleted_null.delete_marker().unwrap_or(false));
+        assert_terminal_completion_replay(
+            &bucket,
+            numbered_key,
+            &later_upload_id,
+            &later_body,
+            None,
+            "deleted null completion",
+        );
+
+        let replaced_key = "terminal-retry-suspended-null-replaced";
+        let (replaced_upload_id, replaced_body, replaced_completion) =
+            raw_complete_single_part_upload(&bucket, replaced_key, b"replace this null version");
+        let replaced_etag = xml_tag_text(&replaced_completion.body, "ETag").unwrap();
+        assert_terminal_completion_replay(
+            &bucket,
+            replaced_key,
+            &replaced_upload_id,
+            &replaced_body,
+            Some((replaced_etag, None)),
+            "initial null completion",
+        );
+        put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            replaced_key,
+            b"replacement null write".to_vec(),
+        )
+        .await;
+        assert_terminal_completion_replay(
+            &bucket,
+            replaced_key,
+            &replaced_upload_id,
+            &replaced_body,
+            None,
+            "null completion replaced by suspended write",
+        );
+
+        let marker_key = "terminal-retry-suspended-null-marker";
+        let (marker_upload_id, marker_body, _) =
+            raw_complete_single_part_upload(&bucket, marker_key, b"delete this null version");
+        let marker = delete_object_retrying_operation_aborted(client, &bucket, marker_key).await;
+        let marker_version_id = marker.version_id().unwrap_or("null").to_string();
+        assert_eq!(marker_version_id, "null");
+        assert_terminal_completion_replay(
+            &bucket,
+            marker_key,
+            &marker_upload_id,
+            &marker_body,
+            None,
+            "null completion replaced by suspended delete marker",
+        );
+        let removed_marker = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(marker_key)
+            .version_id(&marker_version_id)
+            .send_retrying_operation_aborted("remove null delete marker during replay oracle")
+            .await
+            .unwrap();
+        assert_eq!(removed_marker.version_id(), Some("null"));
+        assert!(removed_marker.delete_marker().unwrap_or(false));
+        assert_terminal_completion_replay(
+            &bucket,
+            marker_key,
+            &marker_upload_id,
+            &marker_body,
+            None,
+            "null completion after delete-marker removal",
+        );
+
+        let later_multipart_key = "terminal-retry-suspended-later-multipart";
+        let (first_upload_id, first_body, _) =
+            raw_complete_single_part_upload(&bucket, later_multipart_key, b"first null completion");
+        let (second_upload_id, second_body, second_completion) = raw_complete_single_part_upload(
+            &bucket,
+            later_multipart_key,
+            b"second null completion",
+        );
+        let second_etag = xml_tag_text(&second_completion.body, "ETag").unwrap();
+        assert_terminal_completion_replay(
+            &bucket,
+            later_multipart_key,
+            &first_upload_id,
+            &first_body,
+            None,
+            "null completion replaced by later multipart completion",
+        );
+        assert_terminal_completion_replay(
+            &bucket,
+            later_multipart_key,
+            &second_upload_id,
+            &second_body,
+            Some((second_etag, None)),
+            "current later multipart completion",
+        );
+
+        s3_tests::cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_terminal_completion_replay_header_matrix() {
+    s3_tests::run(async {
+        use base64::Engine;
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "terminal-retry-header-matrix";
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
+
+        let (_, upload_id) =
+            raw_create_upload(&bucket, key, &[("x-amz-checksum-algorithm", "SHA256")]);
+        let part_body = b"terminal replay header body";
+        let part_checksum = base64::engine::general_purpose::STANDARD
+            .encode(ring::digest::digest(&ring::digest::SHA256, part_body).as_ref());
+        let (_, part_etag) = raw_upload_part(
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            part_body,
+            &[("x-amz-checksum-sha256", part_checksum.as_str())],
+        );
+        let completion_body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{part_etag}</ETag>\
+             <ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part></CompleteMultipartUpload>"
+        );
+        let completed = raw_complete_upload(&bucket, key, &upload_id, &completion_body, &[]);
+        assert_eq!(completed.status, 200, "initial completion: {completed:?}");
+        let completed_etag = xml_tag_text(&completed.body, "ETag").unwrap().to_string();
+        let completed_version_id =
+            s3_tests::shape::response_header_value(&completed, "x-amz-version-id")
+                .expect("versioned completion should return x-amz-version-id")
+                .to_string();
+        let completed_checksum = xml_tag_text(&completed.body, "ChecksumSHA256")
+            .expect("completion should return ChecksumSHA256")
+            .to_string();
+        let wrong_checksum = format!(
+            "{}-1",
+            base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+        );
+        let matching_size = part_body.len().to_string();
+        let mismatched_size = (part_body.len() + 1).to_string();
+
+        let replay_cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("absent", vec![]),
+            (
+                "if-match current",
+                vec![("if-match", completed_etag.as_str())],
+            ),
+            ("if-match mismatch", vec![("if-match", "\"wrong\"")]),
+            ("if-none-match wildcard", vec![("if-none-match", "*")]),
+            (
+                "checksum matching",
+                vec![("x-amz-checksum-sha256", completed_checksum.as_str())],
+            ),
+            (
+                "checksum mismatch",
+                vec![("x-amz-checksum-sha256", wrong_checksum.as_str())],
+            ),
+            (
+                "size matching",
+                vec![("x-amz-mp-object-size", matching_size.as_str())],
+            ),
+            (
+                "size mismatch",
+                vec![("x-amz-mp-object-size", mismatched_size.as_str())],
+            ),
+        ];
+
+        for (label, headers) in replay_cases {
+            let response =
+                raw_complete_upload(&bucket, key, &upload_id, &completion_body, &headers);
+            assert_eq!(response.status, 200, "{label}: {response:?}");
+            assert_eq!(
+                xml_tag_text(&response.body, "ETag"),
+                Some(completed_etag.as_str()),
+                "{label}: {response:?}"
+            );
+            assert_eq!(
+                s3_tests::shape::response_header_value(&response, "x-amz-version-id"),
+                Some(completed_version_id.as_str()),
+                "{label}: {response:?}"
+            );
+            assert_eq!(xml_tag_text(&response.body, "ChecksumSHA256"), None);
+            assert_eq!(xml_tag_text(&response.body, "ChecksumType"), None);
+        }
+
+        let malformed_cases = [
+            (
+                "empty If-Match",
+                vec![("if-match", "")],
+                shape()
+                    .status(400)
+                    .headers(error_response_headers())
+                    .body(
+                        "<Error><Code>InvalidArgument</Code>\
+                         <Message>The value provided for the If-Match query parameter cannot be empty for this API.</Message>\
+                         <ArgumentName>If-Match</ArgumentName>\
+                         <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                    ),
+            ),
+            (
+                "specific matching If-None-Match",
+                vec![("if-none-match", completed_etag.as_str())],
+                shape()
+                    .status(501)
+                    .headers(error_response_headers())
+                    .header("cache-control", "no-store")
+                    .body(
+                        "<Error><Code>NotImplemented</Code>\
+                         <Message>A header you provided implies functionality that is not implemented</Message>\
+                         <Header>If-None-Match</Header>\
+                         <additionalMessage>We don't accept the provided value of If-None-Match header for this API</additionalMessage>\
+                         <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                    ),
+            ),
+            (
+                "specific mismatched If-None-Match",
+                vec![("if-none-match", "\"wrong\"")],
+                shape()
+                    .status(501)
+                    .headers(error_response_headers())
+                    .header("cache-control", "no-store")
+                    .body(
+                        "<Error><Code>NotImplemented</Code>\
+                         <Message>A header you provided implies functionality that is not implemented</Message>\
+                         <Header>If-None-Match</Header>\
+                         <additionalMessage>We don't accept the provided value of If-None-Match header for this API</additionalMessage>\
+                         <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                    ),
+            ),
+            (
+                "empty If-None-Match",
+                vec![("if-none-match", "")],
+                shape()
+                    .status(501)
+                    .headers(error_response_headers())
+                    .header("cache-control", "no-store")
+                    .body(
+                        "<Error><Code>NotImplemented</Code>\
+                         <Message>A header you provided implies functionality that is not implemented</Message>\
+                         <Header>If-None-Match</Header>\
+                         <additionalMessage>We don't accept the provided value of If-None-Match header for this API</additionalMessage>\
+                         <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                    ),
+            ),
+            (
+                "malformed aggregate checksum",
+                vec![("x-amz-checksum-sha256", "bad")],
+                shape()
+                    .status(400)
+                    .headers(error_response_headers())
+                    .body(expected_error::complete_multipart_checksum_header_invalid(
+                        "x-amz-checksum-sha256",
+                    )),
+            ),
+            (
+                "malformed expected size",
+                vec![("x-amz-mp-object-size", "bad")],
+                shape()
+                    .status(400)
+                    .headers(error_response_headers())
+                    .body(
+                        "<Error><Code>InvalidRequest</Code>\
+                         <Message>Value for x-amz-mp-object-size header is invalid: 'bad'</Message>\
+                         <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                    ),
+            ),
+        ];
+        for (label, headers, expected) in malformed_cases {
+            let response =
+                raw_complete_upload(&bucket, key, &upload_id, &completion_body, &headers);
+            assert_shape(label, &response, &expected);
+        }
+
+        let claimed_key = "terminal-retry-header-matrix-claimed";
+        let (_, claimed_upload_id) = raw_create_upload(
+            &bucket,
+            claimed_key,
+            &[("x-amz-checksum-algorithm", "SHA256")],
+        );
+        let (_, claimed_part_etag) = raw_upload_part(
+            &bucket,
+            claimed_key,
+            &claimed_upload_id,
+            1,
+            part_body,
+            &[("x-amz-checksum-sha256", part_checksum.as_str())],
+        );
+        let claimed_completion_body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{claimed_part_etag}</ETag>\
+             <ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part></CompleteMultipartUpload>"
+        );
+        let claimed = raw_complete_upload(
+            &bucket,
+            claimed_key,
+            &claimed_upload_id,
+            &claimed_completion_body,
+            &[
+                ("x-amz-checksum-sha256", completed_checksum.as_str()),
+                ("x-amz-mp-object-size", matching_size.as_str()),
+            ],
+        );
+        assert_eq!(claimed.status, 200, "claimed completion: {claimed:?}");
+        let claimed_etag = xml_tag_text(&claimed.body, "ETag").unwrap().to_string();
+        let claimed_version_id =
+            s3_tests::shape::response_header_value(&claimed, "x-amz-version-id")
+                .expect("claimed completion should return x-amz-version-id")
+                .to_string();
+        assert_eq!(
+            xml_tag_text(&claimed.body, "ChecksumSHA256"),
+            Some(completed_checksum.as_str())
+        );
+        let claimed_replay = raw_complete_upload(
+            &bucket,
+            claimed_key,
+            &claimed_upload_id,
+            &claimed_completion_body,
+            &[],
+        );
+        assert_eq!(claimed_replay.status, 200, "{claimed_replay:?}");
+        assert_eq!(
+            xml_tag_text(&claimed_replay.body, "ETag"),
+            Some(claimed_etag.as_str())
+        );
+        assert_eq!(
+            s3_tests::shape::response_header_value(&claimed_replay, "x-amz-version-id"),
+            Some(claimed_version_id.as_str())
+        );
+        assert_eq!(xml_tag_text(&claimed_replay.body, "ChecksumSHA256"), None);
+        assert_eq!(xml_tag_text(&claimed_replay.body, "ChecksumType"), None);
+
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+        assert_list_parts_no_such_upload(&bucket, claimed_key, &claimed_upload_id).await;
+        assert_object_contents_and_etag(&bucket, key, &completed_etag, part_body).await;
+        assert_object_contents_and_etag(&bucket, claimed_key, &claimed_etag, part_body).await;
+
+        let versions = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("list versions after terminal replay header matrix")
+            .await
+            .unwrap();
+        assert_eq!(versions.versions().len(), 2);
+        assert!(versions.delete_markers().is_empty());
+        assert!(versions.versions().iter().any(|version| {
+            version.key() == Some(key)
+                && version.version_id() == Some(completed_version_id.as_str())
+        }));
+        assert!(versions.versions().iter().any(|version| {
+            version.key() == Some(claimed_key)
+                && version.version_id() == Some(claimed_version_id.as_str())
+        }));
+
+        s3_tests::cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_multipart_terminal_completion_replay_obeys_current_explicit_deny() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -5665,6 +6196,46 @@ fn raw_complete_upload(
         body.as_bytes(),
         &headers,
     )
+}
+
+fn raw_complete_single_part_upload(
+    bucket: &str,
+    key: &str,
+    part_body: &[u8],
+) -> (String, String, RawResponse) {
+    let (_, upload_id) = raw_create_upload(bucket, key, &[]);
+    let (_, etag) = raw_upload_part(bucket, key, &upload_id, 1, part_body, &[]);
+    let completion_body = single_part_complete_body(&etag);
+    let completion = raw_complete_upload(bucket, key, &upload_id, &completion_body, &[]);
+    assert_eq!(completion.status, 200, "initial completion: {completion:?}");
+    (upload_id, completion_body, completion)
+}
+
+fn assert_terminal_completion_replay(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    completion_body: &str,
+    expected: Option<(&str, Option<&str>)>,
+    history: &str,
+) {
+    let replay = raw_complete_upload(bucket, key, upload_id, completion_body, &[]);
+    let Some((expected_etag, expected_version_id)) = expected else {
+        assert_eq!(replay.status, 404, "{history}: {replay:?}");
+        assert_invalid_upload_id_no_such_upload(&replay, upload_id);
+        return;
+    };
+    assert_eq!(replay.status, 200, "{history}: {replay:?}");
+    assert_eq!(
+        xml_tag_text(&replay.body, "ETag"),
+        Some(expected_etag),
+        "{history}: {replay:?}"
+    );
+    assert_eq!(
+        s3_tests::shape::response_header_value(&replay, "x-amz-version-id"),
+        expected_version_id,
+        "{history}: {replay:?}"
+    );
 }
 
 fn raw_abort_upload(bucket: &str, key: &str, upload_id: &str) {

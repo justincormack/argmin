@@ -5976,7 +5976,9 @@ fn bucket_owner_enforced_admin_tagging_preserves_delete_marker_and_missing_versi
             bypass_governance: false,
         })
         .unwrap();
-    let delete_marker_version = delete_marker.version_id;
+    let delete_marker_version = delete_marker
+        .version_id
+        .expect("versioned delete marker must return a version ID");
 
     let err = get_object_tags_test(
         &coord,

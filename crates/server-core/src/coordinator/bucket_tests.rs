@@ -3554,7 +3554,9 @@ fn lifecycle_sweep_expires_delete_marker_after_expiration_days_deadline() {
             .test_get_object_version(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
-                delete.version_id,
+                delete
+                    .version_id
+                    .expect("versioned delete marker must return a version ID"),
             )
             .unwrap();
         (
@@ -4080,7 +4082,9 @@ fn lifecycle_delete_marker_cleanup_stops_when_delete_drain_starts_after_claim() 
             NO_DELETE,
         ))
         .unwrap();
-    let marker_version_id = deleted.version_id;
+    let marker_version_id = deleted
+        .version_id
+        .expect("versioned delete marker must return a version ID");
     let bucket_info = coord.storage_node().head_bucket_info(&bucket).unwrap();
     let claim = coord
         .storage_node()

@@ -8838,6 +8838,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
+        versioning: BucketVersioningState,
         owner: OwnerIdentity,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
@@ -8896,14 +8897,54 @@ impl super::StorageCluster {
                     return Ok(Err(error));
                 }
             };
-            let marker_vid = match self.reserve_next_object_version(pg_id, bucket, key) {
-                Ok(marker_vid) => marker_vid,
-                Err(error) => {
+            let null_snapshot = if versioning == BucketVersioningState::Suspended {
+                match storage_client.load_specific_object_delete_snapshot(
+                    pg_id,
+                    bucket,
+                    key,
+                    VersionId::Null,
+                ) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(error) => {
+                        self.release_bucket_write_proof_for_object_metadata_command(
+                            &bucket_write_reservation,
+                        )?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let marker_vid = match versioning {
+                BucketVersioningState::Enabled => {
+                    match self.reserve_next_object_version(pg_id, bucket, key) {
+                        Ok(marker_vid) => marker_vid,
+                        Err(error) => {
+                            self.release_bucket_write_proof_for_object_metadata_command(
+                                &bucket_write_reservation,
+                            )?;
+                            return Err(error);
+                        }
+                    }
+                }
+                BucketVersioningState::Suspended => VersionId::Null,
+                BucketVersioningState::Disabled => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
-                    return Err(error);
+                    return Err(MetadataError::Db {
+                        context: "insert delete marker with disabled versioning",
+                        source: rusqlite::Error::InvalidQuery,
+                    }
+                    .into());
                 }
+            };
+            let stale_payload = if versioning == BucketVersioningState::Suspended {
+                InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
+                    created_at: crate::clock::current_time_millis(),
+                }
+            } else {
+                InsertDeleteMarkerStalePayload::Explicit(None)
             };
             let command = storage_client.build_insert_delete_marker_command(
                 BuildInsertDeleteMarkerCommandReq {
@@ -8914,8 +8955,13 @@ impl super::StorageCluster {
                     version_id: marker_vid,
                     owner: &owner,
                     expected_current: snapshot.stored.as_ref(),
-                    stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
-                    expected_stale_payload_source: None,
+                    stale_payload,
+                    expected_stale_payload_source: null_snapshot.as_ref().and_then(|snapshot| {
+                        match snapshot.stored.as_ref() {
+                            Some(stored @ StoredObject::Live(_)) => Some(stored),
+                            Some(StoredObject::DeleteMarker(_)) | None => None,
+                        }
+                    }),
                     bucket_write_reservation: &bucket_write_reservation,
                 },
             );

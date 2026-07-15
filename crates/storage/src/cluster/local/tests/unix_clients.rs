@@ -3477,6 +3477,119 @@ fn unix_object_mutation_metadata_client_install_rejects_relative_socket_path() {
 }
 
 #[test]
+fn unix_object_mutation_client_repeats_suspended_null_delete_marker() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(0);
+    let pg_id = PgId::new(0);
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let remote_data_dir = tmp.path().join("remote-repeat-suspended-delete");
+    let socket_path = tmp
+        .path()
+        .join("sockets")
+        .join("repeat-suspended-delete.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let bucket = crate::tests::bucket_name("unix-repeat-suspended-delete");
+    let key = crate::tests::object_key("key");
+    let owner = crate::OwnerIdentity::from_principal("owner");
+
+    {
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &remote_data_dir,
+            &[pg_id.get()],
+            ec_shape,
+        )
+        .unwrap();
+        let pg = remote.get_pg(pg_id.get()).unwrap();
+        crate::PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner.canonical_id,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        crate::PgMetadataStore::put_bucket_versioning(
+            &*pg,
+            &bucket,
+            crate::BucketVersioningState::Suspended,
+        )
+        .unwrap();
+        crate::PgMetadataStore::put_object_meta(
+            &*pg,
+            &crate::PutObjectReq::DeleteMarker(crate::PutDeleteMarkerReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: crate::VersionId::Null,
+                owner: owner.clone(),
+            }),
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    let server = StorageNodeServer::bind(StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: ClusterEpoch::INITIAL,
+        route_map_validity: RouteMapValidity::Forever,
+        data_dir: remote_data_dir.clone(),
+        default_ec_shape: ec_shape,
+        pg_ids: vec![pg_id.get()],
+        socket_path: socket_path.clone(),
+        pg_routes: vec![StorageNodePgRoute {
+            pg_id: pg_id.get(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Active,
+            primary_node_id: node_id,
+            acting_set: vec![node_id],
+        }],
+        pending_metadata_command_recoveries: Vec::new(),
+        historical_pg_routes: Vec::new(),
+    })
+    .unwrap();
+    let _server_guard = spawn_storage_node_server(server);
+
+    let mut map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        node_id,
+        [node_id],
+        &[pg_id.get()],
+        ec_shape,
+        ClusterEpoch::INITIAL,
+    )
+    .unwrap();
+    map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+        node_id,
+        socket_path,
+    )])
+    .unwrap();
+    let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+
+    let repeated = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            owner,
+            |stored| {
+                assert!(matches!(stored, Some(crate::StoredObject::DeleteMarker(_))));
+                Ok::<_, ()>(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.version_id, crate::VersionId::Null);
+    let remote =
+        SharedStorageNode::open_with_default_ec_shape(&remote_data_dir, &[pg_id.get()], ec_shape)
+            .unwrap();
+    let remote_pg = remote.get_pg(pg_id.get()).unwrap();
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_meta(&*remote_pg, &bucket, &key).unwrap(),
+        crate::StoredObject::DeleteMarker(marker) if marker.version_id == crate::VersionId::Null
+    ));
+}
+
+#[test]
 fn unix_shard_client_install_rejects_relative_socket_paths_before_mutation() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

@@ -8,7 +8,7 @@ use storage::{
 };
 
 fn multipart_completion_fingerprint(
-    req: &CompleteMultipartUploadRequest<'_>,
+    parts: &[CompletePart],
 ) -> storage::MultipartCompletionFingerprint {
     fn update_bytes(context: &mut ring::digest::Context, bytes: &[u8]) {
         context.update(&(bytes.len() as u64).to_be_bytes());
@@ -16,9 +16,9 @@ fn multipart_completion_fingerprint(
     }
 
     let mut context = ring::digest::Context::new(&ring::digest::SHA256);
-    context.update(b"argmin complete multipart request v1\0");
-    context.update(&(req.parts.len() as u64).to_be_bytes());
-    for part in req.parts {
+    context.update(b"argmin complete multipart manifest v2\0");
+    context.update(&(parts.len() as u64).to_be_bytes());
+    for part in parts {
         context.update(&part.part_number.to_be_bytes());
         update_bytes(&mut context, part.etag.as_bytes());
         match &part.checksum {
@@ -28,21 +28,6 @@ fn multipart_completion_fingerprint(
                 update_bytes(&mut context, checksum.algorithm().as_str().as_bytes());
                 update_bytes(&mut context, checksum.expected_bytes());
             }
-        }
-    }
-    match req.claimed_checksum {
-        None => context.update(&[0]),
-        Some(checksum) => {
-            context.update(&[1]);
-            update_bytes(&mut context, checksum.algorithm().as_str().as_bytes());
-            update_bytes(&mut context, checksum.encoded_value().as_bytes());
-        }
-    }
-    match req.expected_object_size {
-        None => context.update(&[0]),
-        Some(size) => {
-            context.update(&[1]);
-            context.update(&size.to_be_bytes());
         }
     }
     let digest = context.finish();
@@ -574,18 +559,11 @@ impl Coordinator {
                         key,
                         replay,
                     } => {
-                        if replay.fingerprint != multipart_completion_fingerprint(req) {
+                        if replay.fingerprint != multipart_completion_fingerprint(req.parts) {
                             return Err(ServerError::NoSuchUpload {
                                 upload_id: replay.upload_id.to_string(),
                             });
                         }
-                        let system_metadata = replay
-                            .system_metadata_blob
-                            .as_ref()
-                            .map(|metadata| SystemMetadata::deserialize(metadata.as_slice()))
-                            .transpose()?
-                            .unwrap_or_default();
-                        let checksum = system_metadata.checksum();
                         let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                             &bucket_info,
                             key.as_str(),
@@ -597,9 +575,9 @@ impl Coordinator {
                             etag: replay.etag.format(),
                             version_id: replay.version_id,
                             managed_encryption: replay.encryption.managed_encryption_algorithm(),
-                            checksum_algorithm: checksum.map(|checksum| checksum.algorithm()),
-                            checksum_type: checksum.and_then(|checksum| checksum.checksum_type()),
-                            checksum_value: checksum.map(|checksum| checksum.value().to_string()),
+                            checksum_algorithm: None,
+                            checksum_type: None,
+                            checksum_value: None,
                             lifecycle_expiration,
                         });
                     }
@@ -896,7 +874,7 @@ impl Coordinator {
                     bucket: bucket.clone(),
                     key: key.clone(),
                     upload_id: upload_id.clone(),
-                    completion_fingerprint: multipart_completion_fingerprint(req),
+                    completion_fingerprint: multipart_completion_fingerprint(req.parts),
                     versioning: bucket_info.versioning,
                     owner: upload.owner.clone(),
                     acl_grants: upload.acl_grants.clone(),
@@ -1473,5 +1451,54 @@ impl Coordinator {
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
         self.abort_stream_put_for_storage_node(storage_node, bucket, key, session_id)
+    }
+}
+
+#[cfg(test)]
+mod completion_fingerprint_tests {
+    use checksum::ChecksumAlgorithm;
+
+    use super::{multipart_completion_fingerprint, ChecksumClaim, CompletePart};
+
+    #[test]
+    fn fingerprint_identifies_only_the_completion_manifest() {
+        let part = CompletePart {
+            part_number: 1,
+            etag: "\"etag-one\"".to_string(),
+            checksum: None,
+        };
+        let original = multipart_completion_fingerprint(std::slice::from_ref(&part));
+
+        assert_eq!(
+            original,
+            multipart_completion_fingerprint(std::slice::from_ref(&part))
+        );
+        assert_ne!(
+            original,
+            multipart_completion_fingerprint(&[CompletePart {
+                part_number: 2,
+                ..part.clone()
+            }])
+        );
+        assert_ne!(
+            original,
+            multipart_completion_fingerprint(&[CompletePart {
+                etag: "\"etag-two\"".to_string(),
+                ..part.clone()
+            }])
+        );
+        assert_ne!(
+            original,
+            multipart_completion_fingerprint(&[CompletePart {
+                checksum: Some(
+                    ChecksumClaim::from_base64(
+                        ChecksumAlgorithm::Sha256,
+                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                    )
+                    .unwrap(),
+                ),
+                ..part
+            }])
+        );
     }
 }

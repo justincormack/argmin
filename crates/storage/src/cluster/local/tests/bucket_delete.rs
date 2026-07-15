@@ -5636,6 +5636,7 @@ fn begin_bucket_delete_drains_pending_lifecycle_expired_delete_marker_cleanup() 
         .insert_current_delete_marker_if(
             &bucket,
             &key,
+            crate::BucketVersioningState::Enabled,
             crate::OwnerIdentity::from_principal("owner"),
             |_| Ok::<_, ()>(()),
         )

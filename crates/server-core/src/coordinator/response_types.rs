@@ -344,7 +344,10 @@ pub struct ListObjectVersionsResult {
 /// Result of a DeleteObject operation.
 #[derive(Debug)]
 pub struct DeleteObjectResult {
-    pub version_id: VersionId,
+    /// Version ID to return on the wire. Unversioned current-object deletion
+    /// has no value; an explicitly addressed or newly created null version is
+    /// represented as `Some(VersionId::Null)`.
+    pub version_id: Option<VersionId>,
     pub delete_marker: bool,
 }
 

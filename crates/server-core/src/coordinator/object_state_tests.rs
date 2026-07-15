@@ -4944,7 +4944,10 @@ fn delete_object_with_retention_still_inserts_delete_marker_without_version_id()
         })
         .unwrap();
     assert!(delete_marker.delete_marker);
-    assert!(delete_marker.version_id.is_versioned());
+    let delete_marker_version_id = delete_marker
+        .version_id
+        .expect("versioned delete marker must return a version ID");
+    assert!(delete_marker_version_id.is_versioned());
 
     let err = coord
         .delete_object(&DeleteObjectRequest {
@@ -4965,7 +4968,7 @@ fn delete_object_with_retention_still_inserts_delete_marker_without_version_id()
         .delete_object(&delete_object_request(
             "bucket",
             "key",
-            Some(delete_marker.version_id),
+            Some(delete_marker_version_id),
             requester.clone(),
             false,
             NO_DELETE,
@@ -6620,6 +6623,6 @@ fn delete_object_returns_result() {
             NO_DELETE,
         ))
         .unwrap();
-    assert_eq!(result.version_id, VersionId::Null);
+    assert_eq!(result.version_id, None);
     assert!(!result.delete_marker);
 }
