@@ -6583,11 +6583,12 @@ fn assert_sts_cors_preflight_success(label: &str, response: &RawResponse) {
 }
 
 struct S3ControlCanonicalRequest<'a> {
+    method: &'a str,
     endpoint: &'a str,
     path: &'a str,
+    canonical_query: &'a str,
     body: &'a [u8],
-    content_type: &'a str,
-    account_id: &'a str,
+    headers: &'a [(&'a str, &'a str)],
 }
 
 #[derive(Clone, Copy)]
@@ -6642,6 +6643,30 @@ enum AccountIdOperation {
     List,
     Tag,
     Untag,
+}
+
+enum StsAuthCollisionResult {
+    SignatureMismatch,
+    UnknownOperation,
+    EmptyBadRequest,
+}
+
+enum S3ControlAuthCollisionResult {
+    SignatureMismatch,
+    InvalidUri(String),
+    EmptyBadRequest,
+}
+
+struct RoutingAuthCollisionProbe<'a> {
+    label: &'static str,
+    method: &'static str,
+    request_path: String,
+    canonical_path: &'a str,
+    canonical_query: &'a str,
+    body: &'a [u8],
+    headers: Vec<(&'a str, &'a str)>,
+    sts: StsAuthCollisionResult,
+    s3_control: S3ControlAuthCollisionResult,
 }
 
 fn account_id_header_probes(account_id: &str) -> Vec<AccountIdHeaderProbe<'_>> {
@@ -6727,6 +6752,24 @@ fn assert_s3_control_write_success(label: &str, response: &RawResponse) {
     );
 }
 
+fn assert_s3_control_wrong_service(label: &str, response: &RawResponse, provided_service: &str) {
+    let message = format!(
+        "The authorization header is malformed; incorrect service \"{provided_service}\". \
+         This endpoint belongs to \"s3\"."
+    );
+    assert_s3_control_error(
+        label,
+        response,
+        S3ControlError {
+            status: 400,
+            code: "AuthorizationHeaderMalformed",
+            message: &message,
+            detail: "",
+            allow: None,
+        },
+    );
+}
+
 fn assert_s3_control_signature_mismatch(
     label: &str,
     response: &RawResponse,
@@ -6779,21 +6822,39 @@ fn assert_s3_control_signature_mismatch(
         .unwrap_or_else(|error| panic!("{label}: invalid S3 Control endpoint: {error}"));
     let host = parsed_endpoint
         .host_str()
+        .map(|host| {
+            if let Some(port) = parsed_endpoint.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
         .unwrap_or_else(|| panic!("{label}: S3 Control endpoint has no host"));
     let payload_hash = auth::canonical::sha256_hex(request.body);
-    let canonical_query = std::str::from_utf8(request.body)
-        .unwrap_or_else(|error| panic!("{label}: form body is not UTF-8: {error}"));
     let S3ControlCanonicalRequest {
+        method,
         path,
-        content_type,
-        account_id,
+        canonical_query,
+        headers,
         ..
     } = request;
+    let mut canonical_header_pairs = vec![
+        ("host", host.as_str()),
+        ("x-amz-content-sha256", payload_hash.as_str()),
+        ("x-amz-date", amz_date),
+    ];
+    canonical_header_pairs.extend(headers.iter().copied());
+    canonical_header_pairs.sort_by(|left, right| left.0.cmp(right.0));
+    let canonical_headers = auth::canonical::canonical_headers(&canonical_header_pairs);
+    let mut signed_header_names = Vec::new();
+    for (name, _) in &canonical_header_pairs {
+        if signed_header_names.last().copied() != Some(*name) {
+            signed_header_names.push(*name);
+        }
+    }
+    let signed_headers = signed_header_names.join(";");
     let canonical_request = format!(
-        "POST\n{path}\n{canonical_query}\ncontent-type:{content_type}\nhost:{host}\n\
-         x-amz-account-id:{account_id}\nx-amz-content-sha256:{payload_hash}\n\
-         x-amz-date:{amz_date}\n\ncontent-type;host;x-amz-account-id;\
-         x-amz-content-sha256;x-amz-date\n{payload_hash}"
+        "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     );
     let observed_canonical_request = required_xml_text(response, "CanonicalRequest", label);
     let canonical_request_xml = canonical_request.replace('&', "&amp;");
@@ -6936,11 +6997,16 @@ fn run_cross_service_routing_probes(
         "routing-s3-control-query-tags-path",
         &s3_control_query_tags_path,
         S3ControlCanonicalRequest {
+            method: "POST",
             endpoint: s3_control_endpoint,
             path: &tags_path,
+            canonical_query: std::str::from_utf8(query_body)
+                .expect("routing Query body must be UTF-8"),
             body: query_body,
-            content_type: QUERY_CONTENT_TYPE,
-            account_id,
+            headers: &[
+                ("content-type", QUERY_CONTENT_TYPE),
+                ("x-amz-account-id", account_id),
+            ],
         },
         credentials,
     );
@@ -7416,6 +7482,211 @@ fn run_cross_service_routing_probes(
                 allow: None,
             },
         );
+        println!("{s3_control_label}: ok");
+    }
+
+    let wrong_secret = "0".repeat(40);
+    let bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..credentials
+    };
+    for (endpoint_kind, endpoint, correct_service, wrong_service) in [
+        ("sts", sts_endpoint, "sts", "s3"),
+        ("s3-control", s3_control_endpoint, "s3", "sts"),
+    ] {
+        for (scope, service) in [
+            ("correct-service", correct_service),
+            ("missing-service", ""),
+            ("wrong-service", wrong_service),
+        ] {
+            for (signature, signing_credentials, bad_signature) in [
+                ("valid-signature", credentials, false),
+                ("bad-signature", bad_signature_credentials, true),
+            ] {
+                let label = format!("routing-auth-{endpoint_kind}-{scope}-{signature}");
+                let response = send_signed_request_for_service_with_credentials(
+                    "GET",
+                    &format!("{endpoint}{tags_path}"),
+                    b"",
+                    [("x-amz-account-id", account_id)],
+                    service,
+                    signing_credentials,
+                );
+                if endpoint_kind == "sts" {
+                    assert_sts_unknown_operation(&label, &response, false);
+                } else if service != "s3" {
+                    assert_s3_control_wrong_service(&label, &response, service);
+                } else if bad_signature {
+                    assert_s3_control_signature_mismatch(
+                        &label,
+                        &response,
+                        S3ControlCanonicalRequest {
+                            method: "GET",
+                            endpoint: s3_control_endpoint,
+                            path: &tags_path,
+                            canonical_query: "",
+                            body: b"",
+                            headers: &[("x-amz-account-id", account_id)],
+                        },
+                        bad_signature_credentials,
+                    );
+                } else {
+                    assert_s3_control_error(
+                        &label,
+                        &response,
+                        S3ControlError {
+                            status: 404,
+                            code: "NoSuchResource",
+                            message: "The specified resource doesn't exist.",
+                            detail: "",
+                            allow: None,
+                        },
+                    );
+                }
+                println!("{label}: ok");
+            }
+        }
+    }
+
+    let query_body_text =
+        std::str::from_utf8(query_body).expect("routing Query body must be UTF-8");
+    let auth_collision_probes = vec![
+        RoutingAuthCollisionProbe {
+            label: "query-root",
+            method: "POST",
+            request_path: "/".to_string(),
+            canonical_path: "/",
+            canonical_query: "",
+            body: query_body,
+            headers: vec![
+                ("content-type", QUERY_CONTENT_TYPE),
+                ("x-amz-account-id", account_id),
+            ],
+            sts: StsAuthCollisionResult::SignatureMismatch,
+            s3_control: S3ControlAuthCollisionResult::InvalidUri("/".to_string()),
+        },
+        RoutingAuthCollisionProbe {
+            label: "query-tags-path",
+            method: "POST",
+            request_path: tags_path.clone(),
+            canonical_path: &tags_path,
+            canonical_query: query_body_text,
+            body: query_body,
+            headers: vec![
+                ("content-type", QUERY_CONTENT_TYPE),
+                ("x-amz-account-id", account_id),
+            ],
+            sts: StsAuthCollisionResult::SignatureMismatch,
+            s3_control: S3ControlAuthCollisionResult::SignatureMismatch,
+        },
+        RoutingAuthCollisionProbe {
+            label: "action-query-tags-path",
+            method: "POST",
+            request_path: tags_path_with_query.clone(),
+            canonical_path: &tags_path,
+            canonical_query: query_body_text,
+            body: tag_body,
+            headers: vec![
+                ("content-type", "application/xml"),
+                ("x-amz-account-id", account_id),
+            ],
+            sts: StsAuthCollisionResult::SignatureMismatch,
+            s3_control: S3ControlAuthCollisionResult::SignatureMismatch,
+        },
+        RoutingAuthCollisionProbe {
+            label: "malformed-percent",
+            method: "GET",
+            request_path: "/v20180820/tags/%GG".to_string(),
+            canonical_path: "/v20180820/tags/%GG",
+            canonical_query: "",
+            body: b"",
+            headers: vec![("x-amz-account-id", account_id)],
+            sts: StsAuthCollisionResult::EmptyBadRequest,
+            s3_control: S3ControlAuthCollisionResult::EmptyBadRequest,
+        },
+        RoutingAuthCollisionProbe {
+            label: "malformed-arn",
+            method: "GET",
+            request_path: "/v20180820/tags/not-an-arn".to_string(),
+            canonical_path: "/v20180820/tags/not-an-arn",
+            canonical_query: "",
+            body: b"",
+            headers: vec![("x-amz-account-id", account_id)],
+            sts: StsAuthCollisionResult::UnknownOperation,
+            s3_control: S3ControlAuthCollisionResult::InvalidUri("tags/not-an-arn".to_string()),
+        },
+    ];
+    for probe in auth_collision_probes {
+        let sts_label = format!("routing-auth-collision-sts-{}", probe.label);
+        let sts_response = send_signed_request_for_service_with_credentials(
+            probe.method,
+            &format!("{sts_endpoint}{}", probe.request_path),
+            probe.body,
+            probe.headers.iter().copied(),
+            "sts",
+            bad_signature_credentials,
+        );
+        match probe.sts {
+            StsAuthCollisionResult::SignatureMismatch => assert_error_probe(
+                &sts_label,
+                &sts_response,
+                403,
+                STS_XMLNS,
+                "SignatureDoesNotMatch",
+                Some(STS_SIGNATURE_MISMATCH_MESSAGE),
+            ),
+            StsAuthCollisionResult::UnknownOperation => {
+                assert_sts_unknown_operation(&sts_label, &sts_response, false);
+            }
+            StsAuthCollisionResult::EmptyBadRequest => {
+                assert_empty_bad_path_request(&sts_label, &sts_response);
+            }
+        }
+        println!("{sts_label}: ok");
+
+        let s3_control_label = format!("routing-auth-collision-s3-control-{}", probe.label);
+        let s3_control_response = send_signed_request_for_service_with_credentials(
+            probe.method,
+            &format!("{s3_control_endpoint}{}", probe.request_path),
+            probe.body,
+            probe.headers.iter().copied(),
+            "s3",
+            bad_signature_credentials,
+        );
+        match probe.s3_control {
+            S3ControlAuthCollisionResult::SignatureMismatch => {
+                assert_s3_control_signature_mismatch(
+                    &s3_control_label,
+                    &s3_control_response,
+                    S3ControlCanonicalRequest {
+                        method: probe.method,
+                        endpoint: s3_control_endpoint,
+                        path: probe.canonical_path,
+                        canonical_query: probe.canonical_query,
+                        body: probe.body,
+                        headers: &probe.headers,
+                    },
+                    bad_signature_credentials,
+                );
+            }
+            S3ControlAuthCollisionResult::InvalidUri(uri) => {
+                let detail = format!("<URI>{uri}</URI>");
+                assert_s3_control_error(
+                    &s3_control_label,
+                    &s3_control_response,
+                    S3ControlError {
+                        status: 400,
+                        code: "InvalidURI",
+                        message: "Couldn't parse the specified URI.",
+                        detail: &detail,
+                        allow: None,
+                    },
+                );
+            }
+            S3ControlAuthCollisionResult::EmptyBadRequest => {
+                assert_empty_bad_path_request(&s3_control_label, &s3_control_response);
+            }
+        }
         println!("{s3_control_label}: ok");
     }
 }

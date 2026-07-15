@@ -1930,9 +1930,49 @@ select S3 Control; authenticated identity and the resource determine account
 authority, while `x-amz-account-id` is ignored for these three operations. An
 arbitrary header value must never select another account or endpoint kind.
 
-The remaining signing-service and bad-signature collisions, malformed
-operation bodies, and local Host/SNI trust-boundary cases remain required
-before the Phase 4 service refactor.
+The signing-service and bad-HMAC routing slice completed on 2026-07-15. On the
+valid reserved tags path it crosses the endpoint's correct, empty, and other
+service scope with both the real secret and a deliberately wrong secret. Exact
+goldens establish:
+
+| Request | `AwsRegionalSts` | `AwsRegionalS3Control` | Local `SharedRegional` selection |
+| --- | --- | --- | --- |
+| valid path, correct service, valid HMAC | `404 <UnknownOperationException/>` | `404 NoSuchResource` | S3 Control |
+| valid path, correct service, bad HMAC | `404 <UnknownOperationException/>` | `403 SignatureDoesNotMatch` with complete signing diagnostics | S3 Control |
+| valid path, empty service, either HMAC | `404 <UnknownOperationException/>` | `400 AuthorizationHeaderMalformed`: incorrect service `""`, endpoint `"s3"` | S3 Control |
+| valid path, other service, either HMAC | `404 <UnknownOperationException/>` | `400 AuthorizationHeaderMalformed`: incorrect service `"sts"`, endpoint `"s3"` | S3 Control |
+
+Regional STS therefore classifies a non-root reserved path as unknown before
+checking the SigV4 service component or HMAC. S3 Control classifies the valid
+reserved path first, validates the service component before the HMAC, then
+validates the HMAC before resource lookup. Empty and wrong service results are
+identical for valid and bad HMACs, so they are not signature-verification
+artifacts.
+
+The same slice repeats the earlier mixed routing requests with a bad HMAC:
+
+| Bad-HMAC collision | `AwsRegionalSts` | `AwsRegionalS3Control` | Local `SharedRegional` selection |
+| --- | --- | --- | --- |
+| root Query-form `GetCallerIdentity` | `403 SignatureDoesNotMatch` in the STS namespace | `400 InvalidURI` for `/` | STS |
+| Query-form `GetCallerIdentity` body on the reserved tags path | `403 SignatureDoesNotMatch` in the STS namespace | `403 SignatureDoesNotMatch` in the S3 Control envelope | S3 Control |
+| STS `Action`/`Version` query on the reserved tags path with TagResource XML | `403 SignatureDoesNotMatch` in the STS namespace | `403 SignatureDoesNotMatch` in the S3 Control envelope | S3 Control |
+| malformed percent triplet on the reserved path | outer HTTP `400`, empty body | outer HTTP `400`, empty body | S3 Control outer-error shape |
+| malformed ARN on the reserved path | `404 <UnknownOperationException/>` | `400 InvalidURI` | S3 Control |
+
+Thus root Query classification reaches STS authentication before the bad HMAC,
+whereas the S3 Control endpoint's root URI rejection wins first. On the
+reserved path, malformed percent decoding and ARN validation win before HMAC
+verification; a syntactically valid path reaches HMAC verification before
+resource lookup. Adding STS parameters never diverts that reserved path.
+
+The S3 Control signature-mismatch assertion now reconstructs the complete
+canonical request generically for method, path, canonical query, payload, and
+signed headers. It checks the canonical-request and string-to-sign hashes and
+byte encodings, then sanitizes the echoed access key before the complete
+response-shape comparison.
+
+The remaining malformed operation-body collisions and local Host/SNI
+trust-boundary cases remain required before the Phase 4 service refactor.
 The narrow current local `TagResource`/`UntagResource` routes still inherit the
 ordinary S3 listener's transport and are therefore a documented temporary gap;
 the typed Phase 4 endpoint refactor must remove that gap rather than inventing
@@ -2221,8 +2261,8 @@ body may appear in traces.
    and S3 Control endpoint kinds? The routing-boundary matrix and explicit
    `SharedRegional` mapping above have pinned the root-Query,
    versioned-path/form/query, bounded HTTP-method, path/percent/ARN near-miss,
-   and account-ID-header rows. The remaining signing/authentication and body
-   rows must be completed, and the local authority/SNI matrix must enforce the
+   account-ID-header, and signing/authentication rows. The remaining body rows
+   must be completed, and the local authority/SNI matrix must enforce the
    endpoint-kind trust boundary, before the typed service refactor.
 
 ## Definition Of The First Usable Milestone
