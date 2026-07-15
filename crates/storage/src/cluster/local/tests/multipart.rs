@@ -476,9 +476,10 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    let upload_id = upload_id_from_label("mpucreateretry");
+    let upload_id_key = crate::MultipartUploadIdKey::from_bytes([0x5a; 32]);
+    let provisional_upload_id = upload_id_key.issue(&bucket, &key, "initiator").unwrap();
     let create = crate::CreateMultipartUploadReq {
-        upload_id: upload_id.clone(),
+        upload_id: provisional_upload_id.clone(),
         bucket: bucket.clone(),
         key: key.clone(),
         tags: None,
@@ -495,13 +496,19 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
 
     let _serial = lock_metadata_command_apply_hook_test();
     let fail_once = Arc::new(AtomicBool::new(true));
-    let hook_upload_id = upload_id.clone();
+    let hook_upload_id = provisional_upload_id.clone();
     let fail_once_hook = Arc::clone(&fail_once);
     let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
         move |node_id, command| {
             match command.payload() {
                 MetadataCommandPayload::CreateMultipartUpload(create)
-                    if create.upload.upload_id == hook_upload_id
+                    if crate::MultipartUploadIdKey::has_same_issuance_identity(
+                        &create.upload.upload_id,
+                        &hook_upload_id,
+                    ) && crate::MultipartUploadIdKey::listing_position(
+                        &create.upload.upload_id,
+                    )
+                    .is_some_and(|position| position != (0, 0))
                         && node_id == NodeId::new(0)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
@@ -519,13 +526,13 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
     ));
 
     let err = cluster
-        .create_multipart_upload(
+        .create_multipart_upload_with_ordered_id(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
             |_snapshot, existing_object| {
                 assert!(existing_object.is_none());
-                Ok::<_, ()>(((), create.clone()))
+                Ok::<_, ()>(((), create.clone(), upload_id_key.clone()))
             },
         )
         .unwrap_err();
@@ -541,44 +548,58 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
     );
     drop(hook_guard);
 
-    assert!(
-        pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
-        "partial multipart create command must remain pending"
+    let pending = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+        .expect("partial multipart create command must remain pending");
+    let pending_listing_position = (
+        pending.id().cluster_epoch().get(),
+        pending.id().log_index().get(),
+    );
+    let MetadataCommandPayload::CreateMultipartUpload(pending_create) = pending.payload() else {
+        panic!("pending command should create the multipart upload");
+    };
+    let ordered_upload_id = pending_create.upload.upload_id.clone();
+    assert_ne!(ordered_upload_id, provisional_upload_id);
+    assert!(upload_id_key.authenticates(&bucket, &key, &ordered_upload_id));
+    assert_eq!(
+        crate::MultipartUploadIdKey::listing_position(&ordered_upload_id),
+        Some(pending_listing_position)
     );
     let primary_upload = {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();
         let pg = primary.get_pg(object_pg).unwrap();
-        crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap()
+        crate::PgMetadataStore::get_multipart_upload(&*pg, &ordered_upload_id).unwrap()
     };
     {
         let failed_replica = map.node(NodeId::new(0)).unwrap().storage_node();
         let pg = failed_replica.get_pg(object_pg).unwrap();
         assert!(matches!(
-            crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &ordered_upload_id),
             Err(crate::MetadataError::NoSuchUpload { .. })
         ));
     }
 
     let retry = cluster
-        .create_multipart_upload(
+        .create_multipart_upload_with_ordered_id(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
             |_snapshot, existing_object| {
                 assert!(existing_object.is_none());
-                Ok::<_, ()>((7_u8, create.clone()))
+                Ok::<_, ()>((7_u8, create.clone(), upload_id_key.clone()))
             },
         )
         .unwrap()
         .unwrap();
     assert_eq!(retry.value, 7);
+    assert_eq!(retry.upload_id, ordered_upload_id);
     assert_eq!(retry.initiated_at, primary_upload.initiated_at);
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
         let pg = node.get_pg(object_pg).unwrap();
-        let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+        let upload =
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &ordered_upload_id).unwrap();
         assert_eq!(upload.bucket, bucket);
         assert_eq!(upload.key, key);
         assert_eq!(upload.initiated_at, primary_upload.initiated_at);

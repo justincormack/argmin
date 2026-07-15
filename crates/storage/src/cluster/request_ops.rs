@@ -922,6 +922,12 @@ impl MultipartUploadCursor {
     }
 }
 
+fn multipart_upload_listing_position(upload: &MultipartUploadRecord) -> (u64, u64) {
+    MultipartUploadIdKey::listing_position(&upload.upload_id)
+        .filter(|position| *position != (0, 0))
+        .unwrap_or_else(|| (1, upload.object_generation_id.get()))
+}
+
 struct BoundedSmallestRecords<K, V> {
     capacity: usize,
     records: BTreeMap<K, V>,
@@ -11068,6 +11074,39 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateMultipartUploadReq), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
+        self.create_multipart_upload_inner(bucket, key, request, |snapshot, existing| {
+            action(snapshot, existing).map(|(value, create)| (value, create, None))
+        })
+    }
+
+    pub fn create_multipart_upload_with_ordered_id<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: BucketSnapshotRequest,
+        mut action: impl FnMut(
+            BucketSnapshot,
+            Option<StoredObject>,
+        )
+            -> Result<(T, CreateMultipartUploadReq, MultipartUploadIdKey), E>,
+    ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
+        self.create_multipart_upload_inner(bucket, key, request, |snapshot, existing| {
+            action(snapshot, existing)
+                .map(|(value, create, upload_id_key)| (value, create, Some(upload_id_key)))
+        })
+    }
+
+    fn create_multipart_upload_inner<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: BucketSnapshotRequest,
+        mut action: impl FnMut(
+            BucketSnapshot,
+            Option<StoredObject>,
+        )
+            -> Result<(T, CreateMultipartUploadReq, Option<MultipartUploadIdKey>), E>,
+    ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
         enum Attempt<T> {
             Complete(CreateMultipartUploadOutcome<T>),
             Retry,
@@ -11108,25 +11147,27 @@ impl super::StorageCluster {
                     Some(StoredObject::DeleteMarker(_)) | None => None,
                 };
 
-                let (value, create) = match action(snapshot, existing_object) {
+                let (value, create, upload_id_key) = match action(snapshot, existing_object) {
                     Ok(prepared) => prepared,
                     Err(error) => return Ok(Err(error)),
                 };
+                let applied_create =
+                    super::applied_multipart_create_command(&applied_commands, &create);
                 if let Some(initiated_at) = mutation_client
-                    .matching_multipart_upload_initiated_at(
-                        pg_id,
-                        &create,
-                        super::applied_multipart_create_command(&applied_commands, &create),
-                    )
+                    .matching_multipart_upload_initiated_at(pg_id, &create, applied_create)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                 {
                     return Ok(Ok(Attempt::Complete(CreateMultipartUploadOutcome {
                         value,
+                        upload_id: applied_create.map_or_else(
+                            || create.upload_id.clone(),
+                            |command| command.upload.upload_id.clone(),
+                        ),
                         initiated_at,
                     })));
                 }
 
-                let command = match mutation_client.build_create_multipart_upload_command(
+                let mut command = match mutation_client.build_create_multipart_upload_command(
                     BuildCreateMultipartUploadCommandReq {
                         pg_id,
                         cluster_epoch: self.operation_epoch(),
@@ -11152,6 +11193,26 @@ impl super::StorageCluster {
                         ));
                     }
                 };
+                if let Some(upload_id_key) = upload_id_key {
+                    let MetadataCommandPayload::CreateMultipartUpload(provisional_command) =
+                        command.payload()
+                    else {
+                        unreachable!("multipart create command changed payload kind");
+                    };
+                    let ordered_upload_id = upload_id_key.with_listing_position(
+                        &create.bucket,
+                        &create.key,
+                        &create.upload_id,
+                        command.id().cluster_epoch().get(),
+                        command.id().log_index().get(),
+                    );
+                    let mut ordered_command = provisional_command.as_ref().clone();
+                    ordered_command.upload.upload_id = ordered_upload_id;
+                    command = MetadataCommandEnvelope::new(
+                        command.id(),
+                        MetadataCommandPayload::CreateMultipartUpload(Box::new(ordered_command)),
+                    );
+                }
                 match self
                     .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
@@ -11193,6 +11254,7 @@ impl super::StorageCluster {
                 let initiated_at = create_command.upload.initiated_at;
                 Ok(Ok(Attempt::Complete(CreateMultipartUploadOutcome {
                     value,
+                    upload_id: create_command.upload.upload_id.clone(),
                     initiated_at,
                 })))
             })();
@@ -12340,7 +12402,7 @@ impl super::StorageCluster {
                 for upload in resp.uploads {
                     let order = (
                         upload.key.clone(),
-                        upload.initiated_at,
+                        multipart_upload_listing_position(&upload),
                         upload.upload_id.clone(),
                     );
                     smallest.insert(order, upload);
@@ -12464,7 +12526,10 @@ impl super::StorageCluster {
             .min_by(|(left_index, left), (right_index, right)| {
                 left.key
                     .cmp(&right.key)
-                    .then_with(|| left.initiated_at.cmp(&right.initiated_at))
+                    .then_with(|| {
+                        multipart_upload_listing_position(left)
+                            .cmp(&multipart_upload_listing_position(right))
+                    })
                     .then_with(|| left.upload_id.cmp(&right.upload_id))
                     .then_with(|| left_index.cmp(right_index))
             })

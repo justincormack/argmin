@@ -2684,11 +2684,12 @@ fn mpu_list_uploads_with_prefix() {
 }
 
 #[test]
-fn mpu_list_uploads_same_key_multiple_upload_ids() {
+fn mpu_list_uploads_same_key_uses_listing_position_when_timestamps_match() {
     let (_dir, store) = make_pg_store();
 
     // Insert out of upload-ID order with one shared initiation timestamp. The
-    // final upload-ID tie-break makes this ordering and its cursor deterministic.
+    // durable listing position, rather than an opaque ID or timestamp, defines
+    // creation order and makes the cursor deterministic.
     store
         .test_insert_listing_multipart_uploads(
             &bucket_name("bkt"),
@@ -2711,9 +2712,8 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
         .unwrap();
     assert!(resp.is_truncated);
     assert_eq!(resp.uploads.len(), 2);
-    // All same key, ordered by upload_id
-    assert_eq!(resp.uploads[0].upload_id, multipart_upload_id("u-a"));
-    assert_eq!(resp.uploads[1].upload_id, multipart_upload_id("u-b"));
+    assert_eq!(resp.uploads[0].upload_id, multipart_upload_id("u-c"));
+    assert_eq!(resp.uploads[1].upload_id, multipart_upload_id("u-a"));
 
     // Page 2: resume with markers
     let resp2 = store
@@ -2731,28 +2731,38 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
         .unwrap();
     assert!(!resp2.is_truncated);
     assert_eq!(resp2.uploads.len(), 1);
-    assert_eq!(resp2.uploads[0].upload_id, multipart_upload_id("u-c"));
+    assert_eq!(resp2.uploads[0].upload_id, multipart_upload_id("u-b"));
     assert_eq!(
         resp2.next_key_marker.as_ref().map(ObjectKey::as_str),
         Some("same-key")
     );
     assert_eq!(
         resp2.next_upload_id_marker,
-        Some(multipart_upload_id("u-c"))
+        Some(multipart_upload_id("u-b"))
     );
 }
 
 #[test]
-fn mpu_list_uploads_stale_marker_returns_remaining() {
+fn mpu_list_uploads_authenticated_stale_marker_preserves_position() {
     let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bkt");
+    let key = object_key("key");
+    let signing_key = MultipartUploadIdKey::from_bytes([0x5a; 32]);
+    let upload_ids: Vec<_> = (1..=3)
+        .map(|sequence| {
+            let provisional = signing_key.issue(&bucket, &key, "owner").unwrap();
+            signing_key.with_listing_position(&bucket, &key, &provisional, 1, sequence)
+        })
+        .collect();
 
-    // Create 3 uploads for the same key.
-    for uid in ["u-x", "u-y", "u-z"] {
+    // Create three uploads whose authenticated IDs carry their durable creation
+    // sequence, as production IDs do.
+    for upload_id in &upload_ids {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: multipart_upload_id(uid),
-                bucket: bucket_name("bkt"),
-                key: object_key("key"),
+                upload_id: upload_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2769,31 +2779,79 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
     }
 
     // Delete the middle upload (simulating it being aborted between pages).
-    store
-        .delete_multipart_upload(&multipart_upload_id("u-y"))
-        .unwrap();
+    store.delete_multipart_upload(&upload_ids[1]).unwrap();
 
-    // Paginate using u-y as the marker — it no longer exists.
-    // COALESCE to 0 means all remaining uploads for "key" are returned.
+    // Paginate using the deleted upload as the marker. Its authenticated
+    // sequence retains the cursor position without keeping a tombstone.
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: bucket_name("bkt"),
+            bucket,
             prefix: None,
             page_start: Some(ListMultipartUploadsPageStart::After {
-                key_marker: object_key("key"),
-                upload_id_marker: Some(multipart_upload_id("u-y")),
+                key_marker: key,
+                upload_id_marker: Some(upload_ids[1].clone()),
             }),
             max_uploads: 10,
         })
         .unwrap();
 
-    // u-x and u-z should both appear (safe re-return of u-x, plus u-z).
-    // The stale marker must not cause u-z to be silently dropped.
-    let ids: Vec<&str> = resp.uploads.iter().map(|u| u.upload_id.as_str()).collect();
-    assert!(
-        ids.contains(&multipart_upload_id("u-z").as_str()),
-        "u-z must not be dropped; got: {ids:?}"
-    );
+    let ids: Vec<_> = resp
+        .uploads
+        .iter()
+        .map(|upload| upload.upload_id.clone())
+        .collect();
+    assert_eq!(ids, vec![upload_ids[2].clone()]);
+}
+
+#[test]
+fn mpu_list_uploads_stale_marker_advances_across_cluster_epochs() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("bkt");
+    let key = object_key("key");
+    let signing_key = MultipartUploadIdKey::from_bytes([0x5a; 32]);
+    let old_provisional = signing_key.issue(&bucket, &key, "owner").unwrap();
+    let old_upload_id = signing_key.with_listing_position(&bucket, &key, &old_provisional, 1, 10);
+
+    let create = |upload_id: UploadId| CreateMultipartUploadReq {
+        upload_id,
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: vec![].into(),
+        system_metadata_blob: SerializedSystemMetadataBlob::default(),
+        initiator: test_owner(),
+        owner: test_owner(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        object_lock: ObjectLockState::default(),
+        checksum: None,
+        encryption: ObjectEncryption::None,
+    };
+    store
+        .create_multipart_upload(&create(old_upload_id.clone()))
+        .unwrap();
+    store.delete_multipart_upload(&old_upload_id).unwrap();
+
+    let new_provisional = signing_key.issue(&bucket, &key, "owner").unwrap();
+    let new_upload_id = signing_key.with_listing_position(&bucket, &key, &new_provisional, 2, 1);
+    store
+        .create_multipart_upload(&create(new_upload_id.clone()))
+        .unwrap();
+
+    let response = store
+        .list_multipart_uploads(&ListMultipartUploadsReq {
+            bucket,
+            prefix: None,
+            page_start: Some(ListMultipartUploadsPageStart::After {
+                key_marker: key,
+                upload_id_marker: Some(old_upload_id),
+            }),
+            max_uploads: 10,
+        })
+        .unwrap();
+    assert_eq!(response.uploads.len(), 1);
+    assert_eq!(response.uploads[0].upload_id, new_upload_id);
+    assert_eq!(response.uploads[0].object_generation_id, GenerationId::MIN);
 }
 
 #[test]

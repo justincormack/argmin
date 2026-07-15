@@ -301,6 +301,15 @@ pub const SESSION_ID_LEN: usize = 32;
 pub struct MultipartUploadIdKey([u8; MULTIPART_UPLOAD_ID_KEY_LEN]);
 
 impl MultipartUploadIdKey {
+    // The fixed 128-character ID encodes two 64-bit listing coordinates, a
+    // 96-bit random nonce, a 128-bit initiator claim, and a 192-bit HMAC tag.
+    // The truncated tag leaves room for epoch provenance while retaining a
+    // security margin well beyond the other claims in the ID.
+    const LISTING_COMPONENT_HEX_LEN: usize = 16;
+    const NONCE_LEN: usize = 16;
+    const INITIATOR_CLAIM_HEX_LEN: usize = 32;
+    const AUTH_TAG_LEN: usize = 24;
+
     pub fn generate() -> Result<Self, String> {
         let mut bytes = [0u8; MULTIPART_UPLOAD_ID_KEY_LEN];
         ring::rand::SystemRandom::new()
@@ -323,8 +332,7 @@ impl MultipartUploadIdKey {
         key: &ObjectKey,
         initiator_principal: &str,
     ) -> Result<UploadId, String> {
-        const NONCE_LEN: usize = 32;
-        let mut random = [0u8; NONCE_LEN];
+        let mut random = [0u8; Self::NONCE_LEN];
         ring::rand::SystemRandom::new()
             .fill(&mut random)
             .map_err(|_| "failed to generate multipart upload ID".to_string())?;
@@ -333,24 +341,90 @@ impl MultipartUploadIdKey {
             .map(|byte| UPLOAD_ID_ALPHABET[(byte & 0x3f) as usize] as char)
             .collect();
         let initiator_claim = self.initiator_claim(initiator_principal);
+        Ok(self.encode(bucket, key, 0, 0, nonce.as_bytes(), &initiator_claim))
+    }
+
+    pub(crate) fn with_listing_position(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        cluster_epoch: u64,
+        log_index: u64,
+    ) -> UploadId {
+        let nonce_start = Self::LISTING_COMPONENT_HEX_LEN * 2;
+        let claim_start = nonce_start + Self::NONCE_LEN;
+        let nonce = &upload_id.as_str().as_bytes()[nonce_start..claim_start];
+        let encoded_claim =
+            &upload_id.as_str()[claim_start..claim_start + Self::INITIATOR_CLAIM_HEX_LEN];
+        let initiator_claim = decode_multipart_upload_id_hex::<16>(encoded_claim)
+            .expect("issued multipart upload ID claim should remain valid hexadecimal");
+        self.encode(
+            bucket,
+            key,
+            cluster_epoch,
+            log_index,
+            nonce,
+            &initiator_claim,
+        )
+    }
+
+    pub(crate) fn listing_position(upload_id: &UploadId) -> Option<(u64, u64)> {
+        let (encoded_epoch, remainder) =
+            upload_id.as_str().split_at(Self::LISTING_COMPONENT_HEX_LEN);
+        let encoded_log_index = &remainder[..Self::LISTING_COMPONENT_HEX_LEN];
+        let cluster_epoch =
+            decode_multipart_upload_id_hex::<8>(encoded_epoch).map(u64::from_be_bytes)?;
+        let log_index =
+            decode_multipart_upload_id_hex::<8>(encoded_log_index).map(u64::from_be_bytes)?;
+        Some((cluster_epoch, log_index))
+    }
+
+    pub(crate) fn has_same_issuance_identity(left: &UploadId, right: &UploadId) -> bool {
+        let start = Self::LISTING_COMPONENT_HEX_LEN * 2;
+        let end = start + Self::NONCE_LEN + Self::INITIATOR_CLAIM_HEX_LEN;
+        left.as_str()[start..end] == right.as_str()[start..end]
+    }
+
+    fn encode(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        cluster_epoch: u64,
+        log_index: u64,
+        nonce: &[u8],
+        initiator_claim: &[u8; 16],
+    ) -> UploadId {
         let tag = hmac::sign(
             &hmac::Key::new(hmac::HMAC_SHA256, &self.0),
-            &multipart_upload_id_covered_bytes(bucket, key, nonce.as_bytes(), &initiator_claim),
+            &multipart_upload_id_covered_bytes(
+                bucket,
+                key,
+                cluster_epoch,
+                log_index,
+                nonce,
+                initiator_claim,
+            ),
         );
         let mut encoded = String::with_capacity(UPLOAD_ID_LEN);
-        encoded.push_str(&nonce);
-        for byte in initiator_claim {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{cluster_epoch:016x}{log_index:016x}")
+            .expect("writing multipart upload ID into String cannot fail");
+        encoded.push_str(
+            std::str::from_utf8(nonce)
+                .expect("multipart upload ID nonce should contain only ASCII characters"),
+        );
+        for byte in *initiator_claim {
             use std::fmt::Write as _;
             write!(&mut encoded, "{byte:02x}")
                 .expect("writing multipart upload ID into String cannot fail");
         }
-        for byte in tag.as_ref() {
+        for byte in &tag.as_ref()[..Self::AUTH_TAG_LEN] {
             use std::fmt::Write as _;
             write!(&mut encoded, "{byte:02x}")
                 .expect("writing multipart upload ID into String cannot fail");
         }
-        UploadId::try_from(encoded)
-            .map_err(|error| format!("generated invalid multipart upload ID: {error}"))
+        UploadId::try_from(encoded).expect("encoded multipart upload ID should remain valid")
     }
 
     pub fn authenticates(
@@ -359,23 +433,39 @@ impl MultipartUploadIdKey {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> bool {
-        const NONCE_LEN: usize = 32;
-        const INITIATOR_CLAIM_HEX_LEN: usize = 32;
-        let (nonce, remainder) = upload_id.as_str().split_at(NONCE_LEN);
-        let (encoded_claim, encoded_tag) = remainder.split_at(INITIATOR_CLAIM_HEX_LEN);
+        let Some((cluster_epoch, log_index)) = Self::listing_position(upload_id) else {
+            return false;
+        };
+        let (_, remainder) = upload_id
+            .as_str()
+            .split_at(Self::LISTING_COMPONENT_HEX_LEN * 2);
+        let (nonce, remainder) = remainder.split_at(Self::NONCE_LEN);
+        let (encoded_claim, encoded_tag) = remainder.split_at(Self::INITIATOR_CLAIM_HEX_LEN);
         let Some(initiator_claim) = decode_multipart_upload_id_hex::<16>(encoded_claim) else {
             return false;
         };
-        let Some(tag) = decode_multipart_upload_id_hex::<MULTIPART_UPLOAD_ID_KEY_LEN>(encoded_tag)
+        let Some(tag) = decode_multipart_upload_id_hex::<{ Self::AUTH_TAG_LEN }>(encoded_tag)
         else {
             return false;
         };
-        hmac::verify(
-            &hmac::Key::new(hmac::HMAC_SHA256, &self.0),
-            &multipart_upload_id_covered_bytes(bucket, key, nonce.as_bytes(), &initiator_claim),
-            &tag,
-        )
-        .is_ok()
+        let root_key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
+        let expected = hmac::sign(
+            &root_key,
+            &multipart_upload_id_covered_bytes(
+                bucket,
+                key,
+                cluster_epoch,
+                log_index,
+                nonce.as_bytes(),
+                &initiator_claim,
+            ),
+        );
+        let comparison_key_bytes =
+            hmac::sign(&root_key, b"argmin multipart upload id tag comparison v1\0");
+        let comparison_key = hmac::Key::new(hmac::HMAC_SHA256, comparison_key_bytes.as_ref());
+        let expected_comparison_tag =
+            hmac::sign(&comparison_key, &expected.as_ref()[..Self::AUTH_TAG_LEN]);
+        hmac::verify(&comparison_key, &tag, expected_comparison_tag.as_ref()).is_ok()
     }
 
     pub fn was_issued_for_principal(
@@ -383,9 +473,9 @@ impl MultipartUploadIdKey {
         upload_id: &UploadId,
         initiator_principal: &str,
     ) -> bool {
-        const NONCE_LEN: usize = 32;
-        const INITIATOR_CLAIM_HEX_LEN: usize = 32;
-        let encoded_claim = &upload_id.as_str()[NONCE_LEN..NONCE_LEN + INITIATOR_CLAIM_HEX_LEN];
+        let claim_start = Self::LISTING_COMPONENT_HEX_LEN * 2 + Self::NONCE_LEN;
+        let encoded_claim =
+            &upload_id.as_str()[claim_start..claim_start + Self::INITIATOR_CLAIM_HEX_LEN];
         let Some(claim) = decode_multipart_upload_id_hex::<16>(encoded_claim) else {
             return false;
         };
@@ -433,16 +523,19 @@ fn decode_multipart_upload_id_hex<const N: usize>(encoded: &str) -> Option<[u8; 
 fn multipart_upload_id_covered_bytes(
     bucket: &BucketName,
     key: &ObjectKey,
+    cluster_epoch: u64,
+    log_index: u64,
     nonce: &[u8],
     initiator_claim: &[u8; 16],
 ) -> Vec<u8> {
-    const DOMAIN: &[u8] = b"argmin multipart upload id v1\0";
+    const DOMAIN: &[u8] = b"argmin multipart upload id v3\0";
     let mut covered = Vec::with_capacity(
         DOMAIN.len()
             + 4
             + bucket.as_str().len()
             + 4
             + key.as_str().len()
+            + 16
             + nonce.len()
             + initiator_claim.len(),
     );
@@ -451,6 +544,8 @@ fn multipart_upload_id_covered_bytes(
     covered.extend_from_slice(bucket.as_str().as_bytes());
     covered.extend_from_slice(&(key.as_str().len() as u32).to_be_bytes());
     covered.extend_from_slice(key.as_str().as_bytes());
+    covered.extend_from_slice(&cluster_epoch.to_be_bytes());
+    covered.extend_from_slice(&log_index.to_be_bytes());
     covered.extend_from_slice(nonce);
     covered.extend_from_slice(initiator_claim);
     covered
@@ -4005,6 +4100,7 @@ pub struct CreateMultipartUploadReq {
 #[derive(Debug)]
 pub struct CreateMultipartUploadOutcome<T> {
     pub value: T,
+    pub upload_id: UploadId,
     pub initiated_at: u64,
 }
 
@@ -4877,6 +4973,10 @@ mod tests {
         let key = ObjectKey::try_from("path/to/object").unwrap();
         let upload_id = signing_key.issue(&bucket, &key, "primary").unwrap();
 
+        assert_eq!(
+            MultipartUploadIdKey::listing_position(&upload_id),
+            Some((0, 0))
+        );
         assert!(signing_key.authenticates(&bucket, &key, &upload_id));
         assert!(signing_key.was_issued_for_principal(&upload_id, "primary"));
         assert!(!signing_key.was_issued_for_principal(&upload_id, "alternate"));
@@ -4898,6 +4998,27 @@ mod tests {
         assert!(
             !MultipartUploadIdKey::from_bytes([0xa5; 32]).authenticates(&bucket, &key, &upload_id)
         );
+
+        let ordered_upload_id = signing_key.with_listing_position(&bucket, &key, &upload_id, 7, 42);
+        assert_eq!(
+            MultipartUploadIdKey::listing_position(&ordered_upload_id),
+            Some((7, 42))
+        );
+        assert!(MultipartUploadIdKey::has_same_issuance_identity(
+            &upload_id,
+            &ordered_upload_id
+        ));
+        assert!(signing_key.authenticates(&bucket, &key, &ordered_upload_id));
+        assert!(signing_key.was_issued_for_principal(&ordered_upload_id, "primary"));
+        let mut mutated_sequence = ordered_upload_id.as_str().as_bytes().to_vec();
+        mutated_sequence[31] = b'3';
+        let mutated_sequence =
+            UploadId::try_from(String::from_utf8(mutated_sequence).unwrap()).unwrap();
+        assert_ne!(
+            MultipartUploadIdKey::listing_position(&mutated_sequence),
+            Some((7, 42))
+        );
+        assert!(!signing_key.authenticates(&bucket, &key, &mutated_sequence));
     }
 
     #[test]

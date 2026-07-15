@@ -186,6 +186,52 @@ fn object_and_multipart_listing_select_global_first_page_at_production_cap_volum
 }
 
 #[test]
+fn multipart_upload_global_merge_uses_pg_listing_position_order() {
+    let tmp = test_util::tempdir();
+    let node_id = NodeId::new(0);
+    let map = LocalClusterMap::open(tmp.path(), &[node_id], &[0], EcShape { k: 1, m: 0 }).unwrap();
+    let bucket = crate::BucketName::try_from("multipart-order-bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("same-key".to_string()).unwrap();
+    let upload_ids = [
+        upload_id_from_label("orderc"),
+        upload_id_from_label("ordera"),
+        upload_id_from_label("orderb"),
+    ];
+    let node = map.node(node_id).unwrap().storage_node();
+    node.get_pg(0)
+        .unwrap()
+        .test_insert_listing_multipart_uploads(
+            &bucket,
+            &upload_ids
+                .iter()
+                .map(|upload_id| (key.clone(), upload_id.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let first = cluster
+        .list_multipart_uploads_for_bucket(&bucket, None, None, None, None, 2)
+        .unwrap();
+    assert_eq!(
+        first
+            .uploads
+            .iter()
+            .map(|upload| upload.upload_id.clone())
+            .collect::<Vec<_>>(),
+        upload_ids[..2]
+    );
+    assert!(first.is_truncated);
+
+    let second = cluster
+        .list_multipart_uploads_for_bucket(&bucket, None, None, Some(&key), Some(&upload_ids[1]), 2)
+        .unwrap();
+    assert_eq!(second.uploads.len(), 1);
+    assert_eq!(second.uploads[0].upload_id, upload_ids[2]);
+    assert!(!second.is_truncated);
+}
+
+#[test]
 fn multipart_upload_delimiter_pagination_merges_common_prefix_across_pgs() {
     let tmp = test_util::tempdir();
     let node_id = NodeId::new(0);

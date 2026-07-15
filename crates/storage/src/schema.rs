@@ -204,6 +204,8 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     acl_grants TEXT NOT NULL DEFAULT '',
     public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     object_generation_id INTEGER NOT NULL CHECK (object_generation_id > 0),
+    listing_cluster_epoch INTEGER NOT NULL DEFAULT 1 CHECK (listing_cluster_epoch > 0),
+    listing_log_index INTEGER NOT NULL DEFAULT 1 CHECK (listing_log_index > 0),
     object_lock_retention_mode INTEGER CHECK (
         object_lock_retention_mode IS NULL OR object_lock_retention_mode IN (0, 1)
     ),
@@ -216,7 +218,7 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
 /// Index for listing multipart uploads by bucket/key.
 const CREATE_MPU_BUCKET_KEY_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_mpu_bucket_key \
-    ON multipart_uploads (bucket, key, initiated_at, upload_id)";
+    ON multipart_uploads (bucket, key, listing_cluster_epoch, listing_log_index, upload_id)";
 
 /// In-progress multipart part tracking table.
 const CREATE_MULTIPART_PARTS_TABLE: &str = "\

@@ -2818,7 +2818,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
         expected_command: Option<&CreateMultipartUploadCommand>,
     ) -> Result<Option<u64>, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        match pg.get_multipart_upload(&create.upload_id) {
+        let upload_id =
+            expected_command.map_or(&create.upload_id, |command| &command.upload.upload_id);
+        match pg.get_multipart_upload(upload_id) {
             Ok(existing)
                 if expected_command.is_some_and(|command| {
                     multipart_upload_matches_command(&existing, command)

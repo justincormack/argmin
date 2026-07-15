@@ -82,8 +82,9 @@ impl PgStore {
                         "INSERT INTO multipart_uploads \
                          (upload_id, bucket, key, initiated_at, metadata_blob, \
                           system_metadata_blob, owner_principal, owner_canonical_id, \
-                          initiator_principal, initiator_canonical_id, object_generation_id) \
-                         VALUES (?1, ?2, ?3, 1, X'', X'', ?5, ?6, ?5, ?6, ?4)",
+                          initiator_principal, initiator_canonical_id, object_generation_id, \
+                          listing_cluster_epoch, listing_log_index) \
+                         VALUES (?1, ?2, ?3, 1, X'', X'', ?5, ?6, ?5, ?6, ?4, 1, ?4)",
                     )
                     .map_err(|source| MetadataError::Db {
                         context: "prepare test listing multipart uploads",
@@ -2810,6 +2811,24 @@ impl PgStore {
         let encryption_state = upload.encryption.encode_state();
         let system_metadata_blob = upload.system_metadata_blob.as_slice();
         let initiator = &upload.initiator;
+        let (listing_cluster_epoch, listing_log_index) =
+            MultipartUploadIdKey::listing_position(&upload.upload_id)
+                .filter(|position| *position != (0, 0))
+                .unwrap_or_else(|| (1, upload.object_generation_id.get()));
+        let listing_cluster_epoch =
+            i64::try_from(listing_cluster_epoch).map_err(|_| MetadataError::Db {
+                context: "create multipart upload listing cluster epoch",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                    "multipart upload listing cluster epoch exceeds SQLite integer range",
+                )),
+            })?;
+        let listing_log_index =
+            i64::try_from(listing_log_index).map_err(|_| MetadataError::Db {
+                context: "create multipart upload listing log index",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                    "multipart upload listing log index exceeds SQLite integer range",
+                )),
+            })?;
         self.with_immediate_txn(
             "create multipart upload (begin txn)",
             "create multipart upload (commit txn)",
@@ -2862,8 +2881,8 @@ impl PgStore {
                 match store.conn.execute(
                     "INSERT INTO multipart_uploads \
                      (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, owner_canonical_id, \
-                      initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_generation_id, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                      initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_generation_id, listing_cluster_epoch, listing_log_index, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                     params![
                         upload.upload_id,
                         upload.bucket,
@@ -2884,6 +2903,8 @@ impl PgStore {
                         upload.acl_grants.serialized(),
                         i32::from(upload.public_read),
                         upload.object_generation_id.get() as i64,
+                        listing_cluster_epoch,
+                        listing_log_index,
                         object_lock_retention_mode,
                         object_lock_retain_until,
                         object_lock_legal_hold,
@@ -9561,28 +9582,37 @@ impl PgMetadataStore for PgStore {
             upload_id_marker,
         }) = req.page_start.as_ref()
         {
-            if let Some(uid_marker) = upload_id_marker.as_ref().map(UploadId::as_str) {
-                // Resume after (key_marker, initiated_at of marker, uid_marker).
-                // Use a subquery to resolve the marker's initiated_at so the
-                // cursor is consistent with the (key, initiated_at, upload_id)
-                // sort order. COALESCE to 0 so a deleted marker row safely
-                // returns all remaining uploads for that key (duplicates are
-                // preferable to silently dropped entries).
+            if let Some(uid_marker) = upload_id_marker.as_ref() {
+                // The authenticated production upload ID carries the durable,
+                // non-reusable metadata-command sequence allocated when its
+                // create command was built. Use the live row when it still
+                // exists and the ID claim after completion/abort removes that
+                // row, preserving the same-key continuation position without a
+                // terminal tombstone.
+                let (fallback_epoch, fallback_log_index) =
+                    MultipartUploadIdKey::listing_position(uid_marker).unwrap_or((0, 0));
+                let fallback_epoch = i64::try_from(fallback_epoch).unwrap_or(0);
+                let fallback_log_index = i64::try_from(fallback_log_index).unwrap_or(0);
                 where_clauses.push(format!(
-                    "(key > ?{km} OR (key = ?{km} AND (\
-                     initiated_at > COALESCE((SELECT initiated_at FROM multipart_uploads \
-                     WHERE upload_id = ?{um} AND bucket = ?{bkt} AND key = ?{km}), 0) \
-                     OR (initiated_at = COALESCE((SELECT initiated_at FROM multipart_uploads \
-                     WHERE upload_id = ?{um} AND bucket = ?{bkt} AND key = ?{km}), 0) \
-                     AND upload_id > ?{um}))))",
+                    "(key > ?{km} OR (key = ?{km} AND \
+                     (listing_cluster_epoch > COALESCE((SELECT listing_cluster_epoch FROM multipart_uploads \
+                      WHERE upload_id = ?{um} AND bucket = ?{bkt} AND key = ?{km}), ?{fallback_epoch}) \
+                      OR (listing_cluster_epoch = COALESCE((SELECT listing_cluster_epoch FROM multipart_uploads \
+                          WHERE upload_id = ?{um} AND bucket = ?{bkt} AND key = ?{km}), ?{fallback_epoch}) \
+                          AND listing_log_index > COALESCE((SELECT listing_log_index FROM multipart_uploads \
+                              WHERE upload_id = ?{um} AND bucket = ?{bkt} AND key = ?{km}), ?{fallback_log_index})))))",
                     km = param_idx,
                     um = param_idx + 1,
-                    bkt = param_idx + 2
+                    bkt = param_idx + 2,
+                    fallback_epoch = param_idx + 3,
+                    fallback_log_index = param_idx + 4,
                 ));
                 params_vec.push(Box::new(key_marker.clone()));
-                params_vec.push(Box::new(uid_marker.to_string()));
+                params_vec.push(Box::new(uid_marker.as_str().to_string()));
                 params_vec.push(Box::new(req.bucket.clone()));
-                param_idx += 3;
+                params_vec.push(Box::new(fallback_epoch));
+                params_vec.push(Box::new(fallback_log_index));
+                param_idx += 5;
             } else {
                 where_clauses.push(format!("key > ?{param_idx}"));
                 params_vec.push(Box::new(key_marker.clone()));
@@ -9597,7 +9627,7 @@ impl PgMetadataStore for PgStore {
              checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, object_generation_id \
              FROM multipart_uploads \
              WHERE {where_str} \
-             ORDER BY key ASC, initiated_at ASC, upload_id ASC \
+             ORDER BY key ASC, listing_cluster_epoch ASC, listing_log_index ASC, upload_id ASC \
              LIMIT ?{param_idx}"
         );
         params_vec.push(Box::new(limit));

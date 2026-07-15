@@ -442,10 +442,11 @@ impl Coordinator {
         let expected_bucket_owner = req.object.expected_bucket_owner();
         let CreateMultipartUploadOutcome {
             value: authorized,
+            upload_id: typed_upload_id,
             initiated_at,
         } = self
             .storage_node()
-            .create_multipart_upload(
+            .create_multipart_upload_with_ordered_id(
                 req.object.bucket.name_typed(),
                 req.object.key_typed(),
                 request.resolve_to_storage_request(),
@@ -492,11 +493,11 @@ impl Coordinator {
                         checksum: authorized.checksum,
                         encryption: authorized.write_encryption.object_encryption(),
                     };
-                    Ok::<_, ServerError>(((authorized, typed_upload_id), create))
+                    let upload_id_key = authorized.bucket_info.multipart_upload_id_key.clone();
+                    Ok::<_, ServerError>((authorized, create, upload_id_key))
                 },
             )
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)??;
-        let (authorized, typed_upload_id) = authorized;
         let AuthorizedCreateMultipartUpload {
             bucket_info,
             key,

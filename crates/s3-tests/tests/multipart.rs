@@ -3876,6 +3876,271 @@ fn test_list_multipart_uploads_same_key_ordering_markers_and_terminal_states() {
 }
 
 #[test]
+fn test_list_multipart_uploads_pagination_across_lifecycle_changes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let marker_key = "m-marker";
+
+        let mut initial = Vec::new();
+        for key in [
+            "a-before",
+            marker_key,
+            marker_key,
+            marker_key,
+            "n-complete",
+            "o-abort",
+            "z-stable",
+        ] {
+            let upload =
+                create_multipart_upload_retrying_operation_aborted(client, &bucket, key).await;
+            initial.push((key, upload.upload_id().unwrap().to_string()));
+        }
+
+        let first = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .max_uploads(3)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let first_entries = first
+            .uploads()
+            .iter()
+            .map(|upload| {
+                (
+                    upload.key().unwrap().to_string(),
+                    upload.upload_id().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let first_next_key_marker = first.next_key_marker().unwrap().to_string();
+        let first_next_upload_id_marker = first.next_upload_id_marker().unwrap().to_string();
+
+        // Remove the exact marker row, add uploads on both sides of the marker,
+        // and remove later rows through both terminal paths before resuming.
+        abort_multipart_upload_retrying_operation_aborted(
+            client,
+            &bucket,
+            marker_key,
+            &initial[2].1,
+        )
+        .await;
+        let before_marker =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, "b-new").await;
+        let same_key_after_marker =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, marker_key).await;
+        let after_marker =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, "p-new").await;
+
+        let completed_part = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            initial[4].0,
+            &initial[4].1,
+            1,
+            b"completed-between-pages".to_vec(),
+        )
+        .await;
+        complete_multipart_upload_retrying_operation_aborted(
+            client,
+            &bucket,
+            initial[4].0,
+            &initial[4].1,
+            completed_part.e_tag().unwrap(),
+        )
+        .await;
+        abort_multipart_upload_retrying_operation_aborted(
+            client,
+            &bucket,
+            initial[5].0,
+            &initial[5].1,
+        )
+        .await;
+
+        let second = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .key_marker(&first_next_key_marker)
+            .upload_id_marker(&first_next_upload_id_marker)
+            .max_uploads(100)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let second_entries = second
+            .uploads()
+            .iter()
+            .map(|upload| {
+                (
+                    upload.key().unwrap().to_string(),
+                    upload.upload_id().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let second_is_truncated = second.is_truncated();
+        let second_next_key_marker = second.next_key_marker().map(str::to_string);
+        let second_next_upload_id_marker = second.next_upload_id_marker().map(str::to_string);
+
+        let full = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let full_entries = full
+            .uploads()
+            .iter()
+            .map(|upload| {
+                (
+                    upload.key().unwrap().to_string(),
+                    upload.upload_id().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (key, upload_id) in initial
+            .iter()
+            .map(|(key, upload_id)| (*key, upload_id.as_str()))
+            .chain([
+                ("b-new", before_marker.upload_id().unwrap()),
+                (marker_key, same_key_after_marker.upload_id().unwrap()),
+                ("p-new", after_marker.upload_id().unwrap()),
+            ])
+        {
+            abort_multipart_upload_retrying_operation_aborted(client, &bucket, key, upload_id)
+                .await;
+        }
+        cleanup(&bucket, &[initial[4].0]).await;
+
+        assert_eq!(
+            first_entries,
+            [
+                (initial[0].0.to_string(), initial[0].1.clone()),
+                (initial[1].0.to_string(), initial[1].1.clone()),
+                (initial[2].0.to_string(), initial[2].1.clone()),
+            ]
+        );
+        assert_eq!(first.is_truncated(), Some(true));
+        assert_eq!(first_next_key_marker, marker_key);
+        assert_eq!(first_next_upload_id_marker, initial[2].1);
+
+        assert_eq!(
+            second_entries,
+            [
+                (marker_key.to_string(), initial[3].1.clone()),
+                (
+                    marker_key.to_string(),
+                    same_key_after_marker.upload_id().unwrap().to_string(),
+                ),
+                (
+                    "p-new".to_string(),
+                    after_marker.upload_id().unwrap().to_string(),
+                ),
+                (initial[6].0.to_string(), initial[6].1.clone()),
+            ]
+        );
+        assert_eq!(second_is_truncated, Some(false));
+        assert_eq!(second_next_key_marker.as_deref(), Some(initial[6].0));
+        assert_eq!(
+            second_next_upload_id_marker.as_deref(),
+            Some(initial[6].1.as_str())
+        );
+
+        assert_eq!(
+            full_entries,
+            [
+                (initial[0].0.to_string(), initial[0].1.clone()),
+                (
+                    "b-new".to_string(),
+                    before_marker.upload_id().unwrap().to_string(),
+                ),
+                (marker_key.to_string(), initial[1].1.clone()),
+                (marker_key.to_string(), initial[3].1.clone()),
+                (
+                    marker_key.to_string(),
+                    same_key_after_marker.upload_id().unwrap().to_string(),
+                ),
+                (
+                    "p-new".to_string(),
+                    after_marker.upload_id().unwrap().to_string(),
+                ),
+                (initial[6].0.to_string(), initial[6].1.clone()),
+            ]
+        );
+    });
+}
+
+#[test]
+fn test_list_multipart_uploads_stale_marker_precedes_recreated_same_key_upload() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "stale-marker-recreated-same-key";
+
+        let marker = create_multipart_upload_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .upload_id()
+            .unwrap()
+            .to_string();
+        let first = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .prefix(key)
+            .max_uploads(1)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let first_entries = first
+            .uploads()
+            .iter()
+            .map(|upload| {
+                (
+                    upload.key().unwrap().to_string(),
+                    upload.upload_id().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let key_marker = first.next_key_marker().unwrap().to_string();
+        let upload_id_marker = first.next_upload_id_marker().unwrap().to_string();
+
+        abort_multipart_upload_retrying_operation_aborted(client, &bucket, key, &marker).await;
+        let replacement =
+            create_multipart_upload_retrying_operation_aborted(client, &bucket, key).await;
+        let replacement_id = replacement.upload_id().unwrap().to_string();
+
+        let resumed = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .prefix(key)
+            .key_marker(&key_marker)
+            .upload_id_marker(&upload_id_marker)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let resumed_entries = resumed
+            .uploads()
+            .iter()
+            .map(|upload| {
+                (
+                    upload.key().unwrap().to_string(),
+                    upload.upload_id().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        abort_multipart_upload_retrying_operation_aborted(client, &bucket, key, &replacement_id)
+            .await;
+        cleanup(&bucket, &[]).await;
+
+        assert_eq!(first_entries, [(key.to_string(), marker.clone())]);
+        assert_eq!(key_marker, key);
+        assert_eq!(upload_id_marker, marker);
+        assert_eq!(resumed_entries, [(key.to_string(), replacement_id)]);
+        assert_eq!(resumed.is_truncated(), Some(false));
+    });
+}
+
+#[test]
 fn test_list_multipart_uploads_delimiter_pagination() {
     s3_tests::run(async {
         let client = CTX.client();

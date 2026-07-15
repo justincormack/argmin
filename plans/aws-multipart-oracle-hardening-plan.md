@@ -192,13 +192,21 @@ For each matrix:
 
 - [x] Expand ListParts limits, markers, ordering, overwritten-part metadata,
   checksum fields, and active/terminal upload states.
-- [ ] Expand ListMultipartUploads ordering and pagination across same-key uploads,
+- [x] Expand ListMultipartUploads ordering and pagination across same-key uploads,
   prefixes, delimiters, encoding, duplicate timestamps, completion, abort, and
   concurrent state changes.
   Same-key creation ordering, two-marker continuation, non-truncated next
   markers, prefix/encoding behavior, duplicate-timestamp tie-breaking, and
   completion/abort removal and delimiter/common-prefix pagination are covered.
-  The lifecycle race matrix remains.
+  The lifecycle matrix pins continuation after the exact marker is aborted,
+  creation before and after that stale marker, creation with the same key, and
+  completion/abort removal between pages. Authenticated upload IDs carry their
+  durable creation position, consisting of the PG metadata command's cluster
+  epoch and within-epoch log index, so the stale marker resumes at its former
+  position across epoch transitions without retaining a per-key counter or
+  terminal upload metadata. The minimal
+  abort/recreate case proves a replacement remains visible even when no other
+  same-key upload preserves the old object generation.
 - [ ] Pin malformed and duplicate listing parameters and authorization/error
   precedence with positive list canaries.
 

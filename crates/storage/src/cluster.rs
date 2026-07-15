@@ -516,7 +516,12 @@ fn multipart_create_request_matches_upload(
     upload: &MultipartUploadRecord,
     create: &crate::CreateMultipartUploadReq,
 ) -> bool {
-    upload.upload_id == create.upload_id
+    (upload.upload_id == create.upload_id
+        || (crate::MultipartUploadIdKey::listing_position(&create.upload_id) == Some((0, 0))
+            && crate::MultipartUploadIdKey::has_same_issuance_identity(
+                &upload.upload_id,
+                &create.upload_id,
+            )))
         && upload.bucket == create.bucket
         && upload.key == create.key
         && upload.state == crate::UploadState::InProgress
