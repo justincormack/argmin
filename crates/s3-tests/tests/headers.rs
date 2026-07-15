@@ -1913,6 +1913,60 @@ fn test_put_wrong_region() {
 }
 
 #[test]
+fn test_header_sigv4_unknown_key_wrong_region_bucket_existence_precedence() {
+    s3_tests::run(async {
+        let existing_bucket = setup_bucket().await;
+        let missing_bucket = unique_bucket();
+        let wrong_region = if CTX.region() == "us-east-1" {
+            "us-west-2"
+        } else {
+            "us-east-1"
+        };
+        let credentials = SignedRequestCredentials {
+            access_key: "AKIAIOSFODNN7INVALID",
+            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYWRONGKEY000",
+            region: wrong_region,
+            tls_ca_pem: CTX.tls_ca_pem(),
+        };
+        let expected_message = format!(
+            "The authorization header is malformed; the region '{wrong_region}' is wrong; \
+             expecting '{}'",
+            CTX.region()
+        );
+
+        for (label, bucket, expect_region_header) in [
+            ("existing bucket", existing_bucket.as_str(), true),
+            ("missing bucket", missing_bucket.as_str(), false),
+        ] {
+            let response = s3_tests::send_signed_request_with_credentials(
+                "GET",
+                &format!("{}/{}", CTX.endpoint(), bucket),
+                b"",
+                std::iter::empty::<(&str, &str)>(),
+                credentials,
+            );
+            let mut expected = shape().status(400).headers(error_response_headers()).body(
+                expected_error::with_region(
+                    "AuthorizationHeaderMalformed",
+                    &expected_message,
+                    CTX.region(),
+                ),
+            );
+            if expect_region_header {
+                expected = expected.header("x-amz-bucket-region", CTX.region());
+            }
+            assert_shape(
+                &format!("unknown-key wrong-region GetBucket for {label}"),
+                &response,
+                &expected,
+            );
+        }
+
+        cleanup(&existing_bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_missing_account_regional_bucket_wrong_region_returns_header_malformed() {
     s3_tests::run(async {
         let bucket = unique_account_regional_bucket();

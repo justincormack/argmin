@@ -1,0 +1,231 @@
+Unauthenticated wrong-region requests leak bucket existence
+Link: https://chatgpt.com/codex/cloud/security/findings/65c858fb16488191928fb87261a082ac?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 2ffb6d7
+Author: justin@specialbusservice.com
+Created: 14/07/2026, 13:46:59
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+
+Invalid as a new Argmin security finding. This is a duplicate of
+`security/codex-9e22ede`, which already records that AWS deliberately exposes
+bucket existence on anonymous bucket surfaces: an existing private bucket is
+distinguishable from a missing bucket, and Argmin must preserve that behavior
+for S3 compatibility.
+
+The exact combination reported here was additionally validated directly
+against live AWS S3 on 2026-07-15. Two current, syntactically valid header
+SigV4 requests used an unknown access key, a bogus 64-hex signature, and a
+`us-east-1` credential scope against the `eu-central-1` endpoint:
+
+- the existing bucket returned `400 AuthorizationHeaderMalformed` with
+  `x-amz-bucket-region: eu-central-1`
+- the missing bucket returned the same status, code, message, and `<Region>`
+  element, but omitted `x-amz-bucket-region`
+
+AWS therefore checks the wrong credential-scope region before access-key and
+signature validation, then performs the bucket-existence lookup needed to
+decide whether to attach the region header. The reported metadata lookup and
+response distinction are both required for AWS compatibility. They expose no
+bucket-existence information that is not already available through an ordinary
+anonymous HeadBucket or ListObjects request.
+
+The endpoint-neutral
+`test_header_sigv4_unknown_key_wrong_region_bucket_existence_precedence`
+regression now pins this exact existing/missing-bucket cross-product against
+both AWS and Argmin. No implementation change is required.
+
+# Summary
+Introduced. Previously bucket-scoped header requests used DeferredToBucketRouting and wrong-region handling happened after successful credential lookup and signature verification. This commit always authenticates against the endpoint region first and converts the resulting region mismatch into a bucket-aware WrongRegion response before the request has been authenticated.
+A syntactically valid Authorization header with any access key and any 64-hex signature can now trigger InvalidHeaderCredentialRegion before verify_request_record() looks up the access key or verifies the signature. server-http catches that error for any bucket-scoped operation and calls bucket_exists() using the attacker-controlled bucket name. The response then includes x-amz-bucket-region when the bucket exists and omits it when it does not. This creates an unauthenticated bucket-existence oracle and also allows unauthenticated requests to force metadata lookups in the auth error path.
+
+# Validation
+## Rubric
+- [x] Confirm header SigV4 region mismatch is returned before credential lookup/signature verification.
+- [x] Confirm an arbitrary access key and invalid 64-hex signature are sufficient to trigger InvalidHeaderCredentialRegion with an empty credential store.
+- [x] Confirm server-http passes bucket names into authenticate for bucket-scoped operations and calls bucket_exists in the InvalidHeaderCredentialRegion handler before auth succeeds.
+- [x] Confirm WrongRegion responses expose bucket_exists via conditional x-amz-bucket-region response header.
+- [x] Attempt dynamic validation path: direct test/no crash, valgrind unavailable, LLDB debugger trace captured at the vulnerable bucket_exists branch.
+## Report
+Validated the finding. This is a Rust logic/authentication flaw, not a memory-safety crash. Direct cargo test execution produced no crash, valgrind was unavailable, and LLDB was used to trace the vulnerable error path.
+
+Evidence:
+1. In crates/auth/src/request.rs:340-363, header SigV4 timestamp skew is checked, then region mismatch returns AuthError::InvalidHeaderCredentialRegion before the later verify_request_record call that performs credential lookup/signature validation. I added a targeted auth PoC test at crates/auth/src/request.rs:2401-2428 using CredentialStore::new(), access key ATTACKER, and a 64-hex zero signature. Command: cargo test -p auth poc_header_region_mismatch_precedes_missing_key_and_bad_signature -- --nocapture. Result: test ... ok. This confirms wrong-region is returned even with no credential record and a bogus signature.
+2. In crates/server-http/src/http/mod.rs:945-955, bucket-scoped operations pass the parsed bucket name into authenticate. In crates/server-http/src/http/mod.rs:3194-3237, authenticate_request is called with ExactEndpointRegion, and the InvalidHeaderCredentialRegion handler calls self.coordinator.bucket_exists(parse_bucket_name(bucket)?) before returning ServerError::WrongRegion. In crates/server-http/src/http/response.rs:831-847, WrongRegion includes x-amz-bucket-region only when bucket_region_header is true.
+3. I added a server PoC test at crates/server-http/src/http/mod.rs:6757-6799. It creates an existing bucket named existing, does not add any credentials to the frontend, builds one syntactically valid SigV4 request with ATTACKER and a zero signature in wrong region eu-west-1, then probes existing and missing. The test asserts the response for existing has x-amz-bucket-region: us-east-1, while missing has no x-amz-bucket-region. Command: cargo test -p server-http poc_unauth_wrong_region_header_reveals_bucket_existence -- --nocapture. Result: test ... ok.
+4. LLDB trace hit a breakpoint at crates/server-http/src/http/mod.rs:3227, the bucket_exists decision point, twice from the PoC test: once from line 6783 for existing and once from line 6787 for missing. This shows the bucket existence lookup is reached from HttpFrontend::authenticate_with_payload_check during the auth error path, before any successful authentication.
+
+Valgrind attempt: valgrind --version returned bash: command not found. gdb was also unavailable via rust-gdb, but LLDB was present and used successfully.
+
+# Evidence
+crates/auth/src/request.rs (L340 to 363)
+  Note: Header SigV4 now returns InvalidHeaderCredentialRegion before verify_request_record(), so no access-key lookup or signature verification is required to reach the wrong-region error.
+```
+    let request_epoch_secs = selected_timestamp
+        .map(|timestamp| timestamp.value)
+        .and_then(parse_amz_date);
+    if request_epoch_secs.is_some_and(|request_epoch| {
+        now_epoch_secs.abs_diff(request_epoch) > crate::SIGV4_CLOCK_SKEW_SECS
+    }) {
+        return Err(AuthError::RequestExpired);
+    }
+    if let Some(region) = expected_region.exact() {
+        if parsed.credential.region != region {
+            return Err(AuthError::InvalidHeaderCredentialRegion {
+                provided_region: parsed.credential.region.to_string(),
+                expected_region: region.to_string(),
+            });
+        }
+    }
+    if parsed.credential.service != expected_service {
+        return Err(AuthError::MalformedAuth);
+    }
+    let body_hash = match headers.first_value("x-amz-content-sha256") {
+        Some("UNSIGNED-PAYLOAD") => Cow::Borrowed("UNSIGNED-PAYLOAD"),
+        Some(hash) => Cow::Borrowed(hash),
+        None => Cow::Owned(sha256_hex(body)),
+    };
+```
+
+crates/server-http/src/http/mod.rs (L3194 to 3237)
+  Note: The new InvalidHeaderCredentialRegion handler performs bucket_exists() before authentication has succeeded and stores the result in bucket_region_header.
+```
+        let auth_result = authenticate_request(
+            req.method.as_str(),
+            req.path(),
+            req.query_string(),
+            &req.header_source(),
+            &req.body,
+            &self.credentials,
+            auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
+            "s3",
+            now,
+        );
+
+        let auth = match auth_result {
+            Ok(auth) => auth,
+            Err(auth::AuthError::MissingAuth) => AuthContext::anonymous(),
+            // Missing x-amz-date when declared as signed → AccessDenied
+            // AWS: "AWS authentication requires a valid Date or x-amz-date header"
+            Err(auth::AuthError::MissingSignedHeader { header }) if header == "x-amz-date" => {
+                return Err(ServerError::Auth(auth::AuthError::AccessDenied));
+            }
+            Err(auth::AuthError::UnsupportedAuthType) => {
+                if let Some(err) = Self::unsupported_sigv2_error(
+                    req.header("authorization"),
+                    self.coordinator.region(),
+                ) {
+                    return Err(err);
+                }
+                return Err(ServerError::Auth(auth::AuthError::UnsupportedAuthType));
+            }
+            Err(auth::AuthError::InvalidHeaderCredentialRegion {
+                provided_region,
+                expected_region,
+            }) => {
+                let bucket_region_header = if let Some(bucket) = bucket {
+                    self.coordinator
+                        .bucket_exists(&parse_bucket_name(bucket)?)?
+                } else {
+                    false
+                };
+                return Err(ServerError::WrongRegion {
+                    provided_region,
+                    expected_region,
+                    bucket_region_header,
+                });
+```
+
+crates/server-http/src/http/mod.rs (L945 to 959)
+  Note: Every bucket-scoped operation passes the parsed bucket name into authenticate(), causing auth failures to become bucket-aware.
+```
+        let auth_bucket = operation.bucket_name().map(BucketName::as_str);
+        let auth = {
+            observability::trace_scope!(
+                TRACE_TARGET,
+                "HttpFrontend::authenticate",
+                "method={} path={:?}",
+                s3req.method.as_str(),
+                s3req.path()
+            );
+            self.authenticate(s3req, auth_bucket)
+        };
+        let result = match auth {
+            Ok(auth) => {
+                if auth_bucket.is_some() {
+                    if let Err(err) = self.enforce_bucket_region_for_operation(&operation, &auth) {
+```
+
+crates/server-http/src/http/response.rs (L831 to 847)
+  Note: WrongRegion responses conditionally include x-amz-bucket-region based on bucket_region_header, making the bucket_exists() result visible to the unauthenticated client.
+```
+            ServerError::WrongRegion {
+                expected_region,
+                bucket_region_header,
+                ..
+            } => {
+                let body = xml::error_xml_with_region(
+                    "AuthorizationHeaderMalformed",
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                    expected_region,
+                );
+                let mut response = Self::new(400);
+                if *bucket_region_header {
+                    response = response.header("x-amz-bucket-region", expected_region);
+                }
+                response.chunked_xml_body(body)
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Severity remains medium. Evidence shows the issue is real and in-scope: auth/request.rs returns InvalidHeaderCredentialRegion before verify_request_record, server-http passes bucket names into authenticate, the error handler calls bucket_exists pre-auth, and response.rs conditionally emits x-amz-bucket-region. The validation PoC exercised the normal server path with no credentials and distinguished existing from missing buckets. Likelihood is high for any exposed deployment because exploitation is unauthenticated and low-complexity. Impact is capped at bucket-existence disclosure and metadata lookup amplification; there is no demonstrated object data access, authorization bypass for S3 operations, credential leakage, or code execution. Repository artifacts also show the default listener is 127.0.0.1:9000 and no public ingress/LB manifest is present, which prevents rating this higher based solely on assumed internet exposure.
+## Likelihood
+high - The exploit requires only network reachability to the S3-compatible HTTP endpoint and a syntactically valid SigV4 Authorization header with an arbitrary access key and 64-hex signature. The validated PoC confirms no credential record or valid signature is needed. Default binding is loopback, so internet exposure depends on deployment configuration. | Remote network vector
+## Impact
+medium - The proven impact is disclosure of whether a given bucket exists and unauthenticated triggering of bucket metadata lookups. It does not disclose object contents, secrets, credentials, or allow writes/deletes. This is security-relevant reconnaissance and metadata exposure but not a major compromise.
+## Assumptions
+- The argmin-s3 HTTP frontend is reachable by the attacker over the network, either directly or through a reverse proxy.
+- At least one bucket exists and bucket names are not intended to be enumerable by unauthenticated clients.
+- The attacker can send syntactically valid AWS SigV4 Authorization headers with an arbitrary access key, current timestamp, 64-hex signature, and a region that differs from ARGMIN_REGION.
+- argmin-s3 frontend role is running
+- HTTP listener is reachable from attacker
+- target operation is bucket-scoped
+- attacker supplies a syntactically valid SigV4 header with wrong region
+## Path
+Unauth client
+  -> argmin-s3 listener
+  -> bucket-scoped route
+  -> SigV4 wrong-region check before verify_request_record
+  -> InvalidHeaderCredentialRegion handler
+  -> bucket_exists(attacker bucket)
+  -> x-amz-bucket-region present only for existing bucket
+## Path evidence
+- `crates/auth/src/request.rs:348-364` - Header SigV4 region mismatch returns AuthError::InvalidHeaderCredentialRegion before verify_request_record performs credential lookup and signature verification.
+- `crates/server-http/src/http/mod.rs:945-954` - The routed bucket name from any bucket-scoped operation is passed into authenticate, making authentication errors bucket-aware.
+- `crates/server-http/src/http/mod.rs:3194-3237` - authenticate_request is called with ExactEndpointRegion, and InvalidHeaderCredentialRegion triggers coordinator.bucket_exists(parse_bucket_name(bucket)) before successful authentication.
+- `crates/server-http/src/http/response.rs:831-847` - WrongRegion responses conditionally include x-amz-bucket-region based on bucket_region_header, exposing the bucket_exists result to the client.
+- `crates/argmin-s3/src/main.rs:5308-5385` - The main product binary binds ARGMIN_LISTEN_ADDR and starts server_http::http::serve or serve_tls with the configured frontends.
+- `crates/argmin-s3/src/config.rs:404-431` - Runtime secrets and listener are environment-configured; ARGMIN_LISTEN_ADDR defaults to 127.0.0.1:9000 but is operator-configurable.
+- `crates/server-http/src/http/serve.rs:498-508` - HTTP serving path has connection/request admission controls and timeouts, but these are availability controls and do not prevent the information leak.
+## Narrative
+This is a real, reachable security issue in the main HTTP product path. The auth crate returns InvalidHeaderCredentialRegion at request.rs:348-354 before verify_request_record at line 364 can look up the access key or validate the signature. server-http passes attacker-controlled bucket names from routed bucket-scoped operations into authenticate at mod.rs:945-954. In the InvalidHeaderCredentialRegion arm, mod.rs:3223-3237 calls coordinator.bucket_exists() before authentication has succeeded and stores that boolean in WrongRegion. response.rs:843-847 then makes the boolean observable by adding x-amz-bucket-region only when the bucket exists. The validated PoC used an empty credential store, arbitrary access key, and bogus 64-hex signature to distinguish existing from missing buckets. The assigned medium severity is appropriate: exploitation is unauthenticated and simple when the listener is exposed, but the demonstrated impact is limited to bucket metadata disclosure and unauthenticated metadata lookup, not object read/write/delete, credential disclosure, or code execution.
+## Controls
+- SigV4 authentication is intended to protect bucket/object operations, but this path returns a region error before credential lookup/signature verification.
+- Default ARGMIN_LISTEN_ADDR is 127.0.0.1:9000, reducing exposure only for default local deployments.
+- Direct TLS is supported when ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH are configured.
+- Connection and in-flight request semaphores plus idle timeouts exist in the serve layer.
+- Process startup rejects running as root.
+## Blindspots
+- Static-only review did not inspect live deployment, reverse proxy, firewall, DNS, or cloud load balancer configuration.
+- No Kubernetes, Terraform, or compose ingress artifact was found, so public exposure cannot be proven from the repository.
+- The exact cost of coordinator.bucket_exists depends on storage state and runtime deployment; static review only confirms the unauthenticated lookup is reached.
+- AWS compatibility requirements for wrong-region responses may constrain remediation choices.
