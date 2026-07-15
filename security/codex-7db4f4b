@@ -1,0 +1,227 @@
+S3 Control oracle endpoint lacks HTTPS validation
+Link: https://chatgpt.com/codex/cloud/security/findings/7752ed2cbc0c819198b501183377c82d?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 7db4f4b
+Author: justin@specialbusservice.com
+Created: 15/07/2026, 16:08:45
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+
+Fixed. The finding is valid even though it affects an explicitly invoked AWS
+oracle rather than the production server. The oracle carries real AWS test
+credentials, so a caller-supplied plaintext endpoint must be rejected rather
+than treated as a supported custom endpoint.
+
+Fix commit: [`811b808f`](https://github.com/justincormack/argmin/commit/811b808f981c3293d75291377733910606199703)
+(`tests: require TLS for STS oracle endpoints`).
+
+The Rust oracle now parses and requires HTTPS URLs for both
+`S3_TEST_STS_ENDPOINT` and `S3_TEST_S3_CONTROL_ENDPOINT` before reading the
+credential variables into its signer. The shell wrapper independently rejects
+plain-HTTP overrides before exporting the oracle credential variables. Unit
+coverage rejects HTTP for each endpoint family, and direct wrapper checks prove
+both command-line overrides fail before any request is made.
+
+The STS/IAM plan now follows the documented AWS endpoint contract: ordinary S3
+may use HTTP or HTTPS, while S3 Control and STS require TLS. The current narrow
+local `TagResource`/`UntagResource` routes still inherit the S3 listener's
+transport and are explicitly recorded as a temporary compatibility gap to be
+removed by the typed service-routing work; no unpinned operation-level HTTP
+error was added as a shortcut.
+
+Verification:
+
+- `cargo nextest run -p s3-tests --bin sts_oracle --lib`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `shellcheck -x scripts/aws-sts-oracle`
+- read-only `./scripts/aws-sts-oracle`
+- plaintext STS and S3 Control override rejection checks
+
+# Summary
+Introduced: the commit added use of S3_TEST_S3_CONTROL_ENDPOINT for signed S3 Control probes but did not add the same HTTPS validation already present for S3_TEST_STS_ENDPOINT.
+This commit adds S3 Control probes to the AWS STS oracle. The existing STS endpoint is explicitly required to start with https:// before primary AWS credentials are used, but the newly introduced S3 Control endpoint is read from the environment and used directly. The wrapper script also accepts and exports --s3-control-endpoint without validating the scheme. Because the probe helper constructs an Authorization header containing the AWS access key ID, signed headers, and SigV4 signature, a misconfigured or attacker-influenced http:// S3 Control endpoint would cause those signed requests to be sent over plaintext. This does not expose the AWS secret key, and the default endpoint is HTTPS, but it can disclose credential metadata and replayable signed requests to a network observer during the SigV4 validity window. This affects an explicitly invoked external test/oracle utility, not the production Argmin S3 server.
+
+# Validation
+## Rubric
+- [x] Confirm the wrapper accepts or derives `S3_TEST_S3_CONTROL_ENDPOINT` without an HTTPS scheme check.
+- [x] Confirm `sts_oracle` validates `S3_TEST_STS_ENDPOINT` but lacks equivalent validation for `S3_TEST_S3_CONTROL_ENDPOINT`.
+- [x] Confirm the S3 Control probes use the unvalidated endpoint in signed POST requests.
+- [x] Confirm the shared helper places access-key/signature material in the Authorization header and sends it to the supplied URL.
+- [x] Dynamically reproduce against the real binary by capturing a SigV4 Authorization header on a plaintext HTTP S3 Control endpoint.
+## Report
+Validated the finding. I built the real Rust target with `cargo build -p s3-tests --bin sts_oracle` and exercised the actual `target/debug/sts_oracle` binary. Code review of the touched paths shows an asymmetric scheme check: `crates/s3-tests/src/bin/sts_oracle.rs:6747-6751` asserts `S3_TEST_STS_ENDPOINT` starts with `https://`, but `crates/s3-tests/src/bin/sts_oracle.rs:6762-6763` reads `S3_TEST_S3_CONTROL_ENDPOINT` and immediately passes it to `run_cross_service_routing_probes` without an HTTPS assertion. The wrapper similarly accepts/exports `s3_control_endpoint` at `scripts/aws-sts-oracle:103-114` without scheme validation. The probes send POSTs to `format!("{s3_control_endpoint}/")` and related paths at `sts_oracle.rs:6636-6645`, `6678-6687`, and `6724-6733`. The helper constructs a SigV4 Authorization header containing the access key ID and signature at `crates/s3-tests/src/helpers.rs:1901-1904`, then sends it on the provided URL at `helpers.rs:1968-1984`.
+
+Crash attempt: running the binary with `S3_TEST_STS_ENDPOINT=http://127.0.0.1` immediately panicked at `sts_oracle.rs:6748` with `S3_TEST_STS_ENDPOINT must be an HTTPS AWS STS endpoint`, confirming the pre-existing STS guard. Valgrind attempt: valgrind was not installed in the container. Debugger attempt: lldb was available; I set `S3_TEST_S3_CONTROL_ENDPOINT=http://127.0.0.1:9999` and broke at `sts_oracle.rs:6763`, proving execution reaches the call to `run_cross_service_routing_probes(&endpoint, &s3_control_endpoint, ...)` after reading the HTTP S3 Control endpoint.
+
+Dynamic reproduction: I created `poc_capture_sts_oracle_http_s3_control.py`, which starts a local HTTPS STS shim and a plaintext HTTP S3 Control shim, then runs the real `sts_oracle` with fake credentials. Output included `routing-sts-query-root: ok` and `routing-s3-control-query-root: ok`, then captured the S3 Control request over HTTP. The capture shows `authorization: AWS4-HMAC-SHA256 Credential=LEAKTESTACCESSKEY/20260715/us-east-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-account-id;x-amz-content-sha256;x-amz-date, Signature=f51670e147d7ac9d2940b4f2fe4eab152a28b8a6b0ff1263c5c1c7b86b88c698` with body `Action=GetCallerIdentity&Version=2011-06-15`. The process later panics only because the minimal STS shim intentionally returns a success response for a later STS error case; the vulnerable plaintext S3 Control signed request had already been captured.
+
+# Evidence
+crates/s3-tests/src/bin/sts_oracle.rs (L6636 to 6645)
+  Note: A SigV4-signed S3 Control request is sent to the unvalidated S3 Control endpoint.
+```
+    let s3_control_query_root = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{s3_control_endpoint}/"),
+        query_body,
+        [
+            ("content-type", QUERY_CONTENT_TYPE),
+            ("x-amz-account-id", account_id),
+        ],
+        "s3",
+        credentials,
+```
+
+crates/s3-tests/src/bin/sts_oracle.rs (L6678 to 6687)
+  Note: Another SigV4-signed S3 Control request is sent to the unvalidated endpoint.
+```
+    let s3_control_query_tags_path = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{s3_control_endpoint}{tags_path}"),
+        query_body,
+        [
+            ("content-type", QUERY_CONTENT_TYPE),
+            ("x-amz-account-id", account_id),
+        ],
+        "s3",
+        credentials,
+```
+
+crates/s3-tests/src/bin/sts_oracle.rs (L6724 to 6733)
+  Note: The TagResource-shaped S3 Control probe is also sent to the unvalidated endpoint.
+```
+    let s3_control_tags_path_query_action = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{s3_control_endpoint}{tags_path_with_query}"),
+        tag_body,
+        [
+            ("content-type", "application/xml"),
+            ("x-amz-account-id", account_id),
+        ],
+        "s3",
+        credentials,
+```
+
+crates/s3-tests/src/bin/sts_oracle.rs (L6746 to 6763)
+  Note: The STS endpoint is validated as HTTPS, but the newly added S3 Control endpoint is read and used without an equivalent HTTPS assertion.
+```
+fn main() {
+    let endpoint = required_env("S3_TEST_STS_ENDPOINT");
+    assert!(
+        endpoint.starts_with("https://"),
+        "S3_TEST_STS_ENDPOINT must be an HTTPS AWS STS endpoint"
+    );
+    let access_key = required_env("S3_TEST_ACCESS_KEY");
+    let secret_key = required_env("S3_TEST_SECRET_KEY");
+    let account_id = required_env("S3_TEST_ACCOUNT_ID");
+    let region = required_env("S3_TEST_REGION");
+    let credentials = SignedRequestCredentials {
+        access_key: &access_key,
+        secret_key: &secret_key,
+        region: &region,
+        tls_ca_pem: None,
+    };
+    let s3_control_endpoint = required_env("S3_TEST_S3_CONTROL_ENDPOINT");
+    run_cross_service_routing_probes(&endpoint, &s3_control_endpoint, credentials, &account_id);
+```
+
+crates/s3-tests/src/helpers.rs (L1901 to 1904)
+  Note: The helper builds an AWS SigV4 Authorization header containing the access key ID and signature.
+```
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+        credentials.access_key
+    );
+```
+
+crates/s3-tests/src/helpers.rs (L1968 to 1984)
+  Note: For POST/PUT requests, the Authorization header and signed body are sent to the provided URL.
+```
+            .header("Authorization", &authorization)
+            .header("x-amz-date", &amz_date)
+            .header("Host", &host_header)
+            .header("x-amz-content-sha256", &payload_hash);
+            for (name, value) in &request_headers {
+                if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
+                    continue;
+                }
+                request = request.header(name, value);
+            }
+            for (name, value) in &unsigned_headers {
+                request = request.header(name, value);
+            }
+            if allow_response_body_error {
+                request.send_allow_response_body_error(body)
+            } else {
+                request.send(body)
+```
+
+scripts/aws-sts-oracle (L103 to 114)
+  Note: The script derives or accepts the S3 Control endpoint and exports it without checking that it uses HTTPS.
+```
+region="${region:-${TEST_S3_REGION:-us-east-1}}"
+endpoint="${endpoint:-https://sts.${region}.amazonaws.com}"
+endpoint="${endpoint%/}"
+s3_control_endpoint="${s3_control_endpoint:-${TEST_AWS_S3_CONTROL_ENDPOINT:-https://${TEST_AWS_PRIMARY_ACCOUNT_ID}.s3-control.${region}.amazonaws.com}}"
+s3_control_endpoint="${s3_control_endpoint%/}"
+
+export S3_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY"
+export S3_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
+export S3_TEST_ACCOUNT_ID="$TEST_AWS_PRIMARY_ACCOUNT_ID"
+export S3_TEST_REGION="$region"
+export S3_TEST_STS_ENDPOINT="$endpoint"
+export S3_TEST_S3_CONTROL_ENDPOINT="$s3_control_endpoint"
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The underlying code issue is real and was validated: S3_TEST_S3_CONTROL_ENDPOINT lacks the HTTPS assertion present for S3_TEST_STS_ENDPOINT, and signed S3 Control probes are sent through a helper that includes SigV4 Authorization metadata. Nonetheless, the affected files are scripts/aws-sts-oracle and crates/s3-tests/src/bin/sts_oracle.rs, a developer/test oracle invoked manually via cargo run -p s3-tests --bin sts_oracle, not the production argmin-s3 server or its HTTP attack surface. The project threat model explicitly treats test utilities as outside the production runtime. Preconditions are also restrictive: a developer/CI job must supply real AWS test credentials and choose or be influenced into using an HTTP S3 Control endpoint, while the repository default is HTTPS. Therefore, for product attack-path triage this should be ignored as out of scope; if scoped to developer tooling alone, the severity would remain low due to limited confidentiality impact and high preconditions.
+## Likelihood
+low - Exploitation requires explicit use of a developer-only oracle with real AWS test credentials and a non-default insecure endpoint or attacker-influenced environment/argument. The default endpoint is HTTPS and the production HTTP service does not expose this path.
+## Impact
+low - A plaintext S3 Control endpoint can observe access key ID, account ID header, signed headers, timestamp, signature, and fixed request body, but not the AWS secret key. Replay value is limited to the signed request and validity window. No Argmin object data, production server credentials, or in-scope runtime authorization boundary is exposed by the production application.
+## Assumptions
+- Analysis is limited to repository artifacts in /workspace/argmin; no cloud APIs were called.
+- The affected code is the s3-tests AWS STS oracle utility and wrapper script, not the argmin-s3 production server binary.
+- Impact requires the utility to be run with real AWS test credentials and a non-default plaintext or attacker-observable S3 Control endpoint.
+- A developer or CI job invokes scripts/aws-sts-oracle or cargo run -p s3-tests --bin sts_oracle.
+- Real AWS test credentials are provided through TEST_AWS_PRIMARY_ACCESS_KEY/TEST_AWS_PRIMARY_SECRET_KEY or the derived S3_TEST_* environment variables.
+- S3_TEST_S3_CONTROL_ENDPOINT, TEST_AWS_S3_CONTROL_ENDPOINT, or --s3-control-endpoint is set to an http:// endpoint, or otherwise points at an attacker-observable plaintext network path.
+- An attacker controls the endpoint or can observe the plaintext network traffic during the SigV4 validity window.
+## Path
+Developer/CI + AWS test creds
+  -> scripts/aws-sts-oracle --s3-control-endpoint http://...
+  -> S3_TEST_S3_CONTROL_ENDPOINT exported unchecked
+  -> sts_oracle validates STS HTTPS only
+  -> signed S3 Control POSTs over HTTP
+  -> observer captures access key ID + SigV4 signature/request
+## Path evidence
+- `scripts/aws-sts-oracle:71-75` - The wrapper accepts --s3-control-endpoint and assigns it directly to s3_control_endpoint without validating that it is HTTPS.
+- `scripts/aws-sts-oracle:103-114` - The wrapper derives the default S3 Control endpoint as HTTPS but exports the supplied or environment-provided value as S3_TEST_S3_CONTROL_ENDPOINT without a scheme check.
+- `scripts/aws-sts-oracle:1756-1758` - The script invokes the s3-tests sts_oracle binary with the exported endpoint and credentials.
+- `crates/s3-tests/src/bin/sts_oracle.rs:6746-6763` - main asserts S3_TEST_STS_ENDPOINT starts with https:// but reads S3_TEST_S3_CONTROL_ENDPOINT and immediately passes it to run_cross_service_routing_probes without an equivalent HTTPS check.
+- `crates/s3-tests/src/bin/sts_oracle.rs:6636-6645` - A SigV4-signed S3 Control POST is sent to format!("{s3_control_endpoint}/"), using the unvalidated endpoint.
+- `crates/s3-tests/src/bin/sts_oracle.rs:6678-6688` - A second S3 Control probe sends a signed POST to the unvalidated endpoint plus a tags path.
+- `crates/s3-tests/src/bin/sts_oracle.rs:6724-6733` - A third S3 Control probe sends a signed POST to the unvalidated endpoint and query action path.
+- `crates/s3-tests/src/helpers.rs:1901-1904` - The helper builds an AWS SigV4 Authorization header containing the access key ID and signature.
+- `crates/s3-tests/src/helpers.rs:1968-1984` - The helper attaches the Authorization header and sends the POST/PUT request to the provided URL.
+- `crates/s3-tests/Cargo.toml:1-5` - The affected Rust package is named s3-tests and is marked publish = false, supporting developer/test utility scope rather than production service scope.
+## Narrative
+The reported behavior is supported by the code: the wrapper accepts and exports an S3 Control endpoint without validating the scheme, while sts_oracle validates only the STS endpoint as HTTPS. The S3 Control probes then pass the unvalidated endpoint into a helper that constructs and sends SigV4 Authorization headers. This can disclose access key ID/signature metadata over plaintext if the developer/CI oracle is run with an HTTP endpoint. However, this is not part of the production argmin-s3 server surface; it is a publish=false test/oracle utility requiring explicit invocation and misconfiguration or attacker influence over developer/CI configuration. The correct product-scoped disposition is therefore ignore, while the utility-level bug itself would be low severity.
+## Controls
+- S3_TEST_STS_ENDPOINT has an explicit https:// assertion in sts_oracle.
+- The default S3 Control endpoint constructed by scripts/aws-sts-oracle uses https://.
+- The vulnerable path requires explicit developer/CI invocation of scripts/aws-sts-oracle or the sts_oracle test binary.
+- AWS secret key is used for signing but is not transmitted in the Authorization header.
+- SigV4 signatures are time-scoped and request-specific, limiting replay value.
+## Blindspots
+- No cloud APIs were called, so the actual privileges of referenced AWS test credentials could not be verified.
+- No deployment manifests or CI workflow were identified in the sampled repository artifacts that automatically run this oracle with real credentials.
+- Static analysis cannot prove whether downstream users include crates/s3-tests in release artifacts, but repository naming, publish=false, and threat model context indicate test-only usage.
+- Potential attacker control over developer/CI environment variables is deployment-specific and not evidenced in repository artifacts.
