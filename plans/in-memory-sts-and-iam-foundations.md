@@ -1759,6 +1759,37 @@ count on any failure, before treating a positive target as converged. A single
 successful response is not sufficient evidence that distributed STS caches
 have converged.
 
+The first cross-service routing-boundary slice completed on 2026-07-15. The
+read-only default oracle now sends the same method, request target, body,
+content type, and account-ID header to the regional STS and account-specific
+regional S3 Control endpoint families, changing only the authority and normal
+SigV4 service scope required by each endpoint. It uses a unique nonexistent
+`claude-s3-*` resource ARN, so the probes cannot mutate bucket tags. Complete
+response goldens establish this initial `SharedRegional` table:
+
+| Request shape | `AwsRegionalSts` | `AwsRegionalS3Control` | Local `SharedRegional` selection |
+| --- | --- | --- | --- |
+| `POST /`, Query-form `GetCallerIdentity`, with `x-amz-account-id` | `200 GetCallerIdentity` success; the extra account header is ignored | `400 InvalidURI`, with `/` in the nested S3 Control error | STS |
+| `POST /v20180820/tags/<arn>`, Query-form `GetCallerIdentity` in the body | `403 SignatureDoesNotMatch` in the STS error namespace | `403 SignatureDoesNotMatch` in the nested S3 Control error shape | S3 Control |
+| `POST /v20180820/tags/<arn>?Action=GetCallerIdentity&Version=2011-06-15`, valid TagResource XML body | `403 SignatureDoesNotMatch` in the STS error namespace | authenticated `404 NoSuchResource`; the STS query does not divert the request | S3 Control |
+
+For the S3 Control form-body collision, AWS reports a canonical request whose
+canonical-query line contains the form `Action` and `Version` even though the
+wire URI has no query. The exact golden independently reconstructs and checks
+that canonical request, its hash and byte encoding, the string to sign and its
+byte encoding, and sanitizes the access key before any full-shape comparison.
+This pins the surprising signature failure rather than treating it as an
+ordinary bad-signature response. On the STS endpoint, signing either non-root
+tags request target normally also produces `SignatureDoesNotMatch`; the exact
+STS error shape is distinct from S3 Control's nested error envelope.
+
+The local table deliberately gives the reserved versioned tags path precedence
+over form content type and STS `Action`/`Version`, while an unambiguous root
+Query request selects STS. This is only the first bounded collision subset.
+The remaining methods, path/percent/ARN near misses, account-ID variants,
+signing-service collisions, malformed operation bodies, and local Host/SNI
+trust-boundary cases remain required before the Phase 4 service refactor.
+
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations
 have been transferred into implementation-facing conformance tests and the
@@ -2030,9 +2061,10 @@ confidentiality. No session response or request body may appear in traces.
    Control versioned path collides with method/path decoding, account-ID and ARN
    validation, authentication, and STS Query classification on both the AWS STS
    and S3 Control endpoint kinds? The routing-boundary matrix and explicit
-   `SharedRegional` mapping above must answer this, and the local authority/SNI
-   matrix must enforce the endpoint-kind trust boundary, before the typed
-   service refactor.
+   `SharedRegional` mapping above have pinned the initial root-Query and
+   versioned-path/form/query collision rows. The remaining bounded rows must be
+   completed, and the local authority/SNI matrix must enforce the endpoint-kind
+   trust boundary, before the typed service refactor.
 
 ## Definition Of The First Usable Milestone
 

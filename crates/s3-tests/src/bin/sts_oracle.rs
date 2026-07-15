@@ -28,6 +28,7 @@ const AWS_FAULT_XMLNS: &str = "http://webservices.amazon.com/AWSFault/2005-15-09
 const STS_WRONG_REGION_SCOPE_MESSAGE: &str = "Credential should be scoped to a valid region. ";
 const STS_WRONG_SERVICE_SCOPE_MESSAGE: &str =
     "Credential should be scoped to correct service: 'sts'. ";
+const STS_SIGNATURE_MISMATCH_MESSAGE: &str = "The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method. Consult the service documentation for details.";
 const STS_WRONG_REGION_AND_SERVICE_SCOPE_MESSAGE: &str = concat!(
     "Credential should be scoped to a valid region. ",
     "Credential should be scoped to correct service: 'sts'. "
@@ -6447,6 +6448,301 @@ fn run_cross_account_probes(
     println!("assume-role-cross-account-success: ok");
 }
 
+fn assert_s3_control_error(
+    label: &str,
+    response: &RawResponse,
+    status: u16,
+    code: &str,
+    message: &str,
+    uri: Option<&str>,
+) {
+    let uri = uri
+        .map(|value| format!("<URI>{value}</URI>"))
+        .unwrap_or_default();
+    assert_shape(
+        label,
+        response,
+        &shape()
+            .status(status)
+            .headers(error_response_headers())
+            .sub("code", code)
+            .sub("message", message)
+            .sub("uri", uri)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <ErrorResponse><Error><Code>{code}</Code><Message>{message}</Message>{uri}</Error>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></ErrorResponse>",
+            ),
+    );
+}
+
+struct S3ControlCanonicalRequest<'a> {
+    endpoint: &'a str,
+    path: &'a str,
+    body: &'a [u8],
+    content_type: &'a str,
+    account_id: &'a str,
+}
+
+fn assert_s3_control_signature_mismatch(
+    label: &str,
+    response: &RawResponse,
+    request: S3ControlCanonicalRequest<'_>,
+    credentials: SignedRequestCredentials<'_>,
+) {
+    assert!(
+        required_xml_text(response, "AWSAccessKeyId", label) == credentials.access_key,
+        "{label}: S3 Control did not echo the signing access key"
+    );
+    let string_to_sign = required_xml_text(response, "StringToSign", label);
+    let string_to_sign_bytes = required_xml_text(response, "StringToSignBytes", label);
+    assert!(
+        string_to_sign_bytes == spaced_hex(&string_to_sign),
+        "{label}: StringToSignBytes does not encode StringToSign"
+    );
+    let mut string_to_sign_lines = string_to_sign.lines();
+    assert!(
+        string_to_sign_lines.next() == Some("AWS4-HMAC-SHA256"),
+        "{label}: unexpected signing algorithm"
+    );
+    let amz_date = string_to_sign_lines
+        .next()
+        .unwrap_or_else(|| panic!("{label}: missing signing timestamp"));
+    let amz_date_bytes = amz_date.as_bytes();
+    assert!(
+        amz_date.len() == 16
+            && amz_date_bytes[8] == b'T'
+            && amz_date_bytes[15] == b'Z'
+            && amz_date_bytes[..8].iter().all(|byte| byte.is_ascii_digit())
+            && amz_date_bytes[9..15]
+                .iter()
+                .all(|byte| byte.is_ascii_digit()),
+        "{label}: malformed signing timestamp"
+    );
+    let scope = format!("{}/{}/s3/aws4_request", &amz_date[..8], credentials.region);
+    assert!(
+        string_to_sign_lines.next() == Some(scope.as_str()),
+        "{label}: unexpected S3 Control credential scope"
+    );
+    let canonical_request_hash = string_to_sign_lines
+        .next()
+        .unwrap_or_else(|| panic!("{label}: missing canonical request hash"));
+    assert!(
+        string_to_sign_lines.next().is_none(),
+        "{label}: unexpected extra StringToSign line"
+    );
+
+    let parsed_endpoint = url::Url::parse(request.endpoint)
+        .unwrap_or_else(|error| panic!("{label}: invalid S3 Control endpoint: {error}"));
+    let host = parsed_endpoint
+        .host_str()
+        .unwrap_or_else(|| panic!("{label}: S3 Control endpoint has no host"));
+    let payload_hash = auth::canonical::sha256_hex(request.body);
+    let canonical_query = std::str::from_utf8(request.body)
+        .unwrap_or_else(|error| panic!("{label}: form body is not UTF-8: {error}"));
+    let S3ControlCanonicalRequest {
+        path,
+        content_type,
+        account_id,
+        ..
+    } = request;
+    let canonical_request = format!(
+        "POST\n{path}\n{canonical_query}\ncontent-type:{content_type}\nhost:{host}\n\
+         x-amz-account-id:{account_id}\nx-amz-content-sha256:{payload_hash}\n\
+         x-amz-date:{amz_date}\n\ncontent-type;host;x-amz-account-id;\
+         x-amz-content-sha256;x-amz-date\n{payload_hash}"
+    );
+    let observed_canonical_request = required_xml_text(response, "CanonicalRequest", label);
+    let canonical_request_xml = canonical_request.replace('&', "&amp;");
+    assert!(
+        observed_canonical_request == canonical_request_xml,
+        "{label}: unexpected canonical request\nexpected: {canonical_request_xml:?}\nobserved: {observed_canonical_request:?}"
+    );
+    let canonical_request_bytes = spaced_hex(&canonical_request);
+    assert!(
+        required_xml_text(response, "CanonicalRequestBytes", label) == canonical_request_bytes,
+        "{label}: CanonicalRequestBytes does not encode CanonicalRequest"
+    );
+    assert!(
+        canonical_request_hash == auth::canonical::sha256_hex(canonical_request.as_bytes()),
+        "{label}: StringToSign has the wrong canonical request hash"
+    );
+    let signature = required_xml_text(response, "SignatureProvided", label);
+    assert!(
+        signature.len() == 64
+            && signature
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{label}: malformed provided signature"
+    );
+
+    let response = s3_response_with_sanitized_body(response, credentials.access_key, &[]);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("string_to_sign", string_to_sign)
+            .sub("signature", signature)
+            .sub("string_to_sign_bytes", string_to_sign_bytes)
+            .sub("canonical_request", canonical_request_xml)
+            .sub("canonical_request_bytes", canonical_request_bytes)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <ErrorResponse><Error><Code>SignatureDoesNotMatch</Code>\
+                 <Message>The request signature we calculated does not match the signature you provided. Check your key and signing method.</Message>\
+                 <AWSAccessKeyId>SESSION_ACCESS_KEY</AWSAccessKeyId>\
+                 <StringToSign>{string_to_sign}</StringToSign>\
+                 <SignatureProvided>{signature}</SignatureProvided>\
+                 <StringToSignBytes>{string_to_sign_bytes}</StringToSignBytes>\
+                 <CanonicalRequest>{canonical_request}</CanonicalRequest>\
+                 <CanonicalRequestBytes>{canonical_request_bytes}</CanonicalRequestBytes>\
+                 </Error><RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></ErrorResponse>",
+            ),
+    );
+}
+
+fn run_cross_service_routing_probes(
+    sts_endpoint: &str,
+    s3_control_endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    account_id: &str,
+) {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("current time must be after the Unix epoch")
+        .as_nanos();
+    let resource = format!("arn%3Aaws%3As3%3A%3A%3Aclaude-s3-sts-routing-{unique:x}");
+    let tags_path = format!("/v20180820/tags/{resource}");
+    let tags_path_with_query = format!("{tags_path}?Action=GetCallerIdentity&Version=2011-06-15");
+    let query_body = b"Action=GetCallerIdentity&Version=2011-06-15";
+    let tag_body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags><Tag><Key>routing</Key><Value>probe</Value></Tag></Tags></TagResourceRequest>";
+
+    let sts_query_root = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{sts_endpoint}/"),
+        query_body,
+        [
+            ("content-type", QUERY_CONTENT_TYPE),
+            ("x-amz-account-id", account_id),
+        ],
+        "sts",
+        credentials,
+    );
+    assert_get_caller_identity_success("routing-sts-query-root", &sts_query_root, account_id);
+    println!("routing-sts-query-root: ok");
+
+    let s3_control_query_root = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{s3_control_endpoint}/"),
+        query_body,
+        [
+            ("content-type", QUERY_CONTENT_TYPE),
+            ("x-amz-account-id", account_id),
+        ],
+        "s3",
+        credentials,
+    );
+    assert_s3_control_error(
+        "routing-s3-control-query-root",
+        &s3_control_query_root,
+        400,
+        "InvalidURI",
+        "Couldn't parse the specified URI.",
+        Some("/"),
+    );
+    println!("routing-s3-control-query-root: ok");
+
+    let sts_query_tags_path = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{sts_endpoint}{tags_path}"),
+        query_body,
+        [
+            ("content-type", QUERY_CONTENT_TYPE),
+            ("x-amz-account-id", account_id),
+        ],
+        "sts",
+        credentials,
+    );
+    assert_error_probe(
+        "routing-sts-query-tags-path",
+        &sts_query_tags_path,
+        403,
+        STS_XMLNS,
+        "SignatureDoesNotMatch",
+        Some(STS_SIGNATURE_MISMATCH_MESSAGE),
+    );
+    println!("routing-sts-query-tags-path: ok");
+
+    let s3_control_query_tags_path = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{s3_control_endpoint}{tags_path}"),
+        query_body,
+        [
+            ("content-type", QUERY_CONTENT_TYPE),
+            ("x-amz-account-id", account_id),
+        ],
+        "s3",
+        credentials,
+    );
+    assert_s3_control_signature_mismatch(
+        "routing-s3-control-query-tags-path",
+        &s3_control_query_tags_path,
+        S3ControlCanonicalRequest {
+            endpoint: s3_control_endpoint,
+            path: &tags_path,
+            body: query_body,
+            content_type: QUERY_CONTENT_TYPE,
+            account_id,
+        },
+        credentials,
+    );
+    println!("routing-s3-control-query-tags-path: ok");
+
+    let sts_tags_path_query_action = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{sts_endpoint}{tags_path_with_query}"),
+        tag_body,
+        [
+            ("content-type", "application/xml"),
+            ("x-amz-account-id", account_id),
+        ],
+        "sts",
+        credentials,
+    );
+    assert_error_probe(
+        "routing-sts-tags-path-query-action",
+        &sts_tags_path_query_action,
+        403,
+        STS_XMLNS,
+        "SignatureDoesNotMatch",
+        Some(STS_SIGNATURE_MISMATCH_MESSAGE),
+    );
+    println!("routing-sts-tags-path-query-action: ok");
+
+    let s3_control_tags_path_query_action = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{s3_control_endpoint}{tags_path_with_query}"),
+        tag_body,
+        [
+            ("content-type", "application/xml"),
+            ("x-amz-account-id", account_id),
+        ],
+        "s3",
+        credentials,
+    );
+    assert_s3_control_error(
+        "routing-s3-control-tags-path-query-action",
+        &s3_control_tags_path_query_action,
+        404,
+        "NoSuchResource",
+        "The specified resource doesn't exist.",
+        None,
+    );
+    println!("routing-s3-control-tags-path-query-action: ok");
+}
+
 fn main() {
     let endpoint = required_env("S3_TEST_STS_ENDPOINT");
     assert!(
@@ -6463,6 +6759,8 @@ fn main() {
         region: &region,
         tls_ca_pem: None,
     };
+    let s3_control_endpoint = required_env("S3_TEST_S3_CONTROL_ENDPOINT");
+    run_cross_service_routing_probes(&endpoint, &s3_control_endpoint, credentials, &account_id);
 
     let probes = [
         Probe {
