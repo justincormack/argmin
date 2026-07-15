@@ -403,7 +403,7 @@ fn low_level_put_object_stream_create_uses_durable_bucket_reservation() {
 }
 
 #[test]
-fn low_level_put_object_stream_create_keeps_reservation_until_pending_converges() {
+fn partially_applied_stream_create_converges_after_bucket_reservation_expires() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -464,6 +464,16 @@ fn low_level_put_object_stream_create_keeps_reservation_until_pending_converges(
     let reservations =
         crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket).unwrap();
     assert_eq!(reservations.len(), 1);
+    primary_pg
+        .connection()
+        .execute(
+            "UPDATE bucket_write_reservations SET lease_deadline = ?1 WHERE reservation_id = ?2",
+            rusqlite::params![
+                crate::clock::current_time_millis().saturating_sub(1),
+                &reservations[0].reservation_id,
+            ],
+        )
+        .unwrap();
     let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
     drop(primary_pg);
 
@@ -487,13 +497,115 @@ fn low_level_put_object_stream_create_keeps_reservation_until_pending_converges(
         crate::PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket).unwrap();
     assert_eq!(reservations.len(), 1);
     let upload = crate::PgMetadataStore::get_stream_upload(&*primary_pg, &session_id).unwrap();
-    assert_eq!(
-        upload.bucket_write_reservation.as_ref(),
-        Some(&crate::metadata_command::BucketWriteReservationProof::from(
-            &reservations[0]
-        ))
+    assert!(
+        upload
+            .bucket_write_reservation
+            .as_ref()
+            .is_some_and(|proof| proof.matches_record(&reservations[0])),
+        "the converged stream upload must retain the admitted reservation identity"
     );
     let _ = crate::PgMetadataStore::head_bucket_raw(&*primary_pg, &bucket).unwrap();
+    let expected_state = primary_pg.metadata_command_replica_state().unwrap();
+    drop(primary_pg);
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert_eq!(
+            pg.metadata_command_replica_state().unwrap(),
+            expected_state,
+            "node {node_id:?} did not converge the admitted command"
+        );
+        assert!(crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).is_ok());
+    }
+}
+
+#[test]
+fn unapplied_object_command_is_abandoned_after_bucket_reservation_expires() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "expired-unapplied-command-");
+    let key = key_for_object_pg(topology, &bucket, 1, "key-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+    let pg_id = PgId::new(1);
+    let version_id = cluster
+        .reserve_next_object_version(pg_id, &bucket, &key)
+        .unwrap();
+    let command_id = cluster.next_object_metadata_command_id(pg_id).unwrap();
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        "expired-unapplied-delete-marker",
+        Some(key.as_str()),
+    );
+    let write_sequence = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .next_object_write_sequence(bucket.as_str(), key.as_str())
+        .unwrap();
+    let command = MetadataCommandEnvelope::new(
+        command_id,
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket_write_reservation: proof.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            write_sequence,
+            last_modified_millis: crate::clock::current_time_millis(),
+            stale_payload: None,
+        }),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let primary_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    primary_pg
+        .connection()
+        .execute(
+            "UPDATE bucket_write_reservations SET lease_deadline = ?1 WHERE reservation_id = ?2",
+            rusqlite::params![
+                crate::clock::current_time_millis().saturating_sub(1),
+                &proof.reservation_id,
+            ],
+        )
+        .unwrap();
+    drop(primary_pg);
+
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert!(
+            matches!(
+                crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, version_id),
+                Err(crate::MetadataError::ObjectNotFound)
+            ),
+            "node {node_id:?} applied a command whose admission reservation expired"
+        );
+        assert!(pg
+            .metadata_command_abandoned(NodeId::new(1).as_u32(), &command)
+            .unwrap());
+    }
 }
 
 #[test]

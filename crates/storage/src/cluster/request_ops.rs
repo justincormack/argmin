@@ -1449,6 +1449,19 @@ impl super::StorageCluster {
         self.apply_metadata_command_to_acting_set_with_route_mode(
             command,
             MetadataCommandRouteMode::Normal,
+            self,
+        )
+    }
+
+    pub(super) fn apply_metadata_command_to_acting_set_with_reservation_authority(
+        &self,
+        command: &MetadataCommandEnvelope,
+        reservation_authority: &StorageCluster,
+    ) -> Result<(), MetadataCommandApplyFailure> {
+        self.apply_metadata_command_to_acting_set_with_route_mode(
+            command,
+            MetadataCommandRouteMode::Normal,
+            reservation_authority,
         )
     }
 
@@ -1459,6 +1472,7 @@ impl super::StorageCluster {
         self.apply_metadata_command_to_acting_set_with_route_mode(
             command,
             MetadataCommandRouteMode::Recovery,
+            self,
         )
     }
 
@@ -1466,6 +1480,7 @@ impl super::StorageCluster {
         &self,
         command: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
+        reservation_authority: &StorageCluster,
     ) -> Result<(), MetadataCommandApplyFailure> {
         let pg_id = command.id().pg_id();
         let primary_node_id = match route_mode {
@@ -1488,6 +1503,7 @@ impl super::StorageCluster {
             primary_node_id,
             command,
             route_mode,
+            reservation_authority,
         )
     }
 
@@ -1496,6 +1512,7 @@ impl super::StorageCluster {
         origin_node_id: NodeId,
         command: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
+        reservation_authority: &StorageCluster,
     ) -> Result<(), MetadataCommandApplyFailure> {
         let pg_id = command.id().pg_id();
         let pg_lock = self
@@ -1548,6 +1565,10 @@ impl super::StorageCluster {
             });
         }
         nodes.sort_by_key(|node| node.node_id() != primary_node_id);
+        // Fanout is primary-first. Once the primary has durably applied this
+        // exact command, that log entry is the admission witness for replica
+        // completion even if the original reservation expires meanwhile.
+        let mut admission_witnessed = false;
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
             if node.node_id() == primary_node_id {
                 let primary_critical_section = node
@@ -1571,13 +1592,17 @@ impl super::StorageCluster {
                             applied_nodes,
                             source,
                         })?;
+                    admission_witnessed = true;
                     continue;
                 }
-                self.validate_metadata_command_bucket_write_reservation(command)
-                    .map_err(|source| MetadataCommandApplyFailure {
-                        applied_nodes,
-                        source,
-                    })?;
+                if !admission_witnessed {
+                    reservation_authority
+                        .validate_metadata_command_bucket_write_reservation(command)
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source,
+                        })?;
+                }
                 maybe_run_before_metadata_command_apply_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                     node.node_id(),
@@ -1593,9 +1618,14 @@ impl super::StorageCluster {
                         applied_nodes,
                         source,
                     })?;
+                admission_witnessed = true;
                 continue;
             }
 
+            debug_assert!(
+                admission_witnessed,
+                "metadata primary must be visited first"
+            );
             let metadata_client = node.metadata_command_client();
             let acceptance = match route_mode {
                 MetadataCommandRouteMode::Normal => {
@@ -1628,11 +1658,6 @@ impl super::StorageCluster {
                     })?;
                 continue;
             }
-            self.validate_metadata_command_bucket_write_reservation(command)
-                .map_err(|source| MetadataCommandApplyFailure {
-                    applied_nodes,
-                    source,
-                })?;
             maybe_run_before_metadata_command_apply_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
                 node.node_id(),
@@ -1834,6 +1859,7 @@ impl super::StorageCluster {
             origin_node_id,
             command,
             MetadataCommandRouteMode::Normal,
+            self,
         )
         .map_err(|error| error.source)
     }

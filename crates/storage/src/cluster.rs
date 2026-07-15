@@ -1833,8 +1833,10 @@ impl StorageClusterRuntimeMapHandle {
                 },
             );
         }
-        let _ =
-            recovery_cluster.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
+        let _ = recovery_cluster
+            .drain_pending_metadata_command_with_recovery_gate_and_reservation_authority(
+                pg_id, &command, &current,
+            )?;
         Ok(1)
     }
 
@@ -2673,6 +2675,22 @@ impl StorageCluster {
                     MetadataError::ObjectVersionReservationConflict { version_id },
                 ),
             ) if reservation.version_id == *version_id
+        )
+    }
+
+    fn bucket_write_reservation_rejection_matches(
+        command: &MetadataCommandEnvelope,
+        error: &BucketSnapshotLoadError,
+    ) -> bool {
+        let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
+            return false;
+        };
+        matches!(
+            error,
+            BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationConflict { reservation_id }
+                    | MetadataError::BucketWriteReservationNotFound { reservation_id }
+            ) if *reservation_id == proof.reservation_id
         )
     }
 
@@ -6541,7 +6559,21 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        self.drain_pending_metadata_command_with_recovery_gate_inner(pg_id, command, None)
+        self.drain_pending_metadata_command_with_recovery_gate_inner(pg_id, command, None, self)
+    }
+
+    fn drain_pending_metadata_command_with_recovery_gate_and_reservation_authority(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        reservation_authority: &StorageCluster,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.drain_pending_metadata_command_with_recovery_gate_inner(
+            pg_id,
+            command,
+            None,
+            reservation_authority,
+        )
     }
 
     fn drain_pending_metadata_command_with_recovery_gate_and_work_budget(
@@ -6554,6 +6586,7 @@ impl StorageCluster {
             pg_id,
             command,
             Some(work_budget),
+            self,
         )
     }
 
@@ -6562,6 +6595,7 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         mut work_budget: Option<&mut RequestWorkBudget>,
+        reservation_authority: &StorageCluster,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         loop {
             if let Some(work_budget) = work_budget.as_deref_mut() {
@@ -6631,8 +6665,13 @@ impl StorageCluster {
                         pg_id,
                         command,
                         work_budget,
+                        reservation_authority,
                     )?,
-                None => self.finish_pending_metadata_command_recovery(pg_id, command)?,
+                None => self.finish_pending_metadata_command_recovery(
+                    pg_id,
+                    command,
+                    reservation_authority,
+                )?,
             };
             self.emit_metadata_command_recovery_outcome_for_command(
                 pg_id,
@@ -6669,8 +6708,14 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
+        reservation_authority: &StorageCluster,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        self.finish_pending_metadata_command_recovery_inner(pg_id, command, None)
+        self.finish_pending_metadata_command_recovery_inner(
+            pg_id,
+            command,
+            None,
+            reservation_authority,
+        )
     }
 
     fn finish_pending_metadata_command_recovery_with_work_budget(
@@ -6678,8 +6723,14 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         work_budget: &mut RequestWorkBudget,
+        reservation_authority: &StorageCluster,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        self.finish_pending_metadata_command_recovery_inner(pg_id, command, Some(work_budget))
+        self.finish_pending_metadata_command_recovery_inner(
+            pg_id,
+            command,
+            Some(work_budget),
+            reservation_authority,
+        )
     }
 
     fn finish_pending_metadata_command_recovery_inner(
@@ -6687,6 +6738,7 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         work_budget: Option<&mut RequestWorkBudget>,
+        reservation_authority: &StorageCluster,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
         if Self::metadata_command_is_bucket_pg_command(command) {
@@ -6725,7 +6777,13 @@ impl StorageCluster {
                 }
             });
         }
-        self.finish_object_pg_pending_slot_inner(pg_id, command, true, work_budget)
+        self.finish_object_pg_pending_slot_inner(
+            pg_id,
+            command,
+            true,
+            work_budget,
+            reservation_authority,
+        )
     }
 
     fn metadata_command_recovery_applied_collectable_object_command(
@@ -6741,7 +6799,7 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        self.finish_object_pg_pending_slot_inner(pg_id, command, false, None)
+        self.finish_object_pg_pending_slot_inner(pg_id, command, false, None, self)
     }
 
     fn finish_object_pg_pending_slot_inner(
@@ -6750,6 +6808,7 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         abandon_zero_apply_stale_reservation: bool,
         mut work_budget: Option<&mut RequestWorkBudget>,
+        reservation_authority: &StorageCluster,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         let mut command = command.clone();
         loop {
@@ -6765,16 +6824,21 @@ impl StorageCluster {
                     .map_err(|error| {
                         bucket_snapshot_error_to_object_pg_action_error(error.source)
                     })?;
-                self.release_metadata_command_bucket_write_reservation(&command)
+                reservation_authority
+                    .release_metadata_command_bucket_write_reservation(&command)
                     .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                 self.remove_pending_metadata_command_for_bucket(pg_id, command_bucket, &command)
                     .map_err(ObjectPgActionError::from)?;
                 self.after_object_metadata_command_abandoned(&command)?;
                 return Ok(PendingMetadataCommandOutcome::Abandoned);
             }
-            match self.apply_metadata_command_to_acting_set(&command) {
+            match self.apply_metadata_command_to_acting_set_with_reservation_authority(
+                &command,
+                reservation_authority,
+            ) {
                 Ok(()) => {
-                    self.release_applied_metadata_command_bucket_write_reservations(&command)
+                    reservation_authority
+                        .release_applied_metadata_command_bucket_write_reservations(&command)
                         .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                     self.remove_pending_metadata_command_for_bucket(
                         pg_id,
@@ -6800,7 +6864,8 @@ impl StorageCluster {
                         .metadata_command_is_applied_on_all_acting_nodes(pg_id, &command)
                         .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                     {
-                        self.release_applied_metadata_command_bucket_write_reservations(&command)
+                        reservation_authority
+                            .release_applied_metadata_command_bucket_write_reservations(&command)
                             .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                         self.remove_pending_metadata_command_for_bucket(
                             pg_id,
@@ -6840,13 +6905,17 @@ impl StorageCluster {
                         ) || Self::reserve_object_version_conflict_matches(
                             &command,
                             &error.source,
+                        ) || Self::bucket_write_reservation_rejection_matches(
+                            &command,
+                            &error.source,
                         )) =>
                 {
                     self.record_abandoned_metadata_command_to_acting_set(&command)
                         .map_err(|error| {
                             bucket_snapshot_error_to_object_pg_action_error(error.source)
                         })?;
-                    self.release_metadata_command_bucket_write_reservation(&command)
+                    reservation_authority
+                        .release_metadata_command_bucket_write_reservation(&command)
                         .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                     self.remove_pending_metadata_command_for_bucket(
                         pg_id,
