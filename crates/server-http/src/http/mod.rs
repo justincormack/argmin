@@ -530,20 +530,35 @@ fn required_account_id(req: &S3Request) -> Result<&str, ServerError> {
         })
 }
 
-fn parse_bucket_namespace(req: &S3Request) -> Result<BucketNamespace, ServerError> {
+fn parse_bucket_namespace(
+    req: &S3Request,
+    bucket: &BucketName,
+) -> Result<BucketNamespace, ServerError> {
     if req.header_count("x-amz-bucket-namespace") > 1 {
         return Err(ServerError::InvalidArgument {
             reason: "x-amz-bucket-namespace must not be repeated".to_string(),
         });
     }
+    let account_regional_name = s3_types::parse_account_regional_bucket_name(bucket.as_str());
     let Some(value) = req.header("x-amz-bucket-namespace") else {
+        if account_regional_name.is_some() {
+            return Err(ServerError::MissingNamespaceHeader);
+        }
         return Ok(BucketNamespace::Global);
     };
-    value
+    let namespace = value
         .parse::<BucketNamespace>()
         .map_err(|_| ServerError::InvalidArgument {
             reason: format!("invalid x-amz-bucket-namespace: {value}"),
-        })
+        })?;
+    if namespace == BucketNamespace::Global && account_regional_name.is_some() {
+        return Err(
+            ServerError::GlobalNamespaceHeaderRejectedForAccountRegionalBucket {
+                bucket: bucket.to_string(),
+            },
+        );
+    }
+    Ok(namespace)
 }
 
 fn reject_directory_bucket_only_object_features(req: &S3Request) -> Result<(), ServerError> {
@@ -1420,7 +1435,7 @@ impl HttpFrontend {
                 let object_lock_enabled = parse_bucket_object_lock_enabled(
                     req.header("x-amz-bucket-object-lock-enabled"),
                 )?;
-                let namespace = parse_bucket_namespace(req)?;
+                let namespace = parse_bucket_namespace(req, &bucket)?;
                 let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
                 let requester = self.requester_from_auth(auth, req);
                 self.coordinator
@@ -7352,8 +7367,9 @@ mod tests {
     #[test]
     fn parse_bucket_namespace_defaults_to_global() {
         let req = new_req(http::Method::PUT, "/bucket", "", vec![], vec![]);
+        let bucket = BucketName::try_from("bucket".to_string()).unwrap();
         assert_eq!(
-            parse_bucket_namespace(&req).unwrap(),
+            parse_bucket_namespace(&req, &bucket).unwrap(),
             BucketNamespace::Global
         );
     }
@@ -7370,8 +7386,9 @@ mod tests {
             )],
             vec![],
         );
+        let bucket = BucketName::try_from("bucket".to_string()).unwrap();
         assert_eq!(
-            parse_bucket_namespace(&req).unwrap(),
+            parse_bucket_namespace(&req, &bucket).unwrap(),
             BucketNamespace::AccountRegional
         );
     }
@@ -7385,12 +7402,41 @@ mod tests {
             vec![("x-amz-bucket-namespace".to_string(), "bogus".to_string())],
             vec![],
         );
-        match parse_bucket_namespace(&req).unwrap_err() {
+        let bucket = BucketName::try_from("bucket".to_string()).unwrap();
+        match parse_bucket_namespace(&req, &bucket).unwrap_err() {
             ServerError::InvalidArgument { reason } => {
                 assert_eq!(reason, "invalid x-amz-bucket-namespace: bogus");
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_bucket_namespace_requires_header_for_account_regional_name() {
+        let req = new_req(http::Method::PUT, "/bucket", "", vec![], vec![]);
+        let bucket = BucketName::try_from("bucket-111122223333-us-east-1-an".to_string()).unwrap();
+        assert!(matches!(
+            parse_bucket_namespace(&req, &bucket),
+            Err(ServerError::MissingNamespaceHeader)
+        ));
+    }
+
+    #[test]
+    fn parse_bucket_namespace_rejects_global_header_for_account_regional_name() {
+        let req = new_req(
+            http::Method::PUT,
+            "/bucket",
+            "",
+            vec![("x-amz-bucket-namespace".to_string(), "global".to_string())],
+            vec![],
+        );
+        let bucket = BucketName::try_from("bucket-111122223333-us-east-1-an".to_string()).unwrap();
+        assert!(matches!(
+            parse_bucket_namespace(&req, &bucket),
+            Err(ServerError::GlobalNamespaceHeaderRejectedForAccountRegionalBucket {
+                bucket
+            }) if bucket == "bucket-111122223333-us-east-1-an"
+        ));
     }
 
     #[test]

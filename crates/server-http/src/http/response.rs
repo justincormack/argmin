@@ -340,6 +340,9 @@ fn client_error_message(err: &ServerError) -> String {
             max_size_allowed,
         } => format!("key too long: {size} bytes (max {max_size_allowed})"),
         ServerError::InvalidBucketNamespace { reason, .. } => reason.clone(),
+        ServerError::MissingNamespaceHeader => "The requested bucket is an account-regional namespace bucket, but your request is missing the required x-amz-bucket-namespace header.".to_string(),
+        ServerError::AccountRegionalNamespaceHeaderRequiresSuffix { .. } => "The requested bucket name did not include the account-regional namespace suffix, but the provided x-amz-bucket-namespace header value is account-regional. Specify -[accountId]-[region]-an as the bucket name suffix to create a bucket in your account-regional namespace, or remove the header.".to_string(),
+        ServerError::GlobalNamespaceHeaderRejectedForAccountRegionalBucket { .. } => "The requested bucket is an account-regional namespace bucket, but the provided x-amz-bucket-namespace header value is global. If you want to create an account-regional namespace bucket, set your x-amz-bucket-namespace header to account-regional.".to_string(),
         ServerError::ObjectTooLarge { size, max } => {
             format!("object too large: {size} bytes (max {max})")
         }
@@ -911,6 +914,40 @@ impl S3Response {
                     &client_error_message(err),
                     bucket_namespace,
                     request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::MissingNamespaceHeader => {
+                let body = xml::namespace_header_error_xml(
+                    "MissingNamespaceHeader",
+                    &client_error_message(err),
+                    "x-amz-bucket-namespace",
+                    None,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::AccountRegionalNamespaceHeaderRequiresSuffix { bucket } => {
+                let body = xml::namespace_header_error_xml(
+                    "InvalidNamespaceHeader",
+                    &client_error_message(err),
+                    bucket,
+                    None,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::GlobalNamespaceHeaderRejectedForAccountRegionalBucket { bucket } => {
+                let body = xml::namespace_header_error_xml(
+                    "InvalidNamespaceHeader",
+                    &client_error_message(err),
+                    "global",
+                    Some(bucket),
+                    request_id,
+                    host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -3562,6 +3599,24 @@ mod tests {
         assert!(
             body.contains("<BucketNamespace>bucket-111122223333-us-east-1-an</BucketNamespace>")
         );
+        assert!(body.contains("<HostId>"));
+    }
+
+    #[test]
+    fn namespace_header_error_response_includes_aws_header_fields() {
+        let err = ServerError::GlobalNamespaceHeaderRejectedForAccountRegionalBucket {
+            bucket: "bucket-111122223333-us-east-1-an".to_string(),
+        };
+        let resp = S3Response::error(&err, "/bucket", TEST_HOST_ID);
+        assert_eq!(resp.status_code, 400);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>InvalidNamespaceHeader</Code>"));
+        assert!(body.contains(
+            "<Message>The requested bucket is an account-regional namespace bucket, but the provided x-amz-bucket-namespace header value is global."
+        ));
+        assert!(body.contains("<Header>global</Header>"));
+        assert!(body.contains("<HeaderValue>bucket-111122223333-us-east-1-an</HeaderValue>"));
+        assert!(body.contains("<HostId>"));
     }
 
     #[test]

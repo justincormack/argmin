@@ -942,6 +942,46 @@ fn create_bucket_account_regional_rejects_mismatched_region_suffix() {
 }
 
 #[test]
+fn create_bucket_account_regional_rejects_name_without_suffix() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+
+    let err = coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("ordinary-bucket"),
+            requester: test_helpers::requester("111122223333"),
+            namespace: BucketNamespace::AccountRegional,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::AccountRegionalNamespaceHeaderRequiresSuffix { bucket }
+            if bucket == "ordinary-bucket"
+    ));
+}
+
+#[test]
+fn create_bucket_global_namespace_rejects_account_regional_name() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+
+    let err = coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket-111122223333-us-east-1-an"),
+            requester: test_helpers::requester("111122223333"),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::MissingNamespaceHeader));
+}
+
+#[test]
 fn create_bucket_account_regional_accepts_iam_arn_principal() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());

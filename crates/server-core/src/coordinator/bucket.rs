@@ -142,26 +142,18 @@ impl Coordinator {
     ) -> Result<bool, ServerError> {
         let locked = parse_account_regional_bucket_name(bucket.as_str());
         if namespace == BucketNamespace::AccountRegional && locked.is_none() {
-            let account_id =
-                owner_account
-                    .account_id()
-                    .ok_or_else(|| ServerError::InvalidRequest {
-                        reason:
-                            "account-regional bucket namespace requires a 12-digit AWS account ID"
-                                .to_string(),
-                    })?;
-            return Err(ServerError::InvalidBucketNamespace {
-                reason: format!(
-                    "The requested bucket is an account-regional namespace bucket, but the bucket name does not end with -{account_id}-{}-an. Specify the targeted account and region in the bucket name.",
-                    self.region
-                ),
-                bucket_namespace: bucket.to_string(),
+            return Err(ServerError::AccountRegionalNamespaceHeaderRequiresSuffix {
+                bucket: bucket.to_string(),
             });
         }
 
         let Some(locked) = locked else {
             return Ok(false);
         };
+
+        if namespace == BucketNamespace::Global {
+            return Err(ServerError::MissingNamespaceHeader);
+        }
 
         let account_id = owner_account
             .account_id()

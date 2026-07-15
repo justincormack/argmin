@@ -8,7 +8,7 @@ use s3_tests::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, delete_all_and_bucket, err_status,
     expected_raw_bucket_location_constraint, raw_bucket, retrying_operation_aborted,
     retrying_operation_aborted_result, send_signed_request,
-    shape::{assert_shape, shape, xml_response_headers},
+    shape::{assert_shape, error_response_headers, shape, xml_response_headers},
     unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use s3_types::{is_legacy_create_bucket_region, BucketNamespace};
@@ -90,6 +90,18 @@ fn create_bucket_in_namespace(bucket: &str, namespace: BucketNamespace) -> RawRe
     )
 }
 
+fn create_bucket_with_optional_namespace(
+    bucket: &str,
+    namespace: Option<BucketNamespace>,
+) -> RawResponse {
+    let url = format!("{}/{}", CTX.endpoint(), bucket);
+    let body = create_bucket_configuration_body(CTX.region());
+    let headers = namespace
+        .map(|namespace| vec![("x-amz-bucket-namespace", namespace.as_header_value())])
+        .unwrap_or_default();
+    send_signed_request("PUT", &url, &body, headers)
+}
+
 fn assert_raw_s3_error(response: &RawResponse, status: u16, code: &str) {
     assert_eq!(
         response.status, status,
@@ -100,6 +112,14 @@ fn assert_raw_s3_error(response: &RawResponse, status: u16, code: &str) {
         response.body.contains(&format!("<Code>{code}</Code>")),
         "expected {code} in response body, got: {}",
         response.body
+    );
+}
+
+fn assert_bucket_was_not_created(bucket: &str) {
+    let response = raw_bucket("HEAD", bucket, None);
+    assert_eq!(
+        response.status, 404,
+        "rejected CreateBucket unexpectedly created {bucket}: {response:#?}"
     );
 }
 
@@ -226,11 +246,101 @@ fn test_account_regional_bucket_create_succeeds_when_suffix_matches() {
 }
 
 #[test]
+fn test_account_regional_header_rejects_ordinary_bucket_name() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let response =
+            create_bucket_with_optional_namespace(&bucket, Some(BucketNamespace::AccountRegional));
+        assert_shape(
+            "CreateBucket account-regional header with ordinary name",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .sub("bucket", &bucket)
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>InvalidNamespaceHeader</Code>\
+                     <Message>The requested bucket name did not include the account-regional namespace suffix, but the provided x-amz-bucket-namespace header value is account-regional. Specify -[accountId]-[region]-an as the bucket name suffix to create a bucket in your account-regional namespace, or remove the header.</Message>\
+                     <Header>{bucket}</Header><RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+                ),
+        );
+        assert_bucket_was_not_created(&bucket);
+    });
+}
+
+#[test]
+fn test_account_regional_name_requires_namespace_header() {
+    s3_tests::run(async {
+        let bucket = account_regional_bucket_name(CTX.account_id(), CTX.region());
+        let response = create_bucket_with_optional_namespace(&bucket, None);
+        assert_shape(
+            "CreateBucket account-regional name without namespace header",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>MissingNamespaceHeader</Code>\
+                     <Message>The requested bucket is an account-regional namespace bucket, but your request is missing the required x-amz-bucket-namespace header.</Message>\
+                     <Header>x-amz-bucket-namespace</Header>\
+                     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                ),
+        );
+        assert_bucket_was_not_created(&bucket);
+    });
+}
+
+#[test]
+fn test_account_regional_name_rejects_global_namespace_header() {
+    s3_tests::run(async {
+        let bucket = account_regional_bucket_name(CTX.account_id(), CTX.region());
+        let response =
+            create_bucket_with_optional_namespace(&bucket, Some(BucketNamespace::Global));
+        assert_shape(
+            "CreateBucket account-regional name with global namespace header",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .sub("bucket", &bucket)
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>InvalidNamespaceHeader</Code>\
+                     <Message>The requested bucket is an account-regional namespace bucket, but the provided x-amz-bucket-namespace header value is global. If you want to create an account-regional namespace bucket, set your x-amz-bucket-namespace header to account-regional.</Message>\
+                     <Header>global</Header><HeaderValue>{bucket}</HeaderValue>\
+                     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                ),
+        );
+        assert_bucket_was_not_created(&bucket);
+    });
+}
+
+#[test]
 fn test_account_regional_bucket_rejects_mismatched_account_suffix() {
     s3_tests::run(async {
         let bucket = account_regional_bucket_name(CTX.alt_account_id(), CTX.region());
         let response = create_bucket_in_namespace(&bucket, BucketNamespace::AccountRegional);
-        assert_raw_s3_error(&response, 400, "InvalidBucketNamespace");
+        assert_shape(
+            "CreateBucket mismatched account-regional account",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .sub("bucket", &bucket)
+                .sub("requested_account", CTX.alt_account_id())
+                .sub("caller_account", CTX.account_id())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>InvalidBucketNamespace</Code>\
+                     <Message>The requested bucket is an account-regional namespace bucket, but the requested AWS Account ID '{requested_account}' does not match the caller's AWS Account ID '{caller_account}'. Specify the caller's AWS Account ID in the bucket name.</Message>\
+                     <BucketNamespace>{bucket}</BucketNamespace>\
+                     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                ),
+        );
+        assert_bucket_was_not_created(&bucket);
     });
 }
 
@@ -244,7 +354,24 @@ fn test_account_regional_bucket_rejects_mismatched_region_suffix() {
         };
         let bucket = account_regional_bucket_name(CTX.account_id(), wrong_region);
         let response = create_bucket_in_namespace(&bucket, BucketNamespace::AccountRegional);
-        assert_raw_s3_error(&response, 400, "InvalidBucketNamespace");
+        assert_shape(
+            "CreateBucket mismatched account-regional region",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .sub("bucket", &bucket)
+                .sub("requested_region", wrong_region)
+                .sub("current_region", CTX.region())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>InvalidBucketNamespace</Code>\
+                     <Message>The requested bucket is an account-regional namespace bucket, but the requested region '{requested_region}' does not match the current region '{current_region}'. Specify the targeted region in the bucket name.</Message>\
+                     <BucketNamespace>{bucket}</BucketNamespace>\
+                     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                ),
+        );
+        assert_bucket_was_not_created(&bucket);
     });
 }
 

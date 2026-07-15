@@ -946,6 +946,7 @@ pub fn error_xml_with_bucket_namespace(
     message: &str,
     bucket_namespace: &str,
     request_id: &str,
+    host_id: &str,
 ) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -954,11 +955,45 @@ pub fn error_xml_with_bucket_namespace(
          <Message>{}</Message>\
          <BucketNamespace>{}</BucketNamespace>\
          <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
          </Error>",
         xml_escape(code),
         xml_escape(message),
         xml_escape(bucket_namespace),
         xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an S3 namespace-header error with AWS's unusual `<Header>` fields.
+#[must_use]
+pub fn namespace_header_error_xml(
+    code: &str,
+    message: &str,
+    header: &str,
+    header_value: Option<&str>,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    let header_value = header_value.map_or_else(String::new, |value| {
+        format!("<HeaderValue>{}</HeaderValue>", xml_escape(value))
+    });
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>{}</Code>\
+         <Message>{}</Message>\
+         <Header>{}</Header>\
+         {}\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(code),
+        xml_escape(message),
+        xml_escape(header),
+        header_value,
+        xml_escape(request_id),
+        xml_escape(host_id),
     )
 }
 

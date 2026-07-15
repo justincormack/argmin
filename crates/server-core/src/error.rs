@@ -114,6 +114,15 @@ pub enum ServerError {
         reason: String,
         bucket_namespace: String,
     },
+
+    #[error("missing x-amz-bucket-namespace header")]
+    MissingNamespaceHeader,
+
+    #[error("account-regional namespace header requires an account-regional bucket-name suffix")]
+    AccountRegionalNamespaceHeaderRequiresSuffix { bucket: String },
+
+    #[error("global namespace header cannot be used with an account-regional bucket name")]
+    GlobalNamespaceHeaderRejectedForAccountRegionalBucket { bucket: String },
     #[error("metadata blob error: {reason}")]
     MetadataBlobError { reason: String },
 
@@ -531,6 +540,11 @@ impl ServerError {
             Self::InvalidBucketName { .. } => "InvalidBucketName",
             Self::KeyTooLongError { .. } => "KeyTooLongError",
             Self::InvalidBucketNamespace { .. } => "InvalidBucketNamespace",
+            Self::MissingNamespaceHeader => "MissingNamespaceHeader",
+            Self::AccountRegionalNamespaceHeaderRequiresSuffix { .. }
+            | Self::GlobalNamespaceHeaderRejectedForAccountRegionalBucket { .. } => {
+                "InvalidNamespaceHeader"
+            }
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
             Self::MetadataTooLarge | Self::MetadataTooLargeDetailed { .. } => "MetadataTooLarge",
@@ -656,6 +670,9 @@ impl ServerError {
             | Self::InvalidBucketName { .. }
             | Self::KeyTooLongError { .. }
             | Self::InvalidBucketNamespace { .. }
+            | Self::MissingNamespaceHeader
+            | Self::AccountRegionalNamespaceHeaderRequiresSuffix { .. }
+            | Self::GlobalNamespaceHeaderRejectedForAccountRegionalBucket { .. }
             | Self::MaxMessageLengthExceeded { .. }
             | Self::BadDigest
             | Self::ChecksumDigestMismatch { .. }
