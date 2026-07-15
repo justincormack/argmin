@@ -11087,26 +11087,6 @@ fn sign_control_plane_response_payload(
     envelope.encode_frame()
 }
 
-fn build_runtime_map_rpc_response(
-    kind: ControlPlaneRpcKind,
-    response: Result<Vec<u8>, ControlPlaneError>,
-    response_auth: Option<(ControlPlaneScopedCredential, ControlPlaneAuthPrincipal)>,
-    authority_now_ms: u64,
-) -> Result<ControlPlaneRpcResponse, ControlPlaneError> {
-    let mut payload = encode_control_plane_rpc_response(response)?;
-    if let Some((credential, target)) = response_auth {
-        payload = sign_control_plane_response_payload(
-            kind,
-            &credential,
-            target,
-            ControlPlaneAuthOperation::RuntimeMapResponse,
-            authority_now_ms,
-            payload,
-        )?;
-    }
-    Ok(ControlPlaneRpcResponse { kind, payload })
-}
-
 impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
     fn runtime_map_snapshot(
         &self,
@@ -11491,6 +11471,26 @@ impl ControlPlaneRpcRequest {
     pub fn metrics_kind(&self) -> observability::ControlPlaneRpcMetricKind {
         self.kind.metrics_kind()
     }
+}
+
+#[derive(Debug)]
+struct ControlPlaneUnixResponseAuth {
+    credential: ControlPlaneScopedCredential,
+    target: ControlPlaneAuthPrincipal,
+    operation: ControlPlaneAuthOperation,
+}
+
+pub struct VerifiedControlPlaneRpcRequest {
+    kind: ControlPlaneRpcKind,
+    payload: Vec<u8>,
+    response_auth: Option<ControlPlaneUnixResponseAuth>,
+}
+
+impl VerifiedControlPlaneRpcRequest {
+    #[must_use]
+    pub fn metrics_kind(&self) -> observability::ControlPlaneRpcMetricKind {
+        self.kind.metrics_kind()
+    }
 
     #[must_use]
     pub fn is_refresh_node_heartbeat(&self) -> bool {
@@ -11505,6 +11505,14 @@ impl ControlPlaneRpcRequest {
                 | ControlPlaneRpcKind::ReestablishAuthorityClock
         )
     }
+
+    #[must_use]
+    pub fn requires_raft_authority_confirmation(&self) -> bool {
+        !matches!(
+            self.kind,
+            ControlPlaneRpcKind::AuthorityClockStatus | ControlPlaneRpcKind::TriggerRaftElection
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -11516,7 +11524,7 @@ pub struct ControlPlaneRpcResponse {
 #[derive(Debug)]
 pub struct PreparedControlPlaneHeartbeatResponse {
     refresh: Result<ControlPlaneHeartbeatRefresh, ControlPlaneError>,
-    response_auth: Option<(ControlPlaneScopedCredential, ControlPlaneAuthPrincipal)>,
+    response_auth: Option<ControlPlaneUnixResponseAuth>,
 }
 
 pub fn read_control_plane_unix_request(
@@ -11524,6 +11532,150 @@ pub fn read_control_plane_unix_request(
 ) -> Result<ControlPlaneRpcRequest, ControlPlaneError> {
     let (kind, payload) = read_control_plane_rpc_frame(stream)?;
     Ok(ControlPlaneRpcRequest { kind, payload })
+}
+
+pub fn verify_control_plane_unix_request(
+    request: ControlPlaneRpcRequest,
+    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
+    authority_now_ms: u64,
+) -> Result<VerifiedControlPlaneRpcRequest, ControlPlaneError> {
+    let ControlPlaneRpcRequest { kind, payload } = request;
+    let (payload, response_auth) = match kind {
+        ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
+            let auth_payload_operation = if control_plane_auth_payload_has_magic(&payload) {
+                ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
+                    .ok()
+                    .map(|envelope| envelope.header().operation())
+            } else {
+                None
+            };
+            match auth_verifier {
+                Some(auth_verifier)
+                    if auth_verifier.requires_admin_control_plane_auth()
+                        && auth_payload_operation
+                            == Some(ControlPlaneAuthOperation::AdminControlPlaneCommand) =>
+                {
+                    let verified = auth_verifier.verify_admin_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    (
+                        verified.payload,
+                        Some(ControlPlaneUnixResponseAuth {
+                            credential: verified.response_credential,
+                            target: verified.response_target,
+                            operation: ControlPlaneAuthOperation::AdminControlPlaneResponse,
+                        }),
+                    )
+                }
+                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
+                    let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    (
+                        verified.payload,
+                        Some(ControlPlaneUnixResponseAuth {
+                            credential: verified.response_credential,
+                            target: verified.response_target,
+                            operation: ControlPlaneAuthOperation::RuntimeMapResponse,
+                        }),
+                    )
+                }
+                Some(auth_verifier)
+                    if auth_verifier.requires_admin_control_plane_auth()
+                        && control_plane_auth_payload_has_magic(&payload) =>
+                {
+                    let verified = auth_verifier.verify_admin_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    (
+                        verified.payload,
+                        Some(ControlPlaneUnixResponseAuth {
+                            credential: verified.response_credential,
+                            target: verified.response_target,
+                            operation: ControlPlaneAuthOperation::AdminControlPlaneResponse,
+                        }),
+                    )
+                }
+                _ => (payload, None),
+            }
+        }
+        _ if kind.auth_operation() == ControlPlaneAuthOperation::AdminControlPlaneCommand => {
+            match auth_verifier.filter(|verifier| verifier.requires_admin_control_plane_auth()) {
+                Some(auth_verifier) => {
+                    let verified = auth_verifier.verify_admin_control_plane_command_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    (
+                        verified.payload,
+                        Some(ControlPlaneUnixResponseAuth {
+                            credential: verified.response_credential,
+                            target: verified.response_target,
+                            operation: ControlPlaneAuthOperation::AdminControlPlaneResponse,
+                        }),
+                    )
+                }
+                None => (payload, None),
+            }
+        }
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            match auth_verifier.filter(|verifier| verifier.requires_storage_node_heartbeat_auth()) {
+                Some(auth_verifier) => {
+                    let verified = auth_verifier
+                        .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?;
+                    (
+                        verified.payload,
+                        Some(ControlPlaneUnixResponseAuth {
+                            credential: verified.response_credential,
+                            target: verified.response_target,
+                            operation: ControlPlaneAuthOperation::RuntimeMapResponse,
+                        }),
+                    )
+                }
+                None => (payload, None),
+            }
+        }
+        _ => match auth_verifier.filter(|verifier| verifier.requires_frontend_runtime_map_auth()) {
+            Some(auth_verifier) => {
+                let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
+                    kind,
+                    &payload,
+                    authority_now_ms,
+                )?;
+                (
+                    verified.payload,
+                    Some(ControlPlaneUnixResponseAuth {
+                        credential: verified.response_credential,
+                        target: verified.response_target,
+                        operation: ControlPlaneAuthOperation::RuntimeMapResponse,
+                    }),
+                )
+            }
+            None => (payload, None),
+        },
+    };
+    if matches!(
+        kind,
+        ControlPlaneRpcKind::AuthorityClockStatus | ControlPlaneRpcKind::ReestablishAuthorityClock
+    ) && response_auth.is_none()
+    {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "authority-clock administration requires configured admin authentication"
+                .to_owned(),
+        });
+    }
+    Ok(VerifiedControlPlaneRpcRequest {
+        kind,
+        payload,
+        response_auth,
+    })
 }
 
 pub fn build_control_plane_unix_response<T>(
@@ -11560,46 +11712,38 @@ pub fn build_control_plane_unix_response_with_auth_and_response_clock<T, F>(
     request: ControlPlaneRpcRequest,
     authority_now_ms: u64,
     auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
+    response_authority_now_ms: F,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
+where
+    T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+    F: FnMut() -> Result<u64, ControlPlaneError>,
+{
+    let request = verify_control_plane_unix_request(request, auth_verifier, authority_now_ms)?;
+    build_control_plane_unix_response_from_verified(
+        control_plane,
+        request,
+        authority_now_ms,
+        response_authority_now_ms,
+    )
+}
+
+pub fn build_control_plane_unix_response_from_verified<T, F>(
+    control_plane: &mut T,
+    request: VerifiedControlPlaneRpcRequest,
+    authority_now_ms: u64,
     mut response_authority_now_ms: F,
 ) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
 where
     T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
     F: FnMut() -> Result<u64, ControlPlaneError>,
 {
-    let ControlPlaneRpcRequest { kind, payload } = request;
-    let (payload, admin_response_auth) = match auth_verifier {
-        Some(auth_verifier)
-            if kind.auth_operation() == ControlPlaneAuthOperation::AdminControlPlaneCommand
-                && auth_verifier.requires_admin_control_plane_auth() =>
-        {
-            let verified = auth_verifier.verify_admin_control_plane_command_payload(
-                kind,
-                &payload,
-                authority_now_ms,
-            )?;
-            (
-                verified.payload,
-                Some((verified.response_credential, verified.response_target)),
-            )
-        }
-        _ => (payload, None),
-    };
+    let VerifiedControlPlaneRpcRequest {
+        kind,
+        payload,
+        response_auth,
+    } = request;
     let response = match kind {
         ControlPlaneRpcKind::RuntimeMapSnapshot => {
-            let (payload, response_auth) = match auth_verifier {
-                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
-                    let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
-                        kind,
-                        &payload,
-                        authority_now_ms,
-                    )?;
-                    (
-                        verified.payload,
-                        Some((verified.response_credential, verified.response_target)),
-                    )
-                }
-                _ => (payload, None),
-            };
             let reader = PayloadReader::new(&payload);
             reader.finish()?;
             let response = match control_plane.runtime_map_snapshot(authority_now_ms) {
@@ -11611,7 +11755,7 @@ where
                 Err(error) => Err(error),
             };
             let response_authority_now_ms = response_authority_now_ms()?;
-            return build_runtime_map_rpc_response(
+            return build_control_plane_verified_response(
                 kind,
                 response,
                 response_auth,
@@ -11619,20 +11763,6 @@ where
             );
         }
         ControlPlaneRpcKind::RuntimeMapDiagnostics => {
-            let (payload, response_auth) = match auth_verifier {
-                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
-                    let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
-                        kind,
-                        &payload,
-                        authority_now_ms,
-                    )?;
-                    (
-                        verified.payload,
-                        Some((verified.response_credential, verified.response_target)),
-                    )
-                }
-                _ => (payload, None),
-            };
             let reader = PayloadReader::new(&payload);
             reader.finish()?;
             let response = match control_plane.runtime_map_diagnostics_snapshot(authority_now_ms) {
@@ -11644,7 +11774,7 @@ where
                 Err(error) => Err(error),
             };
             let response_authority_now_ms = response_authority_now_ms()?;
-            return build_runtime_map_rpc_response(
+            return build_control_plane_verified_response(
                 kind,
                 response,
                 response_auth,
@@ -11652,20 +11782,6 @@ where
             );
         }
         ControlPlaneRpcKind::RuntimeMapStatus => {
-            let (payload, response_auth) = match auth_verifier {
-                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
-                    let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
-                        kind,
-                        &payload,
-                        authority_now_ms,
-                    )?;
-                    (
-                        verified.payload,
-                        Some((verified.response_credential, verified.response_target)),
-                    )
-                }
-                _ => (payload, None),
-            };
             let reader = PayloadReader::new(&payload);
             reader.finish()?;
             let response = match control_plane.runtime_map_status(authority_now_ms) {
@@ -11677,7 +11793,7 @@ where
                 Err(error) => Err(error),
             };
             let response_authority_now_ms = response_authority_now_ms()?;
-            return build_runtime_map_rpc_response(
+            return build_control_plane_verified_response(
                 kind,
                 response,
                 response_auth,
@@ -11685,20 +11801,6 @@ where
             );
         }
         ControlPlaneRpcKind::PendingMetadataCommandRecoveries => {
-            let (payload, response_auth) = match auth_verifier {
-                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
-                    let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
-                        kind,
-                        &payload,
-                        authority_now_ms,
-                    )?;
-                    (
-                        verified.payload,
-                        Some((verified.response_credential, verified.response_target)),
-                    )
-                }
-                _ => (payload, None),
-            };
             let reader = PayloadReader::new(&payload);
             reader.finish()?;
             let response = control_plane
@@ -11709,7 +11811,7 @@ where
                     Ok(response)
                 });
             let response_authority_now_ms = response_authority_now_ms()?;
-            return build_runtime_map_rpc_response(
+            return build_control_plane_verified_response(
                 kind,
                 response,
                 response_auth,
@@ -11717,55 +11819,6 @@ where
             );
         }
         ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
-            let mut admin_response_auth = None;
-            let auth_payload_operation = if control_plane_auth_payload_has_magic(&payload) {
-                ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
-                    .ok()
-                    .map(|envelope| envelope.header().operation())
-            } else {
-                None
-            };
-            let (payload, response_auth) = match auth_verifier {
-                Some(auth_verifier)
-                    if auth_verifier.requires_admin_control_plane_auth()
-                        && auth_payload_operation
-                            == Some(ControlPlaneAuthOperation::AdminControlPlaneCommand) =>
-                {
-                    let verified = auth_verifier.verify_admin_runtime_map_read_payload(
-                        kind,
-                        &payload,
-                        authority_now_ms,
-                    )?;
-                    admin_response_auth =
-                        Some((verified.response_credential, verified.response_target));
-                    (verified.payload, None)
-                }
-                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
-                    let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
-                        kind,
-                        &payload,
-                        authority_now_ms,
-                    )?;
-                    (
-                        verified.payload,
-                        Some((verified.response_credential, verified.response_target)),
-                    )
-                }
-                Some(auth_verifier)
-                    if auth_verifier.requires_admin_control_plane_auth()
-                        && control_plane_auth_payload_has_magic(&payload) =>
-                {
-                    let verified = auth_verifier.verify_admin_runtime_map_read_payload(
-                        kind,
-                        &payload,
-                        authority_now_ms,
-                    )?;
-                    admin_response_auth =
-                        Some((verified.response_credential, verified.response_target));
-                    (verified.payload, None)
-                }
-                _ => (payload, None),
-            };
             let mut reader = PayloadReader::new(&payload);
             let pg_id = read_pg_id_request(&mut reader)?;
             reader.finish()?;
@@ -11778,18 +11831,7 @@ where
                 Err(error) => Err(error),
             };
             let response_authority_now_ms = response_authority_now_ms()?;
-            if let Some((credential, target)) = admin_response_auth {
-                let payload = sign_control_plane_response_payload(
-                    kind,
-                    &credential,
-                    target,
-                    ControlPlaneAuthOperation::AdminControlPlaneResponse,
-                    response_authority_now_ms,
-                    encode_control_plane_rpc_response(response)?,
-                )?;
-                return Ok(ControlPlaneRpcResponse { kind, payload });
-            }
-            return build_runtime_map_rpc_response(
+            return build_control_plane_verified_response(
                 kind,
                 response,
                 response_auth,
@@ -11801,17 +11843,6 @@ where
                 kind.auth_operation(),
                 ControlPlaneAuthOperation::StorageRuntimeMapRefresh
             );
-            let (payload, response_auth) = match auth_verifier {
-                Some(auth_verifier) if auth_verifier.requires_storage_node_heartbeat_auth() => {
-                    let verified = auth_verifier
-                        .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?;
-                    (
-                        verified.payload,
-                        Some((verified.response_credential, verified.response_target)),
-                    )
-                }
-                _ => (payload, None),
-            };
             let mut reader = PayloadReader::new(&payload);
             let heartbeat = read_node_heartbeat(&mut reader)?;
             reader.finish()?;
@@ -11825,7 +11856,7 @@ where
                 Err(error) => Err(error),
             };
             let response_authority_now_ms = response_authority_now_ms()?;
-            return build_runtime_map_rpc_response(
+            return build_control_plane_verified_response(
                 kind,
                 response,
                 response_auth,
@@ -11943,15 +11974,41 @@ where
             });
         }
     };
+    build_control_plane_verified_response(
+        kind,
+        response,
+        response_auth,
+        response_authority_now_ms()?,
+    )
+}
+
+pub fn build_control_plane_unix_admission_error_response(
+    request: VerifiedControlPlaneRpcRequest,
+    error: ControlPlaneError,
+    authority_now_ms: u64,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError> {
+    build_control_plane_verified_response(
+        request.kind,
+        Err(error),
+        request.response_auth,
+        authority_now_ms,
+    )
+}
+
+fn build_control_plane_verified_response(
+    kind: ControlPlaneRpcKind,
+    response: Result<Vec<u8>, ControlPlaneError>,
+    response_auth: Option<ControlPlaneUnixResponseAuth>,
+    authority_now_ms: u64,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError> {
     let mut payload = encode_control_plane_rpc_response(response)?;
-    if let Some((credential, target)) = admin_response_auth {
-        let response_authority_now_ms = response_authority_now_ms()?;
+    if let Some(response_auth) = response_auth {
         payload = sign_control_plane_response_payload(
             kind,
-            &credential,
-            target,
-            ControlPlaneAuthOperation::AdminControlPlaneResponse,
-            response_authority_now_ms,
+            &response_auth.credential,
+            response_auth.target,
+            response_auth.operation,
+            authority_now_ms,
             payload,
         )?;
     }
@@ -11965,6 +12022,31 @@ pub fn build_control_plane_authority_clock_admin_response<T, P, F>(
     auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
     sample: ControlPlaneAuthorityClockAdminSample,
     before_response_sign: P,
+    response_authority_now_ms: F,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
+where
+    T: ControlPlaneAdmin,
+    P: FnOnce(&T, &mut ControlPlaneAuthorityClock) -> Result<(), ControlPlaneError>,
+    F: FnMut() -> Result<u64, ControlPlaneError>,
+{
+    let request =
+        verify_control_plane_unix_request(request, auth_verifier, sample.auth_authority_now_ms)?;
+    build_control_plane_authority_clock_admin_response_from_verified(
+        control_plane,
+        authority_clock,
+        request,
+        sample,
+        before_response_sign,
+        response_authority_now_ms,
+    )
+}
+
+pub fn build_control_plane_authority_clock_admin_response_from_verified<T, P, F>(
+    control_plane: &T,
+    authority_clock: &mut ControlPlaneAuthorityClock,
+    request: VerifiedControlPlaneRpcRequest,
+    sample: ControlPlaneAuthorityClockAdminSample,
+    before_response_sign: P,
     mut response_authority_now_ms: F,
 ) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
 where
@@ -11972,7 +12054,11 @@ where
     P: FnOnce(&T, &mut ControlPlaneAuthorityClock) -> Result<(), ControlPlaneError>,
     F: FnMut() -> Result<u64, ControlPlaneError>,
 {
-    let ControlPlaneRpcRequest { kind, payload } = request;
+    let VerifiedControlPlaneRpcRequest {
+        kind,
+        payload,
+        response_auth,
+    } = request;
     if !matches!(
         kind,
         ControlPlaneRpcKind::AuthorityClockStatus | ControlPlaneRpcKind::ReestablishAuthorityClock
@@ -11981,23 +12067,16 @@ where
             message: format!("expected authority-clock admin RPC, got {kind:?}"),
         });
     }
-    let Some(auth_verifier) =
-        auth_verifier.filter(|auth_verifier| auth_verifier.requires_admin_control_plane_auth())
-    else {
+    let Some(response_auth) = response_auth else {
         return Err(ControlPlaneError::RpcProtocol {
             message: "authority-clock administration requires configured admin authentication"
                 .to_owned(),
         });
     };
-    let verified = auth_verifier.verify_admin_control_plane_command_payload(
-        kind,
-        &payload,
-        sample.auth_authority_now_ms,
-    )?;
     let context = control_plane.authority_clock_context();
     let response = match kind {
         ControlPlaneRpcKind::AuthorityClockStatus => context.and_then(|context| {
-            let reader = PayloadReader::new(&verified.payload);
+            let reader = PayloadReader::new(&payload);
             reader.finish()?;
             let mut response = Vec::new();
             let status =
@@ -12006,7 +12085,7 @@ where
             Ok(response)
         }),
         ControlPlaneRpcKind::ReestablishAuthorityClock => context.and_then(|context| {
-            let mut reader = PayloadReader::new(&verified.payload);
+            let mut reader = PayloadReader::new(&payload);
             let expected_generation = reader.read_u64()?;
             let expected_committed_timestamp_high_water_ms = reader.read_option_u64()?;
             let expected_raft_leadership_term = reader.read_option_u64()?;
@@ -12031,9 +12110,9 @@ where
     let response_authority_now_ms = response_authority_now_ms()?;
     let payload = sign_control_plane_response_payload(
         kind,
-        &verified.response_credential,
-        verified.response_target,
-        ControlPlaneAuthOperation::AdminControlPlaneResponse,
+        &response_auth.credential,
+        response_auth.target,
+        response_auth.operation,
         response_authority_now_ms,
         encode_control_plane_rpc_response(response)?,
     )?;
@@ -12188,12 +12267,23 @@ pub fn prepare_control_plane_heartbeat_response<T>(
 where
     T: ControlPlaneHeartbeatRuntimeMapSource,
 {
+    let request = verify_control_plane_unix_request(request, auth_verifier, authority_now_ms)?;
+    prepare_control_plane_heartbeat_response_from_verified(control_plane, request, authority_now_ms)
+}
+
+pub fn prepare_control_plane_heartbeat_response_from_verified<T>(
+    control_plane: &mut T,
+    request: VerifiedControlPlaneRpcRequest,
+    authority_now_ms: u64,
+) -> Result<PreparedControlPlaneHeartbeatResponse, ControlPlaneError>
+where
+    T: ControlPlaneHeartbeatRuntimeMapSource,
+{
     prepare_control_plane_heartbeat_response_internal(
         control_plane,
         request,
         authority_now_ms,
         None,
-        auth_verifier,
     )
 }
 
@@ -12207,26 +12297,46 @@ pub fn prepare_control_plane_heartbeat_response_with_lease_horizon_authority<T>(
 where
     T: ControlPlaneHeartbeatRuntimeMapSource,
 {
+    let request = verify_control_plane_unix_request(request, auth_verifier, authority_now_ms)?;
+    prepare_control_plane_heartbeat_response_with_lease_horizon_authority_from_verified(
+        control_plane,
+        request,
+        authority_now_ms,
+        lease_horizon_authority,
+    )
+}
+
+pub fn prepare_control_plane_heartbeat_response_with_lease_horizon_authority_from_verified<T>(
+    control_plane: &mut T,
+    request: VerifiedControlPlaneRpcRequest,
+    authority_now_ms: u64,
+    lease_horizon_authority: LeaseHorizonAuthorityBinding,
+) -> Result<PreparedControlPlaneHeartbeatResponse, ControlPlaneError>
+where
+    T: ControlPlaneHeartbeatRuntimeMapSource,
+{
     prepare_control_plane_heartbeat_response_internal(
         control_plane,
         request,
         authority_now_ms,
         Some(lease_horizon_authority),
-        auth_verifier,
     )
 }
 
 fn prepare_control_plane_heartbeat_response_internal<T>(
     control_plane: &mut T,
-    request: ControlPlaneRpcRequest,
+    request: VerifiedControlPlaneRpcRequest,
     authority_now_ms: u64,
     lease_horizon_authority: Option<LeaseHorizonAuthorityBinding>,
-    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
 ) -> Result<PreparedControlPlaneHeartbeatResponse, ControlPlaneError>
 where
     T: ControlPlaneHeartbeatRuntimeMapSource,
 {
-    let ControlPlaneRpcRequest { kind, payload } = request;
+    let VerifiedControlPlaneRpcRequest {
+        kind,
+        payload,
+        response_auth,
+    } = request;
     if kind != ControlPlaneRpcKind::RefreshNodeHeartbeat {
         return Err(ControlPlaneError::RpcProtocol {
             message: format!("expected RefreshNodeHeartbeat RPC, got {kind:?}"),
@@ -12236,17 +12346,6 @@ where
         kind.auth_operation(),
         ControlPlaneAuthOperation::StorageRuntimeMapRefresh
     );
-    let (payload, response_auth) = match auth_verifier {
-        Some(auth_verifier) if auth_verifier.requires_storage_node_heartbeat_auth() => {
-            let verified =
-                auth_verifier.verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?;
-            (
-                verified.payload,
-                Some((verified.response_credential, verified.response_target)),
-            )
-        }
-        _ => (payload, None),
-    };
     let mut reader = PayloadReader::new(&payload);
     let heartbeat = read_node_heartbeat(&mut reader)?;
     reader.finish()?;
@@ -12303,7 +12402,7 @@ where
         Err(error) => Err(error),
     };
     let response_authority_now_ms = response_authority_now_ms()?;
-    build_runtime_map_rpc_response(
+    build_control_plane_verified_response(
         ControlPlaneRpcKind::RefreshNodeHeartbeat,
         response,
         prepared.response_auth,
@@ -21068,6 +21167,47 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_admission_error_preserves_explicit_routing_rejection() {
+        let credential = frontend_auth_credential("auth-cluster", "frontend-1");
+        let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new("unused-test-socket"),
+            credential.clone(),
+        );
+        let kind = ControlPlaneRpcKind::RuntimeMapStatus;
+        let request = signed_frontend_runtime_map_request(
+            kind,
+            &credential,
+            Vec::new(),
+            Some(2_000),
+            Some(7_000),
+        );
+        let request = verify_control_plane_unix_request(request, Some(&verifier), 2_000).unwrap();
+        let response = build_control_plane_unix_admission_error_response(
+            request,
+            ControlPlaneError::RpcRemote {
+                message: "local OpenRaft authority is not the serving leader: NotLocalLeader"
+                    .to_owned(),
+            },
+            2_000,
+        )
+        .unwrap();
+        let payload = client
+            .verify_runtime_map_response(kind, 2_000, &response.payload)
+            .unwrap();
+        let error = decode_control_plane_rpc_response(payload).unwrap_err();
+        let metrics = verifier.metrics_snapshot();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcRemote { message }
+                if message.contains("local OpenRaft authority is not the serving leader")
+                    && message.contains("NotLocalLeader")
+        ));
+        assert_eq!(metrics.accepted_total(), 1);
+    }
+
+    #[test]
     fn unix_control_plane_client_reads_pending_recoveries_without_runtime_map() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -25516,6 +25656,31 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn control_plane_rpc_raft_admission_classifies_verified_requests() {
+        let request = |kind| VerifiedControlPlaneRpcRequest {
+            kind,
+            payload: Vec::new(),
+            response_auth: None,
+        };
+
+        let status = request(ControlPlaneRpcKind::AuthorityClockStatus);
+        assert!(status.is_authority_clock_admin());
+        assert!(!status.requires_raft_authority_confirmation());
+
+        let reestablish = request(ControlPlaneRpcKind::ReestablishAuthorityClock);
+        assert!(reestablish.is_authority_clock_admin());
+        assert!(reestablish.requires_raft_authority_confirmation());
+
+        let election = request(ControlPlaneRpcKind::TriggerRaftElection);
+        assert!(!election.is_authority_clock_admin());
+        assert!(!election.requires_raft_authority_confirmation());
+
+        let heartbeat = request(ControlPlaneRpcKind::RefreshNodeHeartbeat);
+        assert!(!heartbeat.is_authority_clock_admin());
+        assert!(heartbeat.requires_raft_authority_confirmation());
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -25,24 +26,26 @@ use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
 use storage::control_plane::{
-    build_control_plane_authority_clock_admin_response, build_control_plane_unix_response,
-    build_control_plane_unix_response_with_auth_and_response_clock,
-    finish_control_plane_heartbeat_response, invalidate_authority_clock_restart_checkpoint,
-    load_authority_clock_restart_checkpoint, prepare_control_plane_heartbeat_response,
-    prepare_control_plane_heartbeat_response_with_lease_horizon_authority,
+    build_control_plane_authority_clock_admin_response_from_verified,
+    build_control_plane_unix_admission_error_response,
+    build_control_plane_unix_response_from_verified, finish_control_plane_heartbeat_response,
+    invalidate_authority_clock_restart_checkpoint, load_authority_clock_restart_checkpoint,
+    prepare_control_plane_heartbeat_response_from_verified,
+    prepare_control_plane_heartbeat_response_with_lease_horizon_authority_from_verified,
     read_control_plane_unix_request, store_authority_clock_restart_checkpoint,
-    store_validated_authority_clock_restart_checkpoint, write_control_plane_unix_response,
-    AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneAdminAuthCredentialInput,
-    ControlPlaneAuthorityClock, ControlPlaneAuthorityClockAdminSample,
-    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneAuthorityClockContext,
-    ControlPlaneAuthorityClockStatus, ControlPlaneError, ControlPlaneFrontendAuthCredential,
-    ControlPlaneFrontendAuthCredentialInput, ControlPlaneHeartbeatRefresh,
-    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
-    ControlPlaneStorageNodeAuthCredential, ControlPlaneStorageNodeAuthCredentialInput,
-    ControlPlaneUnixAuthVerifier, FencedPgMetadataTransferSnapshot, FileControlPlaneStore,
-    LeaseHorizonAuthorityBinding, PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot,
-    SingleAuthorityControlPlane, UnixControlPlaneClient,
+    store_validated_authority_clock_restart_checkpoint, verify_control_plane_unix_request,
+    write_control_plane_unix_response, AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot,
+    ClusterRuntimeMapSnapshot, ControlPlaneAdmin, ControlPlaneAdminAuthCredential,
+    ControlPlaneAdminAuthCredentialInput, ControlPlaneAuthorityClock,
+    ControlPlaneAuthorityClockAdminSample, ControlPlaneAuthorityClockCheckpointBinding,
+    ControlPlaneAuthorityClockContext, ControlPlaneAuthorityClockStatus, ControlPlaneError,
+    ControlPlaneFrontendAuthCredential, ControlPlaneFrontendAuthCredentialInput,
+    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
+    ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
+    ControlPlaneStorageNodeAuthCredentialInput, ControlPlaneUnixAuthVerifier,
+    FencedPgMetadataTransferSnapshot, FileControlPlaneStore, LeaseHorizonAuthorityBinding,
+    PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane,
+    UnixControlPlaneClient,
 };
 use storage::control_plane_auth::{
     ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
@@ -57,9 +60,9 @@ use storage::control_plane_raft::{
     handle_control_plane_raft_peer_rpc_frame, handle_control_plane_raft_peer_snapshot_frame,
     read_control_plane_raft_peer_transport_frame, write_control_plane_raft_peer_transport_frame,
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
-    ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerFrameIdentity,
-    ControlPlaneRaftPeerFrameKind, ControlPlaneRaftPeerTransportLimits,
-    ControlPlaneRaftPeerTransportPolicy,
+    ControlPlaneRaftLogId, ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy,
+    ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerFrameKind,
+    ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::{
     advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodeDataDirGuard,
@@ -87,6 +90,7 @@ use server_http::http::HttpFrontend;
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 const CONTROL_PLANE_RPC_WORKER_LIMIT: usize = 64;
+const CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT: usize = 8;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT: usize = 64;
 const CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
@@ -871,7 +875,7 @@ fn trigger_control_plane_raft_election(socket_path: &Path) -> Result<(), String>
 fn control_plane_authority_clock_status(
     socket_path: &Path,
 ) -> Result<ControlPlaneAuthorityClockStatus, String> {
-    build_admin_control_plane_client_from_command_auth_env(socket_path)?
+    build_admin_clock_recovery_client_from_command_auth_env(socket_path)?
         .authority_clock_status()
         .map_err(|error| format!("failed to read control-plane authority-clock status: {error}"))
 }
@@ -879,9 +883,21 @@ fn control_plane_authority_clock_status(
 fn reestablish_control_plane_authority_clock(
     socket_path: &Path,
 ) -> Result<ControlPlaneAuthorityClockStatus, String> {
-    build_admin_control_plane_client_from_command_auth_env(socket_path)?
+    build_admin_clock_recovery_client_from_command_auth_env(socket_path)?
         .reestablish_authority_clock()
         .map_err(|error| format!("failed to re-establish control-plane authority clock: {error}"))
+}
+
+fn control_plane_clock_recovery_socket_path(control_plane_socket_path: &Path) -> PathBuf {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for byte in control_plane_socket_path.as_os_str().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    control_plane_socket_path.with_file_name(format!(".c-{hash:016x}"))
 }
 
 fn format_authority_clock_status(status: ControlPlaneAuthorityClockStatus) -> String {
@@ -1787,6 +1803,12 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("{error}");
         std::process::exit(1);
     });
+    let recovery_socket_path = control_plane_clock_recovery_socket_path(Path::new(socket_path));
+    let recovery_listener = bind_control_plane_clock_recovery_socket(&recovery_socket_path)
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
     let store = FileControlPlaneStore::new(state_path);
     let authority_clock_checkpoint_binding = store
         .load_or_create_authority_clock_checkpoint_binding()
@@ -1846,6 +1868,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
     });
     let authority = Arc::new(Mutex::new(authority));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
+    let active_recovery_rpc_workers = Arc::new(AtomicUsize::new(0));
     let auth_verifier = build_control_plane_unix_auth_verifier(config)
         .unwrap_or_else(|error| {
             eprintln!("failed to configure control-plane auth verifier: {error}");
@@ -1853,9 +1876,10 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         })
         .map(Arc::new);
     process_info!(
-        "argmin-s3 control-plane manager using state {} on {} (lease scan {} ms)",
+        "argmin-s3 control-plane manager using state {} on {} (clock recovery {}, lease scan {} ms)",
         state_path,
         socket_path,
+        recovery_socket_path.display(),
         config.control_plane_lease_scan_interval.as_millis()
     );
     if let Some(auth_verifier) = &auth_verifier {
@@ -1870,9 +1894,30 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         Arc::clone(&authority),
         Some(Arc::clone(&authority_clock)),
         Some(Arc::clone(&authority_clock_checkpoint_target)),
-        true,
-        Arc::clone(&active_rpc_workers),
-        auth_verifier.clone(),
+        ControlPlaneRpcWorkerPolicy {
+            gate_request_time_with_authority_clock: true,
+            active_rpc_workers: Arc::clone(&active_rpc_workers),
+            worker_limit: CONTROL_PLANE_RPC_WORKER_LIMIT,
+            endpoint: ControlPlaneRpcEndpoint::Ordinary,
+            auth_verifier: auth_verifier.clone(),
+            raft_authority_admission: None,
+            durable_response_publication: None,
+        },
+    );
+    let _clock_recovery_listener_loop = spawn_control_plane_rpc_listener_loop(
+        recovery_listener,
+        Arc::clone(&authority),
+        Some(Arc::clone(&authority_clock)),
+        Some(Arc::clone(&authority_clock_checkpoint_target)),
+        ControlPlaneRpcWorkerPolicy {
+            gate_request_time_with_authority_clock: true,
+            active_rpc_workers: active_recovery_rpc_workers,
+            worker_limit: CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT,
+            endpoint: ControlPlaneRpcEndpoint::ClockRecovery,
+            auth_verifier: auth_verifier.clone(),
+            raft_authority_admission: None,
+            durable_response_publication: None,
+        },
     );
 
     loop {
@@ -1919,19 +1964,67 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
     }
 }
 
+#[derive(Clone)]
+struct ExperimentalRaftDurabilityPublication {
+    gate: Arc<Mutex<()>>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl ExperimentalRaftDurabilityPublication {
+    fn new() -> Self {
+        Self {
+            gate: Arc::new(Mutex::new(())),
+            poisoned: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    fn publish_poison(&self, before_publish: impl FnOnce()) {
+        let _publication = self
+            .gate
+            .lock()
+            .expect("experimental OpenRaft response publication mutex poisoned");
+        before_publish();
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    fn publish<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T, ControlPlaneError>,
+    ) -> Result<T, ControlPlaneError> {
+        let _publication = self
+            .gate
+            .lock()
+            .expect("experimental OpenRaft response publication mutex poisoned");
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(ControlPlaneError::RpcRemote {
+                message: "experimental OpenRaft durable authority was poisoned before response publication"
+                    .to_owned(),
+            });
+        }
+        publish()
+    }
+}
+
+// RPC workers clone this wrapper so quorum waits never hold a process-wide
+// authority mutex. Every mutable correctness field remains explicitly shared.
+#[derive(Clone)]
 struct ExperimentalRaftControlPlane {
     runtime: Handle,
     authority: Arc<ControlPlaneRaftAuthority>,
     durable_artifact_path: Option<Arc<PathBuf>>,
     durable_checkpoint_lock: Option<Arc<Mutex<()>>>,
-    durable_serving_checkpoint: Mutex<Option<ExperimentalRaftCheckpointMarker>>,
+    durable_serving_checkpoint: Arc<Mutex<Option<ExperimentalRaftCheckpointMarker>>>,
     checkpoint_serving_reads: bool,
     resample_authority_time: bool,
     authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
-    durable_poison: Option<String>,
-    durable_poison_gate: Arc<AtomicBool>,
+    durable_poison: Arc<Mutex<Option<String>>>,
+    durable_publication: ExperimentalRaftDurabilityPublication,
     #[cfg(test)]
-    after_heartbeat_commit_hook: Option<ExperimentalRaftAfterHeartbeatCommitHook>,
+    after_heartbeat_commit_hook: Arc<Mutex<Option<ExperimentalRaftAfterHeartbeatCommitHook>>>,
 }
 
 #[cfg(test)]
@@ -2004,8 +2097,13 @@ impl ExperimentalRaftControlPlane {
     }
 
     #[cfg(test)]
-    fn run_after_heartbeat_commit_hook(&mut self) -> Result<(), ControlPlaneError> {
-        let Some(hook) = self.after_heartbeat_commit_hook.take() else {
+    fn run_after_heartbeat_commit_hook(&self) -> Result<(), ControlPlaneError> {
+        let Some(hook) = self
+            .after_heartbeat_commit_hook
+            .lock()
+            .expect("experimental OpenRaft heartbeat hook mutex poisoned")
+            .take()
+        else {
             return Ok(());
         };
         hook(self)
@@ -2061,10 +2159,10 @@ impl ExperimentalRaftControlPlane {
 
     fn durable_poison_error(&self) -> Option<ControlPlaneError> {
         self.durable_poison
-            .as_ref()
-            .map(|message| ControlPlaneError::RpcRemote {
-                message: message.clone(),
-            })
+            .lock()
+            .expect("experimental OpenRaft durable poison mutex poisoned")
+            .clone()
+            .map(|message| ControlPlaneError::RpcRemote { message })
     }
 
     fn ensure_not_durably_poisoned(&self) -> Result<(), ControlPlaneError> {
@@ -2075,9 +2173,13 @@ impl ExperimentalRaftControlPlane {
         }
     }
 
-    fn poison_durable_authority(&mut self, message: String) {
-        self.durable_poison = Some(message);
-        self.durable_poison_gate.store(true, Ordering::Release);
+    fn poison_durable_authority(&self, message: String) {
+        self.durable_publication.publish_poison(|| {
+            *self
+                .durable_poison
+                .lock()
+                .expect("experimental OpenRaft durable poison mutex poisoned") = Some(message);
+        });
     }
 
     fn store_durable_restart_artifact(&self) -> Result<(), ControlPlaneError> {
@@ -2464,12 +2566,75 @@ async fn wait_for_experimental_raft_startup_catch_up(
     timeout: Duration,
     message: &'static str,
 ) -> Result<(), ControlPlaneError> {
-    let Some(committed) = authority.status().await?.committed() else {
-        return Ok(());
-    };
-    authority
-        .wait_for_applied_log_id(committed, timeout, message)
-        .await
+    wait_for_experimental_raft_startup_catch_up_from(authority, timeout, message).await
+}
+
+trait ExperimentalRaftStartupCatchUpSource {
+    type Position: Copy + Eq;
+
+    async fn committed_and_applied(
+        &self,
+    ) -> Result<(Option<Self::Position>, Option<Self::Position>), ControlPlaneError>;
+
+    async fn wait_for_applied(
+        &self,
+        position: Self::Position,
+        timeout: Duration,
+        message: &'static str,
+    ) -> Result<(), ControlPlaneError>;
+}
+
+impl ExperimentalRaftStartupCatchUpSource for ControlPlaneRaftAuthority {
+    type Position = ControlPlaneRaftLogId;
+
+    async fn committed_and_applied(
+        &self,
+    ) -> Result<(Option<Self::Position>, Option<Self::Position>), ControlPlaneError> {
+        let status = self.status().await?;
+        Ok((status.committed(), status.applied()))
+    }
+
+    async fn wait_for_applied(
+        &self,
+        position: Self::Position,
+        timeout: Duration,
+        message: &'static str,
+    ) -> Result<(), ControlPlaneError> {
+        self.wait_for_applied_log_id(position, timeout, message)
+            .await
+    }
+}
+
+async fn wait_for_experimental_raft_startup_catch_up_from<S>(
+    source: &S,
+    timeout: Duration,
+    message: &'static str,
+) -> Result<(), ControlPlaneError>
+where
+    S: ExperimentalRaftStartupCatchUpSource,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (committed, applied) = source.committed_and_applied().await?;
+        let Some(committed) = committed else {
+            return Ok(());
+        };
+        if applied == Some(committed) {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "OpenRaft startup did not apply through committed state within {timeout:?}: \
+                     {message}"
+                ),
+            });
+        }
+        source
+            .wait_for_applied(committed, deadline.saturating_duration_since(now), message)
+            .await?;
+    }
 }
 
 struct ExperimentalRaftPeerListener {
@@ -2738,6 +2903,21 @@ async fn experimental_raft_local_authority_serving_within(
     }
 }
 
+async fn wait_for_experimental_raft_local_authority_serving(
+    authority: &ControlPlaneRaftAuthority,
+    timeout: Duration,
+    message: &'static str,
+) -> Result<(), ControlPlaneError> {
+    if experimental_raft_local_authority_serving_within(authority, timeout).await? {
+        return Ok(());
+    }
+    Err(ControlPlaneError::RpcRemote {
+        message: format!(
+            "local OpenRaft authority did not become serving within {timeout:?}: {message}"
+        ),
+    })
+}
+
 async fn maybe_trigger_experimental_raft_seed_election(
     authority: &ControlPlaneRaftAuthority,
     peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
@@ -2804,28 +2984,28 @@ struct ExperimentalRaftPeerRpcWorkerContext {
 struct ExperimentalRaftPeerDurabilityContext {
     artifact_path: Option<Arc<PathBuf>>,
     checkpoint_lock: Arc<Mutex<()>>,
-    poison_gate: Arc<AtomicBool>,
+    publication: ExperimentalRaftDurabilityPublication,
 }
 
 #[derive(Clone, Copy)]
 struct ExperimentalRaftPeerRpcDurability<'a> {
     artifact_path: Option<&'a Path>,
     checkpoint_lock: Option<&'a Arc<Mutex<()>>>,
-    poison_gate: Option<&'a AtomicBool>,
+    publication: Option<&'a ExperimentalRaftDurabilityPublication>,
 }
 
 impl<'a> ExperimentalRaftPeerRpcDurability<'a> {
     const NONE: Self = Self {
         artifact_path: None,
         checkpoint_lock: None,
-        poison_gate: None,
+        publication: None,
     };
 
     fn from_context(context: &'a ExperimentalRaftPeerDurabilityContext) -> Self {
         Self {
             artifact_path: context.artifact_path.as_deref().map(PathBuf::as_path),
             checkpoint_lock: Some(&context.checkpoint_lock),
-            poison_gate: Some(context.poison_gate.as_ref()),
+            publication: Some(&context.publication),
         }
     }
 }
@@ -2937,7 +3117,7 @@ fn spawn_experimental_raft_peer_rpc_worker(
     } = context;
     if durability
         .as_ref()
-        .is_some_and(|durability| durability.poison_gate.load(Ordering::Acquire))
+        .is_some_and(|durability| durability.publication.is_poisoned())
     {
         eprintln!(
             "experimental OpenRaft control-plane peer RPC rejected: durable authority is poisoned"
@@ -2977,6 +3157,9 @@ fn spawn_experimental_raft_peer_rpc_worker(
                 eprintln!("experimental OpenRaft control-plane peer RPC failed: {error}");
             }
             Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(error)) => {
+                if let Some(durability) = &durability {
+                    durability.publication.publish_poison(|| {});
+                }
                 eprintln!(
                     "experimental OpenRaft control-plane durability checkpoint failed before peer RPC response; exiting to avoid acknowledging volatile Raft state: {error}"
                 );
@@ -3032,7 +3215,7 @@ fn handle_experimental_raft_peer_rpc_with_response_writer<WriteResponse>(
 where
     WriteResponse: FnOnce(&mut UnixStream, &[u8]) -> Result<(), ControlPlaneError>,
 {
-    ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
+    ensure_experimental_raft_peer_not_durably_poisoned(durability.publication)?;
     stream
         .set_read_timeout(Some(CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT))
         .map_err(|source| ControlPlaneError::Io {
@@ -3120,8 +3303,21 @@ where
         durability,
     )?;
 
-    ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
-    write_response(stream, &response_frame).map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)
+    publish_experimental_raft_peer_response(durability.publication, || {
+        write_response(stream, &response_frame)
+    })
+}
+
+fn publish_experimental_raft_peer_response<T>(
+    publication: Option<&ExperimentalRaftDurabilityPublication>,
+    publish: impl FnOnce() -> Result<T, ControlPlaneError>,
+) -> Result<T, ExperimentalRaftPeerRpcWorkerError> {
+    match publication {
+        Some(publication) => publication
+            .publish(publish)
+            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc),
+        None => publish().map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc),
+    }
 }
 
 fn experimental_raft_peer_auth_envelope_identity(
@@ -3163,7 +3359,7 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
     policy: &ControlPlaneRaftPeerTransportPolicy,
     durability: ExperimentalRaftPeerRpcDurability<'_>,
 ) -> Result<Vec<u8>, ExperimentalRaftPeerRpcWorkerError> {
-    ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
+    ensure_experimental_raft_peer_not_durably_poisoned(durability.publication)?;
     let raw_response_frame = block_on_control_plane_raft(runtime, async {
         match request.kind {
             ControlPlaneRaftPeerFrameKind::OrdinaryRpc => {
@@ -3225,14 +3421,14 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
         }
     }
 
-    ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
+    ensure_experimental_raft_peer_not_durably_poisoned(durability.publication)?;
     Ok(response_frame)
 }
 
 fn ensure_experimental_raft_peer_not_durably_poisoned(
-    durable_poison_gate: Option<&AtomicBool>,
+    publication: Option<&ExperimentalRaftDurabilityPublication>,
 ) -> Result<(), ExperimentalRaftPeerRpcWorkerError> {
-    if durable_poison_gate.is_some_and(|gate| gate.load(Ordering::Acquire)) {
+    if publication.is_some_and(ExperimentalRaftDurabilityPublication::is_poisoned) {
         return Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(
             ControlPlaneError::RpcRemote {
                 message: "experimental OpenRaft control-plane durable authority is poisoned; refusing peer RPC until restart".to_string(),
@@ -3305,7 +3501,7 @@ fn spawn_experimental_raft_peer_checkpoint_loop(
     thread::spawn(move || {
         let mut tracker = ExperimentalRaftPeerCheckpointTracker::new(policy);
         loop {
-            if durability.poison_gate.load(Ordering::Acquire) {
+            if durability.publication.is_poisoned() {
                 return;
             }
             if let Err(error) = checkpoint_experimental_raft_peer_wal_if_due(
@@ -3315,7 +3511,7 @@ fn spawn_experimental_raft_peer_checkpoint_loop(
                 &mut tracker,
                 Instant::now(),
             ) {
-                durability.poison_gate.store(true, Ordering::Release);
+                publish_experimental_raft_checkpoint_monitor_poison(&durability);
                 eprintln!(
                     "experimental OpenRaft control-plane bounded peer WAL checkpoint failed; exiting to avoid serving after durability failure: {error}"
                 );
@@ -3324,6 +3520,12 @@ fn spawn_experimental_raft_peer_checkpoint_loop(
             thread::sleep(tracker.policy.poll_interval);
         }
     })
+}
+
+fn publish_experimental_raft_checkpoint_monitor_poison(
+    durability: &ExperimentalRaftPeerDurabilityContext,
+) {
+    durability.publication.publish_poison(|| {});
 }
 
 fn spawn_experimental_raft_peer_listener_loop(
@@ -3412,6 +3614,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("{error}");
         std::process::exit(1);
     });
+    let recovery_socket_path = control_plane_clock_recovery_socket_path(Path::new(socket_path));
+    let recovery_listener = bind_control_plane_clock_recovery_socket(&recovery_socket_path)
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
 
     let runtime = Handle::current();
     let node_id: ControlPlaneRaftNodeId = config.control_plane_raft_node_id.unwrap_or(1);
@@ -3471,14 +3679,14 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 std::process::exit(1);
             });
     let active_raft_peer_rpc_workers = Arc::new(AtomicUsize::new(0));
-    let durable_poison_gate = Arc::new(AtomicBool::new(false));
+    let durable_publication = ExperimentalRaftDurabilityPublication::new();
     let multi_node_raft_peer_mode = raft_peer_policy
         .as_ref()
         .is_some_and(|policy| policy.peers().len() > 1);
     let raft_peer_durability = ExperimentalRaftPeerDurabilityContext {
         artifact_path: Some(Arc::clone(&durable_artifact_path)),
         checkpoint_lock: Arc::clone(&durable_checkpoint_lock),
-        poison_gate: Arc::clone(&durable_poison_gate),
+        publication: durable_publication.clone(),
     };
     let _raft_checkpoint_loop = spawn_experimental_raft_peer_checkpoint_loop(
         runtime.clone(),
@@ -3535,13 +3743,20 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                     "experimental single-node control-plane startup leadership",
                 )
                 .await?;
+            wait_for_experimental_raft_local_authority_serving(
+                &authority,
+                Duration::from_secs(1),
+                "experimental single-node control-plane startup",
+            )
+            .await?;
+        } else {
+            wait_for_experimental_raft_startup_catch_up(
+                &authority,
+                Duration::from_secs(1),
+                "experimental control-plane startup committed replay",
+            )
+            .await?;
         }
-        wait_for_experimental_raft_startup_catch_up(
-            &authority,
-            Duration::from_secs(1),
-            "experimental control-plane startup committed replay",
-        )
-        .await?;
         Ok::<_, ControlPlaneError>(())
     })
     .unwrap_or_else(|error| {
@@ -3615,14 +3830,14 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         authority: Arc::clone(&authority),
         durable_artifact_path: Some(Arc::clone(&durable_artifact_path)),
         durable_checkpoint_lock: Some(Arc::clone(&durable_checkpoint_lock)),
-        durable_serving_checkpoint: Mutex::new(None),
+        durable_serving_checkpoint: Arc::new(Mutex::new(None)),
         checkpoint_serving_reads: multi_node_raft_peer_mode,
         resample_authority_time: true,
         authority_clock: Some(Arc::clone(&authority_clock)),
-        durable_poison: None,
-        durable_poison_gate: Arc::clone(&durable_poison_gate),
+        durable_poison: Arc::new(Mutex::new(None)),
+        durable_publication: durable_publication.clone(),
         #[cfg(test)]
-        after_heartbeat_commit_hook: None,
+        after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
     };
     let should_bootstrap_control_plane_state =
         if experimental_raft_startup_bootstrap_requires_local_serving(raft_peer_policy.as_ref()) {
@@ -3648,12 +3863,13 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         );
     }
     let raft_authority = Arc::clone(&authority);
-    let authority = Arc::new(Mutex::new(control_plane));
+    let mut authority = control_plane;
     let authority_clock_checkpoint_target = Arc::new(AuthorityClockCheckpointTarget {
         path: durable_artifact_path.as_ref().clone(),
         binding: authority_clock_checkpoint_binding,
     });
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
+    let active_recovery_rpc_workers = Arc::new(AtomicUsize::new(0));
     let auth_verifier = build_control_plane_unix_auth_verifier(config)
         .unwrap_or_else(|error| {
             eprintln!("failed to configure control-plane auth verifier: {error}");
@@ -3665,9 +3881,10 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .as_deref()
         .unwrap_or("-");
     process_info!(
-        "argmin-s3 experimental durable OpenRaft control-plane manager using state {} on {} (raft node {}, peer socket {}, configured peers {}, configured auth credentials {}, lease scan {} ms)",
+        "argmin-s3 experimental durable OpenRaft control-plane manager using state {} on {} (clock recovery {}, raft node {}, peer socket {}, configured peers {}, configured auth credentials {}, lease scan {} ms)",
         state_path,
         socket_path,
+        recovery_socket_path.display(),
         node_id,
         raft_peer_socket_path,
         config.control_plane_raft_peer_sockets.len(),
@@ -3684,14 +3901,49 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         );
     }
 
-    let _rpc_listener_loop = spawn_control_plane_rpc_listener_loop(
+    let rpc_runtime = runtime.clone();
+    let rpc_raft_authority = Arc::clone(&raft_authority);
+    let raft_authority_admission: ControlPlaneRaftRpcAuthorityAdmission =
+        Arc::new(move |request| {
+            if !request.requires_raft_authority_confirmation() {
+                return Ok(());
+            }
+            block_on_control_plane_raft(
+                &rpc_runtime,
+                rpc_raft_authority.confirmed_linearized_authority_status(),
+            )
+            .map(|_| ())
+        });
+
+    let _rpc_listener_loop = spawn_cloned_control_plane_rpc_listener_loop(
         listener,
-        Arc::clone(&authority),
+        authority.clone(),
         Some(Arc::clone(&authority_clock)),
         Some(Arc::clone(&authority_clock_checkpoint_target)),
-        false,
-        Arc::clone(&active_rpc_workers),
-        auth_verifier.clone(),
+        ControlPlaneRpcWorkerPolicy {
+            gate_request_time_with_authority_clock: false,
+            active_rpc_workers: Arc::clone(&active_rpc_workers),
+            worker_limit: CONTROL_PLANE_RPC_WORKER_LIMIT,
+            endpoint: ControlPlaneRpcEndpoint::Ordinary,
+            auth_verifier: auth_verifier.clone(),
+            raft_authority_admission: Some(Arc::clone(&raft_authority_admission)),
+            durable_response_publication: Some(durable_publication.clone()),
+        },
+    );
+    let _clock_recovery_listener_loop = spawn_cloned_control_plane_rpc_listener_loop(
+        recovery_listener,
+        authority.clone(),
+        Some(Arc::clone(&authority_clock)),
+        Some(Arc::clone(&authority_clock_checkpoint_target)),
+        ControlPlaneRpcWorkerPolicy {
+            gate_request_time_with_authority_clock: false,
+            active_rpc_workers: active_recovery_rpc_workers,
+            worker_limit: CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT,
+            endpoint: ControlPlaneRpcEndpoint::ClockRecovery,
+            auth_verifier: auth_verifier.clone(),
+            raft_authority_admission: Some(raft_authority_admission),
+            durable_response_publication: Some(durable_publication),
+        },
     );
 
     loop {
@@ -3724,9 +3976,6 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             true
         };
         let expiry = if local_raft_authority_serving {
-            let mut authority = authority
-                .lock()
-                .expect("control-plane authority mutex poisoned");
             if multi_node_raft_peer_mode {
                 bootstrap_empty_experimental_raft_control_plane(&mut authority, config)
                     .unwrap_or_else(|error| {
@@ -3923,9 +4172,7 @@ fn spawn_control_plane_rpc_listener_loop<T>(
     authority: Arc<Mutex<T>>,
     authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
     authority_clock_checkpoint_target: Option<Arc<AuthorityClockCheckpointTarget>>,
-    gate_request_time_with_authority_clock: bool,
-    active_rpc_workers: Arc<AtomicUsize>,
-    auth_verifier: Option<Arc<ControlPlaneUnixAuthVerifier>>,
+    worker_policy: ControlPlaneRpcWorkerPolicy,
 ) -> thread::JoinHandle<()>
 where
     T: ControlPlaneAdmin
@@ -3942,12 +4189,10 @@ where
         match listener.accept() {
             Ok((stream, _addr)) => spawn_control_plane_rpc_worker(
                 stream,
-                Arc::clone(&authority),
+                ControlPlaneRpcWorkerAuthority::Shared(Arc::clone(&authority)),
                 authority_clock.clone(),
                 authority_clock_checkpoint_target.clone(),
-                gate_request_time_with_authority_clock,
-                Arc::clone(&active_rpc_workers),
-                auth_verifier.clone(),
+                worker_policy.clone(),
             ),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
@@ -3958,35 +4203,178 @@ where
     })
 }
 
-fn spawn_control_plane_rpc_worker(
-    mut stream: UnixStream,
-    authority: Arc<
-        Mutex<
-            impl ControlPlaneAdmin
-                + ControlPlaneHeartbeatRuntimeMapSource
-                + ControlPlaneRuntimeMapSource
-                + Send
-                + 'static,
-        >,
-    >,
+fn spawn_cloned_control_plane_rpc_listener_loop<T>(
+    listener: UnixListener,
+    authority: T,
     authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
     authority_clock_checkpoint_target: Option<Arc<AuthorityClockCheckpointTarget>>,
+    worker_policy: ControlPlaneRpcWorkerPolicy,
+) -> thread::JoinHandle<()>
+where
+    T: Clone
+        + ControlPlaneAdmin
+        + ControlPlaneHeartbeatRuntimeMapSource
+        + ControlPlaneRuntimeMapSource
+        + Send
+        + 'static,
+{
+    listener.set_nonblocking(false).unwrap_or_else(|error| {
+        eprintln!("control-plane socket failed to enter blocking accept mode: {error}");
+        std::process::exit(1);
+    });
+    thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((stream, _addr)) => spawn_control_plane_rpc_worker(
+                stream,
+                ControlPlaneRpcWorkerAuthority::PerWorker(authority.clone()),
+                authority_clock.clone(),
+                authority_clock_checkpoint_target.clone(),
+                worker_policy.clone(),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                eprintln!("control-plane socket accept failed: {error}");
+                std::process::exit(1);
+            }
+        }
+    })
+}
+
+enum ControlPlaneRpcWorkerAuthority<T> {
+    Shared(Arc<Mutex<T>>),
+    PerWorker(T),
+}
+
+impl<T> ControlPlaneRpcWorkerAuthority<T> {
+    fn with_mut<R>(
+        &mut self,
+        metrics_kind: observability::ControlPlaneRpcMetricKind,
+        operation: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        match self {
+            Self::Shared(authority) => {
+                let lock_started = Instant::now();
+                let mut authority = authority
+                    .lock()
+                    .expect("control-plane authority mutex poisoned");
+                observability::record_control_plane_rpc_lock_wait(
+                    metrics_kind,
+                    lock_started.elapsed(),
+                );
+                operation(&mut authority)
+            }
+            Self::PerWorker(authority) => {
+                observability::record_control_plane_rpc_lock_wait(metrics_kind, Duration::ZERO);
+                operation(authority)
+            }
+        }
+    }
+}
+
+type ControlPlaneRaftRpcAuthorityAdmission = Arc<
+    dyn Fn(&storage::control_plane::VerifiedControlPlaneRpcRequest) -> Result<(), ControlPlaneError>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlPlaneRpcEndpoint {
+    Ordinary,
+    ClockRecovery,
+}
+
+impl ControlPlaneRpcEndpoint {
+    fn accepts(self, request: &storage::control_plane::VerifiedControlPlaneRpcRequest) -> bool {
+        match self {
+            Self::Ordinary => !request.is_authority_clock_admin(),
+            Self::ClockRecovery => request.is_authority_clock_admin(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ControlPlaneRpcWorkerPolicy {
     gate_request_time_with_authority_clock: bool,
     active_rpc_workers: Arc<AtomicUsize>,
+    worker_limit: usize,
+    endpoint: ControlPlaneRpcEndpoint,
     auth_verifier: Option<Arc<ControlPlaneUnixAuthVerifier>>,
-) {
-    match active_rpc_workers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-        (active < CONTROL_PLANE_RPC_WORKER_LIMIT).then_some(active + 1)
-    }) {
-        Ok(_) => {}
-        Err(_) => {
-            eprintln!("control-plane RPC rejected: worker limit reached");
-            return;
+    raft_authority_admission: Option<ControlPlaneRaftRpcAuthorityAdmission>,
+    durable_response_publication: Option<ExperimentalRaftDurabilityPublication>,
+}
+
+enum ControlPlaneRpcAdmissionFailure {
+    Unauthenticated(Box<ControlPlaneError>),
+    Authenticated {
+        request: Box<storage::control_plane::VerifiedControlPlaneRpcRequest>,
+        error: Box<ControlPlaneError>,
+    },
+}
+
+fn authenticate_and_admit_control_plane_rpc(
+    request: storage::control_plane::ControlPlaneRpcRequest,
+    worker_policy: &ControlPlaneRpcWorkerPolicy,
+    authority_now_ms: u64,
+) -> Result<storage::control_plane::VerifiedControlPlaneRpcRequest, ControlPlaneRpcAdmissionFailure>
+{
+    let request = verify_control_plane_unix_request(
+        request,
+        worker_policy.auth_verifier.as_deref(),
+        authority_now_ms,
+    )
+    .map_err(|error| ControlPlaneRpcAdmissionFailure::Unauthenticated(Box::new(error)))?;
+    if !worker_policy.endpoint.accepts(&request) {
+        let error = ControlPlaneError::RpcProtocol {
+            message: match worker_policy.endpoint {
+                ControlPlaneRpcEndpoint::Ordinary => {
+                    "authority-clock administration requires the dedicated recovery endpoint"
+                        .to_owned()
+                }
+                ControlPlaneRpcEndpoint::ClockRecovery => {
+                    "dedicated authority-clock recovery endpoint rejects ordinary control-plane RPCs"
+                        .to_owned()
+                }
+            },
+        };
+        return Err(ControlPlaneRpcAdmissionFailure::Authenticated {
+            request: Box::new(request),
+            error: Box::new(error),
+        });
+    }
+    if let Some(admission) = &worker_policy.raft_authority_admission {
+        if let Err(error) = admission(&request) {
+            return Err(ControlPlaneRpcAdmissionFailure::Authenticated {
+                request: Box::new(request),
+                error: Box::new(error),
+            });
         }
+    }
+    Ok(request)
+}
+
+fn spawn_control_plane_rpc_worker<T>(
+    mut stream: UnixStream,
+    mut authority: ControlPlaneRpcWorkerAuthority<T>,
+    authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
+    authority_clock_checkpoint_target: Option<Arc<AuthorityClockCheckpointTarget>>,
+    worker_policy: ControlPlaneRpcWorkerPolicy,
+) where
+    T: ControlPlaneAdmin
+        + ControlPlaneHeartbeatRuntimeMapSource
+        + ControlPlaneRuntimeMapSource
+        + Send
+        + 'static,
+{
+    if !reserve_control_plane_rpc_worker(
+        &worker_policy.active_rpc_workers,
+        worker_policy.worker_limit,
+    ) {
+        eprintln!("control-plane RPC rejected: worker limit reached");
+        return;
     }
     thread::spawn(move || {
         let _guard = ControlPlaneRpcWorkerGuard {
-            active_rpc_workers: Arc::clone(&active_rpc_workers),
+            active_rpc_workers: Arc::clone(&worker_policy.active_rpc_workers),
         };
         if let Err(error) = stream.set_nonblocking(false) {
             eprintln!("control-plane RPC failed to set blocking mode: {error}");
@@ -4008,16 +4396,28 @@ fn spawn_control_plane_rpc_worker(
             }
         };
         let metrics_kind = request.metrics_kind();
+        let request = match authenticate_and_admit_control_plane_rpc(
+            request,
+            &worker_policy,
+            storage::clock::current_time_millis(),
+        ) {
+            Ok(request) => request,
+            Err(ControlPlaneRpcAdmissionFailure::Unauthenticated(error)) => {
+                eprintln!("control-plane RPC authentication failed: {error}");
+                return;
+            }
+            Err(ControlPlaneRpcAdmissionFailure::Authenticated { request, error }) => {
+                let response = build_control_plane_unix_admission_error_response(
+                    *request,
+                    *error,
+                    storage::clock::current_time_millis(),
+                );
+                write_control_plane_rpc_admission_response(&mut stream, metrics_kind, response);
+                return;
+            }
+        };
         let response = (|| {
             if request.is_authority_clock_admin() {
-                let lock_started = Instant::now();
-                let authority = authority
-                    .lock()
-                    .expect("control-plane authority mutex poisoned");
-                observability::record_control_plane_rpc_lock_wait(
-                    metrics_kind,
-                    lock_started.elapsed(),
-                );
                 let _operation_timer =
                     observability::control_plane_rpc_operation_timer(metrics_kind);
                 let authority_clock =
@@ -4031,21 +4431,22 @@ fn spawn_control_plane_rpc_worker(
                 let mut authority_clock = authority_clock
                     .lock()
                     .expect("control-plane authority clock mutex poisoned");
-                let response = build_control_plane_authority_clock_admin_response(
-                    &*authority,
-                    &mut authority_clock,
-                    request,
-                    auth_verifier.as_deref(),
-                    ControlPlaneAuthorityClockAdminSample::from_process_clock()?,
-                    |authority, authority_clock| {
-                        persist_established_authority_clock_checkpoint(
-                            authority,
-                            authority_clock,
-                            authority_clock_checkpoint_target.as_deref(),
-                        )
-                    },
-                    || Ok(storage::clock::current_time_millis()),
-                );
+                let response = authority.with_mut(metrics_kind, |authority| {
+                    build_control_plane_authority_clock_admin_response_from_verified(
+                        &*authority,
+                        &mut authority_clock,
+                        request,
+                        ControlPlaneAuthorityClockAdminSample::from_process_clock()?,
+                        |authority, authority_clock| {
+                            persist_established_authority_clock_checkpoint(
+                                authority,
+                                authority_clock,
+                                authority_clock_checkpoint_target.as_deref(),
+                            )
+                        },
+                        || Ok(storage::clock::current_time_millis()),
+                    )
+                });
                 invalidate_blocked_authority_clock_checkpoint(
                     &authority_clock,
                     authority_clock_checkpoint_target.as_deref(),
@@ -4053,18 +4454,58 @@ fn spawn_control_plane_rpc_worker(
                 response
             } else if request.is_refresh_node_heartbeat() {
                 let prepared = {
-                    let lock_started = Instant::now();
-                    let mut authority = authority
-                        .lock()
-                        .expect("control-plane authority mutex poisoned");
-                    observability::record_control_plane_rpc_lock_wait(
-                        metrics_kind,
-                        lock_started.elapsed(),
-                    );
                     let _operation_timer =
                         observability::control_plane_rpc_operation_timer(metrics_kind);
-                    let (now_ms, lease_horizon_authority) = match &authority_clock {
-                        Some(authority_clock) if gate_request_time_with_authority_clock => {
+                    authority.with_mut(metrics_kind, |authority| {
+                        let (now_ms, lease_horizon_authority) = match &authority_clock {
+                            Some(authority_clock)
+                                if worker_policy.gate_request_time_with_authority_clock =>
+                            {
+                                let mut authority_clock = authority_clock
+                                    .lock()
+                                    .expect("control-plane authority clock mutex poisoned");
+                                let now_ms = authority_clock.effective_process_now_ms();
+                                invalidate_blocked_authority_clock_checkpoint(
+                                    &authority_clock,
+                                    authority_clock_checkpoint_target.as_deref(),
+                                )?;
+                                let now_ms = now_ms?;
+                                let lease_horizon_authority =
+                                    authority_clock.lease_horizon_authority_binding(None)?;
+                                (now_ms, Some(lease_horizon_authority))
+                            }
+                            _ => (storage::clock::current_time_millis(), None),
+                        };
+                        match lease_horizon_authority {
+                            Some(lease_horizon_authority) => {
+                                prepare_control_plane_heartbeat_response_with_lease_horizon_authority_from_verified(
+                                    authority,
+                                    request,
+                                    now_ms,
+                                    lease_horizon_authority,
+                                )
+                            }
+                            None => prepare_control_plane_heartbeat_response_from_verified(
+                                authority,
+                                request,
+                                now_ms,
+                            ),
+                        }
+                    })
+                };
+                prepared.and_then(|prepared| {
+                    finish_control_plane_heartbeat_response(prepared, || {
+                        Ok(storage::clock::current_time_millis())
+                    })
+                })
+            } else {
+                let _operation_timer =
+                    observability::control_plane_rpc_operation_timer(metrics_kind);
+                authority.with_mut(metrics_kind, |authority| {
+                    let now_ms = match &authority_clock {
+                        Some(authority_clock)
+                            if worker_policy.gate_request_time_with_authority_clock =>
+                        {
                             let mut authority_clock = authority_clock
                                 .lock()
                                 .expect("control-plane authority clock mutex poisoned");
@@ -4073,73 +4514,17 @@ fn spawn_control_plane_rpc_worker(
                                 &authority_clock,
                                 authority_clock_checkpoint_target.as_deref(),
                             )?;
-                            let now_ms = now_ms?;
-                            let lease_horizon_authority =
-                                authority_clock.lease_horizon_authority_binding(None)?;
-                            (now_ms, Some(lease_horizon_authority))
+                            now_ms?
                         }
-                        _ => (storage::clock::current_time_millis(), None),
+                        _ => storage::clock::current_time_millis(),
                     };
-                    match lease_horizon_authority {
-                        Some(lease_horizon_authority) => {
-                            prepare_control_plane_heartbeat_response_with_lease_horizon_authority(
-                                &mut *authority,
-                                request,
-                                now_ms,
-                                lease_horizon_authority,
-                                auth_verifier.as_deref(),
-                            )
-                        }
-                        None => prepare_control_plane_heartbeat_response(
-                            &mut *authority,
-                            request,
-                            now_ms,
-                            auth_verifier.as_deref(),
-                        ),
-                    }
-                };
-                prepared.and_then(|prepared| {
-                    finish_control_plane_heartbeat_response(prepared, || {
-                        Ok(storage::clock::current_time_millis())
-                    })
+                    build_control_plane_unix_response_from_verified(
+                        authority,
+                        request,
+                        now_ms,
+                        || Ok(storage::clock::current_time_millis()),
+                    )
                 })
-            } else {
-                let lock_started = Instant::now();
-                let mut authority = authority
-                    .lock()
-                    .expect("control-plane authority mutex poisoned");
-                observability::record_control_plane_rpc_lock_wait(
-                    metrics_kind,
-                    lock_started.elapsed(),
-                );
-                let _operation_timer =
-                    observability::control_plane_rpc_operation_timer(metrics_kind);
-                let now_ms = match &authority_clock {
-                    Some(authority_clock) if gate_request_time_with_authority_clock => {
-                        let mut authority_clock = authority_clock
-                            .lock()
-                            .expect("control-plane authority clock mutex poisoned");
-                        let now_ms = authority_clock.effective_process_now_ms();
-                        invalidate_blocked_authority_clock_checkpoint(
-                            &authority_clock,
-                            authority_clock_checkpoint_target.as_deref(),
-                        )?;
-                        now_ms?
-                    }
-                    _ => storage::clock::current_time_millis(),
-                };
-                match auth_verifier.as_deref() {
-                    Some(auth_verifier) => {
-                        build_control_plane_unix_response_with_auth_and_response_clock(
-                            &mut *authority,
-                            request,
-                            now_ms,
-                            Some(auth_verifier),
-                            || Ok(storage::clock::current_time_millis()),
-                        )
-                    }
-                    None => build_control_plane_unix_response(&mut *authority, request, now_ms),
-                }
             }
         })();
         if let Some(authority_clock) = &authority_clock {
@@ -4164,7 +4549,12 @@ fn spawn_control_plane_rpc_worker(
             }
         };
         let response_write_started = Instant::now();
-        let response_result = write_control_plane_unix_response(&mut stream, response);
+        let response_result = match &worker_policy.durable_response_publication {
+            Some(publication) => {
+                publication.publish(|| write_control_plane_unix_response(&mut stream, response))
+            }
+            None => write_control_plane_unix_response(&mut stream, response),
+        };
         observability::record_control_plane_rpc_response_write(
             metrics_kind,
             response_write_started.elapsed(),
@@ -4173,6 +4563,37 @@ fn spawn_control_plane_rpc_worker(
             eprintln!("control-plane RPC response failed: {error}");
         }
     });
+}
+
+fn reserve_control_plane_rpc_worker(active_rpc_workers: &AtomicUsize, worker_limit: usize) -> bool {
+    active_rpc_workers
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < worker_limit).then_some(active + 1)
+        })
+        .is_ok()
+}
+
+fn write_control_plane_rpc_admission_response(
+    stream: &mut UnixStream,
+    metrics_kind: observability::ControlPlaneRpcMetricKind,
+    response: Result<storage::control_plane::ControlPlaneRpcResponse, ControlPlaneError>,
+) {
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("control-plane RPC admission response build failed: {error}");
+            return;
+        }
+    };
+    let response_write_started = Instant::now();
+    let response_result = write_control_plane_unix_response(stream, response);
+    observability::record_control_plane_rpc_response_write(
+        metrics_kind,
+        response_write_started.elapsed(),
+    );
+    if let Err(error) = response_result {
+        eprintln!("control-plane RPC admission response failed: {error}");
+    }
 }
 
 #[derive(Debug)]
@@ -4715,6 +5136,26 @@ fn build_admin_control_plane_client_from_command_auth_env(
     control_plane_socket_path: &Path,
 ) -> Result<AdminControlPlaneClient, String> {
     let client = build_command_unix_control_plane_client(control_plane_socket_path)?;
+    build_admin_control_plane_client_with_command_auth_env(client)
+}
+
+fn build_admin_clock_recovery_client_from_command_auth_env(
+    control_plane_socket_path: &Path,
+) -> Result<AdminControlPlaneClient, String> {
+    let client = build_command_unix_control_plane_client(control_plane_socket_path)?;
+    let client = UnixControlPlaneClient::with_socket_paths(
+        client
+            .socket_paths()
+            .iter()
+            .map(|path| control_plane_clock_recovery_socket_path(path)),
+    )
+    .map_err(|error| format!("invalid control-plane clock recovery socket paths: {error}"))?;
+    build_admin_control_plane_client_with_command_auth_env(client)
+}
+
+fn build_admin_control_plane_client_with_command_auth_env(
+    client: UnixControlPlaneClient,
+) -> Result<AdminControlPlaneClient, String> {
     match ConfiguredControlPlaneAdminCommandAuth::from_env()? {
         Some(auth_config) => {
             let configured = latest_admin_auth_credential_for_instance(
@@ -4855,6 +5296,10 @@ fn latest_auth_credential_by_version_then_id<'a, T>(
 
 fn bind_control_plane_socket(socket_path: &Path) -> Result<UnixListener, String> {
     bind_control_plane_unix_socket(socket_path, "ARGMIN_CONTROL_PLANE_SOCKET_PATH")
+}
+
+fn bind_control_plane_clock_recovery_socket(socket_path: &Path) -> Result<UnixListener, String> {
+    bind_control_plane_unix_socket(socket_path, "derived control-plane clock recovery socket")
 }
 
 fn bind_control_plane_raft_peer_socket(socket_path: &Path) -> Result<UnixListener, String> {
@@ -5734,6 +6179,7 @@ mod tests {
     use openraft::impls::{BasicNode, Vote};
     use openraft::raft::{TransferLeaderRequest, VoteRequest};
     use storage::control_plane::{
+        build_control_plane_unix_response_with_auth_and_response_clock,
         handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeAvailabilityState,
         NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
     };
@@ -5743,6 +6189,245 @@ mod tests {
     use storage::control_plane_raft::{
         ControlPlaneRaftLeaderId, ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerRpcRequest,
     };
+
+    #[test]
+    fn authority_clock_recovery_workers_are_reserved_at_connection_admission() {
+        let ordinary_workers = AtomicUsize::new(CONTROL_PLANE_RPC_WORKER_LIMIT);
+        let recovery_workers = AtomicUsize::new(0);
+
+        assert!(!reserve_control_plane_rpc_worker(
+            &ordinary_workers,
+            CONTROL_PLANE_RPC_WORKER_LIMIT
+        ));
+        assert!(reserve_control_plane_rpc_worker(
+            &recovery_workers,
+            CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT
+        ));
+        assert_eq!(recovery_workers.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn post_admission_raft_wait_does_not_block_recovery_authority_access() {
+        #[derive(Clone)]
+        struct TestRaftAuthority;
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let ordinary_release = Arc::clone(&release);
+        let mut ordinary = ControlPlaneRpcWorkerAuthority::PerWorker(TestRaftAuthority);
+        let ordinary_worker = thread::spawn(move || {
+            ordinary.with_mut(
+                observability::ControlPlaneRpcMetricKind::RuntimeMapSnapshot,
+                |_| {
+                    entered_tx
+                        .send(())
+                        .expect("ordinary worker should report entering quorum wait");
+                    let (released, wake) = &*ordinary_release;
+                    let mut released = released
+                        .lock()
+                        .expect("quorum-wait test mutex should not be poisoned");
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .expect("quorum-wait test mutex should not be poisoned");
+                    }
+                },
+            );
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ordinary worker should reach its post-admission quorum wait");
+
+        let (recovery_tx, recovery_rx) = std::sync::mpsc::channel();
+        let recovery_worker = thread::spawn(move || {
+            let mut recovery = ControlPlaneRpcWorkerAuthority::PerWorker(TestRaftAuthority);
+            recovery.with_mut(
+                observability::ControlPlaneRpcMetricKind::AuthorityClockStatus,
+                |_| (),
+            );
+            recovery_tx
+                .send(())
+                .expect("recovery worker completion should be observed");
+        });
+        recovery_rx.recv_timeout(Duration::from_secs(1)).expect(
+            "recovery authority access must not wait for an ordinary worker's quorum timeout",
+        );
+
+        let (released, wake) = &*release;
+        *released
+            .lock()
+            .expect("quorum-wait test mutex should not be poisoned") = true;
+        wake.notify_one();
+        ordinary_worker
+            .join()
+            .expect("ordinary quorum-wait worker should exit");
+        recovery_worker
+            .join()
+            .expect("recovery authority worker should exit");
+    }
+
+    #[test]
+    fn saturated_ordinary_worker_pool_does_not_block_clock_recovery_endpoint() {
+        let tmp = test_util::tempdir();
+        let authority = Arc::new(Mutex::new(
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+                tmp.path().join("control-plane.state"),
+            ))
+            .unwrap(),
+        ));
+        let now_ms = storage::clock::current_time_millis();
+        let authority_clock = Arc::new(Mutex::new(
+            ControlPlaneAuthorityClock::new(
+                None,
+                now_ms,
+                storage::clock::clock_health_time_millis(),
+            )
+            .unwrap(),
+        ));
+        let admin_credential =
+            ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
+                instance_id: "admin-1".to_owned(),
+                credential_id: "admin-1".to_owned(),
+                credential_version: 1,
+                secret: b"admin-test-secret".to_vec(),
+            })
+            .unwrap();
+        let verifier = Arc::new(
+            ControlPlaneUnixAuthVerifier::new_empty("auth-cluster")
+                .unwrap()
+                .with_admin_credentials(vec![admin_credential.clone()])
+                .unwrap(),
+        );
+        let ordinary_workers = Arc::new(AtomicUsize::new(0));
+        let ordinary_policy = ControlPlaneRpcWorkerPolicy {
+            gate_request_time_with_authority_clock: false,
+            active_rpc_workers: Arc::clone(&ordinary_workers),
+            worker_limit: CONTROL_PLANE_RPC_WORKER_LIMIT,
+            endpoint: ControlPlaneRpcEndpoint::Ordinary,
+            auth_verifier: Some(Arc::clone(&verifier)),
+            raft_authority_admission: None,
+            durable_response_publication: None,
+        };
+        let mut incomplete_clients = Vec::new();
+        for _ in 0..CONTROL_PLANE_RPC_WORKER_LIMIT {
+            let (server, client) = UnixStream::pair().unwrap();
+            spawn_control_plane_rpc_worker(
+                server,
+                ControlPlaneRpcWorkerAuthority::Shared(Arc::clone(&authority)),
+                Some(Arc::clone(&authority_clock)),
+                None,
+                ordinary_policy.clone(),
+            );
+            incomplete_clients.push(client);
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while ordinary_workers.load(Ordering::Acquire) != CONTROL_PLANE_RPC_WORKER_LIMIT {
+            assert!(
+                Instant::now() < deadline,
+                "ordinary worker pool did not saturate"
+            );
+            thread::yield_now();
+        }
+
+        let recovery_socket = tmp.path().join("clock-recovery.sock");
+        let recovery_listener = UnixListener::bind(&recovery_socket).unwrap();
+        let client_credential = admin_credential.scoped_for_cluster("auth-cluster").unwrap();
+        let client = thread::spawn(move || {
+            AuthenticatedUnixControlPlaneClient::new(
+                UnixControlPlaneClient::new(recovery_socket),
+                client_credential,
+            )
+            .authority_clock_status(now_ms)
+        });
+        let (recovery_stream, _) = recovery_listener.accept().unwrap();
+        let recovery_workers = Arc::new(AtomicUsize::new(0));
+        spawn_control_plane_rpc_worker(
+            recovery_stream,
+            ControlPlaneRpcWorkerAuthority::Shared(Arc::clone(&authority)),
+            Some(Arc::clone(&authority_clock)),
+            None,
+            ControlPlaneRpcWorkerPolicy {
+                gate_request_time_with_authority_clock: false,
+                active_rpc_workers: Arc::clone(&recovery_workers),
+                worker_limit: CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT,
+                endpoint: ControlPlaneRpcEndpoint::ClockRecovery,
+                auth_verifier: Some(verifier),
+                raft_authority_admission: None,
+                durable_response_publication: None,
+            },
+        );
+
+        assert!(client.join().unwrap().unwrap().established());
+        assert_eq!(ordinary_workers.load(Ordering::Acquire), 64);
+        drop(incomplete_clients);
+    }
+
+    #[test]
+    fn clock_recovery_socket_is_distinct_and_shorter_than_standard_process_socket() {
+        let socket = Path::new("/tmp/private/control-plane-101.sock");
+        let recovery = control_plane_clock_recovery_socket_path(socket);
+
+        assert_eq!(recovery.parent(), socket.parent());
+        assert_ne!(recovery, socket);
+        assert!(recovery.as_os_str().as_bytes().len() <= socket.as_os_str().as_bytes().len());
+    }
+
+    #[test]
+    fn invalid_control_plane_auth_cannot_invoke_raft_admission() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let credential = |secret: &[u8]| {
+            ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
+                instance_id: "frontend-1".to_owned(),
+                credential_id: "frontend-1".to_owned(),
+                credential_version: 1,
+                secret: secret.to_vec(),
+            })
+            .unwrap()
+        };
+        let verifier = ControlPlaneUnixAuthVerifier::new_empty("auth-cluster")
+            .unwrap()
+            .with_frontend_credentials(vec![credential(b"expected-secret")])
+            .unwrap();
+        let client_credential = credential(b"wrong-secret")
+            .scoped_for_cluster("auth-cluster")
+            .unwrap();
+        let client_socket_path = socket_path.clone();
+        let client = thread::spawn(move || {
+            AuthenticatedUnixControlPlaneClient::new(
+                UnixControlPlaneClient::new(client_socket_path),
+                client_credential,
+            )
+            .runtime_map_status_with_check_applied_timeout(2_000)
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_control_plane_unix_request(&mut stream).unwrap();
+        let admission_calls = Arc::new(AtomicUsize::new(0));
+        let admission_calls_for_policy = Arc::clone(&admission_calls);
+        let policy = ControlPlaneRpcWorkerPolicy {
+            gate_request_time_with_authority_clock: false,
+            active_rpc_workers: Arc::new(AtomicUsize::new(0)),
+            worker_limit: CONTROL_PLANE_RPC_WORKER_LIMIT,
+            endpoint: ControlPlaneRpcEndpoint::Ordinary,
+            auth_verifier: Some(Arc::new(verifier)),
+            raft_authority_admission: Some(Arc::new(move |_| {
+                admission_calls_for_policy.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })),
+            durable_response_publication: None,
+        };
+
+        assert!(matches!(
+            authenticate_and_admit_control_plane_rpc(request, &policy, 2_000),
+            Err(ControlPlaneRpcAdmissionFailure::Unauthenticated(_))
+        ));
+        assert_eq!(admission_calls.load(Ordering::Acquire), 0);
+        let invalid_magic = [0; b"argmin-control-plane-rpc".len()];
+        std::io::Write::write_all(&mut stream, &invalid_magic).unwrap();
+        drop(stream);
+        assert!(client.join().unwrap().is_err());
+    }
 
     fn durable_raft_artifact_vote(path: &Path) -> Option<Vote<ControlPlaneRaftLeaderId>> {
         let artifact =
@@ -6464,6 +7149,77 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn experimental_raft_startup_catch_up_rechecks_advanced_committed_watermark() {
+        struct ScriptedCatchUpSource {
+            statuses: Mutex<std::collections::VecDeque<(Option<u64>, Option<u64>)>>,
+            waited_for: Mutex<Vec<u64>>,
+        }
+
+        impl ExperimentalRaftStartupCatchUpSource for ScriptedCatchUpSource {
+            type Position = u64;
+
+            async fn committed_and_applied(
+                &self,
+            ) -> Result<(Option<Self::Position>, Option<Self::Position>), ControlPlaneError>
+            {
+                Ok(self
+                    .statuses
+                    .lock()
+                    .expect("scripted status mutex should not be poisoned")
+                    .pop_front()
+                    .expect("catch-up loop requested an unexpected status"))
+            }
+
+            async fn wait_for_applied(
+                &self,
+                position: Self::Position,
+                _timeout: Duration,
+                _message: &'static str,
+            ) -> Result<(), ControlPlaneError> {
+                self.waited_for
+                    .lock()
+                    .expect("scripted wait mutex should not be poisoned")
+                    .push(position);
+                Ok(())
+            }
+        }
+
+        let source = ScriptedCatchUpSource {
+            statuses: Mutex::new(std::collections::VecDeque::from([
+                (Some(1), None),
+                (Some(2), Some(1)),
+                (Some(2), Some(2)),
+            ])),
+            waited_for: Mutex::new(Vec::new()),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("catch-up test runtime should build");
+
+        runtime
+            .block_on(wait_for_experimental_raft_startup_catch_up_from(
+                &source,
+                Duration::from_secs(1),
+                "scripted advancing committed watermark",
+            ))
+            .expect("catch-up should follow the advanced committed watermark");
+
+        assert_eq!(
+            *source
+                .waited_for
+                .lock()
+                .expect("scripted wait mutex should not be poisoned"),
+            vec![1, 2]
+        );
+        assert!(source
+            .statuses
+            .lock()
+            .expect("scripted status mutex should not be poisoned")
+            .is_empty());
+    }
+
     struct ExperimentalRaftTestHarness {
         runtime: tokio::runtime::Runtime,
         authority: Arc<ControlPlaneRaftAuthority>,
@@ -6527,6 +7283,13 @@ mod tests {
                 )
                 .await
                 .expect("single-node raft should become leader");
+            wait_for_experimental_raft_local_authority_serving(
+                &authority,
+                Duration::from_secs(1),
+                "experimental process test committed membership",
+            )
+            .await
+            .expect("single-node raft should apply committed membership and become serving");
             Arc::new(authority)
         });
         let control_plane = ExperimentalRaftControlPlane {
@@ -6534,19 +7297,114 @@ mod tests {
             authority: Arc::clone(&authority),
             durable_artifact_path: None,
             durable_checkpoint_lock: None,
-            durable_serving_checkpoint: Mutex::new(None),
+            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
             authority_clock: None,
-            durable_poison: None,
-            durable_poison_gate: Arc::new(AtomicBool::new(false)),
-            after_heartbeat_commit_hook: None,
+            durable_poison: Arc::new(Mutex::new(None)),
+            durable_publication: ExperimentalRaftDurabilityPublication::new(),
+            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
         };
         ExperimentalRaftTestHarness {
             runtime,
             authority,
             control_plane,
         }
+    }
+
+    #[test]
+    fn cloned_raft_wrapper_suppresses_response_publication_after_concurrent_poison() {
+        let harness = experimental_raft_test_harness("cloned-response-poison");
+        let in_flight = harness.control_plane.clone();
+        let poisoner = harness.control_plane.clone();
+        let publication = in_flight.durable_publication.clone();
+        let published = Arc::new(AtomicBool::new(false));
+        let worker_published = Arc::clone(&published);
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            in_flight
+                .ensure_not_durably_poisoned()
+                .expect("in-flight clone should pass its initial poison check");
+            admitted_tx
+                .send(())
+                .expect("in-flight clone should report admission");
+            resume_rx
+                .recv()
+                .expect("in-flight clone should be released after poison");
+            publication.publish(|| {
+                worker_published.store(true, Ordering::Release);
+                Ok(())
+            })
+        });
+        admitted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("in-flight clone should pass its initial poison check");
+
+        poisoner.poison_durable_authority(
+            "test durability failure after another clone passed admission".to_owned(),
+        );
+        resume_tx
+            .send(())
+            .expect("in-flight clone should resume after poison publication");
+        let error = worker
+            .join()
+            .expect("in-flight clone worker should exit")
+            .expect_err("response publication after poison must fail closed");
+        assert!(error
+            .to_string()
+            .contains("poisoned before response publication"));
+        assert!(!published.load(Ordering::Acquire));
+        assert!(harness.control_plane.ensure_not_durably_poisoned().is_err());
+        harness.shutdown();
+    }
+
+    #[test]
+    fn wal_checkpoint_monitor_poison_suppresses_parked_peer_response_publication() {
+        let harness = experimental_raft_test_harness("monitor-response-poison");
+        let publication = harness.control_plane.durable_publication.clone();
+        let durability = ExperimentalRaftPeerDurabilityContext {
+            artifact_path: None,
+            checkpoint_lock: Arc::new(Mutex::new(())),
+            publication: publication.clone(),
+        };
+        let published = Arc::new(AtomicBool::new(false));
+        let worker_published = Arc::clone(&published);
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            assert!(!publication.is_poisoned());
+            checked_tx
+                .send(())
+                .expect("response worker should report its early poison check");
+            resume_rx
+                .recv()
+                .expect("response worker should resume after monitor poison");
+            publish_experimental_raft_peer_response(Some(&publication), || {
+                worker_published.store(true, Ordering::Release);
+                Ok(())
+            })
+        });
+        checked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("response worker should pass its early poison check");
+
+        publish_experimental_raft_checkpoint_monitor_poison(&durability);
+        resume_tx
+            .send(())
+            .expect("response worker should resume after monitor poison");
+        let error = worker
+            .join()
+            .expect("response worker should exit")
+            .expect_err("monitor poison must suppress parked response publication");
+        assert!(matches!(
+            error,
+            ExperimentalRaftPeerRpcWorkerError::PeerRpc(error)
+                if error.to_string().contains("poisoned before response publication")
+        ));
+        assert!(!published.load(Ordering::Acquire));
+        assert!(harness.control_plane.durable_publication.is_poisoned());
+        harness.shutdown();
     }
 
     fn experimental_raft_peer_auth_credential(
@@ -6696,7 +7554,7 @@ mod tests {
                 )
                 .await
                 .expect("single-node durable raft should become leader");
-            wait_for_experimental_raft_startup_catch_up(
+            wait_for_experimental_raft_local_authority_serving(
                 &authority,
                 Duration::from_secs(1),
                 "durable experimental process test committed replay",
@@ -6714,13 +7572,13 @@ mod tests {
             authority: Arc::clone(&authority),
             durable_artifact_path: Some(Arc::new(state_path.to_path_buf())),
             durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
-            durable_serving_checkpoint: Mutex::new(None),
+            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
             authority_clock: None,
-            durable_poison: None,
-            durable_poison_gate: Arc::new(AtomicBool::new(false)),
-            after_heartbeat_commit_hook: None,
+            durable_poison: Arc::new(Mutex::new(None)),
+            durable_publication: ExperimentalRaftDurabilityPublication::new(),
+            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
         };
         ExperimentalRaftTestHarness {
             runtime,
@@ -6749,13 +7607,13 @@ mod tests {
             authority: Arc::clone(&harness.authority),
             durable_artifact_path: None,
             durable_checkpoint_lock: None,
-            durable_serving_checkpoint: Mutex::new(None),
+            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
             authority_clock: None,
-            durable_poison: None,
-            durable_poison_gate: Arc::new(AtomicBool::new(false)),
-            after_heartbeat_commit_hook: None,
+            durable_poison: Arc::new(Mutex::new(None)),
+            durable_publication: ExperimentalRaftDurabilityPublication::new(),
+            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
         };
         std::thread::spawn(move || {
             for request_index in 0..request_count {
@@ -6936,7 +7794,7 @@ mod tests {
                 )
                 .await
                 .expect("single-node raft should become leader");
-            wait_for_experimental_raft_startup_catch_up(
+            wait_for_experimental_raft_local_authority_serving(
                 &authority,
                 Duration::from_secs(1),
                 "restarted durable experimental process test committed replay",
@@ -6967,13 +7825,13 @@ mod tests {
             authority: Arc::clone(&authority),
             durable_artifact_path: Some(Arc::new(state_path.clone())),
             durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
-            durable_serving_checkpoint: Mutex::new(None),
+            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
             authority_clock: None,
-            durable_poison: None,
-            durable_poison_gate: Arc::new(AtomicBool::new(false)),
-            after_heartbeat_commit_hook: None,
+            durable_poison: Arc::new(Mutex::new(None)),
+            durable_publication: ExperimentalRaftDurabilityPublication::new(),
+            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
         };
         bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
@@ -7022,6 +7880,13 @@ mod tests {
                 )
                 .await
                 .expect("single-node raft should become leader");
+            wait_for_experimental_raft_local_authority_serving(
+                &authority,
+                Duration::from_secs(1),
+                "checkpoint poison test committed membership",
+            )
+            .await
+            .expect("single-node raft should apply committed membership");
             Arc::new(authority)
         });
         let mut control_plane = ExperimentalRaftControlPlane {
@@ -7029,13 +7894,13 @@ mod tests {
             authority: Arc::clone(&authority),
             durable_artifact_path: Some(Arc::new(invalid_checkpoint_path)),
             durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
-            durable_serving_checkpoint: Mutex::new(None),
+            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
             checkpoint_serving_reads: false,
             resample_authority_time: false,
             authority_clock: None,
-            durable_poison: None,
-            durable_poison_gate: Arc::new(AtomicBool::new(false)),
-            after_heartbeat_commit_hook: None,
+            durable_poison: Arc::new(Mutex::new(None)),
+            durable_publication: ExperimentalRaftDurabilityPublication::new(),
+            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
         };
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
@@ -7047,8 +7912,12 @@ mod tests {
         let err = bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
             .expect_err("checkpoint failure should reject the bootstrap response");
         assert!(err.contains("durable restart artifact"));
-        assert!(control_plane.durable_poison.is_some());
-        assert!(control_plane.durable_poison_gate.load(Ordering::Acquire));
+        assert!(control_plane
+            .durable_poison
+            .lock()
+            .expect("durable poison mutex should not be poisoned")
+            .is_some());
+        assert!(control_plane.durable_publication.is_poisoned());
 
         let runtime_map_err = ControlPlaneRuntimeMapSource::runtime_map_snapshot(
             &control_plane,
@@ -7671,7 +8540,7 @@ mod tests {
                 .durable_checkpoint_lock
                 .clone()
                 .expect("durable test authority should retain a checkpoint lock"),
-            poison_gate: Arc::clone(&harness.control_plane.durable_poison_gate),
+            publication: harness.control_plane.durable_publication.clone(),
         };
         let mut monitor_tracker = ExperimentalRaftPeerCheckpointTracker::default();
         let mut monitor_poll_total = 0_u64;
@@ -8254,30 +9123,36 @@ mod tests {
             .expect("experimental Raft status should read")
             .current_term()
             .expect("single-node leader should have a term");
-        harness.control_plane.after_heartbeat_commit_hook = Some(Box::new(move |control_plane| {
-            control_plane.block_on(
-                control_plane
-                    .authority
-                    .trigger_pre_vote_election_until_serving(Duration::from_secs(1)),
-            )?;
-            let deadline = Instant::now() + Duration::from_secs(1);
-            loop {
-                let status = control_plane.block_on(control_plane.authority.status())?;
-                if status
-                    .current_term()
-                    .is_some_and(|term| term > initial_term)
-                    && status.linearized_authority_serving()
-                {
-                    return Ok(());
+        *harness
+            .control_plane
+            .after_heartbeat_commit_hook
+            .lock()
+            .expect("heartbeat hook mutex should not be poisoned") =
+            Some(Box::new(move |control_plane| {
+                control_plane.block_on(
+                    control_plane
+                        .authority
+                        .trigger_pre_vote_election_until_serving(Duration::from_secs(1)),
+                )?;
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    let status = control_plane.block_on(control_plane.authority.status())?;
+                    if status
+                        .current_term()
+                        .is_some_and(|term| term > initial_term)
+                        && status.linearized_authority_serving()
+                    {
+                        return Ok(());
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(ControlPlaneError::RpcRemote {
+                            message: "test election did not advance the local Raft term"
+                                .to_string(),
+                        });
+                    }
+                    thread::sleep(Duration::from_millis(5));
                 }
-                if Instant::now() >= deadline {
-                    return Err(ControlPlaneError::RpcRemote {
-                        message: "test election did not advance the local Raft term".to_string(),
-                    });
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-        }));
+            }));
 
         let error = storage::clock::with_time_override(31_000, || {
             harness.control_plane.refresh_node_heartbeat(
@@ -8670,7 +9545,8 @@ mod tests {
             UnixStream::pair().expect("test UnixStream pair should create");
         write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
             .expect("client should write request frame");
-        let poison_gate = AtomicBool::new(true);
+        let publication = ExperimentalRaftDurabilityPublication::new();
+        publication.publish_poison(|| {});
         let runtime_handle = harness.runtime.handle().clone();
 
         let result = handle_experimental_raft_peer_rpc_before_ack(
@@ -8682,7 +9558,7 @@ mod tests {
             ExperimentalRaftPeerRpcDurability {
                 artifact_path: None,
                 checkpoint_lock: None,
-                poison_gate: Some(&poison_gate),
+                publication: Some(&publication),
             },
         );
         assert!(
@@ -8738,7 +9614,8 @@ mod tests {
             .runtime
             .block_on(harness.authority.status())
             .expect("status should read before poisoned dispatch");
-        let poison_gate = AtomicBool::new(true);
+        let publication = ExperimentalRaftDurabilityPublication::new();
+        publication.publish_poison(|| {});
 
         let result = handle_experimental_raft_peer_rpc_validated_frame_before_ack(
             harness.runtime.handle(),
@@ -8753,7 +9630,7 @@ mod tests {
             ExperimentalRaftPeerRpcDurability {
                 artifact_path: None,
                 checkpoint_lock: None,
-                poison_gate: Some(&poison_gate),
+                publication: Some(&publication),
             },
         );
         assert!(
@@ -8949,7 +9826,7 @@ mod tests {
                 ExperimentalRaftPeerRpcDurability {
                     artifact_path: None,
                     checkpoint_lock: None,
-                    poison_gate: None,
+                    publication: None,
                 },
             );
             assert!(
@@ -9066,7 +9943,7 @@ mod tests {
             ExperimentalRaftPeerRpcDurability {
                 artifact_path: None,
                 checkpoint_lock: None,
-                poison_gate: None,
+                publication: None,
             },
         );
         assert!(
@@ -9516,11 +10393,11 @@ mod tests {
         write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
             .expect("client should write request frame");
         let checkpoint_lock = Arc::new(Mutex::new(()));
-        let poison_gate = AtomicBool::new(false);
+        let publication = ExperimentalRaftDurabilityPublication::new();
         let durability_context = ExperimentalRaftPeerDurabilityContext {
             artifact_path: Some(Arc::new(state_path.clone())),
             checkpoint_lock,
-            poison_gate: Arc::new(poison_gate),
+            publication,
         };
         let mut checkpoint_tracker =
             ExperimentalRaftPeerCheckpointTracker::new(ExperimentalRaftPeerCheckpointPolicy {
@@ -9838,6 +10715,13 @@ mod tests {
                 )
                 .await
                 .expect("single-node authority should become leader");
+            wait_for_experimental_raft_local_authority_serving(
+                &authority,
+                Duration::from_secs(1),
+                "local-election checkpoint baseline",
+            )
+            .await
+            .expect("single-node authority should apply committed membership");
             authority
                 .store_durable_restart_artifact(&state_path)
                 .await
@@ -9849,14 +10733,14 @@ mod tests {
             .expect("baseline authority status should read")
             .persisted_vote()
             .expect("baseline authority should have a persisted vote");
-        let poison_gate = Arc::new(AtomicBool::new(false));
+        let publication = ExperimentalRaftDurabilityPublication::new();
         let checkpoint_loop = spawn_experimental_raft_peer_checkpoint_loop(
             runtime.handle().clone(),
             Arc::clone(&authority),
             ExperimentalRaftPeerDurabilityContext {
                 artifact_path: Some(Arc::new(state_path.clone())),
                 checkpoint_lock: Arc::new(Mutex::new(())),
-                poison_gate: Arc::clone(&poison_gate),
+                publication: publication.clone(),
             },
             ExperimentalRaftPeerCheckpointPolicy {
                 max_wal_suffix_bytes: u64::MAX,
@@ -9915,7 +10799,7 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        poison_gate.store(true, Ordering::Release);
+        publication.publish_poison(|| {});
         checkpoint_loop
             .join()
             .expect("checkpoint observer should stop after poison gate closes");

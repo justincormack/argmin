@@ -65,6 +65,7 @@ use crate::{ClusterEpoch, PgState};
 pub type ControlPlaneRaftNodeId = u64;
 pub type ControlPlaneRaftTerm = u64;
 pub type ControlPlaneRaftLeaderId = LeaderId<ControlPlaneRaftTerm, ControlPlaneRaftNodeId>;
+pub type ControlPlaneRaftLogId = LogId<ControlPlaneRaftLeaderId>;
 pub type ControlPlaneRaftEntry =
     Entry<ControlPlaneRaftLeaderId, ControlPlaneCommand, ControlPlaneRaftNodeId, BasicNode>;
 
@@ -4135,14 +4136,20 @@ impl ControlPlaneRaftAuthority {
                 ),
             });
         }
-        self.raft
-            .ensure_linearizable(ReadPolicy::ReadIndex)
-            .await
-            .map_err(|error| ControlPlaneError::RpcRemote {
-                message: format!(
-                    "local OpenRaft authority is not the serving leader: command-authority read-index failed: {error}"
-                ),
-            })?;
+        ControlPlaneRaftTypeConfig::timeout(
+            Duration::from_secs(1),
+            self.raft.ensure_linearizable(ReadPolicy::ReadIndex),
+        )
+        .await
+        .map_err(|_| ControlPlaneError::RpcRemote {
+            message: "local OpenRaft authority is not the serving leader: command-authority read-index timed out after 1s"
+                .to_owned(),
+        })?
+        .map_err(|error| ControlPlaneError::RpcRemote {
+            message: format!(
+                "local OpenRaft authority is not the serving leader: command-authority read-index failed: {error}"
+            ),
+        })?;
         Ok(status)
     }
 
@@ -10099,6 +10106,7 @@ mod tests {
     use openraft::testing::log::{StoreBuilder, Suite as OpenRaftLogSuite};
     use openraft::type_config::TypeConfigExt;
     use openraft::{AnyError, Config, Membership, Raft, ReadPolicy, StorageError};
+    use proptest::prelude::*;
 
     use crate::control_plane::{
         ClusterControlSnapshot, NodeAvailabilityState, NodeHeartbeat, RuntimeMapFreshnessProof,
@@ -10114,6 +10122,210 @@ mod tests {
         ControlPlaneOpenRaftSuiteBuilder,
         (),
     >;
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReplicatedFailoverModelOp {
+        LoseOriginalLeader,
+        ElectReplacement,
+        RestoreQuorum,
+        LoseQuorum,
+        ReestablishClock,
+        RenewStorageNode(usize),
+        MarkPgServing(usize),
+        AdvanceUnrelatedEpoch,
+        RestartOriginalLeader,
+    }
+
+    impl ReplicatedFailoverModelOp {
+        fn from_byte(value: u8) -> Self {
+            match value % 11 {
+                0 => Self::LoseOriginalLeader,
+                1 => Self::ElectReplacement,
+                2 => Self::RestoreQuorum,
+                3 => Self::LoseQuorum,
+                4 => Self::ReestablishClock,
+                5..=7 => Self::RenewStorageNode(usize::from(value % 3)),
+                8 => Self::MarkPgServing(usize::from(value % 3)),
+                9 => Self::AdvanceUnrelatedEpoch,
+                _ => Self::RestartOriginalLeader,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct ReplicatedFailoverBarrierModel {
+        term: u64,
+        leader: Option<usize>,
+        quorum_available: bool,
+        local_terms: [u64; 3],
+        locally_claims_leader: [bool; 3],
+        clock_terms: [Option<u64>; 3],
+        failover_started: bool,
+        pre_failover_epoch: u64,
+        epoch: u64,
+        pre_failover_max_lease_deadline_ms: u64,
+        storage_lease_deadlines_ms: [u64; 3],
+        pg_serving: [bool; 3],
+    }
+
+    impl ReplicatedFailoverBarrierModel {
+        fn new() -> Self {
+            Self {
+                term: 1,
+                leader: Some(0),
+                quorum_available: true,
+                local_terms: [1; 3],
+                locally_claims_leader: [true, false, false],
+                clock_terms: [Some(1), None, None],
+                failover_started: false,
+                pre_failover_epoch: 10,
+                epoch: 10,
+                pre_failover_max_lease_deadline_ms: 1_000,
+                storage_lease_deadlines_ms: [1_000; 3],
+                pg_serving: [true; 3],
+            }
+        }
+
+        fn command_authorized(&self, node: usize) -> bool {
+            self.quorum_available
+                && self.leader == Some(node)
+                && self.locally_claims_leader[node]
+                && self.local_terms[node] == self.term
+        }
+
+        fn lease_authorized(&self, node: usize) -> bool {
+            self.command_authorized(node) && self.clock_terms[node] == Some(self.term)
+        }
+
+        fn failover_barrier_satisfied(&self) -> bool {
+            let Some(leader) = self.leader else {
+                return false;
+            };
+            self.failover_started
+                && self.lease_authorized(leader)
+                && self.epoch > self.pre_failover_epoch
+                && self.pg_serving.iter().all(|serving| *serving)
+                && self
+                    .storage_lease_deadlines_ms
+                    .iter()
+                    .all(|deadline| *deadline > self.pre_failover_max_lease_deadline_ms)
+        }
+
+        fn apply(&mut self, operation: ReplicatedFailoverModelOp) {
+            match operation {
+                ReplicatedFailoverModelOp::LoseOriginalLeader if !self.failover_started => {
+                    self.failover_started = true;
+                    self.leader = None;
+                }
+                ReplicatedFailoverModelOp::ElectReplacement if self.failover_started => {
+                    self.quorum_available = true;
+                    self.term = self.term.saturating_add(1);
+                    self.leader = Some(1);
+                    self.local_terms[1] = self.term;
+                    self.local_terms[2] = self.term;
+                    self.locally_claims_leader[1] = true;
+                    self.clock_terms[1] = None;
+                    self.epoch = self.epoch.saturating_add(1);
+                    self.pg_serving = [false; 3];
+                }
+                ReplicatedFailoverModelOp::RestoreQuorum => self.quorum_available = true,
+                ReplicatedFailoverModelOp::LoseQuorum => self.quorum_available = false,
+                ReplicatedFailoverModelOp::ReestablishClock => {
+                    if let Some(leader) = self
+                        .leader
+                        .filter(|leader| self.command_authorized(*leader))
+                    {
+                        self.clock_terms[leader] = Some(self.term);
+                    }
+                }
+                ReplicatedFailoverModelOp::RenewStorageNode(node) => {
+                    if self
+                        .leader
+                        .is_some_and(|leader| self.lease_authorized(leader))
+                    {
+                        self.storage_lease_deadlines_ms[node] =
+                            self.pre_failover_max_lease_deadline_ms + 1 + self.term;
+                    }
+                }
+                ReplicatedFailoverModelOp::MarkPgServing(pg) => {
+                    if self
+                        .leader
+                        .is_some_and(|leader| self.lease_authorized(leader))
+                    {
+                        self.pg_serving[pg] = true;
+                    }
+                }
+                ReplicatedFailoverModelOp::AdvanceUnrelatedEpoch => {
+                    if self
+                        .leader
+                        .is_some_and(|leader| self.command_authorized(leader))
+                    {
+                        self.epoch = self.epoch.saturating_add(1);
+                    }
+                }
+                ReplicatedFailoverModelOp::RestartOriginalLeader => {
+                    self.locally_claims_leader[0] = true;
+                }
+                ReplicatedFailoverModelOp::LoseOriginalLeader
+                | ReplicatedFailoverModelOp::ElectReplacement => {}
+            }
+
+            if self.failover_started && self.term > 1 {
+                assert!(
+                    !self.command_authorized(0),
+                    "a restarted original leader must not pass quorum authority confirmation"
+                );
+            }
+            if self.failover_barrier_satisfied() {
+                let leader = self.leader.expect("satisfied barrier must have a leader");
+                assert!(self.lease_authorized(leader));
+                assert!(self.epoch > self.pre_failover_epoch);
+                assert!(self.pg_serving.iter().all(|serving| *serving));
+                assert!(self
+                    .storage_lease_deadlines_ms
+                    .iter()
+                    .all(|deadline| { *deadline > self.pre_failover_max_lease_deadline_ms }));
+            }
+        }
+    }
+
+    #[test]
+    fn replicated_failover_barrier_rejects_stale_leader_and_partial_recovery() {
+        let mut model = ReplicatedFailoverBarrierModel::new();
+        model.apply(ReplicatedFailoverModelOp::LoseOriginalLeader);
+        model.apply(ReplicatedFailoverModelOp::RestartOriginalLeader);
+        assert!(model.locally_claims_leader[0]);
+        assert!(!model.command_authorized(0));
+
+        model.apply(ReplicatedFailoverModelOp::ElectReplacement);
+        model.apply(ReplicatedFailoverModelOp::AdvanceUnrelatedEpoch);
+        assert!(!model.failover_barrier_satisfied());
+
+        model.apply(ReplicatedFailoverModelOp::ReestablishClock);
+        for pg in 0..3 {
+            model.apply(ReplicatedFailoverModelOp::MarkPgServing(pg));
+        }
+        model.apply(ReplicatedFailoverModelOp::RenewStorageNode(0));
+        model.apply(ReplicatedFailoverModelOp::RenewStorageNode(1));
+        assert!(!model.failover_barrier_satisfied());
+
+        model.apply(ReplicatedFailoverModelOp::RenewStorageNode(2));
+        assert!(model.failover_barrier_satisfied());
+        model.apply(ReplicatedFailoverModelOp::LoseQuorum);
+        assert!(!model.failover_barrier_satisfied());
+    }
+
+    proptest! {
+        #[test]
+        fn prop_replicated_failover_barrier_requires_full_authority_recovery(
+            operations in proptest::collection::vec(any::<u8>(), 1..128),
+        ) {
+            let mut model = ReplicatedFailoverBarrierModel::new();
+            for operation in operations {
+                model.apply(ReplicatedFailoverModelOp::from_byte(operation));
+            }
+        }
+    }
 
     fn test_raft_wal_file(
         path: impl Into<PathBuf>,
@@ -17629,6 +17841,18 @@ mod tests {
                 .await
                 .unwrap();
 
+            let confirmation_error = expect_bounded_control_plane_raft_error(
+                restarted_authority.confirmed_linearized_authority_status(),
+                Duration::from_secs(2),
+                "stale restarted leader bounds quorum authority confirmation",
+            )
+            .await;
+            assert!(matches!(
+                &confirmation_error,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("local OpenRaft authority is not the serving leader")
+            ));
+
             let error = expect_bounded_control_plane_raft_error(
                 restarted_authority.submit_control_plane_command(
                     ControlPlaneCommand::MarkNodeAvailability {
@@ -17636,7 +17860,7 @@ mod tests {
                         availability: NodeAvailabilityState::Unavailable,
                     },
                 ),
-                Duration::from_secs(1),
+                Duration::from_secs(2),
                 "stale restarted leader rejects command without quorum authority",
             )
             .await;

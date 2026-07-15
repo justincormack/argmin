@@ -11472,10 +11472,40 @@ Replicated route-change soak cutover:
   wrong process and saturate the bounded control-plane RPC worker pool.
   Lease-bearing process work and command submission therefore require both
   full applied-through-committed local readiness and a successful OpenRaft
-  ReadIndex quorum confirmation before entering snapshot or Raft write work.
-  A stale restored leader returns the explicit routing rejection instead of
-  retaining the process authority mutex while waiting for an unavailable
-  quorum.
+  ReadIndex quorum confirmation before snapshot or Raft write work. The
+  confirmation itself has a bounded deadline; it must not consume a process RPC
+  worker indefinitely when quorum is absent. The replicated process does not
+  place its `ExperimentalRaftControlPlane` wrapper behind one process-wide
+  authority mutex: each RPC worker owns a lightweight clone, while OpenRaft,
+  authority-clock state, durability poison, and checkpoint publication retain
+  their own narrow shared synchronization. Any additional ReadIndex or client
+  write performed during dispatch therefore runs without holding a mutex needed
+  by another RPC worker or by clock recovery. Replicated wrapper clones also
+  share a narrow response-publication gate: wrapper checkpoint failures, peer
+  checkpoint failures, and the bounded WAL checkpoint monitor all publish
+  durability poison under that gate. Final poison checks and both control-plane
+  and peer response writes use the same gate. Quorum work, command application,
+  checkpointing, and response construction all remain outside it. A response
+  therefore linearizes before poison publication or is suppressed afterward,
+  even when its worker passed an earlier poison check. A stale restored leader returns
+  the explicit routing rejection without serializing unrelated work behind an
+  unavailable quorum. Authority-clock status and recovery use a dedicated derived Unix
+  socket and independently bounded worker pool, so capacity is reserved at
+  connection admission before request bytes are read; ordinary, incomplete, or
+  quorum-blocked connections on the general control-plane socket cannot consume
+  it. Both listeners authenticate and unwrap each request exactly once before
+  any ReadIndex confirmation, and carry the verified response-signing context
+  through routing rejection or dispatch. Invalid credentials therefore cannot
+  trigger quorum work, while authenticated routing failures remain explicit and
+  retryable. Targeted regressions cover bounded stale-leader confirmation,
+  independent connection-admission capacity, authentication-before-admission,
+  signed routing rejection without duplicate verification, and a recovery
+  request completing while an already-admitted ordinary worker remains parked
+  in a post-admission quorum wait. A real cloned-wrapper regression also parks
+  one admitted clone, poisons through another clone, and proves final response
+  publication fails closed. A separate deterministic monitor regression parks a
+  response after its early check, publishes WAL-monitor poison, and proves that
+  the response body is never written.
   Standalone restart likewise has to resume from its durable clock checkpoint;
   the soak does not hide missing or invalid restart evidence with an admin
   reset. After recovery, the failover barrier requires a fully serving runtime
@@ -11488,6 +11518,13 @@ Replicated route-change soak cutover:
   serve under the predecessor horizon. The combined diagnostic-snapshot check
   proves the new term has crossed that horizon, renewed all storage-node
   leases, and returned every PG to serving before route traffic resumes.
+  A bounded property model now exercises those gates independently: stale
+  original-leader restart, quorum loss/restoration, replacement election,
+  authority-clock re-establishment, unrelated epoch movement, per-node lease
+  renewal, and per-PG serving recovery. It asserts that the original leader
+  cannot regain command authority from a stale local view and that the barrier
+  cannot pass until quorum authority, current-term clock binding, a newer
+  epoch, every renewed lease, and every serving PG hold simultaneously.
 - The first replicated soak exposed two failover-only heartbeat invariants.
   A stale-epoch heartbeat after durable lease expiry is no longer eligible for
   the volatile overlay unless the durable base node is administratively
