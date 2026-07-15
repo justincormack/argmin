@@ -55,6 +55,7 @@
             "Sid": "AllowBucketTagControlPlaneOps",
             "Effect": "Allow",
             "Action": [
+                "s3:ListTagsForResource",
                 "s3:TagResource",
                 "s3:UntagResource"
             ],

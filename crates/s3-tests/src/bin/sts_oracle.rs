@@ -15,8 +15,8 @@ use s3_tests::{
     build_test_agent, post_object_raw_to_test_endpoint_with_headers,
     presign_url_for_service_with_credentials, send_signed_request_for_service_with_credentials,
     shape::{
-        assert_shape, error_response_headers, expected_error, response_header_value, shape,
-        xml_tag_text, ShapeSpec,
+        assert_shape, assert_shape_with_request_id_validator, error_response_headers,
+        expected_error, id_headers, response_header_value, shape, xml_tag_text, ShapeSpec,
     },
     sigv4_post_fields_for_credentials, sigv4_post_fields_for_service_with_credentials,
     PresignedRequest, RawResponse, SignedRequestCredentials,
@@ -6448,31 +6448,118 @@ fn run_cross_account_probes(
     println!("assume-role-cross-account-success: ok");
 }
 
-fn assert_s3_control_error(
-    label: &str,
-    response: &RawResponse,
+struct S3ControlError<'a> {
     status: u16,
-    code: &str,
-    message: &str,
-    uri: Option<&str>,
-) {
-    let uri = uri
-        .map(|value| format!("<URI>{value}</URI>"))
-        .unwrap_or_default();
+    code: &'a str,
+    message: &'a str,
+    detail: &'a str,
+    allow: Option<&'a str>,
+}
+
+fn assert_s3_control_error(label: &str, response: &RawResponse, expected: S3ControlError<'_>) {
+    let mut spec = shape()
+        .status(expected.status)
+        .headers(error_response_headers());
+    if let Some(allow) = expected.allow {
+        spec = spec.header("allow", allow);
+    }
+    assert_shape(
+        label,
+        response,
+        &spec
+            .sub("code", expected.code)
+            .sub("message", expected.message)
+            .sub("detail", expected.detail)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <ErrorResponse><Error><Code>{code}</Code><Message>{message}</Message>{detail}</Error>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></ErrorResponse>",
+            ),
+    );
+}
+
+fn assert_sts_unknown_operation(label: &str, response: &RawResponse, head: bool) {
+    let spec = sts_wire_shape(label, response).status(404);
+    let spec = if head {
+        spec.header("content-length", "29").body_empty()
+    } else {
+        spec.body("<UnknownOperationException/>\n")
+    };
+    assert_shape(label, response, &spec);
+}
+
+fn assert_frontend_empty_bad_request(label: &str, response: &RawResponse) {
+    let request_id = response_header_value(response, "x-amz-request-id")
+        .unwrap_or_else(|| panic!("{label}: missing outer-frontend request ID"));
+    assert_shape_with_request_id_validator(
+        label,
+        response,
+        &shape()
+            .status(400)
+            .header("x-amz-request-id", "{frontend_request_id}")
+            .sub("frontend_request_id", request_id)
+            .body_empty(),
+        is_outer_frontend_request_id,
+    );
+}
+
+fn assert_s3_frontend_bad_request(label: &str, response: &RawResponse) {
+    let request_id = response_header_value(response, "x-amz-request-id")
+        .unwrap_or_else(|| panic!("{label}: missing outer-frontend request ID"));
+    assert_shape_with_request_id_validator(
+        label,
+        response,
+        &shape()
+            .status(400)
+            .header("x-amz-request-id", "{frontend_request_id}")
+            .header("x-amz-id-2", "{host_id}")
+            .header("content-type", "application/xml")
+            .sub("frontend_request_id", request_id)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <Error><Code>BadRequest</Code>\
+                 <Message>An error occurred when parsing the HTTP request.</Message>\
+                 <RequestId>{frontend_request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+        is_outer_frontend_request_id,
+    );
+}
+
+fn is_outer_frontend_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 16
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+}
+
+fn assert_s3_control_head_method_not_allowed(label: &str, response: &RawResponse) {
     assert_shape(
         label,
         response,
         &shape()
-            .status(status)
+            .status(405)
             .headers(error_response_headers())
-            .sub("code", code)
-            .sub("message", message)
-            .sub("uri", uri)
-            .body(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                 <ErrorResponse><Error><Code>{code}</Code><Message>{message}</Message>{uri}</Error>\
-                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></ErrorResponse>",
-            ),
+            .header("allow", "DELETE, POST, GET")
+            .body_empty(),
+    );
+}
+
+fn assert_sts_cors_preflight_success(label: &str, response: &RawResponse) {
+    assert_shape(
+        label,
+        response,
+        &sts_wire_shape(label, response)
+            .status(200)
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "POST")
+            .header(
+                "access-control-expose-headers",
+                "x-amzn-RequestId,x-amzn-ErrorType,x-amzn-ErrorMessage,Date,smithy-protocol",
+            )
+            .header("access-control-max-age", "172800")
+            .header("content-length", "0")
+            .body_empty(),
     );
 }
 
@@ -6482,6 +6569,29 @@ struct S3ControlCanonicalRequest<'a> {
     body: &'a [u8],
     content_type: &'a str,
     account_id: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum StsMethodResult {
+    UnknownOperation,
+    UnknownOperationHead,
+    FrontendBadRequest,
+}
+
+#[derive(Clone, Copy)]
+enum S3ControlMethodResult {
+    NoSuchResource,
+    HeadMethodNotAllowed,
+    MethodNotAllowed,
+    OptionsBadRequest,
+    FrontendBadRequest,
+}
+
+#[derive(Clone, Copy)]
+struct RoutingMethodProbe<'a> {
+    method: &'a str,
+    sts: StsMethodResult,
+    s3_control: S3ControlMethodResult,
 }
 
 fn assert_s3_control_signature_mismatch(
@@ -6647,10 +6757,13 @@ fn run_cross_service_routing_probes(
     assert_s3_control_error(
         "routing-s3-control-query-root",
         &s3_control_query_root,
-        400,
-        "InvalidURI",
-        "Couldn't parse the specified URI.",
-        Some("/"),
+        S3ControlError {
+            status: 400,
+            code: "InvalidURI",
+            message: "Couldn't parse the specified URI.",
+            detail: "<URI>/</URI>",
+            allow: None,
+        },
     );
     println!("routing-s3-control-query-root: ok");
 
@@ -6735,12 +6848,240 @@ fn run_cross_service_routing_probes(
     assert_s3_control_error(
         "routing-s3-control-tags-path-query-action",
         &s3_control_tags_path_query_action,
-        404,
-        "NoSuchResource",
-        "The specified resource doesn't exist.",
-        None,
+        S3ControlError {
+            status: 404,
+            code: "NoSuchResource",
+            message: "The specified resource doesn't exist.",
+            detail: "",
+            allow: None,
+        },
     );
     println!("routing-s3-control-tags-path-query-action: ok");
+
+    let method_probes = [
+        RoutingMethodProbe {
+            method: "GET",
+            sts: StsMethodResult::UnknownOperation,
+            s3_control: S3ControlMethodResult::NoSuchResource,
+        },
+        RoutingMethodProbe {
+            method: "HEAD",
+            sts: StsMethodResult::UnknownOperationHead,
+            s3_control: S3ControlMethodResult::HeadMethodNotAllowed,
+        },
+        RoutingMethodProbe {
+            method: "POST",
+            sts: StsMethodResult::UnknownOperation,
+            s3_control: S3ControlMethodResult::NoSuchResource,
+        },
+        RoutingMethodProbe {
+            method: "PUT",
+            sts: StsMethodResult::UnknownOperation,
+            s3_control: S3ControlMethodResult::MethodNotAllowed,
+        },
+        RoutingMethodProbe {
+            method: "DELETE",
+            sts: StsMethodResult::UnknownOperation,
+            s3_control: S3ControlMethodResult::NoSuchResource,
+        },
+        RoutingMethodProbe {
+            method: "OPTIONS",
+            sts: StsMethodResult::UnknownOperation,
+            s3_control: S3ControlMethodResult::OptionsBadRequest,
+        },
+        RoutingMethodProbe {
+            method: "PATCH",
+            sts: StsMethodResult::UnknownOperation,
+            s3_control: S3ControlMethodResult::MethodNotAllowed,
+        },
+        RoutingMethodProbe {
+            method: "PROPFIND",
+            sts: StsMethodResult::FrontendBadRequest,
+            s3_control: S3ControlMethodResult::FrontendBadRequest,
+        },
+        RoutingMethodProbe {
+            method: "X-ARGMIN-PROBE",
+            sts: StsMethodResult::FrontendBadRequest,
+            s3_control: S3ControlMethodResult::FrontendBadRequest,
+        },
+    ];
+
+    for probe in method_probes {
+        let method = probe.method;
+        let request_target = if method == "DELETE" {
+            format!("{tags_path}?tagKeys=routing")
+        } else {
+            tags_path.clone()
+        };
+        let body = if method == "POST" {
+            tag_body.as_slice()
+        } else {
+            b"".as_slice()
+        };
+        let mut headers = vec![("x-amz-account-id", account_id)];
+        if method == "POST" {
+            headers.push(("content-type", "application/xml"));
+        }
+
+        let sts_response = send_signed_request_for_service_with_credentials(
+            method,
+            &format!("{sts_endpoint}{request_target}"),
+            body,
+            headers.clone(),
+            "sts",
+            credentials,
+        );
+        let sts_label = format!("routing-method-sts-{method}");
+        match probe.sts {
+            StsMethodResult::UnknownOperation => {
+                assert_sts_unknown_operation(&sts_label, &sts_response, false);
+            }
+            StsMethodResult::UnknownOperationHead => {
+                assert_sts_unknown_operation(&sts_label, &sts_response, true);
+            }
+            StsMethodResult::FrontendBadRequest => {
+                assert_frontend_empty_bad_request(&sts_label, &sts_response);
+            }
+        }
+        println!("{sts_label}: ok");
+
+        let s3_control_response = send_signed_request_for_service_with_credentials(
+            method,
+            &format!("{s3_control_endpoint}{request_target}"),
+            body,
+            headers,
+            "s3",
+            credentials,
+        );
+        let s3_control_label = format!("routing-method-s3-control-{method}");
+        match probe.s3_control {
+            S3ControlMethodResult::NoSuchResource => assert_s3_control_error(
+                &s3_control_label,
+                &s3_control_response,
+                S3ControlError {
+                    status: 404,
+                    code: "NoSuchResource",
+                    message: "The specified resource doesn't exist.",
+                    detail: "",
+                    allow: None,
+                },
+            ),
+            S3ControlMethodResult::HeadMethodNotAllowed => {
+                assert_s3_control_head_method_not_allowed(&s3_control_label, &s3_control_response);
+            }
+            S3ControlMethodResult::MethodNotAllowed => {
+                let detail =
+                    format!("<Method>{method}</Method><ResourceType>BUCKET_TAGS</ResourceType>");
+                assert_s3_control_error(
+                    &s3_control_label,
+                    &s3_control_response,
+                    S3ControlError {
+                        status: 405,
+                        code: "MethodNotAllowed",
+                        message: "The specified method is not allowed against this resource.",
+                        detail: &detail,
+                        allow: Some("DELETE, POST, GET"),
+                    },
+                );
+            }
+            S3ControlMethodResult::OptionsBadRequest => assert_s3_control_error(
+                &s3_control_label,
+                &s3_control_response,
+                S3ControlError {
+                    status: 400,
+                    code: "BadRequest",
+                    message: "Insufficient information. Origin request header needed.",
+                    detail: "",
+                    allow: None,
+                },
+            ),
+            S3ControlMethodResult::FrontendBadRequest => {
+                assert_s3_frontend_bad_request(&s3_control_label, &s3_control_response);
+            }
+        }
+        println!("{s3_control_label}: ok");
+    }
+
+    let cors_headers = [
+        ("x-amz-account-id", account_id),
+        ("origin", "https://example.com"),
+        ("access-control-request-method", "POST"),
+    ];
+    let sts_options_cors = send_signed_request_for_service_with_credentials(
+        "OPTIONS",
+        &format!("{sts_endpoint}{tags_path}"),
+        b"",
+        cors_headers,
+        "sts",
+        credentials,
+    );
+    assert_sts_cors_preflight_success("routing-options-cors-sts", &sts_options_cors);
+    println!("routing-options-cors-sts: ok");
+
+    let s3_control_options_cors = send_signed_request_for_service_with_credentials(
+        "OPTIONS",
+        &format!("{s3_control_endpoint}{tags_path}"),
+        b"",
+        cors_headers,
+        "s3",
+        credentials,
+    );
+    assert_s3_control_error(
+        "routing-options-cors-s3-control",
+        &s3_control_options_cors,
+        S3ControlError {
+            status: 403,
+            code: "AccessForbidden",
+            message: "CORSResponse: Bucket not found",
+            detail: "<Method>POST</Method><ResourceType>BUCKET</ResourceType>",
+            allow: None,
+        },
+    );
+    println!("routing-options-cors-s3-control: ok");
+}
+
+fn run_list_tags_for_resource_success_probe(
+    sts_endpoint: &str,
+    s3_control_endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    account_id: &str,
+    bucket: &str,
+) {
+    let resource_arn = auth::canonical::uri_encode(&format!("arn:aws:s3:::{bucket}"));
+    let path = format!("/v20180820/tags/{resource_arn}");
+    let sts_response = send_signed_request_for_service_with_credentials(
+        "GET",
+        &format!("{sts_endpoint}{path}"),
+        b"",
+        [("x-amz-account-id", account_id)],
+        "sts",
+        credentials,
+    );
+    assert_sts_unknown_operation("routing-list-tags-existing-sts", &sts_response, false);
+    println!("routing-list-tags-existing-sts: ok");
+
+    let s3_control_response = send_signed_request_for_service_with_credentials(
+        "GET",
+        &format!("{s3_control_endpoint}{path}"),
+        b"",
+        [("x-amz-account-id", account_id)],
+        "s3",
+        credentials,
+    );
+    assert_shape(
+        "routing-list-tags-existing-s3-control",
+        &s3_control_response,
+        &shape()
+            .status(200)
+            .headers(id_headers())
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <ListTagsForResourceResult xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">\
+                 <Tags><Tag><Key>routing-key</Key><Value>routing-value</Value></Tag></Tags>\
+                 </ListTagsForResourceResult>",
+            ),
+    );
+    println!("routing-list-tags-existing-s3-control: ok");
 }
 
 fn main() {
@@ -6760,6 +7101,15 @@ fn main() {
         tls_ca_pem: None,
     };
     let s3_control_endpoint = required_env("S3_TEST_S3_CONTROL_ENDPOINT");
+    if let Ok(bucket) = env::var("S3_TEST_STS_POST_BUCKET") {
+        run_list_tags_for_resource_success_probe(
+            &endpoint,
+            &s3_control_endpoint,
+            credentials,
+            &account_id,
+            &bucket,
+        );
+    }
     run_cross_service_routing_probes(&endpoint, &s3_control_endpoint, credentials, &account_id);
 
     let probes = [

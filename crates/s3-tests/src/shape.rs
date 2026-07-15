@@ -662,6 +662,40 @@ pub fn assert_shape(
     }
 }
 
+/// Assert a complete response shape while using an endpoint-specific request-ID validator.
+///
+/// Some AWS outer HTTP frontends return `x-amz-request-id` values that do not
+/// use S3's normal fixed-width shape. The supplied shape must use a custom
+/// substitution rather than the built-in `{request_id}` placeholder.
+pub fn assert_shape_with_request_id_validator<F>(
+    operation: &str,
+    response: &RawResponse,
+    spec: &ShapeSpec,
+    validate_request_id: F,
+) -> BTreeMap<String, String>
+where
+    F: FnOnce(&str) -> bool,
+{
+    let captures = match spec.check(operation, response) {
+        Ok(captures) => captures,
+        Err(message) => panic!("{message}"),
+    };
+    let request_id = response_header_value(response, REQUEST_ID_HEADER)
+        .unwrap_or_else(|| panic!("{operation}: missing {REQUEST_ID_HEADER}"));
+    assert!(
+        validate_request_id(request_id),
+        "{operation}: invalid endpoint-specific {REQUEST_ID_HEADER} shape: {request_id}"
+    );
+    if let Some(host_id) = response_header_value(response, HOST_ID_HEADER) {
+        assert!(
+            is_aws_host_id_shape(host_id),
+            "{operation}: invalid {HOST_ID_HEADER} shape: {host_id}"
+        );
+    }
+    assert_error_ids_match_headers(operation, response);
+    captures
+}
+
 /// Assert a status and full body template when only `(status, body)` is
 /// available, e.g. ureq fetch paths that do not build a [`RawResponse`].
 /// The spec must not pin headers; use [`assert_shape`] where the full
@@ -1242,6 +1276,25 @@ mod tests {
             .body(error_template())
             .sub("code", "NoSuchKey");
         assert_shape("test", &resp, &spec);
+    }
+
+    #[test]
+    fn endpoint_specific_request_id_validator_accepts_unpadded_frontend_id() {
+        let request_id = "F0A9C5D18175BAF";
+        let resp = response(400, &[("x-amz-request-id", request_id)], "");
+        let spec = shape()
+            .status(400)
+            .header("x-amz-request-id", "{frontend_request_id}")
+            .sub("frontend_request_id", request_id)
+            .body_empty();
+
+        assert_shape_with_request_id_validator("test", &resp, &spec, |value| {
+            !value.is_empty()
+                && value.len() <= 16
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+        });
     }
 
     #[test]

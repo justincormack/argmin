@@ -74,30 +74,37 @@ impl Agent {
     }
 
     pub fn get(&self, uri: &str) -> RequestBuilder {
-        self.request(Method::GET, uri)
+        self.request_method(Method::GET, uri)
     }
 
     pub fn post(&self, uri: &str) -> RequestBuilder {
-        self.request(Method::POST, uri)
+        self.request_method(Method::POST, uri)
     }
 
     pub fn put(&self, uri: &str) -> RequestBuilder {
-        self.request(Method::PUT, uri)
+        self.request_method(Method::PUT, uri)
     }
 
     pub fn delete(&self, uri: &str) -> RequestBuilder {
-        self.request(Method::DELETE, uri)
+        self.request_method(Method::DELETE, uri)
     }
 
     pub fn head(&self, uri: &str) -> RequestBuilder {
-        self.request(Method::HEAD, uri)
+        self.request_method(Method::HEAD, uri)
     }
 
     pub fn options(&self, uri: &str) -> RequestBuilder {
-        self.request(Method::OPTIONS, uri)
+        self.request_method(Method::OPTIONS, uri)
     }
 
-    fn request(&self, method: Method, uri: &str) -> RequestBuilder {
+    /// Build a request for a standard or extension HTTP method token.
+    pub fn request(&self, method: &str, uri: &str) -> RequestBuilder {
+        let method = Method::from_bytes(method.as_bytes())
+            .unwrap_or_else(|error| panic!("invalid raw HTTP method {method:?}: {error}"));
+        self.request_method(method, uri)
+    }
+
+    fn request_method(&self, method: Method, uri: &str) -> RequestBuilder {
         RequestBuilder {
             agent: self.clone(),
             method,
@@ -328,4 +335,18 @@ fn build_tls_config_with_custom_ca(tls_ca_pem: &[u8]) -> ClientConfig {
     ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Agent;
+    use std::time::Duration;
+
+    #[test]
+    fn request_accepts_extension_method_tokens() {
+        let agent = Agent::new("http://127.0.0.1", None, Duration::from_secs(1));
+        let request = agent.request("X-ARGMIN-PROBE", "http://127.0.0.1/");
+
+        assert_eq!(request.method.as_str(), "X-ARGMIN-PROBE");
+    }
 }

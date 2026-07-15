@@ -467,6 +467,76 @@ wait_for_session_context_bucket_policy_success() {
     echo "session-context-bucket-policy-success: ok"
 }
 
+wait_for_list_tags_for_resource_success() {
+    local label="$1"
+    local account_id="$2"
+    local resource_arn="$3"
+    local attempt consecutive_successes=0 error_file ready=false response_file
+    response_file="$tmpdir/${label}-list-tags.out"
+    error_file="$tmpdir/${label}-list-tags.err"
+
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if aws_primary s3control list-tags-for-resource \
+            --account-id "$account_id" \
+            --resource-arn "$resource_arn" \
+            --output json >"$response_file" 2>"$error_file" && \
+            jq -e \
+                '.Tags == [{"Key":"routing-key","Value":"routing-value"}]' \
+                "$response_file" >/dev/null; then
+            ((consecutive_successes += 1))
+            if ((consecutive_successes == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_successes=0
+        fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        if [[ -s "$response_file" ]]; then
+            echo "$label ListTagsForResource last stdout:" >&2
+            cat "$response_file" >&2
+        fi
+        if [[ -s "$error_file" ]]; then
+            echo "$label ListTagsForResource last stderr:" >&2
+            cat "$error_file" >&2
+        fi
+        external_s3_test_die "$label ListTagsForResource did not converge"
+    fi
+    echo "$label-list-tags-for-resource: ok"
+}
+
+wait_for_get_bucket_tagging_denied() {
+    local label="$1"
+    local bucket="$2"
+    local attempt consecutive_denials=0 error_file ready=false
+    error_file="$tmpdir/${label}-get-bucket-tagging.err"
+
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if aws_primary s3api get-bucket-tagging \
+            --bucket "$bucket" >/dev/null 2>"$error_file"; then
+            consecutive_denials=0
+        elif grep -Fq \
+            'An error occurred (AccessDenied) when calling the GetBucketTagging operation:' \
+            "$error_file"; then
+            ((consecutive_denials += 1))
+            if ((consecutive_denials == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_denials=0
+        fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        cat "$error_file" >&2
+        external_s3_test_die "$label GetBucketTagging deny did not converge"
+    fi
+    echo "$label-get-bucket-tagging-access-denied: ok"
+}
+
 declare -a created_role_names=()
 created_bucket=""
 tmpdir=""
@@ -934,6 +1004,14 @@ create_assume_role_fixture() {
     created_bucket="$S3_TEST_STS_POST_BUCKET"
     aws_primary s3api wait bucket-exists --bucket "$created_bucket"
     echo "post-object-bucket-fixture: ok"
+    aws_primary s3control tag-resource \
+        --account-id "$primary_account" \
+        --resource-arn "arn:aws:s3:::${created_bucket}" \
+        --tags Key=routing-key,Value=routing-value
+    wait_for_list_tags_for_resource_success \
+        initial-tag-fixture \
+        "$primary_account" \
+        "arn:aws:s3:::${created_bucket}"
     export S3_TEST_STS_ROLE_NAME="path-shape-${role_suffix}"
     export S3_TEST_STS_ROLE_SESSION_NAME="path-shape-session"
     export S3_TEST_STS_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_ROLE_NAME}"
@@ -1441,9 +1519,17 @@ create_assume_role_fixture() {
         --arg lower_bound "$S3_TEST_STS_TOKEN_ISSUE_LOWER_BOUND" \
         --arg upper_bound "$S3_TEST_STS_TOKEN_ISSUE_UPPER_BOUND" \
         --arg bucket_arn "arn:aws:s3:::${S3_TEST_STS_POST_BUCKET}" \
+        --arg primary_principal "$primary_arn" \
         '{
             Version: "2012-10-17",
             Statement: [
+                {
+                    Sid: "DenyGetBucketTaggingAuthorizationAlias",
+                    Effect: "Deny",
+                    Principal: {AWS: $primary_principal},
+                    Action: "s3:GetBucketTagging",
+                    Resource: $bucket_arn
+                },
                 {
                     Sid: "AllowRecreatedRoleStreamingOracle",
                     Effect: "Allow",
@@ -1566,6 +1652,13 @@ create_assume_role_fixture() {
         --policy "file://${streaming_bucket_policy}"
     wait_for_streaming_bucket_policy_success
     wait_for_session_context_bucket_policy_success
+    wait_for_get_bucket_tagging_denied \
+        list-tags-distinct-action \
+        "$S3_TEST_STS_POST_BUCKET"
+    wait_for_list_tags_for_resource_success \
+        list-tags-distinct-action \
+        "$primary_account" \
+        "arn:aws:s3:::${S3_TEST_STS_POST_BUCKET}"
 
     trust_recreated_role_revoked="$tmpdir/trust-recreated-role-revoked.json"
     jq -n --arg principal "$primary_arn" '{

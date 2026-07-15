@@ -669,7 +669,9 @@ format that becomes an accidental long-term role database.
 
 The HTTP router already has a small endpoint-family preclassification: it
 recognizes the S3 Control-style `/v20180820/tags/<resource-arn>` path before
-normal bucket/key parsing and routes `TagResource` and `UntagResource`. The
+normal bucket/key parsing and routes `TagResource` and `UntagResource`; AWS also
+routes `GET` on that path to the distinct `ListTagsForResource` operation, which
+the local router does not yet implement. The
 external tests give S3 Control its own endpoint URL and sign those requests with
 service `s3`, while the embedded server currently serves them on the shared
 listener and expects the same signing scope. Preserve those behaviors and use
@@ -701,11 +703,16 @@ method, content type, `x-amz-account-id`, `Action`, `Version`, Host, and SigV4
 credential service. Ambiguous requests must receive the same error family AWS
 uses rather than falling through to an unrelated S3 operation.
 
-Do not fold STS operations into `S3Operation`, and do not leave the existing S3
-Control endpoint operations there once the service boundary is introduced.
+Do not fold STS operations into `S3Operation`, and do not leave S3 Control
+endpoint operations there once the service boundary is introduced.
 Introduce a service-level request enum or equivalent with typed S3, S3 Control,
 and STS operation payloads so each service's parsing, auth expectation, response
-format, and errors stay explicit. The existing S3 Control scenarios provide
+format, and errors stay explicit. The initial typed S3 Control operation set is
+`ListTagsForResource`, `TagResource`, and `UntagResource`.
+`ListTagsForResource` must use its own `s3:ListTagsForResource` authorization
+action and S3 Control response renderer; it must not be aliased to ordinary S3
+`GetBucketTagging` merely because both read bucket tags. The existing S3
+Control scenarios provide
 valid-dispatch and policy-evaluation controls, but they do not pin the routing
 boundary or error precedence. The current implementation selects the HTTP
 method and strictly percent-decodes the versioned resource path before
@@ -713,7 +720,7 @@ authentication, then validates the account ID, ARN semantics, XML or `tagKeys`,
 and authorization afterward. That implementation order is not itself AWS
 evidence and must not be accidentally preserved or changed without an oracle.
 
-Before moving `TagResource` or `UntagResource` out of `S3Operation`, add complete
+Before moving the tag-resource operations out of `S3Operation`, add complete
 AWS-facing routing-boundary goldens for:
 
 - the bounded method set `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `OPTIONS`, and
@@ -1771,7 +1778,7 @@ response goldens establish this initial `SharedRegional` table:
 | --- | --- | --- | --- |
 | `POST /`, Query-form `GetCallerIdentity`, with `x-amz-account-id` | `200 GetCallerIdentity` success; the extra account header is ignored | `400 InvalidURI`, with `/` in the nested S3 Control error | STS |
 | `POST /v20180820/tags/<arn>`, Query-form `GetCallerIdentity` in the body | `403 SignatureDoesNotMatch` in the STS error namespace | `403 SignatureDoesNotMatch` in the nested S3 Control error shape | S3 Control |
-| `POST /v20180820/tags/<arn>?Action=GetCallerIdentity&Version=2011-06-15`, valid TagResource XML body | `403 SignatureDoesNotMatch` in the STS error namespace | authenticated `404 NoSuchResource`; the STS query does not divert the request | S3 Control |
+| `POST /v20180820/tags/<arn>?Action=GetCallerIdentity&Version=2011-06-15`, valid TagResource XML body | `403 SignatureDoesNotMatch` in the STS error namespace | valid-signature `404 NoSuchResource`; the STS query does not divert the request | S3 Control |
 
 For the S3 Control form-body collision, AWS reports a canonical request whose
 canonical-query line contains the form `Action` and `Version` even though the
@@ -1786,7 +1793,63 @@ STS error shape is distinct from S3 Control's nested error envelope.
 The local table deliberately gives the reserved versioned tags path precedence
 over form content type and STS `Action`/`Version`, while an unambiguous root
 Query request selects STS. This is only the first bounded collision subset.
-The remaining methods, path/percent/ARN near misses, account-ID variants,
+
+The bounded HTTP-method slice then sent the same validly signed versioned tags
+request to both endpoint families for `GET`, `HEAD`, `POST`, `PUT`, `DELETE`,
+`OPTIONS`, `PATCH`, `PROPFIND`, and `X-ARGMIN-PROBE`. `POST` carried valid
+TagResource XML, `DELETE` carried one `tagKeys` query member, and every request
+used the unique nonexistent resource ARN and correct account-ID header. That
+nonexistent-resource GET pins routing and error precedence only; it cannot by
+itself establish which S3 Control operation was selected. Exact status,
+complete normalized semantic headers, and complete bodies establish:
+
+| Methods | `AwsRegionalSts` | `AwsRegionalS3Control` | Local `SharedRegional` selection |
+| --- | --- | --- | --- |
+| `GET`, `POST`, `DELETE` against the nonexistent resource | `404` `<UnknownOperationException/>` | valid-signature `404 NoSuchResource` | S3 Control |
+| `HEAD` | `404`, the `UnknownOperationException` body suppressed with its representation length pinned as 29 | `405`, empty body, `Allow: DELETE, POST, GET` | S3 Control |
+| `PUT`, `PATCH` | `404` `<UnknownOperationException/>` | `405 MethodNotAllowed`, with the exact method and `BUCKET_TAGS` resource type, plus `Allow: DELETE, POST, GET` | S3 Control |
+| `OPTIONS` without an `Origin` header | `404` `<UnknownOperationException/>` | `400 BadRequest`: `Insufficient information. Origin request header needed.` | S3 Control |
+| `OPTIONS` with origin `https://example.com` and requested method `POST` | `200` empty CORS response allowing origin `*` and method `POST`, with the exact exposed-header list and 172,800-second maximum age | `403 AccessForbidden`: `CORSResponse: Bucket not found`, with method `POST` and resource type `BUCKET` | S3 Control |
+| `PROPFIND`, `X-ARGMIN-PROBE` | outer HTTP `400`, empty body, ordinary S3-shaped request ID rather than STS request IDs | outer HTTP `400` standard S3 `BadRequest`: `An error occurred when parsing the HTTP request.` | S3 Control outer-error shape for this reserved path |
+
+The mutating `--assume-role` fixture separately creates and tags a unique
+bucket, then requires three consecutive successful
+`ListTagsForResource` calls before the raw golden runs. An explicit bucket-
+policy deny for `s3:GetBucketTagging` against the primary test user is required
+to converge to three consecutive `GetBucketTagging` `AccessDenied` responses;
+`ListTagsForResource` must then continue to succeed three consecutive times.
+This proves that AWS authorizes the S3 Control GET with the distinct
+`s3:ListTagsForResource` action rather than aliasing it to ordinary S3
+`GetBucketTagging`.
+
+The exact existing-resource wire probe sends the identical GET to both endpoint
+families. Regional STS returns its `404 <UnknownOperationException/>`, while S3
+Control returns HTTP 200 with only the two normal AWS request-ID headers and no
+`Content-Type`. Its complete body is an XML declaration followed by
+`ListTagsForResourceResult` in the
+`http://awss3control.amazonaws.com/doc/2018-08-20/` namespace, containing
+`Tags/Tag/Key` and `Value` in that order. This pins a real typed
+`ListTagsForResource` success and its distinct response renderer; the Phase 4
+refactor must not implement it as an alias for the normal S3 tagging operation.
+
+The extension-method probes also observed that this outer AWS frontend can
+emit an unpadded uppercase hexadecimal `x-amz-request-id` shorter than the
+ordinary fixed-width S3 shape (15 and 16 characters were observed). Those two
+outer response assertions therefore use a dedicated nonempty, at-most-16-
+character uppercase-hex validator without weakening the standard response-ID
+invariant used by every normal S3, S3 Control, and STS response.
+
+The extension methods use an outer endpoint HTTP-parser response rather than
+either normal STS XML or the nested S3 Control error envelope. The different
+AWS endpoint families render that outer response differently. The local choice
+of the S3 Control outer-error shape follows the reserved-path precedence rule;
+it is not evidence that AWS's S3 Control operation router saw the extension
+method, and this valid-signature slice does not yet order the outer parser
+against authentication. The raw test client now accepts arbitrary valid HTTP
+method tokens so these named extension methods are sent on the wire rather than
+approximated with a recognized method.
+
+The remaining path/percent/ARN near misses, account-ID variants,
 signing-service collisions, malformed operation bodies, and local Host/SNI
 trust-boundary cases remain required before the Phase 4 service refactor.
 
@@ -1861,6 +1924,9 @@ involved.
   authentication boundaries, and after local Host/authority/SNI tests prove
   attacker-controlled authority cannot change endpoint kind; then add bounded
   Query protocol parsing
+- introduce typed S3 Control `ListTagsForResource`, `TagResource`, and
+  `UntagResource` operations during that refactor, preserving their distinct
+  authorization actions and wire renderers
 - authenticate STS requests with service name `sts`
 - authorize `AssumeRole` using the AWS-equivalent combination of caller identity
   permissions and the role trust policy
@@ -2061,10 +2127,10 @@ confidentiality. No session response or request body may appear in traces.
    Control versioned path collides with method/path decoding, account-ID and ARN
    validation, authentication, and STS Query classification on both the AWS STS
    and S3 Control endpoint kinds? The routing-boundary matrix and explicit
-   `SharedRegional` mapping above have pinned the initial root-Query and
-   versioned-path/form/query collision rows. The remaining bounded rows must be
-   completed, and the local authority/SNI matrix must enforce the endpoint-kind
-   trust boundary, before the typed service refactor.
+   `SharedRegional` mapping above have pinned the root-Query,
+   versioned-path/form/query, and bounded HTTP-method rows. The remaining
+   bounded rows must be completed, and the local authority/SNI matrix must
+   enforce the endpoint-kind trust boundary, before the typed service refactor.
 
 ## Definition Of The First Usable Milestone
 

@@ -1963,7 +1963,7 @@ where
             let mut request = match method {
                 "PUT" => agent.put(connect_url_str),
                 "POST" => agent.post(connect_url_str),
-                other => panic!("unsupported method: {other}"),
+                other => agent.request(other, connect_url_str),
             }
             .header("Authorization", &authorization)
             .header("x-amz-date", &amz_date)
