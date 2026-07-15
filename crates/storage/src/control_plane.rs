@@ -3,6 +3,7 @@ use std::io::{ErrorKind, Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -416,6 +417,7 @@ pub struct ControlPlaneAuthorityClockStatus {
     committed_timestamp_high_water_ms: Option<u64>,
     bound_raft_leadership_term: Option<u64>,
     current_raft_leadership_term: Option<u64>,
+    local_raft_authority_leader: bool,
     local_raft_authority_serving: bool,
 }
 
@@ -451,6 +453,11 @@ impl ControlPlaneAuthorityClockStatus {
     }
 
     #[must_use]
+    pub fn local_raft_authority_leader(self) -> bool {
+        self.local_raft_authority_leader
+    }
+
+    #[must_use]
     pub fn local_raft_authority_serving(self) -> bool {
         self.local_raft_authority_serving
     }
@@ -460,6 +467,7 @@ impl ControlPlaneAuthorityClockStatus {
 pub struct ControlPlaneAuthorityClockContext {
     committed_timestamp_high_water_ms: Option<u64>,
     current_raft_leadership_term: Option<u64>,
+    local_raft_authority_leader: bool,
     local_raft_authority_serving: bool,
 }
 
@@ -495,11 +503,14 @@ impl ControlPlaneAuthorityClockContext {
     pub fn new(
         committed_timestamp_high_water_ms: Option<u64>,
         current_raft_leadership_term: Option<u64>,
+        local_raft_authority_leader: bool,
         local_raft_authority_serving: bool,
     ) -> Self {
+        debug_assert!(!local_raft_authority_serving || local_raft_authority_leader);
         Self {
             committed_timestamp_high_water_ms,
             current_raft_leadership_term,
+            local_raft_authority_leader,
             local_raft_authority_serving,
         }
     }
@@ -680,6 +691,7 @@ impl ControlPlaneAuthorityClock {
             committed_timestamp_high_water_ms: context.committed_timestamp_high_water_ms,
             bound_raft_leadership_term: self.raft_leadership_term,
             current_raft_leadership_term: context.current_raft_leadership_term,
+            local_raft_authority_leader: context.local_raft_authority_leader,
             local_raft_authority_serving: context.local_raft_authority_serving,
         }
     }
@@ -2062,6 +2074,15 @@ impl ClusterControlSnapshot {
         }
 
         let node_id = heartbeat.node_id;
+        let Some(durable_node) = self.nodes.get(&node_id) else {
+            return Ok(None);
+        };
+        if !durable_node.administratively_available
+            || durable_node.observed_availability != NodeAvailabilityState::Healthy
+            || durable_node.lease_deadline_ms.is_none()
+        {
+            return Ok(None);
+        }
         let applied = self.apply_control_plane_command(command)?;
         if !self.heartbeat_update_is_volatile(applied.snapshot(), node_id) {
             return Ok(None);
@@ -3544,20 +3565,16 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         });
                     }
                 }
-                let horizon =
-                    self.lease_grant_horizon
-                        .ok_or_else(|| ControlPlaneError::CommandDecode {
-                            message: "targeted heartbeat expiry requires a committed lease horizon"
-                                .to_string(),
-                        })?;
-                if horizon.authority() != authority {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message: format!(
-                            "targeted heartbeat expiry authority {authority:?} does not match committed horizon authority {:?}",
-                            horizon.authority()
-                        ),
-                    });
-                }
+                let mut next_snapshot = self.clone();
+                next_snapshot.establish_heartbeat_lease_horizon(
+                    Some(authority),
+                    expire_at_ms,
+                    expire_at_ms,
+                )?;
+                let horizon = next_snapshot
+                    .lease_grant_horizon
+                    .expect("targeted expiry establishes a committed lease horizon");
+                let horizon_changed = self.lease_grant_horizon != Some(horizon);
                 let mut previous_node_id = None;
                 for lease in &expired {
                     if previous_node_id.is_some_and(|previous| previous >= lease.node_id) {
@@ -3616,7 +3633,6 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     }
                 }
 
-                let mut next_snapshot = self.clone();
                 let timestamp_changed = next_snapshot.record_committed_timestamp(expire_at_ms);
                 let mut expired_nodes = Vec::with_capacity(expired.len());
                 let mut serving_expired_nodes = Vec::new();
@@ -3640,7 +3656,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     next_snapshot.bump_epoch()?;
                     peering_pgs
                 };
-                let changed = timestamp_changed || !expired_nodes.is_empty();
+                let changed = horizon_changed || timestamp_changed || !expired_nodes.is_empty();
                 Ok(applied_control_plane_command(
                     self,
                     next_snapshot,
@@ -7806,6 +7822,7 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
             self.snapshot().max_committed_timestamp_ms(),
             None,
             true,
+            true,
         ))
     }
 
@@ -7845,7 +7862,8 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
 
 #[derive(Debug, Clone)]
 pub struct UnixControlPlaneClient {
-    socket_path: PathBuf,
+    socket_paths: Arc<[PathBuf]>,
+    preferred_socket_index: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone)]
@@ -8324,13 +8342,59 @@ impl UnixControlPlaneClient {
     #[must_use]
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
-            socket_path: socket_path.into(),
+            socket_paths: Arc::from([socket_path.into()]),
+            preferred_socket_index: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub fn with_socket_paths(
+        socket_paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, ControlPlaneError> {
+        let socket_paths: Vec<PathBuf> = socket_paths.into_iter().collect();
+        if socket_paths.is_empty() {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: "control-plane Unix client requires at least one socket path".to_owned(),
+            });
+        }
+        let mut unique = BTreeSet::new();
+        for socket_path in &socket_paths {
+            if !unique.insert(socket_path.clone()) {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "control-plane Unix client contains duplicate socket path {}",
+                        socket_path.display()
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            socket_paths: socket_paths.into(),
+            preferred_socket_index: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     #[must_use]
     pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+        &self.socket_paths[0]
+    }
+
+    #[must_use]
+    pub fn socket_paths(&self) -> &[PathBuf] {
+        &self.socket_paths
+    }
+
+    fn preferred_socket_index(&self) -> usize {
+        self.preferred_socket_index.load(Ordering::Acquire) % self.socket_paths.len()
+    }
+
+    fn prefer_socket_index(&self, socket_index: usize) {
+        self.preferred_socket_index
+            .store(socket_index % self.socket_paths.len(), Ordering::Release);
+    }
+
+    fn advance_preferred_socket(&self) {
+        let next = (self.preferred_socket_index() + 1) % self.socket_paths.len();
+        self.prefer_socket_index(next);
     }
 
     fn send_request(
@@ -8347,9 +8411,19 @@ impl UnixControlPlaneClient {
         payload: &[u8],
         read_timeout: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let response_payload =
-            self.send_request_raw_response_with_read_timeout(kind, payload, read_timeout)?;
-        decode_control_plane_rpc_response(response_payload)
+        let mut last_routing_error = None;
+        for _ in 0..self.socket_paths.len() {
+            let response_payload =
+                self.send_request_raw_response_with_read_timeout(kind, payload, read_timeout)?;
+            match decode_control_plane_rpc_response(response_payload) {
+                Err(error) if error.is_control_plane_leader_routing_rejection() => {
+                    last_routing_error = Some(error);
+                    self.advance_preferred_socket();
+                }
+                result => return result,
+            }
+        }
+        Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
     }
 
     fn send_request_raw_response_with_read_timeout(
@@ -8358,11 +8432,29 @@ impl UnixControlPlaneClient {
         payload: &[u8],
         read_timeout: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let mut stream =
-            UnixStream::connect(&self.socket_path).map_err(|source| ControlPlaneError::Io {
-                context: "connect control-plane socket",
-                source,
-            })?;
+        let start = self.preferred_socket_index();
+        let mut stream = None;
+        let mut last_connect_error = None;
+        for offset in 0..self.socket_paths.len() {
+            let socket_index = (start + offset) % self.socket_paths.len();
+            match UnixStream::connect(&self.socket_paths[socket_index]) {
+                Ok(connected) => {
+                    self.prefer_socket_index(socket_index);
+                    stream = Some(connected);
+                    break;
+                }
+                Err(source) => {
+                    last_connect_error = Some(ControlPlaneError::Io {
+                        context: "connect control-plane socket",
+                        source,
+                    });
+                    self.prefer_socket_index((socket_index + 1) % self.socket_paths.len());
+                }
+            }
+        }
+        let mut stream = stream.ok_or_else(|| {
+            last_connect_error.expect("endpoint set is non-empty and every connect failed")
+        })?;
         stream
             .set_read_timeout(Some(read_timeout))
             .map_err(|source| ControlPlaneError::Io {
@@ -8434,48 +8526,32 @@ impl UnixControlPlaneClient {
         }
     }
 
-    fn send_read_only_request_with_raw_response_payload_factory<F>(
-        &self,
-        kind: ControlPlaneRpcKind,
-        read_timeout: Duration,
-        mut build_payload: F,
-    ) -> Result<Vec<u8>, ControlPlaneError>
-    where
-        F: FnMut() -> Result<Vec<u8>, ControlPlaneError>,
-    {
-        debug_assert!(matches!(
-            kind,
-            ControlPlaneRpcKind::RuntimeMapSnapshot
-                | ControlPlaneRpcKind::RuntimeMapDiagnostics
-                | ControlPlaneRpcKind::PgRuntimeMapSnapshot
-                | ControlPlaneRpcKind::RuntimeMapStatus
-                | ControlPlaneRpcKind::PendingMetadataCommandRecoveries
-        ));
-        let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
-        loop {
-            let payload = build_payload()?;
-            match self.send_request_raw_response_with_read_timeout(kind, &payload, read_timeout) {
-                Ok(payload) => return Ok(payload),
-                Err(error)
-                    if error.is_retryable_read_only_rpc_transport_error()
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
     fn send_liveness_request(
         &self,
         kind: ControlPlaneRpcKind,
         payload: &[u8],
         retry_budget: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let response_payload =
-            self.send_liveness_request_raw_response(kind, payload, retry_budget)?;
-        decode_control_plane_rpc_response(response_payload)
+        let deadline = Instant::now() + retry_budget;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let response_payload =
+                self.send_liveness_request_raw_response(kind, payload, remaining)?;
+            match decode_control_plane_rpc_response(response_payload) {
+                Err(error)
+                    if error.is_control_plane_leader_routing_rejection()
+                        && Instant::now() < deadline =>
+                {
+                    self.advance_preferred_socket();
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let retry_sleep = CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF.min(remaining / 2);
+                    if !retry_sleep.is_zero() {
+                        std::thread::sleep(retry_sleep);
+                    }
+                }
+                result => return result,
+            }
+        }
     }
 
     fn send_liveness_request_raw_response(
@@ -9095,6 +9171,37 @@ impl AuthenticatedUnixControlPlaneClient {
         &self.credential
     }
 
+    fn send_verified_request_with_endpoint_failover<B, V>(
+        &self,
+        kind: ControlPlaneRpcKind,
+        read_timeout: Duration,
+        mut build_payload: B,
+        mut verify_response: V,
+    ) -> Result<Vec<u8>, ControlPlaneError>
+    where
+        B: FnMut() -> Result<Vec<u8>, ControlPlaneError>,
+        V: FnMut(&[u8]) -> Result<Vec<u8>, ControlPlaneError>,
+    {
+        let mut last_routing_error = None;
+        for _ in 0..self.inner.socket_paths.len() {
+            let payload = build_payload()?;
+            let response = self.inner.send_request_raw_response_with_read_timeout(
+                kind,
+                &payload,
+                read_timeout,
+            )?;
+            let response = verify_response(&response)?;
+            match decode_control_plane_rpc_response(response) {
+                Err(error) if error.is_control_plane_leader_routing_rejection() => {
+                    last_routing_error = Some(error);
+                    self.inner.advance_preferred_socket();
+                }
+                result => return result,
+            }
+        }
+        Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
+    }
+
     fn sign_read_only_request(
         &self,
         kind: ControlPlaneRpcKind,
@@ -9180,13 +9287,26 @@ impl AuthenticatedUnixControlPlaneClient {
     where
         F: FnMut() -> Result<u64, ControlPlaneError>,
     {
-        let payload = self.sign_admin_control_plane_request(kind, authority_now_ms()?, payload)?;
-        let response =
-            self.inner
-                .send_request_raw_response_with_read_timeout(kind, &payload, read_timeout)?;
-        let response =
-            self.verify_admin_control_plane_response(kind, authority_now_ms()?, &response)?;
-        decode_control_plane_rpc_response(response)
+        let mut last_routing_error = None;
+        for _ in 0..self.inner.socket_paths.len() {
+            let request =
+                self.sign_admin_control_plane_request(kind, authority_now_ms()?, payload.clone())?;
+            let response = self.inner.send_request_raw_response_with_read_timeout(
+                kind,
+                &request,
+                read_timeout,
+            )?;
+            let response =
+                self.verify_admin_control_plane_response(kind, authority_now_ms()?, &response)?;
+            match decode_control_plane_rpc_response(response) {
+                Err(error) if error.is_control_plane_leader_routing_rejection() => {
+                    last_routing_error = Some(error);
+                    self.inner.advance_preferred_socket();
+                }
+                result => return result,
+            }
+        }
+        Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
     }
 
     fn send_admin_request_with_read_timeout_and_clocks<R, S>(
@@ -9201,17 +9321,24 @@ impl AuthenticatedUnixControlPlaneClient {
         R: FnMut() -> Result<u64, ControlPlaneError>,
         S: FnMut() -> Result<u64, ControlPlaneError>,
     {
-        let payload =
-            self.sign_admin_control_plane_request(kind, request_authority_now_ms()?, payload)?;
-        let response =
-            self.inner
-                .send_request_raw_response_with_read_timeout(kind, &payload, read_timeout)?;
-        let response = self.verify_admin_control_plane_response(
+        self.send_verified_request_with_endpoint_failover(
             kind,
-            response_authority_now_ms()?,
-            &response,
-        )?;
-        decode_control_plane_rpc_response(response)
+            read_timeout,
+            || {
+                self.sign_admin_control_plane_request(
+                    kind,
+                    request_authority_now_ms()?,
+                    payload.clone(),
+                )
+            },
+            |response| {
+                self.verify_admin_control_plane_response(
+                    kind,
+                    response_authority_now_ms()?,
+                    response,
+                )
+            },
+        )
     }
 
     fn admin_pg_runtime_map_snapshot_with_read_timeout(
@@ -9222,9 +9349,9 @@ impl AuthenticatedUnixControlPlaneClient {
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let mut payload = Vec::new();
         write_pg_id_request(&mut payload, pg_id);
-        let response = self
-            .inner
-            .send_read_only_request_with_raw_response_payload_factory(
+        let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
+        let response = loop {
+            match self.send_verified_request_with_endpoint_failover(
                 ControlPlaneRpcKind::PgRuntimeMapSnapshot,
                 read_timeout,
                 || {
@@ -9234,13 +9361,24 @@ impl AuthenticatedUnixControlPlaneClient {
                         payload.clone(),
                     )
                 },
-            )?;
-        let response = self.verify_admin_control_plane_response(
-            ControlPlaneRpcKind::PgRuntimeMapSnapshot,
-            retry_clock.now_ms(),
-            &response,
-        )?;
-        let response = decode_control_plane_rpc_response(response)?;
+                |response| {
+                    self.verify_admin_control_plane_response(
+                        ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+                        retry_clock.now_ms(),
+                        response,
+                    )
+                },
+            ) {
+                Ok(response) => break response,
+                Err(error)
+                    if error.is_retryable_read_only_rpc_transport_error()
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let mut reader = PayloadReader::new(&response);
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
         reader.finish()?;
@@ -9729,16 +9867,25 @@ impl AuthenticatedUnixControlPlaneClient {
         &self,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
-        let payload = self.send_admin_request_with_read_timeout(
-            ControlPlaneRpcKind::AuthorityClockStatus,
-            authority_now_ms,
-            Vec::new(),
-            CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT,
-        )?;
-        let mut reader = PayloadReader::new(&payload);
-        let status = read_authority_clock_status(&mut reader)?;
-        reader.finish()?;
-        Ok(status)
+        for attempt in 0..self.inner.socket_paths.len() {
+            let payload = self.send_admin_request_with_read_timeout(
+                ControlPlaneRpcKind::AuthorityClockStatus,
+                authority_now_ms,
+                Vec::new(),
+                CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT,
+            )?;
+            let mut reader = PayloadReader::new(&payload);
+            let status = read_authority_clock_status(&mut reader)?;
+            reader.finish()?;
+            if status.current_raft_leadership_term().is_none()
+                || status.local_raft_authority_leader()
+                || attempt + 1 == self.inner.socket_paths.len()
+            {
+                return Ok(status);
+            }
+            self.inner.advance_preferred_socket();
+        }
+        unreachable!("control-plane endpoint set is non-empty")
     }
 
     fn reestablish_authority_clock_from_status(
@@ -9834,13 +9981,47 @@ impl AuthenticatedUnixControlPlaneClient {
     where
         F: FnMut() -> Result<u64, ControlPlaneError>,
     {
-        let response = self
-            .inner
-            .send_read_only_request_with_raw_response_payload_factory(kind, read_timeout, || {
-                self.sign_read_only_request(kind, authority_now_ms()?, payload.clone())
-            })?;
-        let response = self.verify_runtime_map_response(kind, authority_now_ms()?, &response)?;
-        decode_control_plane_rpc_response(response)
+        let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
+        loop {
+            let mut last_retryable_error = None;
+            for _ in 0..self.inner.socket_paths.len() {
+                let request =
+                    self.sign_read_only_request(kind, authority_now_ms()?, payload.clone())?;
+                let response = self.inner.send_request_raw_response_with_read_timeout(
+                    kind,
+                    &request,
+                    read_timeout,
+                );
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error)
+                        if error.is_retryable_read_only_rpc_transport_error()
+                            && Instant::now() < deadline =>
+                    {
+                        last_retryable_error = Some(error);
+                        self.inner.advance_preferred_socket();
+                        std::thread::sleep(CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let response =
+                    self.verify_runtime_map_response(kind, authority_now_ms()?, &response)?;
+                match decode_control_plane_rpc_response(response) {
+                    Err(error) if error.is_control_plane_leader_routing_rejection() => {
+                        last_retryable_error = Some(error);
+                        self.inner.advance_preferred_socket();
+                    }
+                    result => return result,
+                }
+            }
+            let error = last_retryable_error
+                .expect("authenticated read retry requires at least one retryable error");
+            if Instant::now() >= deadline {
+                return Err(error);
+            }
+            std::thread::sleep(CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF);
+        }
     }
 
     fn verify_runtime_map_response(
@@ -11097,36 +11278,59 @@ impl AuthenticatedUnixControlPlaneClient {
             ControlPlaneRpcKind::RefreshNodeHeartbeat,
             &payload,
         );
-        let issued_at_ms = authority_now_ms()?;
-        let expires_at_ms = issued_at_ms
-            .checked_add(heartbeat.requested_lease_duration_ms)
-            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
-        let envelope = self.credential.sign_envelope(
-            crate::control_plane_auth::ControlPlaneAuthSignInput {
-                target: ControlPlaneAuthTarget::Service(
-                    crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
-                ),
-                operation: ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
-                issued_at_ms: Some(issued_at_ms),
-                expires_at_ms: Some(expires_at_ms),
-                sequence: None,
-                nonce: Vec::new(),
-                payload,
-            },
-        )?;
-        let payload = envelope.encode_frame()?;
         let retry_budget = Duration::from_millis(heartbeat.requested_lease_duration_ms);
-        let payload = self.inner.send_liveness_request_raw_response(
-            ControlPlaneRpcKind::RefreshNodeHeartbeat,
-            &payload,
-            retry_budget,
-        )?;
-        let payload = self.verify_runtime_map_response(
-            ControlPlaneRpcKind::RefreshNodeHeartbeat,
-            authority_now_ms()?,
-            &payload,
-        )?;
-        let payload = decode_control_plane_rpc_response(payload)?;
+        let deadline = Instant::now() + retry_budget;
+        let payload = loop {
+            let issued_at_ms = authority_now_ms()?;
+            let expires_at_ms = issued_at_ms
+                .checked_add(heartbeat.requested_lease_duration_ms)
+                .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+            let envelope = self.credential.sign_envelope(
+                crate::control_plane_auth::ControlPlaneAuthSignInput {
+                    target: ControlPlaneAuthTarget::Service(
+                        crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
+                    ),
+                    operation: ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                    issued_at_ms: Some(issued_at_ms),
+                    expires_at_ms: Some(expires_at_ms),
+                    sequence: None,
+                    nonce: Vec::new(),
+                    payload: payload.clone(),
+                },
+            )?;
+            let request = envelope.encode_frame()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ControlPlaneError::RpcUnconfirmed {
+                    message: "heartbeat retry budget expired before leader routing completed"
+                        .to_owned(),
+                });
+            }
+            let response = self.inner.send_liveness_request_raw_response(
+                ControlPlaneRpcKind::RefreshNodeHeartbeat,
+                &request,
+                remaining,
+            )?;
+            let response = self.verify_runtime_map_response(
+                ControlPlaneRpcKind::RefreshNodeHeartbeat,
+                authority_now_ms()?,
+                &response,
+            )?;
+            match decode_control_plane_rpc_response(response) {
+                Err(error)
+                    if error.is_control_plane_leader_routing_rejection()
+                        && Instant::now() < deadline =>
+                {
+                    self.inner.advance_preferred_socket();
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let retry_sleep = CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF.min(remaining / 2);
+                    if !retry_sleep.is_zero() {
+                        std::thread::sleep(retry_sleep);
+                    }
+                }
+                result => break result?,
+            }
+        };
         let mut reader = PayloadReader::new(&payload);
         let lease = read_heartbeat_lease_summary(&mut reader)?;
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
@@ -13035,6 +13239,7 @@ fn write_authority_clock_status(out: &mut Vec<u8>, status: ControlPlaneAuthority
     write_option_u64(out, status.committed_timestamp_high_water_ms());
     write_option_u64(out, status.bound_raft_leadership_term());
     write_option_u64(out, status.current_raft_leadership_term());
+    write_u8(out, u8::from(status.local_raft_authority_leader()));
     write_u8(out, u8::from(status.local_raft_authority_serving()));
 }
 
@@ -13048,6 +13253,7 @@ fn read_authority_clock_status(
         committed_timestamp_high_water_ms: reader.read_option_u64()?,
         bound_raft_leadership_term: reader.read_option_u64()?,
         current_raft_leadership_term: reader.read_option_u64()?,
+        local_raft_authority_leader: reader.read_bool()?,
         local_raft_authority_serving: reader.read_bool()?,
     })
 }
@@ -14588,8 +14794,25 @@ pub enum ControlPlaneError {
 
 impl ControlPlaneError {
     #[must_use]
+    pub fn is_control_plane_leader_routing_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::RpcRemote { message }
+                if message.contains("local OpenRaft authority is not the serving leader")
+                    || message.contains(
+                        "control-plane authority clock can only be re-established on the local serving Raft authority",
+                    )
+                    || (message.contains("OpenRaft client-write failed")
+                        && message.contains("has to forward request to"))
+                    || message.contains("OpenRaft runtime-map")
+                        && message.contains("not enough for a quorum")
+        )
+    }
+
+    #[must_use]
     pub fn is_retryable_read_only_rpc_transport_error(&self) -> bool {
         self.is_retryable_control_plane_rpc_transport_error()
+            || self.is_control_plane_leader_routing_rejection()
     }
 
     #[must_use]
@@ -17675,6 +17898,52 @@ mod tests {
     }
 
     #[test]
+    fn stale_heartbeat_after_expiry_requires_a_durable_base_lease() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+
+        let mut expired = authority.snapshot().clone();
+        let horizon_authority = LeaseHorizonAuthorityBinding::new(3, Some(9));
+        expired.lease_grant_horizon = Some(CommittedLeaseGrantHorizon::from_parts(
+            horizon_authority,
+            3_000,
+        ));
+        let current_epoch = expired.cluster_epoch();
+        let stale_epoch = ClusterEpoch::new(current_epoch.get() - 1).unwrap();
+        let record = expired.nodes.get_mut(&NodeId::new(1)).unwrap();
+        record.observed_availability = NodeAvailabilityState::Unavailable;
+        record.lease_deadline_ms = None;
+        let heartbeat = heartbeat_from_snapshot(&expired, 1, stale_epoch, 2_000);
+        let command = ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            heartbeat_at_ms: 2_000,
+            lease_deadline_ms: 2_100,
+            lease_horizon_authority: Some(horizon_authority),
+        };
+
+        assert!(expired
+            .apply_control_plane_command(command.clone())
+            .unwrap()
+            .snapshot()
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .is_some());
+        assert!(expired
+            .apply_covered_volatile_heartbeat(command)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn parse_snapshot_round_trips_canonical_snapshot_bytes() {
         let snapshot = canonical_snapshot_with_node();
         let contents = format_snapshot(&snapshot);
@@ -20159,6 +20428,179 @@ mod tests {
                 issued_at_ms: 1_001,
             }
         );
+    }
+
+    #[test]
+    fn unix_control_plane_client_routes_around_dead_and_follower_endpoints() {
+        let tmp = test_util::tempdir();
+        let dead_socket_path = tmp.path().join("dead.sock");
+        let follower_socket_path = tmp.path().join("follower.sock");
+        let leader_socket_path = tmp.path().join("leader.sock");
+        let follower_listener =
+            std::os::unix::net::UnixListener::bind(&follower_socket_path).unwrap();
+        let leader_listener = std::os::unix::net::UnixListener::bind(&leader_socket_path).unwrap();
+        let mut leader_authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("leader.state"),
+        ))
+        .unwrap();
+        leader_authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let follower = std::thread::spawn(move || {
+            let (mut stream, _addr) = follower_listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let response = ControlPlaneRpcResponse {
+                kind: request.kind,
+                payload: encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
+                    message: "local OpenRaft authority is not the serving leader".to_owned(),
+                }))
+                .unwrap(),
+            };
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+        });
+        let leader = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _addr) = leader_listener.accept().unwrap();
+                handle_control_plane_unix_stream(&mut leader_authority, &mut stream, 2_000)
+                    .unwrap();
+            }
+        });
+
+        let client = UnixControlPlaneClient::with_socket_paths([
+            dead_socket_path,
+            follower_socket_path,
+            leader_socket_path,
+        ])
+        .unwrap();
+        let first = client.runtime_map_snapshot(0).unwrap();
+        let second = client.runtime_map_snapshot(0).unwrap();
+
+        follower.join().unwrap();
+        leader.join().unwrap();
+        assert_eq!(first.cluster_epoch(), ClusterEpoch::new(2).unwrap());
+        assert_eq!(second.cluster_epoch(), ClusterEpoch::new(2).unwrap());
+        assert_eq!(client.preferred_socket_index(), 2);
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_routes_after_verified_follower_rejection() {
+        let tmp = test_util::tempdir();
+        let follower_1_socket_path = tmp.path().join("follower-1.sock");
+        let follower_2_socket_path = tmp.path().join("follower-2.sock");
+        let leader_socket_path = tmp.path().join("leader.sock");
+        let follower_1_listener =
+            std::os::unix::net::UnixListener::bind(&follower_1_socket_path).unwrap();
+        let follower_2_listener =
+            std::os::unix::net::UnixListener::bind(&follower_2_socket_path).unwrap();
+        let leader_listener = std::os::unix::net::UnixListener::bind(&leader_socket_path).unwrap();
+        let credential = frontend_auth_credential("auth-cluster", "frontend-1");
+        let mut leader_authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("leader.state"),
+        ))
+        .unwrap();
+        leader_authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let spawn_follower = |listener: std::os::unix::net::UnixListener,
+                              signer: ControlPlaneScopedCredential| {
+            std::thread::spawn(move || {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let (kind, _payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
+                let response =
+                    encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
+                        message: "local OpenRaft authority is not the serving leader".to_owned(),
+                    }))
+                    .unwrap();
+                let response = sign_control_plane_response_payload(
+                    kind,
+                    &signer
+                        .runtime_map_response_credential_for_frontend()
+                        .unwrap(),
+                    signer.principal().clone(),
+                    ControlPlaneAuthOperation::RuntimeMapResponse,
+                    2_000,
+                    response,
+                )
+                .unwrap();
+                write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
+            })
+        };
+        let follower_1 = spawn_follower(follower_1_listener, credential.clone());
+        let follower_2 = spawn_follower(follower_2_listener, credential.clone());
+        let leader = std::thread::spawn(move || {
+            let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+            let (mut stream, _addr) = leader_listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut leader_authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let inner = UnixControlPlaneClient::with_socket_paths([
+            follower_1_socket_path,
+            follower_2_socket_path,
+            leader_socket_path,
+        ])
+        .unwrap();
+        let client = AuthenticatedUnixControlPlaneClient::new(inner, credential);
+        let payload = client
+            .send_signed_read_only_request_with_read_timeout_and_clock(
+                ControlPlaneRpcKind::RuntimeMapSnapshot,
+                Vec::new(),
+                CONTROL_PLANE_RPC_IO_TIMEOUT,
+                || Ok(2_000),
+            )
+            .unwrap();
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+
+        follower_1.join().unwrap();
+        follower_2.join().unwrap();
+        leader.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), ClusterEpoch::new(2).unwrap());
+        assert_eq!(client.inner().preferred_socket_index(), 2);
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_rejects_unverified_follower_routing_error() {
+        let tmp = test_util::tempdir();
+        let follower_socket_path = tmp.path().join("follower.sock");
+        let follower_listener =
+            std::os::unix::net::UnixListener::bind(&follower_socket_path).unwrap();
+        let credential = frontend_auth_credential("auth-cluster", "frontend-1");
+        let follower = std::thread::spawn(move || {
+            let (mut stream, _addr) = follower_listener.accept().unwrap();
+            let (kind, _payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
+            let response = encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
+                message: "local OpenRaft authority is not the serving leader".to_owned(),
+            }))
+            .unwrap();
+            write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
+        });
+
+        let inner = UnixControlPlaneClient::new(follower_socket_path);
+        let client = AuthenticatedUnixControlPlaneClient::new(inner, credential);
+        let error = client
+            .send_signed_read_only_request_with_read_timeout_and_clock(
+                ControlPlaneRpcKind::RuntimeMapSnapshot,
+                Vec::new(),
+                CONTROL_PLANE_RPC_IO_TIMEOUT,
+                || Ok(2_000),
+            )
+            .unwrap_err();
+
+        follower.join().unwrap();
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("authentication envelope")
+                    || message.contains("truncated")
+                    || message.contains("magic")
+        ));
     }
 
     #[test]
@@ -29688,6 +30130,70 @@ mod tests {
     }
 
     #[test]
+    fn targeted_heartbeat_expiry_transitions_horizon_after_successor_fence() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        let previous_authority = LeaseHorizonAuthorityBinding::new(7, Some(1));
+        let successor_authority = LeaseHorizonAuthorityBinding::new(8, Some(2));
+        let authority_now_ms = authority.snapshot().max_committed_timestamp_ms().unwrap();
+        let baseline = authority
+            .snapshot()
+            .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+                authority: previous_authority,
+                authority_now_ms,
+                horizon_duration_ms: CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS,
+            })
+            .unwrap()
+            .into_snapshot();
+        let lease_deadline_ms = baseline
+            .node(NodeId::new(1))
+            .unwrap()
+            .lease_deadline_ms()
+            .unwrap();
+        let successor_fence_ms = baseline.lease_grant_horizon().unwrap().grant_not_after_ms()
+            + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
+        let command = |expire_at_ms| ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+            authority: successor_authority,
+            expire_at_ms,
+            expired: vec![ExpiredNodeHeartbeatLease {
+                node_id: NodeId::new(1),
+                lease_deadline_ms,
+            }],
+        };
+
+        assert!(matches!(
+            baseline.apply_control_plane_command(command(successor_fence_ms - 1)),
+            Err(ControlPlaneError::PreviousLeaseGrantHorizonStillActive {
+                authority_now_ms,
+                fenced_until_ms,
+            }) if authority_now_ms == successor_fence_ms - 1
+                && fenced_until_ms == successor_fence_ms
+        ));
+
+        let applied = baseline
+            .apply_control_plane_command(command(successor_fence_ms))
+            .unwrap();
+        assert_eq!(
+            applied.snapshot().lease_grant_horizon_authority(),
+            Some(successor_authority)
+        );
+        assert_eq!(
+            applied
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .observed_availability(),
+            NodeAvailabilityState::Unavailable
+        );
+    }
+
+    #[test]
     fn expire_heartbeat_leases_command_rejects_committed_timestamp_regression() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -29835,6 +30341,7 @@ mod tests {
                 Some(1_000),
                 None,
                 true,
+                true,
             ))
             .established());
 
@@ -29851,6 +30358,7 @@ mod tests {
             .status(ControlPlaneAuthorityClockContext::new(
                 Some(1_001),
                 None,
+                true,
                 true,
             ))
             .established());
@@ -29870,6 +30378,7 @@ mod tests {
             .status(ControlPlaneAuthorityClockContext::new(
                 Some(1_000),
                 None,
+                true,
                 true,
             ))
             .established());
@@ -29945,7 +30454,7 @@ mod tests {
     fn recovered_clock_checkpoint_cannot_resume_an_older_horizon_generation() {
         let binding = ControlPlaneAuthorityClockCheckpointBinding([0x43; 32]);
         let previous_authority = LeaseHorizonAuthorityBinding::new(7, None);
-        let context = ControlPlaneAuthorityClockContext::new(Some(1_000), None, true);
+        let context = ControlPlaneAuthorityClockContext::new(Some(1_000), None, true, true);
         let mut recovered = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
             Some(1_000),
             1_000,
@@ -30032,6 +30541,7 @@ mod tests {
                     .status(ControlPlaneAuthorityClockContext::new(
                         authority.snapshot().max_committed_timestamp_ms(),
                         None,
+                        true,
                         true,
                     ))
                     .established());
@@ -30175,6 +30685,7 @@ mod tests {
                     authority.snapshot().max_committed_timestamp_ms(),
                     None,
                     true,
+                    true,
                 ))
                 .established());
         });
@@ -30211,7 +30722,7 @@ mod tests {
     fn authority_clock_status_observes_new_raft_term_before_serving_request() {
         let mut clock = ControlPlaneAuthorityClock::new(Some(1_000), 1_000, Some(50)).unwrap();
         clock.bind_initial_raft_leadership_term(Some(7));
-        let context = ControlPlaneAuthorityClockContext::new(Some(1_000), Some(8), true);
+        let context = ControlPlaneAuthorityClockContext::new(Some(1_000), Some(8), true, true);
 
         let status = clock.observe_status(context, 1_100, Some(150)).unwrap();
 
@@ -30222,6 +30733,28 @@ mod tests {
         );
         assert_eq!(status.bound_raft_leadership_term(), Some(7));
         assert_eq!(status.current_raft_leadership_term(), Some(8));
+        assert!(status.local_raft_authority_leader());
+        assert!(status.local_raft_authority_serving());
+    }
+
+    #[test]
+    fn authority_clock_status_codec_preserves_blocked_local_raft_leader() {
+        let clock = ControlPlaneAuthorityClock::new(Some(1_000), 1_000, Some(50)).unwrap();
+        let status = clock.status(ControlPlaneAuthorityClockContext::new(
+            Some(1_000),
+            Some(8),
+            true,
+            false,
+        ));
+        let mut encoded = Vec::new();
+        write_authority_clock_status(&mut encoded, status);
+        let mut reader = PayloadReader::new(&encoded);
+        let decoded = read_authority_clock_status(&mut reader).unwrap();
+        reader.finish().unwrap();
+
+        assert!(decoded.local_raft_authority_leader());
+        assert!(!decoded.local_raft_authority_serving());
+        assert_eq!(decoded.current_raft_leadership_term(), Some(8));
     }
 
     #[test]
@@ -30246,7 +30779,7 @@ mod tests {
         let mut clock = ControlPlaneAuthorityClock::new(Some(1_000), 1_000, Some(50)).unwrap();
         clock.bind_initial_raft_leadership_term(Some(7));
         assert!(clock.validate_raft_leadership_term(8).is_err());
-        let context = ControlPlaneAuthorityClockContext::new(Some(1_000), Some(8), true);
+        let context = ControlPlaneAuthorityClockContext::new(Some(1_000), Some(8), true, true);
         let blocked = clock.status(context);
         assert!(!blocked.established());
         assert_eq!(
@@ -30310,7 +30843,8 @@ mod tests {
         let mut clock = ControlPlaneAuthorityClock::new(Some(2_000), 4_000, Some(50)).unwrap();
         clock.bind_initial_raft_leadership_term(Some(7));
         assert!(clock.validate_raft_leadership_term(8).is_err());
-        let follower_context = ControlPlaneAuthorityClockContext::new(Some(2_000), Some(8), false);
+        let follower_context =
+            ControlPlaneAuthorityClockContext::new(Some(2_000), Some(8), false, false);
         let generation = clock.status(follower_context).generation();
         assert!(matches!(
             clock.reestablish(
@@ -30324,7 +30858,8 @@ mod tests {
             Err(ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority)
         ));
 
-        let leader_context = ControlPlaneAuthorityClockContext::new(Some(2_000), Some(8), true);
+        let leader_context =
+            ControlPlaneAuthorityClockContext::new(Some(2_000), Some(8), true, true);
         assert!(matches!(
             clock.reestablish(
                 generation,

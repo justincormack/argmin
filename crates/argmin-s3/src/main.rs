@@ -393,6 +393,33 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         };
     }
 
+    if command == "control-plane-pg-runtime-map-ready" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <pg-id> <node-id>...",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some((pg_id, acting_set)) = parse_control_plane_pg_acting_set_args(args) else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <pg-id> <node-id>...",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        return match control_plane_pg_runtime_map_ready(Path::new(&path), pg_id, &acting_set) {
+            Ok((runtime_epoch, route_epoch)) => {
+                println!("{} {}", runtime_epoch.get(), route_epoch.get());
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
     if command == "control-plane-authority-clock-status" {
         let Some(path) = args.next() else {
             eprintln!(
@@ -859,7 +886,7 @@ fn reestablish_control_plane_authority_clock(
 
 fn format_authority_clock_status(status: ControlPlaneAuthorityClockStatus) -> String {
     format!(
-        "generation={} established={} blocked_reason={:?} committed_timestamp_high_water_ms={} bound_raft_term={} current_raft_term={} local_raft_authority_serving={}",
+        "generation={} established={} blocked_reason={:?} committed_timestamp_high_water_ms={} bound_raft_term={} current_raft_term={} local_raft_authority_leader={} local_raft_authority_serving={}",
         status.generation(),
         status.established(),
         status.blocked_reason(),
@@ -872,6 +899,7 @@ fn format_authority_clock_status(status: ControlPlaneAuthorityClockStatus) -> St
         status
             .current_raft_leadership_term()
             .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+        status.local_raft_authority_leader(),
         status.local_raft_authority_serving(),
     )
 }
@@ -1518,6 +1546,41 @@ fn control_plane_runtime_map_diagnostics(socket_path: &Path) -> Result<String, S
         .runtime_map_diagnostics()
         .map_err(|error| format!("control-plane runtime map is not ready: {error}"))?;
     Ok(format_control_plane_runtime_map_diagnostics(&diagnostics))
+}
+
+fn control_plane_pg_runtime_map_ready(
+    socket_path: &Path,
+    pg_id: PgId,
+    expected_acting_set: &[NodeId],
+) -> Result<(ClusterEpoch, ClusterEpoch), String> {
+    let control_plane = build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)?;
+    let runtime_map = control_plane
+        .runtime_map_snapshot(storage::clock::current_time_millis())
+        .map_err(|error| format!("control-plane PG runtime map is not ready: {error}"))?;
+    let route = runtime_map
+        .pg_routes()
+        .iter()
+        .find(|route| route.pg_id() == pg_id)
+        .ok_or_else(|| {
+            format!(
+                "control-plane runtime map has no route for PG {}",
+                pg_id.get()
+            )
+        })?;
+    if route.state() != PgState::Active
+        || route.primary_lease_deadline_ms().is_none()
+        || route.acting_set() != expected_acting_set
+    {
+        return Err(format!(
+            "control-plane PG {} is not serving on expected acting set {:?}: state {:?}, acting set {:?}, primary lease deadline {:?}",
+            pg_id.get(),
+            expected_acting_set,
+            route.state(),
+            route.acting_set(),
+            route.primary_lease_deadline_ms(),
+        ));
+    }
+    Ok((runtime_map.cluster_epoch(), route.cluster_epoch()))
 }
 
 fn format_control_plane_runtime_map_diagnostics(
@@ -2271,6 +2334,7 @@ impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
         Ok(ControlPlaneAuthorityClockContext::new(
             snapshot.max_committed_timestamp_ms(),
             status.current_term(),
+            status.local_leader(),
             status.linearized_authority_serving(),
         ))
     }
@@ -3687,7 +3751,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                     "experimental OpenRaft control-plane lease expiry deferred because a coherent clock sample was unavailable: {error}"
                 );
             }
-            Err(error) if experimental_raft_error_is_non_local_leader(&error) => {}
+            Err(error) if experimental_raft_lease_expiry_error_is_transient(&error) => {}
             Err(error) if control_plane_lease_expiry_error_is_clock_wait(&error) => {
                 eprintln!(
                     "experimental OpenRaft control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
@@ -3707,6 +3771,7 @@ fn control_plane_lease_expiry_error_is_clock_wait(error: &ControlPlaneError) -> 
         error,
         ControlPlaneError::CommittedTimestampRegression { .. }
             | ControlPlaneError::CommittedTimestampTooFarAhead { .. }
+            | ControlPlaneError::PreviousLeaseGrantHorizonStillActive { .. }
             | ControlPlaneError::AuthorityClockLeadershipChanged { .. }
             | ControlPlaneError::AuthorityClockSourceUnavailable
             | ControlPlaneError::AuthorityClockNotEstablished { .. }
@@ -3721,6 +3786,14 @@ fn experimental_raft_error_is_non_local_leader(error: &ControlPlaneError) -> boo
                 || (message.contains("OpenRaft client-write failed")
                     && message.contains("has to forward request to"))
     )
+}
+
+fn experimental_raft_lease_expiry_error_is_transient(error: &ControlPlaneError) -> bool {
+    experimental_raft_error_is_non_local_leader(error)
+        || matches!(
+            error,
+            ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch { .. }
+        )
 }
 
 fn bootstrap_empty_experimental_raft_control_plane(
@@ -4542,10 +4615,9 @@ fn build_frontend_control_plane_client(
     config: &ServerConfig,
     control_plane_socket_path: &str,
 ) -> Result<FrontendControlPlaneClient, String> {
+    let client = build_configured_unix_control_plane_client(config, control_plane_socket_path)?;
     if config.control_plane_frontend_auth_credentials.is_empty() {
-        return Ok(FrontendControlPlaneClient::Plain(
-            UnixControlPlaneClient::new(control_plane_socket_path),
-        ));
+        return Ok(FrontendControlPlaneClient::Plain(client));
     }
     let cluster_id = config
         .control_plane_auth_cluster_id
@@ -4559,17 +4631,35 @@ fn build_frontend_control_plane_client(
         &config.control_plane_frontend_auth_credentials,
         instance_id,
     )?;
-    build_authenticated_frontend_control_plane_client(
-        control_plane_socket_path,
+    build_authenticated_frontend_control_plane_client_with_inner(
+        client,
         cluster_id,
         instance_id,
         configured,
     )
 }
 
+fn build_configured_unix_control_plane_client(
+    config: &ServerConfig,
+    primary_socket_path: &str,
+) -> Result<UnixControlPlaneClient, String> {
+    let socket_paths = if config.control_plane_client_socket_paths.is_empty() {
+        vec![PathBuf::from(primary_socket_path)]
+    } else {
+        config
+            .control_plane_client_socket_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    };
+    UnixControlPlaneClient::with_socket_paths(socket_paths)
+        .map_err(|error| format!("invalid control-plane client socket paths: {error}"))
+}
+
 fn build_frontend_control_plane_client_from_runtime_map_auth_env(
     control_plane_socket_path: &Path,
 ) -> Result<FrontendControlPlaneClient, String> {
+    let client = build_command_unix_control_plane_client(control_plane_socket_path)?;
     let auth_config = ConfiguredControlPlaneFrontendRuntimeMapAuth::from_env()?;
     match auth_config {
         Some(auth_config) => {
@@ -4578,22 +4668,40 @@ fn build_frontend_control_plane_client_from_runtime_map_auth_env(
                 &auth_config.instance_id,
             )
             .expect("auth-only frontend config validates local instance credential");
-            build_authenticated_frontend_control_plane_client(
-                control_plane_socket_path,
+            build_authenticated_frontend_control_plane_client_with_inner(
+                client,
                 &auth_config.cluster_id,
                 &auth_config.instance_id,
                 configured,
             )
         }
-        None => Ok(FrontendControlPlaneClient::Plain(
-            UnixControlPlaneClient::new(control_plane_socket_path),
-        )),
+        None => Ok(FrontendControlPlaneClient::Plain(client)),
     }
+}
+
+fn build_command_unix_control_plane_client(
+    primary_socket_path: &Path,
+) -> Result<UnixControlPlaneClient, String> {
+    let configured = std::env::var("ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS").ok();
+    let Some(configured) = configured else {
+        return Ok(UnixControlPlaneClient::new(primary_socket_path));
+    };
+    let primary_socket_path = primary_socket_path.to_str().ok_or_else(|| {
+        "control-plane command socket path must be UTF-8 when ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS is set"
+            .to_owned()
+    })?;
+    let socket_paths = config::parse_control_plane_client_socket_paths(
+        Some(configured),
+        Some(primary_socket_path),
+    )?;
+    UnixControlPlaneClient::with_socket_paths(socket_paths.into_iter().map(PathBuf::from))
+        .map_err(|error| format!("invalid control-plane client socket paths: {error}"))
 }
 
 fn build_admin_control_plane_client_from_command_auth_env(
     control_plane_socket_path: &Path,
 ) -> Result<AdminControlPlaneClient, String> {
+    let client = build_command_unix_control_plane_client(control_plane_socket_path)?;
     match ConfiguredControlPlaneAdminCommandAuth::from_env()? {
         Some(auth_config) => {
             let configured = latest_admin_auth_credential_for_instance(
@@ -4610,20 +4718,15 @@ fn build_admin_control_plane_client_from_command_auth_env(
                     )
                 })?;
             Ok(AdminControlPlaneClient::Authenticated(
-                AuthenticatedUnixControlPlaneClient::new(
-                    UnixControlPlaneClient::new(control_plane_socket_path),
-                    credential,
-                ),
+                AuthenticatedUnixControlPlaneClient::new(client, credential),
             ))
         }
-        None => Ok(AdminControlPlaneClient::Plain(UnixControlPlaneClient::new(
-            control_plane_socket_path,
-        ))),
+        None => Ok(AdminControlPlaneClient::Plain(client)),
     }
 }
 
-fn build_authenticated_frontend_control_plane_client(
-    control_plane_socket_path: impl Into<std::path::PathBuf>,
+fn build_authenticated_frontend_control_plane_client_with_inner(
+    client: UnixControlPlaneClient,
     cluster_id: &str,
     instance_id: &str,
     configured: &ConfiguredControlPlaneFrontendAuthCredential,
@@ -4636,10 +4739,7 @@ fn build_authenticated_frontend_control_plane_client(
             )
         })?;
     Ok(FrontendControlPlaneClient::Authenticated(
-        AuthenticatedUnixControlPlaneClient::new(
-            UnixControlPlaneClient::new(control_plane_socket_path),
-            credential,
-        ),
+        AuthenticatedUnixControlPlaneClient::new(client, credential),
     ))
 }
 
@@ -4649,7 +4749,7 @@ fn build_storage_node_control_plane_client(
     node_id: NodeId,
     node_incarnation: u64,
 ) -> Result<StorageNodeControlPlaneClient, String> {
-    let client = UnixControlPlaneClient::new(control_plane_socket_path);
+    let client = build_configured_unix_control_plane_client(config, control_plane_socket_path)?;
     if config.control_plane_storage_auth_credentials.is_empty() {
         return Ok(StorageNodeControlPlaneClient::Plain(client));
     }
@@ -5751,6 +5851,7 @@ mod tests {
                 Some(999),
                 None,
                 true,
+                true,
             ))
             .established());
         std::fs::remove_dir_all(tmp).unwrap();
@@ -5945,6 +6046,7 @@ mod tests {
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
             control_plane_state_path: None,
             control_plane_socket_path: None,
+            control_plane_client_socket_paths: Vec::new(),
             control_plane_auth_cluster_id: None,
             control_plane_storage_auth_credentials: Vec::new(),
             control_plane_frontend_auth_instance_id: None,
@@ -6300,6 +6402,12 @@ mod tests {
                 ),
             }
         ));
+        assert!(control_plane_lease_expiry_error_is_clock_wait(
+            &ControlPlaneError::PreviousLeaseGrantHorizonStillActive {
+                authority_now_ms: 1_999,
+                fenced_until_ms: 2_000,
+            }
+        ));
         assert!(!control_plane_lease_expiry_error_is_clock_wait(
             &ControlPlaneError::InvalidLeaseDuration
         ));
@@ -6316,6 +6424,12 @@ mod tests {
             &ControlPlaneError::RpcRemote {
                 message: "OpenRaft client-write failed: has to forward request to: Some(102)"
                     .to_string(),
+            }
+        ));
+        assert!(experimental_raft_lease_expiry_error_is_transient(
+            &ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
+                authority_term: Some(2),
+                committed_term: Some(3),
             }
         ));
         assert!(!experimental_raft_error_is_non_local_leader(

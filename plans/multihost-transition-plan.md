@@ -11422,9 +11422,62 @@ Production exit gates for this blocker:
   configured deadline without authority-lock starvation. The release test must
   fail on any frontend refresh timeout or control-plane response-side broken
   pipe.
-- A long-running route-change/control-plane-restart soak passes on tmpfs and on
-  the dedicated durable-write profile while exporting zero unclassified
-  refresh failures and bounded write/checkpoint metrics.
+- The primary long-running route-change/control-plane-restart soak uses three
+  authenticated durable OpenRaft authority processes, survives abrupt loss and
+  restart of the current leader, and passes on tmpfs and on the dedicated
+  durable-write profile while exporting zero unclassified refresh failures and
+  bounded write/checkpoint metrics. Standalone route-change/restart coverage
+  remains in the lower-level compatibility and differential gates; it is not a
+  substitute for this replicated-mode release soak.
+
+Replicated route-change soak cutover:
+
+- `./scripts/uat-s3-tests --smoke route-change-control-plane-restart` now uses
+  three independently persisted OpenRaft voters with authenticated Unix peer,
+  storage-heartbeat, frontend-read, and admin RPCs. It kills the observed
+  leader, explicitly re-establishes clock authority on the naturally elected
+  replacement, waits for a linearized all-serving runtime map, restarts the old
+  voter, handles a further legitimate term change, and then verifies retained
+  reads/listings plus a new write on the moved PG. The existing standalone
+  route-change, process-restart, and differential tests continue to cover the
+  supported standalone authority without making it the primary multihost soak.
+- Local control-plane clients may be configured with an ordered set of Unix
+  authority sockets. They rotate freely when connection fails before request
+  dispatch and after a successfully authenticated explicit non-leader/routing
+  rejection. They remember the last successful endpoint, but never turn an
+  ambiguous post-dispatch mutating response loss into a blind retry. Runtime-map
+  readiness and PG-route checks use the RPC model rather than inspecting the
+  single-authority text state file.
+- Authority-clock status now distinguishes local Raft leadership from Raft
+  applied/committed serving readiness; clock establishment remains a separate
+  required gate. This lets authenticated recovery target a newly elected
+  Raft-ready leader while it is intentionally clock-fenced, without treating a
+  follower as eligible or weakening the combined serving-read boundary. The
+  soak performs recovery only at its explicit leader-loss or voter-rejoin
+  failover boundary, after proving the replacement is in a strictly newer term
+  and is fenced for exactly `RaftLeadershipChanged`. Ordinary readiness polling
+  is observational: any other clock latch fails the soak rather than silently
+  re-establishing it. The voter-rejoin boundary remains active until one
+  established term has stayed stable for five seconds, which exceeds the
+  configured three-second maximum election timeout and leaves a convergence
+  interval; every newer term resets that window and repeats the strict fence
+  validation before recovery.
+  Standalone restart likewise has to resume from its durable clock checkpoint;
+  the soak does not hide missing or invalid restart evidence with an admin
+  reset. After recovery, the failover barrier requires a fully serving runtime
+  map in an epoch newer than the pre-failover map, so a briefly valid old lease
+  horizon cannot let the test proceed into the later expiry/peering window.
+- The first replicated soak exposed two failover-only heartbeat invariants.
+  A stale-epoch heartbeat after durable lease expiry is no longer eligible for
+  the volatile overlay unless the durable base node is administratively
+  available, observed healthy, and already has a durable lease. Targeted expiry
+  now atomically establishes the current term's horizon on its candidate
+  snapshot before expiring selected leases: it defers with
+  `PreviousLeaseGrantHorizonStillActive` until the predecessor horizon plus
+  skew fence elapses, then transitions the horizon and expiry in one committed
+  command. Expected fence waits and sampled-term/committed-term election races
+  do not terminate the authority process; unrelated deterministic command
+  failures remain fatal to the manager loop.
 
 Phase 12.4 proposed scope:
 

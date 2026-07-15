@@ -284,6 +284,7 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_rpc_control_admission_wait_timeout: Duration,
     pub(crate) control_plane_state_path: Option<String>,
     pub(crate) control_plane_socket_path: Option<String>,
+    pub(crate) control_plane_client_socket_paths: Vec<String>,
     pub(crate) control_plane_auth_cluster_id: Option<String>,
     pub(crate) control_plane_storage_auth_credentials:
         Vec<ConfiguredControlPlaneStorageAuthCredential>,
@@ -341,6 +342,7 @@ impl ServerConfig {
     ///   `ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS` (1000)
     ///   `ARGMIN_CONTROL_PLANE_STATE_PATH` (required for control-plane role)
     ///   `ARGMIN_CONTROL_PLANE_SOCKET_PATH` (required for control-plane role, optional dynamic route source for frontend/storage roles)
+    ///   `ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS` (comma-separated absolute Unix sockets used by frontend/storage/admin clients for replicated-authority routing)
     ///   `ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID` (required when control-plane internal auth credentials are configured)
     ///   `ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS` (`node_id=credential_id:version:secret,...`, optional authenticated storage-node heartbeat refresh)
     ///   `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID` (required for frontend roles when frontend control-plane auth credentials are configured)
@@ -510,6 +512,10 @@ impl ServerConfig {
             Duration::from_millis(storage_node_rpc_control_admission_wait_ms);
         let control_plane_state_path = get("ARGMIN_CONTROL_PLANE_STATE_PATH");
         let control_plane_socket_path = get("ARGMIN_CONTROL_PLANE_SOCKET_PATH");
+        let control_plane_client_socket_paths = parse_control_plane_client_socket_paths(
+            get("ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS"),
+            control_plane_socket_path.as_deref(),
+        )?;
         let control_plane_auth_cluster_id = get("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID");
         let control_plane_storage_auth_credentials = parse_control_plane_storage_auth_credentials(
             get("ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS"),
@@ -940,6 +946,7 @@ impl ServerConfig {
             storage_node_rpc_control_admission_wait_timeout,
             control_plane_state_path,
             control_plane_socket_path,
+            control_plane_client_socket_paths,
             control_plane_auth_cluster_id,
             control_plane_storage_auth_credentials,
             control_plane_frontend_auth_instance_id,
@@ -998,6 +1005,50 @@ fn parse_process_role(value: &str) -> Result<ProcessRole, String> {
                 .to_string(),
         ),
     }
+}
+
+pub(crate) fn parse_control_plane_client_socket_paths(
+    value: Option<String>,
+    primary_socket_path: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let Some(value) = value else {
+        return Ok(primary_socket_path
+            .map(ToOwned::to_owned)
+            .into_iter()
+            .collect());
+    };
+    if value.trim().is_empty() {
+        return Err("ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS must not be empty".to_owned());
+    }
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_path in value.split(',') {
+        let path = raw_path.trim();
+        if path.is_empty() {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS contains an empty entry".to_owned(),
+            );
+        }
+        if !Path::new(path).is_absolute() {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS entry {path:?} must use an absolute path"
+            ));
+        }
+        if !seen.insert(path.to_owned()) {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS contains duplicate path {path:?}"
+            ));
+        }
+        paths.push(path.to_owned());
+    }
+    if let Some(primary_socket_path) = primary_socket_path {
+        if !seen.contains(primary_socket_path) {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS must include ARGMIN_CONTROL_PLANE_SOCKET_PATH {primary_socket_path:?}"
+            ));
+        }
+    }
+    Ok(paths)
 }
 
 fn parse_storage_pg_ids(value: Option<String>, pg_count: u32) -> Result<Vec<u32>, String> {
@@ -3275,6 +3326,49 @@ mod tests {
             Some("/tmp/argmin-control-plane.sock")
         );
         assert!(cfg.storage_node_sockets.is_empty());
+    }
+
+    #[test]
+    fn control_plane_client_socket_paths_include_primary_and_preserve_order() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/control-plane-1.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS",
+                "/tmp/control-plane-1.sock,/tmp/control-plane-2.sock,/tmp/control-plane-3.sock",
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            cfg.control_plane_client_socket_paths,
+            [
+                "/tmp/control-plane-1.sock",
+                "/tmp/control-plane-2.sock",
+                "/tmp/control-plane-3.sock",
+            ]
+        );
+    }
+
+    #[test]
+    fn control_plane_client_socket_paths_reject_missing_primary() {
+        let error = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/control-plane-1.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS",
+                "/tmp/control-plane-2.sock,/tmp/control-plane-3.sock",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(error.contains("must include ARGMIN_CONTROL_PLANE_SOCKET_PATH"));
     }
 
     #[test]

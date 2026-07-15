@@ -409,6 +409,13 @@ metrics_sampler_pid=""
 slowdown_summary_printed=0
 control_plane_state_path=""
 control_plane_socket_path=""
+control_plane_client_socket_paths=""
+replicated_control_plane=0
+control_plane_raft_node_ids=(101 102 103)
+control_plane_pids=()
+control_plane_logs=()
+control_plane_socket_paths=()
+control_plane_peer_socket_paths=()
 
 print_command() {
     printf '+'
@@ -463,7 +470,10 @@ start_storage_node() {
     node_log="$logs_dir/storage-node-$(printf '%04d' "$node_id").log"
     local control_plane_env=()
     if [[ -n "$control_plane_socket_path" ]]; then
-        control_plane_env=(ARGMIN_CONTROL_PLANE_SOCKET_PATH="$control_plane_socket_path")
+        control_plane_env=(
+            ARGMIN_CONTROL_PLANE_SOCKET_PATH="$control_plane_socket_path"
+            ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS="$control_plane_client_socket_paths"
+        )
     fi
     start_process "storage-node-$node_id" "$node_log" env \
         -u ARGMIN_STORAGE_NODE_SOCKETS \
@@ -481,14 +491,71 @@ start_storage_node() {
     storage_node_logs[node_id]="${server_logs[$index]}"
 }
 
+configure_replicated_control_plane() {
+    replicated_control_plane=1
+    local client_paths=()
+    local peer_entries=()
+    local auth_entries=()
+    local raft_node_id
+    for raft_node_id in "${control_plane_raft_node_ids[@]}"; do
+        control_plane_socket_paths[raft_node_id]="$sockets_dir/control-plane-$raft_node_id.sock"
+        control_plane_peer_socket_paths[raft_node_id]="$sockets_dir/control-plane-raft-$raft_node_id.sock"
+        client_paths+=("${control_plane_socket_paths[$raft_node_id]}")
+        peer_entries+=("$raft_node_id=${control_plane_peer_socket_paths[$raft_node_id]}")
+        auth_entries+=("$raft_node_id=uat-raft-$raft_node_id:1:uat-raft-secret-$raft_node_id")
+    done
+    control_plane_socket_path="${control_plane_socket_paths[101]}"
+    control_plane_state_path="$data_dir/control-plane-101.state"
+    control_plane_client_socket_paths="$(IFS=,; echo "${client_paths[*]}")"
+    control_plane_raft_peer_sockets="$(IFS=,; echo "${peer_entries[*]}")"
+    control_plane_raft_auth_credentials="$(IFS=,; echo "${auth_entries[*]}")"
+    export ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS="$control_plane_client_socket_paths"
+}
+
+start_control_plane_node() {
+    local raft_node_id="$1"
+    local state_path="$data_dir/control-plane-$raft_node_id.state"
+    local socket_path="${control_plane_socket_paths[$raft_node_id]}"
+    local peer_socket_path="${control_plane_peer_socket_paths[$raft_node_id]}"
+    local control_plane_log="$logs_dir/control-plane-$raft_node_id.log"
+    start_process "control-plane-$raft_node_id" "$control_plane_log" env \
+        ARGMIN_PROCESS_ROLE=control-plane \
+        ARGMIN_CONTROL_PLANE_STATE_PATH="$state_path" \
+        ARGMIN_CONTROL_PLANE_SOCKET_PATH="$socket_path" \
+        ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS="$control_plane_client_socket_paths" \
+        ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT=1 \
+        ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME=uat-control-plane-raft \
+        ARGMIN_CONTROL_PLANE_RAFT_NODE_ID="$raft_node_id" \
+        ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH="$peer_socket_path" \
+        ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS="$control_plane_raft_peer_sockets" \
+        ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS="$control_plane_raft_auth_credentials" \
+        ARGMIN_STORAGE_NODE_SOCKETS="$storage_node_sockets" \
+        ARGMIN_DATA_DIR="$data_dir/control-plane-$raft_node_id" \
+        ARGMIN_LISTEN_ADDR="$listen_addr" \
+        "${server_cmd[@]}"
+    local index=$((${#server_pids[@]} - 1))
+    control_plane_pids[raft_node_id]="${server_pids[$index]}"
+    control_plane_logs[raft_node_id]="${server_logs[$index]}"
+}
+
 start_control_plane() {
+    if ((replicated_control_plane)); then
+        # Followers bind first so the deterministic bootstrap node can form the
+        # initial quorum without relying on startup timing.
+        start_control_plane_node 102
+        start_control_plane_node 103
+        start_control_plane_node 101
+        return
+    fi
     control_plane_state_path="$data_dir/control-plane.state"
     control_plane_socket_path="$sockets_dir/control-plane.sock"
+    control_plane_client_socket_paths="$control_plane_socket_path"
     local control_plane_log="$logs_dir/control-plane.log"
     start_process "control-plane" "$control_plane_log" env \
         ARGMIN_PROCESS_ROLE=control-plane \
         ARGMIN_CONTROL_PLANE_STATE_PATH="$control_plane_state_path" \
         ARGMIN_CONTROL_PLANE_SOCKET_PATH="$control_plane_socket_path" \
+        ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS="$control_plane_client_socket_paths" \
         ARGMIN_STORAGE_NODE_SOCKETS="$storage_node_sockets" \
         ARGMIN_DATA_DIR="$data_dir/control-plane" \
         ARGMIN_LISTEN_ADDR="$listen_addr" \
@@ -508,6 +575,7 @@ start_frontend() {
             ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
             ARGMIN_LOCAL_DEBUG_ENDPOINT="$uat_local_debug_endpoint" \
             ARGMIN_CONTROL_PLANE_SOCKET_PATH="$control_plane_socket_path" \
+            ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS="$control_plane_client_socket_paths" \
             ARGMIN_DATA_DIR="$data_dir/frontend" \
             "${server_cmd[@]}"
     else
@@ -558,6 +626,13 @@ wait_for_storage_node_socket() {
 }
 
 wait_for_control_plane_socket() {
+    if ((replicated_control_plane)); then
+        local raft_node_id
+        for raft_node_id in "${control_plane_raft_node_ids[@]}"; do
+            wait_for_control_plane_node_socket "$raft_node_id"
+        done
+        return
+    fi
     local pid="${server_pids[$((${#server_pids[@]} - 1))]}"
     local log_path="${server_logs[$((${#server_logs[@]} - 1))]}"
     for ((attempt = 0; attempt < 200; attempt++)); do
@@ -570,6 +645,23 @@ wait_for_control_plane_socket() {
     done
     cat "$log_path" >&2 || true
     die "control-plane did not become ready at $control_plane_socket_path"
+}
+
+wait_for_control_plane_node_socket() {
+    local raft_node_id="$1"
+    local pid="${control_plane_pids[$raft_node_id]}"
+    local log_path="${control_plane_logs[$raft_node_id]}"
+    local socket_path="${control_plane_socket_paths[$raft_node_id]}"
+    for ((attempt = 0; attempt < 300; attempt++)); do
+        wait_for_process "$pid" "$log_path" "control-plane-$raft_node_id"
+        if [[ -S "$socket_path" ]] \
+            && grep -q "control-plane manager using state" "$log_path"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    cat "$log_path" >&2 || true
+    die "control-plane-$raft_node_id did not become ready at $socket_path"
 }
 
 restart_storage_node() {
@@ -625,25 +717,245 @@ kill_control_plane() {
     done
 }
 
+current_replicated_control_plane_leader() {
+    local raft_node_id
+    for raft_node_id in "${control_plane_raft_node_ids[@]}"; do
+        local pid="${control_plane_pids[$raft_node_id]:-}"
+        [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null || continue
+        local status
+        if status="$(control_plane_authority_clock_status_for_node "$raft_node_id" 2>/dev/null)" \
+            && [[ "$status" == *"local_raft_authority_leader=true"* ]]; then
+            echo "$raft_node_id"
+            return 0
+        fi
+    done
+    return 1
+}
+
+control_plane_authority_clock_status_for_node() {
+    local raft_node_id="$1"
+    env -u ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS \
+        "${server_cmd[@]}" control-plane-authority-clock-status \
+        "${control_plane_socket_paths[$raft_node_id]}"
+}
+
+authority_clock_status_field() {
+    local status="$1"
+    local field="$2"
+    local token
+    for token in $status; do
+        if [[ "$token" == "$field="* ]]; then
+            printf '%s\n' "${token#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+fail_if_replicated_control_plane_authority_clock_blocked() {
+    ((replicated_control_plane)) || return 0
+    local leader
+    leader="$(current_replicated_control_plane_leader)" || return 0
+    local status
+    status="$(control_plane_authority_clock_status_for_node "$leader" 2>/dev/null)" || return 0
+    local established
+    established="$(authority_clock_status_field "$status" established)" ||
+        die "replicated control-plane authority-clock status omitted established state: $status"
+    if [[ "$established" == "false" ]]; then
+        echo "$status" >&2
+        die "replicated control-plane authority clock became blocked outside an explicit failover recovery step"
+    fi
+    [[ "$established" == "true" ]] ||
+        die "replicated control-plane authority-clock status has invalid established state: $status"
+}
+
+reestablished_control_plane_term=""
+
+reestablish_replicated_control_plane_after_term_change() {
+    local previous_term="$1"
+    local transition_label="$2"
+    local leader=""
+    local status=""
+    local current_term=""
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        if leader="$(current_replicated_control_plane_leader)" \
+            && status="$(control_plane_authority_clock_status_for_node "$leader" 2>/dev/null)"; then
+            current_term="$(authority_clock_status_field "$status" current_raft_term)" ||
+                die "$transition_label authority-clock status omitted current Raft term: $status"
+            if [[ "$current_term" =~ ^[0-9]+$ ]] && ((current_term > previous_term)); then
+                break
+            fi
+        fi
+        sleep 0.1
+    done
+    [[ "$current_term" =~ ^[0-9]+$ ]] && ((current_term > previous_term)) || {
+        [[ -z "$status" ]] || echo "$status" >&2
+        die "$transition_label did not elect a leader in a term newer than $previous_term"
+    }
+
+    local established
+    local blocked_reason
+    local local_leader
+    established="$(authority_clock_status_field "$status" established)" ||
+        die "$transition_label status omitted established state: $status"
+    blocked_reason="$(authority_clock_status_field "$status" blocked_reason)" ||
+        die "$transition_label status omitted blocked reason: $status"
+    local_leader="$(authority_clock_status_field "$status" local_raft_authority_leader)" ||
+        die "$transition_label status omitted local leader state: $status"
+    if [[ "$established" != "false" \
+        || "$blocked_reason" != "Some(RaftLeadershipChanged)" \
+        || "$local_leader" != "true" ]]; then
+        echo "$status" >&2
+        die "$transition_label did not produce the expected RaftLeadershipChanged authority-clock fence"
+    fi
+
+    echo "== argmin-s3 UAT $transition_label authority clock before recovery: $status =="
+    local socket_path="${control_plane_socket_paths[$leader]}"
+    print_command env -u ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS \
+        "${server_cmd[@]}" control-plane-reestablish-authority-clock "$socket_path"
+    local recovery_status
+    recovery_status="$(env -u ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS \
+        "${server_cmd[@]}" control-plane-reestablish-authority-clock "$socket_path")" ||
+        die "$transition_label authority-clock re-establishment failed"
+    echo "$recovery_status"
+
+    local recovered_established
+    local recovered_term
+    local recovered_leader
+    recovered_established="$(authority_clock_status_field "$recovery_status" established)" ||
+        die "$transition_label recovery status omitted established state: $recovery_status"
+    recovered_term="$(authority_clock_status_field "$recovery_status" current_raft_term)" ||
+        die "$transition_label recovery status omitted current Raft term: $recovery_status"
+    recovered_leader="$(authority_clock_status_field "$recovery_status" local_raft_authority_leader)" ||
+        die "$transition_label recovery status omitted local leader state: $recovery_status"
+    if [[ "$recovered_established" != "true" \
+        || "$recovered_term" != "$current_term" \
+        || "$recovered_leader" != "true" ]]; then
+        die "$transition_label recovery did not establish clock authority in term $current_term: $recovery_status"
+    fi
+    reestablished_control_plane_term="$current_term"
+}
+
+recover_replicated_control_plane_rejoin_term_if_needed() {
+    local previous_term="$1"
+    # OpenRaft's automatic timer permits a three-second election timeout. Keep
+    # this explicit recovery boundary active until the term has remained stable
+    # for five seconds, leaving an additional convergence interval before
+    # ordinary observational readiness polling resumes.
+    local stable_observations=0
+    local required_stable_observations=51
+    for ((attempt = 0; attempt < 300; attempt++)); do
+        local leader
+        local status
+        if leader="$(current_replicated_control_plane_leader)" \
+            && status="$(control_plane_authority_clock_status_for_node "$leader" 2>/dev/null)"; then
+            local current_term
+            current_term="$(authority_clock_status_field "$status" current_raft_term)" ||
+                die "rejoined voter status omitted current Raft term: $status"
+            [[ "$current_term" =~ ^[0-9]+$ ]] ||
+                die "rejoined voter status has invalid current Raft term: $status"
+            if ((current_term > previous_term)); then
+                reestablish_replicated_control_plane_after_term_change \
+                    "$previous_term" "rejoined-voter term transition"
+                previous_term="$reestablished_control_plane_term"
+                stable_observations=0
+                continue
+            fi
+            ((current_term == previous_term)) ||
+                die "rejoined voter regressed Raft term from $previous_term to $current_term"
+            local established
+            established="$(authority_clock_status_field "$status" established)" ||
+                die "rejoined voter status omitted established state: $status"
+            if [[ "$established" != "true" ]]; then
+                echo "$status" >&2
+                die "rejoined voter blocked authority clock without a Raft term transition"
+            fi
+            ((stable_observations += 1))
+            if ((stable_observations >= required_stable_observations)); then
+                reestablished_control_plane_term="$previous_term"
+                return
+            fi
+        else
+            stable_observations=0
+        fi
+        sleep 0.1
+    done
+    die "rejoined voter did not retain an established authority clock in one stable Raft term"
+}
+
+kill_control_plane_node() {
+    local raft_node_id="$1"
+    local pid="${control_plane_pids[$raft_node_id]}"
+    echo "== argmin-s3 UAT kill control-plane-$raft_node_id =="
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
 restart_control_plane() {
+    if ((replicated_control_plane)); then
+        local old_leader
+        for ((attempt = 0; attempt < 200; attempt++)); do
+            if old_leader="$(current_replicated_control_plane_leader)"; then
+                break
+            fi
+            sleep 0.1
+        done
+        [[ -n "${old_leader:-}" ]] || die "could not identify replicated control-plane leader"
+        local old_status
+        old_status="$(control_plane_authority_clock_status_for_node "$old_leader")" ||
+            die "could not read replicated control-plane leader status before restart"
+        local old_term
+        old_term="$(authority_clock_status_field "$old_status" current_raft_term)" ||
+            die "replicated control-plane leader status omitted current Raft term: $old_status"
+        [[ "$old_term" =~ ^[0-9]+$ ]] ||
+            die "replicated control-plane leader status has invalid current Raft term: $old_status"
+        [[ "$(authority_clock_status_field "$old_status" established)" == "true" ]] ||
+            die "replicated control-plane leader was already clock-blocked before restart: $old_status"
+        local pre_failover_epoch
+        pre_failover_epoch="$(control_plane_cluster_epoch)" ||
+            die "could not read replicated control-plane epoch before leader restart"
+        [[ "$pre_failover_epoch" =~ ^[0-9]+$ ]] ||
+            die "replicated control-plane returned invalid pre-failover epoch $pre_failover_epoch"
+        local post_failover_min_epoch=$((pre_failover_epoch + 1))
+        echo "== argmin-s3 UAT restart replicated control-plane leader $old_leader =="
+        kill_control_plane_node "$old_leader"
+        reestablish_replicated_control_plane_after_term_change \
+            "$old_term" "leader-loss term transition"
+        local replacement_term="$reestablished_control_plane_term"
+        start_control_plane_node "$old_leader"
+        wait_for_control_plane_node_socket "$old_leader"
+        # Rejoining the former leader can legitimately advance the term again.
+        # Bind clock authority only after all three voters are back so the
+        # resumed storage heartbeats cannot retain the interim term binding.
+        recover_replicated_control_plane_rejoin_term_if_needed "$replacement_term"
+        # Do not accept the still-serving pre-failover map. The predecessor
+        # horizon can keep it valid briefly before lease expiry starts peering;
+        # wait for that transition and subsequent heartbeat convergence to
+        # publish a newer epoch with every PG serving.
+        wait_for_control_plane_runtime_map_ready 30 "$post_failover_min_epoch"
+        return
+    fi
     echo "== argmin-s3 UAT restart control-plane =="
     kill_control_plane
     start_control_plane
     wait_for_control_plane_socket
-    reestablish_control_plane_authority_clock_after_restart
+    assert_control_plane_authority_clock_established_after_restart
 }
 
-reestablish_control_plane_authority_clock_after_restart() {
-    local status
-    status="$("${server_cmd[@]}" control-plane-authority-clock-status "$control_plane_socket_path")" ||
-        die "failed to read control-plane authority-clock status after restart"
+assert_control_plane_authority_clock_established_after_restart() {
+    local status=""
+    for ((attempt = 0; attempt < 200; attempt++)); do
+        if status="$("${server_cmd[@]}" control-plane-authority-clock-status "$control_plane_socket_path" 2>/dev/null)"; then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ -n "$status" ]] || die "failed to read control-plane authority-clock status after restart"
     echo "== argmin-s3 UAT control-plane authority clock after restart: $status =="
-
-    if [[ "$status" == *"established=false"* ]]; then
-        print_command "${server_cmd[@]}" control-plane-reestablish-authority-clock "$control_plane_socket_path"
-        "${server_cmd[@]}" control-plane-reestablish-authority-clock "$control_plane_socket_path" ||
-            die "failed to re-establish control-plane authority clock after restart"
-    fi
+    [[ "$(authority_clock_status_field "$status" established)" == "true" ]] ||
+        die "control-plane authority clock did not resume from durable restart evidence: $status"
 }
 
 set_pg_acting_set() {
@@ -692,19 +1004,21 @@ wait_for_control_plane_pg_active() {
     local pg_id="$1"
     local deadline_seconds="$2"
     local expected_acting_set="${3:-}"
+    [[ -n "$expected_acting_set" ]] || die "wait_for_control_plane_pg_active requires an expected acting set"
+    local expected_nodes=()
+    IFS=: read -r -a expected_nodes <<<"$expected_acting_set"
     local start
     start="$(date +%s)"
     while true; do
-        local active_pattern="^pg=$pg_id,active,"
-        if [[ -n "$expected_acting_set" ]]; then
-            active_pattern="^pg=$pg_id,active,$expected_acting_set,"
-        fi
-        if grep -q "$active_pattern" "$control_plane_state_path" 2>/dev/null; then
-            echo "== argmin-s3 UAT PG $pg_id is active =="
+        local pg_status
+        if pg_status="$("${server_cmd[@]}" control-plane-pg-runtime-map-ready "$control_plane_socket_path" "$pg_id" "${expected_nodes[@]}" 2>/dev/null)"; then
+            read -r control_plane_pg_runtime_epoch control_plane_pg_route_epoch <<<"$pg_status"
+            echo "== argmin-s3 UAT PG $pg_id is active at route epoch $control_plane_pg_route_epoch in runtime epoch $control_plane_pg_runtime_epoch =="
             return 0
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
-            tail -n 80 "$control_plane_state_path" >&2 || true
+            "${server_cmd[@]}" control-plane-pg-runtime-map-ready "$control_plane_socket_path" "$pg_id" "${expected_nodes[@]}" >&2 || true
+            print_control_plane_runtime_map_diagnostics
             die "timed out waiting for PG $pg_id to become active"
         fi
         sleep 0.1
@@ -712,7 +1026,9 @@ wait_for_control_plane_pg_active() {
 }
 
 control_plane_cluster_epoch() {
-    awk -F= '$1 == "cluster_epoch" { print $2; exit }' "$control_plane_state_path"
+    local status
+    status="$("${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path")" || return 1
+    awk '{ print $1; exit }' <<<"$status"
 }
 
 wait_for_control_plane_node_epochs_aligned() {
@@ -721,6 +1037,7 @@ wait_for_control_plane_node_epochs_aligned() {
     local start
     start="$(date +%s)"
     while true; do
+        fail_if_replicated_control_plane_authority_clock_blocked
         local aligned_epoch
         aligned_epoch="$(control_plane_node_aligned_epoch)"
         if [[ -n "$aligned_epoch" ]] && ((aligned_epoch >= min_epoch)); then
@@ -777,6 +1094,7 @@ wait_for_control_plane_runtime_map_ready() {
     local start
     start="$(date +%s)"
     while true; do
+        fail_if_replicated_control_plane_authority_clock_blocked
         local map_status
         if map_status="$("${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" 2>/dev/null)"; then
             if control_plane_runtime_map_status_ready "$map_status" "$min_epoch"; then
@@ -915,7 +1233,7 @@ wait_for_target_pg_runtime_installed() {
     local metrics_path="$4"
     wait_for_control_plane_pg_active "$pg_id" "$deadline_seconds" "$expected_acting_set"
     local target_epoch
-    target_epoch="$(control_plane_cluster_epoch)"
+    target_epoch="$control_plane_pg_runtime_epoch"
     wait_for_control_plane_runtime_map_ready "$deadline_seconds" "$target_epoch"
     wait_for_control_plane_node_epochs_aligned "$deadline_seconds" "$control_plane_runtime_map_ready_epoch"
     wait_for_frontend_storage_epoch_at_least "$control_plane_aligned_epoch" "$deadline_seconds" "$metrics_path"
@@ -1882,6 +2200,10 @@ else
         IFS=,
         echo "${socket_entries[*]}"
     )"
+
+    if [[ "$smoke" == "route-change-control-plane-restart" ]]; then
+        configure_replicated_control_plane
+    fi
 
     if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "route-change" || "$smoke" == "route-change-node-restart" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" || "$smoke" == "cleanup-versioned-stress" ]]; then
         start_control_plane
