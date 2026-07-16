@@ -534,6 +534,22 @@ fn assert_access_denied(response: &RawResponse) {
     );
 }
 
+fn assert_listing_invalid_argument(
+    case: &str,
+    response: &RawResponse,
+    message: &str,
+    argument_name: &str,
+    argument_value: &str,
+) {
+    assert_shape(
+        case,
+        response,
+        &shape().status(400).headers(error_response_headers()).body(
+            expected_error::invalid_argument_with_value(message, argument_name, argument_value),
+        ),
+    );
+}
+
 fn assert_malformed_xml(response: &RawResponse) {
     assert_eq!(
         response.status, 400,
@@ -4356,6 +4372,545 @@ fn test_list_multipart_uploads_invalid_present_upload_id_marker_rejected() {
                 .await
                 .unwrap();
         }
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_parts_parameter_wire_matrix_and_authorization_precedence() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "list-parts-parameter-matrix";
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("create upload for ListParts parameter matrix")
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+        upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            b"list parts canary".to_vec(),
+        )
+        .await;
+        let encoded_upload_id = query_encode_value(&upload_id);
+
+        let canary_url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            key,
+            Some(&format!("uploadId={encoded_upload_id}")),
+        );
+        let canary = send_signed_request_with_credentials(
+            "GET",
+            &canary_url,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            primary_credentials(),
+        );
+        assert_eq!(canary.status, 200, "ListParts canary: {canary:?}");
+        assert_eq!(
+            xml_tag_text(&canary.body, "UploadId"),
+            Some(upload_id.as_str())
+        );
+        assert_eq!(xml_tag_text(&canary.body, "PartNumber"), Some("1"));
+
+        let denied_canary = send_signed_request_with_credentials(
+            "GET",
+            &canary_url,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            alt_credentials(),
+        );
+        assert_access_denied(&denied_canary);
+
+        for (case, query, expected_marker, expected_max) in [
+            (
+                "empty numeric parameters use defaults",
+                format!(
+                    "uploadId={encoded_upload_id}&part-number-marker=&max-parts="
+                ),
+                "0",
+                "1000",
+            ),
+            (
+                "explicit plus is accepted",
+                format!(
+                    "uploadId={encoded_upload_id}&part-number-marker=%2B1&max-parts=%2B1"
+                ),
+                "1",
+                "1",
+            ),
+            (
+                "signed integer maximum is accepted and clamped",
+                format!(
+                    "uploadId={encoded_upload_id}&part-number-marker=2147483647&max-parts=2147483647"
+                ),
+                "2147483647",
+                "1000",
+            ),
+            (
+                "first duplicate numeric values win",
+                format!(
+                    "uploadId={encoded_upload_id}&part-number-marker=0&part-number-marker=abc&max-parts=1&max-parts=abc"
+                ),
+                "0",
+                "1",
+            ),
+        ] {
+            let url = object_url(CTX.endpoint(), &bucket, key, Some(&query));
+            let response = send_signed_request_with_credentials(
+                "GET",
+                &url,
+                b"",
+                std::iter::empty::<(&str, &str)>(),
+                primary_credentials(),
+            );
+            assert_eq!(response.status, 200, "{case}: {response:?}");
+            assert_eq!(
+                xml_tag_text(&response.body, "PartNumberMarker"),
+                Some(expected_marker),
+                "{case}: {response:?}"
+            );
+            assert_eq!(
+                xml_tag_text(&response.body, "MaxParts"),
+                Some(expected_max),
+                "{case}: {response:?}"
+            );
+        }
+
+        let malformed_cases = [
+            (
+                "max-parts wins over part-number-marker",
+                format!("uploadId={encoded_upload_id}&part-number-marker=abc&max-parts=abc"),
+                "Provided max-parts not an integer or within integer range",
+                "max-parts",
+                "abc",
+            ),
+            (
+                "negative max-parts",
+                format!("uploadId={encoded_upload_id}&max-parts=-1"),
+                "Argument max-parts must be an integer between 0 and 2147483647",
+                "max-parts",
+                "-1",
+            ),
+            (
+                "max-parts above signed integer range",
+                format!("uploadId={encoded_upload_id}&max-parts=2147483648"),
+                "Provided max-parts not an integer or within integer range",
+                "max-parts",
+                "2147483648",
+            ),
+            (
+                "invalid first duplicate max-parts",
+                format!("uploadId={encoded_upload_id}&max-parts=abc&max-parts=1"),
+                "Provided max-parts not an integer or within integer range",
+                "max-parts",
+                "abc",
+            ),
+            (
+                "part marker precedes upload lookup",
+                "uploadId=invalid&part-number-marker=abc".to_string(),
+                "Provided part-number-marker not an integer or within integer range",
+                "part-number-marker",
+                "abc",
+            ),
+            (
+                "negative part-number-marker",
+                format!("uploadId={encoded_upload_id}&part-number-marker=-1"),
+                "Argument part-number-marker must be an integer between 0 and 2147483647",
+                "part-number-marker",
+                "-1",
+            ),
+            (
+                "part-number-marker above signed integer range",
+                format!("uploadId={encoded_upload_id}&part-number-marker=2147483648"),
+                "Provided part-number-marker not an integer or within integer range",
+                "part-number-marker",
+                "2147483648",
+            ),
+            (
+                "invalid first duplicate part-number-marker",
+                format!("uploadId={encoded_upload_id}&part-number-marker=abc&part-number-marker=0"),
+                "Provided part-number-marker not an integer or within integer range",
+                "part-number-marker",
+                "abc",
+            ),
+        ];
+        for (case, query, message, argument_name, argument_value) in malformed_cases {
+            let url = object_url(CTX.endpoint(), &bucket, key, Some(&query));
+            for (principal, credentials) in [
+                ("primary", primary_credentials()),
+                ("alternate", alt_credentials()),
+            ] {
+                let response = send_signed_request_with_credentials(
+                    "GET",
+                    &url,
+                    b"",
+                    std::iter::empty::<(&str, &str)>(),
+                    credentials,
+                );
+                assert_listing_invalid_argument(
+                    &format!("ListParts {case} for {principal}"),
+                    &response,
+                    message,
+                    argument_name,
+                    argument_value,
+                );
+            }
+        }
+
+        let final_canary = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send_retrying_operation_aborted("final ListParts parameter-matrix canary")
+            .await
+            .unwrap();
+        assert_eq!(final_canary.parts().len(), 1);
+        assert_eq!(final_canary.parts()[0].part_number(), Some(1));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send_retrying_operation_aborted("abort upload after ListParts parameter matrix")
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_multipart_uploads_parameter_wire_matrix_and_authorization_precedence() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "list-uploads-parameter-matrix";
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted(
+                "create upload for ListMultipartUploads parameter matrix",
+            )
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+        let encoded_upload_id = query_encode_value(&upload_id);
+
+        let canary_url = format!("{}/{bucket}?uploads=", CTX.endpoint());
+        let canary = send_signed_request_with_credentials(
+            "GET",
+            &canary_url,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            primary_credentials(),
+        );
+        assert_eq!(
+            canary.status, 200,
+            "ListMultipartUploads canary: {canary:?}"
+        );
+        assert!(
+            canary
+                .body
+                .contains(&format!("<UploadId>{upload_id}</UploadId>")),
+            "ListMultipartUploads canary: {canary:?}"
+        );
+
+        let denied_canary = send_signed_request_with_credentials(
+            "GET",
+            &canary_url,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            alt_credentials(),
+        );
+        assert_access_denied(&denied_canary);
+
+        for (
+            case,
+            query,
+            expected_key_marker,
+            expected_upload_marker,
+            expected_max,
+            expected_encoding,
+            expected_prefix,
+            expected_delimiter,
+            lists_upload,
+        ) in [
+            (
+                "empty max-uploads uses the default",
+                "uploads=&max-uploads=".to_string(),
+                "",
+                "",
+                "1000",
+                None,
+                None,
+                None,
+                true,
+            ),
+            (
+                "explicit plus and first duplicate max-uploads are accepted",
+                "uploads=&max-uploads=%2B1&max-uploads=abc".to_string(),
+                "",
+                "",
+                "1",
+                None,
+                None,
+                None,
+                true,
+            ),
+            (
+                "signed integer maximum is clamped",
+                "uploads=&max-uploads=2147483647".to_string(),
+                "",
+                "",
+                "1000",
+                None,
+                None,
+                None,
+                true,
+            ),
+            (
+                "first duplicate encoding-type wins",
+                "uploads=&encoding-type=url&encoding-type=invalid".to_string(),
+                "",
+                "",
+                "1000",
+                Some("url"),
+                None,
+                None,
+                true,
+            ),
+            (
+                "upload-id-marker without key-marker is ignored",
+                "uploads=&upload-id-marker=invalid".to_string(),
+                "",
+                "",
+                "1000",
+                None,
+                None,
+                None,
+                true,
+            ),
+            (
+                "first duplicate upload-id-marker wins",
+                format!(
+                    "uploads=&key-marker={key}&upload-id-marker={encoded_upload_id}&upload-id-marker=invalid"
+                ),
+                key,
+                upload_id.as_str(),
+                "1000",
+                None,
+                None,
+                None,
+                false,
+            ),
+            (
+                "first duplicate key-marker wins",
+                "uploads=&key-marker=a&key-marker=z".to_string(),
+                "a",
+                "",
+                "1000",
+                None,
+                None,
+                None,
+                true,
+            ),
+            (
+                "first duplicate prefix wins",
+                "uploads=&prefix=list-uploads&prefix=absent".to_string(),
+                "",
+                "",
+                "1000",
+                None,
+                Some("list-uploads"),
+                None,
+                true,
+            ),
+            (
+                "first duplicate delimiter wins",
+                "uploads=&delimiter=/&delimiter=-".to_string(),
+                "",
+                "",
+                "1000",
+                None,
+                None,
+                Some("/"),
+                true,
+            ),
+        ] {
+            let url = format!("{}/{bucket}?{query}", CTX.endpoint());
+            let response = send_signed_request_with_credentials(
+                "GET",
+                &url,
+                b"",
+                std::iter::empty::<(&str, &str)>(),
+                primary_credentials(),
+            );
+            assert_eq!(response.status, 200, "{case}: {response:?}");
+            assert_eq!(
+                xml_tag_text(&response.body, "KeyMarker"),
+                Some(expected_key_marker),
+                "{case}: {response:?}"
+            );
+            assert_eq!(
+                xml_tag_text(&response.body, "UploadIdMarker"),
+                Some(expected_upload_marker),
+                "{case}: {response:?}"
+            );
+            assert_eq!(
+                xml_tag_text(&response.body, "MaxUploads"),
+                Some(expected_max),
+                "{case}: {response:?}"
+            );
+            assert_eq!(
+                xml_tag_text(&response.body, "EncodingType"),
+                expected_encoding,
+                "{case}: {response:?}"
+            );
+            assert_eq!(
+                xml_tag_text(&response.body, "Prefix"),
+                expected_prefix,
+                "{case}: {response:?}"
+            );
+            assert_eq!(
+                xml_tag_text(&response.body, "Delimiter"),
+                expected_delimiter,
+                "{case}: {response:?}"
+            );
+            assert_eq!(
+                response
+                    .body
+                    .contains(&format!("<UploadId>{upload_id}</UploadId>")),
+                lists_upload,
+                "{case}: {response:?}"
+            );
+        }
+
+        let malformed_cases = [
+            (
+                "max-uploads wins over encoding-type",
+                "uploads=&encoding-type=invalid&max-uploads=abc".to_string(),
+                "Provided max-uploads not an integer or within integer range",
+                "max-uploads",
+                "abc",
+            ),
+            (
+                "negative max-uploads",
+                "uploads=&max-uploads=-1".to_string(),
+                "Argument max-uploads must be an integer between 0 and 2147483647",
+                "max-uploads",
+                "-1",
+            ),
+            (
+                "max-uploads above signed integer range",
+                "uploads=&max-uploads=2147483648".to_string(),
+                "Provided max-uploads not an integer or within integer range",
+                "max-uploads",
+                "2147483648",
+            ),
+            (
+                "invalid first duplicate max-uploads",
+                "uploads=&max-uploads=abc&max-uploads=1".to_string(),
+                "Provided max-uploads not an integer or within integer range",
+                "max-uploads",
+                "abc",
+            ),
+            (
+                "empty encoding-type",
+                "uploads=&encoding-type=".to_string(),
+                "Invalid Encoding Method specified in Request",
+                "encoding-type",
+                "",
+            ),
+            (
+                "encoding-type wins over upload-id-marker",
+                format!(
+                    "uploads=&key-marker={key}&upload-id-marker=invalid&encoding-type=invalid"
+                ),
+                "Invalid Encoding Method specified in Request",
+                "encoding-type",
+                "invalid",
+            ),
+            (
+                "invalid first duplicate encoding-type",
+                "uploads=&encoding-type=invalid&encoding-type=url".to_string(),
+                "Invalid Encoding Method specified in Request",
+                "encoding-type",
+                "invalid",
+            ),
+            (
+                "invalid upload-id-marker with key-marker",
+                format!("uploads=&key-marker={key}&upload-id-marker=invalid"),
+                "Invalid uploadId marker",
+                "upload-id-marker",
+                "invalid",
+            ),
+            (
+                "invalid first duplicate upload-id-marker",
+                format!(
+                    "uploads=&key-marker={key}&upload-id-marker=invalid&upload-id-marker={encoded_upload_id}"
+                ),
+                "Invalid uploadId marker",
+                "upload-id-marker",
+                "invalid",
+            ),
+        ];
+        for (case, query, message, argument_name, argument_value) in malformed_cases {
+            let url = format!("{}/{bucket}?{query}", CTX.endpoint());
+            for (principal, credentials) in [
+                ("primary", primary_credentials()),
+                ("alternate", alt_credentials()),
+            ] {
+                let response = send_signed_request_with_credentials(
+                    "GET",
+                    &url,
+                    b"",
+                    std::iter::empty::<(&str, &str)>(),
+                    credentials,
+                );
+                assert_listing_invalid_argument(
+                    &format!("ListMultipartUploads {case} for {principal}"),
+                    &response,
+                    message,
+                    argument_name,
+                    argument_value,
+                );
+            }
+        }
+
+        let final_canary = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .send_retrying_operation_aborted("final ListMultipartUploads parameter-matrix canary")
+            .await
+            .unwrap();
+        assert_eq!(final_canary.uploads().len(), 1);
+        assert_eq!(final_canary.uploads()[0].key(), Some(key));
+        assert_eq!(
+            final_canary.uploads()[0].upload_id(),
+            Some(upload_id.as_str())
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send_retrying_operation_aborted(
+                "abort upload after ListMultipartUploads parameter matrix",
+            )
+            .await
+            .unwrap();
         cleanup(&bucket, &[]).await;
     });
 }

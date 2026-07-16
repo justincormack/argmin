@@ -298,6 +298,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::InvalidRequestHostId { reason }
         | ServerError::BadRequest { reason }
         | ServerError::InvalidArgument { reason }
+        | ServerError::InvalidArgumentValue { reason, .. }
         | ServerError::InvalidRedirectLocation { reason }
         | ServerError::InvalidURI { reason }
         | ServerError::InvalidBucketName { reason }
@@ -592,6 +593,20 @@ impl S3Response {
                     &client_error_message(err),
                     "partNumber",
                     Some(value),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidArgumentValue {
+                reason,
+                argument_name,
+                argument_value,
+            } => {
+                let body = xml::invalid_argument_error_xml(
+                    reason,
+                    argument_name,
+                    Some(argument_value),
                     request_id,
                     host_id,
                 );

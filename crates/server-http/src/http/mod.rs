@@ -189,11 +189,50 @@ fn parse_u32_or_default<S: AsRef<str>>(
 fn parse_optional_upload_id_marker(raw: Option<&str>) -> Result<Option<UploadId>, ServerError> {
     raw.filter(|value| !value.is_empty())
         .map(|value| {
-            UploadId::try_from(value).map_err(|_| ServerError::InvalidArgument {
+            UploadId::try_from(value).map_err(|_| ServerError::InvalidArgumentValue {
                 reason: "Invalid uploadId marker".to_string(),
+                argument_name: "upload-id-marker".to_string(),
+                argument_value: value.to_string(),
             })
         })
         .transpose()
+}
+
+fn parse_optional_s3_list_integer(
+    raw: Option<impl AsRef<str>>,
+    argument_name: &str,
+) -> Result<Option<u32>, ServerError> {
+    let Some(value) = raw.map(|value| value.as_ref().to_string()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+
+    match value.parse::<i32>() {
+        Ok(parsed) if parsed >= 0 => Ok(Some(parsed as u32)),
+        Ok(_) => Err(ServerError::InvalidArgumentValue {
+            reason: format!("Argument {argument_name} must be an integer between 0 and 2147483647"),
+            argument_name: argument_name.to_string(),
+            argument_value: value,
+        }),
+        Err(_) => Err(ServerError::InvalidArgumentValue {
+            reason: format!("Provided {argument_name} not an integer or within integer range"),
+            argument_name: argument_name.to_string(),
+            argument_value: value,
+        }),
+    }
+}
+
+fn validate_list_encoding_type(raw: Option<&str>) -> Result<(), ServerError> {
+    match raw {
+        None | Some("url") => Ok(()),
+        Some(value) => Err(ServerError::InvalidArgumentValue {
+            reason: "Invalid Encoding Method specified in Request".to_string(),
+            argument_name: "encoding-type".to_string(),
+            argument_value: value.to_string(),
+        }),
+    }
 }
 
 fn canned_acl_and_header_grants_conflict() -> ServerError {
@@ -3112,13 +3151,17 @@ impl HttpFrontend {
                 let delimiter = req.query_param_lossy("delimiter");
                 let key_marker = req.query_param_lossy("key-marker");
                 let upload_id_marker = req.query_param_lossy("upload-id-marker");
-                let parsed_upload_id_marker =
-                    parse_optional_upload_id_marker(upload_id_marker.as_deref())?;
                 let encoding_type = req.query_param_lossy("encoding-type");
-                let max_uploads = parse_s3_list_limit(
-                    req.query_param_lossy("max-uploads"),
-                    "invalid max-uploads",
-                )?;
+                let max_uploads =
+                    parse_s3_list_limit(req.query_param_lossy("max-uploads"), "max-uploads")?;
+                validate_list_encoding_type(encoding_type.as_deref())?;
+                let effective_upload_id_marker = key_marker
+                    .as_deref()
+                    .filter(|marker| !marker.is_empty())
+                    .and(upload_id_marker.as_deref())
+                    .filter(|marker| !marker.is_empty());
+                let parsed_upload_id_marker =
+                    parse_optional_upload_id_marker(effective_upload_id_marker)?;
                 let requester = self.requester_from_auth(auth, req);
                 let result = self.coordinator.list_multipart_uploads(
                     &crate::coordinator::ListMultipartUploadsRequest {
@@ -3137,7 +3180,7 @@ impl HttpFrontend {
                         prefix: prefix.as_deref(),
                         delimiter: delimiter.as_deref(),
                         key_marker: key_marker.as_deref(),
-                        upload_id_marker: upload_id_marker.as_deref(),
+                        upload_id_marker: effective_upload_id_marker,
                         encoding_type: encoding_type.as_deref(),
                         max_uploads,
                     },
@@ -3145,14 +3188,14 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::ListParts { bucket, key } => {
+                let max_parts =
+                    parse_s3_list_limit(req.query_param_lossy("max-parts"), "max-parts")?;
+                let part_number_marker = parse_optional_s3_list_integer(
+                    req.query_param_lossy("part-number-marker"),
+                    "part-number-marker",
+                )?;
                 let upload_id =
                     parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
-                let part_number_marker = parse_optional_u32(
-                    req.query_param_lossy("part-number-marker"),
-                    "part-number-marker must be an integer",
-                )?;
-                let max_parts =
-                    parse_s3_list_limit(req.query_param_lossy("max-parts"), "invalid max-parts")?;
                 let requester = self.requester_from_auth(auth, req);
                 let result =
                     self.coordinator
@@ -5127,11 +5170,13 @@ fn parse_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
     Ok(parse_u32_or_default(raw, 1000, "invalid max-keys")?.min(S3_MAX_LIST_KEYS))
 }
 
-fn parse_s3_list_limit<S: AsRef<str>>(
-    raw: Option<S>,
-    invalid_reason: &str,
+fn parse_s3_list_limit(
+    raw: Option<impl AsRef<str>>,
+    argument_name: &str,
 ) -> Result<u32, ServerError> {
-    Ok(parse_u32_or_default(raw, 1000, invalid_reason)?.min(S3_MAX_LIST_KEYS))
+    Ok(parse_optional_s3_list_integer(raw, argument_name)?
+        .unwrap_or(1000)
+        .min(S3_MAX_LIST_KEYS))
 }
 
 fn parse_requested_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
@@ -10635,7 +10680,18 @@ mod tests {
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(ServerError::InvalidArgumentValue {
+                reason,
+                argument_name,
+                argument_value,
+            }) => {
+                assert_eq!(
+                    reason,
+                    "Provided part-number-marker not an integer or within integer range"
+                );
+                assert_eq!(argument_name, "part-number-marker");
+                assert_eq!(argument_value, "xyz");
+            }
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
@@ -10654,7 +10710,18 @@ mod tests {
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(ServerError::InvalidArgumentValue {
+                reason,
+                argument_name,
+                argument_value,
+            }) => {
+                assert_eq!(
+                    reason,
+                    "Provided max-parts not an integer or within integer range"
+                );
+                assert_eq!(argument_name, "max-parts");
+                assert_eq!(argument_value, "notanumber");
+            }
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
@@ -10667,7 +10734,7 @@ mod tests {
         create_test_bucket(&fe.coordinator, "mybucket");
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
 
-        let req = make_req(&format!("uploadId={upload_id}&max-parts=4294967295"));
+        let req = make_req(&format!("uploadId={upload_id}&max-parts=2147483647"));
         let op = S3Operation::ListParts {
             bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
@@ -10680,7 +10747,7 @@ mod tests {
             "unexpected ListParts body: {body}"
         );
         assert!(
-            !body.contains("<MaxParts>4294967295</MaxParts>"),
+            !body.contains("<MaxParts>2147483647</MaxParts>"),
             "unexpected ListParts body: {body}"
         );
     }
@@ -10875,7 +10942,18 @@ mod tests {
             bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(ServerError::InvalidArgumentValue {
+                reason,
+                argument_name,
+                argument_value,
+            }) => {
+                assert_eq!(
+                    reason,
+                    "Provided max-uploads not an integer or within integer range"
+                );
+                assert_eq!(argument_name, "max-uploads");
+                assert_eq!(argument_value, "abc");
+            }
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
@@ -10887,7 +10965,7 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
 
-        let req = make_req("uploads&max-uploads=4294967295");
+        let req = make_req("uploads&max-uploads=2147483647");
         let op = S3Operation::ListMultipartUploads {
             bucket: test_bucket_name("mybucket"),
         };
@@ -10899,7 +10977,7 @@ mod tests {
             "unexpected ListMultipartUploads body: {body}"
         );
         assert!(
-            !body.contains("<MaxUploads>4294967295</MaxUploads>"),
+            !body.contains("<MaxUploads>2147483647</MaxUploads>"),
             "unexpected ListMultipartUploads body: {body}"
         );
     }
@@ -10910,13 +10988,19 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
 
-        let req = make_req("uploads&upload-id-marker=bad");
+        let req = make_req("uploads&key-marker=mykey&upload-id-marker=bad");
         let op = S3Operation::ListMultipartUploads {
             bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { reason }) => {
+            Err(ServerError::InvalidArgumentValue {
+                reason,
+                argument_name,
+                argument_value,
+            }) => {
                 assert_eq!(reason, "Invalid uploadId marker");
+                assert_eq!(argument_name, "upload-id-marker");
+                assert_eq!(argument_value, "bad");
             }
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),

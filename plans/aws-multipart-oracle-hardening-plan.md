@@ -207,8 +207,17 @@ For each matrix:
   terminal upload metadata. The minimal
   abort/recreate case proves a replacement remains visible even when no other
   same-key upload preserves the old object generation.
-- [ ] Pin malformed and duplicate listing parameters and authorization/error
-  precedence with positive list canaries.
+- [x] Pin malformed and duplicate listing parameters and authorization/error
+  precedence with positive list canaries. ListParts and
+  ListMultipartUploads treat empty numeric parameters as omitted, accept an
+  explicit plus sign, reject values outside the signed 32-bit range, clamp
+  valid limits above 1,000, and select the first duplicate value. Malformed
+  `max-parts` precedes `part-number-marker`, which precedes upload lookup;
+  malformed `max-uploads` precedes `encoding-type`, which precedes an
+  effective `upload-id-marker`. These validation failures precede current
+  authorization. ListMultipartUploads ignores `upload-id-marker` unless a
+  nonempty `key-marker` is also present, and first-value selection is pinned
+  for key markers, prefixes, and delimiters.
 
 ### 5. Lifecycle and concurrency
 

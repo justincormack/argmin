@@ -76,6 +76,13 @@ pub enum ServerError {
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
 
+    #[error("invalid argument: {argument_name}={argument_value}: {reason}")]
+    InvalidArgumentValue {
+        reason: String,
+        argument_name: String,
+        argument_value: String,
+    },
+
     #[error("invalid managed encryption read header: {header:?}")]
     InvalidManagedEncryptionReadHeader {
         context: ManagedEncryptionReadHeaderContext,
@@ -542,6 +549,7 @@ impl ServerError {
             Self::InvalidRequest { .. } | Self::InvalidRequestHostId { .. } => "InvalidRequest",
             Self::BadRequest { .. } => "BadRequest",
             Self::InvalidArgument { .. }
+            | Self::InvalidArgumentValue { .. }
             | Self::UploadPartMissingUploadId
             | Self::UploadPartCopyMissingUploadId
             | Self::InvalidUploadPartNumber { .. }
@@ -679,6 +687,7 @@ impl ServerError {
             | Self::InvalidRequestHostId { .. }
             | Self::BadRequest { .. }
             | Self::InvalidArgument { .. }
+            | Self::InvalidArgumentValue { .. }
             | Self::UploadPartMissingUploadId
             | Self::UploadPartCopyMissingUploadId
             | Self::InvalidUploadPartNumber { .. }
