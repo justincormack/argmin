@@ -17,6 +17,38 @@ struct MultipartMetadataRaceSync {
     _guard: ReclamationTestHookGuard,
 }
 
+struct ObjectReadSnapshotRaceSync {
+    snapshot_reached: Arc<Barrier>,
+    snapshot_resume: Arc<Barrier>,
+    _serial_guard: MutexGuard<'static, ()>,
+    _guard: ReclamationTestHookGuard,
+}
+
+fn install_object_read_snapshot_race_hook(bucket: &str, key: &str) -> ObjectReadSnapshotRaceSync {
+    let serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let snapshot_reached = Arc::new(Barrier::new(2));
+    let snapshot_resume = Arc::new(Barrier::new(2));
+    let snapshot_reached_hook = Arc::clone(&snapshot_reached);
+    let snapshot_resume_hook = Arc::clone(&snapshot_resume);
+    let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        after_object_read_snapshot: Some(Arc::new(move || {
+            snapshot_reached_hook.wait();
+            snapshot_resume_hook.wait();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    ObjectReadSnapshotRaceSync {
+        snapshot_reached,
+        snapshot_resume,
+        _serial_guard: serial,
+        _guard: guard,
+    }
+}
+
 fn install_multipart_metadata_race_hooks(bucket: &str, key: &str) -> MultipartMetadataRaceSync {
     let serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -5887,6 +5919,279 @@ fn copy_object_is_consistent_during_concurrent_overwrite() {
 
         current = next;
     }
+}
+
+#[test]
+fn copy_object_uses_snapshotted_source_during_overwrite() {
+    let tmp = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+
+    let admin = make_coord();
+    admin
+        .create_bucket_for_owner("default-owner", "src-bucket", false)
+        .unwrap();
+    admin
+        .create_bucket_for_owner("default-owner", "dst-bucket", false)
+        .unwrap();
+
+    let original_body = vec![b'o'; (2 * 1024 * 1024) + 137];
+    let original_headers = [
+        ("Content-Type", "application/x-original"),
+        ("X-Amz-Meta-Source-State", "original"),
+    ];
+    let original_metadata = MetadataBlob::from_headers(&original_headers).unwrap();
+    let original_system_metadata = SystemMetadata::from_headers(&original_headers).unwrap();
+    let original = test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("src-bucket", "src", test_requester(), None),
+            data: &original_body,
+            metadata: &original_metadata,
+            system_metadata: &original_system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let original_etag = original.etag;
+
+    let sync = install_object_read_snapshot_race_hook("src-bucket", "src");
+    let copier = make_coord();
+    let copy = thread::spawn(move || {
+        copier.copy_object(&CopyObjectRequest {
+            source: copy_source("src-bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "dst-bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+    });
+    sync.snapshot_reached.wait();
+
+    let replacement_body = vec![b'r'; (2 * 1024 * 1024) + 137];
+    let replacement_headers = [
+        ("Content-Type", "application/x-replacement"),
+        ("X-Amz-Meta-Source-State", "replacement"),
+    ];
+    let replacement_metadata = MetadataBlob::from_headers(&replacement_headers).unwrap();
+    let replacement_system_metadata = SystemMetadata::from_headers(&replacement_headers).unwrap();
+    let replacement = test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("src-bucket", "src", test_requester(), None),
+            data: &replacement_body,
+            metadata: &replacement_metadata,
+            system_metadata: &replacement_system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    );
+    sync.snapshot_resume.wait();
+    let copied = copy.join().unwrap();
+    drop(sync);
+    let replacement = replacement.expect("source overwrite must complete while copy is paused");
+    let copied = copied.expect("copy must complete from its source snapshot");
+    assert_ne!(replacement.etag, original_etag);
+    assert_eq!(copied.etag, original_etag);
+
+    let destination = admin
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "dst-bucket",
+                "dst",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(destination.etag, original_etag);
+    assert_eq!(
+        destination
+            .system_metadata
+            .content_type()
+            .map(|value| value.as_str()),
+        Some("application/x-original")
+    );
+    assert_eq!(
+        destination.metadata.get("x-amz-meta-source-state"),
+        Some("original")
+    );
+    assert_eq!(destination.body.read_all().unwrap(), original_body);
+
+    let source = admin
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "src-bucket",
+                "src",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(source.etag, replacement.etag);
+    assert_eq!(
+        source
+            .system_metadata
+            .content_type()
+            .map(|value| value.as_str()),
+        Some("application/x-replacement")
+    );
+    assert_eq!(
+        source.metadata.get("x-amz-meta-source-state"),
+        Some("replacement")
+    );
+    assert_eq!(source.body.read_all().unwrap(), replacement_body);
+}
+
+#[test]
+fn copy_object_uses_snapshotted_source_during_delete() {
+    let tmp = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let make_coord =
+        || setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+
+    let admin = make_coord();
+    admin
+        .create_bucket_for_owner("default-owner", "src-bucket", false)
+        .unwrap();
+    admin
+        .create_bucket_for_owner("default-owner", "dst-bucket", false)
+        .unwrap();
+
+    let source_body = vec![b's'; (2 * 1024 * 1024) + 137];
+    let source_headers = [
+        ("Content-Type", "application/x-before-delete"),
+        ("X-Amz-Meta-Source-State", "before-delete"),
+    ];
+    let source_metadata = MetadataBlob::from_headers(&source_headers).unwrap();
+    let source_system_metadata = SystemMetadata::from_headers(&source_headers).unwrap();
+    let source = test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("src-bucket", "src", test_requester(), None),
+            data: &source_body,
+            metadata: &source_metadata,
+            system_metadata: &source_system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let source_etag = source.etag;
+
+    let sync = install_object_read_snapshot_race_hook("src-bucket", "src");
+    let copier = make_coord();
+    let copy = thread::spawn(move || {
+        copier.copy_object(&CopyObjectRequest {
+            source: copy_source("src-bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "dst-bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+    });
+    sync.snapshot_reached.wait();
+
+    let deleted = admin.delete_object(&delete_object_request(
+        "src-bucket",
+        "src",
+        None,
+        test_requester(),
+        false,
+        NO_DELETE,
+    ));
+    sync.snapshot_resume.wait();
+    let copied = copy.join().unwrap();
+    drop(sync);
+    deleted.expect("source delete must complete while copy is paused");
+    let copied = copied.expect("copy must complete from its source snapshot");
+    assert_eq!(copied.etag, source_etag);
+
+    let destination = admin
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "dst-bucket",
+                "dst",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(destination.etag, source_etag);
+    assert_eq!(
+        destination
+            .system_metadata
+            .content_type()
+            .map(|value| value.as_str()),
+        Some("application/x-before-delete")
+    );
+    assert_eq!(
+        destination.metadata.get("x-amz-meta-source-state"),
+        Some("before-delete")
+    );
+    assert_eq!(destination.body.read_all().unwrap(), source_body);
+
+    assert!(matches!(
+        admin.get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "src-bucket",
+                "src",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        }),
+        Err(ServerError::ObjectNotFound { .. })
+    ));
 }
 
 #[test]

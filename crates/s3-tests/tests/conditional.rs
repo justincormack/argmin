@@ -1,3 +1,4 @@
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{
@@ -10,6 +11,7 @@ use s3_tests::{
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Create a bucket, returning its name.
@@ -2678,6 +2680,363 @@ fn test_copy_source_version_header_follows_source_bucket_versioning() {
 
         cleanup_versioned_bucket(client, &source_bucket).await;
         s3_tests::delete_bucket_retrying_operation_aborted(client, &destination_bucket).await;
+    });
+}
+
+#[test]
+fn test_copy_source_malformed_dates_are_ignored() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let source_etag = put_object(&bucket, "src", b"source data").await;
+
+        for (index, header_name) in [
+            "x-amz-copy-source-if-modified-since",
+            "x-amz-copy-source-if-unmodified-since",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let destination = format!("malformed-date-copy-{index}");
+            let copy_source = format!("{bucket}/src");
+            let response = raw_object_with(
+                "PUT",
+                &bucket,
+                &destination,
+                b"",
+                &[
+                    ("x-amz-copy-source", copy_source.as_str()),
+                    (header_name, "not-an-http-date"),
+                ],
+            );
+            assert_eq!(
+                response.status, 200,
+                "CopyObject with malformed {header_name}: {response:?}"
+            );
+            let copied = client
+                .get_object()
+                .bucket(&bucket)
+                .key(&destination)
+                .send_retrying_operation_aborted("get malformed-date copied object")
+                .await
+                .unwrap();
+            assert_eq!(copied.e_tag(), Some(source_etag.as_str()));
+            let copied_data = copied.body.collect().await.unwrap().into_bytes();
+            assert_eq!(&copied_data[..], b"source data");
+
+            let upload_key = format!("malformed-date-part-copy-{index}");
+            let upload = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(&upload_key)
+                .send_retrying_operation_aborted("create malformed-date copy upload")
+                .await
+                .unwrap();
+            let upload_id = upload.upload_id().unwrap();
+            let upload_response = s3_tests::send_signed_request(
+                "PUT",
+                &format!(
+                    "{}/{}/{}?partNumber=1&uploadId={upload_id}",
+                    CTX.endpoint(),
+                    bucket,
+                    upload_key
+                ),
+                b"",
+                [
+                    ("x-amz-copy-source", copy_source.as_str()),
+                    (header_name, "not-an-http-date"),
+                ],
+            );
+            assert_eq!(
+                upload_response.status, 200,
+                "UploadPartCopy with malformed {header_name}: {upload_response:?}"
+            );
+            let parts = client
+                .list_parts()
+                .bucket(&bucket)
+                .key(&upload_key)
+                .upload_id(upload_id)
+                .send_retrying_operation_aborted("list malformed-date copied part")
+                .await
+                .unwrap();
+            assert_eq!(parts.parts().len(), 1);
+            assert_eq!(parts.parts()[0].e_tag(), Some(source_etag.as_str()));
+            client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(&upload_key)
+                .upload_id(upload_id)
+                .send_retrying_operation_aborted("abort malformed-date copy upload")
+                .await
+                .unwrap();
+        }
+
+        cleanup(
+            &bucket,
+            &["src", "malformed-date-copy-0", "malformed-date-copy-1"],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_copy_object_racing_source_replacement_uses_one_object_version() {
+    s3_tests::run(async {
+        for attempt in 0..6 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let source_key = "copy-object-race-replaced-source";
+            let destination_key = "copy-object-race-replaced-destination";
+            let original_body = vec![b'o'; 64 * 1024];
+            let replacement_body = vec![b'r'; 64 * 1024];
+            let original = put_object_result_retrying_operation_aborted(
+                "put CopyObject replacement-race source",
+                || {
+                    client
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(source_key)
+                        .content_type("application/x-original")
+                        .metadata("source-state", "original")
+                        .body(ByteStream::from(original_body.clone()))
+                },
+            )
+            .await
+            .unwrap();
+            let original_etag = original.e_tag().unwrap().to_string();
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let copy_client = client.clone();
+            let copy_bucket = bucket.clone();
+            let copy_barrier = Arc::clone(&barrier);
+            let copy = tokio::spawn(async move {
+                copy_barrier.wait().await;
+                if attempt % 2 != 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                copy_client
+                    .copy_object()
+                    .bucket(&copy_bucket)
+                    .key(destination_key)
+                    .copy_source(format!("{copy_bucket}/{source_key}"))
+                    .send()
+                    .await
+            });
+            let replacement_client = client.clone();
+            let replacement_bucket = bucket.clone();
+            let replacement_barrier = barrier;
+            let replacement_body_for_task = replacement_body.clone();
+            let replacement = tokio::spawn(async move {
+                replacement_barrier.wait().await;
+                if attempt % 2 == 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                replacement_client
+                    .put_object()
+                    .bucket(replacement_bucket)
+                    .key(source_key)
+                    .content_type("application/x-replacement")
+                    .metadata("source-state", "replacement")
+                    .body(ByteStream::from(replacement_body_for_task))
+                    .send()
+                    .await
+            });
+            let (copy, replacement) = tokio::join!(copy, replacement);
+            copy.unwrap()
+                .unwrap_or_else(|error| panic!("CopyObject attempt {attempt}: {error:?}"));
+            let replacement = replacement
+                .unwrap()
+                .unwrap_or_else(|error| panic!("source replacement attempt {attempt}: {error:?}"));
+            let replacement_etag = replacement.e_tag().unwrap().to_string();
+            assert_ne!(original_etag, replacement_etag);
+
+            let copied = client
+                .get_object()
+                .bucket(&bucket)
+                .key(destination_key)
+                .send()
+                .await
+                .unwrap();
+            let copied_etag = copied.e_tag().unwrap().to_string();
+            assert!(
+                copied_etag == original_etag || copied_etag == replacement_etag,
+                "CopyObject attempt {attempt} returned an ETag from neither source version: {copied_etag}"
+            );
+            let expected_body = if copied_etag == original_etag {
+                original_body.as_slice()
+            } else {
+                replacement_body.as_slice()
+            };
+            let (expected_content_type, expected_source_state) = if copied_etag == original_etag {
+                ("application/x-original", "original")
+            } else {
+                ("application/x-replacement", "replacement")
+            };
+            assert_eq!(copied.content_type(), Some(expected_content_type));
+            assert_eq!(
+                copied
+                    .metadata()
+                    .and_then(|metadata| metadata.get("source-state"))
+                    .map(String::as_str),
+                Some(expected_source_state)
+            );
+            let copied_data = copied.body.collect().await.unwrap().into_bytes();
+            assert_eq!(copied_data.as_ref(), expected_body);
+
+            let current_source = client
+                .get_object()
+                .bucket(&bucket)
+                .key(source_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(current_source.e_tag(), Some(replacement_etag.as_str()));
+            assert_eq!(
+                current_source.content_type(),
+                Some("application/x-replacement")
+            );
+            assert_eq!(
+                current_source
+                    .metadata()
+                    .and_then(|metadata| metadata.get("source-state"))
+                    .map(String::as_str),
+                Some("replacement")
+            );
+            assert_eq!(
+                current_source
+                    .body
+                    .collect()
+                    .await
+                    .unwrap()
+                    .into_bytes()
+                    .as_ref(),
+                replacement_body.as_slice()
+            );
+
+            cleanup(&bucket, &[source_key, destination_key]).await;
+        }
+    });
+}
+
+#[test]
+fn test_copy_object_racing_source_delete_is_atomic() {
+    s3_tests::run(async {
+        for attempt in 0..6 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let source_key = "copy-object-race-deleted-source";
+            let destination_key = "copy-object-race-deleted-destination";
+            let source_body = vec![b's'; 64 * 1024];
+            let source = put_object_result_retrying_operation_aborted(
+                "put CopyObject deletion-race source",
+                || {
+                    client
+                        .put_object()
+                        .bucket(&bucket)
+                        .key(source_key)
+                        .content_type("application/x-before-delete")
+                        .metadata("source-state", "before-delete")
+                        .body(ByteStream::from(source_body.clone()))
+                },
+            )
+            .await
+            .unwrap();
+            let source_etag = source.e_tag().unwrap().to_string();
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let copy_client = client.clone();
+            let copy_bucket = bucket.clone();
+            let copy_barrier = Arc::clone(&barrier);
+            let copy = tokio::spawn(async move {
+                copy_barrier.wait().await;
+                if attempt % 2 != 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                copy_client
+                    .copy_object()
+                    .bucket(&copy_bucket)
+                    .key(destination_key)
+                    .copy_source(format!("{copy_bucket}/{source_key}"))
+                    .send()
+                    .await
+            });
+            let delete_client = client.clone();
+            let delete_bucket = bucket.clone();
+            let delete = tokio::spawn(async move {
+                barrier.wait().await;
+                if attempt % 2 == 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                delete_client
+                    .delete_object()
+                    .bucket(delete_bucket)
+                    .key(source_key)
+                    .send()
+                    .await
+            });
+            let (copy, delete) = tokio::join!(copy, delete);
+            let copy = copy.unwrap();
+            delete
+                .unwrap()
+                .unwrap_or_else(|error| panic!("source delete attempt {attempt}: {error:?}"));
+
+            let missing_source = client
+                .get_object()
+                .bucket(&bucket)
+                .key(source_key)
+                .send()
+                .await;
+            assert_eq!(err_status(&missing_source), 404);
+            assert_s3_err_code(&missing_source, "NoSuchKey");
+
+            match copy {
+                Ok(_) => {
+                    let copied = client
+                        .get_object()
+                        .bucket(&bucket)
+                        .key(destination_key)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(copied.e_tag(), Some(source_etag.as_str()));
+                    assert_eq!(copied.content_type(), Some("application/x-before-delete"));
+                    assert_eq!(
+                        copied
+                            .metadata()
+                            .and_then(|metadata| metadata.get("source-state"))
+                            .map(String::as_str),
+                        Some("before-delete")
+                    );
+                    assert_eq!(
+                        copied.body.collect().await.unwrap().into_bytes().as_ref(),
+                        source_body.as_slice()
+                    );
+                }
+                Err(error) => {
+                    assert_eq!(
+                        error
+                            .raw_response()
+                            .map(|response| response.status().as_u16()),
+                        Some(404)
+                    );
+                    assert_eq!(
+                        error
+                            .as_service_error()
+                            .and_then(ProvideErrorMetadata::code),
+                        Some("NoSuchKey")
+                    );
+                    let destination = client
+                        .head_object()
+                        .bucket(&bucket)
+                        .key(destination_key)
+                        .send()
+                        .await;
+                    assert_eq!(err_status(&destination), 404);
+                }
+            }
+
+            cleanup(&bucket, &[source_key, destination_key]).await;
+        }
     });
 }
 

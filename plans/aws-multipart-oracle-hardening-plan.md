@@ -316,7 +316,7 @@ choice.
   versioning state so they can match this operation-specific distinction. The
   same oracle also pins that `partNumber=1` over a non-multipart object omits
   `x-amz-mp-parts-count`; multipart objects continue to return their count.
-- [ ] Fill CopyObject and UploadPartCopy source-condition coverage. Cross the
+- [x] Fill CopyObject and UploadPartCopy source-condition coverage. Cross the
   four source conditional families individually and in AWS's combined-header
   precedence pairs, including malformed dates, missing/current-delete-marker
   sources, explicit source versions, and source replacement or deletion while
@@ -339,8 +339,18 @@ choice.
   or suspended bucket omits the header; and explicitly selecting
   `versionId=null` returns `null` in both bucket states. Exact source version and
   marker history is unchanged, and every rejection publishes neither a
-  destination nor a part. The remaining malformed-input and raced CopyObject
-  cases keep this item open.
+  destination nor a part. Both malformed source date headers are ignored by
+  both operations, with the successful destination or part state verified.
+  AWS-facing CopyObject probes establish the permitted replacement and
+  deletion orderings: replacement publishes exactly one complete old or new
+  source snapshot, while deletion either publishes the complete old snapshot
+  or returns `404 NoSuchKey` without a destination. These match the equivalent
+  UploadPartCopy source-race outcomes in the multipart concurrency matrix. The
+  staggered AWS probes do not themselves prove that the operations overlap.
+  Deterministic coordinator regressions now pause CopyObject after its source
+  snapshot, complete replacement or deletion, and then require the old body,
+  ETag, content type, and user metadata on resume. The overwrite case also
+  verifies that the current source contains the distinct replacement state.
 - [ ] Probe conditional PutObject contention for both the direct and streamed
   paths, including aws-chunked requests. Cover simultaneous
   `If-None-Match: *` creates, competing `If-Match` overwrites, intervening
