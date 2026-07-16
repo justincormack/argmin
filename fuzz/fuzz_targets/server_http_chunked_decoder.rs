@@ -21,6 +21,8 @@ fn seeded_context(seed: &[u8], trailer_seed: &[u8]) -> StreamingSigningContext {
         seed_signature,
         scope: argmin_fuzz::lossy(seed),
         timestamp: argmin_fuzz::lossy(trailer_seed),
+        access_key_id: argmin_fuzz::lossy(trailer_seed),
+        seed_canonical_request: argmin_fuzz::lossy(seed),
     }
 }
 

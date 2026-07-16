@@ -683,9 +683,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.26"
+version = "0.10.0-alpha.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04186d1a672129db137efbf571bbe4a15fbf886a8e23c601cf204774f1e32460"
+checksum = "d7ee2febc2358d7d98a2ef862334faced350898361fb1c29cae4aef49f4935ab"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -709,9 +709,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.26"
+version = "0.10.0-alpha.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4afe3ad4ffb04729bb0fa63747db47ca450f67d90db962cf39cb930f4ba05997"
+checksum = "09fb59121d90b48db847cc5c4df2ed0b1ef36d7693a63702ee721637f27c2875"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -722,9 +722,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.26"
+version = "0.10.0-alpha.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2de21974b6de6f4df84d555841a9c50663fa9686db95fa58d4c5341daf15e788"
+checksum = "f547a950b78c2e0935857ea5d63e155c66998334442616c099b88fdde823b39a"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -735,9 +735,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.26"
+version = "0.10.0-alpha.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e51b7d12a7fccc2d3a68db73ac06f1f64cf0cde1361aff1ac86a5f773ed09d6"
+checksum = "7960a1ee0630bde5f0fdbfe883b0bd34fdab9d523eff99bfaa4d0da75ad430ab"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -1146,6 +1146,7 @@ dependencies = [
  "checksum",
  "ec",
  "futures-util",
+ "libc",
  "observability",
  "openraft",
  "placement",
@@ -1200,6 +1201,7 @@ version = "1.52.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

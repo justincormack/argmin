@@ -835,6 +835,18 @@ reestablish_replicated_control_plane_after_term_change() {
     done
     [[ "$current_term" =~ ^[0-9]+$ ]] && ((current_term > previous_term)) || {
         [[ -z "$status" ]] || echo "$status" >&2
+        local diagnostic_node_id
+        for diagnostic_node_id in "${control_plane_raft_node_ids[@]}"; do
+            local diagnostic_pid="${control_plane_pids[$diagnostic_node_id]:-}"
+            if [[ -z "$diagnostic_pid" ]] || ! kill -0 "$diagnostic_pid" 2>/dev/null; then
+                echo "control-plane-$diagnostic_node_id process is not running" >&2
+                continue
+            fi
+            local diagnostic_status
+            diagnostic_status="$(control_plane_authority_clock_status_for_node \
+                "$diagnostic_node_id" 2>&1)" || true
+            echo "control-plane-$diagnostic_node_id authority clock: $diagnostic_status" >&2
+        done
         die "$transition_label did not elect a leader in a term newer than $previous_term"
     }
 
@@ -856,11 +868,10 @@ reestablish_replicated_control_plane_after_term_change() {
 
     echo "== argmin-s3 UAT $transition_label authority clock before recovery: $status =="
     local socket_path="${control_plane_socket_paths[$leader]}"
-    print_command env -u ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS \
-        "${server_cmd[@]}" control-plane-reestablish-authority-clock "$socket_path"
+    print_command "${server_cmd[@]}" control-plane-reestablish-authority-clock "$socket_path"
     local recovery_status
-    recovery_status="$(env -u ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS \
-        "${server_cmd[@]}" control-plane-reestablish-authority-clock "$socket_path")" ||
+    recovery_status="$("${server_cmd[@]}" \
+        control-plane-reestablish-authority-clock "$socket_path")" ||
         die "$transition_label authority-clock re-establishment failed"
     echo "$recovery_status"
 
@@ -974,7 +985,7 @@ restart_control_plane() {
         pre_failover_max_node_lease_deadline_ms="$(runtime_map_max_node_lease_deadline \
             "$pre_failover_diagnostics")" ||
             die "replicated control-plane diagnostics omitted a pre-failover storage-node lease"
-        local post_failover_min_epoch=$((pre_failover_epoch + 1))
+        local post_failover_min_epoch="$pre_failover_epoch"
         echo "== argmin-s3 UAT restart replicated control-plane leader $old_leader =="
         kill_control_plane_node "$old_leader"
         reestablish_replicated_control_plane_after_term_change \
@@ -986,11 +997,11 @@ restart_control_plane() {
         # Bind clock authority only after all three voters are back so the
         # resumed storage heartbeats cannot retain the interim term binding.
         recover_replicated_control_plane_rejoin_term_if_needed "$replacement_term"
-        # Do not accept the still-serving pre-failover map. Epoch movement can
-        # come from unrelated expiry or peering commands while every PG still
-        # depends on predecessor-term leases. Require every storage node to
-        # renew beyond the greatest predecessor deadline in the same snapshot
-        # that reports every PG serving.
+        # Do not accept a map still covered only by predecessor-term leases.
+        # A clean failover does not change topology and therefore need not bump
+        # the cluster epoch. Require the epoch not to regress and every storage
+        # node to renew beyond the greatest predecessor deadline in the same
+        # snapshot that reports every PG serving.
         wait_for_control_plane_runtime_map_ready 30 "$post_failover_min_epoch" \
             "$pre_failover_max_node_lease_deadline_ms"
         return

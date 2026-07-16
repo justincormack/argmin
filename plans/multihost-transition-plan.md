@@ -11502,11 +11502,51 @@ Replicated route-change soak cutover:
   the verified response-signing context through routing rejection or dispatch.
   Invalid credentials therefore cannot trigger quorum work, while authenticated
   routing failures remain explicit and retryable. Targeted regressions cover
-  bounded stale-leader confirmation,
+  bounded stale-leader confirmation, applied authority-clock recovery whose
+  successful mutation response remains delayed past its per-attempt I/O
+  deadline while a read-only status request confirms the durable generation
+  within the aggregate operation deadline. Recovery retains the configured
+  endpoint set and restarts the status/mutation handshake against a newly
+  observed serving term if leadership changes during ambiguous-outcome
+  confirmation; it never replays an old term's expected-generation mutation.
+  Multi-node processes never invoke the manual election trigger internally:
+  OpenRaft's automatic timer owns both initial and replacement elections, so a
+  startup or manager-loop trigger cannot race a newer automatic-election vote.
+  The explicit election admin operation remains operator-driven. Serving
+  readiness additionally requires a committed log entry from the current term,
+  not merely a local leader vote plus an applied prior-term tip. Repeated
+  process-restart soak runs on OpenRaft 0.10.0-alpha.26 exposed a replication
+  liveness case where the automatically appended current-term blank remained
+  only in the leader's local log after one follower was lost. OpenRaft
+  0.10.0-alpha.27 fixed a closed or hung follower replication task blocking
+  RaftCore, and replicated mode now uses alpha.30. Retained alpha.30 failure
+  artifacts exposed the remaining local integration defect: OpenRaft's default
+  `max_payload_entries` was 300 while the fail-closed peer transport accepted at
+  most 256 entries. A replacement leader repeatedly tried to catch a follower
+  up with roughly 270 entries, the transport rejected every request before
+  sending it, and the natural current-term blank therefore never reached a
+  quorum. Replicated mode now caps OpenRaft payloads at 64 entries. Every
+  normal command must fit one sixty-fourth of the eight-MiB encoded append
+  payload, including its Raft entry framing, before it can enter the leader
+  log; the configured peer policy must carry the full 64-entry/eight-MiB batch
+  and corresponding frame, and its worst-case joint membership entry must fit
+  the same per-entry bound. This prevents a locally accepted log entry or
+  policy from becoming permanently unreplicable. A restart catch-up regression
+  keeps a follower offline across more than 256 committed entries and proves
+  it converges through multiple bounded batches. The Unix adapter converts
+  alpha.30's `RPCOption::soft_ttl()` to one absolute deadline sampled before
+  `spawn_blocking`; encoding, deadline-bounded connect, writes, and the complete
+  framed response read all consume that same budget, so a cancelled async call
+  cannot leave an unbounded blocking worker. No application-level blank barrier
+  is submitted: OpenRaft remains the sole owner of leader establishment and its
+  natural current-term entry. Targeted regressions pin the batch/transport,
+  pre-append byte, policy, catch-up, and end-to-end deadline invariants. Other
+  targeted regressions cover
   independent connection-admission capacity, authentication-before-admission,
-  signed routing rejection without duplicate verification, and a recovery
-  request completing while an already-admitted ordinary worker remains parked
-  in a post-admission quorum wait. A real cloned-wrapper regression also parks
+  signed routing rejection without duplicate
+  verification, and a recovery request completing while an already-admitted
+  ordinary worker remains parked in a post-admission quorum wait. A real
+  cloned-wrapper regression also parks
   one admitted clone, poisons through another clone, and proves final response
   publication fails closed. A separate deterministic monitor regression parks a
   response after its early check, publishes WAL-monitor poison, and proves that
@@ -11514,9 +11554,10 @@ Replicated route-change soak cutover:
   Standalone restart likewise has to resume from its durable clock checkpoint;
   the soak does not hide missing or invalid restart evidence with an admin
   reset. After recovery, the failover barrier requires a fully serving runtime
-  map in an epoch newer than the pre-failover map, and every configured storage
+  map whose topology epoch has not regressed, and every configured storage
   node's effective lease deadline must exceed the greatest deadline observed
-  before failover. These deadlines are carried only in the authenticated
+  before failover. A clean leadership change does not mutate topology solely
+  to manufacture an epoch bump. These deadlines are carried only in the authenticated
   diagnostic response, not in the serving runtime-map wire format. Epoch
   movement alone is insufficient
   because unrelated expiry or peering commands can advance it while PGs still
@@ -11528,8 +11569,9 @@ Replicated route-change soak cutover:
   authority-clock re-establishment, unrelated epoch movement, per-node lease
   renewal, and per-PG serving recovery. It asserts that the original leader
   cannot regain command authority from a stale local view and that the barrier
-  cannot pass until quorum authority, current-term clock binding, a newer
-  epoch, every renewed lease, and every serving PG hold simultaneously.
+  cannot pass until quorum authority, current-term clock binding, a
+  non-regressed topology epoch, every renewed lease, and every serving PG hold
+  simultaneously. Unrelated epoch movement alone remains insufficient.
 - Add autonomous recovery for the expected clean-leadership-change case rather
   than making routine Raft election availability depend indefinitely on a CLI
   invocation. This is narrower than automatic recovery from an arbitrary clock
@@ -11552,10 +11594,18 @@ Replicated route-change soak cutover:
   now atomically establishes the current term's horizon on its candidate
   snapshot before expiring selected leases: it defers with
   `PreviousLeaseGrantHorizonStillActive` until the predecessor horizon plus
-  skew fence elapses, then transitions the horizon and expiry in one committed
-  command. Expected fence waits and sampled-term/committed-term election races
-  do not terminate the authority process; unrelated deterministic command
-  failures remain fatal to the manager loop.
+  skew fence elapses. Once that safety fence passes, runtime-map and
+  storage-node leases are already unusable; changing durable node/PG topology
+  is cleanup rather than the serving fence. The manager therefore gives
+  storage nodes one maximum jittered heartbeat interval plus one RPC deadline
+  to atomically establish the successor horizon and renew before submitting
+  targeted expiry. This prevents the 100 ms expiry scanner from deterministically
+  beating healthy one-second heartbeat retries and forcing every PG through
+  Peering after each failover. A node that does not renew in that bounded
+  window is expired through the existing atomic horizon-and-expiry command.
+  Expected fence waits and sampled-term/committed-term election races do not
+  terminate the authority process; unrelated deterministic command failures
+  remain fatal to the manager loop.
 
 Phase 12.4 proposed scope:
 

@@ -26,7 +26,7 @@ use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
 use storage::control_plane::{
-    build_control_plane_authority_clock_admin_response_from_verified,
+    build_control_plane_authority_clock_admin_response_from_verified_with_context,
     build_control_plane_unix_admission_error_response,
     build_control_plane_unix_response_from_verified, finish_control_plane_heartbeat_response,
     invalidate_authority_clock_restart_checkpoint, load_authority_clock_restart_checkpoint,
@@ -2084,7 +2084,9 @@ struct ExperimentalRaftControlPlane {
 
 #[cfg(test)]
 type ExperimentalRaftAfterHeartbeatCommitHook = Box<
-    dyn FnOnce(&ExperimentalRaftControlPlane) -> Result<(), ControlPlaneError> + Send + 'static,
+    dyn FnOnce(&ExperimentalRaftControlPlane) -> Result<Option<u64>, ControlPlaneError>
+        + Send
+        + 'static,
 >;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2152,14 +2154,14 @@ impl ExperimentalRaftControlPlane {
     }
 
     #[cfg(test)]
-    fn run_after_heartbeat_commit_hook(&self) -> Result<(), ControlPlaneError> {
+    fn run_after_heartbeat_commit_hook(&self) -> Result<Option<u64>, ControlPlaneError> {
         let Some(hook) = self
             .after_heartbeat_commit_hook
             .lock()
             .expect("experimental OpenRaft heartbeat hook mutex poisoned")
             .take()
         else {
-            return Ok(());
+            return Ok(None);
         };
         hook(self)
     }
@@ -2195,6 +2197,42 @@ impl ExperimentalRaftControlPlane {
             return Ok((supplied_now_ms, None));
         }
         let status = self.block_on(self.authority.confirmed_linearized_authority_status())?;
+        self.authority_time_and_lease_horizon_binding_for_status(status)
+    }
+
+    fn local_authority_time_and_lease_horizon_binding(
+        &self,
+        supplied_now_ms: u64,
+    ) -> Result<(u64, Option<LeaseHorizonAuthorityBinding>), ControlPlaneError> {
+        if !self.resample_authority_time {
+            return self.authority_time_and_lease_horizon_binding(supplied_now_ms);
+        }
+        let status = self.block_on(self.authority.status())?;
+        if !status.linearized_authority_serving() {
+            return Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "local OpenRaft authority is not the serving leader: {:?}",
+                    status.linearized_authority_readiness()
+                ),
+            });
+        }
+        self.authority_time_and_lease_horizon_binding_for_status(status)
+    }
+
+    fn authority_time_and_lease_horizon_binding_for_status(
+        &self,
+        status: ControlPlaneRaftAuthorityStatus,
+    ) -> Result<(u64, Option<LeaseHorizonAuthorityBinding>), ControlPlaneError> {
+        let current_term = status.current_term().ok_or(ControlPlaneError::RpcRemote {
+            message: "local OpenRaft leader has no current term".to_string(),
+        })?;
+        self.authority_time_and_lease_horizon_binding_for_term(current_term)
+    }
+
+    fn authority_time_and_lease_horizon_binding_for_term(
+        &self,
+        current_term: u64,
+    ) -> Result<(u64, Option<LeaseHorizonAuthorityBinding>), ControlPlaneError> {
         let max_committed_timestamp_ms = self.current_snapshot()?.max_committed_timestamp_ms();
         let mut authority_clock = self
             .authority_clock
@@ -2203,9 +2241,6 @@ impl ExperimentalRaftControlPlane {
             .lock()
             .expect("control-plane authority clock mutex poisoned");
         authority_clock.observe_committed_timestamp_high_water(max_committed_timestamp_ms);
-        let current_term = status.current_term().ok_or(ControlPlaneError::RpcRemote {
-            message: "local OpenRaft leader has no current term".to_string(),
-        })?;
         authority_clock.validate_raft_leadership_term(current_term)?;
         let authority_now_ms = authority_clock.effective_process_now_ms()?;
         let authority = authority_clock.lease_horizon_authority_binding(Some(current_term))?;
@@ -2315,6 +2350,21 @@ impl ExperimentalRaftControlPlane {
         &mut self,
         now_ms: u64,
     ) -> Result<(ClusterEpoch, usize, usize), ControlPlaneError> {
+        let (preflight_now_ms, preflight_authority) =
+            self.local_authority_time_and_lease_horizon_binding(now_ms)?;
+        let preflight_snapshot = self.current_snapshot()?;
+        let preflight_expired = preflight_snapshot.expired_node_heartbeat_leases(
+            preflight_snapshot.heartbeat_lease_expiry_timestamp(preflight_now_ms),
+        );
+        if preflight_expired.is_empty() {
+            return Ok((preflight_snapshot.cluster_epoch(), 0, 0));
+        }
+        let preflight_authority = preflight_authority.ok_or(ControlPlaneError::RpcRemote {
+            message: "OpenRaft heartbeat expiry has no serving lease-horizon authority".to_string(),
+        })?;
+        preflight_snapshot
+            .validate_lease_grant_horizon_rebinding(preflight_authority, preflight_now_ms)?;
+
         let (now_ms, lease_horizon_authority) =
             self.authority_time_and_lease_horizon_binding(now_ms)?;
         let snapshot = self.current_snapshot()?;
@@ -2326,6 +2376,7 @@ impl ExperimentalRaftControlPlane {
         let authority = lease_horizon_authority.ok_or(ControlPlaneError::RpcRemote {
             message: "OpenRaft heartbeat expiry has no serving lease-horizon authority".to_string(),
         })?;
+        snapshot.validate_lease_grant_horizon_rebinding(authority, now_ms)?;
         let response =
             self.submit_raft_command(ControlPlaneCommand::ExpireNodeHeartbeatLeases {
                 authority,
@@ -2439,16 +2490,31 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
             self.submit_raft_command(command)?;
         }
         #[cfg(test)]
-        if volatile_snapshot.is_none() {
-            self.run_after_heartbeat_commit_hook()?;
-        }
+        let post_commit_term_override = if volatile_snapshot.is_none() {
+            self.run_after_heartbeat_commit_hook()?
+        } else {
+            None
+        };
         let snapshot = match volatile_snapshot {
             Some(snapshot) => snapshot,
             None => self.current_snapshot()?,
         };
         if let Some(expected_authority) = lease_horizon_authority {
-            let (_, current_authority) =
-                self.authority_time_and_lease_horizon_binding(authority_now_ms)?;
+            #[cfg(test)]
+            let current_authority = match post_commit_term_override {
+                Some(current_term) => {
+                    self.authority_time_and_lease_horizon_binding_for_term(current_term)?
+                        .1
+                }
+                None => {
+                    self.authority_time_and_lease_horizon_binding(authority_now_ms)?
+                        .1
+                }
+            };
+            #[cfg(not(test))]
+            let current_authority = self
+                .authority_time_and_lease_horizon_binding(authority_now_ms)?
+                .1;
             if current_authority != Some(expected_authority) {
                 return Err(ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
                     authority_term: expected_authority.raft_term(),
@@ -2505,14 +2571,7 @@ impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
         &self,
     ) -> Result<ControlPlaneAuthorityClockContext, ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
-        let status = self.block_on(self.authority.status())?;
-        let snapshot = self.current_snapshot()?;
-        Ok(ControlPlaneAuthorityClockContext::new(
-            snapshot.max_committed_timestamp_ms(),
-            status.current_term(),
-            status.local_leader(),
-            status.linearized_authority_serving(),
-        ))
+        self.block_on(self.authority.authority_clock_context())
     }
 
     fn set_pg_acting_set(
@@ -2971,30 +3030,6 @@ async fn wait_for_experimental_raft_local_authority_serving(
             "local OpenRaft authority did not become serving within {timeout:?}: {message}"
         ),
     })
-}
-
-async fn maybe_trigger_experimental_raft_seed_election(
-    authority: &ControlPlaneRaftAuthority,
-    peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
-    local_node_id: ControlPlaneRaftNodeId,
-) -> Result<(), ControlPlaneError> {
-    if !experimental_raft_startup_initializes_membership(peer_policy, local_node_id) {
-        return Ok(());
-    }
-    if peer_policy.is_none_or(|policy| policy.peers().len() <= 1) {
-        return Ok(());
-    }
-    if authority.status().await?.current_leader().is_some() {
-        return Ok(());
-    }
-    authority
-        .raft()
-        .trigger()
-        .elect(true)
-        .await
-        .map_err(|error| ControlPlaneError::RpcRemote {
-            message: format!("OpenRaft startup election trigger failed: {error:?}"),
-        })
 }
 
 #[cfg(test)]
@@ -4001,35 +4036,22 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         },
     );
 
+    let mut lease_expiry_not_before_ms = None;
     loop {
-        if multi_node_raft_peer_mode {
-            block_on_control_plane_raft(&runtime, async {
-                maybe_trigger_experimental_raft_seed_election(
-                    &raft_authority,
-                    raft_peer_policy.as_ref(),
-                    node_id,
-                )
-                .await
-            })
-            .unwrap_or_else(|error| {
-                eprintln!("experimental OpenRaft control-plane election trigger failed: {error}");
-                std::process::exit(1);
-            });
-        }
-        let local_raft_authority_serving = if multi_node_raft_peer_mode {
-            block_on_control_plane_raft(&runtime, async {
-                raft_authority
-                    .status()
-                    .await
-                    .map(|status| status.linearized_authority_serving())
-            })
-            .unwrap_or_else(|error| {
-                eprintln!("experimental OpenRaft control-plane status check failed: {error}");
-                std::process::exit(1);
-            })
+        let raft_status = if multi_node_raft_peer_mode {
+            block_on_control_plane_raft(&runtime, async { raft_authority.status().await })
+                .map(Some)
+                .unwrap_or_else(|error| {
+                    eprintln!("experimental OpenRaft control-plane status check failed: {error}");
+                    std::process::exit(1);
+                })
         } else {
-            true
+            None
         };
+        let local_raft_authority_serving = raft_status
+            .as_ref()
+            .is_none_or(|status| status.linearized_authority_serving());
+        let expiry_now_ms = storage::clock::current_time_millis();
         let expiry = if local_raft_authority_serving {
             if multi_node_raft_peer_mode {
                 bootstrap_empty_experimental_raft_control_plane(&mut authority, config)
@@ -4040,7 +4062,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                         std::process::exit(1);
                     });
             }
-            authority.expire_heartbeat_leases(storage::clock::current_time_millis())
+            if lease_expiry_not_before_ms.is_some_and(|not_before_ms| expiry_now_ms < not_before_ms)
+            {
+                Ok((ClusterEpoch::INITIAL, 0, 0))
+            } else {
+                authority.expire_heartbeat_leases(expiry_now_ms)
+            }
         } else {
             Ok((ClusterEpoch::INITIAL, 0, 0))
         };
@@ -4074,6 +4101,30 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                     "experimental OpenRaft control-plane lease expiry deferred because a coherent clock sample was unavailable: {error}"
                 );
             }
+            Err(
+                error @ ControlPlaneError::PreviousLeaseGrantHorizonStillActive {
+                    fenced_until_ms,
+                    ..
+                },
+            ) => {
+                let renewal_not_before_ms = successor_heartbeat_renewal_not_before_ms(
+                    fenced_until_ms,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!(
+                        "experimental OpenRaft successor heartbeat renewal window failed: {error}"
+                    );
+                    std::process::exit(1);
+                });
+                lease_expiry_not_before_ms = Some(
+                    lease_expiry_not_before_ms.map_or(renewal_not_before_ms, |existing: u64| {
+                        existing.max(renewal_not_before_ms)
+                    }),
+                );
+                eprintln!(
+                    "experimental OpenRaft control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
+                );
+            }
             Err(error) if experimental_raft_lease_expiry_error_is_transient(&error) => {}
             Err(error) if control_plane_lease_expiry_error_is_clock_wait(&error) => {
                 eprintln!(
@@ -4087,6 +4138,19 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         }
         thread::sleep(config.control_plane_lease_scan_interval);
     }
+}
+
+fn successor_heartbeat_renewal_not_before_ms(
+    predecessor_fenced_until_ms: u64,
+) -> Result<u64, ControlPlaneError> {
+    let rpc_timeout_ms = u64::try_from(CONTROL_PLANE_RPC_IO_TIMEOUT.as_millis())
+        .map_err(|_| ControlPlaneError::LeaseDeadlineOverflow)?;
+    predecessor_fenced_until_ms
+        .checked_add(
+            storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS,
+        )
+        .and_then(|deadline_ms| deadline_ms.checked_add(rpc_timeout_ms))
+        .ok_or(ControlPlaneError::LeaseDeadlineOverflow)
 }
 
 fn control_plane_lease_expiry_error_is_clock_wait(error: &ControlPlaneError) -> bool {
@@ -4483,25 +4547,30 @@ fn spawn_control_plane_rpc_worker<T>(
                                 "authority-clock administration requires a process-local clock gate"
                                     .to_owned(),
                         })?;
+                // OpenRaft/state-machine reads may wait for convergence. Keep
+                // them outside the process-local clock gate so status and
+                // recovery confirmation remain observable while they wait.
+                let context = authority.with_mut(metrics_kind, |authority| {
+                    authority.authority_clock_context()
+                });
                 let mut authority_clock = authority_clock
                     .lock()
                     .expect("control-plane authority clock mutex poisoned");
-                let response = authority.with_mut(metrics_kind, |authority| {
-                    build_control_plane_authority_clock_admin_response_from_verified(
-                        &*authority,
+                let response =
+                    build_control_plane_authority_clock_admin_response_from_verified_with_context(
                         &mut authority_clock,
                         request,
                         ControlPlaneAuthorityClockAdminSample::from_process_clock()?,
-                        |authority, authority_clock| {
+                        context,
+                        |context, authority_clock| {
                             persist_established_authority_clock_checkpoint(
-                                authority,
+                                context,
                                 authority_clock,
                                 authority_clock_checkpoint_target.as_deref(),
                             )
                         },
                         || Ok(storage::clock::current_time_millis()),
-                    )
-                });
+                    );
                 invalidate_blocked_authority_clock_checkpoint(
                     &authority_clock,
                     authority_clock_checkpoint_target.as_deref(),
@@ -4658,27 +4727,40 @@ struct AuthorityClockCheckpointTarget {
 }
 
 fn persist_established_authority_clock_checkpoint(
-    authority: &impl ControlPlaneAdmin,
+    context: ControlPlaneAuthorityClockContext,
     authority_clock: &mut ControlPlaneAuthorityClock,
     checkpoint_target: Option<&AuthorityClockCheckpointTarget>,
 ) -> Result<(), ControlPlaneError> {
-    let context = authority.authority_clock_context()?;
     if !authority_clock.status(context).established() {
         return Ok(());
     }
     let checkpoint_target = checkpoint_target.ok_or_else(|| ControlPlaneError::RpcProtocol {
         message: "authority-clock administration requires a durable checkpoint path".to_owned(),
     })?;
+    let persistence_started = Instant::now();
+    let mut invalidate_elapsed = Duration::ZERO;
+    let mut store_elapsed = Duration::ZERO;
     let persistence_result = (|| {
+        let invalidate_started = Instant::now();
         invalidate_authority_clock_restart_checkpoint(&checkpoint_target.path)?;
+        invalidate_elapsed = invalidate_started.elapsed();
+        let store_started = Instant::now();
         store_validated_authority_clock_restart_checkpoint(
             &checkpoint_target.path,
             checkpoint_target.binding,
             context.committed_timestamp_high_water_ms(),
             authority_clock,
         )?;
+        store_elapsed = store_started.elapsed();
         Ok::<(), ControlPlaneError>(())
     })();
+    let persistence_elapsed = persistence_started.elapsed();
+    if persistence_elapsed >= Duration::from_secs(1) {
+        eprintln!(
+            "control-plane authority-clock checkpoint persistence took {persistence_elapsed:?} \
+             (invalidation {invalidate_elapsed:?}, replacement {store_elapsed:?})"
+        );
+    }
     if let Err(error) = persistence_result {
         if authority_clock.status(context).established() {
             authority_clock.fail_closed_after_checkpoint_persistence_failure()?;
@@ -6549,7 +6631,7 @@ mod tests {
 
         storage::clock::with_time_override(5_000, || {
             persist_established_authority_clock_checkpoint(
-                &authority,
+                context,
                 &mut authority_clock,
                 Some(&checkpoint_target),
             )
@@ -6634,7 +6716,7 @@ mod tests {
 
         storage::clock::with_time_override(1_000, || {
             assert!(persist_established_authority_clock_checkpoint(
-                &authority,
+                context,
                 &mut authority_clock,
                 Some(&target),
             )
@@ -6737,7 +6819,7 @@ mod tests {
         };
         storage::clock::with_time_override(1_000, || {
             assert!(persist_established_authority_clock_checkpoint(
-                &authority,
+                context,
                 &mut authority_clock,
                 Some(&target),
             )
@@ -7201,6 +7283,18 @@ mod tests {
             &ControlPlaneError::RpcRemote {
                 message: "unrelated control-plane failure".to_string(),
             }
+        ));
+    }
+
+    #[test]
+    fn successor_expiry_waits_for_one_heartbeat_attempt_after_predecessor_fence() {
+        assert_eq!(
+            successor_heartbeat_renewal_not_before_ms(10_000).unwrap(),
+            12_000
+        );
+        assert!(matches!(
+            successor_heartbeat_renewal_not_before_ms(u64::MAX),
+            Err(ControlPlaneError::LeaseDeadlineOverflow)
         ));
     }
 
@@ -9261,31 +9355,7 @@ mod tests {
             .after_heartbeat_commit_hook
             .lock()
             .expect("heartbeat hook mutex should not be poisoned") =
-            Some(Box::new(move |control_plane| {
-                control_plane.block_on(
-                    control_plane
-                        .authority
-                        .trigger_pre_vote_election_until_serving(Duration::from_secs(1)),
-                )?;
-                let deadline = Instant::now() + Duration::from_secs(1);
-                loop {
-                    let status = control_plane.block_on(control_plane.authority.status())?;
-                    if status
-                        .current_term()
-                        .is_some_and(|term| term > initial_term)
-                        && status.linearized_authority_serving()
-                    {
-                        return Ok(());
-                    }
-                    if Instant::now() >= deadline {
-                        return Err(ControlPlaneError::RpcRemote {
-                            message: "test election did not advance the local Raft term"
-                                .to_string(),
-                        });
-                    }
-                    thread::sleep(Duration::from_millis(5));
-                }
-            }));
+            Some(Box::new(move |_| Ok(Some(initial_term + 1))));
 
         let error = storage::clock::with_time_override(31_000, || {
             harness.control_plane.refresh_node_heartbeat(
@@ -9302,13 +9372,16 @@ mod tests {
             )
         })
         .expect_err("a heartbeat committed under the previous term must not return a lease");
-        assert!(matches!(
-            error,
-            ControlPlaneError::AuthorityClockLeadershipChanged {
-                established_term: Some(term),
-                current_term,
-            } if term == initial_term && current_term > initial_term
-        ));
+        assert!(
+            matches!(
+                error,
+                ControlPlaneError::AuthorityClockLeadershipChanged {
+                    established_term: Some(term),
+                    current_term,
+                } if term == initial_term && current_term > initial_term
+            ),
+            "unexpected post-election heartbeat error: {error:?}"
+        );
 
         let committed = harness
             .control_plane
@@ -10826,7 +10899,7 @@ mod tests {
             "argmin-s3-experimental-raft-local-election-checkpoint-{}",
             std::process::id()
         );
-        let authority = runtime.block_on(async {
+        let (authority, initial_vote) = runtime.block_on(async {
             let authority =
                 ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
                     cluster_name,
@@ -10858,14 +10931,34 @@ mod tests {
             authority
                 .store_durable_restart_artifact(&state_path)
                 .await
-                .expect("baseline authority state should checkpoint");
-            Arc::new(authority)
+                .expect("leader baseline authority state should checkpoint");
+            let status = authority
+                .status()
+                .await
+                .expect("baseline authority status should read before step-down");
+            let initial_term = status
+                .current_term()
+                .expect("baseline authority should have a current term");
+            let response = authority
+                .raft()
+                .vote(VoteRequest {
+                    vote: Vote::new(initial_term + 1, 2),
+                    last_log_id: status.last_log_id(),
+                    leadership_transfer: true,
+                })
+                .await
+                .expect("higher peer vote should step down the local leader");
+            assert!(response.vote_granted);
+            let stepped_down = authority
+                .status()
+                .await
+                .expect("stepped-down authority status should read");
+            assert!(!stepped_down.local_leader());
+            let initial_vote = stepped_down
+                .persisted_vote()
+                .expect("stepped-down authority should have a persisted vote");
+            (Arc::new(authority), initial_vote)
         });
-        let initial_vote = runtime
-            .block_on(authority.status())
-            .expect("baseline authority status should read")
-            .persisted_vote()
-            .expect("baseline authority should have a persisted vote");
         let publication = ExperimentalRaftDurabilityPublication::new();
         let checkpoint_loop = spawn_experimental_raft_peer_checkpoint_loop(
             runtime.handle().clone(),
@@ -10887,7 +10980,7 @@ mod tests {
             authority
                 .raft()
                 .trigger()
-                .elect(true)
+                .elect(false)
                 .await
                 .expect("local election should trigger");
             tokio::time::timeout(Duration::from_secs(1), async {

@@ -52,6 +52,7 @@ const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
+const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 23;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
@@ -522,6 +523,16 @@ impl ControlPlaneAuthorityClockContext {
     #[must_use]
     pub fn committed_timestamp_high_water_ms(self) -> Option<u64> {
         self.committed_timestamp_high_water_ms
+    }
+
+    #[must_use]
+    pub fn current_raft_leadership_term(self) -> Option<u64> {
+        self.current_raft_leadership_term
+    }
+
+    #[must_use]
+    pub fn local_raft_authority_leader(self) -> bool {
+        self.local_raft_authority_leader
     }
 }
 
@@ -1299,6 +1310,26 @@ impl ClusterControlSnapshot {
     #[must_use]
     pub fn lease_grant_horizon_authority(&self) -> Option<LeaseHorizonAuthorityBinding> {
         self.lease_grant_horizon.map(|horizon| horizon.authority())
+    }
+
+    /// Fail closed while a previous authority's acknowledged lease horizon
+    /// still fences a replacement authority.
+    pub fn validate_lease_grant_horizon_rebinding(
+        &self,
+        authority: LeaseHorizonAuthorityBinding,
+        authority_now_ms: u64,
+    ) -> Result<(), ControlPlaneError> {
+        self.lease_grant_horizon
+            .map(|horizon| {
+                horizon.validate_rebinding(
+                    authority,
+                    authority_now_ms,
+                    CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+                )
+            })
+            .transpose()
+            .map(|_| ())
+            .map_err(control_plane_lease_horizon_error)
     }
 
     #[must_use]
@@ -6973,15 +7004,18 @@ pub fn invalidate_authority_clock_restart_checkpoint(
     durable_state_path: &Path,
 ) -> Result<(), ControlPlaneError> {
     let checkpoint_path = authority_clock_restart_checkpoint_path(durable_state_path);
-    match std::fs::remove_file(&checkpoint_path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
+    let removed = match std::fs::remove_file(&checkpoint_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
         Err(source) => {
             return Err(ControlPlaneError::Io {
                 context: "invalidate control-plane authority clock checkpoint",
                 source,
             });
         }
+    };
+    if !removed {
+        return Ok(());
     }
     if let Some(parent) = state_parent(&checkpoint_path) {
         std::fs::File::open(parent)
@@ -8460,7 +8494,10 @@ fn unix_io_remaining(deadline: Instant) -> Result<Duration, std::io::Error> {
     Ok(remaining)
 }
 
-fn connect_unix_stream_until(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
+pub(crate) fn connect_unix_stream_until(
+    path: &Path,
+    deadline: Instant,
+) -> std::io::Result<UnixStream> {
     unix_io_remaining(deadline)?;
     let path_bytes = path.as_os_str().as_bytes();
     if path_bytes.contains(&0) {
@@ -8657,12 +8694,16 @@ fn wait_for_unix_connect(fd: &OwnedFd, deadline: Instant) -> std::io::Result<()>
     }
 }
 
-struct DeadlineUnixStream<'a> {
+pub(crate) struct DeadlineUnixStream<'a> {
     stream: &'a mut UnixStream,
     deadline: Instant,
 }
 
 impl DeadlineUnixStream<'_> {
+    pub(crate) fn new(stream: &mut UnixStream, deadline: Instant) -> DeadlineUnixStream<'_> {
+        DeadlineUnixStream { stream, deadline }
+    }
+
     fn remaining(&self) -> std::io::Result<Duration> {
         unix_io_remaining(self.deadline)
     }
@@ -10256,12 +10297,26 @@ impl AuthenticatedUnixControlPlaneClient {
         authority_now_ms: u64,
         deadline: Instant,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        self.authority_clock_status_until_with_attempt_timeout(
+            authority_now_ms,
+            deadline,
+            CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT,
+        )
+    }
+
+    fn authority_clock_status_until_with_attempt_timeout(
+        &self,
+        authority_now_ms: u64,
+        deadline: Instant,
+        attempt_timeout: Duration,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
         for attempt in 0..self.inner.socket_paths.len() {
-            authority_clock_admin_remaining(deadline)?;
+            let attempt_deadline =
+                authority_clock_admin_attempt_deadline(deadline, attempt_timeout)?;
             let payload = self.send_admin_request_until_and_clocks(
                 ControlPlaneRpcKind::AuthorityClockStatus,
                 Vec::new(),
-                deadline,
+                attempt_deadline,
                 || Ok(authority_now_ms),
                 || Ok(crate::clock::current_time_millis()),
             )?;
@@ -10279,21 +10334,22 @@ impl AuthenticatedUnixControlPlaneClient {
         unreachable!("control-plane endpoint set is non-empty")
     }
 
-    fn reestablish_authority_clock_from_status(
+    fn reestablish_authority_clock_from_status_with_attempt_timeout(
         &self,
         expected: ControlPlaneAuthorityClockStatus,
         authority_now_ms: u64,
         deadline: Instant,
+        attempt_timeout: Duration,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
         let mut payload = Vec::new();
         write_u64(&mut payload, expected.generation());
         write_option_u64(&mut payload, expected.committed_timestamp_high_water_ms());
         write_option_u64(&mut payload, expected.current_raft_leadership_term());
-        authority_clock_admin_remaining(deadline)?;
+        let attempt_deadline = authority_clock_admin_attempt_deadline(deadline, attempt_timeout)?;
         let payload = self.send_admin_request_until_and_clocks(
             ControlPlaneRpcKind::ReestablishAuthorityClock,
             payload,
-            deadline,
+            attempt_deadline,
             || Ok(authority_now_ms),
             || Ok(crate::clock::current_time_millis()),
         )?;
@@ -10307,18 +10363,33 @@ impl AuthenticatedUnixControlPlaneClient {
         &self,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        self.reestablish_authority_clock_with_attempt_timeout(
+            authority_now_ms,
+            CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT,
+        )
+    }
+
+    fn reestablish_authority_clock_with_attempt_timeout(
+        &self,
+        authority_now_ms: u64,
+        attempt_timeout: Duration,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
         let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
         let retry_deadline = Instant::now() + CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT;
-        loop {
-            let expected =
-                self.authority_clock_status_until(retry_clock.now_ms(), retry_deadline)?;
+        'recovery: loop {
+            let expected = self.retry_authority_clock_status_until(
+                retry_clock.now_ms(),
+                retry_deadline,
+                attempt_timeout,
+            )?;
             if expected.established() {
                 return Ok(expected);
             }
-            match self.reestablish_authority_clock_from_status(
+            match self.reestablish_authority_clock_from_status_with_attempt_timeout(
                 expected,
                 retry_clock.now_ms(),
                 retry_deadline,
+                attempt_timeout,
             ) {
                 Ok(status) => return Ok(status),
                 Err(error) if error.is_control_plane_leader_routing_rejection() => {
@@ -10329,17 +10400,21 @@ impl AuthenticatedUnixControlPlaneClient {
                     );
                 }
                 Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                    let expected_generation = expected
+                        .generation()
+                        .checked_add(1)
+                        .ok_or(ControlPlaneError::AuthorityClockGenerationOverflow)?;
                     let observed = self
-                        .authority_clock_status_until(retry_clock.now_ms(), retry_deadline)
+                        .retry_authority_clock_status_until(
+                            retry_clock.now_ms(),
+                            retry_deadline,
+                            attempt_timeout,
+                        )
                         .map_err(|status_error| ControlPlaneError::RpcUnconfirmed {
                             message: format!(
                                 "authority-clock re-establishment response was lost ({error}); status confirmation failed: {status_error}"
                             ),
                         })?;
-                    let expected_generation = expected
-                        .generation()
-                        .checked_add(1)
-                        .ok_or(ControlPlaneError::AuthorityClockGenerationOverflow)?;
                     if observed.established()
                         && observed.generation() == expected_generation
                         && observed.committed_timestamp_high_water_ms()
@@ -10349,11 +10424,67 @@ impl AuthenticatedUnixControlPlaneClient {
                     {
                         return Ok(observed);
                     }
+                    if observed.generation() == expected.generation()
+                        && !observed.established()
+                        && observed.committed_timestamp_high_water_ms()
+                            == expected.committed_timestamp_high_water_ms()
+                        && observed.current_raft_leadership_term()
+                            == expected.current_raft_leadership_term()
+                    {
+                        let remaining = authority_clock_admin_remaining(retry_deadline).map_err(
+                            |_| ControlPlaneError::RpcUnconfirmed {
+                                message: format!(
+                                    "authority-clock re-establishment response was lost ({error}); status remained at the pre-operation generation until the confirmation deadline"
+                                ),
+                            },
+                        )?;
+                        std::thread::sleep(
+                            CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF.min(remaining),
+                        );
+                        // Re-establishment is a compare-and-swap over the
+                        // expected generation and authority context. If a
+                        // read-back proves those values are unchanged, a
+                        // fresh status/mutation handshake cannot apply the
+                        // operation twice and is safe after an ambiguous
+                        // transport outcome.
+                        continue 'recovery;
+                    }
+                    if observed.local_raft_authority_leader()
+                        && observed.current_raft_leadership_term()
+                            != expected.current_raft_leadership_term()
+                    {
+                        continue 'recovery;
+                    }
                     return Err(ControlPlaneError::RpcUnconfirmed {
                         message: format!(
                             "authority-clock re-establishment response was lost ({error}); observed status did not confirm the expected generation and authority state"
                         ),
                     });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn retry_authority_clock_status_until(
+        &self,
+        authority_now_ms: u64,
+        deadline: Instant,
+        attempt_timeout: Duration,
+    ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
+        loop {
+            match self.authority_clock_status_until_with_attempt_timeout(
+                authority_now_ms,
+                deadline,
+                attempt_timeout,
+            ) {
+                Ok(status) => return Ok(status),
+                Err(error) if error.is_retryable_read_only_rpc_transport_error() => {
+                    self.inner.advance_preferred_socket();
+                    let remaining = authority_clock_admin_remaining(deadline).map_err(|_| error)?;
+                    std::thread::sleep(
+                        CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF.min(remaining),
+                    );
                 }
                 Err(error) => return Err(error),
             }
@@ -11603,6 +11734,14 @@ fn authority_clock_admin_remaining(deadline: Instant) -> Result<Duration, Contro
     Ok(remaining)
 }
 
+fn authority_clock_admin_attempt_deadline(
+    operation_deadline: Instant,
+    attempt_timeout: Duration,
+) -> Result<Instant, ControlPlaneError> {
+    let remaining = authority_clock_admin_remaining(operation_deadline)?;
+    Ok(Instant::now() + attempt_timeout.min(remaining))
+}
+
 fn metadata_transfer_fence_observable(
     runtime_map: &ClusterRuntimeMapSnapshot,
     pg_id: PgId,
@@ -12359,11 +12498,37 @@ pub fn build_control_plane_authority_clock_admin_response_from_verified<T, P, F>
     request: VerifiedControlPlaneRpcRequest,
     sample: ControlPlaneAuthorityClockAdminSample,
     before_response_sign: P,
-    mut response_authority_now_ms: F,
+    response_authority_now_ms: F,
 ) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
 where
     T: ControlPlaneAdmin,
     P: FnOnce(&T, &mut ControlPlaneAuthorityClock) -> Result<(), ControlPlaneError>,
+    F: FnMut() -> Result<u64, ControlPlaneError>,
+{
+    let context = control_plane.authority_clock_context();
+    build_control_plane_authority_clock_admin_response_from_verified_with_context(
+        authority_clock,
+        request,
+        sample,
+        context,
+        |_, authority_clock| before_response_sign(control_plane, authority_clock),
+        response_authority_now_ms,
+    )
+}
+
+pub fn build_control_plane_authority_clock_admin_response_from_verified_with_context<P, F>(
+    authority_clock: &mut ControlPlaneAuthorityClock,
+    request: VerifiedControlPlaneRpcRequest,
+    sample: ControlPlaneAuthorityClockAdminSample,
+    context: Result<ControlPlaneAuthorityClockContext, ControlPlaneError>,
+    before_response_sign: P,
+    mut response_authority_now_ms: F,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
+where
+    P: FnOnce(
+        ControlPlaneAuthorityClockContext,
+        &mut ControlPlaneAuthorityClock,
+    ) -> Result<(), ControlPlaneError>,
     F: FnMut() -> Result<u64, ControlPlaneError>,
 {
     let VerifiedControlPlaneRpcRequest {
@@ -12385,7 +12550,7 @@ where
                 .to_owned(),
         });
     };
-    let context = control_plane.authority_clock_context();
+    let mut successful_reestablishment_context = None;
     let response = match kind {
         ControlPlaneRpcKind::AuthorityClockStatus => context.and_then(|context| {
             let reader = PayloadReader::new(&payload);
@@ -12410,6 +12575,7 @@ where
                 sample.wall_ms,
                 sample.clock_health_ms,
             )?;
+            successful_reestablishment_context = Some(context);
             let mut response = Vec::new();
             write_authority_clock_status(&mut response, status);
             Ok(response)
@@ -12417,7 +12583,11 @@ where
         _ => unreachable!("authority-clock RPC kind checked above"),
     };
     if kind == ControlPlaneRpcKind::ReestablishAuthorityClock && response.is_ok() {
-        before_response_sign(control_plane, authority_clock)?;
+        before_response_sign(
+            successful_reestablishment_context
+                .expect("successful authority-clock response requires a valid context"),
+            authority_clock,
+        )?;
     }
     let response_authority_now_ms = response_authority_now_ms()?;
     let payload = sign_control_plane_response_payload(
@@ -18783,6 +18953,28 @@ mod tests {
         test_auth(cluster_id).admin_verifier(instance_id)
     }
 
+    fn scripted_authenticated_authority_clock_response(
+        request: ControlPlaneRpcRequest,
+        verifier: &ControlPlaneUnixAuthVerifier,
+        authority_now_ms: u64,
+        response: Result<ControlPlaneAuthorityClockStatus, ControlPlaneError>,
+    ) -> ControlPlaneRpcResponse {
+        let request = verify_control_plane_unix_request(request, Some(verifier), authority_now_ms)
+            .expect("scripted authority-clock request should authenticate");
+        let VerifiedControlPlaneRpcRequest {
+            kind,
+            response_auth,
+            ..
+        } = request;
+        let response = response.map(|status| {
+            let mut payload = Vec::new();
+            write_authority_clock_status(&mut payload, status);
+            payload
+        });
+        build_control_plane_verified_response(kind, response, response_auth, authority_now_ms)
+            .expect("scripted authority-clock response should encode")
+    }
+
     fn signed_frontend_runtime_map_request(
         kind: ControlPlaneRpcKind,
         signer: &ControlPlaneScopedCredential,
@@ -22613,6 +22805,276 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_authority_clock_recovery_retries_when_lost_request_did_not_apply() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let wall_ms = 2_000;
+        let blocked = ControlPlaneAuthorityClockStatus {
+            generation: 7,
+            established: false,
+            blocked_reason: Some(ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged),
+            committed_timestamp_high_water_ms: Some(1_000),
+            bound_raft_leadership_term: None,
+            current_raft_leadership_term: Some(3),
+            local_raft_authority_leader: true,
+            local_raft_authority_serving: true,
+        };
+        let established = ControlPlaneAuthorityClockStatus {
+            generation: 8,
+            established: true,
+            blocked_reason: None,
+            bound_raft_leadership_term: Some(3),
+            ..blocked
+        };
+        let server = std::thread::spawn(move || {
+            let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+            for request_number in 0..5 {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let request_now_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let expected_kind = if matches!(request_number, 1 | 4) {
+                    ControlPlaneRpcKind::ReestablishAuthorityClock
+                } else {
+                    ControlPlaneRpcKind::AuthorityClockStatus
+                };
+                assert_eq!(request.kind, expected_kind);
+                if request_number == 1 {
+                    drop(stream);
+                    continue;
+                }
+                let response = scripted_authenticated_authority_clock_response(
+                    request,
+                    &verifier,
+                    request_now_ms,
+                    Ok(if request_number == 4 {
+                        established
+                    } else {
+                        blocked
+                    }),
+                );
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+            }
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let status = crate::clock::with_time_override(wall_ms, || {
+            client.reestablish_authority_clock_with_attempt_timeout(
+                wall_ms,
+                Duration::from_millis(100),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(status, established);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn authenticated_authority_clock_recovery_confirms_while_success_response_is_delayed() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let high_water = authority.snapshot().max_committed_timestamp_ms();
+        let wall_ms = high_water.unwrap() + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1;
+        let mut clock = ControlPlaneAuthorityClock::new(high_water, wall_ms, Some(50)).unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut delayed_response = None;
+            for request_number in 0..3 {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let now_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let elapsed_ms = now_ms.saturating_sub(wall_ms);
+                let response = build_control_plane_authority_clock_admin_response(
+                    &authority,
+                    &mut clock,
+                    request,
+                    Some(&verifier),
+                    ControlPlaneAuthorityClockAdminSample::new(
+                        now_ms,
+                        now_ms,
+                        Some(50u64.saturating_add(elapsed_ms)),
+                    ),
+                    |_, _| Ok(()),
+                    || Ok(now_ms),
+                )
+                .unwrap();
+                if request_number == 1 {
+                    delayed_response = Some(std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(200));
+                        let _ = write_control_plane_unix_response(&mut stream, response);
+                    }));
+                } else {
+                    write_control_plane_unix_response(&mut stream, response).unwrap();
+                }
+            }
+            if let Some(delayed_response) = delayed_response {
+                delayed_response.join().unwrap();
+            }
+            clock.status(authority.authority_clock_context().unwrap())
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let status = crate::clock::with_time_override(wall_ms, || {
+            client.reestablish_authority_clock_with_attempt_timeout(
+                wall_ms,
+                Duration::from_millis(50),
+            )
+        })
+        .unwrap();
+        assert!(status.established());
+        assert_eq!(status, server.join().unwrap());
+    }
+
+    #[test]
+    fn authenticated_authority_clock_recovery_follows_new_leader_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let old_socket = tmp.path().join("old-leader.sock");
+        let new_socket = tmp.path().join("new-leader.sock");
+        let old_listener = std::os::unix::net::UnixListener::bind(&old_socket).unwrap();
+        let new_listener = std::os::unix::net::UnixListener::bind(&new_socket).unwrap();
+        let wall_ms = 2_000;
+        let old_blocked = ControlPlaneAuthorityClockStatus {
+            generation: 2,
+            established: false,
+            blocked_reason: Some(ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged),
+            committed_timestamp_high_water_ms: Some(1_000),
+            bound_raft_leadership_term: None,
+            current_raft_leadership_term: Some(2),
+            local_raft_authority_leader: true,
+            local_raft_authority_serving: true,
+        };
+        let new_blocked = ControlPlaneAuthorityClockStatus {
+            generation: 7,
+            current_raft_leadership_term: Some(3),
+            ..old_blocked
+        };
+        let new_established = ControlPlaneAuthorityClockStatus {
+            generation: 8,
+            established: true,
+            blocked_reason: None,
+            bound_raft_leadership_term: Some(3),
+            ..new_blocked
+        };
+
+        let old_server = std::thread::spawn(move || {
+            let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+            for request_number in 0..3 {
+                let (mut stream, _addr) = old_listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let request_now_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let response = match request_number {
+                    0 => scripted_authenticated_authority_clock_response(
+                        request,
+                        &verifier,
+                        request_now_ms,
+                        Ok(old_blocked),
+                    ),
+                    1 => {
+                        assert_eq!(request.kind, ControlPlaneRpcKind::ReestablishAuthorityClock);
+                        drop(stream);
+                        continue;
+                    }
+                    2 => {
+                        let response = scripted_authenticated_authority_clock_response(
+                            request,
+                            &verifier,
+                            request_now_ms,
+                            Err(ControlPlaneError::RpcRemote {
+                                message: "local OpenRaft authority is not the serving leader: NotLocalLeader"
+                                    .to_owned(),
+                            }),
+                        );
+                        std::thread::sleep(Duration::from_millis(200));
+                        let _ = write_control_plane_unix_response(&mut stream, response);
+                        continue;
+                    }
+                    _ => unreachable!(),
+                };
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+            }
+        });
+        let new_server = std::thread::spawn(move || {
+            let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+            for request_number in 0..3 {
+                let (mut stream, _addr) = new_listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let request_now_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let response = scripted_authenticated_authority_clock_response(
+                    request,
+                    &verifier,
+                    request_now_ms,
+                    Ok(if request_number == 2 {
+                        new_established
+                    } else {
+                        new_blocked
+                    }),
+                );
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+            }
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::with_socket_paths([old_socket, new_socket]).unwrap(),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let status = crate::clock::with_time_override(wall_ms, || {
+            client.reestablish_authority_clock_with_attempt_timeout(
+                wall_ms,
+                Duration::from_millis(100),
+            )
+        })
+        .unwrap();
+
+        assert_eq!(status, new_established);
+        old_server.join().unwrap();
+        new_server.join().unwrap();
+    }
+
+    #[test]
     fn authenticated_authority_clock_recovery_checks_deadline_before_each_rpc() {
         let client = AuthenticatedUnixControlPlaneClient::new(
             UnixControlPlaneClient::new("unused-test-socket"),
@@ -22634,7 +23096,12 @@ mod tests {
             .authority_clock_status_until(2_000, expired)
             .unwrap_err();
         let mutation_error = client
-            .reestablish_authority_clock_from_status(expected, 2_000, expired)
+            .reestablish_authority_clock_from_status_with_attempt_timeout(
+                expected,
+                2_000,
+                expired,
+                CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT,
+            )
             .unwrap_err();
 
         assert!(matches!(

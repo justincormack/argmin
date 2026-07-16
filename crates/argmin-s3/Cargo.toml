@@ -30,6 +30,6 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
-openraft = { version = "=0.10.0-alpha.26", default-features = false }
+openraft = { version = "=0.10.0-alpha.30", default-features = false }
 storage = { path = "../storage", default-features = false, features = ["test-hooks"] }
 test-util = { path = "../test-util" }

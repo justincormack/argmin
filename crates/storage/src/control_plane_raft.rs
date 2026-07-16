@@ -43,11 +43,12 @@ use openraft::{AnyError, Config};
 use placement::NodeId;
 
 use crate::control_plane::{
-    AuthorityIncarnation, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneError,
-    ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapNodeLeaseDiagnostic,
-    ControlPlaneRuntimeMapStatus, NodeAvailabilityState, NodeMembershipState,
-    RuntimeMapContentCertificate, RuntimeMapFreshnessProof,
+    connect_unix_stream_until, AuthorityIncarnation, ClusterControlSnapshot,
+    ClusterRuntimeMapSnapshot, ControlPlaneAuthorityClockCheckpointBinding,
+    ControlPlaneAuthorityClockContext, ControlPlaneError, ControlPlaneRuntimeMapDiagnosticSnapshot,
+    ControlPlaneRuntimeMapNodeLeaseDiagnostic, ControlPlaneRuntimeMapStatus, DeadlineUnixStream,
+    NodeAvailabilityState, NodeMembershipState, RuntimeMapContentCertificate,
+    RuntimeMapFreshnessProof,
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
@@ -115,7 +116,7 @@ pub enum ControlPlaneRaftPeerRpcResponse {
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftPeerSnapshotRequest {
     pub vote: VoteOf<ControlPlaneRaftTypeConfig>,
-    pub snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+    pub snapshot: ControlPlaneRaftSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -909,6 +910,64 @@ impl ControlPlaneRaftPeerTransportPolicy {
         )))
     }
 
+    fn validate_replication_compatibility(&self) -> Result<(), ControlPlaneError> {
+        if self.limits.max_append_entries
+            < usize::try_from(CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES)
+                .expect("OpenRaft payload-entry limit fits usize")
+        {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft peer transport policy permits {} append entries, below the configured replication batch size {}",
+                self.limits.max_append_entries, CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES
+            )));
+        }
+        if self.limits.max_append_entries_bytes
+            < ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES_BYTES
+        {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft peer transport policy permits {} append-entry bytes, below the required replication payload size {}",
+                self.limits.max_append_entries_bytes,
+                ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES_BYTES
+            )));
+        }
+        if self.limits.max_frame_bytes
+            < ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES
+        {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft peer transport policy permits {} frame bytes, below the required replication frame size {}",
+                self.limits.max_frame_bytes,
+                ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES
+            )));
+        }
+        if !self.peers.is_empty() {
+            let voters = self.peers.keys().copied().collect::<BTreeSet<_>>();
+            let membership = Membership::new(vec![voters.clone(), voters], self.peers.clone())
+                .map_err(|error| {
+                    raft_artifact_protocol_error(format!(
+                    "control-plane OpenRaft peer transport policy membership is invalid: {error}"
+                ))
+                })?;
+            let entry = ControlPlaneRaftEntry {
+                log_id: LogId::new(
+                    LeaderId {
+                        term: u64::MAX,
+                        node_id: u64::MAX,
+                    },
+                    u64::MAX,
+                ),
+                payload: EntryPayload::Membership(membership),
+            };
+            let mut encoded = Vec::new();
+            write_raft_entry(&mut encoded, &entry)?;
+            if encoded.len() > CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
+                return Err(raft_artifact_protocol_error(format!(
+                    "control-plane OpenRaft peer transport policy membership encodes to {} entry bytes, exceeding the replication-safe per-entry limit {}",
+                    encoded.len(), CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_configured_membership(
         &self,
         context: &'static str,
@@ -1364,6 +1423,20 @@ pub struct ControlPlaneRaftUnixPeerNetwork {
 }
 
 impl ControlPlaneRaftUnixPeerNetwork {
+    fn effective_rpc_deadline(
+        &self,
+        option: &RPCOption,
+    ) -> Result<Instant, RPCError<ControlPlaneRaftTypeConfig>> {
+        Instant::now()
+            .checked_add(self.rpc_timeout.min(option.soft_ttl()))
+            .ok_or_else(|| {
+                raft_rpc_protocol_error(
+                    "deadline",
+                    raft_artifact_protocol_error("OpenRaft peer RPC deadline overflowed"),
+                )
+            })
+    }
+
     fn auth_operation_for_request(
         request: &ControlPlaneRaftPeerRpcRequest,
     ) -> ControlPlaneAuthOperation {
@@ -1409,28 +1482,23 @@ impl ControlPlaneRaftUnixPeerNetwork {
         reverse_raft_peer_frame_identity(identity)
     }
 
-    fn connect(
+    fn connect_until(
         &self,
         rpc_name: &'static str,
+        deadline: Instant,
     ) -> Result<UnixStream, RPCError<ControlPlaneRaftTypeConfig>> {
         self.policy
             .validate_target_node(self.target, &self.node, rpc_name)
             .map_err(raft_rpc_error_from_transport_rejection)?;
-        let stream = UnixStream::connect(&self.node.addr)
-            .map_err(|source| raft_unix_io_rpc_error("connect", self.target, source))?;
-        stream
-            .set_read_timeout(Some(self.rpc_timeout))
-            .map_err(|source| raft_unix_io_rpc_error("set read timeout", self.target, source))?;
-        stream
-            .set_write_timeout(Some(self.rpc_timeout))
-            .map_err(|source| raft_unix_io_rpc_error("set write timeout", self.target, source))?;
-        Ok(stream)
+        connect_unix_stream_until(Path::new(&self.node.addr), deadline)
+            .map_err(|source| raft_unix_io_rpc_error("connect", self.target, source))
     }
 
     fn send_rpc_frame(
         &self,
         rpc_name: &'static str,
         request: ControlPlaneRaftPeerRpcRequest,
+        deadline: Instant,
     ) -> Result<ControlPlaneRaftPeerRpcResponse, RPCError<ControlPlaneRaftTypeConfig>> {
         let identity = self.request_identity()?;
         let operation = Self::auth_operation_for_request(&request);
@@ -1444,7 +1512,8 @@ impl ControlPlaneRaftUnixPeerNetwork {
         } else {
             raw_request_frame
         };
-        let mut stream = self.connect(rpc_name)?;
+        let mut stream = self.connect_until(rpc_name, deadline)?;
+        let mut stream = DeadlineUnixStream::new(&mut stream, deadline);
         write_control_plane_raft_peer_transport_frame(&mut stream, &encoded).map_err(|error| {
             raft_unix_transport_rpc_error("write transport", self.target, error)
         })?;
@@ -1474,9 +1543,10 @@ impl ControlPlaneRaftUnixPeerNetwork {
         &self,
         rpc_name: &'static str,
         request: ControlPlaneRaftPeerRpcRequest,
+        deadline: Instant,
     ) -> Result<ControlPlaneRaftPeerRpcResponse, RPCError<ControlPlaneRaftTypeConfig>> {
         let network = self.clone();
-        tokio::task::spawn_blocking(move || network.send_rpc_frame(rpc_name, request))
+        tokio::task::spawn_blocking(move || network.send_rpc_frame(rpc_name, request, deadline))
             .await
             .map_err(|error| raft_unix_blocking_task_rpc_error(rpc_name, self.target, error))?
     }
@@ -1484,7 +1554,8 @@ impl ControlPlaneRaftUnixPeerNetwork {
     fn send_snapshot_frame(
         &self,
         vote: VoteOf<ControlPlaneRaftTypeConfig>,
-        snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+        snapshot: ControlPlaneRaftSnapshot,
+        deadline: Instant,
     ) -> Result<
         SnapshotResponse<ControlPlaneRaftTypeConfig>,
         StreamingError<ControlPlaneRaftTypeConfig>,
@@ -1515,8 +1586,9 @@ impl ControlPlaneRaftUnixPeerNetwork {
             raw_request_frame
         };
         let mut stream = self
-            .connect("full_snapshot")
+            .connect_until("full_snapshot", deadline)
             .map_err(raft_streaming_error_from_rpc_error)?;
+        let mut stream = DeadlineUnixStream::new(&mut stream, deadline);
         write_control_plane_raft_peer_transport_frame(&mut stream, &encoded).map_err(|error| {
             raft_unix_transport_streaming_error("full_snapshot write transport", self.target, error)
         })?;
@@ -1553,13 +1625,14 @@ impl ControlPlaneRaftUnixPeerNetwork {
     async fn send_snapshot_frame_blocking(
         &self,
         vote: VoteOf<ControlPlaneRaftTypeConfig>,
-        snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+        snapshot: ControlPlaneRaftSnapshot,
+        deadline: Instant,
     ) -> Result<
         SnapshotResponse<ControlPlaneRaftTypeConfig>,
         StreamingError<ControlPlaneRaftTypeConfig>,
     > {
         let network = self.clone();
-        tokio::task::spawn_blocking(move || network.send_snapshot_frame(vote, snapshot))
+        tokio::task::spawn_blocking(move || network.send_snapshot_frame(vote, snapshot, deadline))
             .await
             .map_err(|error| {
                 raft_unix_blocking_task_streaming_error("full_snapshot", self.target, error)
@@ -1577,14 +1650,17 @@ impl fmt::Debug for ControlPlaneRaftUnixPeerNetwork {
 }
 
 impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ControlPlaneRaftUnixPeerNetwork {
+    type SnapshotData = ControlPlaneRaftSnapshotData;
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         AppendEntriesResponse<ControlPlaneRaftTypeConfig>,
         RPCError<ControlPlaneRaftTypeConfig>,
     > {
+        let deadline = self.effective_rpc_deadline(&option)?;
         self.policy
             .validate_append_entries(
                 self.target,
@@ -1592,13 +1668,14 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ControlPlaneRaftUnixPeerNetwo
                 Self::encoded_append_entries_payload_len(&rpc.entries)?,
             )
             .map_err(raft_rpc_error_from_transport_rejection)?;
-        let ControlPlaneRaftPeerRpcResponse::AppendEntries(response) = self
+        let rpc_result = self
             .send_rpc_frame_blocking(
                 "append_entries",
                 ControlPlaneRaftPeerRpcRequest::AppendEntries(rpc),
+                deadline,
             )
-            .await?
-        else {
+            .await?;
+        let ControlPlaneRaftPeerRpcResponse::AppendEntries(response) = rpc_result else {
             return Err(raft_rpc_protocol_error(
                 "append_entries response decode",
                 raft_artifact_protocol_error("decoded non-append_entries response frame"),
@@ -1610,11 +1687,15 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ControlPlaneRaftUnixPeerNetwo
     async fn vote(
         &mut self,
         rpc: VoteRequest<ControlPlaneRaftTypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
     {
         let ControlPlaneRaftPeerRpcResponse::Vote(response) = self
-            .send_rpc_frame_blocking("vote", ControlPlaneRaftPeerRpcRequest::Vote(rpc))
+            .send_rpc_frame_blocking(
+                "vote",
+                ControlPlaneRaftPeerRpcRequest::Vote(rpc),
+                self.effective_rpc_deadline(&option)?,
+            )
             .await?
         else {
             return Err(raft_rpc_protocol_error(
@@ -1628,11 +1709,15 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ControlPlaneRaftUnixPeerNetwo
     async fn pre_vote(
         &mut self,
         rpc: VoteRequest<ControlPlaneRaftTypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
     {
         let ControlPlaneRaftPeerRpcResponse::Vote(response) = self
-            .send_rpc_frame_blocking("pre_vote", ControlPlaneRaftPeerRpcRequest::PreVote(rpc))
+            .send_rpc_frame_blocking(
+                "pre_vote",
+                ControlPlaneRaftPeerRpcRequest::PreVote(rpc),
+                self.effective_rpc_deadline(&option)?,
+            )
             .await?
         else {
             return Err(raft_rpc_protocol_error(
@@ -1646,20 +1731,24 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ControlPlaneRaftUnixPeerNetwo
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<ControlPlaneRaftTypeConfig>,
-        snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+        snapshot: ControlPlaneRaftSnapshot,
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         SnapshotResponse<ControlPlaneRaftTypeConfig>,
         StreamingError<ControlPlaneRaftTypeConfig>,
     > {
-        self.send_snapshot_frame_blocking(vote, snapshot).await
+        let deadline = self
+            .effective_rpc_deadline(&option)
+            .map_err(raft_streaming_error_from_rpc_error)?;
+        self.send_snapshot_frame_blocking(vote, snapshot, deadline)
+            .await
     }
 
     async fn transfer_leader(
         &mut self,
         req: TransferLeaderRequest<ControlPlaneRaftTypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         TransferLeaderResponse<ControlPlaneRaftTypeConfig>,
         RPCError<ControlPlaneRaftTypeConfig>,
@@ -1668,6 +1757,7 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ControlPlaneRaftUnixPeerNetwo
             .send_rpc_frame_blocking(
                 "transfer_leader",
                 ControlPlaneRaftPeerRpcRequest::TransferLeader(req),
+                self.effective_rpc_deadline(&option)?,
             )
             .await?
         else {
@@ -2974,6 +3064,7 @@ pub enum ControlPlaneRaftLinearizedAuthorityReadiness {
     NotLocalLeader,
     NotEffectiveVoter,
     NotAppliedToCommitted,
+    NotCommittedInCurrentTerm,
 }
 
 impl ControlPlaneRaftLinearizedAuthorityReadiness {
@@ -2988,6 +3079,7 @@ fn linearized_authority_readiness_from_flags(
     local_leader: bool,
     effective_voter: bool,
     applied_caught_up_to_committed: bool,
+    committed_in_current_term: bool,
 ) -> ControlPlaneRaftLinearizedAuthorityReadiness {
     if !local_leader {
         ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
@@ -2995,6 +3087,8 @@ fn linearized_authority_readiness_from_flags(
         ControlPlaneRaftLinearizedAuthorityReadiness::NotEffectiveVoter
     } else if !applied_caught_up_to_committed {
         ControlPlaneRaftLinearizedAuthorityReadiness::NotAppliedToCommitted
+    } else if !committed_in_current_term {
+        ControlPlaneRaftLinearizedAuthorityReadiness::NotCommittedInCurrentTerm
     } else {
         ControlPlaneRaftLinearizedAuthorityReadiness::Serving
     }
@@ -3052,6 +3146,7 @@ impl ControlPlaneRaftAuthorityStatus {
             self.local_leader,
             self.effective_voter,
             self.applied_caught_up_to_committed(),
+            self.committed_in_current_term(),
         )
     }
 
@@ -3173,6 +3268,15 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn applied_caught_up_to_committed(&self) -> bool {
         self.committed.is_some() && self.committed == self.applied
+    }
+
+    #[must_use]
+    pub fn committed_in_current_term(&self) -> bool {
+        matches!(
+            (self.current_term, self.committed),
+            (Some(current_term), Some(committed))
+                if committed.committed_leader_id().term == current_term
+        )
     }
 
     #[must_use]
@@ -3391,6 +3495,8 @@ impl ExperimentalSingleNodeRaftNetwork {
 }
 
 impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNetwork {
+    type SnapshotData = ControlPlaneRaftSnapshotData;
+
     async fn append_entries(
         &mut self,
         _rpc: AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
@@ -3414,7 +3520,7 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNet
     async fn full_snapshot(
         &mut self,
         _vote: VoteOf<ControlPlaneRaftTypeConfig>,
-        _snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+        _snapshot: ControlPlaneRaftSnapshot,
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<
@@ -3433,6 +3539,23 @@ enum ExperimentalRaftTimerMode {
     Automatic,
 }
 
+const CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES: u64 = 64;
+const CONTROL_PLANE_RAFT_APPEND_ENTRIES_COUNT_BYTES: usize = 4;
+const CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES: usize =
+    (ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES_BYTES
+        - CONTROL_PLANE_RAFT_APPEND_ENTRIES_COUNT_BYTES)
+        / CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES as usize;
+const _: () = assert!(
+    CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES
+        <= ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES as u64
+);
+const _: () = assert!(
+    CONTROL_PLANE_RAFT_APPEND_ENTRIES_COUNT_BYTES
+        + CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+            * CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES as usize
+        <= ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES_BYTES
+);
+
 fn experimental_raft_config(
     cluster_name: impl Into<String>,
     timer_mode: ExperimentalRaftTimerMode,
@@ -3447,6 +3570,7 @@ fn experimental_raft_config(
             heartbeat_interval: 250,
             election_timeout_min: 1_500,
             election_timeout_max: 3_000,
+            max_payload_entries: CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES,
             enable_tick: timers_enabled,
             enable_heartbeat: timers_enabled,
             enable_elect: timers_enabled,
@@ -3694,6 +3818,7 @@ impl ControlPlaneRaftAuthority {
         let cluster_name = cluster_name.into();
         peer_policy.validate_cluster_name(&cluster_name)?;
         peer_policy.validate_local_node(node_id)?;
+        peer_policy.validate_replication_compatibility()?;
         let config =
             experimental_raft_config(cluster_name.clone(), ExperimentalRaftTimerMode::Automatic)?;
         let policy_for_restore = peer_policy.clone();
@@ -3719,25 +3844,6 @@ impl ControlPlaneRaftAuthority {
             cluster_name,
             peer_policy,
         ))
-    }
-
-    #[must_use]
-    pub fn new(raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>) -> Self {
-        let node_id = *raft.node_id();
-        Self {
-            cluster_name: String::new(),
-            node_id,
-            raft,
-            log_store: None,
-            static_peer_policy: None,
-            volatile_heartbeat_update_gate: tokio::sync::Mutex::new(()),
-            volatile_heartbeat_overlay: Mutex::new(None),
-            runtime_map_content_certificate: Mutex::new(None),
-            checkpoint_instance: Arc::new(()),
-            checkpoint_publication: Mutex::new(None),
-            checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
-            command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
-        }
     }
 
     #[must_use]
@@ -4100,6 +4206,68 @@ impl ControlPlaneRaftAuthority {
             .await
             .map(|_| ())
             .map_err(|error| openraft_remote_error("wait-current-leader", error))
+    }
+
+    /// Read only the Raft and state-machine fields needed to validate process
+    /// clock authority. This avoids putting recovery behind the full
+    /// diagnostic status scan or a cloned control-plane snapshot.
+    pub async fn authority_clock_context(
+        &self,
+    ) -> Result<ControlPlaneAuthorityClockContext, ControlPlaneError> {
+        let node_id = *self.raft.node_id();
+        let current_leader = self.raft.current_leader().await;
+        let current_term = self
+            .log_store
+            .as_ref()
+            .map(ControlPlaneRaftLogStore::status_snapshot)
+            .transpose()
+            .map_err(|error| openraft_remote_error("clock-context log-store read", error))?
+            .and_then(|status| status.vote)
+            .map(|vote| vote.leader_id.term);
+        let (committed, effective_voter) = self
+            .raft
+            .with_raft_state(move |state| {
+                (
+                    state.local_committed().cloned(),
+                    state
+                        .membership_state
+                        .effective()
+                        .membership()
+                        .voter_ids()
+                        .any(|voter| voter == node_id),
+                )
+            })
+            .await
+            .map_err(|error| openraft_remote_error("clock-context raft-state read", error))?;
+        let (applied, committed_timestamp_high_water_ms) = self
+            .raft
+            .with_state_machine(|state_machine| {
+                let applied = state_machine.last_applied();
+                let committed_timestamp_high_water_ms = state_machine
+                    .inner()
+                    .snapshot()
+                    .max_committed_timestamp_ms();
+                Box::pin(async move { (applied, committed_timestamp_high_water_ms) })
+            })
+            .await
+            .map_err(|error| openraft_remote_error("clock-context state-machine read", error))?;
+        let local_leader = current_leader == Some(node_id);
+        let committed_in_current_term = matches!(
+            (current_term, committed),
+            (Some(current_term), Some(committed))
+                if committed.committed_leader_id().term == current_term
+        );
+        let local_serving = local_leader
+            && effective_voter
+            && committed.is_some()
+            && committed == applied
+            && committed_in_current_term;
+        Ok(ControlPlaneAuthorityClockContext::new(
+            committed_timestamp_high_water_ms,
+            current_term,
+            local_leader,
+            local_serving,
+        ))
     }
 
     pub async fn submit_control_plane_command(
@@ -5133,8 +5301,11 @@ openraft::declare_raft_types!(
         LeaderId = ControlPlaneRaftLeaderId,
         Vote = Vote<ControlPlaneRaftLeaderId>,
         Entry = ControlPlaneRaftEntry,
-        SnapshotData = Cursor<Vec<u8>>,
 );
+
+pub type ControlPlaneRaftSnapshotData = Cursor<Vec<u8>>;
+pub type ControlPlaneRaftSnapshot =
+    SnapshotOf<ControlPlaneRaftTypeConfig, ControlPlaneRaftSnapshotData>;
 
 #[must_use]
 pub fn raft_node_id_from_storage_node_id(node_id: NodeId) -> ControlPlaneRaftNodeId {
@@ -5177,6 +5348,7 @@ pub async fn submit_control_plane_command_via_openraft(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     command: ControlPlaneCommand,
 ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+    validate_control_plane_command_replication_size(&command)?;
     let response = raft
         .client_write(command)
         .await
@@ -5200,6 +5372,32 @@ pub async fn submit_control_plane_command_via_openraft(
     Ok(SubmittedControlPlaneRaftCommand {
         log_id: response.log_id,
         outcome,
+    })
+}
+
+fn validate_control_plane_command_replication_size(
+    command: &ControlPlaneCommand,
+) -> Result<(), ControlPlaneError> {
+    let entry = ControlPlaneRaftEntry {
+        log_id: LogId::new(
+            LeaderId {
+                term: u64::MAX,
+                node_id: u64::MAX,
+            },
+            u64::MAX,
+        ),
+        payload: EntryPayload::Normal(command.clone()),
+    };
+    let mut encoded = Vec::new();
+    write_raft_entry(&mut encoded, &entry)?;
+    if encoded.len() <= CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES {
+        return Ok(());
+    }
+    Err(ControlPlaneError::RpcProtocol {
+        message: format!(
+            "control-plane command encodes to {} OpenRaft entry bytes, exceeding the replication-safe per-entry limit {}",
+            encoded.len(), CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+        ),
     })
 }
 
@@ -7518,7 +7716,7 @@ impl ControlPlaneRaftRestartArtifact {
 
     fn validate_cached_snapshot_membership_at_boundary(
         log_store: &ControlPlaneRaftLogStoreRestartArtifact,
-        snapshot: &SnapshotOf<ControlPlaneRaftTypeConfig>,
+        snapshot: &ControlPlaneRaftSnapshot,
         target_last_applied: LogIdOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), io::Error> {
         let Some(snapshot_log_id) = snapshot.meta.last_log_id else {
@@ -8527,7 +8725,7 @@ fn read_raft_state_machine_artifact(
 
 fn write_raft_option_snapshot(
     out: &mut Vec<u8>,
-    snapshot: Option<&SnapshotOf<ControlPlaneRaftTypeConfig>>,
+    snapshot: Option<&ControlPlaneRaftSnapshot>,
 ) -> Result<(), ControlPlaneError> {
     match snapshot {
         None => write_raft_u8(out, 0),
@@ -8541,7 +8739,7 @@ fn write_raft_option_snapshot(
 
 fn write_raft_snapshot(
     out: &mut Vec<u8>,
-    snapshot: &SnapshotOf<ControlPlaneRaftTypeConfig>,
+    snapshot: &ControlPlaneRaftSnapshot,
 ) -> Result<(), ControlPlaneError> {
     write_raft_snapshot_meta(out, &snapshot.meta)?;
     write_raft_bytes(out, snapshot.snapshot.get_ref())?;
@@ -9094,7 +9292,7 @@ impl<'a> RaftArtifactReader<'a> {
 
     fn read_option_snapshot(
         &mut self,
-    ) -> Result<Option<SnapshotOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
+    ) -> Result<Option<ControlPlaneRaftSnapshot>, ControlPlaneError> {
         match self.read_u8()? {
             0 => Ok(None),
             1 => Ok(Some(self.read_snapshot("raft cached snapshot payload")?)),
@@ -9107,7 +9305,7 @@ impl<'a> RaftArtifactReader<'a> {
     fn read_snapshot(
         &mut self,
         payload_field: &'static str,
-    ) -> Result<SnapshotOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+    ) -> Result<ControlPlaneRaftSnapshot, ControlPlaneError> {
         let meta = self.read_snapshot_meta()?;
         let payload = self.read_bytes(payload_field)?.to_vec();
         Ok(Snapshot {
@@ -9120,7 +9318,7 @@ impl<'a> RaftArtifactReader<'a> {
         &mut self,
         payload_field: &'static str,
         max_payload_bytes: usize,
-    ) -> Result<SnapshotOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+    ) -> Result<ControlPlaneRaftSnapshot, ControlPlaneError> {
         let meta = self.read_snapshot_meta()?;
         let payload = self.read_limited_bytes(payload_field, max_payload_bytes)?;
         Ok(Snapshot {
@@ -9369,12 +9567,12 @@ fn raft_entry_payload_name(entry: &ControlPlaneRaftEntry) -> &'static str {
 
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftSnapshotBuilder {
-    snapshot: Result<SnapshotOf<ControlPlaneRaftTypeConfig>, String>,
+    snapshot: Result<ControlPlaneRaftSnapshot, String>,
 }
 
 impl ControlPlaneRaftSnapshotBuilder {
     #[must_use]
-    pub fn new(snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>) -> Self {
+    pub fn new(snapshot: ControlPlaneRaftSnapshot) -> Self {
         Self {
             snapshot: Ok(snapshot),
         }
@@ -9389,9 +9587,9 @@ impl ControlPlaneRaftSnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<ControlPlaneRaftTypeConfig> for ControlPlaneRaftSnapshotBuilder {
-    async fn build_snapshot(
-        &mut self,
-    ) -> Result<SnapshotOf<ControlPlaneRaftTypeConfig>, io::Error> {
+    type SnapshotData = ControlPlaneRaftSnapshotData;
+
+    async fn build_snapshot(&mut self) -> Result<ControlPlaneRaftSnapshot, io::Error> {
         self.snapshot.clone().map_err(|message| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -9406,7 +9604,7 @@ pub struct ControlPlaneRaftStateMachine {
     inner: ReplicatedControlPlaneStateMachine,
     last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     last_membership: StoredMembershipOf<ControlPlaneRaftTypeConfig>,
-    current_snapshot: Option<SnapshotOf<ControlPlaneRaftTypeConfig>>,
+    current_snapshot: Option<ControlPlaneRaftSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -9414,7 +9612,7 @@ pub struct ControlPlaneRaftStateMachineRestartArtifact {
     inner: ReplicatedControlPlaneStateMachine,
     last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     last_membership: StoredMembershipOf<ControlPlaneRaftTypeConfig>,
-    current_snapshot: Option<SnapshotOf<ControlPlaneRaftTypeConfig>>,
+    current_snapshot: Option<ControlPlaneRaftSnapshot>,
 }
 
 impl ControlPlaneRaftStateMachine {
@@ -9502,13 +9700,13 @@ impl ControlPlaneRaftStateMachine {
     }
 
     #[must_use]
-    pub fn current_snapshot(&self) -> Option<&SnapshotOf<ControlPlaneRaftTypeConfig>> {
+    pub fn current_snapshot(&self) -> Option<&ControlPlaneRaftSnapshot> {
         self.current_snapshot.as_ref()
     }
 
     fn validate_cached_snapshot(
         &self,
-        snapshot: &SnapshotOf<ControlPlaneRaftTypeConfig>,
+        snapshot: &ControlPlaneRaftSnapshot,
     ) -> Result<(), ControlPlaneError> {
         let control_plane_snapshot_log_id = match snapshot.meta.last_log_id {
             Some(log_id) if is_openraft_bootstrap_log_id(log_id) => None,
@@ -9753,9 +9951,7 @@ impl ControlPlaneRaftStateMachine {
         Ok(())
     }
 
-    pub fn build_snapshot(
-        &mut self,
-    ) -> Result<SnapshotOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+    pub fn build_snapshot(&mut self) -> Result<ControlPlaneRaftSnapshot, ControlPlaneError> {
         let artifact = self.inner.build_snapshot_artifact()?;
         let meta = self.snapshot_meta_for_artifact(&artifact)?;
         let snapshot = Snapshot {
@@ -10018,6 +10214,7 @@ impl ControlPlaneRaftStateMachine {
 }
 
 impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachine {
+    type SnapshotData = ControlPlaneRaftSnapshotData;
     type SnapshotBuilder = ControlPlaneRaftSnapshotBuilder;
 
     async fn applied_state(
@@ -10076,7 +10273,7 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<SnapshotOf<ControlPlaneRaftTypeConfig>>, io::Error> {
+    ) -> Result<Option<ControlPlaneRaftSnapshot>, io::Error> {
         Ok(self.current_snapshot.clone())
     }
 }
@@ -10087,7 +10284,7 @@ mod tests {
     use std::future::Future;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
     use std::thread;
@@ -10203,7 +10400,7 @@ mod tests {
             };
             self.failover_started
                 && self.lease_authorized(leader)
-                && self.epoch > self.pre_failover_epoch
+                && self.epoch >= self.pre_failover_epoch
                 && self.pg_serving.iter().all(|serving| *serving)
                 && self
                     .storage_lease_deadlines_ms
@@ -10225,8 +10422,6 @@ mod tests {
                     self.local_terms[2] = self.term;
                     self.locally_claims_leader[1] = true;
                     self.clock_terms[1] = None;
-                    self.epoch = self.epoch.saturating_add(1);
-                    self.pg_serving = [false; 3];
                 }
                 ReplicatedFailoverModelOp::RestoreQuorum => self.quorum_available = true,
                 ReplicatedFailoverModelOp::LoseQuorum => self.quorum_available = false,
@@ -10279,7 +10474,7 @@ mod tests {
             if self.failover_barrier_satisfied() {
                 let leader = self.leader.expect("satisfied barrier must have a leader");
                 assert!(self.lease_authorized(leader));
-                assert!(self.epoch > self.pre_failover_epoch);
+                assert!(self.epoch >= self.pre_failover_epoch);
                 assert!(self.pg_serving.iter().all(|serving| *serving));
                 assert!(self
                     .storage_lease_deadlines_ms
@@ -10313,6 +10508,20 @@ mod tests {
         assert!(model.failover_barrier_satisfied());
         model.apply(ReplicatedFailoverModelOp::LoseQuorum);
         assert!(!model.failover_barrier_satisfied());
+    }
+
+    #[test]
+    fn replicated_failover_barrier_accepts_renewed_leases_without_topology_epoch_churn() {
+        let mut model = ReplicatedFailoverBarrierModel::new();
+        model.apply(ReplicatedFailoverModelOp::LoseOriginalLeader);
+        model.apply(ReplicatedFailoverModelOp::ElectReplacement);
+        model.apply(ReplicatedFailoverModelOp::ReestablishClock);
+        for node in 0..3 {
+            model.apply(ReplicatedFailoverModelOp::RenewStorageNode(node));
+        }
+
+        assert_eq!(model.epoch, model.pre_failover_epoch);
+        assert!(model.failover_barrier_satisfied());
     }
 
     proptest! {
@@ -10393,6 +10602,8 @@ mod tests {
     }
 
     impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for UnreachableRaftNetwork {
+        type SnapshotData = ControlPlaneRaftSnapshotData;
+
         async fn append_entries(
             &mut self,
             _rpc: AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
@@ -10416,7 +10627,7 @@ mod tests {
         async fn full_snapshot(
             &mut self,
             _vote: VoteOf<ControlPlaneRaftTypeConfig>,
-            _snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+            _snapshot: ControlPlaneRaftSnapshot,
             _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
             _option: RPCOption,
         ) -> Result<
@@ -10441,6 +10652,7 @@ mod tests {
         >,
         policy: Option<Arc<ControlPlaneRaftPeerTransportPolicy>>,
         local_node_id: Option<ControlPlaneRaftNodeId>,
+        max_append_entries_seen: Arc<AtomicUsize>,
     }
 
     impl InMemoryRaftNetworkFactory {
@@ -10449,6 +10661,7 @@ mod tests {
                 peers: Arc::default(),
                 policy: Some(Arc::new(policy)),
                 local_node_id: None,
+                max_append_entries_seen: Arc::default(),
             }
         }
 
@@ -10457,6 +10670,7 @@ mod tests {
                 peers: self.peers.clone(),
                 policy: self.policy.clone(),
                 local_node_id: Some(local_node_id),
+                max_append_entries_seen: Arc::clone(&self.max_append_entries_seen),
             }
         }
 
@@ -10470,6 +10684,10 @@ mod tests {
 
         fn unregister(&self, node_id: ControlPlaneRaftNodeId) {
             self.peers.lock().unwrap().remove(&node_id);
+        }
+
+        fn max_append_entries_seen(&self) -> usize {
+            self.max_append_entries_seen.load(Ordering::Relaxed)
         }
     }
 
@@ -10699,6 +10917,7 @@ mod tests {
                 source: self.local_node_id,
                 target,
                 node: node.clone(),
+                max_append_entries_seen: Arc::clone(&self.max_append_entries_seen),
             }
         }
     }
@@ -10717,6 +10936,7 @@ mod tests {
         source: Option<ControlPlaneRaftNodeId>,
         target: ControlPlaneRaftNodeId,
         node: BasicNode,
+        max_append_entries_seen: Arc<AtomicUsize>,
     }
 
     impl InMemoryRaftNetwork {
@@ -10897,6 +11117,8 @@ mod tests {
     }
 
     impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for InMemoryRaftNetwork {
+        type SnapshotData = ControlPlaneRaftSnapshotData;
+
         async fn append_entries(
             &mut self,
             rpc: AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
@@ -10905,6 +11127,8 @@ mod tests {
             AppendEntriesResponse<ControlPlaneRaftTypeConfig>,
             RPCError<ControlPlaneRaftTypeConfig>,
         > {
+            self.max_append_entries_seen
+                .fetch_max(rpc.entries.len(), Ordering::Relaxed);
             self.validate_peer("append_entries")?;
             if let Some(policy) = &self.policy {
                 policy
@@ -11015,7 +11239,7 @@ mod tests {
         async fn full_snapshot(
             &mut self,
             vote: VoteOf<ControlPlaneRaftTypeConfig>,
-            snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+            snapshot: ControlPlaneRaftSnapshot,
             _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
             _option: RPCOption,
         ) -> Result<
@@ -13337,6 +13561,198 @@ mod tests {
         test_raft_config_with_log_reversion(cluster_name, None)
     }
 
+    #[test]
+    fn experimental_raft_replication_batch_fits_peer_transport_limit() {
+        let config = experimental_raft_config(
+            "control-plane-raft-batch-limit-test",
+            ExperimentalRaftTimerMode::Automatic,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.max_payload_entries,
+            CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES
+        );
+        assert!(
+            config.max_payload_entries
+                <= ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES as u64
+        );
+        assert!(
+            CONTROL_PLANE_RAFT_APPEND_ENTRIES_COUNT_BYTES
+                + CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES
+                    * usize::try_from(config.max_payload_entries).unwrap()
+                <= ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES_BYTES
+        );
+    }
+
+    #[test]
+    fn experimental_raft_replication_rejects_undersized_peer_policy() {
+        let policy = ControlPlaneRaftPeerTransportPolicy::new(
+            "control-plane-raft-undersized-policy-test",
+            BTreeMap::from([(1, BasicNode::new("node-1"))]),
+            ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+                max_append_entries: usize::try_from(CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES)
+                    .unwrap()
+                    - 1,
+                max_append_entries_bytes:
+                    ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES_BYTES,
+                max_snapshot_bytes: ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_SNAPSHOT_BYTES,
+            },
+        );
+
+        let error = policy.validate_replication_compatibility().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("below the configured replication batch size"));
+    }
+
+    #[test]
+    fn control_plane_command_replication_rejects_oversized_entry() {
+        let command = ControlPlaneCommand::BootstrapInitialClusterMap {
+            nodes: vec![(
+                NodeId::new(1),
+                "x".repeat(CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES),
+            )],
+            pg_ids: vec![PgId::new(0)],
+        };
+
+        let error = validate_control_plane_command_replication_size(&command).unwrap_err();
+        assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
+        assert!(error
+            .to_string()
+            .contains("exceeding the replication-safe per-entry limit"));
+    }
+
+    #[test]
+    fn control_plane_command_replication_rejects_oversized_entry_before_log_mutation() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let log_store = ControlPlaneRaftLogStore::empty();
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config("control-plane-raft-command-size-boundary-test"),
+                UnreachableRaftNetworkFactory,
+                log_store.clone(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let authority = ControlPlaneRaftAuthority::new_with_log_store(
+                raft,
+                log_store,
+                "control-plane-raft-command-size-boundary-test",
+            );
+            authority
+                .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+                .await
+                .unwrap();
+            wait_for_local_leader(authority.raft(), "command-size boundary leadership").await;
+            wait_for_authority_status_matching(
+                &authority,
+                Duration::from_secs(1),
+                "command-size boundary authority applies initialization",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+            let before = authority.status().await.unwrap();
+            let command = ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(
+                    NodeId::new(1),
+                    "x".repeat(CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES),
+                )],
+                pg_ids: vec![PgId::new(0)],
+            };
+
+            let error = authority
+                .submit_control_plane_command(command)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
+            let after = authority.status().await.unwrap();
+            assert_eq!(after.last_log_id(), before.last_log_id());
+            assert_eq!(after.committed(), before.committed());
+            assert_eq!(after.applied(), before.applied());
+
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn unix_peer_rpc_timeout_honors_openraft_soft_ttl() {
+        let network = ControlPlaneRaftUnixPeerNetwork {
+            local_node_id: 1,
+            target: 2,
+            node: BasicNode::new("unused"),
+            policy: Arc::new(ControlPlaneRaftPeerTransportPolicy::new(
+                "control-plane-raft-rpc-timeout-test",
+                BTreeMap::new(),
+                ControlPlaneRaftPeerTransportLimits::default(),
+            )),
+            rpc_timeout: Duration::from_secs(1),
+        };
+
+        let short_deadline = network
+            .effective_rpc_deadline(&RPCOption::new(Duration::from_millis(400)))
+            .unwrap();
+        let short_budget = short_deadline.saturating_duration_since(Instant::now());
+        assert!(short_budget <= Duration::from_millis(300));
+        assert!(!short_budget.is_zero());
+
+        let capped_deadline = network
+            .effective_rpc_deadline(&RPCOption::new(Duration::from_secs(2)))
+            .unwrap();
+        let capped_budget = capped_deadline.saturating_duration_since(Instant::now());
+        assert!(capped_budget <= Duration::from_secs(1));
+        assert!(!capped_budget.is_zero());
+    }
+
+    #[test]
+    fn unix_peer_rpc_absolute_deadline_bounds_complete_response_read() {
+        let (_socket_dir, socket_path) =
+            raft_unix_socket_path("control-plane-raft-absolute-deadline-test");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let policy = ControlPlaneRaftPeerTransportPolicy::new(
+            "control-plane-raft-absolute-deadline-test",
+            BTreeMap::from([
+                (1, BasicNode::new("source")),
+                (2, BasicNode::new(socket_path.to_string_lossy())),
+            ]),
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let network = ControlPlaneRaftUnixPeerNetwork {
+            local_node_id: 1,
+            target: 2,
+            node: BasicNode::new(socket_path.to_string_lossy()),
+            policy: Arc::new(policy),
+            rpc_timeout: Duration::from_secs(1),
+        };
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(1, 1),
+            last_log_id: None,
+            leadership_transfer: false,
+        });
+        let started = Instant::now();
+        let error = network
+            .send_rpc_frame(
+                "vote",
+                request,
+                started.checked_add(Duration::from_millis(40)).unwrap(),
+            )
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(elapsed < Duration::from_millis(150), "elapsed={elapsed:?}");
+        assert!(matches!(
+            error,
+            RPCError::Unreachable(_) | RPCError::Network(_)
+        ));
+        server.join().unwrap();
+    }
+
     fn test_raft_config_with_log_reversion(
         cluster_name: &'static str,
         allow_log_reversion: Option<bool>,
@@ -13377,28 +13793,32 @@ mod tests {
     ) -> (ControlPlaneRaftAuthority, ControlPlaneRaftAuthority) {
         let network = InMemoryRaftNetworkFactory::default();
         let config = test_raft_config(cluster_name);
+        let log_store1 = ControlPlaneRaftLogStore::empty();
         let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node1,
             config.clone(),
             network.clone(),
-            ControlPlaneRaftLogStore::empty(),
+            log_store1.clone(),
             ControlPlaneRaftStateMachine::empty(),
         )
         .await
         .unwrap();
+        let log_store2 = ControlPlaneRaftLogStore::empty();
         let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node2,
             config,
             network.clone(),
-            ControlPlaneRaftLogStore::empty(),
+            log_store2.clone(),
             ControlPlaneRaftStateMachine::empty(),
         )
         .await
         .unwrap();
         network.register(node1, raft1.clone());
         network.register(node2, raft2.clone());
-        let authority1 = ControlPlaneRaftAuthority::new(raft1);
-        let authority2 = ControlPlaneRaftAuthority::new(raft2);
+        let authority1 =
+            ControlPlaneRaftAuthority::new_with_log_store(raft1, log_store1, cluster_name);
+        let authority2 =
+            ControlPlaneRaftAuthority::new_with_log_store(raft2, log_store2, cluster_name);
 
         authority1
             .initialize_membership(BTreeMap::from([
@@ -13431,29 +13851,32 @@ mod tests {
     ) {
         let network = InMemoryRaftNetworkFactory::default();
         let config = test_raft_config(cluster_name);
+        let log_store1 = ControlPlaneRaftLogStore::empty();
         let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node1,
             config.clone(),
             network.clone(),
-            ControlPlaneRaftLogStore::empty(),
+            log_store1.clone(),
             ControlPlaneRaftStateMachine::empty(),
         )
         .await
         .unwrap();
+        let log_store2 = ControlPlaneRaftLogStore::empty();
         let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node2,
             config.clone(),
             network.clone(),
-            ControlPlaneRaftLogStore::empty(),
+            log_store2.clone(),
             ControlPlaneRaftStateMachine::empty(),
         )
         .await
         .unwrap();
+        let log_store3 = ControlPlaneRaftLogStore::empty();
         let raft3 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node3,
             config,
             network.clone(),
-            ControlPlaneRaftLogStore::empty(),
+            log_store3.clone(),
             ControlPlaneRaftStateMachine::empty(),
         )
         .await
@@ -13461,9 +13884,12 @@ mod tests {
         network.register(node1, raft1.clone());
         network.register(node2, raft2.clone());
         network.register(node3, raft3.clone());
-        let authority1 = ControlPlaneRaftAuthority::new(raft1);
-        let authority2 = ControlPlaneRaftAuthority::new(raft2);
-        let authority3 = ControlPlaneRaftAuthority::new(raft3);
+        let authority1 =
+            ControlPlaneRaftAuthority::new_with_log_store(raft1, log_store1, cluster_name);
+        let authority2 =
+            ControlPlaneRaftAuthority::new_with_log_store(raft2, log_store2, cluster_name);
+        let authority3 =
+            ControlPlaneRaftAuthority::new_with_log_store(raft3, log_store3, cluster_name);
 
         authority1
             .initialize_membership(BTreeMap::from([
@@ -13526,11 +13952,12 @@ mod tests {
         )
         .await
         .unwrap();
+        let log_store2 = ControlPlaneRaftLogStore::empty();
         let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node2,
             config.clone(),
             network.clone(),
-            ControlPlaneRaftLogStore::empty(),
+            log_store2.clone(),
             ControlPlaneRaftStateMachine::empty(),
         )
         .await
@@ -13553,7 +13980,8 @@ mod tests {
             leader_log_store.clone(),
             "test-cluster",
         );
-        let authority2 = ControlPlaneRaftAuthority::new(raft2);
+        let authority2 =
+            ControlPlaneRaftAuthority::new_with_log_store(raft2, log_store2, "test-cluster");
         let authority3 = ControlPlaneRaftAuthority::new_with_log_store(
             raft3,
             log_store3.clone(),
@@ -13613,23 +14041,27 @@ mod tests {
     #[test]
     fn control_plane_raft_linearized_authority_readiness_from_flags_is_ordered() {
         assert_eq!(
-            linearized_authority_readiness_from_flags(false, false, false),
+            linearized_authority_readiness_from_flags(false, false, false, false),
             ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
         );
         assert_eq!(
-            linearized_authority_readiness_from_flags(false, true, true),
+            linearized_authority_readiness_from_flags(false, true, true, true),
             ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
         );
         assert_eq!(
-            linearized_authority_readiness_from_flags(true, false, true),
+            linearized_authority_readiness_from_flags(true, false, true, true),
             ControlPlaneRaftLinearizedAuthorityReadiness::NotEffectiveVoter
         );
         assert_eq!(
-            linearized_authority_readiness_from_flags(true, true, false),
+            linearized_authority_readiness_from_flags(true, true, false, true),
             ControlPlaneRaftLinearizedAuthorityReadiness::NotAppliedToCommitted
         );
         assert_eq!(
-            linearized_authority_readiness_from_flags(true, true, true),
+            linearized_authority_readiness_from_flags(true, true, true, false),
+            ControlPlaneRaftLinearizedAuthorityReadiness::NotCommittedInCurrentTerm
+        );
+        assert_eq!(
+            linearized_authority_readiness_from_flags(true, true, true, true),
             ControlPlaneRaftLinearizedAuthorityReadiness::Serving
         );
     }
@@ -13653,7 +14085,7 @@ mod tests {
             applied_voter: linearized_authority_serving,
             applied_learner: false,
             persisted_vote: None,
-            current_term: None,
+            current_term: linearized_authority_serving.then_some(1),
             last_log_id: None,
             last_purged_log_id: None,
             committed: caught_up_log_id,
@@ -13767,6 +14199,14 @@ mod tests {
             Err(ControlPlaneError::RpcRemote { message })
                 if message.contains("no serving raft authority")
         ));
+
+        let mut prior_term_commit = test_authority_status(435, true);
+        prior_term_commit.current_term = Some(2);
+        assert_eq!(
+            prior_term_commit.linearized_authority_readiness(),
+            ControlPlaneRaftLinearizedAuthorityReadiness::NotCommittedInCurrentTerm
+        );
+        assert!(!prior_term_commit.linearized_authority_serving());
     }
 
     async fn wait_for_log_purged_to(
@@ -13844,7 +14284,10 @@ mod tests {
         .await
         {
             Ok(status) => status,
-            Err(_) => panic!("{message}: timed out after {timeout:?}"),
+            Err(_) => {
+                let status = authority.status().await;
+                panic!("{message}: timed out after {timeout:?}; last status: {status:?}");
+            }
         }
     }
 
@@ -14649,7 +15092,15 @@ mod tests {
                 .capture_durable_restart_checkpoint()
                 .await
                 .expect("restart checkpoint should capture");
-            let foreign_authority = ControlPlaneRaftAuthority::new(authority.raft().clone());
+            let foreign_authority = ControlPlaneRaftAuthority::new_with_log_store(
+                authority.raft().clone(),
+                authority
+                    .log_store
+                    .as_ref()
+                    .expect("test authority should retain its log store")
+                    .clone(),
+                "test-cluster",
+            );
 
             let error = foreign_authority
                 .persist_durable_restart_checkpoint(checkpoint, &artifact_path)
@@ -16849,13 +17300,17 @@ mod tests {
                 1,
                 test_raft_config("control-plane-raft-read-index-runtime-map-test"),
                 UnreachableRaftNetworkFactory,
-                log_store,
+                log_store.clone(),
                 state_machine,
             )
             .await
             .unwrap();
 
-            let authority = ControlPlaneRaftAuthority::new(raft);
+            let authority = ControlPlaneRaftAuthority::new_with_log_store(
+                raft,
+                log_store,
+                "control-plane-raft-read-index-runtime-map-test",
+            );
             authority
                 .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
@@ -16954,13 +17409,17 @@ mod tests {
                 301,
                 test_raft_config("control-plane-raft-linearized-authority-trait-test"),
                 UnreachableRaftNetworkFactory,
-                log_store,
+                log_store.clone(),
                 state_machine,
             )
             .await
             .unwrap();
 
-            let authority = Arc::new(ControlPlaneRaftAuthority::new(raft));
+            let authority = Arc::new(ControlPlaneRaftAuthority::new_with_log_store(
+                raft,
+                log_store,
+                "control-plane-raft-linearized-authority-trait-test",
+            ));
             authority
                 .initialize_membership(BTreeMap::from([(301, BasicNode::new("node-301"))]))
                 .await
@@ -17310,7 +17769,7 @@ mod tests {
                         if statuses.get(&412).is_some_and(|status| {
                             status.current_leader() == Some(412)
                                 && status.local_leader()
-                                && status.applied_caught_up_to_committed()
+                                && status.linearized_authority_serving()
                         }) {
                             return Ok(statuses);
                         }
@@ -17542,26 +18001,36 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let operation_timeout = Duration::from_secs(2);
             let network = InMemoryRaftNetworkFactory::default();
+            let log_store1 = ControlPlaneRaftLogStore::empty();
             let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 421,
                 test_raft_config("control-plane-raft-directory-multiple-serving-test-421"),
                 network.clone(),
-                ControlPlaneRaftLogStore::empty(),
+                log_store1.clone(),
                 ControlPlaneRaftStateMachine::empty(),
             )
             .await
             .unwrap();
+            let log_store2 = ControlPlaneRaftLogStore::empty();
             let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 422,
                 test_raft_config("control-plane-raft-directory-multiple-serving-test-422"),
                 network,
-                ControlPlaneRaftLogStore::empty(),
+                log_store2.clone(),
                 ControlPlaneRaftStateMachine::empty(),
             )
             .await
             .unwrap();
-            let authority1 = Arc::new(ControlPlaneRaftAuthority::new(raft1));
-            let authority2 = Arc::new(ControlPlaneRaftAuthority::new(raft2));
+            let authority1 = Arc::new(ControlPlaneRaftAuthority::new_with_log_store(
+                raft1,
+                log_store1,
+                "control-plane-raft-directory-multiple-serving-test-421",
+            ));
+            let authority2 = Arc::new(ControlPlaneRaftAuthority::new_with_log_store(
+                raft2,
+                log_store2,
+                "control-plane-raft-directory-multiple-serving-test-422",
+            ));
             authority1
                 .initialize_membership(BTreeMap::from([(421, BasicNode::new("node-421"))]))
                 .await
@@ -17692,7 +18161,11 @@ mod tests {
             .await
             .unwrap();
 
-            let authority = ControlPlaneRaftAuthority::new(raft);
+            let authority = ControlPlaneRaftAuthority::new_with_log_store(
+                raft,
+                log_store,
+                "control-plane-raft-read-index-non-leader-test",
+            );
             authority
                 .initialize_membership(BTreeMap::from([
                     (1, BasicNode::new("node-1")),
@@ -18144,6 +18617,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            wait_for_authority_status_matching(
+                &authority2,
+                Duration::from_secs(1),
+                "transferred leader committed its current-term entry",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
 
             let old_leader_read_err = authority1
                 .linearized_runtime_map_snapshot(77_000)
@@ -18630,12 +19110,14 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let network = InMemoryRaftNetworkFactory::default();
             let config = test_raft_config("control-plane-raft-promoted-voter-restart-test");
+            let log_store1 = ControlPlaneRaftLogStore::empty();
+            let log_store2 = ControlPlaneRaftLogStore::empty();
             let log_store3 = ControlPlaneRaftLogStore::empty();
             let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 621,
                 config.clone(),
                 network.clone(),
-                ControlPlaneRaftLogStore::empty(),
+                log_store1.clone(),
                 ControlPlaneRaftStateMachine::empty(),
             )
             .await
@@ -18644,7 +19126,7 @@ mod tests {
                 622,
                 config.clone(),
                 network.clone(),
-                ControlPlaneRaftLogStore::empty(),
+                log_store2.clone(),
                 ControlPlaneRaftStateMachine::empty(),
             )
             .await
@@ -18661,8 +19143,16 @@ mod tests {
             network.register(621, raft1.clone());
             network.register(622, raft2.clone());
             network.register(623, raft3.clone());
-            let authority1 = ControlPlaneRaftAuthority::new(raft1);
-            let authority2 = ControlPlaneRaftAuthority::new(raft2);
+            let authority1 = ControlPlaneRaftAuthority::new_with_log_store(
+                raft1,
+                log_store1,
+                "control-plane-raft-promoted-voter-restart-test",
+            );
+            let authority2 = ControlPlaneRaftAuthority::new_with_log_store(
+                raft2,
+                log_store2,
+                "control-plane-raft-promoted-voter-restart-test",
+            );
             let authority3 = ControlPlaneRaftAuthority::new_with_log_store(
                 raft3,
                 log_store3.clone(),
@@ -18940,8 +19430,12 @@ mod tests {
                 authority1,
                 authority2,
                 authority3,
-            } = initialized_three_node_voter_authorities(
-                "control-plane-raft-follower-restart-catch-up-test",
+            } = initialized_three_node_voter_authorities_with_config(
+                experimental_raft_config(
+                    "control-plane-raft-follower-restart-catch-up-test",
+                    ExperimentalRaftTimerMode::Manual,
+                )
+                .unwrap(),
                 801,
                 802,
                 803,
@@ -18979,23 +19473,36 @@ mod tests {
             authority3.shutdown().await.unwrap();
             network.unregister(803);
 
-            let offline_write = authority1
-                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
-                    node_id: NodeId::new(802),
-                    availability: NodeAvailabilityState::Unavailable,
-                })
-                .await
-                .unwrap();
-            assert!(matches!(
-                offline_write.outcome(),
-                ControlPlaneRaftCommandOutcome::Applied(
-                    ControlPlaneCommandResponse::MarkNodeAvailability
-                )
-            ));
+            let mut offline_write = None;
+            for update in 0..=ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES {
+                let write = authority1
+                    .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(802),
+                        availability: if update % 2 == 0 {
+                            NodeAvailabilityState::Unavailable
+                        } else {
+                            NodeAvailabilityState::Healthy
+                        },
+                    })
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    write.outcome(),
+                    ControlPlaneRaftCommandOutcome::Applied(
+                        ControlPlaneCommandResponse::MarkNodeAvailability
+                    )
+                ));
+                offline_write = Some(write);
+            }
+            let offline_write = offline_write.expect("offline suffix contains commands");
+            assert!(
+                offline_write.log_id().index() - bootstrap.log_id().index()
+                    > ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES as u64
+            );
             authority2
                 .wait_for_applied_index_at_least(
                     offline_write.log_id().index(),
-                    Duration::from_secs(1),
+                    Duration::from_secs(3),
                     "second voter applied command committed while third voter was down",
                 )
                 .await
@@ -19038,12 +19545,17 @@ mod tests {
             restarted_authority
                 .wait_for_applied_index_at_least(
                     catch_up_trigger.log_id().index(),
-                    Duration::from_secs(1),
+                    Duration::from_secs(3),
                     "restarted third voter caught up missing committed prefix",
                 )
                 .await
                 .unwrap();
             let restarted_status = restarted_authority.status().await.unwrap();
+            assert!(
+                network.max_append_entries_seen()
+                    <= usize::try_from(CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES).unwrap(),
+                "restart catch-up exceeded the configured replication batch"
+            );
             assert_eq!(restarted_status.current_leader(), Some(801));
             assert_eq!(restarted_status.applied(), Some(catch_up_trigger.log_id()));
             assert_eq!(

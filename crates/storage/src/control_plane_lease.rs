@@ -361,22 +361,34 @@ impl CommittedLeaseGrantHorizon {
                 grant_not_after_ms: previous.grant_not_after_ms.max(proposed_grant_not_after_ms),
             });
         }
-        let fenced_until_ms = previous
-            .grant_not_after_ms
-            .checked_add(skew_budget_ms)
-            .ok_or(LeaseHorizonError::TimestampOverflow {
+        previous.validate_rebinding(authority, authority_now_ms, skew_budget_ms)?;
+        Ok(Self {
+            authority,
+            grant_not_after_ms: proposed_grant_not_after_ms,
+        })
+    }
+
+    pub(crate) fn validate_rebinding(
+        self,
+        authority: LeaseHorizonAuthorityBinding,
+        authority_now_ms: u64,
+        skew_budget_ms: u64,
+    ) -> Result<(), LeaseHorizonError> {
+        if self.authority == authority {
+            return Ok(());
+        }
+        let fenced_until_ms = self.grant_not_after_ms.checked_add(skew_budget_ms).ok_or(
+            LeaseHorizonError::TimestampOverflow {
                 field: "previous lease horizon fence",
-            })?;
+            },
+        )?;
         if authority_now_ms < fenced_until_ms {
             return Err(LeaseHorizonError::PreviousHorizonStillActive {
                 authority_now_ms,
                 fenced_until_ms,
             });
         }
-        Ok(Self {
-            authority,
-            grant_not_after_ms: proposed_grant_not_after_ms,
-        })
+        Ok(())
     }
 
     /// Validate a volatile heartbeat lease against the durable horizon.
