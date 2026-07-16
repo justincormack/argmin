@@ -12380,6 +12380,25 @@ Phase 12.4 progress:
   pending-command reporter. These replicated-boundary checks close both races
   between a safe observation and command apply without allowing the checked
   client to overwrite unresolved recovery state.
+  Two subsequent 30-minute soaks exposed a separate preflight ambiguity: a
+  transient target-route read failure was collapsed into the same `None` value
+  as a successful observation that the PG did not exist. The client then sent
+  one mutation without a conflict baseline and could only observe the old route
+  until its confirmation deadline, never safely resubmitting. Checked acting-set
+  updates now require a successful target-specific linearized preflight before
+  mutation, retry transient preflight failures under one bounded deadline, and
+  represent observed absence separately from a present route. `UnknownPg` has a
+  typed RPC response so new-PG creation preserves this distinction. During
+  confirmation, matching typed `UnknownPg` after an explicit absent preflight
+  proves a lost mutation did not apply and permits safe resubmission; it remains
+  a conflict after a present preflight. A successful PG-specific response that
+  omits the requested PG is always a protocol violation and never evidence of
+  absence. Scripted plain and authenticated regressions cover both malformed
+  confirmation responses and lost-before-apply new-PG creation, while another
+  authenticated regression proves a transient preflight failure causes another
+  read, no mutation, and only then the acting-set command. Preflight deadline
+  expiry before any attempt also returns a typed unconfirmed result rather than
+  panicking.
   A later replicated route-change soak exposed the corresponding confirmation
   gap after 37 successful leader-restart iterations. An acting-set mutation
   advanced the cluster to epoch 301 while the epoch bump had temporarily
