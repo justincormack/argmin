@@ -3704,6 +3704,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
             }
             ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => {
                 validate_acting_set(self, pg_id, &acting_set)?;
+                validate_acting_set_change_ready(self, pg_id, &acting_set)?;
                 validate_acting_set_preserves_pending_recovery(self, pg_id, &acting_set)?;
                 let mut next_snapshot = self.clone();
                 let mut changed = false;
@@ -4551,22 +4552,39 @@ impl PgRouteSnapshot {
     }
 }
 
-fn same_pg_acting_set_route(left: &PgRouteSnapshot, right: &PgRouteSnapshot) -> bool {
-    if left.pg_id != right.pg_id
-        || left.acting_set != right.acting_set
-        || left.pending_metadata_command_recovery != right.pending_metadata_command_recovery
-    {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgActingSetRetryRouteDisposition {
+    RetryReady,
+    Wait,
+    Conflict,
+}
+
+fn pg_acting_set_retry_route_disposition(
+    before: &PgRouteSnapshot,
+    current: &PgRouteSnapshot,
+) -> PgActingSetRetryRouteDisposition {
+    if before.pg_id != current.pg_id || before.acting_set != current.acting_set {
+        return PgActingSetRetryRouteDisposition::Conflict;
     }
-    if left.state == PgState::Peering && right.state == PgState::Active {
-        return true;
+    if current.pending_metadata_command_recovery.is_some() {
+        return PgActingSetRetryRouteDisposition::Wait;
     }
-    left.state == right.state
-        && left.peering_metadata_transfer == right.peering_metadata_transfer
-        && left.peering_metadata_transfer_source_route_epoch
-            == right.peering_metadata_transfer_source_route_epoch
-        && left.peering_metadata_transfer_source_node_id
-            == right.peering_metadata_transfer_source_node_id
+    match current.state {
+        PgState::Active => PgActingSetRetryRouteDisposition::RetryReady,
+        PgState::Peering
+            if before.state == PgState::Peering
+                && before.peering_metadata_transfer == current.peering_metadata_transfer
+                && before.peering_metadata_transfer_source_route_epoch
+                    == current.peering_metadata_transfer_source_route_epoch
+                && before.peering_metadata_transfer_source_node_id
+                    == current.peering_metadata_transfer_source_node_id =>
+        {
+            PgActingSetRetryRouteDisposition::RetryReady
+        }
+        PgState::Peering | PgState::Degraded | PgState::Backfilling | PgState::Inconsistent => {
+            PgActingSetRetryRouteDisposition::Wait
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9174,20 +9192,20 @@ impl UnixControlPlaneClient {
                             route.acting_set(),
                             acting_set
                         );
-                    if pre_update_route
-                        .as_ref()
-                        .is_some_and(|before| !same_pg_acting_set_route(before, route))
-                    {
-                        return Err(ControlPlaneError::RpcUnconfirmed { message });
-                    }
-                    if pre_update_route
-                        .as_ref()
-                        .is_some_and(|before| same_pg_acting_set_route(before, route))
-                    {
-                        match self.set_pg_acting_set(pg_id, acting_set.to_vec()) {
-                            Ok(cluster_epoch) => return Ok(cluster_epoch),
-                            Err(error) if error.is_retryable_pg_acting_set_checked_error() => {}
-                            Err(error) => return Err(error),
+                    if let Some(before) = pre_update_route.as_ref() {
+                        match pg_acting_set_retry_route_disposition(before, route) {
+                            PgActingSetRetryRouteDisposition::Conflict => {
+                                return Err(ControlPlaneError::RpcUnconfirmed { message });
+                            }
+                            PgActingSetRetryRouteDisposition::RetryReady => {
+                                match self.set_pg_acting_set(pg_id, acting_set.to_vec()) {
+                                    Ok(cluster_epoch) => return Ok(cluster_epoch),
+                                    Err(error)
+                                        if error.is_retryable_pg_acting_set_checked_error() => {}
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            PgActingSetRetryRouteDisposition::Wait => {}
                         }
                     }
                     last_unconfirmed_message = Some(message);
@@ -9869,24 +9887,24 @@ impl AuthenticatedUnixControlPlaneClient {
                         route.acting_set(),
                         acting_set
                     );
-                    if pre_update_route
-                        .as_ref()
-                        .is_some_and(|before| !same_pg_acting_set_route(before, route))
-                    {
-                        return Err(ControlPlaneError::RpcUnconfirmed { message });
-                    }
-                    if pre_update_route
-                        .as_ref()
-                        .is_some_and(|before| same_pg_acting_set_route(before, route))
-                    {
-                        match self.set_pg_acting_set(
-                            pg_id,
-                            acting_set.to_vec(),
-                            retry_clock.now_ms(),
-                        ) {
-                            Ok(cluster_epoch) => return Ok(cluster_epoch),
-                            Err(error) if error.is_retryable_pg_acting_set_checked_error() => {}
-                            Err(error) => return Err(error),
+                    if let Some(before) = pre_update_route.as_ref() {
+                        match pg_acting_set_retry_route_disposition(before, route) {
+                            PgActingSetRetryRouteDisposition::Conflict => {
+                                return Err(ControlPlaneError::RpcUnconfirmed { message });
+                            }
+                            PgActingSetRetryRouteDisposition::RetryReady => {
+                                match self.set_pg_acting_set(
+                                    pg_id,
+                                    acting_set.to_vec(),
+                                    retry_clock.now_ms(),
+                                ) {
+                                    Ok(cluster_epoch) => return Ok(cluster_epoch),
+                                    Err(error)
+                                        if error.is_retryable_pg_acting_set_checked_error() => {}
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            PgActingSetRetryRouteDisposition::Wait => {}
                         }
                     }
                     last_unconfirmed_message = Some(message);
@@ -13077,6 +13095,16 @@ fn encode_control_plane_rpc_response(
             write_u64(&mut payload, cluster_epoch.get());
             write_pg_state(&mut payload, state);
         }
+        Err(ControlPlaneError::PgActingSetChangeNotReady {
+            pg_id,
+            cluster_epoch,
+            state,
+        }) => {
+            write_u8(&mut payload, 7);
+            write_u32(&mut payload, pg_id);
+            write_u64(&mut payload, cluster_epoch.get());
+            write_pg_state(&mut payload, state);
+        }
         Err(error) => {
             write_u8(&mut payload, 1);
             write_string(&mut payload, &error.to_string())?;
@@ -13165,6 +13193,18 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             Err(ControlPlaneError::PgPrimaryObservationNotActive {
                 pg_id,
                 node_id,
+                cluster_epoch,
+                state,
+            })
+        }
+        7 => {
+            let pg_id = reader.read_u32()?;
+            let cluster_epoch =
+                read_cluster_epoch(&mut reader, "PG acting-set readiness cluster epoch")?;
+            let state = read_pg_state(&mut reader)?;
+            reader.finish()?;
+            Err(ControlPlaneError::PgActingSetChangeNotReady {
+                pg_id,
                 cluster_epoch,
                 state,
             })
@@ -15133,6 +15173,15 @@ pub enum ControlPlaneError {
     },
 
     #[error(
+        "PG {pg_id} in state {state} cannot change acting set in cluster epoch {cluster_epoch}"
+    )]
+    PgActingSetChangeNotReady {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
+
+    #[error(
         "PG {pg_id} metadata transfer source epoch {source_epoch} is newer than current cluster epoch {cluster_epoch}"
     )]
     PgMetadataTransferSourceEpochInFuture {
@@ -15668,7 +15717,11 @@ impl ControlPlaneError {
     fn is_retryable_pg_acting_set_checked_error(&self) -> bool {
         self.is_maybe_applied_control_plane_rpc_response_loss()
             || self.is_transient_runtime_map_serving_gap()
-            || matches!(self, Self::PgMetadataMigrationSourceNotReady { .. })
+            || matches!(
+                self,
+                Self::PgMetadataMigrationSourceNotReady { .. }
+                    | Self::PgActingSetChangeNotReady { .. }
+            )
     }
 
     #[must_use]
@@ -17399,6 +17452,26 @@ fn validate_acting_set(
         }
     }
     Ok(())
+}
+
+fn validate_acting_set_change_ready(
+    snapshot: &ClusterControlSnapshot,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+) -> Result<(), ControlPlaneError> {
+    let Some(record) = snapshot.pg(pg_id) else {
+        return Ok(());
+    };
+    if record.acting_set() == acting_set
+        || matches!(record.state(), PgState::Active | PgState::Peering)
+    {
+        return Ok(());
+    }
+    Err(ControlPlaneError::PgActingSetChangeNotReady {
+        pg_id: pg_id.get(),
+        cluster_epoch: snapshot.cluster_epoch(),
+        state: record.state(),
+    })
 }
 
 fn validate_acting_set_preserves_pending_recovery(
@@ -21569,6 +21642,27 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_preserves_acting_set_change_not_ready_identity() {
+        let cluster_epoch = ClusterEpoch::new(44).unwrap();
+        let encoded =
+            encode_control_plane_rpc_response(Err(ControlPlaneError::PgActingSetChangeNotReady {
+                pg_id: 7,
+                cluster_epoch,
+                state: PgState::Backfilling,
+            }))
+            .unwrap();
+
+        assert!(matches!(
+            decode_control_plane_rpc_response(encoded),
+            Err(ControlPlaneError::PgActingSetChangeNotReady {
+                pg_id: 7,
+                cluster_epoch: decoded_epoch,
+                state: PgState::Backfilling,
+            }) if decoded_epoch == cluster_epoch
+        ));
+    }
+
+    #[test]
     fn unix_control_plane_client_fetches_pg_runtime_map_with_bounded_non_serving_validity() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -23672,7 +23766,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_admin_pg_update_retries_across_target_pg_lifecycle_progress() {
+    fn authenticated_admin_pg_update_waits_across_target_pg_lifecycle_progress() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -23706,12 +23800,12 @@ mod tests {
         let verifier = admin_auth_verifier("auth-cluster", "admin-1");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
-            for request_number in 0..4 {
+            for request_number in 0..5 {
                 let (mut stream, _addr) = listener.accept().unwrap();
                 let request = read_control_plane_unix_request(&mut stream).unwrap();
                 let expected_kind = match request_number {
-                    0 | 2 => ControlPlaneRpcKind::PgRuntimeMapSnapshot,
-                    1 | 3 => ControlPlaneRpcKind::SetPgActingSet,
+                    0 | 2 | 3 => ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+                    1 | 4 => ControlPlaneRpcKind::SetPgActingSet,
                     _ => unreachable!(),
                 };
                 assert_eq!(request.kind, expected_kind);
@@ -23741,6 +23835,8 @@ mod tests {
                         PgState::Active
                     );
                     assert!(authority.snapshot().cluster_epoch() > preflight_epoch);
+                    authority.snapshot.pgs.get_mut(&target_pg_id).unwrap().state =
+                        PgState::Degraded;
                     continue;
                 }
 
@@ -23761,6 +23857,9 @@ mod tests {
                 )
                 .unwrap();
                 write_control_plane_unix_response(&mut stream, response).unwrap();
+                if request_number == 2 {
+                    authority.snapshot.pgs.get_mut(&target_pg_id).unwrap().state = PgState::Active;
+                }
             }
             authority.snapshot().clone()
         });
@@ -23787,7 +23886,7 @@ mod tests {
     }
 
     #[test]
-    fn pg_acting_set_retry_identity_rejects_pending_reporter_removed_by_update() {
+    fn pg_acting_set_retry_waits_for_pending_and_unsafe_routes_before_resubmission() {
         let pg_id = PgId::new(7);
         let reporting_node_id = NodeId::new(1);
         let retained_node_id = NodeId::new(2);
@@ -23814,7 +23913,18 @@ mod tests {
 
         let requested_acting_set = [retained_node_id];
         assert!(!requested_acting_set.contains(&reporting_node_id));
-        assert!(!same_pg_acting_set_route(&before, &recovery));
+        assert_eq!(
+            pg_acting_set_retry_route_disposition(&before, &recovery),
+            PgActingSetRetryRouteDisposition::Wait
+        );
+
+        let mut recovered = recovery.clone();
+        recovered.state = PgState::Active;
+        recovered.pending_metadata_command_recovery = None;
+        assert_eq!(
+            pg_acting_set_retry_route_disposition(&before, &recovered),
+            PgActingSetRetryRouteDisposition::RetryReady
+        );
 
         for unsafe_state in [
             PgState::Degraded,
@@ -23823,8 +23933,18 @@ mod tests {
         ] {
             let mut changed = before.clone();
             changed.state = unsafe_state;
-            assert!(!same_pg_acting_set_route(&before, &changed));
+            assert_eq!(
+                pg_acting_set_retry_route_disposition(&before, &changed),
+                PgActingSetRetryRouteDisposition::Wait
+            );
         }
+
+        let mut conflicting = before.clone();
+        conflicting.acting_set = vec![retained_node_id];
+        assert_eq!(
+            pg_acting_set_retry_route_disposition(&before, &conflicting),
+            PgActingSetRetryRouteDisposition::Conflict
+        );
     }
 
     #[test]
@@ -23904,6 +24024,50 @@ mod tests {
             } if actual == pending
         ));
         assert_eq!(authority.snapshot(), &before);
+    }
+
+    #[test]
+    fn pg_acting_set_command_rejects_unsafe_lifecycle_state_before_mutation() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let pg_id = PgId::new(7);
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        let baseline = authority.snapshot().clone();
+
+        for state in [
+            PgState::Degraded,
+            PgState::Backfilling,
+            PgState::Inconsistent,
+        ] {
+            let mut snapshot = baseline.clone();
+            snapshot.pgs.get_mut(&pg_id).unwrap().state = state;
+            let before = snapshot.clone();
+            let error = snapshot
+                .apply_control_plane_command(ControlPlaneCommand::SetPgActingSet {
+                    pg_id,
+                    acting_set: vec![NodeId::new(1), NodeId::new(2)],
+                })
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                ControlPlaneError::PgActingSetChangeNotReady {
+                    pg_id: 7,
+                    state: actual,
+                    ..
+                } if actual == state
+            ));
+            assert_eq!(snapshot, before);
+        }
     }
 
     #[test]
