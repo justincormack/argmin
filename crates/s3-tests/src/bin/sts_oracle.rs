@@ -6477,6 +6477,7 @@ fn run_expired_deleted_session_probes(
     bucket: &str,
     credentials: SignedRequestCredentials<'_>,
     security_token: &str,
+    other_live_security_token: &str,
 ) {
     let wrong_secret = "0".repeat(40);
     let bad_signature_credentials = SignedRequestCredentials {
@@ -6484,6 +6485,7 @@ fn run_expired_deleted_session_probes(
         ..credentials
     };
     let sts_expired_message = "The security token included in the request is expired";
+    let sts_invalid_token_message = "The security token included in the request is invalid.";
 
     for (label, signing_credentials) in [
         ("session-auth-expired-deleted-valid", credentials),
@@ -6503,6 +6505,114 @@ fn run_expired_deleted_session_probes(
             Some(sts_expired_message),
         );
         println!("{label}: ok");
+    }
+
+    for (case, supplied_token) in [
+        ("missing-token", None),
+        ("mismatched-token", Some(other_live_security_token)),
+    ] {
+        for (signature, signing_credentials) in [
+            ("valid-signature", credentials),
+            ("bad-signature", bad_signature_credentials),
+        ] {
+            let label = format!("session-auth-expired-deleted-{case}-{signature}");
+            let response =
+                send_get_caller_identity(sts_endpoint, signing_credentials, supplied_token);
+            assert_error_probe(
+                &label,
+                &response,
+                403,
+                STS_XMLNS,
+                "InvalidClientTokenId",
+                Some(sts_invalid_token_message),
+            );
+            println!("{label}: ok");
+        }
+    }
+
+    let wrong_region = if credentials.region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    };
+    let wrong_region_credentials = SignedRequestCredentials {
+        region: wrong_region,
+        ..credentials
+    };
+    let wrong_region_bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..wrong_region_credentials
+    };
+    let wrong_service_bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..credentials
+    };
+    for (case, signing_credentials, supplied_token, service, message) in [
+        (
+            "valid-token-wrong-region",
+            wrong_region_credentials,
+            Some(security_token),
+            "sts",
+            STS_WRONG_REGION_SCOPE_MESSAGE,
+        ),
+        (
+            "missing-token-wrong-region",
+            wrong_region_credentials,
+            None,
+            "sts",
+            STS_WRONG_REGION_SCOPE_MESSAGE,
+        ),
+        (
+            "mismatched-token-wrong-region",
+            wrong_region_credentials,
+            Some(other_live_security_token),
+            "sts",
+            STS_WRONG_REGION_SCOPE_MESSAGE,
+        ),
+        (
+            "valid-token-wrong-region-bad-signature",
+            wrong_region_bad_signature_credentials,
+            Some(security_token),
+            "sts",
+            STS_WRONG_REGION_SCOPE_MESSAGE,
+        ),
+        (
+            "valid-token-wrong-service",
+            credentials,
+            Some(security_token),
+            "s3",
+            STS_WRONG_SERVICE_SCOPE_MESSAGE,
+        ),
+        (
+            "missing-token-wrong-service",
+            credentials,
+            None,
+            "s3",
+            STS_WRONG_SERVICE_SCOPE_MESSAGE,
+        ),
+        (
+            "mismatched-token-wrong-service",
+            credentials,
+            Some(other_live_security_token),
+            "s3",
+            STS_WRONG_SERVICE_SCOPE_MESSAGE,
+        ),
+        (
+            "valid-token-wrong-service-bad-signature",
+            wrong_service_bad_signature_credentials,
+            Some(security_token),
+            "s3",
+            STS_WRONG_SERVICE_SCOPE_MESSAGE,
+        ),
+    ] {
+        let label = format!("scope-expired-deleted-{case}");
+        let response = send_get_caller_identity_with_scope(
+            sts_endpoint,
+            signing_credentials,
+            supplied_token,
+            service,
+        );
+        assert_signing_scope_error(&label, &response, message);
     }
 
     for (label, signing_credentials) in [
@@ -8811,6 +8921,7 @@ fn main() {
                 &post_bucket,
                 expired_deleted_credentials,
                 &expired_deleted_security_token,
+                &other_live_security_token,
             );
         }
     }

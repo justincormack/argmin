@@ -459,8 +459,9 @@ admission controls plus strict encoded-token and decoded-payload limits.
 The STS route performs its AWS-pinned credential-scope validation before
 entering the shared temporary-credential path: simultaneous region and service
 errors are aggregated in that order, and either individual error precedes STS
-token resolution and HMAC comparison. This placement is STS-specific and is
-not evidence for any S3 mode; each S3 mode requires its own collision matrix.
+token resolution, token/access-key binding, expiry, issuer liveness, and HMAC
+comparison. This placement is STS-specific and is not evidence for any S3
+mode; each S3 mode requires its own collision matrix.
 
 The S3 header-auth route is now independently pinned to perform its own scope
 validation before the specifically probed session-token presence and binding,
@@ -1841,6 +1842,19 @@ or POST-policy signature, and streaming expiry wins over both a bad seed
 signature and a bad first-chunk signature. Expiry therefore precedes stable
 issuer-role liveness, which in turn precedes signature verification.
 
+The STS expiry-input collision extension completed on 2026-07-16 using the
+same already-expired credential and an independently live session token. With
+the correct STS scope, omitting the expired credential's token or substituting
+the live token returns the exact HTTP 403 `InvalidClientTokenId` golden with
+`The security token included in the request is invalid.`, for both correct and
+bad signatures. AWS therefore cannot reach the embedded expiry check until a
+token has been selected and bound to the access key. Conversely, wrong-region
+and wrong-service scope errors win over the expired credential with its
+correct, missing, or mismatched token; the correct expired token combined with
+each scope error and a bad signature receives the scope error too. This closes
+the STS expiry collision ordering only. Equivalent expiry-input collisions for
+each S3 authentication mode remain separately unresolved.
+
 During this slice, one newly created role produced one successful STS
 assumption followed immediately by `AccessDenied` for the same request. The
 fixture now requires three consecutive successful assumptions, resetting the
@@ -2353,8 +2367,9 @@ body may appear in traces.
    STS, S3 header, S3 presigned-query, and S3 POST Object region/service
    collisions are now pinned separately, as are streaming region/service
    collisions. Expiry versus issuer deletion is pinned independently for STS
-   and every initial S3 mode. Disabled-credential collisions and expiry
-   collisions with missing, mismatched, or wrong-scope inputs are not.
+   and every initial S3 mode. STS expiry collisions with missing, mismatched,
+   or wrong-scope inputs are pinned. Disabled-credential collisions and the
+   equivalent S3 expiry-input collisions are not.
 3. Should the first standalone UAT role be injected through a dedicated
    test-only constructor/config object or through explicitly UAT-only
    environment variables?
