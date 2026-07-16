@@ -498,7 +498,397 @@ fn load_private_key_from_pem(data: &[u8]) -> Result<PrivateKeyDer<'static>, Stri
 
 #[cfg(test)]
 mod tests {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::client::WebPkiServerVerifier;
+    use rustls::pki_types::{ServerName, UnixTime};
+    use rustls::{
+        CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore,
+        SignatureScheme,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+
+    const ROUTING_BOUNDARY_TARGET: &str =
+        "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Aauthority-probe%GG?tagKeys=probe";
+
+    #[derive(Debug)]
+    struct FixedCertificateNameVerifier {
+        inner: Arc<WebPkiServerVerifier>,
+        certificate_name: ServerName<'static>,
+    }
+
+    impl ServerCertVerifier for FixedCertificateNameVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            ocsp_response: &[u8],
+            now: UnixTime,
+        ) -> Result<ServerCertVerified, TlsError> {
+            self.inner.verify_server_cert(
+                end_entity,
+                intermediates,
+                &self.certificate_name,
+                ocsp_response,
+                now,
+            )
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            self.inner.verify_tls12_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            self.inner.verify_tls13_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.inner.supported_verify_schemes()
+        }
+    }
+
+    fn routing_boundary_request(
+        host_headers: &[&str],
+        absolute_form: bool,
+        amz_date: &str,
+    ) -> Vec<u8> {
+        let target = if absolute_form {
+            format!("http://absolute-target.invalid{ROUTING_BOUNDARY_TARGET}")
+        } else {
+            ROUTING_BOUNDARY_TARGET.to_string()
+        };
+        let date = &amz_date[..8];
+        let mut request = format!(
+            "POST {target} HTTP/1.1\r\n\
+             Authorization: AWS4-HMAC-SHA256 Credential={TEST_ACCESS_KEY}/{date}/{TEST_REGION}/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={}\r\n\
+             x-amz-content-sha256: {}\r\n\
+             x-amz-date: {amz_date}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n",
+            "0".repeat(64),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        for host in host_headers {
+            request.push_str("Host: ");
+            request.push_str(host);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        request.into_bytes()
+    }
+
+    fn current_amz_date() -> String {
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time is after the Unix epoch")
+            .as_secs();
+        crate::helpers::format_amz_date(epoch_secs)
+    }
+
+    fn endpoint_port(server: &TestServer) -> u16 {
+        url::Url::parse(server.endpoint())
+            .expect("valid test endpoint")
+            .port()
+            .expect("test endpoint has a port")
+    }
+
+    async fn read_raw_response<S>(mut stream: S, request: &[u8]) -> Vec<u8>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        stream.write_all(request).await.expect("write raw request");
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            crate::configured_test_timeout(),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("raw response should arrive")
+        .expect("read raw response");
+        response
+    }
+
+    async fn send_raw_http(server: &TestServer, request: &[u8]) -> Vec<u8> {
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", endpoint_port(server)))
+            .await
+            .expect("connect to HTTP test server");
+        read_raw_response(stream, request).await
+    }
+
+    fn test_tls_client_config(fixed_certificate_name: bool) -> ClientConfig {
+        let mut roots = RootCertStore::empty();
+        for cert in load_certs_from_pem(TEST_TLS_CA_CERT_PEM).expect("valid test CA") {
+            roots.add(cert).expect("add test CA root");
+        }
+        let roots = Arc::new(roots);
+        let mut config = if fixed_certificate_name {
+            let verifier = WebPkiServerVerifier::builder(roots)
+                .build()
+                .expect("build test TLS verifier");
+            let verifier = FixedCertificateNameVerifier {
+                inner: verifier,
+                certificate_name: ServerName::try_from("localhost")
+                    .expect("valid certificate DNS name")
+                    .to_owned(),
+            };
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_no_client_auth()
+        } else {
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        };
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config
+    }
+
+    async fn connect_raw_tls(
+        server: &TestServer,
+        server_name: ServerName<'static>,
+        fixed_certificate_name: bool,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", endpoint_port(server)))
+            .await
+            .expect("connect to HTTPS test server");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(test_tls_client_config(
+            fixed_certificate_name,
+        )));
+        connector.connect(server_name, stream).await
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ClassifierFingerprint<'a> {
+        status: &'a str,
+        code: Option<&'a str>,
+        message: Option<&'a str>,
+        s3_error_root: bool,
+        semantic_body_empty: bool,
+        has_s3_request_id_header: bool,
+    }
+
+    fn xml_element<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+        let start = format!("<{name}>");
+        let end = format!("</{name}>");
+        let (_, value) = body.split_once(&start)?;
+        let (value, _) = value.split_once(&end)?;
+        Some(value)
+    }
+
+    fn classifier_fingerprint(response: &[u8]) -> ClassifierFingerprint<'_> {
+        let response = std::str::from_utf8(response).expect("HTTP response is UTF-8");
+        let (head, body) = response
+            .split_once("\r\n\r\n")
+            .expect("HTTP response has header terminator");
+        let status = head.lines().next().expect("HTTP status line");
+        let has_s3_request_id_header = head.lines().skip(1).any(|line| {
+            line.split_once(':').is_some_and(|(name, _)| {
+                name.eq_ignore_ascii_case("x-amz-request-id")
+                    || name.eq_ignore_ascii_case("x-amz-id-2")
+            })
+        });
+        ClassifierFingerprint {
+            status,
+            code: xml_element(body, "Code"),
+            message: xml_element(body, "Message"),
+            s3_error_root: body.contains("<Error><Code>"),
+            semantic_body_empty: body.is_empty() || body == "0\r\n\r\n",
+            has_s3_request_id_header,
+        }
+    }
+
+    fn assert_shared_classifier_or_http_rejection(fingerprint: &ClassifierFingerprint<'_>) {
+        if fingerprint.status == "HTTP/1.1 400 Bad Request" && fingerprint.code.is_none() {
+            assert!(
+                fingerprint.semantic_body_empty,
+                "HTTP-parser rejection must have an empty semantic body: {fingerprint:?}"
+            );
+            assert!(
+                !fingerprint.has_s3_request_id_header,
+                "HTTP-parser rejection must precede S3 request-ID allocation: {fingerprint:?}"
+            );
+            return;
+        }
+        assert_eq!(fingerprint.status, "HTTP/1.1 403 Forbidden");
+        assert!(fingerprint.s3_error_root);
+        assert!(
+            matches!(
+                fingerprint.code,
+                Some("SignatureDoesNotMatch" | "AccessDenied")
+            ),
+            "accepted authority shape must remain in the shared S3 authentication path: {fingerprint:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_listener_host_authority_cannot_select_an_endpoint_kind() {
+        let server = TestServer::start_http().await;
+        let port = endpoint_port(&server);
+        let configured = format!("127.0.0.1:{port}");
+        let amz_date = current_amz_date();
+        let authorities = [
+            configured.as_str(),
+            "sts.us-east-1.amazonaws.com",
+            "111122223333.s3-control.us-east-1.amazonaws.com",
+            "unrelated.example",
+            "127.0.0.1:1",
+        ];
+
+        let baseline = send_raw_http(
+            &server,
+            &routing_boundary_request(&[&configured], false, &amz_date),
+        )
+        .await;
+        let baseline_fingerprint = classifier_fingerprint(&baseline);
+        assert_eq!(
+            baseline_fingerprint,
+            ClassifierFingerprint {
+                status: "HTTP/1.1 403 Forbidden",
+                code: Some("SignatureDoesNotMatch"),
+                message: Some("The request signature we calculated does not match the signature you provided. Check your key and signing method."),
+                s3_error_root: true,
+                semantic_body_empty: false,
+                has_s3_request_id_header: true,
+            }
+        );
+
+        for authority in authorities {
+            let response = send_raw_http(
+                &server,
+                &routing_boundary_request(&[authority], false, &amz_date),
+            )
+            .await;
+            assert_eq!(classifier_fingerprint(&response), baseline_fingerprint);
+        }
+
+        for hosts in [
+            Vec::<&str>::new(),
+            vec![configured.as_str(), configured.as_str()],
+            vec![configured.as_str(), "sts.us-east-1.amazonaws.com"],
+        ] {
+            let response =
+                send_raw_http(&server, &routing_boundary_request(&hosts, false, &amz_date)).await;
+            let fingerprint = classifier_fingerprint(&response);
+            assert_shared_classifier_or_http_rejection(&fingerprint);
+        }
+
+        let absolute = send_raw_http(
+            &server,
+            &routing_boundary_request(&[configured.as_str()], true, &amz_date),
+        )
+        .await;
+        assert_eq!(classifier_fingerprint(&absolute), baseline_fingerprint);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_tls_listener_sni_and_authority_cannot_select_an_endpoint_kind() {
+        let server = TestServer::start_https().await;
+        let port = endpoint_port(&server);
+        let configured = format!("localhost:{port}");
+        let amz_date = current_amz_date();
+        let request = routing_boundary_request(&[&configured], false, &amz_date);
+
+        let matching = connect_raw_tls(
+            &server,
+            ServerName::try_from("localhost")
+                .expect("valid DNS name")
+                .to_owned(),
+            false,
+        )
+        .await
+        .expect("matching SNI handshake");
+        let baseline = read_raw_response(matching, &request).await;
+        let baseline_fingerprint = classifier_fingerprint(&baseline);
+        assert_eq!(
+            baseline_fingerprint,
+            ClassifierFingerprint {
+                status: "HTTP/1.1 403 Forbidden",
+                code: Some("SignatureDoesNotMatch"),
+                message: Some("The request signature we calculated does not match the signature you provided. Check your key and signing method."),
+                s3_error_root: true,
+                semantic_body_empty: false,
+                has_s3_request_id_header: true,
+            }
+        );
+
+        let mismatched_sni = connect_raw_tls(
+            &server,
+            ServerName::try_from("sts.us-east-1.amazonaws.com")
+                .expect("valid DNS name")
+                .to_owned(),
+            true,
+        )
+        .await
+        .expect("server accepts mismatched SNI independently of routing");
+        let response = read_raw_response(mismatched_sni, &request).await;
+        assert_eq!(classifier_fingerprint(&response), baseline_fingerprint);
+
+        let no_sni = connect_raw_tls(
+            &server,
+            ServerName::try_from("127.0.0.1")
+                .expect("valid IP server name")
+                .to_owned(),
+            true,
+        )
+        .await
+        .expect("server permits a TLS connection without SNI");
+        let response = read_raw_response(no_sni, &request).await;
+        assert_eq!(classifier_fingerprint(&response), baseline_fingerprint);
+
+        let mismatched_authority = routing_boundary_request(
+            &["111122223333.s3-control.us-east-1.amazonaws.com"],
+            false,
+            &amz_date,
+        );
+        let matching_sni = connect_raw_tls(
+            &server,
+            ServerName::try_from("localhost")
+                .expect("valid DNS name")
+                .to_owned(),
+            false,
+        )
+        .await
+        .expect("matching SNI handshake");
+        let response = read_raw_response(matching_sni, &mismatched_authority).await;
+        assert_eq!(classifier_fingerprint(&response), baseline_fingerprint);
+
+        let rejected = connect_raw_tls(
+            &server,
+            ServerName::try_from("sts.us-east-1.amazonaws.com")
+                .expect("valid DNS name")
+                .to_owned(),
+            false,
+        )
+        .await;
+        let error = rejected
+            .expect_err("normal certificate verification must reject a mismatched TLS authority");
+        let tls_error = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<TlsError>());
+        assert!(
+            matches!(
+                tls_error,
+                Some(TlsError::InvalidCertificate(
+                    CertificateError::NotValidForName
+                        | CertificateError::NotValidForNameContext { .. }
+                ))
+            ),
+            "expected certificate-name rejection, got {error:?}"
+        );
+    }
 
     #[test]
     fn resolve_local_trace_config_prefers_explicit_argmin_vars() {

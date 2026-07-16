@@ -2072,7 +2072,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     hmac::sign(&key, data).as_ref().to_vec()
 }
 
-fn format_amz_date(epoch_secs: u64) -> String {
+pub(crate) fn format_amz_date(epoch_secs: u64) -> String {
     let days = epoch_secs / 86_400;
     let time_of_day = epoch_secs % 86_400;
     let (year, month, day) = days_to_date(days as i64);

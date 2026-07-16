@@ -777,6 +777,32 @@ the configured certificate/listener names. Assert the configured TLS policy's
 handshake or authority rejection boundary and prove that a mismatched SNI cannot
 change the endpoint kind after connection acceptance.
 
+The local authority trust-boundary matrix completed on 2026-07-16 against the
+real plain-HTTP and TLS listener paths. It holds the reserved S3 Control target,
+method, query, `s3` credential scope, timestamp, payload hash, and deliberately
+bad signature constant while varying only authority inputs. Configured,
+STS-looking, S3-Control-looking, unrelated, and wrong-port authorities all
+retain the S3 error root and authentication result. Missing and duplicate-
+identical/conflicting `Host` fields either remain in that same S3 authentication
+path or receive the HTTP parser's empty-body `400` before S3 request-ID headers
+are allocated; the test accepts either EOF or chunked empty-body framing without
+pinning which one is used. An absolute-form target with an authority conflicting
+with `Host` retains the shared-listener result.
+
+The TLS half uses the configured test CA normally for matching SNI and proves
+that normal certificate verification rejects an unrelated DNS name. A test-
+only verifier that still validates the certificate chain and the configured
+`localhost` certificate name lets the client deliberately reach the listener
+with an unrelated SNI, and an IP-address server name exercises a connection
+without SNI. Both accepted connections retain the same S3 classifier shape, as
+does a matching-SNI connection with an S3-Control-looking HTTP authority. The
+custom verifier exists only to observe server behavior after a client bypasses
+the normal name check; it is not a production trust policy. These deterministic
+listener tests close the Phase 0 authority-input evidence. Phase 4 must retain
+them while introducing the typed `SharedRegional` value and must repeat the
+accepted/rejected cases through standalone TLS UAT to verify production
+configuration wiring.
+
 Those goldens must identify, per endpoint kind, which path/method/decoding
 checks happen before authentication and which account/ARN/body/query checks
 happen after it. The typed service refactor is complete only when it retains the
@@ -2000,9 +2026,9 @@ authentication ordering. It establishes:
 
 Every valid-result assertion is an exact response golden. Every
 signature-mismatch assertion reconstructs and validates the complete canonical
-request without printing live credentials. The local Host/SNI trust-boundary
-cases are now the only routing-boundary evidence still required before the
-Phase 4 service refactor.
+request without printing live credentials. Together with the completed local
+Host/authority/SNI trust-boundary matrix, the routing-boundary evidence required
+before the Phase 4 service refactor is complete.
 
 The narrow current local `TagResource`/`UntagResource` routes still inherit the
 ordinary S3 listener's transport and are therefore a documented temporary gap;
@@ -2293,8 +2319,9 @@ body may appear in traces.
    `SharedRegional` mapping above have pinned the root-Query,
    versioned-path/form/query, bounded HTTP-method, path/percent/ARN near-miss,
    account-ID-header, signing/authentication, and operation-body rows. The local
-   authority/SNI matrix must still enforce the endpoint-kind trust boundary
-   before the typed service refactor.
+   authority/SNI matrix now also pins the endpoint-kind trust boundary before
+   the typed service refactor; standalone TLS UAT remains a Phase 4 wiring
+   acceptance check rather than an unresolved AWS-oracle question.
 
 ## Definition Of The First Usable Milestone
 

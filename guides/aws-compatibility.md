@@ -302,6 +302,10 @@ Current narrow exception:
   endpoint shape or AWS's documented HTTPS-only S3 Control transport for those
   operations and still accepts them on the ordinary S3 endpoint, including an
   ordinary plain-HTTP listener
+- local raw-listener tests establish the security boundary for that temporary
+  shared endpoint: changing accepted `Host` text, TLS SNI, or their relationship
+  does not select a different parser, while malformed HTTP authority and normal
+  certificate-name mismatches may be rejected before request classification
 - this is a temporary compatibility compromise that will be removed when the
   dedicated typed `s3-control` routing surface exists locally
 
