@@ -12367,6 +12367,18 @@ Phase 12.4 progress:
   regressions pin the reject-without-mutation, refresh, and retry sequence. The
   heartbeat model must include unrelated-PG epoch churn between preflight and
   migration as a first-class generated interleaving.
+  Two later retained route-change soaks exposed the same checked-client retry
+  boundary when the target PG itself made lifecycle progress between preflight
+  and confirmation. The conflict predicate now accepts unchanged lifecycle
+  state and the specific forward Peering-to-Active transition while requiring
+  the ordered acting set and pending-command recovery identity to remain exact.
+  Same-state Peering retries also require unchanged metadata-transfer identity;
+  other state transitions fail closed before resubmission. Authenticated
+  lost-request coverage pins the safe activation case, while a pending reporter
+  that the requested acting set would remove and transitions into Degraded,
+  Backfilling, or Inconsistent remain conflicts. Command apply independently
+  rejects any acting-set update that removes a current pending-command reporter,
+  closing the observation-to-resubmission race at the replicated boundary.
   A later replicated route-change soak exposed the corresponding confirmation
   gap after 37 successful leader-restart iterations. An acting-set mutation
   advanced the cluster to epoch 301 while the epoch bump had temporarily

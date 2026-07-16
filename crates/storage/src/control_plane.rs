@@ -3704,6 +3704,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
             }
             ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => {
                 validate_acting_set(self, pg_id, &acting_set)?;
+                validate_acting_set_preserves_pending_recovery(self, pg_id, &acting_set)?;
                 let mut next_snapshot = self.clone();
                 let mut changed = false;
                 match next_snapshot.pgs.get_mut(&pg_id) {
@@ -3825,6 +3826,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 transfer,
             } => {
                 validate_acting_set(self, pg_id, &acting_set)?;
+                validate_acting_set_preserves_pending_recovery(self, pg_id, &acting_set)?;
                 let record = self
                     .pg(pg_id)
                     .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
@@ -4550,16 +4552,21 @@ impl PgRouteSnapshot {
 }
 
 fn same_pg_acting_set_route(left: &PgRouteSnapshot, right: &PgRouteSnapshot) -> bool {
-    left.pg_id == right.pg_id
-        && left.primary_node_id == right.primary_node_id
-        && left.acting_set == right.acting_set
-        && left.state == right.state
+    if left.pg_id != right.pg_id
+        || left.acting_set != right.acting_set
+        || left.pending_metadata_command_recovery != right.pending_metadata_command_recovery
+    {
+        return false;
+    }
+    if left.state == PgState::Peering && right.state == PgState::Active {
+        return true;
+    }
+    left.state == right.state
         && left.peering_metadata_transfer == right.peering_metadata_transfer
         && left.peering_metadata_transfer_source_route_epoch
             == right.peering_metadata_transfer_source_route_epoch
         && left.peering_metadata_transfer_source_node_id
             == right.peering_metadata_transfer_source_node_id
-        && left.pending_metadata_command_recovery == right.pending_metadata_command_recovery
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17394,6 +17401,28 @@ fn validate_acting_set(
     Ok(())
 }
 
+fn validate_acting_set_preserves_pending_recovery(
+    snapshot: &ClusterControlSnapshot,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+) -> Result<(), ControlPlaneError> {
+    let Some(record) = snapshot.pg(pg_id) else {
+        return Ok(());
+    };
+    let Some(recovery) = snapshot.pending_metadata_command_recovery_for_pg(record)? else {
+        return Ok(());
+    };
+    if acting_set.contains(&recovery.reporting_node_id()) {
+        return Ok(());
+    }
+    Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+        pg_id: pg_id.get(),
+        node_id: recovery.reporting_node_id().as_u32(),
+        cluster_epoch: snapshot.cluster_epoch(),
+        pending: recovery.pending(),
+    })
+}
+
 fn validate_pg_heartbeat_observations(
     snapshot: &ClusterControlSnapshot,
     node_id: NodeId,
@@ -23640,6 +23669,241 @@ mod tests {
             snapshot.pg(target_pg_id).unwrap().acting_set(),
             &[NodeId::new(1), NodeId::new(2)]
         );
+    }
+
+    #[test]
+    fn authenticated_admin_pg_update_retries_across_target_pg_lifecycle_progress() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let target_pg_id = PgId::new(7);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        authority
+            .set_pg_acting_set(target_pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            target_pg_id.get(),
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        let preflight_epoch = authority.snapshot().cluster_epoch();
+
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            for request_number in 0..4 {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let expected_kind = match request_number {
+                    0 | 2 => ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+                    1 | 3 => ControlPlaneRpcKind::SetPgActingSet,
+                    _ => unreachable!(),
+                };
+                assert_eq!(request.kind, expected_kind);
+
+                if request_number == 1 {
+                    drop(request);
+                    drop(stream);
+                    authority
+                        .complete_pg_peering(
+                            target_pg_id,
+                            NodeId::new(1),
+                            node_incarnation(&authority, 1),
+                            2_001,
+                        )
+                        .unwrap();
+                    heartbeat_with_pg_proof(
+                        &mut authority,
+                        1,
+                        target_pg_id.get(),
+                        PgState::Active,
+                        active_proof,
+                        false,
+                        2_002,
+                    );
+                    assert_eq!(
+                        authority.snapshot().pg(target_pg_id).unwrap().state(),
+                        PgState::Active
+                    );
+                    assert!(authority.snapshot().cluster_epoch() > preflight_epoch);
+                    continue;
+                }
+
+                let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let response = build_control_plane_unix_response_with_auth_and_response_clock(
+                    &mut authority,
+                    request,
+                    issued_at_ms,
+                    Some(&verifier),
+                    || Ok(issued_at_ms),
+                )
+                .unwrap();
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+            }
+            authority.snapshot().clone()
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let cluster_epoch = crate::clock::with_time_override(3_000, || {
+            client.set_pg_acting_set_checked(
+                target_pg_id,
+                vec![NodeId::new(1), NodeId::new(2)],
+                3_000,
+            )
+        })
+        .unwrap();
+
+        let snapshot = server.join().unwrap();
+        assert_eq!(snapshot.cluster_epoch(), cluster_epoch);
+        assert_eq!(
+            snapshot.pg(target_pg_id).unwrap().acting_set(),
+            &[NodeId::new(1), NodeId::new(2)]
+        );
+    }
+
+    #[test]
+    fn pg_acting_set_retry_identity_rejects_pending_reporter_removed_by_update() {
+        let pg_id = PgId::new(7);
+        let reporting_node_id = NodeId::new(1);
+        let retained_node_id = NodeId::new(2);
+        let acting_set = vec![reporting_node_id, retained_node_id];
+        let before = PgRouteSnapshot::reconstructed(
+            ClusterEpoch::new(11).unwrap(),
+            pg_id,
+            reporting_node_id,
+            acting_set,
+            PgState::Active,
+        );
+        let pending = PendingMetadataCommandObservation::new(
+            before.cluster_epoch(),
+            NonZeroU64::new(3).unwrap(),
+            0xfeed_beef,
+        );
+        let mut recovery = before.clone();
+        recovery.cluster_epoch = ClusterEpoch::new(12).unwrap();
+        recovery.state = PgState::Peering;
+        recovery.pending_metadata_command_recovery = Some(PendingMetadataCommandRecovery::new(
+            reporting_node_id,
+            pending,
+        ));
+
+        let requested_acting_set = [retained_node_id];
+        assert!(!requested_acting_set.contains(&reporting_node_id));
+        assert!(!same_pg_acting_set_route(&before, &recovery));
+
+        for unsafe_state in [
+            PgState::Degraded,
+            PgState::Backfilling,
+            PgState::Inconsistent,
+        ] {
+            let mut changed = before.clone();
+            changed.state = unsafe_state;
+            assert!(!same_pg_acting_set_route(&before, &changed));
+        }
+    }
+
+    #[test]
+    fn pg_acting_set_command_rejects_removing_pending_reporter_before_mutation() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let pg_id = PgId::new(7);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        for node_id in [1, 2] {
+            heartbeat_with_pg_proof(
+                &mut authority,
+                node_id,
+                pg_id.get(),
+                PgState::Peering,
+                active_proof,
+                false,
+                2_000,
+            );
+        }
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let pending = test_pending_metadata_command(active_epoch);
+        let mut pending_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_002);
+        pending_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id,
+            state: PgState::Active,
+            metadata_proof: active_proof,
+            pending_metadata_command: Some(pending),
+        }];
+        authority
+            .refresh_node_heartbeat(pending_heartbeat, 2_002)
+            .unwrap();
+        assert_eq!(
+            authority
+                .snapshot()
+                .pending_metadata_command_recoveries()
+                .tasks(),
+            &[PendingMetadataCommandRecoveryTask::new(
+                pg_id,
+                PendingMetadataCommandRecovery::new(NodeId::new(1), pending),
+            )]
+        );
+
+        let before = authority.snapshot().clone();
+        let error = authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(2)])
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id: 7,
+                node_id: 1,
+                pending: actual,
+                ..
+            } if actual == pending
+        ));
+        assert_eq!(authority.snapshot(), &before);
     }
 
     #[test]
