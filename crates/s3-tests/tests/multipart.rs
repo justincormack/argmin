@@ -335,6 +335,86 @@ async fn upload_part_copy_retrying_operation_aborted(
         .await
 }
 
+type CompleteMultipartResult = Result<
+    aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput,
+    aws_sdk_s3::error::SdkError<
+        aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadError,
+    >,
+>;
+
+fn single_part_completion(etag: &str, part_number: i32) -> CompletedMultipartUpload {
+    CompletedMultipartUpload::builder()
+        .parts(
+            CompletedPart::builder()
+                .e_tag(etag)
+                .part_number(part_number)
+                .build(),
+        )
+        .build()
+}
+
+async fn send_single_part_completion(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    etag: &str,
+) -> CompleteMultipartResult {
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(single_part_completion(etag, part_number))
+        .send()
+        .await
+}
+
+fn spawn_barrier_single_part_completion(
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    key: &'static str,
+    upload_id: String,
+    part_number: i32,
+    etag: String,
+    barrier: Arc<tokio::sync::Barrier>,
+) -> tokio::task::JoinHandle<CompleteMultipartResult> {
+    tokio::spawn(async move {
+        barrier.wait().await;
+        send_single_part_completion(&client, &bucket, key, &upload_id, part_number, &etag).await
+    })
+}
+
+async fn create_single_part_upload(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    part_number: i32,
+    body: &[u8],
+) -> (String, String) {
+    let upload_id = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("S3 operation during multipart test")
+        .await
+        .unwrap()
+        .upload_id()
+        .unwrap()
+        .to_string();
+    let part = upload_part_retrying_operation_aborted(
+        client,
+        bucket,
+        key,
+        &upload_id,
+        part_number,
+        body.to_vec(),
+    )
+    .await;
+    (upload_id, part.e_tag().unwrap().to_string())
+}
+
 async fn complete_multipart_upload_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -347,11 +427,7 @@ async fn complete_multipart_upload_retrying_operation_aborted(
         .bucket(bucket)
         .key(key)
         .upload_id(upload_id)
-        .multipart_upload(
-            CompletedMultipartUpload::builder()
-                .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
-                .build(),
-        )
+        .multipart_upload(single_part_completion(etag, 1))
         .send_retrying_operation_aborted("complete multipart upload during multipart setup")
         .await
         .unwrap();
@@ -6320,6 +6396,394 @@ fn test_multipart_get_part_rejects_range_header() {
 // ── Multiple concurrent uploads for same key ────────────────────────
 
 #[test]
+fn test_complete_multipart_upload_racing_abort_is_serializable() {
+    s3_tests::run(async {
+        for attempt in 0..6 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let key = "complete-abort-race";
+            let (upload_id, etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"race body").await;
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let complete_task = spawn_barrier_single_part_completion(
+                client.clone(),
+                bucket.clone(),
+                key,
+                upload_id.clone(),
+                1,
+                etag.clone(),
+                Arc::clone(&barrier),
+            );
+
+            let abort_client = client.clone();
+            let abort_bucket = bucket.clone();
+            let abort_upload_id = upload_id.clone();
+            let abort_barrier = Arc::clone(&barrier);
+            let abort_task = tokio::spawn(async move {
+                abort_barrier.wait().await;
+                if attempt % 2 != 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                abort_client
+                    .abort_multipart_upload()
+                    .bucket(abort_bucket)
+                    .key(key)
+                    .upload_id(abort_upload_id)
+                    .send()
+                    .await
+            });
+
+            let (complete, abort) = tokio::join!(complete_task, abort_task);
+            let complete = complete.unwrap();
+            let abort = abort.unwrap();
+            abort.expect("raced AbortMultipartUpload should remain idempotently successful");
+            let get = client.get_object().bucket(&bucket).key(key).send().await;
+            let list = client
+                .list_parts()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            let retry =
+                send_single_part_completion(client, &bucket, key, &upload_id, 1, &etag).await;
+
+            assert_eq!(err_status(&list), 404);
+            assert_s3_err_code(&list, "NoSuchUpload");
+
+            match complete {
+                Ok(completed) => {
+                    let object = get.expect(
+                        "a successful raced completion must leave its object visible after abort",
+                    );
+                    assert_eq!(
+                        object.body.collect().await.unwrap().into_bytes().as_ref(),
+                        b"race body"
+                    );
+                    let replay = retry.expect(
+                        "an exact retry of the winning completion must remain successful after abort",
+                    );
+                    assert_eq!(replay.e_tag(), completed.e_tag());
+                    cleanup(&bucket, &[key]).await;
+                }
+                Err(err) => {
+                    assert_eq!(err.code(), Some("NoSuchUpload"));
+                    assert_eq!(err_status(&get), 404);
+                    assert_s3_err_code(&get, "NoSuchKey");
+                    assert_eq!(err_status(&retry), 404);
+                    assert_s3_err_code(&retry, "NoSuchUpload");
+                    cleanup(&bucket, &[]).await;
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn test_simultaneous_identical_complete_multipart_uploads_are_idempotent() {
+    s3_tests::run(async {
+        for attempt in 0..5 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let key = "simultaneous-identical-complete";
+            let (upload_id, etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"identical completion body")
+                    .await;
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let spawn_completion = |barrier: Arc<tokio::sync::Barrier>| {
+                spawn_barrier_single_part_completion(
+                    client.clone(),
+                    bucket.clone(),
+                    key,
+                    upload_id.clone(),
+                    1,
+                    etag.clone(),
+                    barrier,
+                )
+            };
+            let first = spawn_completion(Arc::clone(&barrier));
+            let second = spawn_completion(barrier);
+            let (first, second) = tokio::join!(first, second);
+            let first = first.unwrap();
+            let second = second.unwrap();
+            let retry =
+                send_single_part_completion(client, &bucket, key, &upload_id, 1, &etag).await;
+            let first = first.unwrap_or_else(|err| {
+                panic!("first identical completion attempt {attempt} failed: {err:?}")
+            });
+            let second = second.unwrap_or_else(|err| {
+                panic!("second identical completion attempt {attempt} failed: {err:?}")
+            });
+            let retry = retry.unwrap_or_else(|err| {
+                panic!("identical completion retry for attempt {attempt} failed: {err:?}")
+            });
+            assert_eq!(second.e_tag(), first.e_tag());
+            assert_eq!(retry.e_tag(), first.e_tag());
+
+            let object = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send_retrying_operation_aborted("read simultaneously completed object")
+                .await
+                .unwrap();
+            assert_eq!(object.e_tag(), first.e_tag());
+            assert_eq!(
+                object.body.collect().await.unwrap().into_bytes().as_ref(),
+                b"identical completion body"
+            );
+            assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+
+            cleanup(&bucket, &[key]).await;
+        }
+    });
+}
+
+#[test]
+fn test_simultaneous_different_complete_multipart_uploads_publish_one_manifest() {
+    s3_tests::run(async {
+        for attempt in 0..5 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let key = "simultaneous-different-complete";
+            let (upload_id, first_etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"first manifest").await;
+            let second_part = upload_part_retrying_operation_aborted(
+                client,
+                &bucket,
+                key,
+                &upload_id,
+                2,
+                b"second manifest".to_vec(),
+            )
+            .await;
+            let second_etag = second_part.e_tag().unwrap().to_string();
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let spawn_completion =
+                |barrier: Arc<tokio::sync::Barrier>, part_number: i32, etag: String| {
+                    spawn_barrier_single_part_completion(
+                        client.clone(),
+                        bucket.clone(),
+                        key,
+                        upload_id.clone(),
+                        part_number,
+                        etag,
+                        barrier,
+                    )
+                };
+            let first = spawn_completion(Arc::clone(&barrier), 1, first_etag.clone());
+            let second = spawn_completion(barrier, 2, second_etag.clone());
+            let (first, second) = tokio::join!(first, second);
+            let first = first.unwrap();
+            let second = second.unwrap();
+
+            let object = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            let object_etag = object.e_tag().unwrap().to_string();
+            let object_body = object.body.collect().await.unwrap().into_bytes();
+            let first_retry =
+                send_single_part_completion(client, &bucket, key, &upload_id, 1, &first_etag).await;
+            let second_retry =
+                send_single_part_completion(client, &bucket, key, &upload_id, 2, &second_etag)
+                    .await;
+            for completion in [&first, &second] {
+                if completion.is_err() {
+                    assert_eq!(err_status(completion), 404);
+                    assert_s3_err_code(completion, "NoSuchUpload");
+                }
+            }
+
+            match object_body.as_ref() {
+                b"first manifest" => {
+                    let first = first.unwrap_or_else(|err| {
+                        panic!(
+                            "the published first manifest in attempt {attempt} must have completed successfully: {err:?}"
+                        )
+                    });
+                    let replay = first_retry.unwrap_or_else(|err| {
+                        panic!(
+                            "the published first manifest in attempt {attempt} must replay successfully: {err:?}"
+                        )
+                    });
+                    assert_eq!(first.e_tag(), replay.e_tag());
+                    assert_eq!(replay.e_tag(), Some(object_etag.as_str()));
+                    assert_eq!(err_status(&second_retry), 404);
+                    assert_s3_err_code(&second_retry, "NoSuchUpload");
+                    if let Ok(second) = second {
+                        assert!(second.e_tag().is_some());
+                    }
+                }
+                b"second manifest" => {
+                    let second = second.unwrap_or_else(|err| {
+                        panic!(
+                            "the published second manifest in attempt {attempt} must have completed successfully: {err:?}"
+                        )
+                    });
+                    let replay = second_retry.unwrap_or_else(|err| {
+                        panic!(
+                            "the published second manifest in attempt {attempt} must replay successfully: {err:?}"
+                        )
+                    });
+                    assert_eq!(second.e_tag(), replay.e_tag());
+                    assert_eq!(replay.e_tag(), Some(object_etag.as_str()));
+                    assert_eq!(err_status(&first_retry), 404);
+                    assert_s3_err_code(&first_retry, "NoSuchUpload");
+                    if let Ok(first) = first {
+                        assert!(first.e_tag().is_some());
+                    }
+                }
+                other => panic!(
+                    "attempt {attempt} published bytes from neither competing manifest: {other:?}"
+                ),
+            }
+
+            assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+            cleanup(&bucket, &[key]).await;
+        }
+    });
+}
+
+#[test]
+fn test_upload_part_replacement_racing_completion_is_serializable() {
+    s3_tests::run(async {
+        for attempt in 0..10 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let key = "upload-part-completion-race";
+            let (upload_id, original_etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"original part").await;
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let spawn_replacement = |barrier: Arc<tokio::sync::Barrier>| {
+                let client = client.clone();
+                let bucket = bucket.clone();
+                let upload_id = upload_id.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    client
+                        .upload_part()
+                        .bucket(bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .part_number(1)
+                        .body(ByteStream::from_static(b"replacement part"))
+                        .send()
+                        .await
+                })
+            };
+            let spawn_completion = |barrier: Arc<tokio::sync::Barrier>| {
+                spawn_barrier_single_part_completion(
+                    client.clone(),
+                    bucket.clone(),
+                    key,
+                    upload_id.clone(),
+                    1,
+                    original_etag.clone(),
+                    barrier,
+                )
+            };
+            let (replacement, completion) = if attempt % 2 == 0 {
+                (
+                    spawn_replacement(Arc::clone(&barrier)),
+                    spawn_completion(barrier),
+                )
+            } else {
+                let completion = spawn_completion(Arc::clone(&barrier));
+                let replacement = spawn_replacement(barrier);
+                (replacement, completion)
+            };
+            let (replacement, completion) = tokio::join!(replacement, completion);
+            let replacement = replacement.unwrap();
+            let completion = completion.unwrap();
+
+            let get = client.get_object().bucket(&bucket).key(key).send().await;
+            let get_state = match get {
+                Ok(object) => Ok(object.body.collect().await.unwrap().into_bytes()),
+                Err(err) => Err(err.code().map(str::to_string)),
+            };
+            let list = client
+                .list_parts()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            let retry =
+                send_single_part_completion(client, &bucket, key, &upload_id, 1, &original_etag)
+                    .await;
+
+            match completion {
+                Ok(completed) => {
+                    assert_eq!(err_status(&replacement), 404);
+                    assert_s3_err_code(&replacement, "NoSuchUpload");
+                    assert_eq!(
+                        get_state.unwrap_or_else(|err| panic!(
+                            "completion-winning attempt {attempt} did not publish its object: {err:?}"
+                        )),
+                        Bytes::from_static(b"original part")
+                    );
+                    assert_eq!(err_status(&list), 404);
+                    assert_s3_err_code(&list, "NoSuchUpload");
+                    let replay = retry.unwrap_or_else(|err| {
+                        panic!(
+                            "completion-winning attempt {attempt} did not replay successfully: {err:?}"
+                        )
+                    });
+                    assert_eq!(replay.e_tag(), completed.e_tag());
+                    cleanup(&bucket, &[key]).await;
+                }
+                Err(err) => {
+                    assert_eq!(err.code(), Some("InvalidPart"));
+                    let replacement = replacement.unwrap_or_else(|err| {
+                        panic!(
+                            "replacement-winning attempt {attempt} did not return success: {err:?}"
+                        )
+                    });
+                    assert_eq!(get_state, Err(Some("NoSuchKey".to_string())));
+                    let listed = list.unwrap_or_else(|err| {
+                        panic!(
+                            "replacement-winning attempt {attempt} did not preserve the upload: {err:?}"
+                        )
+                    });
+                    assert_eq!(listed.parts().len(), 1);
+                    assert_eq!(listed.parts()[0].part_number(), Some(1));
+                    assert_eq!(listed.parts()[0].e_tag(), replacement.e_tag());
+                    assert_eq!(err_status(&retry), 400);
+                    assert_s3_err_code(&retry, "InvalidPart");
+
+                    let corrected = send_single_part_completion(
+                        client,
+                        &bucket,
+                        key,
+                        &upload_id,
+                        1,
+                        replacement.e_tag().unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    assert_object_contents_and_etag(
+                        &bucket,
+                        key,
+                        corrected.e_tag().unwrap(),
+                        b"replacement part",
+                    )
+                    .await;
+                    cleanup(&bucket, &[key]).await;
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn test_multipart_concurrent_uploads_same_key() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -6401,6 +6865,119 @@ fn test_multipart_concurrent_uploads_same_key() {
         assert!(data.iter().all(|&b| b == b'1'));
 
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_simultaneous_completions_of_distinct_uploads_to_same_key() {
+    s3_tests::run(async {
+        for attempt in 0..5 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let key = "distinct-upload-completion-race";
+
+            let (first_upload_id, first_etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"first upload").await;
+            let (second_upload_id, second_etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"second upload").await;
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let spawn_completion =
+                |barrier: Arc<tokio::sync::Barrier>, upload_id: String, etag: String| {
+                    spawn_barrier_single_part_completion(
+                        client.clone(),
+                        bucket.clone(),
+                        key,
+                        upload_id,
+                        1,
+                        etag,
+                        barrier,
+                    )
+                };
+            let (first, second) = if attempt % 2 == 0 {
+                let first = spawn_completion(
+                    Arc::clone(&barrier),
+                    first_upload_id.clone(),
+                    first_etag.clone(),
+                );
+                let second =
+                    spawn_completion(barrier, second_upload_id.clone(), second_etag.clone());
+                (first, second)
+            } else {
+                let second = spawn_completion(
+                    Arc::clone(&barrier),
+                    second_upload_id.clone(),
+                    second_etag.clone(),
+                );
+                let first = spawn_completion(barrier, first_upload_id.clone(), first_etag.clone());
+                (first, second)
+            };
+            let (first, second) = tokio::join!(first, second);
+            let first = first.unwrap();
+            let second = second.unwrap();
+
+            let object = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            let object_etag = object.e_tag().unwrap().to_string();
+            let object_body = object.body.collect().await.unwrap().into_bytes();
+            let first_retry =
+                send_single_part_completion(client, &bucket, key, &first_upload_id, 1, &first_etag)
+                    .await;
+            let second_retry = send_single_part_completion(
+                client,
+                &bucket,
+                key,
+                &second_upload_id,
+                1,
+                &second_etag,
+            )
+            .await;
+            let first = first.unwrap_or_else(|err| {
+                panic!("first distinct upload completion attempt {attempt} failed: {err:?}")
+            });
+            let second = second.unwrap_or_else(|err| {
+                panic!("second distinct upload completion attempt {attempt} failed: {err:?}")
+            });
+
+            match object_body.as_ref() {
+                b"first upload" => {
+                    let replay = first_retry.unwrap_or_else(|err| {
+                        panic!(
+                            "the current first upload in attempt {attempt} must replay successfully: {err:?}"
+                        )
+                    });
+                    assert_eq!(first.e_tag(), replay.e_tag());
+                    assert_eq!(replay.e_tag(), Some(object_etag.as_str()));
+                    assert_eq!(err_status(&second_retry), 404);
+                    assert_s3_err_code(&second_retry, "NoSuchUpload");
+                    assert!(second.e_tag().is_some());
+                }
+                b"second upload" => {
+                    let replay = second_retry.unwrap_or_else(|err| {
+                        panic!(
+                            "the current second upload in attempt {attempt} must replay successfully: {err:?}"
+                        )
+                    });
+                    assert_eq!(second.e_tag(), replay.e_tag());
+                    assert_eq!(replay.e_tag(), Some(object_etag.as_str()));
+                    assert_eq!(err_status(&first_retry), 404);
+                    assert_s3_err_code(&first_retry, "NoSuchUpload");
+                    assert!(first.e_tag().is_some());
+                }
+                other => panic!(
+                    "attempt {attempt} published bytes from neither distinct upload: {other:?}"
+                ),
+            }
+
+            assert_list_parts_no_such_upload(&bucket, key, &first_upload_id).await;
+            assert_list_parts_no_such_upload(&bucket, key, &second_upload_id).await;
+            cleanup(&bucket, &[key]).await;
+        }
     });
 }
 

@@ -66,7 +66,8 @@ use crate::error::ServerError;
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::system_metadata::SystemMetadata;
 
-const COMPLETE_MULTIPART_STALE_COMMIT_RETRIES: usize = 1;
+const COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES: usize = 1;
+pub(super) const COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRIES: usize = 8;
 
 fn complete_multipart_part_checksum(
     part: &MultipartPartRecord,
@@ -535,7 +536,8 @@ impl Coordinator {
             req.upload.upload_id(),
             req.parts.len()
         );
-        let mut stale_commit_retries = 0usize;
+        let mut terminal_race_retries = 0usize;
+        let mut stale_snapshot_retries = 0usize;
         'retry_stale_commit_snapshot: loop {
             let authorized =
                 self.authorize_complete_multipart_upload_with_storage_node(&storage_node, req)?;
@@ -610,6 +612,17 @@ impl Coordinator {
                 .load_multipart_completion_snapshot(&upload, &requested_part_numbers)
             {
                 Ok(snapshot) => snapshot,
+                Err(storage::ObjectPgActionError::Metadata(
+                    storage::MetadataError::NoSuchUpload { .. },
+                )) if terminal_race_retries < COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES => {
+                    // Another completion can publish after authorization but
+                    // before this snapshot lookup. Restart authorization so an
+                    // identical completion resolves through terminal replay,
+                    // while abort or a different manifest still resolves to
+                    // NoSuchUpload.
+                    terminal_race_retries += 1;
+                    continue 'retry_stale_commit_snapshot;
+                }
                 Err(storage::ObjectPgActionError::Metadata(
                     storage::MetadataError::PartNotFound { part_number, .. },
                 )) => {
@@ -895,9 +908,22 @@ impl Coordinator {
             ) {
                 Ok(outcome) => outcome,
                 Err(storage::ObjectPgActionError::StaleMultipartCompletionSnapshot)
-                    if stale_commit_retries < COMPLETE_MULTIPART_STALE_COMMIT_RETRIES =>
+                    if stale_snapshot_retries < COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRIES =>
                 {
-                    stale_commit_retries += 1;
+                    stale_snapshot_retries += 1;
+                    continue 'retry_stale_commit_snapshot;
+                }
+                Err(storage::ObjectPgActionError::StaleMultipartCompletionSnapshot) => {
+                    return Err(ServerError::OperationAborted);
+                }
+                Err(storage::ObjectPgActionError::Metadata(
+                    storage::MetadataError::NoSuchUpload { .. },
+                )) if terminal_race_retries < COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES => {
+                    // The upload can disappear after the validated snapshot if
+                    // another completion or abort publishes first. Reauthorize
+                    // to distinguish an identical terminal replay from a
+                    // genuinely unavailable upload.
+                    terminal_race_retries += 1;
                     continue 'retry_stale_commit_snapshot;
                 }
                 Err(error) => return Err(Coordinator::map_object_pg_action_error(error)),

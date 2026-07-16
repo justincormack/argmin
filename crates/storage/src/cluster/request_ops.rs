@@ -12634,6 +12634,11 @@ impl super::StorageCluster {
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        // A concurrent terminal command may have removed the active upload on
+        // part of the acting set before its object-scoped completion replay is
+        // visible everywhere. Finish the durable command before classifying
+        // the upload for CompleteMultipartUpload or AbortMultipartUpload.
+        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
         self.object_mutation_metadata_primary_client(bucket, key)?
             .lookup_multipart_upload_management(pg_id, bucket, key, upload_id)
     }

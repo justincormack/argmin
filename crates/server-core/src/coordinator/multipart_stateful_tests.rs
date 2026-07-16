@@ -574,6 +574,38 @@ fn install_multipart_complete_snapshot_race_hooks(
     }
 }
 
+fn install_one_shot_multipart_complete_snapshot_race_hooks(
+    bucket: &str,
+    key: &str,
+) -> MultipartCompletePreCommitRaceSync {
+    let serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let reached = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let reached_hook = Arc::clone(&reached);
+    let resume_hook = Arc::clone(&resume);
+    let first = Arc::new(AtomicBool::new(true));
+    let first_hook = Arc::clone(&first);
+    let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        before_multipart_complete_snapshot: Some(Arc::new(move || {
+            if first_hook.swap(false, Ordering::SeqCst) {
+                reached_hook.wait();
+                resume_hook.wait();
+            }
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    MultipartCompletePreCommitRaceSync {
+        reached,
+        resume,
+        _serial_guard: serial,
+        _guard: guard,
+    }
+}
+
 fn begin_stream_put_with_segment_path(
     coord: &Coordinator,
     bucket: &str,
@@ -1209,6 +1241,97 @@ fn completing_multipart_upload_rejects_late_abort_without_state_loss() {
     );
 }
 
+fn assert_identical_completion_race_replays_success(
+    bucket: &'static str,
+    key: &'static str,
+    install_hooks: fn(&str, &str) -> MultipartCompletePreCommitRaceSync,
+    invariant: &str,
+) {
+    let dir = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let delayed = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
+    let state = InvariantHarness::new(&admin);
+
+    admin
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, key, &[(1, b"part")]);
+
+    let sync = install_hooks(bucket, key);
+    let upload_id_for_delayed = upload_id.clone();
+    let parts_for_delayed = parts.clone();
+    let delayed_completion = std::thread::spawn(move || {
+        delayed.complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(bucket, key, &upload_id_for_delayed, test_requester()),
+            parts: &parts_for_delayed,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+    });
+
+    sync.reached.wait();
+    let winning = admin
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+    sync.resume.wait();
+
+    let replay = delayed_completion.join().unwrap().unwrap();
+    assert_eq!(replay.etag, winning.etag, "{invariant}");
+    assert_eq!(replay.version_id, winning.version_id, "{invariant}");
+
+    let object = admin
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request(bucket, key, None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(object.etag, winning.etag, "{invariant}");
+    let err = admin
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "{invariant}: completed upload must be terminal, got {err:?}"
+    );
+    state.assert_no_pending_multipart_uploads_for(bucket, key, invariant);
+}
+
+#[test]
+fn identical_completion_after_snapshot_lookup_race_replays_success() {
+    assert_identical_completion_race_replays_success(
+        "race-identical-snapshot-bucket",
+        "race-identical-snapshot-key",
+        install_one_shot_multipart_complete_snapshot_race_hooks,
+        "an identical completion authorized before another completion publishes must restart after its snapshot lookup loses the race and resolve through terminal replay",
+    );
+}
+
+#[test]
+fn identical_completion_after_pre_commit_race_replays_success() {
+    assert_identical_completion_race_replays_success(
+        "race-identical-commit-bucket",
+        "race-identical-commit-key",
+        install_one_shot_multipart_complete_pre_commit_race_hooks,
+        "an identical completion with a validated snapshot must restart when another completion publishes before its commit and resolve through terminal replay",
+    );
+}
+
 #[test]
 fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
     let dir = test_util::tempdir();
@@ -1383,6 +1506,100 @@ fn upload_part_replace_after_complete_snapshot_is_revalidated_before_publish() {
         .unwrap();
     assert_eq!(listed.parts.len(), 1, "{invariant}");
     assert_eq!(listed.parts[0].etag, replacement.etag, "{invariant}");
+}
+
+#[test]
+fn sustained_same_etag_part_replacement_returns_operation_aborted_without_publication() {
+    let dir = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let completer =
+        setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let uploader = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
+    let bucket = "race-complete-part-starvation";
+    let key = "race-complete-part-starvation-key";
+    let invariant = "sustained valid same-ETag part replacement must exhaust completion retries as OperationAborted without publishing an object or damaging the upload";
+    let state = InvariantHarness::new(&admin);
+
+    admin
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let part_bytes = b"same part bytes";
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, key, &[(1, part_bytes)]);
+
+    let sync = install_multipart_complete_pre_commit_race_hooks(bucket, key);
+    let upload_id_for_complete = upload_id.clone();
+    let parts_for_complete = parts.clone();
+    let t_complete = std::thread::spawn(move || {
+        completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(
+                bucket,
+                key,
+                &upload_id_for_complete,
+                test_requester(),
+            ),
+            parts: &parts_for_complete,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+    });
+
+    for replacement_index in 0..=multipart::COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRIES {
+        sync.reached.wait();
+        let replacement = test_helpers::upload_part(
+            &uploader,
+            &test_helpers::UploadPartRequest {
+                upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+                part_number: 1,
+                data: part_bytes,
+                claimed_checksum: None,
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            replacement.etag, parts[0].etag,
+            "{invariant}: replacement {replacement_index} must preserve the requested ETag"
+        );
+        sync.resume.wait();
+    }
+
+    let err = t_complete.join().unwrap().unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "{invariant}: got {err:?}"
+    );
+
+    let err = admin
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request(bucket, key, None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::ObjectNotFound { .. }),
+        "{invariant}: got published object {err:?}"
+    );
+
+    let listed = admin
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap();
+    assert_eq!(listed.parts.len(), 1, "{invariant}");
+    assert_eq!(listed.parts[0].part_number, 1, "{invariant}");
+    assert_eq!(listed.parts[0].etag, parts[0].etag, "{invariant}");
+    assert_eq!(
+        state.multipart_upload(bucket, key, &upload_id).state,
+        UploadState::InProgress,
+        "{invariant}"
+    );
 }
 
 #[test]

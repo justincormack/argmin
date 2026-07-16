@@ -221,10 +221,29 @@ For each matrix:
 
 ### 5. Lifecycle and concurrency
 
-- [ ] Probe complete/abort races, UploadPart/abort races, UploadPart/complete
+- [x] Probe complete/abort races, UploadPart/abort races, UploadPart/complete
   races, simultaneous completions, and concurrent uploads to the same key.
-- [ ] Assert only AWS-permitted outcomes, plus final object bytes, upload
-  visibility, part visibility, and retry behavior for every outcome.
+- [x] Assert only AWS-permitted outcomes, plus final object bytes, upload
+  visibility, part visibility, and retry behavior for every basic outcome.
+  Complete versus abort is serializable. Simultaneous identical completions
+  are idempotent and all return the same result. Different manifests for one
+  upload may both return success, although only the published manifest remains
+  replayable; a competing call may instead return `NoSuchUpload`. Distinct
+  uploads to one key both complete successfully, with last-writer object state
+  and replay retained only for the current unversioned object. UploadPart
+  replacement versus completion is serializable: either completion publishes
+  the original part and replacement returns `NoSuchUpload`, or replacement is
+  retained and completion of the old ETag returns `InvalidPart`.
+  Deterministic coordinator regressions pin completion races after
+  authorization, after snapshot lookup, and before commit. Completion restarts
+  terminal-transition races once and uses a separate bounded stale-snapshot
+  retry budget so one streaming replacement can settle without leaking an
+  `InternalError`. Exhausting that budget under sustained valid same-ETag part
+  replacement returns retryable `OperationAborted`; a deterministic regression
+  proves that it publishes no object and leaves the upload and selected part
+  intact. Multipart management lookup drains a concurrent durable terminal
+  command before classification, preserving AWS's idempotent abort result when
+  completion wins the race.
 - [ ] Cover versioned buckets, delete markers, conditional completion, multipart
   copy source changes, and object replacement without relying on timing-sensitive
   exact boundaries.
