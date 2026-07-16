@@ -4912,7 +4912,7 @@ fn get_object_part_zero_byte_single_part() {
     assert!(result.body.read_all().unwrap().is_empty());
     assert_eq!(result.part_size, 0);
     assert_eq!(result.size, 0);
-    assert_eq!(result.parts_count, 1);
+    assert_eq!(result.parts_count, Some(1));
     assert_eq!(result.part_start, 0);
     assert_eq!(result.part_end, 0);
 }
@@ -4965,7 +4965,7 @@ fn get_object_part_zero_byte_final_part() {
         .unwrap();
     assert!(result.body.read_all().unwrap().is_empty());
     assert_eq!(result.part_size, 0);
-    assert_eq!(result.parts_count, 2);
+    assert_eq!(result.parts_count, Some(2));
     assert_eq!(result.part_start, MIN_PART as u64);
     assert_eq!(result.part_end, MIN_PART as u64);
 }
@@ -5013,7 +5013,7 @@ fn head_object_part_non_multipart() {
         .unwrap();
     assert_eq!(result.part_size, 11);
     assert_eq!(result.total_size, 11);
-    assert_eq!(result.parts_count, 1);
+    assert_eq!(result.parts_count, None);
     assert_eq!(result.metadata.get("x-amz-meta-foo"), Some("bar"));
 
     // partNumber=2 on non-multipart object returns the object-read partNumber error.
@@ -5082,7 +5082,7 @@ fn head_object_part_non_multipart_zero_byte() {
         .unwrap();
     assert_eq!(result.part_size, 0);
     assert_eq!(result.total_size, 0);
-    assert_eq!(result.parts_count, 1);
+    assert_eq!(result.parts_count, None);
 }
 
 #[test]

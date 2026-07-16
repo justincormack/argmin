@@ -385,6 +385,7 @@ impl Coordinator {
                 last_modified: put_result.last_modified,
                 system_metadata: put_result.system_metadata.clone(),
                 version_id: put_result.version_id,
+                bucket_versioning: put_result.bucket_versioning,
                 managed_encryption: put_result.managed_encryption,
                 sse_customer: dst_response_sse_customer,
                 lifecycle_expiration: put_result.lifecycle_expiration,

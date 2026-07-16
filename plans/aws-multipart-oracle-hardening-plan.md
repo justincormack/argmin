@@ -292,7 +292,7 @@ public tests endpoint-independent and do not retry the first raced conditional
 request, because retrying `OperationAborted` would hide AWS's original 409/412
 choice.
 
-- [ ] Fill the static CopyObject destination matrix. Pin `If-None-Match: *`
+- [x] Fill the static CopyObject destination matrix. Pin `If-None-Match: *`
   against missing and existing destinations, then cover `If-Match` and
   `If-None-Match: *` across current live objects, current delete markers,
   enabled versioning, and suspended null versions. Every rejection must prove
@@ -302,14 +302,32 @@ choice.
   destination. In a versioned bucket, rejection over a current live version
   creates no new version; a current delete marker makes destination `If-Match`
   return `404 NoSuchKey`, while `If-None-Match: *` succeeds and publishes a new
-  current version without removing the retained object version or marker. The
-  suspended null-version cross-product remains open.
+  current version without removing the retained object version or marker.
+  Matching `If-Match` over a versioned live destination publishes a distinct
+  latest version and retains the exact prior version and bytes. In a suspended
+  bucket, rejected conditions preserve the current null live object or null
+  delete marker and the older numbered version. `If-None-Match: *` over the
+  null marker replaces it with a null live copy; matching `If-Match` then
+  replaces that null live row without accumulating null history, while the
+  numbered version remains readable. AWS omits `x-amz-version-id` from the
+  suspended PutObject setup response but returns `x-amz-version-id: null` from
+  suspended CopyObject and every GetObject/HeadObject variant, including range
+  and `partNumber` requests. The local response paths now carry the bucket
+  versioning state so they can match this operation-specific distinction. The
+  same oracle also pins that `partNumber=1` over a non-multipart object omits
+  `x-amz-mp-parts-count`; multipart objects continue to return their count.
 - [ ] Fill CopyObject and UploadPartCopy source-condition coverage. Cross the
   four source conditional families individually and in AWS's combined-header
   precedence pairs, including malformed dates, missing/current-delete-marker
   sources, explicit source versions, and source replacement or deletion while
   a copy is in progress. A success must copy one coherent source snapshot; a
-  failure must publish no destination or part.
+  failure must publish no destination or part. The combined ETag/date pairs are
+  now pinned for both operations: a present `If-Match` controls independently
+  of `If-Unmodified-Since`, and a present `If-None-Match` controls independently
+  of `If-Modified-Since`. The full truth table proves successful copies contain
+  the source bytes and ETag, while each 412 publishes neither a destination nor
+  a multipart part. The remaining source-state, malformed-input, and raced-copy
+  cases keep this item open.
 - [ ] Probe conditional PutObject contention for both the direct and streamed
   paths, including aws-chunked requests. Cover simultaneous
   `If-None-Match: *` creates, competing `If-Match` overwrites, intervening

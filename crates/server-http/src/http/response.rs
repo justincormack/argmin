@@ -1654,7 +1654,7 @@ impl S3Response {
             &result.system_metadata,
         );
         let mut resp = Self::new(200).xml_body(body);
-        if result.version_id.is_versioned() {
+        if result.bucket_versioning != BucketVersioningState::Disabled {
             let vid = format_version_id(result.version_id);
             resp.headers.push(("x-amz-version-id".to_string(), vid));
         }
@@ -1671,7 +1671,7 @@ impl S3Response {
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes");
-        if result.version_id.is_versioned() {
+        if result.bucket_versioning != BucketVersioningState::Disabled {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -1717,7 +1717,7 @@ impl S3Response {
             .header("Content-Length", &result.size.to_string())
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes");
-        if result.version_id.is_versioned() {
+        if result.bucket_versioning != BucketVersioningState::Disabled {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -1744,8 +1744,10 @@ impl S3Response {
             .header("ETag", &result.etag)
             .header("Content-Length", &result.part_size.to_string())
             .header("Last-Modified", &format_http_date(result.last_modified))
-            .header("Accept-Ranges", "bytes")
-            .header("x-amz-mp-parts-count", &result.parts_count.to_string());
+            .header("Accept-Ranges", "bytes");
+        if let Some(parts_count) = result.parts_count {
+            resp = resp.header("x-amz-mp-parts-count", &parts_count.to_string());
+        }
         if result.part_size != 0 {
             let content_range = format!(
                 "bytes {}-{}/{}",
@@ -1753,7 +1755,7 @@ impl S3Response {
             );
             resp = resp.header("Content-Range", &content_range);
         }
-        if result.version_id.is_versioned() {
+        if result.bucket_versioning != BucketVersioningState::Disabled {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -1792,7 +1794,7 @@ impl S3Response {
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes")
             .header("Content-Range", &content_range);
-        if result.version_id.is_versioned() {
+        if result.bucket_versioning != BucketVersioningState::Disabled {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -1817,8 +1819,10 @@ impl S3Response {
         let mut resp = Self::new(206)
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
-            .header("Accept-Ranges", "bytes")
-            .header("x-amz-mp-parts-count", &result.parts_count.to_string());
+            .header("Accept-Ranges", "bytes");
+        if let Some(parts_count) = result.parts_count {
+            resp = resp.header("x-amz-mp-parts-count", &parts_count.to_string());
+        }
         // Only emit Content-Range for non-empty parts; a zero-byte part has
         // no valid byte range to express.
         if result.part_size != 0 {
@@ -1828,7 +1832,7 @@ impl S3Response {
             );
             resp = resp.header("Content-Range", &content_range);
         }
-        if result.version_id.is_versioned() {
+        if result.bucket_versioning != BucketVersioningState::Disabled {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
@@ -2688,7 +2692,8 @@ fn date_to_days(year: i64, month: u32, day: u32) -> i64 {
 mod tests {
     use super::*;
     use crate::coordinator::{
-        GetObjectResult, HeadObjectResult, ListEntry, ListObjectsResult, PutObjectResult,
+        GetObjectPartResult, GetObjectRangeResult, GetObjectResult, HeadObjectPartResult,
+        HeadObjectResult, ListEntry, ListObjectsResult, PutObjectResult,
     };
     use crate::metadata_blob::MetadataBlob;
     use s3_types::{AclGrant, AclGrantee, AclGrants, AclPermission};
@@ -2759,6 +2764,7 @@ mod tests {
             etag: "\"abc123\"".to_string(),
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -2776,6 +2782,7 @@ mod tests {
             etag: "\"abc123\"".to_string(),
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
             lifecycle_expiration: None,
@@ -2793,6 +2800,7 @@ mod tests {
             etag: "\"abc123\"".to_string(),
             last_modified: 0,
             version_id: VersionId::from_u64(42),
+            bucket_versioning: BucketVersioningState::Enabled,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -2801,6 +2809,21 @@ mod tests {
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "ETag"), Some("\"abc123\""));
         assert_eq!(find_header(&resp, "x-amz-version-id"), Some("42"));
+    }
+
+    #[test]
+    fn put_object_response_suspended_null_omits_version_header() {
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            last_modified: 0,
+            version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Suspended,
+            system_metadata: SystemMetadata::EMPTY,
+            managed_encryption: None,
+            lifecycle_expiration: None,
+        };
+        let resp = S3Response::put_object(&result);
+        assert_eq!(find_header(&resp, "x-amz-version-id"), None);
     }
 
     #[test]
@@ -2815,6 +2838,7 @@ mod tests {
             etag: "\"abc123\"".to_string(),
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             system_metadata,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -2883,6 +2907,7 @@ mod tests {
             etag: "\"abc123\"".to_string(),
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -2912,6 +2937,7 @@ mod tests {
             etag: "\"abc123\"".to_string(),
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
             lifecycle_expiration: None,
@@ -2940,6 +2966,7 @@ mod tests {
             etag: "\"abc123\"".to_string(),
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -2967,6 +2994,7 @@ mod tests {
             etag: "\"abc123\"".to_string(),
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -2990,6 +3018,7 @@ mod tests {
             etag: "\"abc123\"".to_string(),
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: Some(LifecycleExpirationHeader {
@@ -3007,6 +3036,145 @@ mod tests {
     // ── get_object ────────────────────────────────────────────────────
 
     #[test]
+    fn copy_object_response_suspended_null_includes_version_header() {
+        let result = CopyObjectResult {
+            etag: "\"abc123\"".to_string(),
+            last_modified: 0,
+            system_metadata: SystemMetadata::EMPTY,
+            version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Suspended,
+            managed_encryption: None,
+            sse_customer: None,
+            lifecycle_expiration: None,
+        };
+        let resp = S3Response::copy_object(&result);
+        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("null"));
+    }
+
+    #[test]
+    fn get_object_response_suspended_null_includes_version_header() {
+        let result = GetObjectResult {
+            sse_customer: None,
+            body: ReadHandle::from_buffered_bytes(Vec::new()),
+            metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::EMPTY,
+            object_lock: s3_types::ObjectLockState::default(),
+            etag: "\"abc123\"".to_string(),
+            size: 0,
+            last_modified: 0,
+            version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Suspended,
+            tag_count: None,
+            managed_encryption: None,
+            lifecycle_expiration: None,
+        };
+        let resp = S3Response::get_object(result, None);
+        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("null"));
+    }
+
+    #[test]
+    fn suspended_null_read_variants_include_version_header() {
+        let range = GetObjectRangeResult {
+            body: ReadHandle::from_buffered_bytes(vec![1]),
+            metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::EMPTY,
+            object_lock: s3_types::ObjectLockState::default(),
+            etag: "\"abc123\"".to_string(),
+            size: 1,
+            last_modified: 0,
+            range_start: 0,
+            range_end: 0,
+            version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Suspended,
+            tag_count: None,
+            managed_encryption: None,
+            sse_customer: None,
+            lifecycle_expiration: None,
+        };
+        let range_response = S3Response::get_object_range(range);
+        assert_eq!(
+            find_header(&range_response, "x-amz-version-id"),
+            Some("null")
+        );
+
+        let part = GetObjectPartResult {
+            body: ReadHandle::from_buffered_bytes(vec![1]),
+            metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::EMPTY,
+            object_lock: s3_types::ObjectLockState::default(),
+            etag: "\"abc123\"".to_string(),
+            size: 1,
+            part_size: 1,
+            last_modified: 0,
+            part_start: 0,
+            part_end: 0,
+            parts_count: None,
+            version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Suspended,
+            tag_count: None,
+            checksum: None,
+            managed_encryption: None,
+            sse_customer: None,
+            lifecycle_expiration: None,
+        };
+        let part_response = S3Response::get_object_part(part);
+        assert_eq!(
+            find_header(&part_response, "x-amz-version-id"),
+            Some("null")
+        );
+        assert_eq!(find_header(&part_response, "x-amz-mp-parts-count"), None);
+
+        let head = HeadObjectResult {
+            metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::EMPTY,
+            object_lock: s3_types::ObjectLockState::default(),
+            etag: "\"abc123\"".to_string(),
+            size: 1,
+            last_modified: 0,
+            version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Suspended,
+            tag_count: None,
+            managed_encryption: None,
+            sse_customer: None,
+            lifecycle_expiration: None,
+        };
+        let head_response = S3Response::head_object(&head, None);
+        assert_eq!(
+            find_header(&head_response, "x-amz-version-id"),
+            Some("null")
+        );
+
+        let part_head = HeadObjectPartResult {
+            metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::EMPTY,
+            object_lock: s3_types::ObjectLockState::default(),
+            etag: "\"abc123\"".to_string(),
+            part_size: 1,
+            part_start: 0,
+            part_end: 0,
+            total_size: 1,
+            last_modified: 0,
+            parts_count: None,
+            version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Suspended,
+            tag_count: None,
+            checksum: None,
+            managed_encryption: None,
+            sse_customer: None,
+            lifecycle_expiration: None,
+        };
+        let part_head_response = S3Response::head_object_part(&part_head);
+        assert_eq!(
+            find_header(&part_head_response, "x-amz-version-id"),
+            Some("null")
+        );
+        assert_eq!(
+            find_header(&part_head_response, "x-amz-mp-parts-count"),
+            None
+        );
+    }
+
+    #[test]
     fn get_object_with_content_type() {
         let result = GetObjectResult {
             sse_customer: None,
@@ -3018,6 +3186,7 @@ mod tests {
             size: 5,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3040,6 +3209,7 @@ mod tests {
             size: 4,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3064,6 +3234,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3091,6 +3262,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3125,6 +3297,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3151,6 +3324,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3178,6 +3352,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3205,6 +3380,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3236,6 +3412,7 @@ mod tests {
             size: 5,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: Some(LifecycleExpirationHeader {
@@ -3263,6 +3440,7 @@ mod tests {
             size: 1024,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3286,6 +3464,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3311,6 +3490,7 @@ mod tests {
             size: 10,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3334,6 +3514,7 @@ mod tests {
             size: 10,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3357,6 +3538,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3379,6 +3561,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3402,6 +3585,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3428,6 +3612,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
@@ -3455,6 +3640,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
+            bucket_versioning: BucketVersioningState::Disabled,
             tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: Some(LifecycleExpirationHeader {

@@ -11801,13 +11801,12 @@ mod tests {
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 206);
 
-        let parts_count = resp
-            .headers
-            .iter()
-            .find(|(k, _)| k == "x-amz-mp-parts-count")
-            .map(|(_, v)| v.as_str())
-            .unwrap();
-        assert_eq!(parts_count, "1");
+        assert!(
+            resp.headers
+                .iter()
+                .all(|(name, _)| name != "x-amz-mp-parts-count"),
+            "AWS omits the multipart parts count for a non-multipart object"
+        );
 
         let content_range = resp
             .headers
