@@ -11192,11 +11192,15 @@ Required production shape and implementation order:
    closed by the bounded WAL-suffix slice below. Periodic checkpoint isolation
    and load validation are now also executable: checkpoint capture clones one
    consistent state-machine/log boundary through the async Raft API, then the
-   dedicated process checkpoint thread performs artifact encoding, file and
-   directory sync, and WAL prefix compaction synchronously after leaving the
-   Tokio runtime. A deterministic regression holds the state-machine boundary
-   while the captured artifact is persisted, proving the I/O phase does not
-   re-enter that boundary. A second regression appends a WAL record after
+   detached state-machine artifact refreshes any cached snapshot to its applied
+   tip after leaving the OpenRaft state-machine boundary. The dedicated process
+   checkpoint thread performs artifact encoding, file and directory sync, and
+   WAL prefix compaction synchronously after leaving the Tokio runtime. A
+   deterministic regression observes the detached artifact before refresh and
+   proves snapshot serialization occurs only after export; another holds the
+   state-machine boundary while the captured artifact is persisted, proving the
+   I/O phase does not re-enter that boundary. A further regression appends a
+   WAL record after
    capture, persists and compacts the older boundary, and proves restart
    recovers the post-capture suffix. The production-shaped gate now runs eight
    forced checkpoints concurrently with 48 covered heartbeats and 16 compact
@@ -11273,6 +11277,22 @@ Required production shape and implementation order:
    history window and reports cumulative/maximum monitor operation time. The
    monitor lock regression and WAL-ack/compaction regression run in the
    control-plane release gate alongside that workload.
+   Restart cost is part of the same bound. A retained route-change soak exposed
+   a 12.66 MB restart artifact with 2,883 retained entries whose cached
+   OpenRaft snapshot was at index 5,000 while the materialized state was at
+   index 6,883. Startup first replayed that 1,883-entry suffix during durable
+   decode and then replayed it again after WAL recovery; the two semantic
+   validation passes took approximately 11 seconds each on an otherwise idle
+   debug build and crossed the 30-second node-readiness boundary under soak
+   load. Durable startup now performs structural/checksum decode first and one
+   semantic validation against the WAL-replayed log before constructing Raft;
+   the public artifact decoder remains fully fail-closed. Checkpoint capture
+   also refreshes an existing cached snapshot to the exact captured applied
+   tip, so normal restart validates the current snapshot directly instead of
+   replaying a stale retained suffix. Forged stale snapshots remain supported
+   only through the fully validated suffix-replay path. Release testing must
+   retain a large-history restart case and fail if checkpoint capture again
+   persists a stale cached snapshot or startup duplicates semantic replay.
 7. Replace full-copy epoch history with a compact deterministic history model.
    Store route/topology deltas or minimal reconstruction records, plus bounded
    periodic bases where needed. Do not copy current heartbeat times, lease
