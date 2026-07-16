@@ -12347,6 +12347,23 @@ Phase 12.4 progress:
   regressions pin the reject-without-mutation, refresh, and retry sequence. The
   heartbeat model must include unrelated-PG epoch churn between preflight and
   migration as a first-class generated interleaving.
+  A later replicated route-change soak exposed the corresponding confirmation
+  gap after 37 successful leader-restart iterations. An acting-set mutation
+  advanced the cluster to epoch 301 while the epoch bump had temporarily
+  cleared PG 0's current-epoch primary observation. The checked admin client
+  treated the resulting `PG 0 has no serving primary` response as a permanent
+  failure even though the same gap had converged repeatedly at earlier epochs.
+  Checked acting-set updates now treat only the bounded, typed runtime-map
+  not-yet-serving states as retryable. The RPC response codec preserves
+  no-serving-primary, missing-primary-observation, non-active-primary-
+  observation, and unresolved-pending-command errors as distinct structured
+  variants; retry decisions do not inspect remote error text. Checked clients
+  continue to observe and compare the target PG route before resubmitting, so
+  an ambiguous response can be confirmed and an unapplied command can be
+  retried only while the target route remains exactly the preflight route.
+  Plain and authenticated Unix regressions each pin mutation apply, response
+  loss, all four typed serving gaps during confirmation, and eventual target-
+  route confirmation.
   CL1 is closed by the paired control-plane fence; RPC4's cross-epoch physical
   shard alias remains separate work.
 - Closed DCC-2/CP2/CL4 operational recovery. The process-local authority clock

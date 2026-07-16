@@ -9192,7 +9192,10 @@ impl UnixControlPlaneClient {
                     }
                     std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
                 }
-                Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                Err(error)
+                    if error.is_maybe_applied_control_plane_rpc_response_loss()
+                        || error.is_transient_runtime_map_serving_gap() =>
+                {
                     if Instant::now() >= deadline {
                         return Err(ControlPlaneError::RpcUnconfirmed {
                             message: last_unconfirmed_message.unwrap_or_else(|| format!(
@@ -9888,7 +9891,10 @@ impl AuthenticatedUnixControlPlaneClient {
                     }
                     std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
                 }
-                Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                Err(error)
+                    if error.is_maybe_applied_control_plane_rpc_response_loss()
+                        || error.is_transient_runtime_map_serving_gap() =>
+                {
                     if Instant::now() >= deadline {
                         return Err(ControlPlaneError::RpcUnconfirmed {
                             message: last_unconfirmed_message.unwrap_or_else(|| format!(
@@ -13034,6 +13040,36 @@ fn encode_control_plane_rpc_response(
             write_u32(&mut payload, pg_id);
             write_u64(&mut payload, cluster_epoch.get());
         }
+        Err(ControlPlaneError::PgHasNoServingPrimary {
+            pg_id,
+            cluster_epoch,
+        }) => {
+            write_u8(&mut payload, 4);
+            write_u32(&mut payload, pg_id);
+            write_u64(&mut payload, cluster_epoch.get());
+        }
+        Err(ControlPlaneError::PgPrimaryMissingActiveObservation {
+            pg_id,
+            node_id,
+            cluster_epoch,
+        }) => {
+            write_u8(&mut payload, 5);
+            write_u32(&mut payload, pg_id);
+            write_u32(&mut payload, node_id);
+            write_u64(&mut payload, cluster_epoch.get());
+        }
+        Err(ControlPlaneError::PgPrimaryObservationNotActive {
+            pg_id,
+            node_id,
+            cluster_epoch,
+            state,
+        }) => {
+            write_u8(&mut payload, 6);
+            write_u32(&mut payload, pg_id);
+            write_u32(&mut payload, node_id);
+            write_u64(&mut payload, cluster_epoch.get());
+            write_pg_state(&mut payload, state);
+        }
         Err(error) => {
             write_u8(&mut payload, 1);
             write_string(&mut payload, &error.to_string())?;
@@ -13088,6 +13124,42 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             Err(ControlPlaneError::PgMetadataMigrationSourceNotReady {
                 pg_id,
                 cluster_epoch,
+            })
+        }
+        4 => {
+            let pg_id = reader.read_u32()?;
+            let cluster_epoch =
+                read_cluster_epoch(&mut reader, "PG serving-primary cluster epoch")?;
+            reader.finish()?;
+            Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id,
+                cluster_epoch,
+            })
+        }
+        5 => {
+            let pg_id = reader.read_u32()?;
+            let node_id = reader.read_u32()?;
+            let cluster_epoch =
+                read_cluster_epoch(&mut reader, "PG primary-observation cluster epoch")?;
+            reader.finish()?;
+            Err(ControlPlaneError::PgPrimaryMissingActiveObservation {
+                pg_id,
+                node_id,
+                cluster_epoch,
+            })
+        }
+        6 => {
+            let pg_id = reader.read_u32()?;
+            let node_id = reader.read_u32()?;
+            let cluster_epoch =
+                read_cluster_epoch(&mut reader, "PG primary-observation cluster epoch")?;
+            let state = read_pg_state(&mut reader)?;
+            reader.finish()?;
+            Err(ControlPlaneError::PgPrimaryObservationNotActive {
+                pg_id,
+                node_id,
+                cluster_epoch,
+                state,
             })
         }
         _ => Err(ControlPlaneError::RpcProtocol {
@@ -15588,7 +15660,19 @@ impl ControlPlaneError {
     #[must_use]
     fn is_retryable_pg_acting_set_checked_error(&self) -> bool {
         self.is_maybe_applied_control_plane_rpc_response_loss()
+            || self.is_transient_runtime_map_serving_gap()
             || matches!(self, Self::PgMetadataMigrationSourceNotReady { .. })
+    }
+
+    #[must_use]
+    fn is_transient_runtime_map_serving_gap(&self) -> bool {
+        matches!(
+            self,
+            Self::PgHasNoServingPrimary { .. }
+                | Self::PgPrimaryMissingActiveObservation { .. }
+                | Self::PgPrimaryObservationNotActive { .. }
+                | Self::PgPeeringPendingMetadataCommand { .. }
+        )
     }
 }
 
@@ -21381,6 +21465,61 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_preserves_runtime_map_serving_gap_error_identities() {
+        let cluster_epoch = ClusterEpoch::new(44).unwrap();
+
+        let encoded =
+            encode_control_plane_rpc_response(Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: 7,
+                cluster_epoch,
+            }))
+            .unwrap();
+        assert!(matches!(
+            decode_control_plane_rpc_response(encoded),
+            Err(ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: 7,
+                cluster_epoch: decoded_epoch,
+            }) if decoded_epoch == cluster_epoch
+        ));
+
+        let encoded = encode_control_plane_rpc_response(Err(
+            ControlPlaneError::PgPrimaryMissingActiveObservation {
+                pg_id: 7,
+                node_id: 3,
+                cluster_epoch,
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            decode_control_plane_rpc_response(encoded),
+            Err(ControlPlaneError::PgPrimaryMissingActiveObservation {
+                pg_id: 7,
+                node_id: 3,
+                cluster_epoch: decoded_epoch,
+            }) if decoded_epoch == cluster_epoch
+        ));
+
+        let encoded = encode_control_plane_rpc_response(Err(
+            ControlPlaneError::PgPrimaryObservationNotActive {
+                pg_id: 7,
+                node_id: 3,
+                cluster_epoch,
+                state: PgState::Peering,
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            decode_control_plane_rpc_response(encoded),
+            Err(ControlPlaneError::PgPrimaryObservationNotActive {
+                pg_id: 7,
+                node_id: 3,
+                cluster_epoch: decoded_epoch,
+                state: PgState::Peering,
+            }) if decoded_epoch == cluster_epoch
+        ));
+    }
+
+    #[test]
     fn control_plane_rpc_preserves_metadata_migration_source_not_ready_identity() {
         let cluster_epoch = ClusterEpoch::new(44).unwrap();
         let encoded = encode_control_plane_rpc_response(Err(
@@ -23593,8 +23732,38 @@ mod tests {
         assert_eq!(metrics.rejected_total(), 0);
     }
 
+    fn runtime_map_serving_gap_test_errors() -> [ControlPlaneError; 4] {
+        [
+            ControlPlaneError::PgHasNoServingPrimary {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            },
+            ControlPlaneError::PgPrimaryMissingActiveObservation {
+                pg_id: 0,
+                node_id: 1,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            },
+            ControlPlaneError::PgPrimaryObservationNotActive {
+                pg_id: 0,
+                node_id: 1,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                state: PgState::Peering,
+            },
+            ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id: 0,
+                node_id: 1,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                pending: PendingMetadataCommandObservation::new(
+                    ClusterEpoch::new(2).unwrap(),
+                    NonZeroU64::new(1).unwrap(),
+                    0xfeed_beef,
+                ),
+            },
+        ]
+    }
+
     #[test]
-    fn authenticated_admin_pg_update_confirms_after_lost_response() {
+    fn authenticated_admin_pg_update_confirms_after_all_typed_serving_gaps() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -23648,6 +23817,26 @@ mod tests {
             .expect("dropped authenticated admin mutation should still apply");
             drop(stream);
 
+            for error in runtime_map_serving_gap_test_errors() {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                let request =
+                    verify_control_plane_unix_request(request, Some(&verifier), issued_at_ms)
+                        .unwrap();
+                let response =
+                    build_control_plane_unix_admission_error_response(request, error, issued_at_ms)
+                        .unwrap();
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+            }
+
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
             let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
@@ -23684,10 +23873,10 @@ mod tests {
         server.join().unwrap();
         assert!(cluster_epoch.get() >= 2);
         let metrics = verifier_for_assert.metrics_snapshot();
-        assert_eq!(metrics.accepted_total(), 3);
+        assert_eq!(metrics.accepted_total(), 7);
         assert_eq!(
             metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
-            3
+            7
         );
         assert_eq!(metrics.rejected_total(), 0);
     }
@@ -25507,7 +25696,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_control_plane_client_observes_pg_acting_set_after_lost_response() {
+    fn unix_control_plane_client_observes_pg_acting_set_after_all_typed_serving_gaps() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -25541,6 +25730,17 @@ mod tests {
             assert_eq!(authority.snapshot().cluster_epoch(), expected_epoch);
             drop(response);
             drop(stream);
+
+            for error in runtime_map_serving_gap_test_errors() {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+                let response = ControlPlaneRpcResponse {
+                    kind: request.kind,
+                    payload: encode_control_plane_rpc_response(Err(error)).unwrap(),
+                };
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+            }
 
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
