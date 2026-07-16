@@ -295,6 +295,7 @@ pub struct CopyObjectResult {
     pub system_metadata: SystemMetadata,
     pub version_id: VersionId,
     pub bucket_versioning: BucketVersioningState,
+    pub copy_source_version_id: Option<VersionId>,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_customer: Option<SseCustomerResponseHeaders>,
     pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
@@ -420,6 +421,7 @@ pub struct UploadPartResult {
 pub struct UploadPartCopyResult {
     pub etag: String,
     pub last_modified: u64,
+    pub copy_source_version_id: Option<VersionId>,
     /// Computed checksum for this copied part (if the multipart upload has one).
     pub checksum: Option<RawChecksum>,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,

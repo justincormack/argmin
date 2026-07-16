@@ -326,7 +326,20 @@ choice.
   of `If-Unmodified-Since`, and a present `If-None-Match` controls independently
   of `If-Modified-Since`. The full truth table proves successful copies contain
   the source bytes and ETag, while each 412 publishes neither a destination nor
-  a multipart part. The remaining source-state, malformed-input, and raced-copy
+  a multipart part. A second cross-operation matrix pins source resolution
+  ahead of all four condition families: missing and current-delete-marker
+  sources return `404 NoSuchKey`, an explicitly selected delete-marker version
+  returns `400 InvalidRequest`, and conditions on an explicitly selected live
+  version use that version's ETag and timestamp rather than the current source
+  state. Successful explicit-version copies return
+  `x-amz-copy-source-version-id`; local CopyObject and UploadPartCopy responses
+  now preserve that selected source identity. A separate source-version header
+  oracle pins the complete rule for both operations: an implicit current
+  numbered version returns its ID; an implicit null version in a never-versioned
+  or suspended bucket omits the header; and explicitly selecting
+  `versionId=null` returns `null` in both bucket states. Exact source version and
+  marker history is unchanged, and every rejection publishes neither a
+  destination nor a part. The remaining malformed-input and raced CopyObject
   cases keep this item open.
 - [ ] Probe conditional PutObject contention for both the direct and streamed
   paths, including aws-chunked requests. Cover simultaneous

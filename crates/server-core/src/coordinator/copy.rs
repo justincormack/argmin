@@ -23,6 +23,14 @@ use super::{
 use crate::conditional::check_copy_source_conditions;
 use crate::error::ServerError;
 
+fn copy_source_response_version_id(
+    requested_version_id: Option<storage::VersionId>,
+    selected_version_id: storage::VersionId,
+) -> Option<storage::VersionId> {
+    (requested_version_id.is_some() || selected_version_id.is_versioned())
+        .then_some(selected_version_id)
+}
+
 impl Coordinator {
     fn copy_source_snapshot_to_read_handle(
         &self,
@@ -193,7 +201,7 @@ impl Coordinator {
             destination: dst_authorized,
         } = self.authorize_copy_object_with_storage_node(&storage_node, req)?;
 
-        let (src_metadata, src_system_metadata, src_tags, mut source_body) = {
+        let (src_metadata, src_system_metadata, src_tags, copy_source_version_id, mut source_body) = {
             let src_stored = source_snapshot.stored.clone();
             let src_record = match &src_stored {
                 StoredObject::Live(r) => r,
@@ -272,6 +280,7 @@ impl Coordinator {
                 src_metadata,
                 src_system_metadata,
                 src_record.tags.clone(),
+                copy_source_response_version_id(src_version_id, src_record.version_id),
                 body,
             )
         };
@@ -386,6 +395,7 @@ impl Coordinator {
                 system_metadata: put_result.system_metadata.clone(),
                 version_id: put_result.version_id,
                 bucket_versioning: put_result.bucket_versioning,
+                copy_source_version_id,
                 managed_encryption: put_result.managed_encryption,
                 sse_customer: dst_response_sse_customer,
                 lifecycle_expiration: put_result.lifecycle_expiration,
@@ -432,7 +442,7 @@ impl Coordinator {
             destination,
         } = self.authorize_upload_part_copy_with_storage_node(&storage_node, req)?;
 
-        let mut source_body = {
+        let (copy_source_version_id, mut source_body) = {
             let src_stored = source.stored.clone();
 
             let src_record = match &src_stored {
@@ -481,14 +491,18 @@ impl Coordinator {
                 });
             }
 
-            self.copy_source_snapshot_to_range_read_handle(
+            let body = self.copy_source_snapshot_to_range_read_handle(
                 &req.source.bucket,
                 &req.source.key,
                 read_runtime,
                 source,
                 (read_start as usize, read_end as usize),
                 source_sse_customer,
-            )?
+            )?;
+            (
+                copy_source_response_version_id(src_version_id, src_record.version_id),
+                body,
+            )
         };
 
         let AuthorizedMultipartPartWrite {
@@ -602,6 +616,7 @@ impl Coordinator {
         Ok(UploadPartCopyResult {
             etag: inner.etag,
             last_modified: inner.last_modified,
+            copy_source_version_id,
             checksum: inner.checksum,
             managed_encryption: inner.managed_encryption,
             sse_customer: sse_customer_headers,

@@ -7,7 +7,7 @@ use crate::coordinator::{
     DeleteObjectsResult, GetBucketAclResult, GetObjectAclResult, GetObjectPartResult,
     GetObjectRangeResult, GetObjectResult, HeadObjectPartResult, HeadObjectResult,
     LifecycleAbortHeaders, LifecycleExpirationHeader, ListObjectVersionsResult, ListObjectsResult,
-    ListPartsResult, PutObjectResult, ReadHandle,
+    ListPartsResult, PutObjectResult, ReadHandle, UploadPartCopyResult,
 };
 use crate::error::{ManagedEncryptionReadHeader, ManagedEncryptionReadHeaderContext, ServerError};
 use auth::canonical::uri_encode;
@@ -1658,6 +1658,12 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp.headers.push(("x-amz-version-id".to_string(), vid));
         }
+        if let Some(version_id) = result.copy_source_version_id {
+            resp.headers.push((
+                "x-amz-copy-source-version-id".to_string(),
+                format_version_id(version_id),
+            ));
+        }
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
             .apply_managed_encryption_headers(result.managed_encryption)
             .apply_sse_customer_headers(result.sse_customer.as_ref())
@@ -2378,18 +2384,19 @@ impl S3Response {
 
     /// Build a response for `UploadPartCopy` (200 OK, XML body with `CopyPartResult`).
     #[must_use]
-    pub fn upload_part_copy(
-        etag: &str,
-        last_modified: u64,
-        checksum: Option<&RawChecksum>,
-        managed_encryption: Option<ManagedEncryptionAlgorithm>,
-        sse_customer: Option<&SseCustomerResponseHeaders>,
-    ) -> Self {
-        let body = xml::copy_part_result_xml(etag, last_modified, checksum);
-        Self::new(200)
-            .xml_body(body)
-            .apply_managed_encryption_headers(managed_encryption)
-            .apply_sse_customer_headers(sse_customer)
+    pub fn upload_part_copy(result: &UploadPartCopyResult) -> Self {
+        let body =
+            xml::copy_part_result_xml(&result.etag, result.last_modified, result.checksum.as_ref());
+        let mut response = Self::new(200).xml_body(body);
+        if let Some(version_id) = result.copy_source_version_id {
+            response = response.header(
+                "x-amz-copy-source-version-id",
+                &format_version_id(version_id),
+            );
+        }
+        response
+            .apply_managed_encryption_headers(result.managed_encryption)
+            .apply_sse_customer_headers(result.sse_customer.as_ref())
     }
 
     /// Build a response for `CompleteMultipartUpload` (200 OK, XML body).
@@ -3043,12 +3050,34 @@ mod tests {
             system_metadata: SystemMetadata::EMPTY,
             version_id: VersionId::Null,
             bucket_versioning: BucketVersioningState::Suspended,
+            copy_source_version_id: Some(VersionId::from_u64(42)),
             managed_encryption: None,
             sse_customer: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::copy_object(&result);
         assert_eq!(find_header(&resp, "x-amz-version-id"), Some("null"));
+        assert_eq!(
+            find_header(&resp, "x-amz-copy-source-version-id"),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn upload_part_copy_response_includes_source_version_header() {
+        let result = UploadPartCopyResult {
+            etag: "\"abc123\"".to_string(),
+            last_modified: 0,
+            copy_source_version_id: Some(VersionId::from_u64(42)),
+            checksum: None,
+            managed_encryption: None,
+            sse_customer: None,
+        };
+        let resp = S3Response::upload_part_copy(&result);
+        assert_eq!(
+            find_header(&resp, "x-amz-copy-source-version-id"),
+            Some("42")
+        );
     }
 
     #[test]

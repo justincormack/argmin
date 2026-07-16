@@ -4,7 +4,8 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, err_status, raw_object_with,
+    assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
+    raw_object_with,
     shape::{assert_shape, error_response_headers, expected_error, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
@@ -2101,6 +2102,582 @@ fn test_copy_source_combined_etag_date_precedence() {
                 .unwrap();
         }
         cleanup(&bucket, &["src"]).await;
+    });
+}
+
+#[test]
+fn test_copy_source_conditions_resolve_selected_source_version_first() {
+    s3_tests::run(async {
+        #[derive(Clone)]
+        enum SourceCondition {
+            Match(String),
+            NoneMatch(String),
+            ModifiedSince(DateTime),
+            UnmodifiedSince(DateTime),
+        }
+
+        struct SourceStateCase {
+            name: &'static str,
+            copy_source: String,
+            condition: SourceCondition,
+            expected_error: Option<(u16, &'static str)>,
+            expected_source_version: Option<String>,
+        }
+
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+
+        let first = put_object_result_retrying_operation_aborted(
+            "put first conditional copy source version",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("src")
+                    .body(ByteStream::from_static(b"first source"))
+            },
+        )
+        .await
+        .unwrap();
+        let first_etag = first.e_tag().unwrap().to_string();
+        let first_version = first.version_id().unwrap().to_string();
+
+        let second = put_object_result_retrying_operation_aborted(
+            "put second conditional copy source version",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("src")
+                    .body(ByteStream::from_static(b"second source"))
+            },
+        )
+        .await
+        .unwrap();
+        let second_etag = second.e_tag().unwrap().to_string();
+        let second_version = second.version_id().unwrap().to_string();
+
+        let first_head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("src")
+            .version_id(&first_version)
+            .send_retrying_operation_aborted("head first conditional copy source version")
+            .await
+            .unwrap();
+        let first_last_modified = *first_head.last_modified().unwrap();
+
+        let marker = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("src")
+            .send_retrying_operation_aborted("create conditional copy source delete marker")
+            .await
+            .unwrap();
+        assert_eq!(marker.delete_marker(), Some(true));
+        let marker_version = marker.version_id().unwrap().to_string();
+
+        let wrong_etag = "\"0000000000000000\"".to_string();
+        let past = DateTime::from_secs(0);
+        let future = DateTime::from_secs(4_102_444_800);
+        let missing_source = format!("{bucket}/missing");
+        let current_marker_source = format!("{bucket}/src");
+        let first_source = copy_source_with_version(&bucket, "src", &first_version);
+        let marker_source = copy_source_with_version(&bucket, "src", &marker_version);
+
+        let cases = vec![
+            SourceStateCase {
+                name: "missing source with If-Match",
+                copy_source: missing_source.clone(),
+                condition: SourceCondition::Match(wrong_etag.clone()),
+                expected_error: Some((404, "NoSuchKey")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "missing source with If-None-Match",
+                copy_source: missing_source.clone(),
+                condition: SourceCondition::NoneMatch(wrong_etag.clone()),
+                expected_error: Some((404, "NoSuchKey")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "missing source with If-Modified-Since",
+                copy_source: missing_source.clone(),
+                condition: SourceCondition::ModifiedSince(past),
+                expected_error: Some((404, "NoSuchKey")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "missing source with If-Unmodified-Since",
+                copy_source: missing_source,
+                condition: SourceCondition::UnmodifiedSince(future),
+                expected_error: Some((404, "NoSuchKey")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "current delete marker with If-Match",
+                copy_source: current_marker_source.clone(),
+                condition: SourceCondition::Match(first_etag.clone()),
+                expected_error: Some((404, "NoSuchKey")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "current delete marker with If-None-Match",
+                copy_source: current_marker_source.clone(),
+                condition: SourceCondition::NoneMatch(wrong_etag.clone()),
+                expected_error: Some((404, "NoSuchKey")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "current delete marker with If-Modified-Since",
+                copy_source: current_marker_source.clone(),
+                condition: SourceCondition::ModifiedSince(past),
+                expected_error: Some((404, "NoSuchKey")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "current delete marker with If-Unmodified-Since",
+                copy_source: current_marker_source,
+                condition: SourceCondition::UnmodifiedSince(future),
+                expected_error: Some((404, "NoSuchKey")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "explicit live version with matching If-Match",
+                copy_source: first_source.clone(),
+                condition: SourceCondition::Match(first_etag.clone()),
+                expected_error: None,
+                expected_source_version: Some(first_version.clone()),
+            },
+            SourceStateCase {
+                name: "explicit live version with current-version If-Match",
+                copy_source: first_source.clone(),
+                condition: SourceCondition::Match(second_etag.clone()),
+                expected_error: Some((412, "PreconditionFailed")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "explicit live version with nonmatching If-None-Match",
+                copy_source: first_source.clone(),
+                condition: SourceCondition::NoneMatch(second_etag.clone()),
+                expected_error: None,
+                expected_source_version: Some(first_version.clone()),
+            },
+            SourceStateCase {
+                name: "explicit live version with matching If-None-Match",
+                copy_source: first_source.clone(),
+                condition: SourceCondition::NoneMatch(first_etag.clone()),
+                expected_error: Some((412, "PreconditionFailed")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "explicit live version modified after epoch",
+                copy_source: first_source.clone(),
+                condition: SourceCondition::ModifiedSince(past),
+                expected_error: None,
+                expected_source_version: Some(first_version.clone()),
+            },
+            SourceStateCase {
+                name: "explicit live version not modified after its timestamp",
+                copy_source: first_source.clone(),
+                condition: SourceCondition::ModifiedSince(first_last_modified),
+                expected_error: Some((412, "PreconditionFailed")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "explicit live version unmodified before future",
+                copy_source: first_source.clone(),
+                condition: SourceCondition::UnmodifiedSince(future),
+                expected_error: None,
+                expected_source_version: Some(first_version.clone()),
+            },
+            SourceStateCase {
+                name: "explicit live version not unmodified since epoch",
+                copy_source: first_source,
+                condition: SourceCondition::UnmodifiedSince(past),
+                expected_error: Some((412, "PreconditionFailed")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "explicit delete marker with If-Match",
+                copy_source: marker_source.clone(),
+                condition: SourceCondition::Match(first_etag.clone()),
+                expected_error: Some((400, "InvalidRequest")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "explicit delete marker with If-None-Match",
+                copy_source: marker_source.clone(),
+                condition: SourceCondition::NoneMatch(wrong_etag),
+                expected_error: Some((400, "InvalidRequest")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "explicit delete marker with If-Modified-Since",
+                copy_source: marker_source.clone(),
+                condition: SourceCondition::ModifiedSince(past),
+                expected_error: Some((400, "InvalidRequest")),
+                expected_source_version: None,
+            },
+            SourceStateCase {
+                name: "explicit delete marker with If-Unmodified-Since",
+                copy_source: marker_source,
+                condition: SourceCondition::UnmodifiedSince(future),
+                expected_error: Some((400, "InvalidRequest")),
+                expected_source_version: None,
+            },
+        ];
+
+        for (index, case) in cases.iter().enumerate() {
+            let destination = format!("copy-source-state-dst-{index}");
+            let request = client
+                .copy_object()
+                .bucket(&bucket)
+                .key(&destination)
+                .copy_source(&case.copy_source);
+            let request = match &case.condition {
+                SourceCondition::Match(value) => request.copy_source_if_match(value),
+                SourceCondition::NoneMatch(value) => request.copy_source_if_none_match(value),
+                SourceCondition::ModifiedSince(value) => {
+                    request.copy_source_if_modified_since(*value)
+                }
+                SourceCondition::UnmodifiedSince(value) => {
+                    request.copy_source_if_unmodified_since(*value)
+                }
+            };
+            let result = request.send().await;
+
+            if let Some((status, code)) = case.expected_error {
+                assert_eq!(err_status(&result), status, "CopyObject {}", case.name);
+                assert_s3_err_code(&result, code);
+                let head = client
+                    .head_object()
+                    .bucket(&bucket)
+                    .key(&destination)
+                    .send()
+                    .await;
+                assert_eq!(err_status(&head), 404, "CopyObject {}", case.name);
+            } else {
+                let output = result.unwrap_or_else(|error| {
+                    panic!("CopyObject {} unexpectedly failed: {error:?}", case.name)
+                });
+                assert_eq!(
+                    output.copy_source_version_id(),
+                    case.expected_source_version.as_deref(),
+                    "{}",
+                    case.name
+                );
+                let copied = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&destination)
+                    .send_retrying_operation_aborted("get source-state conditional copy")
+                    .await
+                    .unwrap();
+                assert_eq!(copied.e_tag(), Some(first_etag.as_str()), "{}", case.name);
+                let copied_data = copied.body.collect().await.unwrap().into_bytes();
+                assert_eq!(&copied_data[..], b"first source", "{}", case.name);
+            }
+
+            let upload_key = format!("upload-part-copy-source-state-dst-{index}");
+            let upload = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(&upload_key)
+                .send_retrying_operation_aborted("create source-state conditional copy upload")
+                .await
+                .unwrap();
+            let upload_id = upload.upload_id().unwrap();
+            let request = client
+                .upload_part_copy()
+                .bucket(&bucket)
+                .key(&upload_key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .copy_source(&case.copy_source);
+            let request = match &case.condition {
+                SourceCondition::Match(value) => request.copy_source_if_match(value),
+                SourceCondition::NoneMatch(value) => request.copy_source_if_none_match(value),
+                SourceCondition::ModifiedSince(value) => {
+                    request.copy_source_if_modified_since(*value)
+                }
+                SourceCondition::UnmodifiedSince(value) => {
+                    request.copy_source_if_unmodified_since(*value)
+                }
+            };
+            let upload_result = request.send().await;
+
+            if let Some((status, code)) = case.expected_error {
+                assert_eq!(
+                    err_status(&upload_result),
+                    status,
+                    "UploadPartCopy {}",
+                    case.name
+                );
+                assert_s3_err_code(&upload_result, code);
+            } else {
+                let output = upload_result.unwrap_or_else(|error| {
+                    panic!(
+                        "UploadPartCopy {} unexpectedly failed: {error:?}",
+                        case.name
+                    )
+                });
+                assert_eq!(
+                    output.copy_source_version_id(),
+                    case.expected_source_version.as_deref(),
+                    "{}",
+                    case.name
+                );
+                assert_eq!(
+                    output.copy_part_result().and_then(|part| part.e_tag()),
+                    Some(first_etag.as_str()),
+                    "{}",
+                    case.name
+                );
+            }
+
+            let parts = client
+                .list_parts()
+                .bucket(&bucket)
+                .key(&upload_key)
+                .upload_id(upload_id)
+                .send_retrying_operation_aborted("list source-state conditional copied parts")
+                .await
+                .unwrap();
+            if case.expected_error.is_some() {
+                assert!(parts.parts().is_empty(), "{}", case.name);
+            } else {
+                assert_eq!(parts.parts().len(), 1, "{}", case.name);
+                assert_eq!(parts.parts()[0].e_tag(), Some(first_etag.as_str()));
+            }
+            client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(&upload_key)
+                .upload_id(upload_id)
+                .send_retrying_operation_aborted("abort source-state conditional copy upload")
+                .await
+                .unwrap();
+        }
+
+        let source_versions = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix("src")
+            .send_retrying_operation_aborted("list source after source-state conditional copies")
+            .await
+            .unwrap();
+        assert_eq!(source_versions.versions().len(), 2);
+        assert_eq!(source_versions.delete_markers().len(), 1);
+        let retained_first = source_versions
+            .versions()
+            .iter()
+            .find(|version| version.version_id() == Some(first_version.as_str()))
+            .expect("first source version must remain listed");
+        assert_eq!(retained_first.e_tag(), Some(first_etag.as_str()));
+        assert_eq!(retained_first.is_latest(), Some(false));
+        let retained_second = source_versions
+            .versions()
+            .iter()
+            .find(|version| version.version_id() == Some(second_version.as_str()))
+            .expect("second source version must remain listed");
+        assert_eq!(retained_second.e_tag(), Some(second_etag.as_str()));
+        assert_eq!(retained_second.is_latest(), Some(false));
+        assert_eq!(
+            source_versions.delete_markers()[0].version_id(),
+            Some(marker_version.as_str())
+        );
+        assert_eq!(source_versions.delete_markers()[0].is_latest(), Some(true));
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_copy_source_version_header_follows_source_bucket_versioning() {
+    s3_tests::run(async {
+        async fn assert_source_version_headers(
+            copy_source: String,
+            destination_bucket: &str,
+            label: &str,
+            expected_source_version: Option<&str>,
+            expected_etag: &str,
+            expected_body: &[u8],
+        ) {
+            let client = CTX.client();
+            let copy_key = format!("copy-source-version-{label}");
+            let copy = client
+                .copy_object()
+                .bucket(destination_bucket)
+                .key(&copy_key)
+                .copy_source(&copy_source)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{label} CopyObject failed: {error:?}"));
+            assert_eq!(
+                copy.copy_source_version_id(),
+                expected_source_version,
+                "{label} CopyObject"
+            );
+            let copied = client
+                .get_object()
+                .bucket(destination_bucket)
+                .key(&copy_key)
+                .send_retrying_operation_aborted("get source-version-header copied object")
+                .await
+                .unwrap();
+            assert_eq!(copied.e_tag(), Some(expected_etag));
+            let copied_data = copied.body.collect().await.unwrap().into_bytes();
+            assert_eq!(&copied_data[..], expected_body);
+
+            let upload_key = format!("upload-part-copy-source-version-{label}");
+            let upload = client
+                .create_multipart_upload()
+                .bucket(destination_bucket)
+                .key(&upload_key)
+                .send_retrying_operation_aborted("create source-version-header copy upload")
+                .await
+                .unwrap();
+            let upload_id = upload.upload_id().unwrap();
+            let part = client
+                .upload_part_copy()
+                .bucket(destination_bucket)
+                .key(&upload_key)
+                .upload_id(upload_id)
+                .part_number(1)
+                .copy_source(&copy_source)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{label} UploadPartCopy failed: {error:?}"));
+            assert_eq!(
+                part.copy_source_version_id(),
+                expected_source_version,
+                "{label} UploadPartCopy"
+            );
+            assert_eq!(
+                part.copy_part_result().and_then(|result| result.e_tag()),
+                Some(expected_etag)
+            );
+            client
+                .abort_multipart_upload()
+                .bucket(destination_bucket)
+                .key(&upload_key)
+                .upload_id(upload_id)
+                .send_retrying_operation_aborted("abort source-version-header copy upload")
+                .await
+                .unwrap();
+            s3_tests::delete_object_retrying_operation_aborted(
+                client,
+                destination_bucket,
+                &copy_key,
+            )
+            .await
+            .unwrap();
+        }
+
+        let client = CTX.client();
+        let source_bucket = unique_bucket();
+        let destination_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &source_bucket)
+            .await
+            .unwrap();
+        s3_tests::create_bucket(client, &destination_bucket)
+            .await
+            .unwrap();
+
+        let disabled_etag = put_object(&source_bucket, "disabled", b"disabled source").await;
+        assert_source_version_headers(
+            format!("{source_bucket}/disabled"),
+            &destination_bucket,
+            "disabled",
+            None,
+            &disabled_etag,
+            b"disabled source",
+        )
+        .await;
+        assert_source_version_headers(
+            copy_source_with_version(&source_bucket, "disabled", "null"),
+            &destination_bucket,
+            "disabled-explicit-null",
+            Some("null"),
+            &disabled_etag,
+            b"disabled source",
+        )
+        .await;
+
+        s3_tests::enable_bucket_versioning(client, &source_bucket).await;
+        let enabled = put_object_result_retrying_operation_aborted(
+            "put enabled implicit copy source",
+            || {
+                client
+                    .put_object()
+                    .bucket(&source_bucket)
+                    .key("enabled")
+                    .body(ByteStream::from_static(b"enabled source"))
+            },
+        )
+        .await
+        .unwrap();
+        let enabled_etag = enabled.e_tag().unwrap().to_string();
+        let enabled_version = enabled.version_id().unwrap().to_string();
+        assert_source_version_headers(
+            format!("{source_bucket}/enabled"),
+            &destination_bucket,
+            "enabled",
+            Some(&enabled_version),
+            &enabled_etag,
+            b"enabled source",
+        )
+        .await;
+
+        client
+            .put_bucket_versioning()
+            .bucket(&source_bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Suspended)
+                    .build(),
+            )
+            .send_retrying_operation_aborted("suspend implicit copy source bucket")
+            .await
+            .unwrap();
+        let suspended = put_object_result_retrying_operation_aborted(
+            "put suspended implicit copy source",
+            || {
+                client
+                    .put_object()
+                    .bucket(&source_bucket)
+                    .key("suspended")
+                    .body(ByteStream::from_static(b"suspended source"))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(suspended.version_id(), None);
+        let suspended_etag = suspended.e_tag().unwrap().to_string();
+        assert_source_version_headers(
+            format!("{source_bucket}/suspended"),
+            &destination_bucket,
+            "suspended",
+            None,
+            &suspended_etag,
+            b"suspended source",
+        )
+        .await;
+        assert_source_version_headers(
+            copy_source_with_version(&source_bucket, "suspended", "null"),
+            &destination_bucket,
+            "suspended-explicit-null",
+            Some("null"),
+            &suspended_etag,
+            b"suspended source",
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &source_bucket).await;
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &destination_bucket).await;
     });
 }
 

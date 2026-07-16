@@ -2993,13 +2993,7 @@ impl HttpFrontend {
                         }
                         other => other,
                     })?;
-                Ok(S3Response::upload_part_copy(
-                    &result.etag,
-                    result.last_modified,
-                    result.checksum.as_ref(),
-                    result.managed_encryption,
-                    result.sse_customer.as_ref(),
-                ))
+                Ok(S3Response::upload_part_copy(&result))
             }
             S3Operation::CompleteMultipartUpload { bucket, key } => {
                 reject_managed_encryption_read_headers(
