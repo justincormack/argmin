@@ -24,6 +24,11 @@ use s3_tests::{
 };
 
 const QUERY_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+const QUERY_POST_MAX_BODY_BYTES: usize = 10_000_000;
+const OBSERVED_GET_BOUNDARY_ENDPOINT: &str = "https://sts.eu-central-1.amazonaws.com";
+const OBSERVED_GET_BOUNDARY_REGION: &str = "eu-central-1";
+const OBSERVED_GET_BOUNDARY_ACCESS_KEY_BYTES: usize = 20;
+const ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES: usize = 15_870;
 const STS_XMLNS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
 const AWS_FAULT_XMLNS: &str = "http://webservices.amazon.com/AWSFault/2005-15-09";
 const STS_WRONG_REGION_SCOPE_MESSAGE: &str = "Credential should be scoped to a valid region. ";
@@ -285,6 +290,179 @@ fn send_get_caller_identity_with_scope(
         content_type: Some(QUERY_CONTENT_TYPE),
     }
     .send_with_scope(endpoint, credentials, security_token, service)
+}
+
+fn query_body_with_ignored_value(total_bytes: usize) -> (String, usize) {
+    const PREFIX: &str = "Action=GetCallerIdentity&Version=2011-06-15&x=";
+    assert!(total_bytes >= PREFIX.len());
+    let value_bytes = total_bytes - PREFIX.len();
+    let body = format!("{PREFIX}{}", "v".repeat(value_bytes));
+    assert_eq!(body.len(), total_bytes);
+    (body, value_bytes)
+}
+
+fn query_body_with_ignored_name(total_bytes: usize) -> (String, usize) {
+    const PREFIX: &str = "Action=GetCallerIdentity&Version=2011-06-15&";
+    assert!(total_bytes >= PREFIX.len());
+    let name_bytes = total_bytes - PREFIX.len();
+    let body = format!("{PREFIX}{}", "N".repeat(name_bytes));
+    assert_eq!(body.len(), total_bytes);
+    (body, name_bytes)
+}
+
+fn query_body_with_maximum_member_count(total_bytes: usize) -> (String, usize) {
+    const REQUIRED_MEMBERS: &str = "Action=GetCallerIdentity&Version=2011-06-15";
+    const IGNORED_MEMBER: &str = "&x";
+    const FINAL_IGNORED_MEMBER: &str = "&y=";
+    let remaining = total_bytes - REQUIRED_MEMBERS.len() - FINAL_IGNORED_MEMBER.len();
+    assert_eq!(remaining % IGNORED_MEMBER.len(), 0);
+    let repeated_member_count = remaining / IGNORED_MEMBER.len();
+    let mut body = String::with_capacity(total_bytes);
+    body.push_str(REQUIRED_MEMBERS);
+    for _ in 0..repeated_member_count {
+        body.push_str(IGNORED_MEMBER);
+    }
+    body.push_str(FINAL_IGNORED_MEMBER);
+    assert_eq!(body.len(), total_bytes);
+    (body, repeated_member_count + 3)
+}
+
+fn matches_observed_get_boundary_fixture(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> bool {
+    endpoint == OBSERVED_GET_BOUNDARY_ENDPOINT
+        && credentials.region == OBSERVED_GET_BOUNDARY_REGION
+        && credentials.access_key.len() == OBSERVED_GET_BOUNDARY_ACCESS_KEY_BYTES
+}
+
+fn run_query_limit_probes(
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    account_id: &str,
+) {
+    let (maximum_body, value_bytes) = query_body_with_ignored_value(QUERY_POST_MAX_BODY_BYTES);
+    assert_eq!(value_bytes, 9_999_954);
+    let maximum_response = QueryRequest::Post {
+        body: &maximum_body,
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send(endpoint, credentials);
+    assert_get_caller_identity_success(
+        "query-member-value-maximum-9999954-bytes",
+        &maximum_response,
+        account_id,
+    );
+    println!("query-member-value-maximum-9999954-bytes: ok");
+
+    let (maximum_name_body, name_bytes) = query_body_with_ignored_name(QUERY_POST_MAX_BODY_BYTES);
+    assert_eq!(name_bytes, 9_999_956);
+    let maximum_name_response = QueryRequest::Post {
+        body: &maximum_name_body,
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send(endpoint, credentials);
+    assert_get_caller_identity_success(
+        "query-member-name-maximum-9999956-bytes",
+        &maximum_name_response,
+        account_id,
+    );
+    println!("query-member-name-maximum-9999956-bytes: ok");
+
+    let (maximum_members_body, member_count) =
+        query_body_with_maximum_member_count(QUERY_POST_MAX_BODY_BYTES);
+    assert_eq!(member_count, 4_999_980);
+    let maximum_members_response = QueryRequest::Post {
+        body: &maximum_members_body,
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send(endpoint, credentials);
+    assert_get_caller_identity_success(
+        "query-member-count-maximum-4999980",
+        &maximum_members_response,
+        account_id,
+    );
+    println!("query-member-count-maximum-4999980: ok");
+
+    let (overlong_body, _) = query_body_with_ignored_value(QUERY_POST_MAX_BODY_BYTES + 1);
+    let overlong_response = QueryRequest::Post {
+        body: &overlong_body,
+        content_type: Some(QUERY_CONTENT_TYPE),
+    }
+    .send(endpoint, credentials);
+    assert_shape(
+        "query-body-overlong-10000001-bytes",
+        &overlong_response,
+        &shape()
+            .status(413)
+            .headers(std::iter::empty::<(&str, &str)>())
+            .body_empty(),
+    );
+    println!("query-body-overlong-10000001-bytes: ok");
+
+    if !matches_observed_get_boundary_fixture(endpoint, credentials) {
+        println!(
+            "query-get-request-head-boundary: skipped (requires {OBSERVED_GET_BOUNDARY_ENDPOINT}, {OBSERVED_GET_BOUNDARY_REGION}, and a {OBSERVED_GET_BOUNDARY_ACCESS_KEY_BYTES}-byte access key)"
+        );
+        return;
+    }
+
+    let (maximum_query, _) =
+        query_body_with_ignored_value(ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES);
+    let maximum_query_response = QueryRequest::Get(&maximum_query).send(endpoint, credentials);
+    assert_get_caller_identity_success(
+        "query-get-maximum-15870-query-bytes",
+        &maximum_query_response,
+        account_id,
+    );
+    println!("query-get-maximum-15870-query-bytes: ok");
+
+    let (overlong_query, _) =
+        query_body_with_ignored_value(ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES + 1);
+    let overlong_query_response = QueryRequest::Get(&overlong_query).send(endpoint, credentials);
+    assert_shape(
+        "query-get-overlong-15871-query-bytes",
+        &overlong_query_response,
+        &shape()
+            .status(400)
+            .headers(std::iter::empty::<(&str, &str)>())
+            .body_empty(),
+    );
+    println!("query-get-overlong-15871-query-bytes: ok");
+
+    let (smaller_query, _) = query_body_with_ignored_value(15_800);
+    let smaller_query_with_header_response = send_signed_request_for_service_with_credentials(
+        "GET",
+        &format!("{endpoint}/?{smaller_query}"),
+        b"",
+        [("x-test-padding", "x")],
+        "sts",
+        credentials,
+    );
+    assert_get_caller_identity_success(
+        "query-get-15800-query-bytes-with-signed-header",
+        &smaller_query_with_header_response,
+        account_id,
+    );
+    println!("query-get-15800-query-bytes-with-signed-header: ok");
+
+    let maximum_query_with_header_response = send_signed_request_for_service_with_credentials(
+        "GET",
+        &format!("{endpoint}/?{maximum_query}"),
+        b"",
+        [("x-test-padding", "")],
+        "sts",
+        credentials,
+    );
+    assert_shape(
+        "query-get-15870-query-bytes-with-signed-header",
+        &maximum_query_with_header_response,
+        &shape()
+            .status(400)
+            .headers(std::iter::empty::<(&str, &str)>())
+            .body_empty(),
+    );
+    println!("query-get-15870-query-bytes-with-signed-header: ok");
 }
 
 fn assert_signing_scope_error(label: &str, response: &RawResponse, message: &str) {
@@ -8301,6 +8479,7 @@ fn main() {
         assert_probe(&probe, &response, &account_id);
         println!("{}: ok", probe.label);
     }
+    run_query_limit_probes(&endpoint, credentials, &account_id);
     run_signing_scope_probes(&endpoint, credentials, &account_id);
 
     if let Ok(role_arn) = env::var("S3_TEST_STS_ROLE_ARN") {
@@ -8640,9 +8819,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        s3_post_response_with_sanitized_body, s3_response_with_sanitized_body,
-        sign_s3_streaming_request, sign_s3_streaming_request_for_service, spaced_hex,
-        validate_https_endpoint, S3StreamingTokens,
+        matches_observed_get_boundary_fixture, s3_post_response_with_sanitized_body,
+        s3_response_with_sanitized_body, sign_s3_streaming_request,
+        sign_s3_streaming_request_for_service, spaced_hex, validate_https_endpoint,
+        S3StreamingTokens, OBSERVED_GET_BOUNDARY_ENDPOINT,
     };
     use s3_tests::{RawResponse, SignedRequestCredentials};
 
@@ -8674,6 +8854,38 @@ mod tests {
                 "unsafe endpoint unexpectedly accepted: {endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn get_request_head_boundary_requires_the_observed_fixture() {
+        let credentials = SignedRequestCredentials {
+            access_key: "ABCDEFGHIJKLMNOPQRST",
+            secret_key: "secret",
+            region: "eu-central-1",
+            tls_ca_pem: None,
+        };
+        assert!(matches_observed_get_boundary_fixture(
+            OBSERVED_GET_BOUNDARY_ENDPOINT,
+            credentials
+        ));
+        assert!(!matches_observed_get_boundary_fixture(
+            "https://sts.us-east-1.amazonaws.com",
+            credentials
+        ));
+        assert!(!matches_observed_get_boundary_fixture(
+            OBSERVED_GET_BOUNDARY_ENDPOINT,
+            SignedRequestCredentials {
+                region: "us-east-1",
+                ..credentials
+            }
+        ));
+        assert!(!matches_observed_get_boundary_fixture(
+            OBSERVED_GET_BOUNDARY_ENDPOINT,
+            SignedRequestCredentials {
+                access_key: "short",
+                ..credentials
+            }
+        ));
     }
 
     #[test]

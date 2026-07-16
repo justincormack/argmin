@@ -453,7 +453,8 @@ impl ShapeSpec {
 
     /// Add one expected header. Once any expected header is given, the
     /// header check is complete-set equality: every non-ignored actual
-    /// header must be expected and vice versa.
+    /// header must be expected and vice versa. Calling [`Self::headers`] with
+    /// an empty iterator explicitly requires no non-ignored headers.
     pub fn header(mut self, name: &str, value_pattern: &str) -> Self {
         self.headers
             .get_or_insert_with(Vec::new)
@@ -462,6 +463,7 @@ impl ShapeSpec {
     }
 
     pub fn headers<'a, I: IntoIterator<Item = (&'a str, &'a str)>>(mut self, headers: I) -> Self {
+        self.headers.get_or_insert_with(Vec::new);
         for (name, value_pattern) in headers {
             self = self.header(name, value_pattern);
         }
@@ -1344,6 +1346,22 @@ mod tests {
             &body,
         );
         assert_shape("test", &chunked, &spec);
+    }
+
+    #[test]
+    fn shape_spec_can_require_no_semantic_headers() {
+        let spec = shape()
+            .status(413)
+            .headers(std::iter::empty::<(&str, &str)>())
+            .body_empty();
+        let framing_only = response(413, &[("Content-Length", "0"), ("Date", "ignored")], "");
+        assert_shape("framing-only", &framing_only, &spec);
+
+        let application_response = response(413, &[("x-amzn-requestid", "request-id")], "");
+        let error = spec
+            .check("application-response", &application_response)
+            .expect_err("semantic headers must not match the empty header set");
+        assert!(error.contains("x-amzn-requestid"), "{error}");
     }
 
     #[test]

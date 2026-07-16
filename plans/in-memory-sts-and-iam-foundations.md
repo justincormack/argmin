@@ -1046,10 +1046,10 @@ The initial Query-protocol slice completed on 2026-07-13:
   `text/xml` response type, and request-ID agreement
 
 Before Phase 0 can satisfy the first-milestone exit condition, it still needs
-to explicitly disposition the remaining bounded Query-parser and credential-
-precedence gaps listed below. The temporary access-key namespace, generation
-shape, session-token envelope, credential-domain binding, and key-overlap
-semantics are now fixed by the completed envelope-design slice.
+to explicitly disposition the remaining credential-precedence and architecture
+decisions listed below. The bounded Query-parser limits, temporary access-key
+namespace, generation shape, session-token envelope, credential-domain binding,
+and key-overlap semantics are now fixed by completed Phase 0 slices.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
 remain unsupported compatibility gaps and must never be silently ignored.
@@ -1220,6 +1220,54 @@ tags, MFA fields, and provided contexts still need explicit AWS-backed scope
 decisions. External ID and source identity are pinned by the following slices.
 The one-hour role-chaining limit also remains separate from the API-level and
 configured-role duration bounds pinned here.
+
+The Query POST body-limit slice completed on 2026-07-16. The
+[AWS Query API guide](https://docs.aws.amazon.com/IAM/latest/UserGuide/programming.html)
+recommends POST for requests too large for practical GET URLs but does not
+publish a total POST body ceiling. The regional live endpoint accepts an exact
+10,000,000-byte `application/x-www-form-urlencoded` body and executes
+`GetCallerIdentity` successfully when one ignored scalar member contains a
+9,999,954-byte value. At 10,000,001 bytes it returns HTTP `413` with an empty
+body and no semantic response headers, including no STS request ID or extended
+request ID; transport framing and the ordinary HTTP date remain ignored. The
+total is therefore decimal wire bytes, not 10 MiB.
+
+At that same exact body ceiling, AWS also executes `GetCallerIdentity` with a
+9,999,956-byte ASCII unknown key-only member name, and with 4,999,980 total
+form members: the required `Action` and `Version`, 4,999,977 repeated shortest
+key-only `x` members, and one final `y=` member that consumes the odd remainder.
+Those constructions exhaust the body with the largest possible name, value,
+and nonempty member count respectively, so there is no independent generic
+member-name, member-value, or member-count ceiling below the total POST body
+ceiling for these syntactically valid forms. Empty components introduced only
+by repeated separators are not counted as form members.
+
+The signed GET boundary is imposed by the HTTP request head rather than by a
+fixed Query-string scalar limit. The boundary golden is deliberately restricted
+to the exact fixture on which it was observed: the
+`https://sts.eu-central-1.amazonaws.com` authority, `eu-central-1` signing
+region, and an ordinary 20-byte IAM access key. With that fixed signing shape,
+a 15,870-byte query executes successfully while 15,871 bytes returns HTTP `400`
+with an empty body and no semantic response headers. Adding an empty signed
+`x-test-padding` header makes the otherwise accepted 15,870-byte query return
+that same `400`; a 15,800-byte query with a one-byte value for the same signed
+header still succeeds. The oracle skips only these aggregate-head rows when an
+advertised `--region` or `--endpoint` override, or a differently sized access
+key, changes the wire-head arithmetic; the portable POST-limit rows continue
+to run. Do not encode 15,870 as a universal Query-string constant: the shared
+HTTP frontend must bound the complete request head and the local oracle must
+reproduce these accepted/rejected fixed-fixture signed shapes before Query
+decoding.
+
+The first supported `AssumeRole` scalar members already have their individual
+decoded-value boundaries pinned by the core, external-ID, and source-identity
+slices. The shared Query reader must enforce the 10,000,000-byte POST wire-body
+limit before allocating a decoded form. It must scan and bind incrementally so
+millions of ignored or duplicate members do not require millions of owned
+allocations, while per-operation binding applies the separately pinned member
+constraints and first-value duplicate semantics. This does not authorize
+silently ignoring known optional security-relevant `AssumeRole` members that
+remain assigned to Phase 6.
 
 The `ExternalId` validation and trust-policy slice completed on 2026-07-14.
 The exact AWS-backed matrix establishes that:
@@ -2307,21 +2355,9 @@ body may appear in traces.
    collisions. Expiry versus issuer deletion is pinned independently for STS
    and every initial S3 mode. Disabled-credential collisions and expiry
    collisions with missing, mismatched, or wrong-scope inputs are not.
-3. What total Query body and member limits does live STS enforce for the first
-   supported parameter set?
-4. Should the first standalone UAT role be injected through a dedicated
+3. Should the first standalone UAT role be injected through a dedicated
    test-only constructor/config object or through explicitly UAT-only
    environment variables?
-5. What exact AWS routing and error precedence applies where the existing S3
-   Control versioned path collides with method/path decoding, account-ID and ARN
-   validation, authentication, and STS Query classification on both the AWS STS
-   and S3 Control endpoint kinds? The routing-boundary matrix and explicit
-   `SharedRegional` mapping above have pinned the root-Query,
-   versioned-path/form/query, bounded HTTP-method, path/percent/ARN near-miss,
-   account-ID-header, signing/authentication, and operation-body rows. The local
-   authority/SNI matrix now also pins the endpoint-kind trust boundary before
-   the typed service refactor; standalone TLS UAT remains a Phase 4 wiring
-   acceptance check rather than an unresolved AWS-oracle question.
 
 ## Definition Of The First Usable Milestone
 
