@@ -618,6 +618,31 @@ pub fn upload_part_copy_precondition_failed_error_xml(
     )
 }
 
+/// Format a conditional-write conflict response. AWS omits the XML
+/// declaration for this CompleteMultipartUpload error.
+#[must_use]
+pub fn conditional_request_conflict_error_xml(
+    key: &str,
+    condition: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>ConditionalRequestConflict</Code>\
+         <Message>The conditional request cannot succeed due to a conflicting operation against this resource.</Message>\
+         <Key>{}</Key>\
+         <Condition>{}</Condition>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(key),
+        xml_escape_text(condition),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format a `MalformedPolicy` error response. AWS includes a `<Detail>`
 /// element echoing the offending value for action/resource/principal
 /// errors and omits it for parse-level failures.

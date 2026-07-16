@@ -14,6 +14,7 @@ use crate::{
         PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
         PgClusterMapHistoryRouteReferences, ScavengerShardFile, ScavengerShardFileScan,
         ScavengerShardRow, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+        METADATA_CANONICAL_STATE_ENCODING_VERSION,
     },
     types::{
         AbortMultipartUploadCleanup, BucketAclSummary, BucketDeleteAttemptOutcomeKind,
@@ -33,28 +34,29 @@ use crate::{
         ListPartsResp, ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
         ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionFingerprint,
         MultipartCompletionPreflight, MultipartCompletionReplay, MultipartCompletionSnapshot,
-        MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-        MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadIdKey,
-        MultipartUploadManagementLookup, MultipartUploadRecord, ObjectEncryption,
-        ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout, ObjectLockState,
-        ObjectPartRecord, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind,
-        ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot,
-        ObjectReadSnapshotMode, ObjectRetention, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-        ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PayloadReclaimRoot, PgId,
-        PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
-        PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimRecord,
-        PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-        PrepareStreamUploadSegmentAppendReq, PublicAccessBlockConfig, SegmentStoredBytesRequest,
-        SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId,
-        ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-        ShardScavengerObservationReason, ShardScavengerObservationRecord,
-        ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
-        ShardScavengerReclaimShardSetReference, ShardScavengerRoutedMultipartPartReference,
-        StorageClass, StoredLegalHoldStatus, StoredObject, StreamPutCommitInput,
-        StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
-        StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
-        StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
-        VersionId, WriteAck, BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
+        MultipartObjectIdentity, MultipartPartRecord, MultipartPartSegmentRecord,
+        MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+        MultipartUploadIdKey, MultipartUploadManagementLookup, MultipartUploadRecord,
+        ObjectEncryption, ObjectEncryptionType, ObjectEtag, ObjectKey, ObjectLayout,
+        ObjectLockState, ObjectPartRecord, ObjectPayloadReclaimClaimRecord,
+        ObjectPayloadReclaimKind, ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity,
+        ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectRetention, ObjectSegmentRecord,
+        ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
+        PayloadReclaimRoot, PgId, PlacedSegmentShardBackfillClaimRecord,
+        PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
+        PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
+        PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
+        PublicAccessBlockConfig, SegmentStoredBytesRequest, SerializedMetadataBlob,
+        SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardIndex, ShardKey,
+        ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
+        ShardScavengerObservationRecord, ShardScavengerPayloadReference,
+        ShardScavengerPlacedShardSetReference, ShardScavengerReclaimShardSetReference,
+        ShardScavengerRoutedMultipartPartReference, StorageClass, StoredLegalHoldStatus,
+        StoredObject, StreamPutCommitInput, StreamPutFinalizeStorageSnapshot,
+        StreamUploadPartSnapshot, StreamUploadPartStorageSnapshot, StreamUploadRecord,
+        StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+        TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
+        BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
         PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN,
         PLACED_SEGMENT_SHARD_BACKFILL_LAST_ERROR_MAX_LEN, PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT,
         PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN,
@@ -74,7 +76,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 1;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 2;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(1);
@@ -771,6 +773,7 @@ pub enum StorageRpcErrorCode {
     TransportTimeout = 22,
     ShardIntegrity = 23,
     TransportClosed = 24,
+    MultipartConditionalRequestConflict = 25,
 }
 
 impl StorageRpcErrorCode {
@@ -800,6 +803,7 @@ impl StorageRpcErrorCode {
             22 => Ok(Self::TransportTimeout),
             23 => Ok(Self::ShardIntegrity),
             24 => Ok(Self::TransportClosed),
+            25 => Ok(Self::MultipartConditionalRequestConflict),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),
@@ -1246,6 +1250,8 @@ pub(crate) enum StorageRpcPayloadError {
     InvalidMetadataCommandPendingSlotRequest(&'static str),
     #[error("invalid metadata command log compaction status {0}")]
     InvalidMetadataCommandLogCompactionStatus(u8),
+    #[error("unsupported metadata canonical-state encoding version {actual}")]
+    UnsupportedMetadataCanonicalStateEncodingVersion { actual: u8 },
     #[error("invalid bucket metadata request: {0}")]
     InvalidBucketMetadataRequest(&'static str),
     #[error("invalid object metadata request: {0}")]
@@ -9223,6 +9229,13 @@ fn decode_metadata_command_checkpoint(
     let applied_log_hash = decoder.read_u64()?;
     let state_digest = decoder.read_u64()?;
     let canonical_state_encoding_version = decoder.read_u8()?;
+    if canonical_state_encoding_version != METADATA_CANONICAL_STATE_ENCODING_VERSION {
+        return Err(
+            StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
+                actual: canonical_state_encoding_version,
+            },
+        );
+    }
     let table_digest_count =
         decoder.read_count_with_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_TABLES)?;
     let mut table_digests = Vec::with_capacity(table_digest_count);
@@ -13754,16 +13767,41 @@ impl<'a> StorageRpcDecoder<'a> {
                     "invalid multipart object generation id",
                 ),
             )?,
+            initiated_object_identity: self.read_optional_multipart_object_identity()?,
             object_lock: self.read_object_lock_state()?,
             checksum: self.read_optional_multipart_checksum_config()?,
             encryption: self.read_object_encryption()?,
         })
     }
 
+    fn read_optional_multipart_object_identity(
+        &mut self,
+    ) -> Result<Option<MultipartObjectIdentity>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(MultipartObjectIdentity::Live {
+                version_id: VersionId::from_u64(self.read_u64()?),
+                generation_id: GenerationId::new(self.read_u64()?).ok_or(
+                    StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                        "invalid multipart initiation live generation",
+                    ),
+                )?,
+            })),
+            2 => Ok(Some(MultipartObjectIdentity::DeleteMarker {
+                version_id: VersionId::from_u64(self.read_u64()?),
+                write_sequence: self.read_u64()?,
+            })),
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid multipart object identity tag",
+            )),
+        }
+    }
+
     fn read_multipart_completion_snapshot(
         &mut self,
     ) -> Result<MultipartCompletionSnapshot, StorageRpcPayloadError> {
         let existing_etag = self.read_optional_string()?;
+        let current_object_identity = self.read_optional_multipart_object_identity()?;
         let stale_payload_source = self.read_optional_stored_object()?;
         let part_count = self.read_bounded_remaining_count(
             STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN,
@@ -13784,6 +13822,7 @@ impl<'a> StorageRpcDecoder<'a> {
         let cleanup = self.read_complete_multipart_commit_cleanup()?;
         Ok(MultipartCompletionSnapshot {
             existing_etag,
+            current_object_identity,
             stale_payload_source,
             part_records,
             selected_streaming_segments,
@@ -14020,6 +14059,8 @@ impl<'a> StorageRpcDecoder<'a> {
         let object_lock = self.read_object_lock_state()?;
         let encryption = self.read_object_encryption()?;
         let expected_stale_payload_source = self.read_optional_stored_object()?;
+        let expected_current_object_identity = self.read_optional_multipart_object_identity()?;
+        let conditional_completion = self.read_bool()?;
         let part_count = self.read_bounded_remaining_count(
             STORAGE_RPC_MIN_MULTIPART_PART_RECORD_LEN,
             "complete multipart part count exceeds payload",
@@ -14055,6 +14096,8 @@ impl<'a> StorageRpcDecoder<'a> {
             object_lock,
             encryption,
             expected_stale_payload_source,
+            expected_current_object_identity,
+            conditional_completion,
             part_records,
             selected_streaming_segments,
             expected_cleanup,
@@ -16004,6 +16047,8 @@ fn put_complete_multipart_commit_request(
     put_object_lock_state(out, request.object_lock);
     put_object_encryption(out, &request.encryption);
     put_optional_stored_object(out, request.expected_stale_payload_source.as_ref());
+    put_optional_multipart_object_identity(out, request.expected_current_object_identity);
+    put_bool(out, request.conditional_completion);
     put_u32(
         out,
         u32::try_from(request.part_records.len())
@@ -16231,9 +16276,35 @@ fn put_multipart_upload_record(out: &mut Vec<u8>, record: &MultipartUploadRecord
     put_string(out, &record.acl_grants.serialized());
     put_bool(out, record.public_read);
     put_u64(out, record.object_generation_id.get());
+    put_optional_multipart_object_identity(out, record.initiated_object_identity);
     put_object_lock_state(out, record.object_lock);
     put_optional_multipart_checksum_config(out, record.checksum);
     put_object_encryption(out, &record.encryption);
+}
+
+fn put_optional_multipart_object_identity(
+    out: &mut Vec<u8>,
+    identity: Option<MultipartObjectIdentity>,
+) {
+    match identity {
+        None => put_u8(out, 0),
+        Some(MultipartObjectIdentity::Live {
+            version_id,
+            generation_id,
+        }) => {
+            put_u8(out, 1);
+            put_u64(out, version_id.to_u64());
+            put_u64(out, generation_id.get());
+        }
+        Some(MultipartObjectIdentity::DeleteMarker {
+            version_id,
+            write_sequence,
+        }) => {
+            put_u8(out, 2);
+            put_u64(out, version_id.to_u64());
+            put_u64(out, write_sequence);
+        }
+    }
 }
 
 fn put_multipart_completion_replay(out: &mut Vec<u8>, record: &MultipartCompletionReplay) {
@@ -16258,6 +16329,7 @@ fn put_multipart_completion_replay(out: &mut Vec<u8>, record: &MultipartCompleti
 
 fn put_multipart_completion_snapshot(out: &mut Vec<u8>, snapshot: &MultipartCompletionSnapshot) {
     put_optional_string(out, snapshot.existing_etag.as_deref());
+    put_optional_multipart_object_identity(out, snapshot.current_object_identity);
     put_optional_stored_object(out, snapshot.stale_payload_source.as_ref());
     put_u32(
         out,
@@ -16878,7 +16950,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&1u16.to_le_bytes());
+        expected.extend_from_slice(&2u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -16886,6 +16958,19 @@ mod tests {
         expected.extend_from_slice(payload);
 
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn storage_rpc_frame_rejects_version_one_fixture() {
+        let mut bytes =
+            encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
+        let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
+        bytes[version_offset..version_offset + 2].copy_from_slice(&1_u16.to_le_bytes());
+
+        assert_eq!(
+            decode_storage_rpc_frame(&bytes),
+            Err(StorageRpcFrameError::UnsupportedVersion(1))
+        );
     }
 
     #[test]
@@ -17395,7 +17480,7 @@ mod tests {
             applied_log_index: 7,
             applied_log_hash: 0x1234,
             state_digest: 0x5678,
-            canonical_state_encoding_version: 1,
+            canonical_state_encoding_version: 2,
             table_digests: vec![MetadataCheckpointTableDigest {
                 table_name: "buckets".to_string(),
                 row_count: 1,
@@ -17455,6 +17540,31 @@ mod tests {
         let decoded = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
 
         assert_eq!(decoded, request.checkpoint);
+
+        let mut version_one_request = request.clone();
+        version_one_request
+            .checkpoint
+            .canonical_state_encoding_version = 1;
+        let bytes =
+            encode_metadata_command_transfer_checkpoint_base_request(&version_one_request).unwrap();
+        assert_eq!(
+            decode_metadata_command_transfer_checkpoint_base_request(&bytes),
+            Err(
+                StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
+                    actual: 1,
+                }
+            )
+        );
+        let bytes =
+            encode_metadata_command_checkpoint_payload(&version_one_request.checkpoint).unwrap();
+        assert_eq!(
+            decode_metadata_command_checkpoint_payload(&bytes),
+            Err(
+                StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
+                    actual: 1,
+                }
+            )
+        );
 
         let candidates_request = StorageRpcMetadataCommandCheckpointCandidatesRequest {
             node_id: NodeId::new(7),

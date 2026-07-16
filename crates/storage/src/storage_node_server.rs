@@ -11787,6 +11787,11 @@ fn bucket_write_drain_heartbeat_error_response(
 
 fn object_pg_error_response(error: ObjectPgActionError) -> StorageRpcErrorResponse {
     match error {
+        ObjectPgActionError::MultipartConditionalRequestConflict => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::MultipartConditionalRequestConflict,
+            message: "multipart completion current object differs from initiation identity"
+                .to_string(),
+        },
         ObjectPgActionError::Store(StoreError::MetadataCommandContention { context }) => {
             StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::MetadataCommandContention,

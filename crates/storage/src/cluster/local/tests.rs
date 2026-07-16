@@ -1142,6 +1142,8 @@ fn seed_streamed_multipart_completion_with_existing(
             object_lock: upload.object_lock,
             encryption: upload.encryption,
             expected_stale_payload_source: None,
+            expected_current_object_identity: None,
+            conditional_completion: false,
             part_records: vec![part],
             selected_streaming_segments: vec![selected_streaming_segment],
             expected_cleanup: crate::CompleteMultipartCommitCleanup::default(),

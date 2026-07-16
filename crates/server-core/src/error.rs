@@ -189,6 +189,12 @@ pub enum ServerError {
     #[error("precondition failed: {condition}")]
     PreconditionFailed { condition: &'static str },
 
+    #[error("conditional request conflict for {key}: {condition}")]
+    ConditionalRequestConflict {
+        key: String,
+        condition: &'static str,
+    },
+
     #[error("not modified")]
     NotModified { etag: String, last_modified: u64 },
 
@@ -545,6 +551,7 @@ impl ServerError {
             }
             Self::Auth(_) => "AccessDenied",
             Self::PreconditionFailed { .. } => "PreconditionFailed",
+            Self::ConditionalRequestConflict { .. } => "ConditionalRequestConflict",
             Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } | Self::InvalidRequestHostId { .. } => "InvalidRequest",
             Self::BadRequest { .. } => "BadRequest",
@@ -769,6 +776,7 @@ impl ServerError {
             | Self::HeadDeleteMarkerMethodNotAllowed { .. } => 405,
             Self::InvalidRange { .. } | Self::InvalidPartNumber { .. } => 416,
             Self::PreconditionFailed { .. } | Self::UploadPartCopyPreconditionFailed { .. } => 412,
+            Self::ConditionalRequestConflict { .. } => 409,
             Self::NotModified { .. } => 304,
             Self::SlowDown => 503,
             _ => 500,

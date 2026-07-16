@@ -268,9 +268,22 @@ impl UnixStorageNodeClient {
         stale_snapshot_error: ObjectPgActionError,
         validate: impl FnOnce(&MetadataCommandEnvelope) -> Result<(), ObjectPgActionError>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
-        let response = self
-            .rpc_request(kind, payload)
-            .map_err(ObjectPgActionError::Store)?;
+        let response = match self
+            .rpc_request_result(kind, payload)
+            .map_err(ObjectPgActionError::Store)?
+        {
+            Ok(response) => response,
+            Err(error)
+                if error.code == StorageRpcErrorCode::MultipartConditionalRequestConflict =>
+            {
+                return Err(ObjectPgActionError::MultipartConditionalRequestConflict);
+            }
+            Err(error) => {
+                return Err(ObjectPgActionError::Store(
+                    self.rpc_response_error(kind, error),
+                ));
+            }
+        };
         let response =
             decode_object_metadata_command_build_response(&response).map_err(|error| {
                 ObjectPgActionError::Store(

@@ -9,6 +9,73 @@ fn test_owner() -> OwnerIdentity {
     OwnerIdentity::from_principal("owner")
 }
 
+#[test]
+fn multipart_object_identity_rejects_negative_sql_values() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    for (kind, version, value) in [(1_i64, -1_i64, 1_i64), (1, 0, -1), (2, -1, 1), (2, 0, -1)] {
+        let result =
+            connection.query_row("SELECT ?1, ?2, ?3", params![kind, version, value], |row| {
+                PgStore::parse_multipart_object_identity(row, 0, 1, 2)
+            });
+        assert!(
+            matches!(result, Err(rusqlite::Error::FromSqlConversionFailure(..))),
+            "kind={kind}, version={version}, value={value} unexpectedly decoded as {result:?}"
+        );
+    }
+}
+
+#[test]
+fn multipart_upload_schema_rejects_invalid_identity_values() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("identity-schema-bucket");
+    let key = trusted_object_key("object");
+    let upload_id = crate::tests::multipart_upload_id("identity-schema-upload");
+    PgMetadataStore::create_bucket(
+        &store,
+        &bucket,
+        "owner",
+        &CanonicalUserId::from_principal("owner"),
+        &AclGrants::default(),
+        false,
+        false,
+    )
+    .unwrap();
+    PgMetadataStore::create_multipart_upload(
+        &store,
+        &CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket,
+            key,
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: test_owner(),
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        },
+    )
+    .unwrap();
+
+    for (kind, version, value) in [(1_i64, -1_i64, 1_i64), (1, 0, -1), (2, -1, 1), (2, 0, -1)] {
+        let result = store.conn.execute(
+            "UPDATE multipart_uploads SET initiated_object_kind = ?1, \
+             initiated_object_version_id = ?2, \
+             initiated_object_generation_or_write_sequence = ?3 \
+             WHERE upload_id = ?4",
+            params![kind, version, value, upload_id.as_str()],
+        );
+        assert!(
+            matches!(result, Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::ConstraintViolation),
+            "kind={kind}, version={version}, value={value} unexpectedly passed schema validation: {result:?}"
+        );
+    }
+}
+
 fn create_bucket_probe_command(
     pg_id: u32,
     log_index: u64,
@@ -2858,6 +2925,10 @@ fn metadata_command_apply_tracks_multipart_upload_create_digest() {
             CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
                 create,
                 GenerationId::new(1).unwrap(),
+                Some(MultipartObjectIdentity::Live {
+                    version_id: VersionId::from_u64(7),
+                    generation_id: GenerationId::new(6).unwrap(),
+                }),
                 123,
                 test_bucket_write_reservation_proof(&bucket, &key, "create-multipart-upload"),
             ),
@@ -4093,11 +4164,17 @@ fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
     assert_eq!(checkpoint.applied_log_index, state.applied_log_index);
     assert_eq!(checkpoint.applied_log_hash, state.applied_log_hash);
     assert_eq!(checkpoint.state_digest, state.state_digest);
-    assert_eq!(checkpoint.canonical_state_encoding_version, 1);
+    assert_eq!(checkpoint.canonical_state_encoding_version, 2);
     assert_eq!(checkpoint.table_digests.len(), METADATA_DIGEST_TABLES.len());
     assert_eq!(checkpoint.table_blocks.len(), METADATA_DIGEST_TABLES.len());
     assert_ne!(checkpoint.checkpoint_crc64, 0);
     checkpoint.verify().unwrap();
+    let mut version_one_checkpoint = checkpoint.clone();
+    version_one_checkpoint.canonical_state_encoding_version = 1;
+    assert_eq!(
+        version_one_checkpoint.verify(),
+        Err(MetadataCommandCheckpointValidationError::UnsupportedStateEncoding { actual: 1 })
+    );
     assert_eq!(
         checkpoint
             .table_digests
@@ -5183,6 +5260,7 @@ fn pending_metadata_command_slot_rejects_proofless_create_multipart_upload() {
                     encryption: ObjectEncryption::None,
                 },
                 GenerationId::MIN,
+                None,
                 3,
                 proof,
             ),

@@ -924,4 +924,6 @@ pub enum ObjectPgActionError {
     StaleStreamFinalizeSnapshot,
     #[error("multipart completion snapshot changed before command build")]
     StaleMultipartCompletionSnapshot,
+    #[error("conditional multipart completion conflicts with an object write after initiation")]
+    MultipartConditionalRequestConflict,
 }

@@ -223,6 +223,12 @@ impl Coordinator {
                         .to_string(),
                 }
             }
+            storage::ObjectPgActionError::MultipartConditionalRequestConflict => {
+                ServerError::InternalError {
+                    reason: "multipart conditional conflict escaped completion-specific mapping"
+                        .to_string(),
+                }
+            }
             storage::ObjectPgActionError::Metadata(error) => match error {
                 storage::MetadataError::NoSuchUpload { upload_id } => {
                     ServerError::NoSuchUpload { upload_id }
@@ -901,6 +907,8 @@ impl Coordinator {
                     )?,
                     encryption: final_encryption,
                     expected_stale_payload_source: completion_snapshot.stale_payload_source,
+                    expected_current_object_identity: completion_snapshot.current_object_identity,
+                    conditional_completion: !req.cond.is_empty(),
                     part_records: part_records.clone(),
                     selected_streaming_segments: completion_snapshot.selected_streaming_segments,
                     expected_cleanup: completion_snapshot.cleanup,
@@ -925,6 +933,22 @@ impl Coordinator {
                     // genuinely unavailable upload.
                     terminal_race_retries += 1;
                     continue 'retry_stale_commit_snapshot;
+                }
+                Err(storage::ObjectPgActionError::MultipartConditionalRequestConflict) => {
+                    let condition = match req.cond {
+                        WriteCondition::IfMatch(_) => "If-Match",
+                        WriteCondition::IfNoneMatchStar => "If-None-Match",
+                        WriteCondition::None => {
+                            return Err(ServerError::InternalError {
+                                reason: "unconditional multipart completion reported a conditional conflict"
+                                    .to_string(),
+                            });
+                        }
+                    };
+                    return Err(ServerError::ConditionalRequestConflict {
+                        key: key.as_str().to_string(),
+                        condition,
+                    });
                 }
                 Err(error) => return Err(Coordinator::map_object_pg_action_error(error)),
             };

@@ -60,6 +60,7 @@ mod rows;
 mod scavenger;
 mod shards;
 
+pub(crate) use command_log::METADATA_CANONICAL_STATE_ENCODING_VERSION;
 #[cfg(test)]
 use command_log::{digest_len_prefixed_bytes, MetadataDigestFilter, METADATA_DIGEST_TABLES};
 pub use command_log::{

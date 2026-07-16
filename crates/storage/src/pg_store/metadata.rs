@@ -2786,6 +2786,64 @@ impl PgStore {
         self.create_multipart_upload_explicit(&command.upload)
     }
 
+    fn parse_multipart_object_identity(
+        row: &rusqlite::Row<'_>,
+        kind_index: usize,
+        version_index: usize,
+        value_index: usize,
+    ) -> rusqlite::Result<Option<MultipartObjectIdentity>> {
+        let kind = row.get::<_, u8>(kind_index)?;
+        let version = row.get::<_, Option<i64>>(version_index)?;
+        let value = row.get::<_, Option<i64>>(value_index)?;
+        match (kind, version, value) {
+            (0, None, None) => Ok(None),
+            (1, Some(version), Some(generation)) => {
+                let generation = u64::try_from(generation).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        value_index,
+                        rusqlite::types::Type::Integer,
+                        Box::from("negative multipart initiation live generation"),
+                    )
+                })?;
+                Ok(Some(MultipartObjectIdentity::Live {
+                    version_id: Self::parse_version_id(version, version_index)?,
+                    generation_id: GenerationId::new(generation).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            value_index,
+                            rusqlite::types::Type::Integer,
+                            Box::from("invalid multipart initiation live generation"),
+                        )
+                    })?,
+                }))
+            }
+            (2, Some(version), Some(write_sequence)) => {
+                let write_sequence = u64::try_from(write_sequence).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        value_index,
+                        rusqlite::types::Type::Integer,
+                        Box::from("negative multipart initiation delete-marker write sequence"),
+                    )
+                })?;
+                if write_sequence == 0 {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        value_index,
+                        rusqlite::types::Type::Integer,
+                        Box::from("zero multipart initiation delete-marker write sequence"),
+                    ));
+                }
+                Ok(Some(MultipartObjectIdentity::DeleteMarker {
+                    version_id: Self::parse_version_id(version, version_index)?,
+                    write_sequence,
+                }))
+            }
+            _ => Err(rusqlite::Error::FromSqlConversionFailure(
+                kind_index,
+                rusqlite::types::Type::Integer,
+                Box::from("invalid multipart initiation object identity"),
+            )),
+        }
+    }
+
     fn create_multipart_upload_explicit(
         &self,
         upload: &MultipartUploadRecord,
@@ -2811,6 +2869,34 @@ impl PgStore {
         let encryption_state = upload.encryption.encode_state();
         let system_metadata_blob = upload.system_metadata_blob.as_slice();
         let initiator = &upload.initiator;
+        let identity_sql_value = |value: u64| {
+            i64::try_from(value).map_err(|_| MetadataError::Db {
+                context: "create multipart upload identity exceeds SQLite integer range",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                    "multipart upload identity exceeds SQLite integer range",
+                )),
+            })
+        };
+        let (initiated_object_kind, initiated_object_version_id, initiated_object_value) =
+            match upload.initiated_object_identity {
+                None => (0_i64, None, None),
+                Some(MultipartObjectIdentity::Live {
+                    version_id,
+                    generation_id,
+                }) => (
+                    1_i64,
+                    Some(identity_sql_value(version_id.to_u64())?),
+                    Some(identity_sql_value(generation_id.get())?),
+                ),
+                Some(MultipartObjectIdentity::DeleteMarker {
+                    version_id,
+                    write_sequence,
+                }) => (
+                    2_i64,
+                    Some(identity_sql_value(version_id.to_u64())?),
+                    Some(identity_sql_value(write_sequence)?),
+                ),
+            };
         let (listing_cluster_epoch, listing_log_index) =
             MultipartUploadIdKey::listing_position(&upload.upload_id)
                 .filter(|position| *position != (0, 0))
@@ -2881,8 +2967,8 @@ impl PgStore {
                 match store.conn.execute(
                     "INSERT INTO multipart_uploads \
                      (upload_id, bucket, key, initiated_at, state, tags, metadata_blob, system_metadata_blob, owner_principal, owner_canonical_id, \
-                      initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_generation_id, listing_cluster_epoch, listing_log_index, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                      initiator_principal, initiator_canonical_id, checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_generation_id, listing_cluster_epoch, listing_log_index, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, initiated_object_kind, initiated_object_version_id, initiated_object_generation_or_write_sequence) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
                     params![
                         upload.upload_id,
                         upload.bucket,
@@ -2908,6 +2994,9 @@ impl PgStore {
                         object_lock_retention_mode,
                         object_lock_retain_until,
                         object_lock_legal_hold,
+                        initiated_object_kind,
+                        initiated_object_version_id,
+                        initiated_object_value,
                     ],
                 ) {
                     Ok(_) => {}
@@ -4035,6 +4124,34 @@ impl PgStore {
                 })
             })
             .transpose()
+    }
+
+    pub(crate) fn multipart_object_identity(
+        &self,
+        object: &StoredObject,
+    ) -> Result<MultipartObjectIdentity, MetadataError> {
+        match object {
+            StoredObject::Live(object) => Ok(MultipartObjectIdentity::Live {
+                version_id: object.version_id,
+                generation_id: object.generation_id,
+            }),
+            StoredObject::DeleteMarker(marker) => {
+                let write_sequence = self
+                    .object_write_sequence(
+                        marker.bucket.as_str(),
+                        marker.key.as_str(),
+                        marker.version_id,
+                    )?
+                    .ok_or_else(|| MetadataError::Db {
+                        context: "load multipart delete-marker identity write sequence",
+                        source: rusqlite::Error::QueryReturnedNoRows,
+                    })?;
+                Ok(MultipartObjectIdentity::DeleteMarker {
+                    version_id: marker.version_id,
+                    write_sequence,
+                })
+            }
+        }
     }
 
     fn mark_current_live_noncurrent(
@@ -9296,6 +9413,7 @@ impl PgMetadataStore for PgStore {
         let command = CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
             req.clone(),
             object_generation_id,
+            None,
             PgStore::now_millis(),
             BucketWriteReservationProof {
                 bucket: req.bucket.clone(),
@@ -9321,7 +9439,7 @@ impl PgMetadataStore for PgStore {
             .query_row(
                 "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
                  system_metadata_blob, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
-                 checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, object_generation_id \
+                 checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, object_generation_id, initiated_object_kind, initiated_object_version_id, initiated_object_generation_or_write_sequence \
                  FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id.as_str()],
                 |row| {
@@ -9408,6 +9526,9 @@ impl PgMetadataStore for PgStore {
                             row.get::<_, i64>(21)?,
                             21,
                             "object_generation_id",
+                        )?,
+                        initiated_object_identity: Self::parse_multipart_object_identity(
+                            row, 22, 23, 24,
                         )?,
                         object_lock,
                         checksum,
@@ -9624,7 +9745,7 @@ impl PgMetadataStore for PgStore {
         let sql = format!(
             "SELECT upload_id, bucket, key, initiated_at, state, tags, metadata_blob, \
              system_metadata_blob, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
-             checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, object_generation_id \
+             checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, object_generation_id, initiated_object_kind, initiated_object_version_id, initiated_object_generation_or_write_sequence \
              FROM multipart_uploads \
              WHERE {where_str} \
              ORDER BY key ASC, listing_cluster_epoch ASC, listing_log_index ASC, upload_id ASC \
@@ -9722,6 +9843,9 @@ impl PgMetadataStore for PgStore {
                         row.get::<_, i64>(21)?,
                         21,
                         "object_generation_id",
+                    )?,
+                    initiated_object_identity: Self::parse_multipart_object_identity(
+                        row, 22, 23, 24,
                     )?,
                     object_lock,
                     checksum,

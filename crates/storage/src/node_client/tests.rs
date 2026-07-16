@@ -258,6 +258,7 @@ fn test_multipart_upload_record(
         acl_grants: AclGrants::default(),
         public_read: false,
         object_generation_id: GenerationId::new(30).unwrap(),
+        initiated_object_identity: None,
         object_lock: ObjectLockState::default(),
         checksum: None,
         encryption: ObjectEncryption::None,

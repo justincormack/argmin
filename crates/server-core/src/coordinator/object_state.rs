@@ -123,6 +123,11 @@ impl Coordinator {
                         .to_string(),
                 }
             }
+            storage::ObjectPgActionError::MultipartConditionalRequestConflict => {
+                ServerError::InternalError {
+                    reason: "multipart conditional conflict escaped object lookup".to_string(),
+                }
+            }
         })
     }
 

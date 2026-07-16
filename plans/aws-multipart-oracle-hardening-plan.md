@@ -225,8 +225,11 @@ For each matrix:
   races, simultaneous completions, and concurrent uploads to the same key.
 - [x] Assert only AWS-permitted outcomes, plus final object bytes, upload
   visibility, part visibility, and retry behavior for every basic outcome.
-  Complete versus abort is serializable. Simultaneous identical completions
-  are idempotent and all return the same result. Different manifests for one
+  Complete versus abort is serializable. When completion wins, the raced abort
+  may either succeed or return `NoSuchUpload`; when abort wins, it succeeds and
+  completion returns `NoSuchUpload`. Sequential abort after completion remains
+  idempotently successful. Simultaneous identical completions are idempotent
+  and all return the same result. Different manifests for one
   upload may both return success, although only the published manifest remains
   replayable; a competing call may instead return `NoSuchUpload`. Distinct
   uploads to one key both complete successfully, with last-writer object state
@@ -244,9 +247,31 @@ For each matrix:
   intact. Multipart management lookup drains a concurrent durable terminal
   command before classification, preserving AWS's idempotent abort result when
   completion wins the race.
-- [ ] Cover versioned buckets, delete markers, conditional completion, multipart
-  copy source changes, and object replacement without relying on timing-sensitive
-  exact boundaries.
+- [x] Cover versioned buckets, delete markers, conditional completion, and object
+  replacement without relying on timing-sensitive exact boundaries. Concurrent
+  completions of distinct uploads in a versioned bucket both publish retained,
+  independently replayable versions. A completion racing a versioned delete
+  retains both the completed version and delete marker; only their latest state
+  varies. Conditional completion is also bound to the current-object identity
+  observed at multipart initiation: normal conditions are evaluated against the
+  current object first, but a condition that would otherwise pass returns
+  `409 ConditionalRequestConflict` when an intervening replacement or deletion
+  changed that identity. The old upload remains listable with its parts, while a
+  newly initiated upload can complete under the new current-object condition.
+  In a versioned bucket, deleting an intervening replacement so the exact
+  initiation-time version becomes current again permits conditional completion;
+  the rule is current identity, not merely whether an intervening write occurred.
+  In a suspended bucket, replacing a current null delete marker with another
+  null marker produces a different identity and returns the same conflict. Local
+  identity therefore includes the marker's durable write sequence rather than
+  relying on its nullable version ID and millisecond timestamp.
+- [x] Cover multipart copy source changes without relying on timing-sensitive
+  exact boundaries. UploadPartCopy racing an unversioned source replacement
+  copies exactly one complete source version: its result ETag, listed part, and
+  completed destination bytes all identify either the old or new object, never
+  a mixture. Racing source deletion either copies the old version successfully
+  or returns `NoSuchKey` without storing a part. In the rejected branch the
+  upload remains usable by a successful copy retry after the source is restored.
 
 ### 6. Cross-feature multipart contracts
 

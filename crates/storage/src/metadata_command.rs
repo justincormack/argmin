@@ -25,7 +25,7 @@ use crate::types::{
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 2;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
@@ -1077,6 +1077,7 @@ impl CreateMultipartUploadCommand {
     pub(crate) fn from_request_with_bucket_write_reservation(
         request: CreateMultipartUploadReq,
         object_generation_id: GenerationId,
+        initiated_object_identity: Option<crate::MultipartObjectIdentity>,
         initiated_at_millis: u64,
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Self {
@@ -1095,6 +1096,7 @@ impl CreateMultipartUploadCommand {
                 acl_grants: request.acl_grants,
                 public_read: request.public_read,
                 object_generation_id,
+                initiated_object_identity,
                 object_lock: request.object_lock,
                 checksum: request.checksum,
                 encryption: request.encryption,
@@ -2440,6 +2442,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_str()?;
         self.skip_bool()?;
         self.read_nonzero_u64("multipart upload object generation")?;
+        self.skip_multipart_object_identity()?;
         self.skip_object_lock_state()?;
         self.skip_optional_multipart_checksum_config()?;
         self.skip_object_encryption()
@@ -2463,10 +2466,45 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             acl_grants: self.read_acl_grants()?,
             public_read: self.read_bool()?,
             object_generation_id: self.read_generation_id("multipart upload object generation")?,
+            initiated_object_identity: self.read_multipart_object_identity()?,
             object_lock: self.read_object_lock_state()?,
             checksum: self.read_optional_multipart_checksum_config()?,
             encryption: self.read_object_encryption()?,
         })
+    }
+
+    fn skip_multipart_object_identity(&mut self) -> Result<(), String> {
+        match self.read_u8()? {
+            0 => Ok(()),
+            1 => {
+                self.read_version_id()?;
+                self.read_nonzero_u64("multipart initiation live generation")?;
+                Ok(())
+            }
+            2 => {
+                self.read_version_id()?;
+                self.read_u64()?;
+                Ok(())
+            }
+            tag => Err(format!("invalid multipart object identity tag {tag}")),
+        }
+    }
+
+    fn read_multipart_object_identity(
+        &mut self,
+    ) -> Result<Option<crate::MultipartObjectIdentity>, String> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(crate::MultipartObjectIdentity::Live {
+                version_id: self.read_version_id()?,
+                generation_id: self.read_generation_id("multipart initiation live generation")?,
+            })),
+            2 => Ok(Some(crate::MultipartObjectIdentity::DeleteMarker {
+                version_id: self.read_version_id()?,
+                write_sequence: self.read_u64()?,
+            })),
+            tag => Err(format!("invalid multipart object identity tag {tag}")),
+        }
     }
 
     fn skip_object_payload_reclaim(&mut self) -> Result<(), String> {
@@ -3396,9 +3434,35 @@ fn encode_multipart_upload(out: &mut Vec<u8>, upload: &MultipartUploadRecord) {
     put_str(out, &upload.acl_grants.serialized());
     put_bool(out, upload.public_read);
     put_u64(out, upload.object_generation_id.get());
+    encode_multipart_object_identity(out, upload.initiated_object_identity);
     encode_object_lock_state(out, upload.object_lock);
     encode_optional_multipart_checksum_config(out, upload.checksum);
     encode_object_encryption(out, &upload.encryption);
+}
+
+fn encode_multipart_object_identity(
+    out: &mut Vec<u8>,
+    identity: Option<crate::MultipartObjectIdentity>,
+) {
+    match identity {
+        None => put_u8(out, 0),
+        Some(crate::MultipartObjectIdentity::Live {
+            version_id,
+            generation_id,
+        }) => {
+            put_u8(out, 1);
+            encode_version_id(out, version_id);
+            put_u64(out, generation_id.get());
+        }
+        Some(crate::MultipartObjectIdentity::DeleteMarker {
+            version_id,
+            write_sequence,
+        }) => {
+            put_u8(out, 2);
+            encode_version_id(out, version_id);
+            put_u64(out, write_sequence);
+        }
+    }
 }
 
 fn encode_put_live_object(out: &mut Vec<u8>, object: &PutLiveObjectReq) {
@@ -4430,7 +4494,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0x034161504946527a);
+        assert_eq!(envelope.checksum_crc64(), 0xa15745a8188c76de);
     }
 
     #[test]
@@ -4468,6 +4532,18 @@ mod tests {
         assert_eq!(applied_header.id(), id);
         assert_eq!(applied_header.kind(), MetadataCommandLogEntryKind::Applied);
         assert_eq!(applied_header.command_kind_name(), Some("CreateBucket"));
+
+        let mut old_version = envelope.command_bytes();
+        let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
+        old_version[version_offset..version_offset + 2].copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(
+            decode_metadata_command_envelope(&old_version),
+            Err("unsupported metadata command encoding version 1".to_string())
+        );
+        assert_eq!(
+            decode_metadata_command_log_entry_header(&old_version),
+            Err("unsupported metadata command encoding version 1".to_string())
+        );
 
         let mut applied_with_trailing_bytes = envelope.command_bytes();
         applied_with_trailing_bytes.push(0);
@@ -4518,7 +4594,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xabea88907d2d7469);
+        assert_eq!(envelope.checksum_crc64(), 0x09fcac682ce750cd);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4546,7 +4622,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x73fc69c5ca05bb59);
+        assert_eq!(envelope.checksum_crc64(), 0xd1ea4d3d9bcf9ffd);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4611,7 +4687,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x5585ffd2108a4cc5);
+        assert_eq!(envelope.checksum_crc64(), 0xf793db2a41406861);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4692,13 +4768,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xf4c75767017499eb,
-                0x5fd79a5c96e861b7,
-                0x0baee4dbd191dd4a,
-                0xcb9279e0016e0b8e,
-                0xeccd43b1f4e1a3fd,
-                0xef85c47dadb328ac,
-                0x879943356a97ba06,
+                0x00a41bfdc30fd605,
+                0x48eb013ee7de61a6,
+                0xa0a5a9f9316ce8b9,
+                0x69ffe7e9dc496192,
+                0x4ea0ddb829c6c9e1,
+                0x4d93e085fc790c08,
+                0x25f4dd3cb7b0d01a,
             ]
         );
     }
@@ -4774,14 +4850,14 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x2c71312aba70ec12,
-                0x7a3aad2f1477e115,
-                0xa9d13d13566d4ae2,
-                0x26a1d1cfadbac4da,
-                0x48043526c6d0ce88,
-                0xb566708169760d44,
-                0xfcc8ed210f34db99,
-                0x4b00ed0e84caf2ba,
+                0x60d7c091911618a3,
+                0x28c4fec276df291d,
+                0xfbb117226a43fa1a,
+                0x745f8222cf120cd2,
+                0x7a4385c68015ff0f,
+                0xe798236c0bdec54c,
+                0xc2e5aef0208bbef4,
+                0x19febee3e6623ab2,
             ]
         );
     }
@@ -4900,6 +4976,10 @@ mod tests {
             acl_grants: AclGrants::default(),
             public_read: true,
             object_generation_id: generation_id,
+            initiated_object_identity: Some(crate::MultipartObjectIdentity::Live {
+                version_id: VersionId::from_u64(7),
+                generation_id,
+            }),
             object_lock: ObjectLockState::default(),
             checksum: None,
             encryption: ObjectEncryption::None,
@@ -5201,6 +5281,7 @@ mod tests {
                         encryption: ObjectEncryption::None,
                     },
                     generation_id,
+                    None,
                     560,
                     bucket_write_reservation.clone(),
                 ),
@@ -5360,36 +5441,36 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x5fc3fd9935e6b23a,
-                0x56db6be41cc9a89c,
-                0x3acf49df359790d4,
-                0x0cb6bb404ef4656f,
-                0x8bd4d497a7b4d97a,
-                0x9da7eb766650947b,
-                0xf9892eeff816b2dd,
-                0xf21cb0547df33874,
-                0x0ca679e24ed84eef,
-                0x66acbb29fe56f0b2,
-                0xa05e22c8dd1f61dc,
-                0x1ca0b069a2818373,
-                0xf5f5816be8b7139b,
-                0x60ef674331e12342,
-                0x24db3cbfda0adf5d,
-                0x78ed7de4e9c019bf,
-                0x8357e4c966d0ea8d,
-                0xbb8b5b593db93b48,
-                0x1550723e75021689,
-                0x601d5126589d6456,
-                0xc895b52e824f1f43,
-                0x98b7bdf59d79d117,
-                0x506bcf86cc513234,
-                0xad26c80659b2eba1,
-                0x73f91e66bbbe0007,
-                0x6c3b4b7d0a8ce150,
-                0x48a90205c35a066d,
-                0x5cdc2de0c4471422,
-                0x0064ce32b63977cd,
-                0x1946524188e07bbb,
+                0x372586f40e38cb61,
+                0x7daf5c99a96377fc,
+                0x43e9ce10ae0b12b4,
+                0x49bb63006d1c2924,
+                0xb09e67ab15c2e77b,
+                0x70be2b4801d91a85,
+                0xd7a09255b5079eaa,
+                0x2e5d0c30fca1995f,
+                0xe43a58b7fbb3aa33,
+                0xe2a042ba93f218b8,
+                0x3f171ef43702a933,
+                0x21c08a183c91cd20,
+                0x9217c71cd24a1a48,
+                0x4e203c119b2d2e2b,
+                0xfb2bd57cb5efbecc,
+                0x562226b6430c14d6,
+                0x8c1ade4137ca3577,
+                0xd71faa6ed41ccac2,
+                0x60ed7d15eb860b45,
+                0x55063a6319a4994e,
+                0x1ed582e14faab576,
+                0x67704a18fce0987b,
+                0x3016ea0efe2c8ecf,
+                0xfb5112a49179305b,
+                0x06c5520bee9e4d63,
+                0xcb3ee868eb7c7346,
+                0x355d299abfe44988,
+                0x721376b26e8b194b,
+                0x2686cc7f12b01922,
+                0xf29f8ff44f15cd4b,
             ]
         );
     }

@@ -1032,6 +1032,10 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
 
     let snapshot = MultipartCompletionSnapshot {
         existing_etag: None,
+        current_object_identity: Some(crate::MultipartObjectIdentity::DeleteMarker {
+            version_id: VersionId::from_u64(3),
+            write_sequence: 11,
+        }),
         stale_payload_source: None,
         part_records: vec![part.clone()],
         selected_streaming_segments: Vec::new(),
@@ -1304,6 +1308,7 @@ fn unix_object_mutation_client_loads_multipart_upload_over_rpc() {
                 CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
                     create,
                     GenerationId::new(1).unwrap(),
+                    None,
                     123,
                     proof,
                 ),
@@ -1936,6 +1941,10 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
         acl_grants: AclGrants::default(),
         public_read: false,
         object_generation_id: GenerationId::new(30).unwrap(),
+        initiated_object_identity: Some(crate::MultipartObjectIdentity::Live {
+            version_id: VersionId::from_u64(1),
+            generation_id: GenerationId::new(29).unwrap(),
+        }),
         object_lock: ObjectLockState::default(),
         checksum: None,
         encryption: ObjectEncryption::None,
@@ -2171,6 +2180,140 @@ fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() 
 }
 
 #[test]
+fn unix_complete_multipart_uses_durable_initiation_identity() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("complete-mpu-identity-rpc-bucket");
+    let key = crate::tests::object_key("complete-mpu-identity-rpc-key");
+    let upload_id = crate::tests::multipart_upload_id("complete-mpu-identity-rpc-upload");
+    let owner = OwnerIdentity::from_principal("owner");
+    let put_live = |generation_id| PutLiveObjectReq {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        version_id: VersionId::Null,
+        owner: owner.clone(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        generation_id: GenerationId::new(generation_id).unwrap(),
+        size: 0,
+        etag: ObjectEtag::single_part(generation_id),
+        ec: EcShape { k: 4, m: 2 },
+        layout: ObjectLayout::Standard,
+        tags: None,
+        metadata_blob: Some(SerializedMetadataBlob::default()),
+        system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+        object_lock: ObjectLockState::default(),
+        encryption: ObjectEncryption::None,
+    };
+    let upload = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner.canonical_id,
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        PgMetadataStore::put_object_meta(&*pg, &crate::PutObjectReq::Live(put_live(1))).unwrap();
+        PgMetadataStore::create_multipart_upload(
+            &*pg,
+            &CreateMultipartUploadReq {
+                upload_id: upload_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                tags: None,
+                metadata_blob: SerializedMetadataBlob::default(),
+                system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                initiator: owner.clone(),
+                owner: owner.clone(),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                object_lock: ObjectLockState::default(),
+                checksum: None,
+                encryption: ObjectEncryption::None,
+            },
+        )
+        .unwrap();
+        pg.connection()
+            .execute(
+                "UPDATE multipart_uploads SET initiated_object_kind = 1, \
+                 initiated_object_version_id = 0, \
+                 initiated_object_generation_or_write_sequence = 1 \
+                 WHERE upload_id = ?1",
+                rusqlite::params![upload_id.as_str()],
+            )
+            .unwrap();
+        PgMetadataStore::put_object_meta(&*pg, &crate::PutObjectReq::Live(put_live(3))).unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap()
+    };
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        config.socket_path,
+    );
+    let current_identity = crate::MultipartObjectIdentity::Live {
+        version_id: VersionId::Null,
+        generation_id: GenerationId::new(3).unwrap(),
+    };
+    let part = test_multipart_part_record(upload_id.clone(), 1);
+    let request = CompleteMultipartCommitRequest {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        upload_id: upload_id.clone(),
+        completion_fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0x77; 32]),
+        versioning: BucketVersioningState::Disabled,
+        owner,
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        generation_id: upload.object_generation_id,
+        size: part.size,
+        etag_crc64: [8; 8],
+        tags: None,
+        metadata_blob: Some(SerializedMetadataBlob::default()),
+        system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+        object_lock: ObjectLockState::default(),
+        encryption: ObjectEncryption::None,
+        expected_stale_payload_source: None,
+        expected_current_object_identity: Some(current_identity),
+        conditional_completion: true,
+        part_records: vec![part],
+        selected_streaming_segments: Vec::new(),
+        expected_cleanup: CompleteMultipartCommitCleanup::default(),
+    };
+    let proof = test_bucket_write_reservation_proof(bucket, &key);
+    let error = ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
+        &client,
+        BuildCompleteMultipartObjectCommandReq {
+            pg_id: PgId::new(0),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            request: &request,
+            version_id: VersionId::Null,
+            expected_object_parts: &[],
+            bucket_write_reservation: &proof,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ObjectPgActionError::MultipartConditionalRequestConflict
+    ));
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
     let tmp = test_util::tempdir();
     let client = UnixStorageNodeClient::new(
@@ -2216,6 +2359,11 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         object_lock: ObjectLockState::default(),
         encryption: ObjectEncryption::None,
         expected_stale_payload_source: None,
+        expected_current_object_identity: Some(crate::MultipartObjectIdentity::Live {
+            version_id: VersionId::from_u64(2),
+            generation_id: GenerationId::new(31).unwrap(),
+        }),
+        conditional_completion: true,
         part_records: vec![part.clone()],
         selected_streaming_segments: Vec::new(),
         expected_cleanup: CompleteMultipartCommitCleanup::default(),
@@ -2454,6 +2602,7 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
         acl_grants: AclGrants::default(),
         public_read: false,
         object_generation_id: GenerationId::new(30).unwrap(),
+        initiated_object_identity: None,
         object_lock: ObjectLockState::default(),
         checksum: None,
         encryption: ObjectEncryption::None,

@@ -368,6 +368,10 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::PreconditionFailed { .. } => {
             "At least one of the pre-conditions you specified did not hold".to_string()
         }
+        ServerError::ConditionalRequestConflict { .. } => {
+            "The conditional request cannot succeed due to a conflicting operation against this resource."
+                .to_string()
+        }
         ServerError::NotModified { .. } => "not modified".to_string(),
         ServerError::SlowDown => "Please reduce your request rate.".to_string(),
         ServerError::BadDigest => "bad digest".to_string(),
@@ -1177,6 +1181,12 @@ impl S3Response {
             ServerError::PreconditionFailed { condition } => {
                 let body = xml::precondition_failed_error_xml(condition, request_id, host_id);
                 Self::new(412).chunked_xml_body(body)
+            }
+            ServerError::ConditionalRequestConflict { key, condition } => {
+                let body = xml::conditional_request_conflict_error_xml(
+                    key, condition, request_id, host_id,
+                );
+                Self::new(409).chunked_xml_body(body)
             }
             ServerError::InvalidPartNumber {
                 part_number,

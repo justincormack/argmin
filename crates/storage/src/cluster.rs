@@ -484,6 +484,12 @@ fn object_pg_action_error_to_bucket_snapshot_error(
                 source: std::io::Error::other("stale multipart completion snapshot"),
             })
         }
+        ObjectPgActionError::MultipartConditionalRequestConflict => {
+            BucketSnapshotLoadError::Store(StoreError::Io {
+                context: "object PG action failed during bucket snapshot operation",
+                source: std::io::Error::other("multipart conditional request conflict"),
+            })
+        }
     }
 }
 
@@ -12015,6 +12021,9 @@ fn metadata_command_checkpoint_record_storage_rpc_error_kind(
         StorageRpcErrorCode::TransportTimeout => "storage_rpc_transport_timeout",
         StorageRpcErrorCode::TransportClosed => "storage_rpc_transport_closed",
         StorageRpcErrorCode::ShardIntegrity => "storage_rpc_shard_integrity",
+        StorageRpcErrorCode::MultipartConditionalRequestConflict => {
+            "storage_rpc_multipart_conditional_request_conflict"
+        }
     }
 }
 

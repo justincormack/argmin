@@ -6437,7 +6437,6 @@ fn test_complete_multipart_upload_racing_abort_is_serializable() {
             let (complete, abort) = tokio::join!(complete_task, abort_task);
             let complete = complete.unwrap();
             let abort = abort.unwrap();
-            abort.expect("raced AbortMultipartUpload should remain idempotently successful");
             let get = client.get_object().bucket(&bucket).key(key).send().await;
             let list = client
                 .list_parts()
@@ -6454,6 +6453,9 @@ fn test_complete_multipart_upload_racing_abort_is_serializable() {
 
             match complete {
                 Ok(completed) => {
+                    if let Err(err) = &abort {
+                        assert_eq!(err.code(), Some("NoSuchUpload"));
+                    }
                     let object = get.expect(
                         "a successful raced completion must leave its object visible after abort",
                     );
@@ -6469,6 +6471,9 @@ fn test_complete_multipart_upload_racing_abort_is_serializable() {
                 }
                 Err(err) => {
                     assert_eq!(err.code(), Some("NoSuchUpload"));
+                    abort.expect(
+                        "the winning raced abort must succeed when completion returns NoSuchUpload",
+                    );
                     assert_eq!(err_status(&get), 404);
                     assert_s3_err_code(&get, "NoSuchKey");
                     assert_eq!(err_status(&retry), 404);
@@ -6977,6 +6982,901 @@ fn test_simultaneous_completions_of_distinct_uploads_to_same_key() {
             assert_list_parts_no_such_upload(&bucket, key, &first_upload_id).await;
             assert_list_parts_no_such_upload(&bucket, key, &second_upload_id).await;
             cleanup(&bucket, &[key]).await;
+        }
+    });
+}
+
+#[test]
+fn test_versioned_simultaneous_completions_retain_both_object_versions() {
+    s3_tests::run(async {
+        for attempt in 0..5 {
+            let client = CTX.client();
+            let bucket = unique_bucket();
+            s3_tests::create_bucket(client, &bucket).await.unwrap();
+            put_bucket_versioning_retrying_operation_aborted(
+                client,
+                &bucket,
+                BucketVersioningStatus::Enabled,
+            )
+            .await;
+            let key = "versioned-distinct-upload-completion-race";
+
+            let (first_upload_id, first_etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"first version").await;
+            let (second_upload_id, second_etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"second version").await;
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let first = spawn_barrier_single_part_completion(
+                client.clone(),
+                bucket.clone(),
+                key,
+                first_upload_id.clone(),
+                1,
+                first_etag.clone(),
+                Arc::clone(&barrier),
+            );
+            let second = spawn_barrier_single_part_completion(
+                client.clone(),
+                bucket.clone(),
+                key,
+                second_upload_id.clone(),
+                1,
+                second_etag.clone(),
+                barrier,
+            );
+            let (first, second) = tokio::join!(first, second);
+            let first = first
+                .unwrap()
+                .unwrap_or_else(|err| panic!("first versioned completion {attempt}: {err:?}"));
+            let second = second
+                .unwrap()
+                .unwrap_or_else(|err| panic!("second versioned completion {attempt}: {err:?}"));
+            let first_version_id = first
+                .version_id()
+                .expect("first versioned completion must return a VersionId")
+                .to_string();
+            let second_version_id = second
+                .version_id()
+                .expect("second versioned completion must return a VersionId")
+                .to_string();
+            assert_ne!(first_version_id, second_version_id);
+
+            for (version_id, expected_body) in [
+                (first_version_id.as_str(), b"first version".as_slice()),
+                (second_version_id.as_str(), b"second version".as_slice()),
+            ] {
+                let object = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(version_id)
+                    .send()
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("read retained completion version {version_id}: {err:?}")
+                    });
+                assert_eq!(
+                    object.body.collect().await.unwrap().into_bytes().as_ref(),
+                    expected_body
+                );
+            }
+
+            let first_replay =
+                send_single_part_completion(client, &bucket, key, &first_upload_id, 1, &first_etag)
+                    .await
+                    .unwrap();
+            let second_replay = send_single_part_completion(
+                client,
+                &bucket,
+                key,
+                &second_upload_id,
+                1,
+                &second_etag,
+            )
+            .await
+            .unwrap();
+            assert_eq!(first_replay.version_id(), Some(first_version_id.as_str()));
+            assert_eq!(second_replay.version_id(), Some(second_version_id.as_str()));
+
+            let listed = client
+                .list_object_versions()
+                .bucket(&bucket)
+                .prefix(key)
+                .send_retrying_operation_aborted("list raced multipart object versions")
+                .await
+                .unwrap();
+            assert_eq!(listed.versions().len(), 2);
+            assert!(listed.delete_markers().is_empty());
+            assert_eq!(
+                listed
+                    .versions()
+                    .iter()
+                    .filter(|version| version.is_latest() == Some(true))
+                    .count(),
+                1
+            );
+
+            s3_tests::cleanup_versioned_bucket(client, &bucket).await;
+        }
+    });
+}
+
+#[test]
+fn test_versioned_completion_racing_delete_retains_version_and_marker() {
+    s3_tests::run(async {
+        for attempt in 0..5 {
+            let client = CTX.client();
+            let bucket = unique_bucket();
+            s3_tests::create_bucket(client, &bucket).await.unwrap();
+            put_bucket_versioning_retrying_operation_aborted(
+                client,
+                &bucket,
+                BucketVersioningStatus::Enabled,
+            )
+            .await;
+            let key = "versioned-completion-delete-race";
+            let (upload_id, part_etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"retained version").await;
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let completion = spawn_barrier_single_part_completion(
+                client.clone(),
+                bucket.clone(),
+                key,
+                upload_id.clone(),
+                1,
+                part_etag.clone(),
+                Arc::clone(&barrier),
+            );
+            let delete_client = client.clone();
+            let delete_bucket = bucket.clone();
+            let delete = tokio::spawn(async move {
+                barrier.wait().await;
+                delete_client
+                    .delete_object()
+                    .bucket(delete_bucket)
+                    .key(key)
+                    .send()
+                    .await
+            });
+            let (completion, delete) = tokio::join!(completion, delete);
+            let completion = completion
+                .unwrap()
+                .unwrap_or_else(|err| panic!("versioned completion attempt {attempt}: {err:?}"));
+            let delete = delete
+                .unwrap()
+                .unwrap_or_else(|err| panic!("versioned delete attempt {attempt}: {err:?}"));
+            let completed_version_id = completion
+                .version_id()
+                .expect("versioned completion must return a VersionId")
+                .to_string();
+            let delete_marker_version_id = delete
+                .version_id()
+                .expect("versioned delete must return a VersionId")
+                .to_string();
+            assert!(delete.delete_marker().unwrap_or(false));
+            assert_ne!(completed_version_id, delete_marker_version_id);
+
+            let retained = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .version_id(&completed_version_id)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                retained.body.collect().await.unwrap().into_bytes().as_ref(),
+                b"retained version"
+            );
+            let replay =
+                send_single_part_completion(client, &bucket, key, &upload_id, 1, &part_etag)
+                    .await
+                    .unwrap();
+            assert_eq!(replay.version_id(), Some(completed_version_id.as_str()));
+
+            let listed = client
+                .list_object_versions()
+                .bucket(&bucket)
+                .prefix(key)
+                .send_retrying_operation_aborted("list completion/delete race versions")
+                .await
+                .unwrap();
+            assert_eq!(listed.versions().len(), 1);
+            assert_eq!(listed.delete_markers().len(), 1);
+            let object_is_latest = listed.versions()[0].is_latest() == Some(true);
+            let marker_is_latest = listed.delete_markers()[0].is_latest() == Some(true);
+            assert_ne!(object_is_latest, marker_is_latest);
+            assert_eq!(
+                listed.versions()[0].version_id(),
+                Some(completed_version_id.as_str())
+            );
+            assert_eq!(
+                listed.delete_markers()[0].version_id(),
+                Some(delete_marker_version_id.as_str())
+            );
+
+            let current = client.get_object().bucket(&bucket).key(key).send().await;
+            if object_is_latest {
+                let current = current.expect("the completion version is current");
+                assert_eq!(current.version_id(), Some(completed_version_id.as_str()));
+                assert_eq!(
+                    current.body.collect().await.unwrap().into_bytes().as_ref(),
+                    b"retained version"
+                );
+            } else {
+                assert_eq!(err_status(&current), 404);
+                assert_s3_err_code(&current, "NoSuchKey");
+            }
+
+            s3_tests::cleanup_versioned_bucket(client, &bucket).await;
+        }
+    });
+}
+
+#[test]
+fn test_conditional_completion_racing_object_replacement_is_serializable() {
+    s3_tests::run(async {
+        for attempt in 0..6 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let key = "conditional-completion-replacement-race";
+            let original = put_object_retrying_operation_aborted(
+                client,
+                &bucket,
+                key,
+                b"original object".to_vec(),
+            )
+            .await;
+            let original_etag = original.e_tag().unwrap().to_string();
+            let (upload_id, part_etag) =
+                create_single_part_upload(client, &bucket, key, 1, b"multipart object").await;
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let complete_client = client.clone();
+            let complete_bucket = bucket.clone();
+            let complete_upload_id = upload_id.clone();
+            let complete_part_etag = part_etag.clone();
+            let complete_original_etag = original_etag.clone();
+            let complete_barrier = Arc::clone(&barrier);
+            let completion = tokio::spawn(async move {
+                complete_barrier.wait().await;
+                if attempt % 2 != 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                complete_client
+                    .complete_multipart_upload()
+                    .bucket(complete_bucket)
+                    .key(key)
+                    .upload_id(complete_upload_id)
+                    .if_match(complete_original_etag)
+                    .multipart_upload(single_part_completion(&complete_part_etag, 1))
+                    .send()
+                    .await
+            });
+
+            let replacement_client = client.clone();
+            let replacement_bucket = bucket.clone();
+            let replacement = tokio::spawn(async move {
+                barrier.wait().await;
+                if attempt % 2 == 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                replacement_client
+                    .put_object()
+                    .bucket(replacement_bucket)
+                    .key(key)
+                    .body(ByteStream::from_static(b"replacement object"))
+                    .send()
+                    .await
+            });
+
+            let (completion, replacement) = tokio::join!(completion, replacement);
+            let completion = completion.unwrap();
+            let replacement = replacement
+                .unwrap()
+                .unwrap_or_else(|err| panic!("replacement PUT attempt {attempt}: {err:?}"));
+            let replacement_etag = replacement.e_tag().unwrap().to_string();
+            let current = client
+                .get_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(current.e_tag(), Some(replacement_etag.as_str()));
+            assert_eq!(
+                current.body.collect().await.unwrap().into_bytes().as_ref(),
+                b"replacement object"
+            );
+
+            if attempt % 2 == 0 {
+                completion.unwrap_or_else(|err| {
+                    panic!("completion-first attempt {attempt} failed: {err:?}")
+                });
+                assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+                let replay =
+                    send_single_part_completion(client, &bucket, key, &upload_id, 1, &part_etag)
+                        .await;
+                assert_eq!(err_status(&replay), 404);
+                assert_s3_err_code(&replay, "NoSuchUpload");
+            } else {
+                assert_eq!(err_status(&completion), 412);
+                assert_s3_err_code(&completion, "PreconditionFailed");
+                let listed = client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(listed.parts().len(), 1);
+                assert_eq!(listed.parts()[0].e_tag(), Some(part_etag.as_str()));
+
+                let corrected = client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .if_match(&replacement_etag)
+                    .multipart_upload(single_part_completion(&part_etag, 1))
+                    .send()
+                    .await;
+                assert_eq!(err_status(&corrected), 409);
+                assert_s3_err_code(&corrected, "ConditionalRequestConflict");
+                let listed = client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(listed.parts().len(), 1);
+                assert_eq!(listed.parts()[0].e_tag(), Some(part_etag.as_str()));
+                abort_multipart_upload_retrying_operation_aborted(client, &bucket, key, &upload_id)
+                    .await;
+
+                let (new_upload_id, new_part_etag) =
+                    create_single_part_upload(client, &bucket, key, 1, b"multipart object").await;
+                let corrected = client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&new_upload_id)
+                    .if_match(&replacement_etag)
+                    .multipart_upload(single_part_completion(&new_part_etag, 1))
+                    .send_retrying_operation_aborted(
+                        "complete newly initiated upload after raced conditional conflict",
+                    )
+                    .await
+                    .unwrap();
+                assert_object_contents_and_etag(
+                    &bucket,
+                    key,
+                    corrected.e_tag().unwrap(),
+                    b"multipart object",
+                )
+                .await;
+            }
+
+            cleanup(&bucket, &[key]).await;
+        }
+    });
+}
+
+#[test]
+fn test_complete_multipart_if_none_match_conflicts_after_post_initiation_delete() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "conditional-completion-post-initiation-replacement";
+        put_object_retrying_operation_aborted(client, &bucket, key, b"original object".to_vec())
+            .await;
+        let (upload_id, part_etag) =
+            create_single_part_upload(client, &bucket, key, 1, b"multipart object").await;
+        delete_object_retrying_operation_aborted(client, &bucket, key).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let completion_body = single_part_complete_body(&part_etag);
+        let conflict = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &completion_body,
+            &[("if-none-match", "*")],
+        );
+        assert_eq!(conflict.status, 409, "{conflict:?}");
+        assert_eq!(
+            xml_tag_text(&conflict.body, "Code"),
+            Some("ConditionalRequestConflict")
+        );
+        assert_eq!(
+            xml_tag_text(&conflict.body, "Message"),
+            Some(
+                "The conditional request cannot succeed due to a conflicting operation against this resource."
+            )
+        );
+        assert_eq!(xml_tag_text(&conflict.body, "Key"), Some(key));
+        assert_eq!(
+            xml_tag_text(&conflict.body, "Condition"),
+            Some("If-None-Match")
+        );
+        assert!(!conflict.body.starts_with("<?xml"), "{conflict:?}");
+        assert!(xml_tag_text(&conflict.body, "RequestId").is_some());
+        assert!(xml_tag_text(&conflict.body, "HostId").is_some());
+        let listed = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.parts().len(), 1);
+        assert_eq!(listed.parts()[0].e_tag(), Some(part_etag.as_str()));
+
+        abort_multipart_upload_retrying_operation_aborted(client, &bucket, key, &upload_id).await;
+        let (new_upload_id, new_part_etag) =
+            create_single_part_upload(client, &bucket, key, 1, b"multipart object").await;
+        let corrected = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(new_upload_id)
+            .if_none_match("*")
+            .multipart_upload(single_part_completion(&new_part_etag, 1))
+            .send_retrying_operation_aborted(
+                "complete newly initiated upload after post-initiation delete conflict",
+            )
+            .await
+            .unwrap();
+        assert_object_contents_and_etag(
+            &bucket,
+            key,
+            corrected.e_tag().unwrap(),
+            b"multipart object",
+        )
+        .await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_conditional_completion_accepts_restored_version_identity() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
+        let key = "conditional-completion-version-restoration";
+        let original = put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"original object".to_vec(),
+        )
+        .await;
+        let original_etag = original.e_tag().unwrap().to_string();
+        let original_version_id = original.version_id().unwrap().to_string();
+        let (upload_id, part_etag) =
+            create_single_part_upload(client, &bucket, key, 1, b"multipart object").await;
+
+        let replacement = put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"replacement object".to_vec(),
+        )
+        .await;
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(replacement.version_id().unwrap())
+            .send_retrying_operation_aborted("remove replacement multipart target version")
+            .await
+            .unwrap();
+        let restored = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(restored.version_id(), Some(original_version_id.as_str()));
+        assert_eq!(restored.e_tag(), Some(original_etag.as_str()));
+
+        let completion = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .if_match(&original_etag)
+            .multipart_upload(single_part_completion(&part_etag, 1))
+            .send_retrying_operation_aborted(
+                "complete conditional upload after restoring initiation version",
+            )
+            .await
+            .unwrap();
+        assert_ne!(completion.version_id(), Some(original_version_id.as_str()));
+        let published = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(published.version_id(), completion.version_id());
+        assert_eq!(
+            published
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+                .as_ref(),
+            b"multipart object"
+        );
+        assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+
+        s3_tests::cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_conditional_completion_detects_replaced_suspended_null_delete_marker() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Enabled,
+        )
+        .await;
+        put_bucket_versioning_retrying_operation_aborted(
+            client,
+            &bucket,
+            BucketVersioningStatus::Suspended,
+        )
+        .await;
+        let key = "conditional-completion-replaced-null-marker";
+        let first_marker = delete_object_retrying_operation_aborted(client, &bucket, key).await;
+        assert_eq!(first_marker.version_id(), Some("null"));
+        assert_eq!(first_marker.delete_marker(), Some(true));
+        let (upload_id, part_etag) =
+            create_single_part_upload(client, &bucket, key, 1, b"multipart object").await;
+
+        let second_marker = delete_object_retrying_operation_aborted(client, &bucket, key).await;
+        assert_eq!(second_marker.version_id(), Some("null"));
+        assert_eq!(second_marker.delete_marker(), Some(true));
+        let completion = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .if_none_match("*")
+            .multipart_upload(single_part_completion(&part_etag, 1))
+            .send()
+            .await;
+        assert_eq!(err_status(&completion), 409);
+        assert_s3_err_code(&completion, "ConditionalRequestConflict");
+        let listed = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.parts().len(), 1);
+        assert_eq!(listed.parts()[0].e_tag(), Some(part_etag.as_str()));
+
+        abort_multipart_upload_retrying_operation_aborted(client, &bucket, key, &upload_id).await;
+        s3_tests::cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_upload_part_copy_racing_source_replacement_uses_one_object_version() {
+    s3_tests::run(async {
+        for attempt in 0..6 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let source_key = "copy-race-replaced-source";
+            let destination_key = "copy-race-replaced-destination";
+            let original_body = vec![b'o'; 64 * 1024];
+            let replacement_body = vec![b'r'; 64 * 1024];
+            let original = put_object_retrying_operation_aborted(
+                client,
+                &bucket,
+                source_key,
+                original_body.clone(),
+            )
+            .await;
+            let original_etag = original.e_tag().unwrap().to_string();
+            let upload_id = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(destination_key)
+                .send_retrying_operation_aborted("create destination for copy/replace race")
+                .await
+                .unwrap()
+                .upload_id()
+                .unwrap()
+                .to_string();
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let copy_client = client.clone();
+            let copy_bucket = bucket.clone();
+            let copy_upload_id = upload_id.clone();
+            let copy_barrier = Arc::clone(&barrier);
+            let copy = tokio::spawn(async move {
+                copy_barrier.wait().await;
+                if attempt % 2 != 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                copy_client
+                    .upload_part_copy()
+                    .bucket(&copy_bucket)
+                    .key(destination_key)
+                    .upload_id(copy_upload_id)
+                    .part_number(1)
+                    .copy_source(format!("{copy_bucket}/{source_key}"))
+                    .send()
+                    .await
+            });
+            let replacement_client = client.clone();
+            let replacement_bucket = bucket.clone();
+            let replacement_barrier = barrier;
+            let replacement_body_for_task = replacement_body.clone();
+            let replacement = tokio::spawn(async move {
+                replacement_barrier.wait().await;
+                if attempt % 2 == 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                replacement_client
+                    .put_object()
+                    .bucket(replacement_bucket)
+                    .key(source_key)
+                    .body(ByteStream::from(replacement_body_for_task))
+                    .send()
+                    .await
+            });
+            let (copy, replacement) = tokio::join!(copy, replacement);
+            let copy = copy
+                .unwrap()
+                .unwrap_or_else(|err| panic!("UploadPartCopy attempt {attempt}: {err:?}"));
+            let replacement = replacement
+                .unwrap()
+                .unwrap_or_else(|err| panic!("source replacement attempt {attempt}: {err:?}"));
+            let replacement_etag = replacement.e_tag().unwrap().to_string();
+            assert_ne!(original_etag, replacement_etag);
+            let copied_etag = copy
+                .copy_part_result()
+                .and_then(|result| result.e_tag())
+                .expect("UploadPartCopy must return an ETag")
+                .to_string();
+            assert!(
+                copied_etag == original_etag || copied_etag == replacement_etag,
+                "copy attempt {attempt} returned an ETag from neither source version: {copied_etag}"
+            );
+
+            let listed = client
+                .list_parts()
+                .bucket(&bucket)
+                .key(destination_key)
+                .upload_id(&upload_id)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(listed.parts().len(), 1);
+            assert_eq!(listed.parts()[0].e_tag(), Some(copied_etag.as_str()));
+            assert_eq!(listed.parts()[0].size(), Some(original_body.len() as i64));
+
+            let completed = send_single_part_completion(
+                client,
+                &bucket,
+                destination_key,
+                &upload_id,
+                1,
+                &copied_etag,
+            )
+            .await
+            .unwrap();
+            let expected_body = if copied_etag == original_etag {
+                original_body.as_slice()
+            } else {
+                replacement_body.as_slice()
+            };
+            assert_object_contents_and_etag(
+                &bucket,
+                destination_key,
+                completed.e_tag().unwrap(),
+                expected_body,
+            )
+            .await;
+            let current_source = client
+                .get_object()
+                .bucket(&bucket)
+                .key(source_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(current_source.e_tag(), Some(replacement_etag.as_str()));
+            assert_eq!(
+                current_source
+                    .body
+                    .collect()
+                    .await
+                    .unwrap()
+                    .into_bytes()
+                    .as_ref(),
+                replacement_body.as_slice()
+            );
+
+            cleanup(&bucket, &[source_key, destination_key]).await;
+        }
+    });
+}
+
+#[test]
+fn test_upload_part_copy_racing_source_delete_is_atomic() {
+    s3_tests::run(async {
+        for attempt in 0..6 {
+            let client = CTX.client();
+            let bucket = setup_bucket().await;
+            let source_key = "copy-race-deleted-source";
+            let destination_key = "copy-race-deleted-destination";
+            let source_body = vec![b's'; 64 * 1024];
+            let source = put_object_retrying_operation_aborted(
+                client,
+                &bucket,
+                source_key,
+                source_body.clone(),
+            )
+            .await;
+            let source_etag = source.e_tag().unwrap().to_string();
+            let upload_id = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(destination_key)
+                .send_retrying_operation_aborted("create destination for copy/delete race")
+                .await
+                .unwrap()
+                .upload_id()
+                .unwrap()
+                .to_string();
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let copy_client = client.clone();
+            let copy_bucket = bucket.clone();
+            let copy_upload_id = upload_id.clone();
+            let copy_barrier = Arc::clone(&barrier);
+            let copy = tokio::spawn(async move {
+                copy_barrier.wait().await;
+                if attempt % 2 != 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                copy_client
+                    .upload_part_copy()
+                    .bucket(&copy_bucket)
+                    .key(destination_key)
+                    .upload_id(copy_upload_id)
+                    .part_number(1)
+                    .copy_source(format!("{copy_bucket}/{source_key}"))
+                    .send()
+                    .await
+            });
+            let delete_client = client.clone();
+            let delete_bucket = bucket.clone();
+            let delete = tokio::spawn(async move {
+                barrier.wait().await;
+                if attempt % 2 == 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                delete_client
+                    .delete_object()
+                    .bucket(delete_bucket)
+                    .key(source_key)
+                    .send()
+                    .await
+            });
+            let (copy, delete) = tokio::join!(copy, delete);
+            let copy = copy.unwrap();
+            delete
+                .unwrap()
+                .unwrap_or_else(|err| panic!("source delete attempt {attempt}: {err:?}"));
+            let missing_source = client
+                .get_object()
+                .bucket(&bucket)
+                .key(source_key)
+                .send()
+                .await;
+            assert_eq!(err_status(&missing_source), 404);
+            assert_s3_err_code(&missing_source, "NoSuchKey");
+
+            let copied_etag = match copy {
+                Ok(copy) => {
+                    let copied_etag = copy
+                        .copy_part_result()
+                        .and_then(|result| result.e_tag())
+                        .expect("successful raced UploadPartCopy must return an ETag")
+                        .to_string();
+                    assert_eq!(copied_etag, source_etag);
+                    copied_etag
+                }
+                Err(err) => {
+                    assert_eq!(
+                        err.raw_response()
+                            .map(|response| response.status().as_u16()),
+                        Some(404)
+                    );
+                    assert_eq!(
+                        err.as_service_error().and_then(ProvideErrorMetadata::code),
+                        Some("NoSuchKey")
+                    );
+                    let listed = client
+                        .list_parts()
+                        .bucket(&bucket)
+                        .key(destination_key)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert!(listed.parts().is_empty());
+                    put_object_retrying_operation_aborted(
+                        client,
+                        &bucket,
+                        source_key,
+                        source_body.clone(),
+                    )
+                    .await;
+                    client
+                        .upload_part_copy()
+                        .bucket(&bucket)
+                        .key(destination_key)
+                        .upload_id(&upload_id)
+                        .part_number(1)
+                        .copy_source(format!("{bucket}/{source_key}"))
+                        .send_retrying_operation_aborted(
+                            "retry UploadPartCopy after raced source deletion",
+                        )
+                        .await
+                        .unwrap()
+                        .copy_part_result()
+                        .and_then(|result| result.e_tag())
+                        .unwrap()
+                        .to_string()
+                }
+            };
+
+            let completed = send_single_part_completion(
+                client,
+                &bucket,
+                destination_key,
+                &upload_id,
+                1,
+                &copied_etag,
+            )
+            .await
+            .unwrap();
+            assert_object_contents_and_etag(
+                &bucket,
+                destination_key,
+                completed.e_tag().unwrap(),
+                &source_body,
+            )
+            .await;
+            cleanup(&bucket, &[source_key, destination_key]).await;
         }
     });
 }

@@ -4,7 +4,7 @@ use crate::storage_rpc::{
     decode_metadata_command_checkpoint_payload, encode_metadata_command_checkpoint_payload,
 };
 
-const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 1;
+pub(crate) const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 2;
 const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
 const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u8 = 1;
 const METADATA_COMMAND_CHECKPOINT_DOMAIN: &[u8] = b"argmin.metadata.command-checkpoint";
@@ -500,6 +500,9 @@ pub(super) const METADATA_DIGEST_TABLES: &[MetadataDigestTable] = &[
             "acl_grants",
             "public_read",
             "object_generation_id",
+            "initiated_object_kind",
+            "initiated_object_version_id",
+            "initiated_object_generation_or_write_sequence",
             "object_lock_retention_mode",
             "object_lock_retain_until",
             "object_lock_legal_hold",

@@ -920,6 +920,136 @@ fn multipart_completion_over_standard_object_reopens_with_valid_digest() {
 }
 
 #[test]
+fn conditional_multipart_completion_rejects_object_created_after_snapshot() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let (bucket, key, object_pg, _) = bucket_key_with_distinct_object_and_data_pg(topology);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let (mut req, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "conditionalrace");
+    req.conditional_completion = true;
+
+    let replacement =
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"intervening object");
+    let error = cluster
+        .complete_multipart_upload_commit_serialized(req.clone())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::MultipartConditionalRequestConflict
+    ));
+    cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &req.upload_id)
+        .expect("a conditional conflict must preserve the multipart upload");
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        assert_eq!(
+            stored.as_live().unwrap().generation_id,
+            replacement.generation_id,
+            "the rejected completion must preserve the intervening object on {node_id:?}"
+        );
+    }
+}
+
+#[test]
+fn conditional_multipart_completion_detects_same_millisecond_null_marker_replacement() {
+    let _clock = crate::clock::test_time_override_guard(1_725_000_000_123);
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let (bucket, key, object_pg, _) = bucket_key_with_distinct_object_and_data_pg(topology);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Suspended);
+    let owner = crate::OwnerIdentity::from_principal("owner");
+    let first_marker = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            owner.clone(),
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    let first_last_modified = match cluster.test_get_object_meta(&bucket, &key).unwrap() {
+        crate::StoredObject::DeleteMarker(marker) => marker.last_modified,
+        crate::StoredObject::Live(_) => panic!("first suspended delete must publish a marker"),
+    };
+    let (mut req, _) = seed_streamed_multipart_completion_with_existing(
+        &cluster,
+        &bucket,
+        &key,
+        "conditionalnullmarker",
+        false,
+    );
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &req.upload_id)
+        .unwrap();
+    let snapshot = cluster
+        .load_multipart_completion_snapshot(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
+            &[1],
+        )
+        .unwrap();
+    req.versioning = crate::BucketVersioningState::Suspended;
+    req.expected_current_object_identity = snapshot.current_object_identity;
+    req.conditional_completion = true;
+    assert_eq!(
+        req.expected_current_object_identity,
+        upload.initiated_object_identity
+    );
+
+    let second_marker = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            owner,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_marker.version_id, crate::VersionId::Null);
+    assert_eq!(second_marker.version_id, crate::VersionId::Null);
+    let second_last_modified = match cluster.test_get_object_meta(&bucket, &key).unwrap() {
+        crate::StoredObject::DeleteMarker(marker) => marker.last_modified,
+        crate::StoredObject::Live(_) => panic!("second suspended delete must publish a marker"),
+    };
+    assert_eq!(first_last_modified, second_last_modified);
+
+    let error = cluster
+        .complete_multipart_upload_commit_serialized(req.clone())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::MultipartConditionalRequestConflict
+    ));
+    cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &req.upload_id)
+        .expect("conditional conflict must preserve the multipart upload");
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+}
+
+#[test]
 fn multipart_completion_rejects_stale_selected_part_row() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

@@ -204,6 +204,9 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     acl_grants TEXT NOT NULL DEFAULT '',
     public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     object_generation_id INTEGER NOT NULL CHECK (object_generation_id > 0),
+    initiated_object_kind INTEGER NOT NULL DEFAULT 0 CHECK (initiated_object_kind IN (0, 1, 2)),
+    initiated_object_version_id INTEGER,
+    initiated_object_generation_or_write_sequence INTEGER,
     listing_cluster_epoch INTEGER NOT NULL DEFAULT 1 CHECK (listing_cluster_epoch > 0),
     listing_log_index INTEGER NOT NULL DEFAULT 1 CHECK (listing_log_index > 0),
     object_lock_retention_mode INTEGER CHECK (
@@ -212,7 +215,14 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     object_lock_retain_until INTEGER CHECK (
         object_lock_retain_until IS NULL OR object_lock_retain_until > 0
     ),
-    object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2))
+    object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2)),
+    CHECK (
+        (initiated_object_kind = 0 AND initiated_object_version_id IS NULL AND initiated_object_generation_or_write_sequence IS NULL)
+        OR
+        (initiated_object_kind = 1 AND initiated_object_version_id >= 0 AND initiated_object_generation_or_write_sequence > 0)
+        OR
+        (initiated_object_kind = 2 AND initiated_object_version_id >= 0 AND initiated_object_generation_or_write_sequence > 0)
+    )
 ) STRICT";
 
 /// Index for listing multipart uploads by bucket/key.

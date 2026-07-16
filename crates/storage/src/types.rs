@@ -3851,6 +3851,22 @@ pub enum UploadState {
     Aborting = 2,
 }
 
+/// Identity of the current object observed when a multipart upload is
+/// initiated or completed. Conditional completion uses this to distinguish a
+/// stable current object from an intervening write even when the current ETag
+/// would otherwise satisfy the request condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultipartObjectIdentity {
+    Live {
+        version_id: VersionId,
+        generation_id: GenerationId,
+    },
+    DeleteMarker {
+        version_id: VersionId,
+        write_sequence: u64,
+    },
+}
+
 impl UploadState {
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -3883,6 +3899,8 @@ pub struct MultipartUploadRecord {
     pub public_read: bool,
     /// Final object payload generation reserved for this upload.
     pub object_generation_id: GenerationId,
+    /// Current object identity at CreateMultipartUpload linearization.
+    pub initiated_object_identity: Option<MultipartObjectIdentity>,
     /// Pending Object Lock state to apply to the committed object version.
     pub object_lock: ObjectLockState,
     /// Validated checksum configuration for this upload.
@@ -3954,6 +3972,7 @@ pub struct MultipartPartRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartCompletionSnapshot {
     pub existing_etag: Option<String>,
+    pub current_object_identity: Option<MultipartObjectIdentity>,
     pub stale_payload_source: Option<StoredObject>,
     pub part_records: Vec<MultipartPartRecord>,
     pub selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
@@ -4026,6 +4045,8 @@ pub struct CompleteMultipartCommitRequest {
     pub object_lock: ObjectLockState,
     pub encryption: ObjectEncryption,
     pub expected_stale_payload_source: Option<StoredObject>,
+    pub expected_current_object_identity: Option<MultipartObjectIdentity>,
+    pub conditional_completion: bool,
     pub part_records: Vec<MultipartPartRecord>,
     pub selected_streaming_segments: Vec<MultipartPartSegmentRecord>,
     pub expected_cleanup: CompleteMultipartCommitCleanup,

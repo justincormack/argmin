@@ -11971,6 +11971,22 @@ impl super::StorageCluster {
                 .into());
             }
 
+            if req.conditional_completion {
+                let upload = match mutation_client
+                    .load_in_progress_multipart_upload(pg_id, &bucket, &key, &upload_id)
+                {
+                    Ok(upload) => upload,
+                    Err(error) => {
+                        release_bucket_write_proof!()?;
+                        return Err(error);
+                    }
+                };
+                if req.expected_current_object_identity != upload.initiated_object_identity {
+                    release_bucket_write_proof!()?;
+                    return Err(ObjectPgActionError::MultipartConditionalRequestConflict);
+                }
+            }
+
             if req.versioning != BucketVersioningState::Enabled {
                 match mutation_client
                     .load_multipart_completion_stale_payload_source(pg_id, &bucket, &key)

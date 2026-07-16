@@ -2543,11 +2543,18 @@ impl StorageNodeClient for LocalStorageNodeClient {
             }
             .into());
         }
-        let existing_etag = match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
-            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+        let current_object = match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
+            Ok(stored) => Some(stored),
             Err(MetadataError::ObjectNotFound) => None,
             Err(other) => return Err(other.into()),
         };
+        let existing_etag = current_object
+            .as_ref()
+            .and_then(|stored| stored.as_live().map(|record| record.etag.format()));
+        let current_object_identity = current_object
+            .as_ref()
+            .map(|stored| pg.multipart_object_identity(stored))
+            .transpose()?;
         let mut part_records = Vec::with_capacity(requested_part_numbers.len());
         for &part_number in requested_part_numbers {
             part_records.push(pg.get_multipart_part(upload_id, part_number)?);
@@ -2562,6 +2569,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             snapshot_direct_put_stale_payload_for_snapshot(&pg, bucket, key, 0)?;
         Ok(MultipartCompletionSnapshot {
             existing_etag,
+            current_object_identity,
             stale_payload_source,
             part_records,
             selected_streaming_segments,
@@ -2974,6 +2982,10 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
                     request.request.clone(),
                     object_generation_id,
+                    current
+                        .as_ref()
+                        .map(|stored| pg.multipart_object_identity(stored))
+                        .transpose()?,
                     crate::clock::current_time_millis(),
                     request.bucket_write_reservation.clone(),
                 ),
@@ -3509,6 +3521,17 @@ impl StorageNodeClient for LocalStorageNodeClient {
             return Err(ObjectPgActionError::InvalidRequest {
                 reason: "unversioned multipart completion must use null version id".to_string(),
             });
+        }
+        let current_object =
+            load_current_object_optional_from_pg(&pg, &complete.bucket, &complete.key)?;
+        let current_object_identity = current_object
+            .as_ref()
+            .map(|stored| pg.multipart_object_identity(stored))
+            .transpose()?;
+        if complete.conditional_completion
+            && current_object_identity != upload.initiated_object_identity
+        {
+            return Err(ObjectPgActionError::MultipartConditionalRequestConflict);
         }
         if request.version_id.is_null() {
             let (stale_payload_source, _) = snapshot_direct_put_stale_payload_for_snapshot(

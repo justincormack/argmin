@@ -525,6 +525,8 @@ fn complete_multipart_trace_upload(
             object_lock: upload_row.object_lock,
             encryption: upload_row.encryption,
             expected_stale_payload_source: completion_snapshot.stale_payload_source,
+            expected_current_object_identity: completion_snapshot.current_object_identity,
+            conditional_completion: false,
             part_records: upload.parts.clone(),
             selected_streaming_segments: completion_snapshot.selected_streaming_segments,
             expected_cleanup: completion_snapshot.cleanup,

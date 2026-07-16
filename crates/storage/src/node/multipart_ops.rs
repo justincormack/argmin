@@ -99,11 +99,18 @@ impl SharedStorageNode {
             }
             .into());
         }
-        let existing_etag = match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
-            Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+        let current_object = match PgMetadataStore::get_object_meta(&*pg, bucket, key) {
+            Ok(stored) => Some(stored),
             Err(crate::error::MetadataError::ObjectNotFound) => None,
             Err(other) => return Err(other.into()),
         };
+        let existing_etag = current_object
+            .as_ref()
+            .and_then(|stored| stored.as_live().map(|record| record.etag.format()));
+        let current_object_identity = current_object
+            .as_ref()
+            .map(|stored| pg.multipart_object_identity(stored))
+            .transpose()?;
         let mut part_records = Vec::with_capacity(requested_part_numbers.len());
         for &part_number in requested_part_numbers {
             part_records.push(pg.get_multipart_part(upload_id, part_number)?);
@@ -169,6 +176,7 @@ impl SharedStorageNode {
             };
         Ok(MultipartCompletionSnapshot {
             existing_etag,
+            current_object_identity,
             stale_payload_source,
             part_records,
             selected_streaming_segments,
