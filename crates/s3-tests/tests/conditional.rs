@@ -2041,6 +2041,227 @@ fn test_put_object_both_ifmatch_and_ifnonematch_rejected() {
 // ── Copy destination conditions ─────────────────────────────────────────
 
 #[test]
+fn test_copy_object_ifnonematch_star_nonexistent_destination_succeeds() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"source data").await;
+
+        CTX.client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_none_match("*")
+            .send_retrying_operation_aborted("copy create-only object to missing destination")
+            .await
+            .unwrap();
+
+        let response = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send_retrying_operation_aborted("get create-only copy destination")
+            .await
+            .unwrap();
+        let data = response.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"source data");
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_ifnonematch_star_existing_destination_fails_without_mutation() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"source data").await;
+        let original_etag = put_object(&bucket, "dst", b"old destination").await;
+
+        let result = CTX
+            .client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_none_match("*")
+            .send_retrying_operation_aborted("copy create-only object to existing destination")
+            .await;
+        assert_eq!(err_status(&result), 412);
+        assert_s3_err_code(&result, "PreconditionFailed");
+
+        let response = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send_retrying_operation_aborted("get rejected create-only copy destination")
+            .await
+            .unwrap();
+        assert_eq!(response.e_tag(), Some(original_etag.as_str()));
+        let data = response.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"old destination");
+
+        let source = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("src")
+            .send_retrying_operation_aborted("get source after rejected create-only copy")
+            .await
+            .unwrap();
+        let source_data = source.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&source_data[..], b"source data");
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_destination_conditions_in_versioned_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+        let source_etag = put_object(&bucket, "src", b"source data").await;
+        let original = put_object_result_retrying_operation_aborted(
+            "put original versioned copy destination",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("dst")
+                    .body(ByteStream::from_static(b"old destination"))
+            },
+        )
+        .await
+        .unwrap();
+        let original_etag = original.e_tag().unwrap().to_string();
+        let original_version_id = original.version_id().unwrap().to_string();
+
+        let rejected_existing = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_none_match("*")
+            .send_retrying_operation_aborted(
+                "copy create-only object over versioned live destination",
+            )
+            .await;
+        assert_eq!(err_status(&rejected_existing), 412);
+        assert_s3_err_code(&rejected_existing, "PreconditionFailed");
+
+        let versions_after_rejection = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix("dst")
+            .send_retrying_operation_aborted("list versions after rejected conditional copy")
+            .await
+            .unwrap();
+        assert_eq!(versions_after_rejection.versions().len(), 1);
+        assert!(versions_after_rejection.delete_markers().is_empty());
+
+        let marker = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send_retrying_operation_aborted("create destination delete marker")
+            .await
+            .unwrap();
+        assert_eq!(marker.delete_marker(), Some(true));
+        let marker_version_id = marker.version_id().unwrap().to_string();
+
+        let rejected_marker_match = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_match(&original_etag)
+            .send_retrying_operation_aborted("copy if-match over current delete marker")
+            .await;
+        assert_eq!(err_status(&rejected_marker_match), 404);
+        assert_s3_err_code(&rejected_marker_match, "NoSuchKey");
+
+        let copied = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_none_match("*")
+            .send_retrying_operation_aborted("copy create-only object over current delete marker")
+            .await
+            .unwrap();
+        let copied_version_id = copied.version_id().unwrap().to_string();
+
+        let response = client
+            .get_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send_retrying_operation_aborted("get versioned conditional copy destination")
+            .await
+            .unwrap();
+        assert_eq!(response.e_tag(), Some(source_etag.as_str()));
+        let data = response.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"source data");
+
+        let final_versions = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix("dst")
+            .send_retrying_operation_aborted("list versions after conditional copy")
+            .await
+            .unwrap();
+        assert_eq!(final_versions.versions().len(), 2);
+        assert_eq!(final_versions.delete_markers().len(), 1);
+        let copied_version = final_versions
+            .versions()
+            .iter()
+            .find(|version| version.version_id() == Some(copied_version_id.as_str()))
+            .expect("copied destination version must remain listed");
+        assert_eq!(copied_version.is_latest(), Some(true));
+        let original_version = final_versions
+            .versions()
+            .iter()
+            .find(|version| version.version_id() == Some(original_version_id.as_str()))
+            .expect("original destination version must remain listed");
+        assert_eq!(original_version.is_latest(), Some(false));
+        let retained_marker = &final_versions.delete_markers()[0];
+        assert_eq!(
+            retained_marker.version_id(),
+            Some(marker_version_id.as_str())
+        );
+        assert_eq!(retained_marker.is_latest(), Some(false));
+
+        let original_response = client
+            .get_object()
+            .bucket(&bucket)
+            .key("dst")
+            .version_id(&original_version_id)
+            .send_retrying_operation_aborted("get retained original copy destination version")
+            .await
+            .unwrap();
+        assert_eq!(original_response.e_tag(), Some(original_etag.as_str()));
+        let original_data = original_response.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&original_data[..], b"old destination");
+
+        let source_response = client
+            .get_object()
+            .bucket(&bucket)
+            .key("src")
+            .send_retrying_operation_aborted("get source after versioned conditional copies")
+            .await
+            .unwrap();
+        assert_eq!(source_response.e_tag(), Some(source_etag.as_str()));
+        let source_data = source_response.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&source_data[..], b"source data");
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_copy_object_ifmatch_good() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;

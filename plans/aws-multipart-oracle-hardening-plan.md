@@ -281,6 +281,66 @@ For each matrix:
 - [ ] Keep feature-specific setup in shared fixtures and run identical assertions
   on AWS and local endpoints.
 
+### 7. Conditional operations beyond multipart completion
+
+Multipart completion exposed a broader class of conditional-operation risks:
+the condition, authorization, and mutation must refer to a coherent object
+state, and contention responses must be derived from AWS rather than inferred
+from documentation. Extend the oracle pass to PutObject, CopyObject,
+UploadPartCopy, DeleteObject, DeleteObjects, GetObject, and HeadObject. Keep all
+public tests endpoint-independent and do not retry the first raced conditional
+request, because retrying `OperationAborted` would hide AWS's original 409/412
+choice.
+
+- [ ] Fill the static CopyObject destination matrix. Pin `If-None-Match: *`
+  against missing and existing destinations, then cover `If-Match` and
+  `If-None-Match: *` across current live objects, current delete markers,
+  enabled versioning, and suspended null versions. Every rejection must prove
+  that the destination bytes, ETag, versions, and source remain unchanged.
+  The shared AWS/local cases now pin success for a missing destination and
+  `412 PreconditionFailed` with unchanged ETag and bytes for an existing
+  destination. In a versioned bucket, rejection over a current live version
+  creates no new version; a current delete marker makes destination `If-Match`
+  return `404 NoSuchKey`, while `If-None-Match: *` succeeds and publishes a new
+  current version without removing the retained object version or marker. The
+  suspended null-version cross-product remains open.
+- [ ] Fill CopyObject and UploadPartCopy source-condition coverage. Cross the
+  four source conditional families individually and in AWS's combined-header
+  precedence pairs, including malformed dates, missing/current-delete-marker
+  sources, explicit source versions, and source replacement or deletion while
+  a copy is in progress. A success must copy one coherent source snapshot; a
+  failure must publish no destination or part.
+- [ ] Probe conditional PutObject contention for both the direct and streamed
+  paths, including aws-chunked requests. Cover simultaneous
+  `If-None-Match: *` creates, competing `If-Match` overwrites, intervening
+  different-ETag replacement, and same-ETag replacement with different
+  ownership, ACLs, or existing tags. Record the first AWS response without the
+  OperationAborted retry helper, then assert permitted 409/412 outcomes, final
+  object bytes and metadata, retry behavior, and absence of partial writes.
+- [ ] Probe CopyObject destination contention with the same destination-state
+  and authorization matrix. Copy's source read creates a naturally longer
+  interval between destination authorization and publication, so explicitly
+  establish whether AWS binds object-dependent authorization to the initial
+  destination state, the commit state, or another linearization point before
+  changing the local capability model.
+- [ ] Probe DeleteObject and DeleteObjects races against same-ETag and
+  different-ETag replacement, current delete-marker insertion, enabled
+  versioning, and suspended null replacement. Pin per-entry DeleteObjects
+  results and final state. The local implementation already re-runs current
+  object authorization and the ETag condition inside one storage callback;
+  deterministic regressions must prove that invariant under replacement.
+- [ ] Add the remaining conditional input and precedence matrix for operations
+  that accept ETag lists or dates: weak and unquoted tags, wildcard/list forms,
+  duplicate headers, malformed dates, missing objects, authorization failures,
+  and GET/HEAD combined-condition ordering. Only retain parser behavior after
+  it has been observed on AWS.
+- [ ] Bound streamed PutObject/CopyObject stale-finalization retries. Direct PUT
+  already has a retry/deadline budget, while the streamed finalizer currently
+  loops on `StaleStreamFinalizeSnapshot`. After the public contention oracle is
+  known, return the appropriate retryable S3 error on exhaustion and add a
+  deterministic regression proving no publication, preserved staged cleanup,
+  and no `InternalError` or indefinitely held request/reservation.
+
 ## Completion
 
 - Every added behavior was first observed on AWS and is asserted by endpoint-
