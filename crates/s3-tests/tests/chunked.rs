@@ -1,10 +1,11 @@
 /// Integration tests for aws-chunked transfer encoding.
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::Client;
+use aws_sdk_s3::{primitives::ByteStream, Client};
 use ring::{digest, hmac};
 use s3_tests::{
-    assert_s3_err_code, build_client_with_ca, build_test_agent, shape::expected_error,
+    assert_s3_err_code, build_client_with_ca, build_test_agent,
+    shape::{expected_error, xml_tag_text},
     unique_bucket, TestServer, CTX,
 };
 
@@ -286,6 +287,40 @@ fn sign_streaming_request(
         content_encoding: "aws-chunked",
         extra_signed_headers,
     })
+}
+
+fn send_signed_chunked_put_with_headers(
+    bucket: &str,
+    key: &str,
+    data: &[u8],
+    extra_signed_headers: &[(&str, &str)],
+) -> (u16, String) {
+    let path = format!("/{bucket}/{key}");
+    let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+    let sign = sign_streaming_request(
+        "PUT",
+        &path,
+        content_sha256,
+        data.len(),
+        extra_signed_headers,
+    );
+    let wire = build_signed_chunked_body(&sign, data);
+    let url = format!("{}{}", CTX.endpoint(), path);
+    let mut request = agent()
+        .put(&url)
+        .header("Authorization", &sign.authorization)
+        .header("x-amz-date", &sign.amz_date)
+        .header("x-amz-content-sha256", content_sha256)
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-decoded-content-length", data.len().to_string())
+        .header("content-length", wire.len().to_string());
+    for (name, value) in extra_signed_headers {
+        request = request.header(*name, *value);
+    }
+    let mut response = request.send(&wire[..]).expect("transport error");
+    let status = response.status().as_u16();
+    let body = response.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
 }
 
 struct ChunkedPutContext {
@@ -917,6 +952,87 @@ fn test_signed_chunked_put() {
         assert_eq!(head.content_encoding(), None);
 
         cleanup(&bucket, &["signed-chunked"]).await;
+    });
+}
+
+#[test]
+fn test_signed_chunked_put_conditions_match_ordinary_put() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let create_key = "signed-chunked-if-none-match";
+        let overwrite_key = "signed-chunked-if-match";
+
+        let (status, body) = send_signed_chunked_put_with_headers(
+            &bucket,
+            create_key,
+            b"created through aws-chunked",
+            &[("if-none-match", "*")],
+        );
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = send_signed_chunked_put_with_headers(
+            &bucket,
+            create_key,
+            b"rejected overwrite",
+            &[("if-none-match", "*")],
+        );
+        assert_eq!(status, 412, "{body}");
+        assert_eq!(xml_tag_text(&body, "Code"), Some("PreconditionFailed"));
+        let created = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key(create_key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(created.as_ref(), b"created through aws-chunked");
+
+        let original = CTX
+            .client()
+            .put_object()
+            .bucket(&bucket)
+            .key(overwrite_key)
+            .body(ByteStream::from_static(b"original"))
+            .send()
+            .await
+            .unwrap();
+        let original_etag = original.e_tag().unwrap();
+        let (status, body) = send_signed_chunked_put_with_headers(
+            &bucket,
+            overwrite_key,
+            b"conditional replacement",
+            &[("if-match", original_etag)],
+        );
+        assert_eq!(status, 200, "{body}");
+        let (status, body) = send_signed_chunked_put_with_headers(
+            &bucket,
+            overwrite_key,
+            b"stale replacement",
+            &[("if-match", original_etag)],
+        );
+        assert_eq!(status, 412, "{body}");
+        assert_eq!(xml_tag_text(&body, "Code"), Some("PreconditionFailed"));
+        let overwritten = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key(overwrite_key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(overwritten.as_ref(), b"conditional replacement");
+
+        cleanup(&bucket, &[create_key, overwrite_key]).await;
     });
 }
 

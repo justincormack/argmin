@@ -46,22 +46,18 @@ impl Coordinator {
             multipart_parts,
             multipart_part_segments,
         } = snapshot;
-        #[cfg(test)]
-        maybe_run_object_read_snapshot_hook(bucket.as_str(), key.as_str());
         let src_record = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         match src_record.layout {
             ObjectLayout::MultipartManifest { .. } => {
-                if src_record.size == 0 {
-                    #[cfg(test)]
-                    maybe_run_multipart_snapshot_hook(bucket.as_str(), key.as_str());
-                    Ok(ReadHandle::from_buffered_bytes(Vec::new()))
+                let body = if src_record.size == 0 {
+                    ReadHandle::from_buffered_bytes(Vec::new())
                 } else {
                     let obj_parts = snapshotted_multipart_parts_from_storage(
                         multipart_parts,
                         multipart_part_segments,
                         &src_record.encryption,
                     );
-                    let body = ReadHandle::from_multipart(
+                    ReadHandle::from_multipart(
                         read_runtime,
                         bucket,
                         key,
@@ -69,15 +65,17 @@ impl Coordinator {
                         obj_parts,
                         src_record.size as usize,
                         source_sse_customer.cloned(),
-                    )?;
-                    #[cfg(test)]
-                    maybe_run_multipart_snapshot_hook(bucket.as_str(), key.as_str());
-                    Ok(body)
-                }
+                    )?
+                };
+                #[cfg(test)]
+                maybe_run_object_read_snapshot_hook(bucket.as_str(), key.as_str());
+                #[cfg(test)]
+                maybe_run_multipart_snapshot_hook(bucket.as_str(), key.as_str());
+                Ok(body)
             }
             ObjectLayout::Standard => {
-                if src_record.size == 0 {
-                    Ok(ReadHandle::from_buffered_bytes(Vec::new()))
+                let body = if src_record.size == 0 {
+                    ReadHandle::from_buffered_bytes(Vec::new())
                 } else {
                     ReadHandle::from_segments(
                         ReadObjectContext {
@@ -93,8 +91,11 @@ impl Coordinator {
                         ),
                         src_record.size as usize,
                         Some(src_record.etag.crc64()),
-                    )
-                }
+                    )?
+                };
+                #[cfg(test)]
+                maybe_run_object_read_snapshot_hook(bucket.as_str(), key.as_str());
+                Ok(body)
             }
         }
     }

@@ -351,13 +351,64 @@ choice.
   snapshot, complete replacement or deletion, and then require the old body,
   ETag, content type, and user metadata on resume. The overwrite case also
   verifies that the current source contains the distinct replacement state.
-- [ ] Probe conditional PutObject contention for both the direct and streamed
+- [x] Probe conditional PutObject contention for both the direct and streamed
   paths, including aws-chunked requests. Cover simultaneous
   `If-None-Match: *` creates, competing `If-Match` overwrites, intervening
   different-ETag replacement, and same-ETag replacement with different
-  ownership, ACLs, or existing tags. Record the first AWS response without the
-  OperationAborted retry helper, then assert permitted 409/412 outcomes, final
-  object bytes and metadata, retry behavior, and absence of partial writes.
+  metadata or tags. Record the first AWS response without the OperationAborted
+  retry helper, then assert permitted 409/412 outcomes, final object bytes and
+  metadata, retry behavior, and absence of partial writes. Coordinated
+  first-body-poll probes now force two ordinary PutObject requests to start
+  together; the multi-segment variant paces both bodies to retain overlap. AWS
+  and local publish exactly one complete writer, with the loser returning
+  either `409 ConditionalRequestConflict` or `412 PreconditionFailed`; a
+  settled retry returns 412. A slow `If-Match` PUT that loses to an intervening
+  different-ETag replacement returns 409 or 412 and cannot disturb the
+  replacement. Replacing the source state with identical bytes but different
+  metadata and tags retains the ETag, so AWS permits the in-flight conditional
+  PUT to publish; local matches this ETag-based rule. Signed aws-chunked
+  success, stale-condition failure, and non-mutation pin the same semantics
+  without introducing a transport-specific rule.
+- [ ] Audit the earlier blanket authorization-at-entry assumption anywhere a
+  long-running operation can observe mutable authorization state. Keep bucket
+  control-plane state (policy, ownership controls, public-access settings, and
+  bucket tags) separate from strongly consistent object owner, ACL, and tag
+  state. For each candidate, use AWS to establish which snapshot or
+  linearization point controls before changing the local authorization token;
+  do not infer a general commit-time reauthorization rule from conditional
+  PutObject. Fold the concrete CopyObject and delete cases below into this
+  audit, and include object ACL/tag mutations where the operation exposes a
+  meaningful race interval.
+
+  Exploratory cross-account ObjectWriter oracles used positive
+  ownership/access canaries and established two important AWS results. First,
+  replacing a requester-owned object with an identical-byte private
+  bucket-owner object while an `If-Match` PutObject body is in flight makes the
+  Put return `403 AccessDenied`, preserves the replacement, and leaves a
+  settled retry denied despite the unchanged ETag. Second, revoking the
+  requester's bucket ACL write grant, waiting until fresh PUTs consistently
+  return 403, and then resuming a request started while the grant existed also
+  returns 403 and publishes nothing. An already-denied paused PUT did not
+  expose its 403 until the body completed. These establish later ObjectWriter
+  authorization behavior but do not demonstrate a client-visible entry check.
+
+  The attempted shared commit-time implementation was removed because it also
+  changed unresolved CopyObject and POST Object timing and treated current
+  delete markers as existing objects during authorization. Keep the local
+  entry-only model until the complete matrix supports operation-specific token
+  capabilities and explicit live-object/delete-marker normalization.
+
+  For BOE, begin with an anonymous PutObject to a private bucket using a paused
+  large body and record whether AWS returns AccessDenied before requesting the
+  body, after receiving a flushed partial body, or only after completion.
+  Repeat with authenticated bucket-policy denial and with a grant revoked after
+  the body starts and policy convergence is observable. Repeat mutable
+  bucket-policy and tag cases for ObjectWriter rather than inferring them from
+  the bucket ACL result. Cover direct PutObject, streamed PutObject,
+  aws-chunked PutObject, CopyObject, and POST Object independently, including
+  absent keys, live objects, and current delete markers. Do not change commit
+  authorization until this matrix identifies each operation's actual
+  authorization points.
 - [ ] Probe CopyObject destination contention with the same destination-state
   and authorization matrix. Copy's source read creates a naturally longer
   interval between destination authorization and publication, so explicitly

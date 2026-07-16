@@ -37,7 +37,7 @@ Read operations must authorize before they:
 
 For reads, authorize-at-operation-start semantics are the default policy.
 
-### 3. Single-request writes authorize once at request entry
+### 3. Single-request writes currently authorize once at request entry
 
 A single client write request must authorize once before meaningful body
 ingestion or durable side effects begin.
@@ -52,7 +52,7 @@ This includes:
 The purpose is to avoid late `AccessDenied` responses after substantial upload
 work for a request that was already structurally valid and authenticated.
 
-### 4. Finalize and commit phases do not re-authorize the same request
+### 4. Finalize and commit phases currently do not re-authorize the same request
 
 Commit-time logic may still reject the request, but those rejections should be
 about mutable stored state or request validity rather than permission being
@@ -68,6 +68,22 @@ Allowed commit-time checks include:
 
 Do not re-run the same request's bucket/object authorization decision at
 finalize time just because the implementation is internally multi-phase.
+
+This is the current implementation rule, not a complete claim about AWS.
+Exploratory AWS oracles found two ObjectWriter PutObject cases in which state
+that changed after the body started controlled the final response: an
+identical-byte replacement that changed current object ownership, and a bucket
+ACL write grant revoked before the body completed. Both returned `403
+AccessDenied` without publishing the in-flight write. An already-denied paused
+PutObject also did not expose its response until its body completed.
+
+These observations are tracked for a comprehensive authorization-timing pass.
+Do not add a shared commit-time reauthorization call based only on them:
+PutObject, CopyObject, POST Object, BOE, ObjectWriter, current delete markers,
+and bucket-policy versus object authorization state require separate oracle
+coverage and operation-specific capabilities. Until that matrix is complete,
+the entry authorization token remains authoritative locally and the known
+PutObject differences remain documented in the work plan.
 
 ### 5. Multi-phase writes should carry an authorized token
 

@@ -4,6 +4,9 @@ use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
 };
+use aws_smithy_types::body::SdkBody;
+use bytes::Bytes;
+use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
     raw_object_with,
@@ -11,8 +14,262 @@ use s3_tests::{
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
+
+const DIRECT_CONDITIONAL_PUT_BYTES: usize = 64 * 1024;
+const STREAMED_CONDITIONAL_PUT_BYTES: usize = 4 * 1024 * 1024;
+const CONDITIONAL_PUT_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct ConditionalPutStartGateState {
+    arrived: usize,
+    waiters: Vec<Waker>,
+}
+
+#[derive(Default)]
+struct ConditionalPutStartGate {
+    state: Mutex<ConditionalPutStartGateState>,
+}
+
+impl ConditionalPutStartGate {
+    fn poll_ready(&self, registered: &mut bool, cx: &Context<'_>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !*registered {
+            state.arrived += 1;
+            *registered = true;
+        }
+        if state.arrived == 2 {
+            let waiters = std::mem::take(&mut state.waiters);
+            drop(state);
+            for waiter in waiters {
+                waiter.wake();
+            }
+            true
+        } else {
+            if !state
+                .waiters
+                .iter()
+                .any(|waiter| waiter.will_wake(cx.waker()))
+            {
+                state.waiters.push(cx.waker().clone());
+            }
+            false
+        }
+    }
+}
+
+struct CoordinatedConditionalPutBody {
+    byte: u8,
+    remaining: usize,
+    gate: Option<Arc<ConditionalPutStartGate>>,
+    gate_registered: bool,
+    start_notification: Option<Arc<tokio::sync::Notify>>,
+    start_notified: bool,
+    inter_chunk_delay: Duration,
+    delay: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl CoordinatedConditionalPutBody {
+    fn new(
+        byte: u8,
+        size: usize,
+        gate: Arc<ConditionalPutStartGate>,
+        inter_chunk_delay: Duration,
+    ) -> Self {
+        Self {
+            byte,
+            remaining: size,
+            gate: Some(gate),
+            gate_registered: false,
+            start_notification: None,
+            start_notified: false,
+            inter_chunk_delay,
+            delay: None,
+        }
+    }
+
+    fn observed(
+        byte: u8,
+        size: usize,
+        start_notification: Arc<tokio::sync::Notify>,
+        inter_chunk_delay: Duration,
+    ) -> Self {
+        Self {
+            byte,
+            remaining: size,
+            gate: None,
+            gate_registered: false,
+            start_notification: Some(start_notification),
+            start_notified: false,
+            inter_chunk_delay,
+            delay: None,
+        }
+    }
+}
+
+impl Body for CoordinatedConditionalPutBody {
+    type Data = Bytes;
+    type Error = aws_sdk_s3::error::BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if let Some(gate) = self.gate.as_ref().map(Arc::clone) {
+            if !gate.poll_ready(&mut self.gate_registered, cx) {
+                return Poll::Pending;
+            }
+        }
+        if let Some(delay) = &mut self.delay {
+            if delay.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.delay = None;
+        }
+        if self.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        let len = self.remaining.min(CONDITIONAL_PUT_STREAM_CHUNK_BYTES);
+        self.remaining -= len;
+        if !self.start_notified {
+            if let Some(notification) = &self.start_notification {
+                notification.notify_one();
+            }
+            self.start_notified = true;
+        }
+        if self.remaining != 0 && !self.inter_chunk_delay.is_zero() {
+            self.delay = Some(Box::pin(tokio::time::sleep(self.inter_chunk_delay)));
+        }
+        Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![self.byte; len])))))
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.remaining as u64)
+    }
+}
+
+#[derive(Clone)]
+enum RacingPutCondition {
+    IfNoneMatchStar,
+    IfMatch(String),
+}
+
+type PutObjectCallResult = Result<
+    aws_sdk_s3::operation::put_object::PutObjectOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
+>;
+
+fn apply_racing_put_condition(
+    request: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    condition: &RacingPutCondition,
+) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+    match condition {
+        RacingPutCondition::IfNoneMatchStar => request.if_none_match("*"),
+        RacingPutCondition::IfMatch(etag) => request.if_match(etag),
+    }
+}
+
+async fn send_coordinated_conditional_puts(
+    bucket: &str,
+    key: &str,
+    condition: RacingPutCondition,
+    body_size: usize,
+    inter_chunk_delay: Duration,
+) -> (PutObjectCallResult, PutObjectCallResult) {
+    let gate = Arc::new(ConditionalPutStartGate::default());
+    let mut tasks = Vec::with_capacity(2);
+    for (byte, state) in [(b'a', "writer-a"), (b'b', "writer-b")] {
+        let client = CTX.client().clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        let condition = condition.clone();
+        let body = ByteStream::new(SdkBody::from_body_1_x(CoordinatedConditionalPutBody::new(
+            byte,
+            body_size,
+            Arc::clone(&gate),
+            inter_chunk_delay,
+        )));
+        tasks.push(tokio::spawn(async move {
+            apply_racing_put_condition(
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .metadata("writer", state)
+                    .body(body),
+                &condition,
+            )
+            .send()
+            .await
+        }));
+    }
+    let right = tasks.pop().unwrap();
+    let left = tasks.pop().unwrap();
+    (left.await.unwrap(), right.await.unwrap())
+}
+
+fn assert_one_conditional_put_winner(
+    left: &PutObjectCallResult,
+    right: &PutObjectCallResult,
+    context: &str,
+) -> (u8, &'static str, String, u16) {
+    let success_count = usize::from(left.is_ok()) + usize::from(right.is_ok());
+    assert_eq!(success_count, 1, "{context}: left={left:?} right={right:?}");
+    let (winner_byte, winner_state, winner, loser) = if left.is_ok() {
+        (b'a', "writer-a", left, right)
+    } else {
+        (b'b', "writer-b", right, left)
+    };
+    let winner_etag = winner.as_ref().unwrap().e_tag().unwrap().to_string();
+    let loser_status = err_status(loser);
+    assert!(
+        matches!(loser_status, 409 | 412),
+        "{context}: unexpected losing response: {loser:?}"
+    );
+    if loser_status == 409 {
+        assert_s3_err_code(loser, "ConditionalRequestConflict");
+    } else {
+        assert_s3_err_code(loser, "PreconditionFailed");
+    }
+    (winner_byte, winner_state, winner_etag, loser_status)
+}
+
+async fn assert_conditional_put_winner_visible(
+    bucket: &str,
+    key: &str,
+    winner_byte: u8,
+    winner_state: &str,
+    winner_etag: &str,
+    expected_size: usize,
+) {
+    let current = CTX
+        .client()
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("get object after conditional PUT race")
+        .await
+        .unwrap();
+    assert_eq!(current.e_tag(), Some(winner_etag));
+    assert_eq!(
+        current
+            .metadata()
+            .and_then(|metadata| metadata.get("writer"))
+            .map(String::as_str),
+        Some(winner_state)
+    );
+    let body = current.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.len(), expected_size);
+    assert!(
+        body.iter().all(|byte| *byte == winner_byte),
+        "conditional PUT published mixed or partial bytes"
+    );
+}
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -1025,6 +1282,411 @@ fn test_put_object_ifmatch_nonexisted_failed() {
         assert_eq!(err_status(&result), 404);
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_simultaneous_if_none_match_puts_publish_one_complete_object() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let cases = [
+            (
+                "single-segment",
+                "simultaneous-if-none-match-single",
+                DIRECT_CONDITIONAL_PUT_BYTES,
+                Duration::ZERO,
+            ),
+            (
+                "multi-segment",
+                "simultaneous-if-none-match-streamed",
+                STREAMED_CONDITIONAL_PUT_BYTES,
+                Duration::from_millis(5),
+            ),
+        ];
+
+        for (name, key, body_size, delay) in cases {
+            let (left, right) = send_coordinated_conditional_puts(
+                &bucket,
+                key,
+                RacingPutCondition::IfNoneMatchStar,
+                body_size,
+                delay,
+            )
+            .await;
+            let (winner_byte, winner_state, winner_etag, loser_status) =
+                assert_one_conditional_put_winner(&left, &right, name);
+            println!("simultaneous If-None-Match {name} loser status: {loser_status}");
+            assert_conditional_put_winner_visible(
+                &bucket,
+                key,
+                winner_byte,
+                winner_state,
+                &winner_etag,
+                body_size,
+            )
+            .await;
+
+            let loser_state = if winner_byte == b'a' {
+                "writer-b"
+            } else {
+                "writer-a"
+            };
+            let retry = CTX
+                .client()
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .if_none_match("*")
+                .metadata("writer", loser_state)
+                .body(ByteStream::from_static(b"loser retry"))
+                .send()
+                .await;
+            assert_eq!(err_status(&retry), 412, "{name}: {retry:?}");
+            assert_s3_err_code(&retry, "PreconditionFailed");
+            assert_conditional_put_winner_visible(
+                &bucket,
+                key,
+                winner_byte,
+                winner_state,
+                &winner_etag,
+                body_size,
+            )
+            .await;
+        }
+
+        cleanup(
+            &bucket,
+            &[
+                "simultaneous-if-none-match-single",
+                "simultaneous-if-none-match-streamed",
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_simultaneous_if_match_puts_publish_one_complete_object() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let cases = [
+            (
+                "single-segment",
+                "simultaneous-if-match-single",
+                DIRECT_CONDITIONAL_PUT_BYTES,
+                Duration::ZERO,
+            ),
+            (
+                "multi-segment",
+                "simultaneous-if-match-streamed",
+                STREAMED_CONDITIONAL_PUT_BYTES,
+                Duration::from_millis(5),
+            ),
+        ];
+
+        for (name, key, body_size, delay) in cases {
+            let original_etag = put_object(&bucket, key, b"original").await;
+            let condition = RacingPutCondition::IfMatch(original_etag.clone());
+            let (left, right) = send_coordinated_conditional_puts(
+                &bucket,
+                key,
+                condition.clone(),
+                body_size,
+                delay,
+            )
+            .await;
+            let (winner_byte, winner_state, winner_etag, loser_status) =
+                assert_one_conditional_put_winner(&left, &right, name);
+            println!("simultaneous If-Match {name} loser status: {loser_status}");
+            assert_ne!(winner_etag, original_etag);
+            assert_conditional_put_winner_visible(
+                &bucket,
+                key,
+                winner_byte,
+                winner_state,
+                &winner_etag,
+                body_size,
+            )
+            .await;
+
+            let loser_state = if winner_byte == b'a' {
+                "writer-b"
+            } else {
+                "writer-a"
+            };
+            let retry = apply_racing_put_condition(
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .metadata("writer", loser_state)
+                    .body(ByteStream::from_static(b"loser retry")),
+                &condition,
+            )
+            .send()
+            .await;
+            assert_eq!(err_status(&retry), 412, "{name}: {retry:?}");
+            assert_s3_err_code(&retry, "PreconditionFailed");
+            assert_conditional_put_winner_visible(
+                &bucket,
+                key,
+                winner_byte,
+                winner_state,
+                &winner_etag,
+                body_size,
+            )
+            .await;
+        }
+
+        cleanup(
+            &bucket,
+            &[
+                "simultaneous-if-match-single",
+                "simultaneous-if-match-streamed",
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_if_match_put_loses_to_intervening_different_etag_replacement() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "if-match-intervening-replacement";
+        let original_etag = put_object(&bucket, key, b"original").await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let body = ByteStream::new(SdkBody::from_body_1_x(
+            CoordinatedConditionalPutBody::observed(
+                b'c',
+                STREAMED_CONDITIONAL_PUT_BYTES,
+                Arc::clone(&started),
+                Duration::from_millis(10),
+            ),
+        ));
+        let conditional_client = CTX.client().clone();
+        let conditional_bucket = bucket.clone();
+        let conditional_etag = original_etag.clone();
+        let conditional = tokio::spawn(async move {
+            conditional_client
+                .put_object()
+                .bucket(conditional_bucket)
+                .key(key)
+                .if_match(conditional_etag)
+                .metadata("writer", "conditional")
+                .body(body)
+                .send()
+                .await
+        });
+
+        started.notified().await;
+        let replacement_body = vec![b'r'; DIRECT_CONDITIONAL_PUT_BYTES];
+        let replacement = CTX
+            .client()
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .metadata("writer", "replacement")
+            .body(ByteStream::from(replacement_body))
+            .send()
+            .await
+            .unwrap();
+        let replacement_etag = replacement.e_tag().unwrap().to_string();
+        assert_ne!(replacement_etag, original_etag);
+
+        let conditional = conditional.await.unwrap();
+        let status = err_status(&conditional);
+        println!("intervening different-ETag replacement loser status: {status}");
+        assert!(matches!(status, 409 | 412), "{conditional:?}");
+        if status == 409 {
+            assert_s3_err_code(&conditional, "ConditionalRequestConflict");
+        } else {
+            assert_s3_err_code(&conditional, "PreconditionFailed");
+        }
+        assert_conditional_put_winner_visible(
+            &bucket,
+            key,
+            b'r',
+            "replacement",
+            &replacement_etag,
+            DIRECT_CONDITIONAL_PUT_BYTES,
+        )
+        .await;
+
+        let retry = CTX
+            .client()
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .if_match(original_etag)
+            .metadata("writer", "conditional-retry")
+            .body(ByteStream::from_static(b"conditional retry"))
+            .send()
+            .await;
+        assert_eq!(err_status(&retry), 412, "{retry:?}");
+        assert_s3_err_code(&retry, "PreconditionFailed");
+        assert_conditional_put_winner_visible(
+            &bucket,
+            key,
+            b'r',
+            "replacement",
+            &replacement_etag,
+            DIRECT_CONDITIONAL_PUT_BYTES,
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_if_match_put_racing_same_etag_replacement_tracks_etag_not_identity() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "if-match-same-etag-replacement";
+        let original_body = b"rrrrrrrrrrrrrrrr";
+        let original = put_object_result_retrying_operation_aborted(
+            "put original same-ETag race object",
+            || {
+                CTX.client()
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .metadata("writer", "original")
+                    .tagging("state=original")
+                    .body(ByteStream::from_static(original_body))
+            },
+        )
+        .await
+        .unwrap();
+        let original_etag = original.e_tag().unwrap().to_string();
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let body = ByteStream::new(SdkBody::from_body_1_x(
+            CoordinatedConditionalPutBody::observed(
+                b'c',
+                STREAMED_CONDITIONAL_PUT_BYTES,
+                Arc::clone(&started),
+                Duration::from_millis(10),
+            ),
+        ));
+        let conditional_client = CTX.client().clone();
+        let conditional_bucket = bucket.clone();
+        let conditional_etag = original_etag.clone();
+        let conditional = tokio::spawn(async move {
+            conditional_client
+                .put_object()
+                .bucket(conditional_bucket)
+                .key(key)
+                .if_match(conditional_etag)
+                .metadata("writer", "conditional")
+                .tagging("state=conditional")
+                .body(body)
+                .send()
+                .await
+        });
+
+        started.notified().await;
+        let replacement = CTX
+            .client()
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .metadata("writer", "replacement")
+            .tagging("state=replacement")
+            .body(ByteStream::from_static(original_body))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replacement.e_tag(), Some(original_etag.as_str()));
+
+        let conditional = conditional.await.unwrap();
+        let status = if conditional.is_ok() {
+            200
+        } else {
+            err_status(&conditional)
+        };
+        println!("intervening same-ETag replacement conditional status: {status}");
+        let (expected_byte, expected_state, expected_etag, expected_size, expected_tag) =
+            match conditional {
+                Ok(result) => (
+                    b'c',
+                    "conditional",
+                    result.e_tag().unwrap().to_string(),
+                    STREAMED_CONDITIONAL_PUT_BYTES,
+                    "conditional",
+                ),
+                Err(error) => {
+                    let failed: PutObjectCallResult = Err(error);
+                    assert_eq!(status, 409, "{failed:?}");
+                    assert_s3_err_code(&failed, "ConditionalRequestConflict");
+                    (
+                        original_body[0],
+                        "replacement",
+                        original_etag.clone(),
+                        original_body.len(),
+                        "replacement",
+                    )
+                }
+            };
+        assert_conditional_put_winner_visible(
+            &bucket,
+            key,
+            expected_byte,
+            expected_state,
+            &expected_etag,
+            expected_size,
+        )
+        .await;
+        let tags = CTX
+            .client()
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("get tags after same-ETag PUT race")
+            .await
+            .unwrap();
+        assert_eq!(tags.tag_set().len(), 1);
+        assert_eq!(tags.tag_set()[0].key(), "state");
+        assert_eq!(tags.tag_set()[0].value(), expected_tag);
+
+        let retry = CTX
+            .client()
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .if_match(&original_etag)
+            .metadata("writer", "conditional-retry")
+            .tagging("state=conditional-retry")
+            .body(ByteStream::from_static(b"cccccccccccccccc"))
+            .send()
+            .await;
+        if expected_etag == original_etag {
+            let retry = retry.expect("same-ETag conflict retry should succeed");
+            assert_conditional_put_winner_visible(
+                &bucket,
+                key,
+                b'c',
+                "conditional-retry",
+                retry.e_tag().unwrap(),
+                b"cccccccccccccccc".len(),
+            )
+            .await;
+        } else {
+            assert_eq!(err_status(&retry), 412, "{retry:?}");
+            assert_s3_err_code(&retry, "PreconditionFailed");
+            assert_conditional_put_winner_visible(
+                &bucket,
+                key,
+                b'c',
+                "conditional",
+                &expected_etag,
+                STREAMED_CONDITIONAL_PUT_BYTES,
+            )
+            .await;
+        }
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
