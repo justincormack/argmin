@@ -464,17 +464,18 @@ comparison. This placement is STS-specific and is not evidence for any S3
 mode; each S3 mode requires its own collision matrix.
 
 The S3 header-auth route is now independently pinned to perform its own scope
-validation before the specifically probed session-token presence and binding,
-stable issuer-role liveness, and HMAC checks; wrong region wins when region and
-service are both wrong. The header matrix does not yet order scope validation
-against empty, malformed, or duplicate signed token headers, so it does not
-establish scope's placement relative to all header-specific token structural
-validation.
+validation before the probed signed-header token structure, presence, binding,
+expiry, stable issuer-role liveness, and HMAC checks; wrong region wins when
+region and service are both wrong. The scope matrix covers missing, empty,
+malformed, independently valid mismatched, identical-duplicate, and
+conflicting-duplicate signed token headers in both conflicting orders for live
+and invalidated sessions.
 
 The presigned-query route is independently pinned to parse its
 `X-Amz-Credential` scope before the probed query and HTTP-header token
 selection, structure, coverage, binding, issuer-liveness, and HMAC checks;
-wrong region also wins when region and service are both wrong. Its matrix
+expiry is also behind the probed scope and binding checks. Wrong region wins
+when region and service are both wrong. Its matrix
 includes missing, empty, malformed, mismatched, identical-duplicate, and
 conflicting-duplicate query tokens in both conflicting orders, plus selected
 signed-header and present unsigned-header cases. Duplicate signed HTTP token
@@ -483,16 +484,16 @@ apply only to header and presigned SigV4 respectively.
 
 POST Object is independently pinned to parse the form
 `x-amz-credential` scope before the probed form-token structure, binding,
-issuer-liveness, and policy-signature checks, with wrong region winning when
-region and service are both wrong. Its already-pinned HTTP-token-header
+expiry, issuer-liveness, and policy-signature checks, with wrong region winning
+when region and service are both wrong. Its already-pinned HTTP-token-header
 presence routing occurs earlier still: any probed `x-amz-security-token` HTTP
 header produces `No AWSAccessKey was presented.` before form credential-scope
 parsing.
 
 The aws-chunked streaming route is independently pinned to validate the
 Authorization-header credential scope before token structure, signature
-coverage, binding, issuer liveness, seed-signature comparison, or chunk-chain
-verification. Its matrix covers missing, empty, malformed, mismatched,
+coverage, binding, expiry, issuer liveness, seed-signature comparison, or
+chunk-chain verification. Its matrix covers missing, empty, malformed, mismatched,
 identical-duplicate, and conflicting-duplicate signed token headers in both
 conflicting orders, plus a present unsigned token, invalidated old sessions,
 bad seed signatures, and bad first-chunk signatures. Wrong region wins when
@@ -1596,18 +1597,18 @@ or unroutable. Complete response goldens establish that:
   `x-amz-bucket-region` header
 - when region and service are both wrong, only the wrong-region response is
   rendered; this differs from STS, which aggregates both scope messages
-- each scope error precedes session-token presence and binding, stable
-  issuer-role liveness, and HMAC comparison. Live and invalidated sessions with
-  valid, missing, or independently valid mismatched tokens receive the scope
-  error, as does a valid token combined with a bad secret
+- each scope error precedes signed session-token structure, presence and
+  binding, stable issuer-role liveness, and HMAC comparison. Live and
+  invalidated sessions with valid, missing, empty, malformed, independently
+  valid mismatched, identical-duplicate, or conflicting-duplicate tokens in
+  both conflicting orders receive the scope error, as does a valid token
+  combined with a bad secret
 
 The S3 header route must therefore validate its credential scope before the
-specifically probed token presence and binding, issuer liveness, and HMAC
-checks. Empty, malformed, and duplicate signed token-header collisions remain
-unpinned, so this does not order scope validation against every mode-specific
-structural token check. It also does not establish the placement or collision
-behavior for presigned, POST Object, or streaming authentication; the separate
-presigned matrix below establishes that mode's own behavior.
+probed signed token-header structural checks, token/access-key binding, issuer
+liveness, and HMAC checks. This does not establish the placement or collision
+behavior for presigned, POST Object, or streaming authentication; each mode's
+separate matrix below establishes its own behavior.
 
 The S3 SigV4 presigned-query slice completed on 2026-07-13 against the same
 live and invalidated sessions. A valid `X-Amz-Security-Token` query parameter
@@ -1852,8 +1853,37 @@ token has been selected and bound to the access key. Conversely, wrong-region
 and wrong-service scope errors win over the expired credential with its
 correct, missing, or mismatched token; the correct expired token combined with
 each scope error and a bad signature receives the scope error too. This closes
-the STS expiry collision ordering only. Equivalent expiry-input collisions for
-each S3 authentication mode remain separately unresolved.
+the STS expiry collision ordering.
+
+The equivalent S3 expiry-input collision extension completed on 2026-07-16
+for header, presigned-query, POST Object, and aws-chunked streaming
+authentication. Each mode uses the already-expired, deleted-issuer credential
+and the independently live session token from the same fixture. With correct
+scope, omitting the expired credential's token, supplying an empty token, or
+substituting the live token returns that mode's exact HTTP 403
+`InvalidAccessKeyId` golden for both correct and bad signatures. A malformed
+non-empty token instead returns the exact HTTP 400 `InvalidToken` golden before
+signature comparison. Two identical expired-token inputs are accepted through
+structural validation and reach `ExpiredToken`; that error preserves both
+presented values as `Token-0` and `Token-1`. Conflicting expired and live
+tokens return `InvalidAccessKeyId` in both wire orders. These cases cover the
+signed HTTP header for header authentication, query member for presigning,
+multipart form field for POST Object, and signed HTTP header for aws-chunked.
+Mode-specific structural validation and a successful token open/access-key
+binding therefore gate the embedded expiry check in every initial S3 mode.
+Conversely, each mode's wrong-region and wrong-service response wins over the
+expired credential with its correct, missing, or mismatched token, and also
+wins when the correct expired token is combined with a bad header/presigned
+request, POST-policy, or streaming seed signature. Header and presigned scope
+probes use the same virtual-hosted bucket endpoint as their established scope
+goldens; their correct-scope authentication collisions retain the regional S3
+endpoint, so endpoint style is not an uncontrolled response-shape variable.
+Together with the prior expiry-versus-signature and expiry-versus-liveness
+probes, this pins, for each mode's tested primary token location, the ordering
+as scope, then mode-specific token structure/selection/opening/binding, then
+expiry, then issuer liveness, then signature verification. Alternate presigned
+signed-header and unsigned-header locations retain the narrower ordering
+documented by their own matrices.
 
 During this slice, one newly created role produced one successful STS
 assumption followed immediately by `AccessDenied` for the same request. The
@@ -2367,9 +2397,12 @@ body may appear in traces.
    STS, S3 header, S3 presigned-query, and S3 POST Object region/service
    collisions are now pinned separately, as are streaming region/service
    collisions. Expiry versus issuer deletion is pinned independently for STS
-   and every initial S3 mode. STS expiry collisions with missing, mismatched,
-   or wrong-scope inputs are pinned. Disabled-credential collisions and the
-   equivalent S3 expiry-input collisions are not.
+   and every initial S3 mode. STS and all four initial S3 modes now pin expiry
+   collisions with missing, mismatched, and wrong-scope inputs; the four S3
+   modes additionally pin empty, malformed, identical-duplicate, and
+   conflicting-duplicate inputs in their primary token locations. Disabled-
+   credential collisions are not yet pinned. Alternate presigned HTTP-header
+   locations retain the explicit limitations documented above.
 3. Should the first standalone UAT role be injected through a dedicated
    test-only constructor/config object or through explicitly UAT-only
    environment variables?
