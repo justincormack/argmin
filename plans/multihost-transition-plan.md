@@ -11172,20 +11172,29 @@ Required production shape and implementation order:
    A production-shaped release regression now makes this write-amplification
    boundary executable. It boots a WAL-backed durable OpenRaft authority with
    three storage nodes and 116 serving PGs, constructs the complete ordinary
-   256-epoch sparse-history window, warms the compact runtime-map certificate
-   and serving checkpoint, then runs 192 canonical unchanged heartbeats and 64
-   compact status reads. The test brackets authority-scoped checkpoint and WAL
-   metric snapshots and requires zero encode/store/file-sync/directory-sync/
-   compaction and append/frame-byte deltas during that phase; restart-artifact
-   bytes, WAL bytes/offsets, the applied log id, and the committed timestamp are
-   retained as secondary invariants. It then advances heartbeat time until
-   exactly one bounded horizon extension is required and calculates the rate
-   from cumulative checkpoint-encoded-byte and WAL-frame-byte metric deltas, so
-   repeated identical writes cannot escape the accounting. The initial
-   optimized release result with operation accounting was one checkpoint store
-   (two file and two directory syncs) plus four WAL appends/syncs: 87,696
-   checkpoint bytes plus 1,547 WAL bytes over 10,010 ms, or 8,916 logical
-   durable bytes/s, below the 1 MiB/s release limit. The gate runs from
+   256-epoch sparse-history window, and builds a retained-log restart artifact
+   of at least 24 MiB, matching the artifact scale observed in the soak
+   failure. It crashes and restores from artifact plus WAL before monitor
+   compaction, then runs two consecutive 600-round intervals of valid durable
+   Peering evidence whose node proofs deliberately disagree so Peering cannot
+   complete. The real checkpoint monitor must perform one coordinated
+   snapshot/purge per interval, compact both the retained log and WAL suffix,
+   converge to a bounded post-purge artifact size, and keep combined WAL-frame
+   plus checkpoint bytes below 1 MiB/s across both intervals. The initial
+   result was a 25,242,065-byte retained artifact, 9,979,494 WAL bytes, and
+   34,610,241 checkpoint bytes over the two intervals, or 371,582 logical
+   durable bytes/s. The compact artifacts were 104,521 and 104,985 bytes,
+   proving the second interval does not inherit the first interval's retained
+   log growth. The test then converges all PGs, warms the
+   compact runtime-map certificate and serving checkpoint, and runs 192
+   canonical unchanged heartbeats plus 64 compact status reads. It brackets
+   authority-scoped checkpoint and WAL metric snapshots and requires zero
+   encode/store/file-sync/directory-sync/compaction and
+   append/frame-byte deltas during that phase; restart-artifact bytes, WAL
+   bytes/offsets, the applied log id, and the committed timestamp are retained
+   as secondary invariants. A later horizon extension is accounted over the
+   same checkpoint-publication interval, so a large artifact cannot be charged
+   as though every horizon mutation rewrote it immediately. The gate runs from
    `scripts/ci-control-plane-release` and prints its accounting on success.
    This closes the steady-heartbeat and bounded-horizon measurement gate. The
    separate ordinary peer-RPC acknowledgement blocker in items 5 and 6 is now
@@ -11213,6 +11222,39 @@ Required production shape and implementation order:
    are not subtracted as though they were interval maxima. Concurrent
    checkpoint timing reports summed call latency, whole-batch wall time, and
    the maximum individual call separately.
+   Replicated liveness commands now use the same fsynced-WAL acknowledgement
+   boundary as ordinary peer mutations. Durable heartbeat observations,
+   heartbeat-triggered Peering completion, and nonempty lease-expiry commands
+   do not synchronously rewrite the restart artifact before returning; the
+   authority-wide bounded WAL checkpoint worker observes and compacts their
+   suffix after 64 MiB, 4,096 successful mutations, or 59.9 seconds of observed
+   suffix age under the 100 ms polling cadence. These are WAL resource and
+   restart-cost bounds; WAL fsync remains the acknowledgement safety boundary.
+   Successful linearized reads likewise trust the synced, non-poisoned WAL
+   recovery boundary for current vote/term/log state instead of converting an
+   intervening liveness suffix into a synchronous full-artifact checkpoint.
+   Explicit admin commands retain their synchronous confirmation checkpoint in
+   this slice. OpenRaft automatic snapshot construction is disabled with
+   `SnapshotPolicy::Never`: its process-local snapshot cache is not itself a
+   restart artifact, so automatic snapshot-driven purge could otherwise remove
+   the replayable prefix before the state-machine payload was durably
+   published. `max_in_snapshot_log_to_keep = u64::MAX` also disables the
+   policy purge that OpenRaft otherwise schedules after completion of a
+   manually triggered snapshot; a 1,300-entry regression proves no purge
+   occurs before the explicit call. Only the application-coordinated
+   snapshot/purge path may compact retained logs: each bounded monitor
+   checkpoint builds a local snapshot on leaders and followers, publishes an
+   artifact containing its state-machine payload before purge, records the
+   purge in the WAL, then publishes the compacted artifact. A crash after
+   purge but before the second publication replays the purge over an artifact
+   that already contains the covering snapshot. Config, crash/restart,
+   heartbeat-replay, and the multi-interval production-shaped
+   sustained-Peering gate pin these boundaries.
+   This removes the feedback loop exposed by 200-iteration replicated
+   route-change soaks: while one PG was Peering, every node heartbeat carried
+   durable Peering evidence and synchronously rewrote an approximately 27 MB
+   accumulated restart artifact, eventually consuming the ten-second node
+   lease and making an unrelated PG lose its serving primary.
    The public split boundary is authority-instance-bound and internally
    serialized. Before any artifact encoding or filesystem mutation,
    persistence rejects a token captured by another authority, a WAL replay
@@ -11263,20 +11305,24 @@ Required production shape and implementation order:
    does not depend on an inbound peer handler or successful response
    construction. It therefore observes pre-existing suffixes, locally
    initiated election/timer writes, and durable writes whose response later
-   fails. The worker compacts after any of three explicit bounds: 1 MiB of WAL
-   suffix, 256 successful WAL appends since the previous checkpoint, or 900 ms
-   from first observing a non-empty suffix. The polling interval plus age
-   threshold keeps the nominal detection-to-checkpoint trigger within one
-   second. Checkpoint failure poisons and fail-stops the process, while
+   fails. The worker compacts after any of three explicit resource/restart-cost
+   bounds: 64 MiB of WAL suffix, 4,096 successful WAL appends since the
+   previous checkpoint, or 59.9 seconds from first observing a non-empty
+   suffix. The 100 ms polling interval gives a nominal one-minute maximum
+   publication interval while amortizing a production-sized restart artifact;
+   the fsynced WAL, not that interval, remains the acknowledgement safety
+   boundary. Checkpoint failure poisons and fail-stops the process, while
    concurrent mutations remain visible in the suffix and are picked up by the
    next observation. Focused tests pin each policy bound, no-op exclusion,
    response independence from the checkpoint lock, failed-response discovery,
    locally initiated election discovery without peer traffic, state-machine
    lock independence, and artifact/WAL compaction. The production-shaped
-   heartbeat gate polls the real monitor against 116 PGs and the full retained
-   history window and reports cumulative/maximum monitor operation time. The
-   monitor lock regression and WAL-ack/compaction regression run in the
-   control-plane release gate alongside that workload.
+   heartbeat gate polls the real monitor against 116 PGs, the full retained
+   history window, a 24+ MiB retained-log artifact, and a minute of continuing
+   durable Peering traffic. It reports cumulative/maximum monitor operation
+   time and fails above 1 MiB/s of combined WAL/checkpoint bytes. The monitor
+   lock regression and WAL-ack/compaction regression run in the control-plane
+   release gate alongside that workload.
    Restart cost is part of the same bound. A retained route-change soak exposed
    a 12.66 MB restart artifact with 2,883 retained entries whose cached
    OpenRaft snapshot was at index 5,000 while the materialized state was at
@@ -12192,16 +12238,21 @@ Phase 12.4 progress:
   An authority-wide worker polls an O(1), poison-tolerant log-store snapshot of
   WAL offsets and append counters independently of peer dispatch, without
   entering the Raft state-machine boundary or scanning control-plane state,
-  then checkpoints and compacts after 1 MiB, 256 successful WAL appends, or a
-  900 ms observed suffix age under a 100 ms polling cadence.
+  then performs a coordinated local snapshot, pre-purge artifact publication,
+  explicit purge, and compacted artifact publication after 64 MiB, 4,096
+  successful WAL appends, or a 59.9-second observed suffix age under a 100 ms
+  polling cadence. The larger interval amortizes production-sized restart
+  artifacts while the fsynced WAL remains the crash-recovery boundary.
   This also covers startup suffixes, locally initiated elections/timers, and
   response-signing/write failures. Regressions prove the reply is independent
   of the checkpoint lock, the artifact remains unchanged at acknowledgement,
   the WAL suffix is present, a direct local election with no inbound peer RPC
   is checkpointed, the monitor completes while the state-machine boundary is
   held, and the bounded checkpoint captures the vote and compacts the suffix.
-  The production-shaped release workload executes the monitor over 116 PGs
-  and 256 retained epochs and reports its cumulative/maximum poll duration.
+  The production-shaped release workload executes two complete monitor
+  intervals over 116 PGs and 256 retained epochs, requires compact
+  post-purge artifacts below 1 MiB with bounded interval-to-interval growth,
+  and reports its cumulative/maximum poll duration.
   The existing WAL crash test remains the recovery guarantee for process loss
   anywhere after fsync.
 - Split periodic OpenRaft checkpointing into an asynchronous immutable capture

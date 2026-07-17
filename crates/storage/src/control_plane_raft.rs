@@ -39,7 +39,7 @@ use openraft::RaftTypeConfig;
 use openraft::ReadPolicy;
 use openraft::ServerState;
 use openraft::StoredMembership;
-use openraft::{AnyError, Config};
+use openraft::{AnyError, Config, SnapshotPolicy};
 use placement::NodeId;
 
 use crate::control_plane::{
@@ -3571,6 +3571,17 @@ fn experimental_raft_config(
             election_timeout_min: 1_500,
             election_timeout_max: 3_000,
             max_payload_entries: CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES,
+            // The process restart boundary is its artifact plus WAL, not
+            // OpenRaft's in-memory snapshot cache. Automatic snapshot-driven
+            // purge could therefore discard the only replayable prefix before
+            // the cache is published in a restart artifact. The application
+            // coordinates explicit snapshot/purge with artifact persistence.
+            snapshot_policy: SnapshotPolicy::Never,
+            // OpenRaft schedules policy-based purge after every completed
+            // snapshot, including manually triggered snapshots. Suppress that
+            // implicit purge; the explicit trigger().purge_log() path ignores
+            // this retention value and is coordinated with artifact writes.
+            max_in_snapshot_log_to_keep: u64::MAX,
             enable_tick: timers_enabled,
             enable_heartbeat: timers_enabled,
             enable_elect: timers_enabled,
@@ -4059,7 +4070,7 @@ impl ControlPlaneRaftAuthority {
         })?
     }
 
-    pub async fn trigger_snapshot_and_purge_applied(
+    pub async fn trigger_snapshot_applied(
         &self,
     ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
         let status = self.status().await?;
@@ -4072,6 +4083,12 @@ impl ControlPlaneRaftAuthority {
                 ),
             });
         }
+        self.trigger_local_snapshot_applied().await
+    }
+
+    pub async fn trigger_local_snapshot_applied(
+        &self,
+    ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
         let Some(applied) = self
             .raft
             .with_state_machine(|state_machine| {
@@ -4109,6 +4126,29 @@ impl ControlPlaneRaftAuthority {
                 .ok_or_else(|| ControlPlaneError::RpcRemote {
                     message: "OpenRaft snapshot trigger produced an empty snapshot".to_string(),
                 })?;
+        Ok(Some(snapshot_log_id))
+    }
+
+    pub async fn purge_log_through_snapshot(
+        &self,
+        snapshot_log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), ControlPlaneError> {
+        let snapshot = self
+            .raft
+            .get_snapshot()
+            .await
+            .map_err(|error| openraft_remote_error("get snapshot before purge", error))?
+            .ok_or_else(|| ControlPlaneError::RpcRemote {
+                message: "OpenRaft snapshot purge requires a current snapshot".to_string(),
+            })?;
+        if snapshot.meta.last_log_id != Some(snapshot_log_id) {
+            return Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "OpenRaft snapshot purge log id {snapshot_log_id} does not match current snapshot {:?}",
+                    snapshot.meta.last_log_id
+                ),
+            });
+        }
         self.raft
             .trigger()
             .purge_log(snapshot_log_id.index())
@@ -4136,7 +4176,7 @@ impl ControlPlaneRaftAuthority {
                 ),
             })??;
         }
-        Ok(Some(snapshot_log_id))
+        Ok(())
     }
 
     pub async fn wait_for_applied_index_at_least(
@@ -13629,6 +13669,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(
+            config.snapshot_policy,
+            SnapshotPolicy::Never,
+            "only the application-coordinated snapshot/purge path may compact the restart log"
+        );
+        assert_eq!(
+            config.max_in_snapshot_log_to_keep,
+            u64::MAX,
+            "manual snapshot completion must not schedule implicit log purge"
+        );
+        assert_eq!(
             config.max_payload_entries,
             CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES
         );
@@ -18610,10 +18660,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let follower_error = authority2
-                .trigger_snapshot_and_purge_applied()
-                .await
-                .unwrap_err();
+            let follower_error = authority2.trigger_snapshot_applied().await.unwrap_err();
             assert!(matches!(
                 follower_error,
                 ControlPlaneError::RpcRemote { message }
@@ -18621,17 +18668,89 @@ mod tests {
                         && message.contains("NotLocalLeader")
             ));
 
-            assert_eq!(
-                authority1
-                    .trigger_snapshot_and_purge_applied()
-                    .await
-                    .unwrap()
-                    .map(|log_id| log_id.index()),
-                Some(write.log_id().index())
-            );
+            let snapshot_log_id = authority1
+                .trigger_snapshot_applied()
+                .await
+                .unwrap()
+                .expect("serving authority snapshot should have an applied log id");
+            assert_eq!(snapshot_log_id.index(), write.log_id().index());
+            authority1
+                .purge_log_through_snapshot(snapshot_log_id)
+                .await
+                .unwrap();
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_manual_snapshot_does_not_purge_before_explicit_trigger() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let node_id = 121;
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                "control-plane-raft-manual-snapshot-no-implicit-purge-test",
+                node_id,
+            )
+            .await
+            .unwrap();
+            authority
+                .initialize_single_node_membership(node_id)
+                .await
+                .unwrap();
+            authority
+                .wait_for_current_leader(
+                    node_id,
+                    Duration::from_secs(1),
+                    "manual snapshot no-implicit-purge leadership",
+                )
+                .await
+                .unwrap();
+            wait_for_authority_status_matching(
+                &authority,
+                Duration::from_secs(1),
+                "manual snapshot no-implicit-purge serving state",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+
+            for _ in 0..1_300 {
+                let rejected = authority
+                    .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(999),
+                        availability: NodeAvailabilityState::Healthy,
+                    })
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    rejected.outcome(),
+                    ControlPlaneRaftCommandOutcome::Rejected(ControlPlaneError::UnknownNode {
+                        node_id: 999
+                    })
+                ));
+            }
+            let snapshot_log_id = authority
+                .trigger_snapshot_applied()
+                .await
+                .unwrap()
+                .expect("rejected entries should advance the applied snapshot position");
+            assert!(snapshot_log_id.index() > 1_000);
+            ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                authority.status().await.unwrap().last_purged_log_id(),
+                None,
+                "manual snapshot completion must not trigger OpenRaft policy purge"
+            );
+
+            authority
+                .purge_log_through_snapshot(snapshot_log_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                authority.status().await.unwrap().last_purged_log_id(),
+                Some(snapshot_log_id)
+            );
+            authority.shutdown().await.unwrap();
         });
     }
 

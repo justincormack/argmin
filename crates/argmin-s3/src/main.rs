@@ -94,9 +94,9 @@ const CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT: usize = 8;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT: usize = 64;
 const CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
-const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_WAL_SUFFIX_BYTES: u64 = 1024 * 1024;
-const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_MUTATIONS: u64 = 256;
-const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(1);
+const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_WAL_SUFFIX_BYTES: u64 = 64 * 1024 * 1024;
+const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_MUTATIONS: u64 = 4_096;
+const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(60);
 const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 macro_rules! process_info {
@@ -2289,6 +2289,17 @@ impl ExperimentalRaftControlPlane {
         if !self.checkpoint_serving_reads {
             return Ok(());
         }
+        if self.authority.durability_metric_snapshots().wal.is_some() {
+            let wal_status = self.authority.durable_wal_monitor_snapshot()?;
+            if let Some(reason) = wal_status.poisoned() {
+                return Err(ControlPlaneError::RpcRemote {
+                    message: format!(
+                        "durable OpenRaft serving read observed poisoned WAL state: {reason}"
+                    ),
+                });
+            }
+            return Ok(());
+        }
 
         let status = self.block_on(self.authority.status()).ok();
         let marker = status
@@ -2325,15 +2336,33 @@ impl ExperimentalRaftControlPlane {
         &mut self,
         command: ControlPlaneCommand,
     ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+        self.submit_raft_command_with_checkpoint_policy(command, true)
+    }
+
+    fn submit_raft_liveness_command(
+        &mut self,
+        command: ControlPlaneCommand,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+        let wal_backed = self.authority.durability_metric_snapshots().wal.is_some();
+        self.submit_raft_command_with_checkpoint_policy(command, !wal_backed)
+    }
+
+    fn submit_raft_command_with_checkpoint_policy(
+        &mut self,
+        command: ControlPlaneCommand,
+        checkpoint_after_commit: bool,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
         let submitted = self.block_on(self.authority.submit_control_plane_command(command))?;
         let outcome = submitted.into_outcome();
-        if let Err(error) = self.store_durable_restart_artifact() {
-            self.poison_durable_authority(format!(
-                "experimental OpenRaft control-plane durability checkpoint failed after a \
-                 committed command; refusing to serve until restart: {error}"
-            ));
-            return Err(error);
+        if checkpoint_after_commit {
+            if let Err(error) = self.store_durable_restart_artifact() {
+                self.poison_durable_authority(format!(
+                    "experimental OpenRaft control-plane durability checkpoint failed after a \
+                     committed command; refusing to serve until restart: {error}"
+                ));
+                return Err(error);
+            }
         }
         match outcome {
             ControlPlaneRaftCommandOutcome::Applied(response) => Ok(response),
@@ -2378,7 +2407,7 @@ impl ExperimentalRaftControlPlane {
         })?;
         snapshot.validate_lease_grant_horizon_rebinding(authority, now_ms)?;
         let response =
-            self.submit_raft_command(ControlPlaneCommand::ExpireNodeHeartbeatLeases {
+            self.submit_raft_liveness_command(ControlPlaneCommand::ExpireNodeHeartbeatLeases {
                 authority,
                 expire_at_ms,
                 expired,
@@ -2487,7 +2516,7 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
             volatile_snapshot = None;
         }
         if volatile_snapshot.is_none() {
-            self.submit_raft_command(command)?;
+            self.submit_raft_liveness_command(command)?;
         }
         #[cfg(test)]
         let post_commit_term_override = if volatile_snapshot.is_none() {
@@ -2539,7 +2568,7 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
         )?;
         let ready = snapshot.ready_pg_peering_completions(authority_now_ms)?;
         if !ready.is_empty() {
-            self.submit_raft_command(ControlPlaneCommand::CompleteReadyPgPeerings {
+            self.submit_raft_liveness_command(ControlPlaneCommand::CompleteReadyPgPeerings {
                 ready_at_ms: authority_now_ms,
                 ready,
             })?;
@@ -2639,15 +2668,28 @@ impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
 
     fn trigger_raft_snapshot_and_purge(&mut self) -> Result<Option<u64>, ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
-        let snapshot_log_id = self.block_on(self.authority.trigger_snapshot_and_purge_applied())?;
+        let snapshot_log_id = self.block_on(self.authority.trigger_snapshot_applied())?;
         if let Err(error) = self.store_durable_restart_artifact() {
             self.poison_durable_authority(format!(
-                "experimental OpenRaft control-plane durability checkpoint failed after a \
+                "experimental OpenRaft control-plane durability checkpoint failed before a \
                  snapshot purge; refusing to serve until restart: {error}"
             ));
             return Err(error);
         }
-        Ok(snapshot_log_id.map(|log_id| log_id.index()))
+        let Some(snapshot_log_id) = snapshot_log_id else {
+            return Ok(None);
+        };
+        let purge_result =
+            self.block_on(self.authority.purge_log_through_snapshot(snapshot_log_id));
+        if let Err(error) = self.store_durable_restart_artifact() {
+            self.poison_durable_authority(format!(
+                "experimental OpenRaft control-plane durability checkpoint failed after a \
+                 snapshot purge attempt; refusing to serve until restart: {error}"
+            ));
+            return Err(error);
+        }
+        purge_result?;
+        Ok(Some(snapshot_log_id.index()))
     }
 
     fn trigger_raft_election(&mut self) -> Result<(), ControlPlaneError> {
@@ -3572,13 +3614,18 @@ fn checkpoint_experimental_raft_peer_wal_if_due(
             message: "durable OpenRaft peer checkpoint scheduler requires an artifact path"
                 .to_string(),
         })?;
-    store_experimental_raft_durable_restart_artifact(
+    snapshot_purge_and_checkpoint_experimental_raft_peer_wal(
         runtime,
         authority,
         path,
-        Some(&durability.checkpoint_lock),
+        &durability.checkpoint_lock,
     )?;
-    tracker.complete_checkpoint(successful_append_total);
+    let completed_wal_metrics = authority.durable_wal_monitor_snapshot()?.metrics();
+    tracker.complete_checkpoint(
+        completed_wal_metrics
+            .append_total
+            .saturating_sub(completed_wal_metrics.append_error_total),
+    );
     Ok(true)
 }
 
@@ -3669,6 +3716,14 @@ fn store_experimental_raft_durable_restart_artifact(
         lock.lock()
             .expect("experimental OpenRaft durable checkpoint mutex poisoned")
     });
+    store_experimental_raft_durable_restart_artifact_while_locked(runtime, authority, path)
+}
+
+fn store_experimental_raft_durable_restart_artifact_while_locked(
+    runtime: &Handle,
+    authority: &ControlPlaneRaftAuthority,
+    path: &Path,
+) -> Result<(), ControlPlaneError> {
     let artifact_existed = path.exists();
     let checkpoint =
         block_on_control_plane_raft(runtime, authority.capture_durable_restart_checkpoint())?;
@@ -3684,6 +3739,29 @@ fn store_experimental_raft_durable_restart_artifact(
         )?;
     }
     Ok(())
+}
+
+fn snapshot_purge_and_checkpoint_experimental_raft_peer_wal(
+    runtime: &Handle,
+    authority: &ControlPlaneRaftAuthority,
+    path: &Path,
+    durable_checkpoint_lock: &Arc<Mutex<()>>,
+) -> Result<(), ControlPlaneError> {
+    let _guard = durable_checkpoint_lock
+        .lock()
+        .expect("experimental OpenRaft durable checkpoint mutex poisoned");
+    let snapshot_log_id =
+        block_on_control_plane_raft(runtime, authority.trigger_local_snapshot_applied())?;
+    store_experimental_raft_durable_restart_artifact_while_locked(runtime, authority, path)?;
+    let Some(snapshot_log_id) = snapshot_log_id else {
+        return Ok(());
+    };
+    let purge_result = block_on_control_plane_raft(
+        runtime,
+        authority.purge_log_through_snapshot(snapshot_log_id),
+    );
+    store_experimental_raft_durable_restart_artifact_while_locked(runtime, authority, path)?;
+    purge_result
 }
 
 fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
@@ -8450,6 +8528,12 @@ mod tests {
         const STORAGE_NODE_COUNT: u32 = 3;
         const PG_COUNT: u32 = 116;
         const RETAINED_HISTORY_EPOCHS: usize = 256;
+        const LARGE_RESTART_ARTIFACT_MIN_BYTES: u64 = 24 * 1024 * 1024;
+        const LARGE_RESTART_ARTIFACT_PADDED_ENTRIES: u64 = 256;
+        const SUSTAINED_PEERING_INTERVALS: u64 = 2;
+        const SUSTAINED_PEERING_ROUNDS: u64 = 600;
+        const SUSTAINED_PEERING_ROUND_MS: u64 = 100;
+        const POST_PURGE_ARTIFACT_MAX_BYTES: u64 = 1024 * 1024;
         const STEADY_HEARTBEAT_ROUNDS: u64 = 64;
         const CONCURRENT_CHECKPOINT_COUNT: u64 = 8;
         const CONCURRENT_HEARTBEAT_ROUNDS: u64 = 16;
@@ -8481,6 +8565,21 @@ mod tests {
                 .durable_wal_monitor_snapshot()
                 .expect("production-shaped WAL monitor snapshot should read")
                 .offsets()
+        }
+
+        fn durable_snapshot(harness: &ExperimentalRaftTestHarness) -> ClusterControlSnapshot {
+            harness
+                .control_plane
+                .block_on(
+                    harness
+                        .authority
+                        .raft()
+                        .with_state_machine(|state_machine| {
+                            let snapshot = state_machine.inner().snapshot().clone();
+                            Box::pin(async move { snapshot })
+                        }),
+                )
+                .expect("durable state-machine snapshot should read")
         }
 
         fn active_primary_observations(
@@ -8610,10 +8709,223 @@ mod tests {
             .current_snapshot()
             .expect("peering snapshot should read")
             .cluster_epoch();
+        harness.control_plane.checkpoint_serving_reads = true;
+
+        // Reproduce the retained-log artifact size from the soak failure
+        // without changing control-plane state. These deterministic
+        // rejections still advance the applied Raft cursor and are
+        // recoverable from the WAL.
+        let padded_endpoint = "x".repeat(96 * 1024);
+        for _ in 0..LARGE_RESTART_ARTIFACT_PADDED_ENTRIES {
+            let error = harness
+                .control_plane
+                .submit_raft_liveness_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(0), padded_endpoint.clone())],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .expect_err("repeated bootstrap padding command should be rejected");
+            assert!(matches!(
+                error,
+                ControlPlaneError::BootstrapRequiresEmptyState
+            ));
+        }
+        let pre_restart_status = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("pre-restart retained-log status should read");
+        assert_eq!(
+            pre_restart_status.last_purged_log_id(),
+            None,
+            "automatic OpenRaft snapshot-driven purge must remain disabled"
+        );
+        assert_eq!(
+            pre_restart_status.current_snapshot(),
+            None,
+            "automatic OpenRaft snapshot construction must remain disabled"
+        );
+        let expected_before_restart = durable_snapshot(&harness);
+        harness.shutdown();
+        harness = experimental_raft_durable_wal_test_harness(
+            "production-shaped-write-amplification",
+            &state_path,
+        );
+        assert_eq!(
+            durable_snapshot(&harness),
+            expected_before_restart,
+            "restart must recover the large retained WAL suffix before monitor checkpoint"
+        );
+        let large_artifact_bytes = fs::metadata(&state_path)
+            .expect("large restart artifact metadata should read")
+            .len();
+        assert!(
+            large_artifact_bytes >= LARGE_RESTART_ARTIFACT_MIN_BYTES,
+            "release workload restart artifact {large_artifact_bytes} bytes does not reproduce the production-sized checkpoint"
+        );
+
+        let monitor_durability = ExperimentalRaftPeerDurabilityContext {
+            artifact_path: harness.control_plane.durable_artifact_path.clone(),
+            checkpoint_lock: harness
+                .control_plane
+                .durable_checkpoint_lock
+                .clone()
+                .expect("durable test authority should retain a checkpoint lock"),
+            publication: harness.control_plane.durable_publication.clone(),
+        };
+        let mut monitor_tracker = ExperimentalRaftPeerCheckpointTracker::default();
+        let peering_monitor_started_at = Instant::now();
+        assert!(
+            !checkpoint_experimental_raft_peer_wal_if_due(
+                &harness.control_plane.runtime,
+                &harness.authority,
+                &monitor_durability,
+                &mut monitor_tracker,
+                peering_monitor_started_at,
+            )
+            .expect("clean large-artifact WAL observation should succeed"),
+            "clean WAL must only initialize the checkpoint tracker"
+        );
+        let sustained_metrics_before = harness.authority.durability_metric_snapshots();
+        let sustained_offsets_before = harness
+            .authority
+            .durable_wal_monitor_snapshot()
+            .expect("pre-peering WAL monitor snapshot should read")
+            .offsets();
+        let mut peering_monitor_checkpoint_total = 0_u64;
+        let mut post_purge_artifact_bytes = Vec::new();
+        for interval in 0..SUSTAINED_PEERING_INTERVALS {
+            for interval_round in 0..SUSTAINED_PEERING_ROUNDS {
+                let round = interval
+                    .saturating_mul(SUSTAINED_PEERING_ROUNDS)
+                    .saturating_add(interval_round);
+                for node_id in 0..STORAGE_NODE_COUNT {
+                    let node_proof = PgMetadataProof {
+                        applied_log_index: round + 2,
+                        applied_log_hash: round
+                            .saturating_mul(u64::from(STORAGE_NODE_COUNT))
+                            .saturating_add(u64::from(node_id))
+                            .saturating_add(3),
+                        state_digest: round
+                            .saturating_mul(u64::from(STORAGE_NODE_COUNT))
+                            .saturating_add(u64::from(node_id))
+                            .saturating_add(4),
+                    };
+                    let snapshot = harness
+                        .control_plane
+                        .current_snapshot()
+                        .expect("sustained Peering observation snapshot should read");
+                    let pg_observations = snapshot
+                        .pgs()
+                        .filter(|pg| pg.acting_set().contains(&NodeId::new(node_id)))
+                        .map(|pg| NodePgHeartbeatObservation {
+                            pg_id: pg.pg_id(),
+                            state: PgState::Peering,
+                            metadata_proof: node_proof,
+                            pending_metadata_command: None,
+                        })
+                        .collect();
+                    harness
+                        .control_plane
+                        .refresh_node_heartbeat(
+                            heartbeat(
+                                node_id,
+                                &endpoints[usize::try_from(node_id).unwrap()],
+                                peering_epoch,
+                                pg_observations,
+                            ),
+                            now_ms,
+                        )
+                        .expect("mismatched-proof Peering heartbeat should refresh");
+                    heartbeat_requests += 1;
+                    now_ms += SUSTAINED_PEERING_ROUND_MS / u64::from(STORAGE_NODE_COUNT);
+                }
+                let monitor_now = peering_monitor_started_at
+                    + Duration::from_millis(round.saturating_mul(SUSTAINED_PEERING_ROUND_MS));
+                if checkpoint_experimental_raft_peer_wal_if_due(
+                    &harness.control_plane.runtime,
+                    &harness.authority,
+                    &monitor_durability,
+                    &mut monitor_tracker,
+                    monitor_now,
+                )
+                .expect("sustained Peering WAL monitor poll should succeed")
+                {
+                    peering_monitor_checkpoint_total += 1;
+                }
+            }
+            assert_eq!(
+                peering_monitor_checkpoint_total,
+                interval + 1,
+                "each sustained Peering interval should produce one coordinated snapshot/purge"
+            );
+            let artifact_bytes = fs::metadata(&state_path)
+                .expect("post-purge artifact metadata should read")
+                .len();
+            assert!(
+                artifact_bytes <= POST_PURGE_ARTIFACT_MAX_BYTES,
+                "coordinated interval {} retained a {}-byte artifact after purge",
+                interval + 1,
+                artifact_bytes
+            );
+            post_purge_artifact_bytes.push(artifact_bytes);
+        }
+        assert_eq!(
+            peering_monitor_checkpoint_total, SUSTAINED_PEERING_INTERVALS,
+            "each minute of sustained Peering traffic should produce one coordinated snapshot/purge"
+        );
+        assert!(
+            post_purge_artifact_bytes[1] <= post_purge_artifact_bytes[0].saturating_add(64 * 1024),
+            "post-purge artifacts must reach a bounded steady state: {post_purge_artifact_bytes:?}"
+        );
+        let sustained_metrics_after = harness.authority.durability_metric_snapshots();
+        let sustained_checkpoint_bytes = sustained_metrics_after
+            .checkpoint
+            .bytes_total
+            .checked_sub(sustained_metrics_before.checkpoint.bytes_total)
+            .expect("sustained checkpoint bytes must advance monotonically");
+        let sustained_wal_bytes = sustained_metrics_after
+            .wal
+            .expect("WAL-backed release authority should expose metrics")
+            .frame_bytes_total
+            .checked_sub(
+                sustained_metrics_before
+                    .wal
+                    .expect("baseline WAL metrics should exist")
+                    .frame_bytes_total,
+            )
+            .expect("sustained WAL bytes must advance monotonically");
+        let sustained_duration_ms = SUSTAINED_PEERING_INTERVALS
+            .saturating_mul(SUSTAINED_PEERING_ROUNDS)
+            .saturating_mul(SUSTAINED_PEERING_ROUND_MS);
+        let sustained_durable_bytes_per_second = sustained_checkpoint_bytes
+            .checked_add(sustained_wal_bytes)
+            .and_then(|bytes| bytes.checked_mul(1_000))
+            .expect("sustained durable byte accounting should not overflow")
+            .div_ceil(sustained_duration_ms);
+        assert!(
+            sustained_durable_bytes_per_second < MAX_AMORTIZED_DURABLE_BYTES_PER_SECOND,
+            "sustained Peering durability rate {sustained_durable_bytes_per_second} B/s exceeds the release limit {MAX_AMORTIZED_DURABLE_BYTES_PER_SECOND} B/s"
+        );
+        let sustained_offsets_after = harness
+            .authority
+            .durable_wal_monitor_snapshot()
+            .expect("post-sustained Peering WAL monitor snapshot should read")
+            .offsets();
+        assert_eq!(
+            sustained_offsets_after.base_offset(),
+            sustained_offsets_after.clean_len(),
+            "the amortized checkpoint should compact sustained Peering WAL state"
+        );
+        assert!(
+            sustained_offsets_after.base_offset() > sustained_offsets_before.base_offset(),
+            "sustained Peering checkpoint must advance the WAL base"
+        );
+
         let metadata_proof = PgMetadataProof {
-            applied_log_index: 1,
-            applied_log_hash: 2,
-            state_digest: 3,
+            applied_log_index: SUSTAINED_PEERING_INTERVALS
+                .saturating_mul(SUSTAINED_PEERING_ROUNDS)
+                .saturating_add(2),
+            applied_log_hash: 0xfeed,
+            state_digest: 0xbeef,
         };
         for node_id in [0_u32, 2, 1] {
             let snapshot = harness
@@ -8726,7 +9038,32 @@ mod tests {
         }
         assert!(stable, "active heartbeat state should converge");
 
-        harness.control_plane.checkpoint_serving_reads = true;
+        let read_checkpoint_before = harness.authority.durability_metric_snapshots().checkpoint;
+        let read_artifact_before =
+            fs::read(&state_path).expect("pre-serving-read restart artifact should read");
+        let pre_measurement_status = harness
+            .control_plane
+            .runtime_map_status(now_ms)
+            .expect("active compact status should read without checkpointing");
+        assert_eq!(
+            pre_measurement_status.active_serving_pg_routes(),
+            PG_COUNT as usize
+        );
+        let read_checkpoint_after = harness.authority.durability_metric_snapshots().checkpoint;
+        assert_eq!(
+            read_checkpoint_after.store_total, read_checkpoint_before.store_total,
+            "a serving read must not convert the Peering WAL suffix into an artifact rewrite"
+        );
+        assert_eq!(
+            read_checkpoint_after.file_sync_total, read_checkpoint_before.file_sync_total,
+            "a serving read must not synchronously sync a liveness checkpoint"
+        );
+        assert_eq!(
+            fs::read(&state_path).expect("post-serving-read restart artifact should read"),
+            read_artifact_before,
+            "a serving read must retain liveness changes solely in the synced WAL suffix"
+        );
+
         let warm_status = harness
             .control_plane
             .runtime_map_status(now_ms)
@@ -8737,6 +9074,10 @@ mod tests {
             .lease_renewal()
             .expect("active production-shaped status should carry a lease renewal")
             .content_digest();
+        harness
+            .control_plane
+            .store_durable_restart_artifact()
+            .expect("measurement baseline should compact setup WAL state");
 
         let durable_timestamp_before = harness
             .control_plane
@@ -8760,16 +9101,6 @@ mod tests {
         );
 
         let measured_heartbeats_before = heartbeat_requests;
-        let monitor_durability = ExperimentalRaftPeerDurabilityContext {
-            artifact_path: harness.control_plane.durable_artifact_path.clone(),
-            checkpoint_lock: harness
-                .control_plane
-                .durable_checkpoint_lock
-                .clone()
-                .expect("durable test authority should retain a checkpoint lock"),
-            publication: harness.control_plane.durable_publication.clone(),
-        };
-        let mut monitor_tracker = ExperimentalRaftPeerCheckpointTracker::default();
         let mut monitor_poll_total = 0_u64;
         let mut monitor_poll_us_total = 0_u64;
         let mut monitor_poll_us_max = 0_u64;
@@ -8889,6 +9220,29 @@ mod tests {
         let horizon_extension_at_ms = horizon_extension_at_ms
             .expect("bounded heartbeat runway should eventually require one durable extension");
         let horizon_probe_heartbeats = heartbeat_requests - horizon_probe_heartbeats_before;
+        let extension_checkpoint_observed_at = Instant::now();
+        assert!(
+            !checkpoint_experimental_raft_peer_wal_if_due(
+                &harness.control_plane.runtime,
+                &harness.authority,
+                &monitor_durability,
+                &mut monitor_tracker,
+                extension_checkpoint_observed_at,
+            )
+            .expect("horizon-extension WAL observation should succeed"),
+            "a new WAL suffix should start the bounded checkpoint delay"
+        );
+        assert!(
+            checkpoint_experimental_raft_peer_wal_if_due(
+                &harness.control_plane.runtime,
+                &harness.authority,
+                &monitor_durability,
+                &mut monitor_tracker,
+                extension_checkpoint_observed_at + CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY,
+            )
+            .expect("horizon-extension WAL checkpoint should succeed"),
+            "the WAL monitor must checkpoint a liveness suffix within its delay bound"
+        );
         let wal_offsets_after_extension = durable_wal_offsets(&harness);
         let durability_metrics_after_extension = harness.authority.durability_metric_snapshots();
         assert_eq!(
@@ -8977,13 +9331,17 @@ mod tests {
             .checked_sub(durable_timestamp_before)
             .expect("horizon extension must follow the previous durable timestamp");
         assert!(extension_interval_ms > 0);
+        let checkpoint_amortization_interval_ms = extension_interval_ms.max(
+            u64::try_from(CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY.as_millis())
+                .expect("checkpoint delay should fit u64 milliseconds"),
+        );
         let logical_durable_bytes = checkpoint_bytes
             .checked_add(wal_bytes_appended)
             .expect("logical durable byte accounting should not overflow");
         let amortized_durable_bytes_per_second = logical_durable_bytes
             .checked_mul(1000)
             .expect("amortized byte accounting should not overflow")
-            .div_ceil(extension_interval_ms);
+            .div_ceil(checkpoint_amortization_interval_ms);
         assert!(
             amortized_durable_bytes_per_second < MAX_AMORTIZED_DURABLE_BYTES_PER_SECOND,
             "measured horizon-extension durability rate {amortized_durable_bytes_per_second} B/s exceeds the release limit {MAX_AMORTIZED_DURABLE_BYTES_PER_SECOND} B/s"
@@ -9140,7 +9498,7 @@ mod tests {
         let final_checkpoint_metrics = concurrent_metrics_after.checkpoint;
 
         eprintln!(
-            "control_plane_write_amplification_release pgs={PG_COUNT} retained_epochs={RETAINED_HISTORY_EPOCHS} storage_nodes={STORAGE_NODE_COUNT} steady_heartbeats={steady_heartbeat_requests} compact_status_reads={STEADY_HEARTBEAT_ROUNDS} wal_monitor_polls={monitor_poll_total} wal_monitor_poll_us_total={monitor_poll_us_total} wal_monitor_poll_us_max={monitor_poll_us_max} steady_checkpoint_stores=0 steady_checkpoint_syncs=0 steady_wal_appends=0 steady_wal_syncs=0 horizon_probe_heartbeats={horizon_probe_heartbeats} checkpoint_stores={checkpoint_store_delta} checkpoint_store_us_total={checkpoint_store_us_total_delta} checkpoint_store_us_lifetime_max={} checkpoint_file_syncs={checkpoint_file_sync_delta} checkpoint_file_sync_us_total={checkpoint_file_sync_us_total_delta} checkpoint_file_sync_us_lifetime_max={} checkpoint_directory_syncs={checkpoint_directory_sync_delta} checkpoint_directory_sync_us_total={checkpoint_directory_sync_us_total_delta} checkpoint_directory_sync_us_lifetime_max={} checkpoint_bytes={checkpoint_bytes} horizon_wal_appends={wal_append_delta} horizon_wal_append_us_total={wal_append_us_total_delta} horizon_wal_append_us_lifetime_max={} horizon_wal_file_syncs={wal_file_sync_delta} horizon_wal_file_sync_us_total={wal_file_sync_us_total_delta} horizon_wal_file_sync_us_lifetime_max={} horizon_wal_directory_syncs={wal_directory_sync_delta} horizon_wal_directory_sync_us_total={wal_directory_sync_us_total_delta} horizon_wal_directory_sync_us_lifetime_max={} horizon_wal_bytes_appended={wal_bytes_appended} horizon_wal_offset_advance={wal_offset_advance} horizon_extension_interval_ms={extension_interval_ms} amortized_durable_bytes_per_second={amortized_durable_bytes_per_second} concurrent_checkpoints={CONCURRENT_CHECKPOINT_COUNT} concurrent_checkpoint_call_us_total={concurrent_checkpoint_call_us_total} concurrent_checkpoint_batch_us={concurrent_checkpoint_batch_us} concurrent_checkpoint_us_max={concurrent_checkpoint_us_max} concurrent_heartbeats={} concurrent_heartbeat_us_max={concurrent_heartbeat_us_max} concurrent_status_reads={CONCURRENT_HEARTBEAT_ROUNDS} concurrent_status_us_max={concurrent_status_us_max}",
+            "control_plane_write_amplification_release pgs={PG_COUNT} retained_epochs={RETAINED_HISTORY_EPOCHS} retained_artifact_bytes={large_artifact_bytes} storage_nodes={STORAGE_NODE_COUNT} sustained_peering_intervals={SUSTAINED_PEERING_INTERVALS} sustained_peering_rounds_per_interval={SUSTAINED_PEERING_ROUNDS} post_purge_artifact_bytes={post_purge_artifact_bytes:?} sustained_peering_checkpoint_bytes={sustained_checkpoint_bytes} sustained_peering_wal_bytes={sustained_wal_bytes} sustained_peering_durable_bytes_per_second={sustained_durable_bytes_per_second} steady_heartbeats={steady_heartbeat_requests} compact_status_reads={STEADY_HEARTBEAT_ROUNDS} wal_monitor_polls={monitor_poll_total} wal_monitor_poll_us_total={monitor_poll_us_total} wal_monitor_poll_us_max={monitor_poll_us_max} steady_checkpoint_stores=0 steady_checkpoint_syncs=0 steady_wal_appends=0 steady_wal_syncs=0 horizon_probe_heartbeats={horizon_probe_heartbeats} checkpoint_stores={checkpoint_store_delta} checkpoint_store_us_total={checkpoint_store_us_total_delta} checkpoint_store_us_lifetime_max={} checkpoint_file_syncs={checkpoint_file_sync_delta} checkpoint_file_sync_us_total={checkpoint_file_sync_us_total_delta} checkpoint_file_sync_us_lifetime_max={} checkpoint_directory_syncs={checkpoint_directory_sync_delta} checkpoint_directory_sync_us_total={checkpoint_directory_sync_us_total_delta} checkpoint_directory_sync_us_lifetime_max={} checkpoint_bytes={checkpoint_bytes} horizon_wal_appends={wal_append_delta} horizon_wal_append_us_total={wal_append_us_total_delta} horizon_wal_append_us_lifetime_max={} horizon_wal_file_syncs={wal_file_sync_delta} horizon_wal_file_sync_us_total={wal_file_sync_us_total_delta} horizon_wal_file_sync_us_lifetime_max={} horizon_wal_directory_syncs={wal_directory_sync_delta} horizon_wal_directory_sync_us_total={wal_directory_sync_us_total_delta} horizon_wal_directory_sync_us_lifetime_max={} horizon_wal_bytes_appended={wal_bytes_appended} horizon_wal_offset_advance={wal_offset_advance} horizon_extension_interval_ms={extension_interval_ms} checkpoint_amortization_interval_ms={checkpoint_amortization_interval_ms} amortized_durable_bytes_per_second={amortized_durable_bytes_per_second} concurrent_checkpoints={CONCURRENT_CHECKPOINT_COUNT} concurrent_checkpoint_call_us_total={concurrent_checkpoint_call_us_total} concurrent_checkpoint_batch_us={concurrent_checkpoint_batch_us} concurrent_checkpoint_us_max={concurrent_checkpoint_us_max} concurrent_heartbeats={} concurrent_heartbeat_us_max={concurrent_heartbeat_us_max} concurrent_status_reads={CONCURRENT_HEARTBEAT_ROUNDS} concurrent_status_us_max={concurrent_status_us_max}",
             final_checkpoint_metrics.store_us_max,
             final_checkpoint_metrics.file_sync_us_max,
             final_checkpoint_metrics.directory_sync_us_max,
@@ -11322,6 +11680,189 @@ mod tests {
 
         restarted.shutdown();
         fs::remove_dir_all(&state_dir).unwrap();
+    }
+
+    #[test]
+    fn experimental_raft_wal_recovers_heartbeat_acknowledged_before_checkpoint() {
+        let state_dir = short_unix_socket_test_dir("experimental-raft-wal-heartbeat-restart");
+        let state_path = state_dir.0.path().join("control-plane.state");
+        let endpoint = state_dir.0.path().join("node-1.sock");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: endpoint.display().to_string(),
+        }];
+        config.storage_pg_ids = vec![7];
+
+        let mut harness =
+            experimental_raft_durable_wal_test_harness("wal-heartbeat-restart", &state_path);
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("WAL-backed control-plane bootstrap should succeed");
+        let checkpoint_before =
+            fs::read(&state_path).expect("baseline restart artifact should read");
+        let wal_offsets_before = harness
+            .authority
+            .durable_wal_monitor_snapshot()
+            .expect("baseline WAL offsets should read")
+            .offsets();
+        let observed_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("baseline snapshot should read")
+            .cluster_epoch();
+
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: endpoint.display().to_string(),
+                    observed_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                20_000,
+            )
+            .expect("WAL-backed heartbeat should be acknowledged");
+        harness.control_plane.checkpoint_serving_reads = true;
+        harness
+            .control_plane
+            .runtime_map_status(20_000)
+            .expect("WAL-backed serving read should use the synced WAL boundary");
+        let expected = harness
+            .control_plane
+            .current_snapshot()
+            .expect("acknowledged heartbeat snapshot should read");
+        assert_eq!(
+            fs::read(&state_path).expect("restart artifact should remain readable"),
+            checkpoint_before,
+            "WAL-backed heartbeat acknowledgement must not synchronously rewrite the artifact"
+        );
+        let wal_offsets_after = harness
+            .authority
+            .durable_wal_monitor_snapshot()
+            .expect("post-heartbeat WAL offsets should read")
+            .offsets();
+        assert_eq!(
+            wal_offsets_after.base_offset(),
+            wal_offsets_before.base_offset()
+        );
+        assert!(
+            wal_offsets_after.clean_len() > wal_offsets_before.clean_len(),
+            "acknowledged heartbeat must advance the durable WAL suffix"
+        );
+        harness.shutdown();
+
+        let restarted =
+            experimental_raft_durable_wal_test_harness("wal-heartbeat-restart", &state_path);
+        let restored = restarted
+            .control_plane
+            .current_snapshot()
+            .expect("artifact plus WAL heartbeat state should restore");
+        assert_eq!(
+            restored.node(NodeId::new(1)).map(|node| (
+                node.node_incarnation(),
+                node.last_observed_epoch(),
+                node.lease_deadline_ms(),
+            )),
+            expected.node(NodeId::new(1)).map(|node| (
+                node.node_incarnation(),
+                node.last_observed_epoch(),
+                node.lease_deadline_ms(),
+            )),
+            "restart must replay the acknowledged heartbeat from the WAL suffix"
+        );
+        restarted.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_wal_recovers_purge_after_snapshot_checkpoint() {
+        let state_dir = short_unix_socket_test_dir("experimental-raft-wal-snapshot-purge-restart");
+        let state_path = state_dir.0.path().join("control-plane.state");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: state_dir.0.path().join("node-1.sock").display().to_string(),
+        }];
+        config.storage_pg_ids = vec![7];
+
+        let mut harness =
+            experimental_raft_durable_wal_test_harness("wal-snapshot-purge-restart", &state_path);
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("WAL-backed control-plane bootstrap should succeed");
+        let snapshot_log_id = harness
+            .control_plane
+            .block_on(harness.authority.trigger_snapshot_applied())
+            .expect("coordinated snapshot should build")
+            .expect("bootstrapped state should have an applied log id");
+        harness
+            .control_plane
+            .store_durable_restart_artifact()
+            .expect("snapshot payload must be durable before purge");
+        let artifact_before_purge =
+            fs::read(&state_path).expect("pre-purge snapshot artifact should read");
+        harness
+            .control_plane
+            .block_on(
+                harness
+                    .authority
+                    .purge_log_through_snapshot(snapshot_log_id),
+            )
+            .expect("snapshot-covered log prefix should purge");
+        assert_eq!(
+            fs::read(&state_path).expect("artifact should remain readable after purge"),
+            artifact_before_purge,
+            "purge must be recoverable before its post-purge artifact checkpoint"
+        );
+        let purge_wal = harness
+            .authority
+            .durable_wal_monitor_snapshot()
+            .expect("post-purge WAL state should read")
+            .offsets();
+        assert!(
+            purge_wal.clean_len() > purge_wal.base_offset(),
+            "purge should remain as a replayable WAL suffix before post-purge checkpoint"
+        );
+        let expected = harness
+            .control_plane
+            .block_on(
+                harness
+                    .authority
+                    .raft()
+                    .with_state_machine(|state_machine| {
+                        let snapshot = state_machine.inner().snapshot().clone();
+                        Box::pin(async move { snapshot })
+                    }),
+            )
+            .expect("pre-crash state-machine snapshot should read");
+        harness.shutdown();
+
+        let restarted =
+            experimental_raft_durable_wal_test_harness("wal-snapshot-purge-restart", &state_path);
+        let restored = restarted
+            .control_plane
+            .block_on(
+                restarted
+                    .authority
+                    .raft()
+                    .with_state_machine(|state_machine| {
+                        let snapshot = state_machine.inner().snapshot().clone();
+                        Box::pin(async move { snapshot })
+                    }),
+            )
+            .expect("artifact plus purge WAL restart should restore state");
+        assert_eq!(restored, expected);
+        assert_eq!(
+            restarted
+                .control_plane
+                .block_on(restarted.authority.status())
+                .expect("restarted purge status should read")
+                .last_purged_log_id(),
+            Some(snapshot_log_id)
+        );
+        restarted.shutdown();
     }
 
     #[test]
