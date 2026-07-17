@@ -239,14 +239,23 @@ For each matrix:
   retained and completion of the old ETag returns `InvalidPart`.
   Deterministic coordinator regressions pin completion races after
   authorization, after snapshot lookup, and before commit. Completion restarts
-  terminal-transition races once and uses a separate bounded stale-snapshot
-  retry budget so one streaming replacement can settle without leaking an
-  `InternalError`. Exhausting that budget under sustained valid same-ETag part
-  replacement returns retryable `OperationAborted`; a deterministic regression
-  proves that it publishes no object and leaves the upload and selected part
-  intact. Multipart management lookup drains a concurrent durable terminal
-  command before classification, preserving AWS's idempotent abort result when
-  completion wins the race.
+  terminal-transition races once and uses a separate elapsed-time
+  stale-snapshot retry budget so fast replacement/contention cannot exhaust a
+  fixed attempt count before it has had time to settle. Exhausting that budget
+  under valid same-ETag part replacement returns retryable
+  `OperationAborted`; a deterministic regression proves that it publishes no
+  object and leaves the upload and selected part intact. Object-version and
+  generation reservation, direct PUT publication, object reads, reservation
+  release, and stream-segment append likewise use elapsed-time contention
+  budgets rather than scheduling-sensitive attempt counts. A stream append
+  relinquishes eager payload-cleanup ownership before metadata-command
+  installation, because an idempotent reissue may publish the same logical
+  segment and shard keys even when its pending slot has already been cleared;
+  deterministic visible-pending and cleared-slot collision coverage proves
+  timeout after publication preserves both metadata and every shard. Multipart
+  management lookup drains a concurrent durable terminal command before
+  classification, preserving AWS's idempotent abort result when completion
+  wins the race.
 - [x] Cover versioned buckets, delete markers, conditional completion, and object
   replacement without relying on timing-sensitive exact boundaries. Concurrent
   completions of distinct uploads in a versioned bucket both publish retained,

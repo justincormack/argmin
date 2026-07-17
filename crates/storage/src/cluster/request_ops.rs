@@ -51,7 +51,8 @@ const BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT: &str =
 const BUCKET_DELETE_RESERVATION_WAIT_BLOCKED_CONTEXT: &str =
     "bucket delete reservation wait blocked by durable bucket write reservation";
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
-const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
+const OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(10);
 const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_WRITE_RESERVATION_LEASE_MILLIS: u64 = 15_000;
 // HTTP streaming PutObject heartbeats active sessions every 10s. Keep the
@@ -7866,7 +7867,14 @@ impl super::StorageCluster {
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client();
 
-        for _ in 0..OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT {
+        let mut work_budget =
+            super::RequestWorkBudget::new(OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET, None)
+                .for_operation("load_object_read_snapshot")
+                .for_pg(pg_id);
+        loop {
+            work_budget
+                .check("load object read snapshot stale retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             let subject =
                 object_read_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
             let value = match action(&subject.stored) {
@@ -7882,17 +7890,17 @@ impl super::StorageCluster {
                 snapshot_mode,
             ) {
                 Ok(snapshot) => return Ok(Ok(ObjectReadSnapshotOutcome { value, snapshot })),
-                Err(ObjectPgActionError::StaleObjectReadSubject) => continue,
+                Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    work_budget
+                        .sleep_after_contention(
+                            "load object read snapshot stale retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
-
-        Err(ObjectPgActionError::Store(StoreError::Io {
-            context: "load object read snapshot stale retry limit exceeded",
-            source: std::io::Error::other(
-                "object changed repeatedly while loading authorized read snapshot",
-            ),
-        }))
     }
 
     pub fn load_leased_object_read_snapshot_if<T, E>(
@@ -7909,7 +7917,14 @@ impl super::StorageCluster {
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client();
 
-        for _ in 0..OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT {
+        let mut work_budget =
+            super::RequestWorkBudget::new(OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET, None)
+                .for_operation("load_leased_object_read_snapshot")
+                .for_pg(pg_id);
+        loop {
+            work_budget
+                .check("load leased object read snapshot stale retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             let subject =
                 object_read_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
             let value = match action(&subject.stored) {
@@ -7919,7 +7934,14 @@ impl super::StorageCluster {
             let payload_lease = if let Some(live) = subject.stored.as_live() {
                 match self.acquire_object_payload_lease(bucket, key, live.generation_id) {
                     Ok(lease) => Some(lease),
-                    Err(StoreError::NotFound) => continue,
+                    Err(StoreError::NotFound) => {
+                        work_budget
+                            .sleep_after_contention(
+                                "load leased object read snapshot stale retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
+                        continue;
+                    }
                     Err(error) => return Err(ObjectPgActionError::Store(error)),
                 }
             } else {
@@ -7940,17 +7962,17 @@ impl super::StorageCluster {
                         payload_lease,
                     }));
                 }
-                Err(ObjectPgActionError::StaleObjectReadSubject) => continue,
+                Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    work_budget
+                        .sleep_after_contention(
+                            "load leased object read snapshot stale retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
-
-        Err(ObjectPgActionError::Store(StoreError::Io {
-            context: "load leased object read snapshot stale retry limit exceeded",
-            source: std::io::Error::other(
-                "object changed repeatedly while loading leased authorized read snapshot",
-            ),
-        }))
     }
 
     pub fn payload_reclaim_exists(
@@ -7979,7 +8001,14 @@ impl super::StorageCluster {
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client();
 
-        for _ in 0..OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT {
+        let mut work_budget =
+            super::RequestWorkBudget::new(OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET, None)
+                .for_operation("get_object_tags")
+                .for_pg(pg_id);
+        loop {
+            work_budget
+                .check("get object tags stale retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             let subject =
                 object_read_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
             let authorized_version_id = match action(&subject.stored) {
@@ -7995,17 +8024,15 @@ impl super::StorageCluster {
                 authorized_version_id,
             ) {
                 Ok(tags) => return Ok(Ok(tags)),
-                Err(ObjectPgActionError::StaleObjectReadSubject) => continue,
+                Err(ObjectPgActionError::StaleObjectReadSubject) => {
+                    work_budget
+                        .sleep_after_contention("get object tags stale retry budget exhausted")
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
-
-        Err(ObjectPgActionError::Store(StoreError::Io {
-            context: "get object tags stale retry limit exceeded",
-            source: std::io::Error::other(
-                "object changed repeatedly while loading authorized tags",
-            ),
-        }))
     }
 
     fn put_object_metadata_command_from_stored(

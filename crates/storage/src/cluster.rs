@@ -94,14 +94,13 @@ use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 mod local;
 mod request_ops;
 
-const DIRECT_PUT_STALE_COMMIT_RETRIES: usize = 16;
 const DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(1);
 const DIRECT_PUT_METADATA_RETRY_BUDGET: Duration = Duration::from_secs(10);
-const OBJECT_PG_EMPTY_LOG_CONFLICT_RETRIES: usize = 16;
 const OBJECT_GENERATION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const OBJECT_VERSION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(10);
 pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET: Duration = Duration::from_secs(10);
+const STREAM_SEGMENT_APPEND_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
 const METADATA_CONTENTION_BACKOFF_MAX: Duration = Duration::from_millis(25);
 const PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 256;
@@ -604,6 +603,9 @@ type ObjectVersionCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(any(test, feature = "test-hooks"))]
 type StreamAppendCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 
+#[cfg(test)]
+type StreamAppendCommandIdAllocatedHook = Arc<dyn Fn(MetadataCommandId) + Send + Sync>;
+
 #[cfg(any(test, feature = "test-hooks"))]
 type ObjectMetadataReservationAcquiredHook =
     Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
@@ -631,6 +633,8 @@ struct StorageClusterTestHooks {
     before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
     before_object_version_command_id: Option<ObjectVersionCommandIdHook>,
     before_stream_append_command_id: Option<StreamAppendCommandIdHook>,
+    #[cfg(test)]
+    after_stream_append_command_id_allocated: Option<StreamAppendCommandIdAllocatedHook>,
     after_object_metadata_reservation_acquired: Option<ObjectMetadataReservationAcquiredHook>,
     after_object_listing_pg_complete: Option<ObjectListingPgCompleteHook>,
     before_placed_payload_shard_read: Option<PayloadShardReadTestHook>,
@@ -666,6 +670,11 @@ pub struct ObjectVersionCommandIdHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct StreamAppendCommandIdHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(test)]
+pub struct StreamAppendCommandIdAllocatedHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -742,6 +751,16 @@ impl Drop for ObjectVersionCommandIdHookGuard {
 impl Drop for StreamAppendCommandIdHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_stream_append_command_id = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for StreamAppendCommandIdAllocatedHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .after_stream_append_command_id_allocated = None;
     }
 }
 
@@ -2091,6 +2110,21 @@ enum BucketWriteReservationDisposition {
 enum StreamAppendCommandApplyOutcome {
     Applied,
     RetryFromFreshSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamAppendPayloadCleanup {
+    EagerAllowed,
+    DeferredToSessionRecovery,
+}
+
+struct StreamAppendCommitRequest<'a> {
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+    session_id: &'a SessionId,
+    segment_index: u32,
+    segment_record: &'a StreamUploadSegmentRecord,
+    shard_batch: &'a [(&'a ShardKey, WriteAck)],
 }
 
 pub enum BucketWriteSnapshotAction<T, E> {
@@ -4329,6 +4363,29 @@ impl StorageCluster {
     #[cfg(not(any(test, feature = "test-hooks")))]
     fn maybe_run_before_stream_append_command_id_hook(&self) {}
 
+    #[cfg(test)]
+    fn maybe_run_after_stream_append_command_id_allocated_hook(
+        &self,
+        command_id: MetadataCommandId,
+    ) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .after_stream_append_command_id_allocated
+            .clone();
+        if let Some(hook) = hook {
+            hook(command_id);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_run_after_stream_append_command_id_allocated_hook(
+        &self,
+        _command_id: MetadataCommandId,
+    ) {
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_after_object_metadata_reservation_acquired_hook(
         &self,
@@ -4823,22 +4880,9 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         pending_visible: bool,
-        empty_log_conflicts: &mut usize,
-        context: &'static str,
     ) -> Result<(), ObjectPgActionError> {
-        let drained = if pending_visible {
-            self.drain_one_pending_object_metadata_command(pg_id, bucket)?
-        } else {
-            false
-        };
-        if drained {
-            *empty_log_conflicts = 0;
-            return Ok(());
-        }
-
-        *empty_log_conflicts += 1;
-        if *empty_log_conflicts >= OBJECT_PG_EMPTY_LOG_CONFLICT_RETRIES {
-            return Err(conflicting_pending_object_metadata_command(context));
+        if pending_visible {
+            self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
         }
         Ok(())
     }
@@ -5794,6 +5838,20 @@ impl StorageCluster {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_install_after_stream_append_command_id_allocated_hook(
+        &self,
+        hook: Arc<dyn Fn(MetadataCommandId) + Send + Sync>,
+    ) -> StreamAppendCommandIdAllocatedHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .after_stream_append_command_id_allocated = Some(hook);
+        StreamAppendCommandIdAllocatedHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_install_after_object_metadata_reservation_acquired_hook(
         &self,
@@ -6101,7 +6159,6 @@ impl StorageCluster {
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
-        let mut empty_log_conflicts = 0;
         let mut work_budget =
             RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
                 .for_operation("reserve_object_generation")
@@ -6203,13 +6260,7 @@ impl StorageCluster {
                     continue;
                 }
                 ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
-                    self.drain_after_object_pg_log_conflict(
-                        pg_id,
-                        bucket,
-                        pending_visible,
-                        &mut empty_log_conflicts,
-                        "object generation reservation log conflict without pending progress",
-                    )?;
+                    self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
                     work_budget
                         .sleep_after_contention(
                             "object generation reservation log conflict retry budget exhausted",
@@ -6378,7 +6429,6 @@ impl StorageCluster {
         key: &ObjectKey,
         completion_admission: bool,
     ) -> Result<VersionId, ObjectPgActionError> {
-        let mut empty_log_conflicts = 0;
         let mut work_budget = RequestWorkBudget::new(OBJECT_VERSION_RESERVATION_RETRY_BUDGET, None)
             .for_operation("reserve_object_version")
             .for_pg(pg_id);
@@ -6486,13 +6536,7 @@ impl StorageCluster {
                     continue;
                 }
                 ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
-                    self.drain_after_object_pg_log_conflict(
-                        pg_id,
-                        bucket,
-                        pending_visible,
-                        &mut empty_log_conflicts,
-                        "object version reservation log conflict without pending progress",
-                    )?;
+                    self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
                     work_budget
                         .sleep_after_contention(
                             "object version reservation log conflict retry budget exhausted",
@@ -7014,8 +7058,14 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        let mut empty_log_conflicts = 0;
+        let mut work_budget =
+            RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
+                .for_operation("release_object_generation")
+                .for_pg(pg_id);
         loop {
+            work_budget
+                .check("object generation release retry budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 match command.payload() {
                     MetadataCommandPayload::ReleaseObjectGeneration(reservation)
@@ -7026,15 +7076,30 @@ impl StorageCluster {
                         match self.finish_exact_pending_object_metadata_command(pg_id, exact)? {
                             PendingMetadataCommandOutcome::Applied => return Ok(()),
                             PendingMetadataCommandOutcome::RetryPartialExactConflict => {
-                                return Err(conflicting_pending_object_metadata_command(
-                                    "retryable partial pending generation release command",
-                                ));
+                                work_budget
+                                    .sleep_after_contention(
+                                        "object generation release partial pending retry budget exhausted",
+                                    )
+                                    .map_err(ObjectPgActionError::Store)?;
+                                continue;
                             }
-                            PendingMetadataCommandOutcome::Abandoned => continue,
+                            PendingMetadataCommandOutcome::Abandoned => {
+                                work_budget
+                                    .sleep_after_contention(
+                                        "object generation release abandoned pending retry budget exhausted",
+                                    )
+                                    .map_err(ObjectPgActionError::Store)?;
+                                continue;
+                            }
                         }
                     }
                     _ => {
                         self.drain_pending_object_metadata_command(pg_id, &command)?;
+                        work_budget
+                            .sleep_after_contention(
+                                "object generation release pending drain retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
                         continue;
                     }
                 }
@@ -7060,16 +7125,20 @@ impl StorageCluster {
                 ObjectPgPendingCommandInstall::Installed(command) => command,
                 ObjectPgPendingCommandInstall::Pending(command) => {
                     self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    work_budget
+                        .sleep_after_contention(
+                            "object generation release pending install retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
                 ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
-                    self.drain_after_object_pg_log_conflict(
-                        pg_id,
-                        bucket,
-                        pending_visible,
-                        &mut empty_log_conflicts,
-                        "object generation release log conflict without pending progress",
-                    )?;
+                    self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
+                    work_budget
+                        .sleep_after_contention(
+                            "object generation release log conflict retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
             };
@@ -7200,14 +7269,6 @@ impl StorageCluster {
             }
         }
         Ok(applied)
-    }
-
-    fn drain_pending_object_metadata_commands_for_exact_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<(), ObjectPgActionError> {
-        self.drain_pending_object_metadata_commands_for_exact_bucket_inner(pg_id, bucket, None)
     }
 
     fn drain_pending_object_metadata_commands_for_exact_bucket_with_work_budget(
@@ -7839,9 +7900,7 @@ impl StorageCluster {
                 }
             };
 
-        let mut stale_commit_snapshot_retries = 0;
         let stale_commit_snapshot_deadline = Instant::now() + DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET;
-        let mut empty_log_conflicts = 0;
         let (command, new_pending_command) = loop {
             check_direct_put_work_before_command_ownership!(
                 "direct PUT metadata retry budget exhausted"
@@ -7918,10 +7977,8 @@ impl StorageCluster {
                     ) {
                         Ok(command) => command,
                         Err(ObjectPgActionError::StaleDirectPutCommitSnapshot)
-                            if stale_commit_snapshot_retries < DIRECT_PUT_STALE_COMMIT_RETRIES
-                                && Instant::now() < stale_commit_snapshot_deadline =>
+                            if Instant::now() < stale_commit_snapshot_deadline =>
                         {
-                            stale_commit_snapshot_retries += 1;
                             sleep_direct_put_before_command_ownership_after_contention!(
                                 "direct PUT stale snapshot retry budget exhausted"
                             );
@@ -7949,8 +8006,6 @@ impl StorageCluster {
                                 pg_id,
                                 &req.bucket,
                                 pending_visible,
-                                &mut empty_log_conflicts,
-                                "direct put commit command log conflict without pending progress",
                             );
                             if let Err(error) = drain_result {
                                 cleanup_direct_put_attempt_before_command_ownership!();
@@ -8873,17 +8928,64 @@ impl StorageCluster {
         segment_record: &StreamUploadSegmentRecord,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
+        let request = StreamAppendCommitRequest {
+            bucket,
+            key,
+            session_id,
+            segment_index,
+            segment_record,
+            shard_batch,
+        };
+        self.commit_stream_segment_append_with_work_budget(
+            request,
+            RequestWorkBudget::new(STREAM_SEGMENT_APPEND_RETRY_BUDGET, None)
+                .for_operation("commit_stream_segment_append")
+                .for_pg(PgId::new(self.object_metadata_pg_id(bucket, key))),
+        )
+    }
+
+    #[cfg(test)]
+    fn test_commit_stream_segment_append_with_max_attempts(
+        &self,
+        request: StreamAppendCommitRequest<'_>,
+        max_attempts: usize,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = PgId::new(self.object_metadata_pg_id(request.bucket, request.key));
+        self.commit_stream_segment_append_with_work_budget(
+            request,
+            RequestWorkBudget::new(STREAM_SEGMENT_APPEND_RETRY_BUDGET, Some(max_attempts))
+                .for_operation("commit_stream_segment_append")
+                .for_pg(pg_id),
+        )
+    }
+
+    fn commit_stream_segment_append_with_work_budget(
+        &self,
+        request: StreamAppendCommitRequest<'_>,
+        mut work_budget: RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        let StreamAppendCommitRequest {
+            bucket,
+            key,
+            session_id,
+            segment_index,
+            segment_record,
+            shard_batch,
+        } = request;
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let ec = EcShape {
             k: segment_record.ec_k,
             m: segment_record.ec_m,
         };
+        let mut payload_cleanup = StreamAppendPayloadCleanup::EagerAllowed;
         macro_rules! cleanup_stream_append_payload {
             () => {
-                self.delete_stream_segment_payload_shard_keys_best_effort(
-                    segment_record,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                )
+                if payload_cleanup == StreamAppendPayloadCleanup::EagerAllowed {
+                    self.delete_stream_segment_payload_shard_keys_best_effort(
+                        segment_record,
+                        shard_batch.iter().map(|(key, _)| (*key).clone()),
+                    )
+                }
             };
         }
         let mutation_client = match self.object_mutation_metadata_primary_client(bucket, key) {
@@ -8893,13 +8995,39 @@ impl StorageCluster {
                 return Err(error.into());
             }
         };
-        let mut empty_log_conflicts = 0;
         loop {
-            if let Err(error) =
-                self.drain_pending_object_metadata_commands_for_exact_bucket(pg_id, bucket)
-            {
+            if let Err(error) = work_budget.check("stream append metadata retry budget exhausted") {
                 cleanup_stream_append_payload!();
-                return Err(error);
+                return Err(ObjectPgActionError::Store(error));
+            }
+            loop {
+                let pending = match self.pending_metadata_command_for_bucket(pg_id, bucket) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        cleanup_stream_append_payload!();
+                        return Err(ObjectPgActionError::Store(error));
+                    }
+                };
+                let Some(command) = pending else {
+                    break;
+                };
+                if command.bucket_name() != bucket {
+                    break;
+                }
+                // Once another command is visible, it may be an idempotent
+                // reissue of this logical segment and may publish these exact
+                // shard keys. Session recovery must own any later cleanup.
+                payload_cleanup = StreamAppendPayloadCleanup::DeferredToSessionRecovery;
+                let outcome =
+                    self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
+                if matches!(
+                    outcome,
+                    PendingMetadataCommandOutcome::RetryPartialExactConflict
+                ) {
+                    return Err(conflicting_pending_object_metadata_command(
+                        "retryable partial pending stream append drain",
+                    ));
+                }
             }
             let existing_stream_segment =
                 match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
@@ -8940,12 +9068,18 @@ impl StorageCluster {
                 return Err(error);
             }
 
+            // From this point another caller can consume the selected log
+            // index, publish this exact logical segment, and clear its pending
+            // slot before our install result is visible. No install outcome
+            // can prove that these shard keys remain exclusively ours.
+            payload_cleanup = StreamAppendPayloadCleanup::DeferredToSessionRecovery;
             self.maybe_run_before_metadata_command_pending_install_hook();
             let command = match self.try_install_object_pg_pending_command_with_fresh_id(
                 pg_id,
                 bucket,
                 false,
                 |command_id| {
+                    self.maybe_run_after_stream_append_command_id_allocated_hook(command_id);
                     MetadataCommandEnvelope::new(
                         command_id,
                         MetadataCommandPayload::AppendStreamSegment(Box::new(
@@ -8960,23 +9094,21 @@ impl StorageCluster {
             ) {
                 Ok(ObjectPgPendingCommandInstall::Installed(command)) => command,
                 Ok(ObjectPgPendingCommandInstall::Pending(command)) => {
-                    if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command)
+                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    if let Err(error) = work_budget
+                        .sleep_after_contention("stream append pending retry budget exhausted")
                     {
-                        cleanup_stream_append_payload!();
-                        return Err(error);
+                        return Err(ObjectPgActionError::Store(error));
                     }
                     continue;
                 }
                 Ok(ObjectPgPendingCommandInstall::LogConflict { pending_visible }) => {
-                    if let Err(error) = self.drain_after_object_pg_log_conflict(
-                        pg_id,
-                        bucket,
-                        pending_visible,
-                        &mut empty_log_conflicts,
-                        "stream append command log conflict without pending progress",
-                    ) {
+                    self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
+                    if let Err(error) = work_budget
+                        .sleep_after_contention("stream append log conflict retry budget exhausted")
+                    {
                         cleanup_stream_append_payload!();
-                        return Err(error);
+                        return Err(ObjectPgActionError::Store(error));
                     }
                     continue;
                 }
@@ -8993,7 +9125,15 @@ impl StorageCluster {
                 shard_batch,
             )? {
                 StreamAppendCommandApplyOutcome::Applied => return Ok(()),
-                StreamAppendCommandApplyOutcome::RetryFromFreshSnapshot => continue,
+                StreamAppendCommandApplyOutcome::RetryFromFreshSnapshot => {
+                    payload_cleanup = StreamAppendPayloadCleanup::DeferredToSessionRecovery;
+                    if let Err(error) = work_budget.sleep_after_contention(
+                        "stream append fresh snapshot retry budget exhausted",
+                    ) {
+                        return Err(ObjectPgActionError::Store(error));
+                    }
+                    continue;
+                }
             }
         }
     }

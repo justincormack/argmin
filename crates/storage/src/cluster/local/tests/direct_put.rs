@@ -2191,6 +2191,8 @@ fn direct_put_log_conflict_pending_visibility_error_cleans_new_payload() {
 
 #[test]
 fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
+    const STALE_SNAPSHOTS: usize = 17;
+
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
@@ -2241,6 +2243,7 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
 
     let hook_calls = Arc::new(AtomicUsize::new(0));
     let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_saw_existing = Arc::new(AtomicBool::new(false));
     let hook_map = Arc::clone(&first_map);
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
@@ -2248,7 +2251,7 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
     let _hook_guard =
         first_cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
             let call = hook_calls_for_closure.fetch_add(1, Ordering::SeqCst);
-            if call >= 2 {
+            if call >= STALE_SNAPSHOTS {
                 return;
             }
             let pg_id = PgId::new(2);
@@ -2284,6 +2287,8 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
         }));
 
     let calls_for_action = Arc::clone(&action_calls);
+    let saw_existing_for_action = Arc::clone(&action_saw_existing);
+    let hook_calls_for_action = Arc::clone(&hook_calls);
     let result = first_cluster
         .commit_direct_put_object_from_payload_shards(
             &loser_req,
@@ -2291,23 +2296,20 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
             move |snapshot| {
                 calls_for_action.fetch_add(1, Ordering::SeqCst);
                 if snapshot.existing_etag.is_some() {
-                    Err("object already exists")
+                    saw_existing_for_action.store(true, Ordering::SeqCst);
+                }
+                if hook_calls_for_action.load(Ordering::SeqCst) >= STALE_SNAPSHOTS {
+                    Err("object changed repeatedly")
                 } else {
                     Ok(())
                 }
             },
         )
         .unwrap();
-    assert!(matches!(result, Err("object already exists")));
-    assert!(
-        hook_calls.load(Ordering::SeqCst) >= 1,
-        "test hook must publish competing same-key work before command build"
-    );
-    assert_eq!(super::super::super::DIRECT_PUT_STALE_COMMIT_RETRIES, 16);
-    assert!(
-        action_calls.load(Ordering::SeqCst) >= 2,
-        "direct PUT precondition must be rerun after storage-side snapshot staleness"
-    );
+    assert!(matches!(result, Err("object changed repeatedly")));
+    assert_eq!(hook_calls.load(Ordering::SeqCst), STALE_SNAPSHOTS);
+    assert_eq!(action_calls.load(Ordering::SeqCst), STALE_SNAPSHOTS + 1);
+    assert!(action_saw_existing.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
 
     assert_bucket_write_reservations_released(&first_map, &bucket);

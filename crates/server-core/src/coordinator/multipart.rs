@@ -1,4 +1,5 @@
 use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig};
+use std::time::{Duration, Instant};
 use storage::{
     BucketName, CreateMultipartUploadOutcome, CreateMultipartUploadReq, FinalizeStreamPartOutcome,
     GenerationId, MultipartPartRecord, MultipartPartSegmentRecord, ObjectKey,
@@ -67,7 +68,7 @@ use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc
 use crate::system_metadata::SystemMetadata;
 
 const COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES: usize = 1;
-pub(super) const COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRIES: usize = 8;
+pub(super) const COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET: Duration = Duration::from_secs(2);
 
 fn complete_multipart_part_checksum(
     part: &MultipartPartRecord,
@@ -543,7 +544,7 @@ impl Coordinator {
             req.parts.len()
         );
         let mut terminal_race_retries = 0usize;
-        let mut stale_snapshot_retries = 0usize;
+        let mut stale_snapshot_retry_deadline = None;
         'retry_stale_commit_snapshot: loop {
             let authorized =
                 self.authorize_complete_multipart_upload_with_storage_node(&storage_node, req)?;
@@ -915,13 +916,13 @@ impl Coordinator {
                 },
             ) {
                 Ok(outcome) => outcome,
-                Err(storage::ObjectPgActionError::StaleMultipartCompletionSnapshot)
-                    if stale_snapshot_retries < COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRIES =>
-                {
-                    stale_snapshot_retries += 1;
-                    continue 'retry_stale_commit_snapshot;
-                }
                 Err(storage::ObjectPgActionError::StaleMultipartCompletionSnapshot) => {
+                    let deadline = stale_snapshot_retry_deadline.get_or_insert_with(|| {
+                        Instant::now() + COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET
+                    });
+                    if Instant::now() < *deadline {
+                        continue 'retry_stale_commit_snapshot;
+                    }
                     return Err(ServerError::OperationAborted);
                 }
                 Err(storage::ObjectPgActionError::Metadata(

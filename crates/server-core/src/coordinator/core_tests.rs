@@ -9788,7 +9788,12 @@ fn delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-stale-auth-recreate";
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
-    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    // This test must retain the deleting incarnation until it has captured the
+    // idempotent-retry authorization. A background finalizer can otherwise
+    // delete it between the explicit begin call and authorization.
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage_cluster),
+    );
     coord
         .create_bucket_for_owner("attacker-owner", bucket, false)
         .unwrap();

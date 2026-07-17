@@ -314,7 +314,7 @@ fn object_read_snapshot_retries_when_object_disappears_after_auth_subject_load()
 }
 
 #[test]
-fn object_read_snapshot_stale_retry_loop_is_bounded() {
+fn object_read_snapshot_stale_retry_uses_time_budget() {
     let tmp = test_util::tempdir();
     let map = Arc::new(
         LocalClusterMap::open(
@@ -337,9 +337,10 @@ fn object_read_snapshot_stale_retry_loop_is_bounded() {
         [1; 16],
         b"first",
     );
+    const STALE_SNAPSHOTS: u8 = 24;
     let call_count = std::cell::Cell::new(0_u8);
 
-    let err = cluster
+    let outcome = cluster
         .load_object_read_snapshot_if(
             &bucket,
             &key,
@@ -349,29 +350,26 @@ fn object_read_snapshot_stale_retry_loop_is_bounded() {
                 let attempt = call_count.get();
                 call_count.set(attempt + 1);
                 assert!(stored.as_live().is_some());
-                let mutation_seed = attempt + 2;
-                write_committed_direct_segment_for_with_versioning(
-                    &cluster,
-                    &bucket,
-                    &key,
-                    crate::BucketVersioningState::Disabled,
-                    [mutation_seed; 16],
-                    [mutation_seed; 16],
-                    &[mutation_seed],
-                );
+                if attempt < STALE_SNAPSHOTS {
+                    let mutation_seed = attempt + 2;
+                    write_committed_direct_segment_for_with_versioning(
+                        &cluster,
+                        &bucket,
+                        &key,
+                        crate::BucketVersioningState::Disabled,
+                        [mutation_seed; 16],
+                        [mutation_seed; 16],
+                        &[mutation_seed],
+                    );
+                }
                 Ok::<_, ()>(())
             },
         )
-        .unwrap_err();
+        .unwrap()
+        .unwrap();
 
-    assert!(matches!(
-        err,
-        crate::ObjectPgActionError::Store(StoreError::Io {
-            context: "load object read snapshot stale retry limit exceeded",
-            ..
-        })
-    ));
-    assert_eq!(call_count.get(), 16);
+    assert!(outcome.snapshot.stored.as_live().is_some());
+    assert_eq!(call_count.get(), STALE_SNAPSHOTS + 1);
 }
 
 #[test]
