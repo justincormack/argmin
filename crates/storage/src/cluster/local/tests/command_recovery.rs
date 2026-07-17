@@ -7166,7 +7166,7 @@ fn direct_put_commit_retries_partial_exact_command_conflict() {
 }
 
 #[test]
-fn reserve_object_version_retry_reuses_pending_partial_replica_command() {
+fn reserve_object_version_retry_converges_pending_then_allocates_fresh_version() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -7256,9 +7256,9 @@ fn reserve_object_version_retry_reuses_pending_partial_replica_command() {
     let reserved = cluster
         .reserve_next_object_version(pg_id, &bucket, &key)
         .unwrap();
-    assert_eq!(reserved, crate::VersionId::from_u64(1));
+    assert_eq!(reserved, crate::VersionId::from_u64(2));
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
-    assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
+    assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 3);
 }
 
 #[test]
@@ -7323,7 +7323,7 @@ fn reserve_object_version_abandons_stale_pending_reservation_and_retries() {
 }
 
 #[test]
-fn reserve_object_version_clears_fully_applied_pending_reservation() {
+fn reserve_object_version_clears_fully_applied_pending_then_allocates_fresh_version() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -7367,9 +7367,9 @@ fn reserve_object_version_clears_fully_applied_pending_reservation() {
     let version = cluster
         .reserve_next_object_version(pg_id, &bucket, &key)
         .unwrap();
-    assert_eq!(version, crate::VersionId::from_u64(1));
+    assert_eq!(version, crate::VersionId::from_u64(2));
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
-    assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
+    assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 3);
     assert_clean_metadata_command_stream(&map, &[object_pg]);
 }
 

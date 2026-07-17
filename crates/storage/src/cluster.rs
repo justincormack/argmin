@@ -100,7 +100,6 @@ const DIRECT_PUT_METADATA_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const OBJECT_PG_EMPTY_LOG_CONFLICT_RETRIES: usize = 16;
 const OBJECT_GENERATION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const OBJECT_VERSION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(10);
-const OBJECT_VERSION_RESERVATION_RETRY_ATTEMPTS: usize = 64;
 pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
@@ -600,6 +599,9 @@ type DirectPutCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 type ObjectGenerationCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+type ObjectVersionCommandIdHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 type StreamAppendCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -627,6 +629,7 @@ struct StorageClusterTestHooks {
     before_metadata_command_pending_install: Option<MetadataCommandPendingInstallHook>,
     before_direct_put_command_id: Option<DirectPutCommandIdHook>,
     before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
+    before_object_version_command_id: Option<ObjectVersionCommandIdHook>,
     before_stream_append_command_id: Option<StreamAppendCommandIdHook>,
     after_object_metadata_reservation_acquired: Option<ObjectMetadataReservationAcquiredHook>,
     after_object_listing_pg_complete: Option<ObjectListingPgCompleteHook>,
@@ -653,6 +656,11 @@ pub struct DirectPutCommandIdHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct ObjectGenerationCommandIdHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ObjectVersionCommandIdHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -720,6 +728,13 @@ impl Drop for ObjectGenerationCommandIdHookGuard {
             .lock()
             .unwrap()
             .before_object_generation_command_id = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ObjectVersionCommandIdHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().before_object_version_command_id = None;
     }
 }
 
@@ -4283,6 +4298,22 @@ impl StorageCluster {
     fn maybe_run_before_object_generation_command_id_hook(&self) {}
 
     #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_object_version_command_id_hook(&self) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_object_version_command_id
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_before_object_version_command_id_hook(&self) {}
+
+    #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_stream_append_command_id_hook(&self) {
         let hook = self
             .test_hooks
@@ -5736,6 +5767,20 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_object_version_command_id_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> ObjectVersionCommandIdHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_object_version_command_id = Some(hook);
+        ObjectVersionCommandIdHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_install_before_stream_append_command_id_hook(
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
@@ -6334,12 +6379,9 @@ impl StorageCluster {
         completion_admission: bool,
     ) -> Result<VersionId, ObjectPgActionError> {
         let mut empty_log_conflicts = 0;
-        let mut work_budget = RequestWorkBudget::new(
-            OBJECT_VERSION_RESERVATION_RETRY_BUDGET,
-            Some(OBJECT_VERSION_RESERVATION_RETRY_ATTEMPTS),
-        )
-        .for_operation("reserve_object_version")
-        .for_pg(pg_id);
+        let mut work_budget = RequestWorkBudget::new(OBJECT_VERSION_RESERVATION_RETRY_BUDGET, None)
+            .for_operation("reserve_object_version")
+            .for_pg(pg_id);
         loop {
             work_budget
                 .check("object version reservation retry budget exhausted")
@@ -6348,54 +6390,39 @@ impl StorageCluster {
                 if let MetadataCommandPayload::ReserveObjectVersion(reservation) = command.payload()
                 {
                     let reserved_version_id = reservation.version_id;
-                    let matches_request = reservation.matches_request(bucket, key);
-                    let outcome = if matches_request {
-                        let exact =
-                            ExactPendingObjectMetadataCommand::for_checked_request(&command);
-                        match self.finish_exact_pending_object_metadata_command(pg_id, exact) {
-                            Ok(outcome) => outcome,
-                            Err(ObjectPgActionError::Metadata(
-                                MetadataError::ObjectVersionReservationConflict { version_id },
-                            )) if version_id == reserved_version_id => {
-                                self.record_abandoned_metadata_command_to_acting_set(&command)
-                                    .map_err(|error| {
-                                        bucket_snapshot_error_to_object_pg_action_error(
-                                            error.source,
-                                        )
-                                    })?;
-                                let pending =
-                                    self.pending_metadata_command_for_bucket(pg_id, bucket)?;
-                                if pending.as_ref() != Some(&command) {
-                                    return Err(conflicting_pending_object_metadata_command(
-                                        "pending version reservation changed before stale cleanup",
-                                    ));
-                                }
-                                self.remove_pending_metadata_command_for_bucket(
-                                    pg_id, bucket, &command,
-                                )
-                                .map_err(ObjectPgActionError::from)?;
-                                work_budget
-                                    .sleep_after_contention(
-                                        "object version reservation stale cleanup retry budget exhausted",
-                                    )
-                                    .map_err(ObjectPgActionError::Store)?;
-                                continue;
+                    let exact = ExactPendingObjectMetadataCommand::for_checked_request(&command);
+                    let outcome = match self
+                        .finish_exact_pending_object_metadata_command(pg_id, exact)
+                    {
+                        Ok(outcome) => outcome,
+                        Err(ObjectPgActionError::Metadata(
+                            MetadataError::ObjectVersionReservationConflict { version_id },
+                        )) if version_id == reserved_version_id => {
+                            self.record_abandoned_metadata_command_to_acting_set(&command)
+                                .map_err(|error| {
+                                    bucket_snapshot_error_to_object_pg_action_error(error.source)
+                                })?;
+                            let pending =
+                                self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+                            if pending.as_ref() != Some(&command) {
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "pending version reservation changed before stale cleanup",
+                                ));
                             }
-                            Err(error) => return Err(error),
-                        }
-                    } else {
-                        self.drain_pending_object_metadata_command(pg_id, &command)?;
-                        work_budget
-                            .sleep_after_contention(
-                                "object version reservation pending drain retry budget exhausted",
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
                             )
-                            .map_err(ObjectPgActionError::Store)?;
-                        continue;
+                            .map_err(ObjectPgActionError::from)?;
+                            work_budget
+                                .sleep_after_contention(
+                                    "object version reservation stale cleanup retry budget exhausted",
+                                )
+                                .map_err(ObjectPgActionError::Store)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     };
                     match outcome {
-                        PendingMetadataCommandOutcome::Applied if matches_request => {
-                            return Ok(reserved_version_id);
-                        }
                         PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                             return Err(conflicting_pending_object_metadata_command(
                                 "retryable partial pending version reservation command",
@@ -6403,6 +6430,9 @@ impl StorageCluster {
                         }
                         PendingMetadataCommandOutcome::Applied
                         | PendingMetadataCommandOutcome::Abandoned => {
+                            // A version reservation has no caller identity. Even when it targets
+                            // the same key, it may belong to a concurrent write, so converge it
+                            // and allocate a fresh version instead of adopting its result.
                             work_budget
                                 .sleep_after_contention(
                                     "object version reservation pending completion retry budget exhausted",
@@ -6427,6 +6457,7 @@ impl StorageCluster {
                 key,
                 completion_admission,
             )?;
+            self.maybe_run_before_object_version_command_id_hook();
             let command = match self.try_install_object_pg_pending_command_with_fresh_id(
                 pg_id,
                 bucket,

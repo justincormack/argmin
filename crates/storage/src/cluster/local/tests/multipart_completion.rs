@@ -1627,6 +1627,82 @@ fn versioned_direct_put_and_multipart_completion_allocate_versions_via_command_s
 }
 
 #[test]
+fn versioned_multipart_completion_uses_time_budget_under_sustained_pg_contention() {
+    const CONTENDING_VERSION_RESERVATIONS: usize = 65;
+
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let contender = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+    let (mut req, mut expected_segment) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "sustainedversioncontention");
+    req.versioning = crate::BucketVersioningState::Enabled;
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let remaining = Arc::new(AtomicUsize::new(CONTENDING_VERSION_RESERVATIONS));
+    let hook_remaining = Arc::clone(&remaining);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_guard =
+        cluster.test_install_before_object_version_command_id_hook(Arc::new(move || {
+            if hook_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                contender
+                    .reserve_next_object_version(PgId::new(object_pg), &hook_bucket, &hook_key)
+                    .unwrap();
+            }
+        }));
+
+    let outcome = cluster
+        .complete_multipart_upload_commit_serialized(req.clone())
+        .unwrap();
+    drop(hook_guard);
+
+    assert_eq!(remaining.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        outcome.version_id,
+        crate::VersionId::from_u64(CONTENDING_VERSION_RESERVATIONS as u64 + 1)
+    );
+    expected_segment.version_id = outcome.version_id.to_u64();
+    assert_streamed_multipart_completion_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &req,
+        &expected_segment,
+        &outcome,
+    );
+    assert_object_version_counter_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &bucket,
+        &key,
+        outcome.version_id.to_u64() + 1,
+    );
+}
+
+#[test]
 fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

@@ -678,10 +678,6 @@ impl ReserveObjectVersionCommand {
             version_id,
         }
     }
-
-    pub(crate) fn matches_request(&self, bucket: &BucketName, key: &ObjectKey) -> bool {
-        self.bucket == *bucket && self.key == *key
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
