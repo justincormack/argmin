@@ -18791,7 +18791,7 @@ mod tests {
     use proptest::prelude::*;
     use std::cell::Cell;
     use std::sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     };
     use std::time::{Duration, Instant};
@@ -19797,6 +19797,31 @@ mod tests {
         Converged,
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum CrossPgActingSetClientAction {
+        UnrelatedChurn { shape: u8 },
+        Restart,
+        InstallPendingRecovery,
+        RecoverTarget,
+        ConflictingTargetChange,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct CrossPgActingSetClientStep {
+        action: CrossPgActingSetClientAction,
+        lose_next_applied_response: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CrossPgActingSetClientPhase {
+        ActiveReady,
+        ActiveNotReady,
+        PeeringPending,
+        PeeringRecovering,
+        Conflict,
+        Desired,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct PendingCommandLifecycleModel {
         slot: PendingCommandSlotState,
@@ -19909,6 +19934,27 @@ mod tests {
             ),
             2 => Just(ControlPlaneHeartbeatModelOp::RestartAuthority),
         ]
+    }
+
+    fn cross_pg_acting_set_client_step_strategy(
+    ) -> impl Strategy<Value = CrossPgActingSetClientStep> {
+        (
+            prop_oneof![
+                any::<u8>()
+                    .prop_map(|shape| { CrossPgActingSetClientAction::UnrelatedChurn { shape } }),
+                Just(CrossPgActingSetClientAction::Restart),
+                Just(CrossPgActingSetClientAction::InstallPendingRecovery),
+                Just(CrossPgActingSetClientAction::RecoverTarget),
+                Just(CrossPgActingSetClientAction::ConflictingTargetChange),
+            ],
+            any::<bool>(),
+        )
+            .prop_map(
+                |(action, lose_next_applied_response)| CrossPgActingSetClientStep {
+                    action,
+                    lose_next_applied_response,
+                },
+            )
     }
 
     fn control_plane_heartbeat_command_boundary_op_strategy(
@@ -20367,6 +20413,466 @@ mod tests {
         Ok(())
     }
 
+    struct CrossPgActingSetClientAuthority {
+        store: FileControlPlaneStore,
+        authority: SingleAuthorityControlPlane<FileControlPlaneStore>,
+        now_ms: u64,
+        active_epoch: ClusterEpoch,
+        proof: PgMetadataProof,
+        expected_target_acting_set: Vec<NodeId>,
+        phase: CrossPgActingSetClientPhase,
+    }
+
+    impl CrossPgActingSetClientAuthority {
+        const TARGET_PG_ID: PgId = PgId::new(40);
+        const UNRELATED_PG_ID: PgId = PgId::new(41);
+
+        fn new(store: FileControlPlaneStore) -> Self {
+            let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+            for node_id in [1, 2, 3] {
+                authority
+                    .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                    .unwrap();
+                assert!(heartbeat_until_serving(
+                    &mut authority,
+                    node_id,
+                    1_000 + u64::from(node_id)
+                )
+                .serving());
+            }
+            authority
+                .set_pg_acting_set(Self::TARGET_PG_ID, Self::initial_acting_set())
+                .unwrap();
+            let proof = heartbeat_model_proof(9);
+            heartbeat_with_pg_proof(
+                &mut authority,
+                1,
+                Self::TARGET_PG_ID.get(),
+                PgState::Peering,
+                proof,
+                false,
+                2_000,
+            );
+            authority.complete_ready_pg_peerings(2_001).unwrap();
+            let active_epoch = authority.snapshot().cluster_epoch();
+            assert!(heartbeat_with_pg_proof(
+                &mut authority,
+                1,
+                Self::TARGET_PG_ID.get(),
+                PgState::Active,
+                proof,
+                false,
+                2_002,
+            )
+            .serving());
+
+            let state = Self {
+                store,
+                authority,
+                now_ms: 2_003,
+                active_epoch,
+                proof,
+                expected_target_acting_set: Self::initial_acting_set(),
+                phase: CrossPgActingSetClientPhase::ActiveReady,
+            };
+            state.assert_invariants();
+            state
+        }
+
+        fn initial_acting_set() -> Vec<NodeId> {
+            vec![NodeId::new(1)]
+        }
+
+        fn desired_acting_set() -> Vec<NodeId> {
+            vec![NodeId::new(1), NodeId::new(2)]
+        }
+
+        fn conflicting_acting_set() -> Vec<NodeId> {
+            vec![NodeId::new(1), NodeId::new(3)]
+        }
+
+        fn advance(&mut self) {
+            self.now_ms += 1;
+        }
+
+        fn target_record(&self) -> &PgControlRecord {
+            self.authority
+                .snapshot()
+                .pg(Self::TARGET_PG_ID)
+                .expect("scripted target PG exists")
+        }
+
+        fn churn_unrelated_pg(&mut self, shape: u8) {
+            self.advance();
+            let current = self
+                .authority
+                .snapshot()
+                .pg(Self::UNRELATED_PG_ID)
+                .map(PgControlRecord::acting_set);
+            let choices = [
+                vec![NodeId::new(1)],
+                vec![NodeId::new(2)],
+                vec![NodeId::new(1), NodeId::new(2)],
+            ];
+            let mut acting_set = choices[usize::from(shape % 3)].clone();
+            if current == Some(acting_set.as_slice()) {
+                acting_set = choices[usize::from(shape.wrapping_add(1) % 3)].clone();
+            }
+            self.authority
+                .set_pg_acting_set(Self::UNRELATED_PG_ID, acting_set)
+                .unwrap();
+            self.phase = match self.phase {
+                CrossPgActingSetClientPhase::ActiveReady => {
+                    CrossPgActingSetClientPhase::ActiveNotReady
+                }
+                CrossPgActingSetClientPhase::PeeringPending => {
+                    CrossPgActingSetClientPhase::PeeringRecovering
+                }
+                phase => phase,
+            };
+            self.assert_invariants();
+        }
+
+        fn refresh_target_node(&mut self, node_id: NodeId, pending: bool) {
+            self.advance();
+            let pg = self.target_record();
+            if !pg.acting_set().contains(&node_id) {
+                return;
+            }
+            let state = pg.state();
+            let metadata_proof = pg
+                .active_metadata_proof()
+                .or_else(|| pg.peering_metadata_proof_floor())
+                .unwrap_or(self.proof);
+            let mut heartbeat = heartbeat_from_record(
+                &self.authority,
+                node_id.as_u32(),
+                self.authority.snapshot().cluster_epoch(),
+                self.now_ms,
+            );
+            heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+                pg_id: Self::TARGET_PG_ID,
+                state,
+                metadata_proof,
+                pending_metadata_command: (pending && node_id == NodeId::new(1))
+                    .then_some(test_pending_metadata_command(self.active_epoch)),
+            }];
+            self.authority
+                .heartbeat(heartbeat, self.now_ms)
+                .expect("model-preconditioned heartbeat should apply");
+        }
+
+        fn refresh_target_acting_set(&mut self, pending_primary: bool) {
+            let acting_set = self.expected_target_acting_set.clone();
+            for node_id in acting_set {
+                self.refresh_target_node(node_id, pending_primary);
+            }
+        }
+
+        fn recover_target(&mut self) {
+            if matches!(
+                self.phase,
+                CrossPgActingSetClientPhase::Conflict | CrossPgActingSetClientPhase::Desired
+            ) {
+                return;
+            }
+            self.refresh_target_acting_set(false);
+            if self.target_record().state() == PgState::Peering {
+                self.advance();
+                self.authority
+                    .complete_ready_pg_peerings(self.now_ms)
+                    .unwrap();
+                self.refresh_target_acting_set(false);
+            }
+            assert_eq!(self.target_record().state(), PgState::Active);
+            self.phase = CrossPgActingSetClientPhase::ActiveReady;
+            self.assert_invariants();
+        }
+
+        fn install_pending_recovery(&mut self) {
+            if self.expected_target_acting_set != Self::initial_acting_set()
+                || matches!(
+                    self.phase,
+                    CrossPgActingSetClientPhase::Conflict | CrossPgActingSetClientPhase::Desired
+                )
+            {
+                return;
+            }
+            self.refresh_target_node(NodeId::new(1), true);
+            if self
+                .authority
+                .snapshot()
+                .pending_metadata_command_recoveries()
+                .tasks()
+                .iter()
+                .any(|task| task.pg_id() == Self::TARGET_PG_ID)
+            {
+                self.phase = CrossPgActingSetClientPhase::PeeringPending;
+            }
+            self.assert_invariants();
+        }
+
+        fn restart(&mut self) {
+            self.advance();
+            self.authority = reopen_file_authority(&self.store);
+            self.phase = if self.expected_target_acting_set == Self::desired_acting_set() {
+                CrossPgActingSetClientPhase::Desired
+            } else if self.expected_target_acting_set == Self::conflicting_acting_set() {
+                CrossPgActingSetClientPhase::Conflict
+            } else {
+                CrossPgActingSetClientPhase::PeeringRecovering
+            };
+            self.assert_invariants();
+        }
+
+        fn install_conflicting_target_change(&mut self) {
+            if self.expected_target_acting_set != Self::initial_acting_set() {
+                return;
+            }
+            self.recover_target();
+            self.advance();
+            self.authority
+                .set_pg_acting_set(Self::TARGET_PG_ID, Self::conflicting_acting_set())
+                .unwrap();
+            self.expected_target_acting_set = Self::conflicting_acting_set();
+            self.phase = CrossPgActingSetClientPhase::Conflict;
+            self.assert_invariants();
+        }
+
+        fn apply_step(&mut self, step: CrossPgActingSetClientStep) {
+            match step.action {
+                CrossPgActingSetClientAction::UnrelatedChurn { shape } => {
+                    self.churn_unrelated_pg(shape);
+                }
+                CrossPgActingSetClientAction::Restart => self.restart(),
+                CrossPgActingSetClientAction::InstallPendingRecovery => {
+                    self.install_pending_recovery();
+                }
+                CrossPgActingSetClientAction::RecoverTarget => self.recover_target(),
+                CrossPgActingSetClientAction::ConflictingTargetChange => {
+                    self.install_conflicting_target_change();
+                }
+            }
+        }
+
+        fn observe_target_command_result(&mut self, before_acting_set: &[NodeId]) -> bool {
+            let after = self.target_record().acting_set();
+            if after == before_acting_set {
+                return false;
+            }
+            assert_eq!(
+                after,
+                Self::desired_acting_set(),
+                "checked client may only install its requested target acting set"
+            );
+            self.expected_target_acting_set = Self::desired_acting_set();
+            self.phase = CrossPgActingSetClientPhase::Desired;
+            self.assert_invariants();
+            true
+        }
+
+        fn assert_invariants(&self) {
+            let snapshot = self.authority.snapshot();
+            snapshot.validate_publication_invariants().unwrap();
+            assert_eq!(
+                self.store.load().unwrap().unwrap(),
+                *snapshot,
+                "scripted live and durable snapshots must match"
+            );
+            let target = snapshot.pg(Self::TARGET_PG_ID).unwrap();
+            assert_eq!(
+                target.acting_set(),
+                self.expected_target_acting_set,
+                "only an explicit target command may change the target acting set"
+            );
+            match self.phase {
+                CrossPgActingSetClientPhase::ActiveReady
+                | CrossPgActingSetClientPhase::ActiveNotReady => {
+                    assert_eq!(target.state(), PgState::Active);
+                }
+                CrossPgActingSetClientPhase::PeeringPending => {
+                    assert_eq!(target.state(), PgState::Peering);
+                    assert!(snapshot
+                        .pending_metadata_command_recoveries()
+                        .tasks()
+                        .iter()
+                        .any(|task| task.pg_id() == Self::TARGET_PG_ID));
+                }
+                CrossPgActingSetClientPhase::PeeringRecovering => {
+                    assert_eq!(target.state(), PgState::Peering);
+                }
+                CrossPgActingSetClientPhase::Conflict => {
+                    assert_eq!(
+                        self.expected_target_acting_set,
+                        Self::conflicting_acting_set()
+                    );
+                }
+                CrossPgActingSetClientPhase::Desired => {
+                    assert_eq!(self.expected_target_acting_set, Self::desired_acting_set());
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct CrossPgActingSetClientReport {
+        snapshot: ClusterControlSnapshot,
+        retry_submission_phases: Vec<CrossPgActingSetClientPhase>,
+        desired_mutations: usize,
+        conflict_applied: bool,
+        dropped_applied_responses: usize,
+        consumed_steps: usize,
+    }
+
+    fn cross_pg_phase_allows_retry_submission(phase: CrossPgActingSetClientPhase) -> bool {
+        matches!(
+            phase,
+            CrossPgActingSetClientPhase::ActiveReady | CrossPgActingSetClientPhase::ActiveNotReady
+        )
+    }
+
+    fn run_cross_pg_checked_client_schedule(
+        socket_path: &std::path::Path,
+        store: FileControlPlaneStore,
+        steps: Vec<CrossPgActingSetClientStep>,
+        authenticated: bool,
+    ) -> (
+        Result<ClusterEpoch, ControlPlaneError>,
+        CrossPgActingSetClientReport,
+    ) {
+        let listener = std::os::unix::net::UnixListener::bind(socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let server_finished = Arc::clone(&finished);
+        let verifier = authenticated.then(|| admin_auth_verifier("model-cluster", "model-admin"));
+        let server = std::thread::spawn(move || {
+            let mut state = CrossPgActingSetClientAuthority::new(store);
+            let mut preflight_served = false;
+            let mut initial_mutation_served = false;
+            let mut next_step = 0_usize;
+            let mut lose_next_applied_response = false;
+            let mut last_confirmation_phase = None;
+            let mut retry_submission_phases = Vec::new();
+            let mut desired_mutations = 0_usize;
+            let mut conflict_applied = false;
+            let mut dropped_applied_responses = 0_usize;
+
+            while !server_finished.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("scripted control-plane accept failed: {error}"),
+                };
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let kind = request.kind;
+
+                if kind == ControlPlaneRpcKind::SetPgActingSet && !initial_mutation_served {
+                    state.churn_unrelated_pg(0);
+                    initial_mutation_served = true;
+                } else if kind == ControlPlaneRpcKind::PgRuntimeMapSnapshot && preflight_served {
+                    let step =
+                        steps
+                            .get(next_step)
+                            .copied()
+                            .unwrap_or(CrossPgActingSetClientStep {
+                                action: CrossPgActingSetClientAction::RecoverTarget,
+                                lose_next_applied_response: false,
+                            });
+                    if next_step < steps.len() {
+                        next_step += 1;
+                    }
+                    state.apply_step(step);
+                    lose_next_applied_response |= step.lose_next_applied_response;
+                    last_confirmation_phase = Some(state.phase);
+                }
+
+                if kind == ControlPlaneRpcKind::SetPgActingSet && initial_mutation_served {
+                    if let Some(phase) = last_confirmation_phase.take() {
+                        assert!(
+                            cross_pg_phase_allows_retry_submission(phase),
+                            "checked client resubmitted from disallowed phase {phase:?}"
+                        );
+                        retry_submission_phases.push(phase);
+                    }
+                }
+
+                let before_acting_set = state.target_record().acting_set().to_vec();
+                let authority_now_ms = if authenticated {
+                    ControlPlaneAuthEnvelope::decode_frame(
+                        &request.payload,
+                        CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                    )
+                    .unwrap()
+                    .header()
+                    .issued_at_ms()
+                    .unwrap()
+                } else {
+                    state.now_ms
+                };
+                let response = build_control_plane_unix_response_with_auth_and_response_clock(
+                    &mut state.authority,
+                    request,
+                    authority_now_ms,
+                    verifier.as_ref(),
+                    || Ok(authority_now_ms),
+                )
+                .unwrap();
+                let desired_applied = if kind == ControlPlaneRpcKind::SetPgActingSet {
+                    let applied = state.observe_target_command_result(&before_acting_set);
+                    desired_mutations += usize::from(applied);
+                    applied
+                } else {
+                    false
+                };
+
+                if kind == ControlPlaneRpcKind::PgRuntimeMapSnapshot && !preflight_served {
+                    preflight_served = true;
+                }
+                if desired_applied && lose_next_applied_response {
+                    lose_next_applied_response = false;
+                    dropped_applied_responses += 1;
+                    drop(stream);
+                    continue;
+                }
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+                conflict_applied |= state.phase == CrossPgActingSetClientPhase::Conflict;
+            }
+
+            state.assert_invariants();
+            CrossPgActingSetClientReport {
+                snapshot: state.authority.snapshot().clone(),
+                retry_submission_phases,
+                desired_mutations,
+                conflict_applied,
+                dropped_applied_responses,
+                consumed_steps: next_step,
+            }
+        });
+
+        let result = if authenticated {
+            let client = AuthenticatedUnixControlPlaneClient::new(
+                UnixControlPlaneClient::new(socket_path),
+                admin_auth_credential("model-cluster", "model-admin"),
+            );
+            client.set_pg_acting_set_checked(
+                CrossPgActingSetClientAuthority::TARGET_PG_ID,
+                CrossPgActingSetClientAuthority::desired_acting_set(),
+                crate::clock::current_time_millis(),
+            )
+        } else {
+            UnixControlPlaneClient::new(socket_path).set_pg_acting_set_checked(
+                CrossPgActingSetClientAuthority::TARGET_PG_ID,
+                CrossPgActingSetClientAuthority::desired_acting_set(),
+            )
+        };
+        finished.store(true, Ordering::Release);
+        let report = server.join().unwrap();
+        (result, report)
+    }
+
     #[derive(Clone)]
     struct PendingCommandLifecycleCase {
         snapshot: ClusterControlSnapshot,
@@ -20651,6 +21157,148 @@ mod tests {
             .snapshot
             .active_pg_route(heartbeat_model_pg_id(), case.now_ms)
             .is_ok());
+    }
+
+    #[test]
+    fn checked_clients_compose_pending_restart_and_lost_applied_response() {
+        let steps = vec![
+            CrossPgActingSetClientStep {
+                action: CrossPgActingSetClientAction::InstallPendingRecovery,
+                lose_next_applied_response: false,
+            },
+            CrossPgActingSetClientStep {
+                action: CrossPgActingSetClientAction::Restart,
+                lose_next_applied_response: false,
+            },
+            CrossPgActingSetClientStep {
+                action: CrossPgActingSetClientAction::RecoverTarget,
+                lose_next_applied_response: true,
+            },
+            CrossPgActingSetClientStep {
+                action: CrossPgActingSetClientAction::Restart,
+                lose_next_applied_response: false,
+            },
+        ];
+        for authenticated in [false, true] {
+            let tmp = test_util::tempdir();
+            let socket_path = tmp.path().join("control-plane.sock");
+            let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+            let (result, report) = run_cross_pg_checked_client_schedule(
+                &socket_path,
+                store,
+                steps.clone(),
+                authenticated,
+            );
+            result.unwrap();
+            assert_eq!(report.consumed_steps, steps.len());
+            assert_eq!(report.desired_mutations, 1);
+            assert_eq!(report.dropped_applied_responses, 1);
+            assert!(!report.conflict_applied);
+            assert_eq!(
+                report
+                    .snapshot
+                    .pg(CrossPgActingSetClientAuthority::TARGET_PG_ID)
+                    .unwrap()
+                    .acting_set(),
+                CrossPgActingSetClientAuthority::desired_acting_set()
+            );
+            assert!(report
+                .retry_submission_phases
+                .iter()
+                .copied()
+                .all(cross_pg_phase_allows_retry_submission));
+        }
+    }
+
+    #[test]
+    fn checked_clients_fail_closed_after_generated_target_conflict() {
+        let steps = vec![CrossPgActingSetClientStep {
+            action: CrossPgActingSetClientAction::ConflictingTargetChange,
+            lose_next_applied_response: false,
+        }];
+        for authenticated in [false, true] {
+            let tmp = test_util::tempdir();
+            let socket_path = tmp.path().join("control-plane.sock");
+            let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+            let (result, report) = run_cross_pg_checked_client_schedule(
+                &socket_path,
+                store,
+                steps.clone(),
+                authenticated,
+            );
+            assert!(
+                matches!(result, Err(ControlPlaneError::RpcUnconfirmed { .. })),
+                "unexpected checked-client conflict result: {result:?}"
+            );
+            assert_eq!(report.consumed_steps, steps.len());
+            assert_eq!(report.desired_mutations, 0);
+            assert!(report.conflict_applied);
+            assert_eq!(
+                report
+                    .snapshot
+                    .pg(CrossPgActingSetClientAuthority::TARGET_PG_ID)
+                    .unwrap()
+                    .acting_set(),
+                CrossPgActingSetClientAuthority::conflicting_acting_set()
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 24,
+            max_shrink_iters: 128,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_checked_clients_preserve_target_route_across_generated_interleavings(
+            steps in proptest::collection::vec(cross_pg_acting_set_client_step_strategy(), 0..8),
+            authenticated in any::<bool>(),
+        ) {
+            let tmp = test_util::tempdir();
+            let socket_path = tmp.path().join("control-plane.sock");
+            let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+            let (result, report) = run_cross_pg_checked_client_schedule(
+                &socket_path,
+                store,
+                steps.clone(),
+                authenticated,
+            );
+            prop_assert!(report.consumed_steps <= steps.len());
+            prop_assert!(report.desired_mutations <= 1);
+            prop_assert!(report.dropped_applied_responses <= 1);
+            prop_assert!(report
+                .retry_submission_phases
+                .iter()
+                .copied()
+                .all(cross_pg_phase_allows_retry_submission));
+
+            let final_acting_set = report
+                .snapshot
+                .pg(CrossPgActingSetClientAuthority::TARGET_PG_ID)
+                .unwrap()
+                .acting_set();
+            if report.conflict_applied {
+                let failed_closed = matches!(
+                    result,
+                    Err(ControlPlaneError::RpcUnconfirmed { .. })
+                );
+                prop_assert!(failed_closed);
+                prop_assert_eq!(
+                    final_acting_set,
+                    CrossPgActingSetClientAuthority::conflicting_acting_set()
+                );
+                prop_assert_eq!(report.desired_mutations, 0);
+            } else {
+                prop_assert!(result.is_ok(), "unexpected checked-client result: {:?}", result);
+                prop_assert_eq!(
+                    final_acting_set,
+                    CrossPgActingSetClientAuthority::desired_acting_set()
+                );
+                prop_assert_eq!(report.desired_mutations, 1);
+            }
+        }
     }
 
     #[test]
@@ -38965,7 +39613,7 @@ mod tests {
         #![proptest_config(ProptestConfig {
             cases: 48,
             max_shrink_iters: 256,
-            ..ProptestConfig::default()
+        ..ProptestConfig::default()
         })]
 
         #[test]

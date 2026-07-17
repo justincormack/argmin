@@ -12419,9 +12419,7 @@ Phase 12.4 progress:
   only after confirming that the target PG route is still the preflight route,
   so unrelated epoch churn can converge without allowing a retry to overwrite
   a newer route. State-machine, RPC-codec, and authenticated checked-client
-  regressions pin the reject-without-mutation, refresh, and retry sequence. The
-  heartbeat model must include unrelated-PG epoch churn between preflight and
-  migration as a first-class generated interleaving.
+  regressions pin the reject-without-mutation, refresh, and retry sequence.
   Two later retained route-change soaks exposed the same checked-client retry
   boundary when the target PG itself made lifecycle progress between preflight
   and confirmation. A follow-up run showed that treating every temporarily
@@ -12468,6 +12466,23 @@ Phase 12.4 progress:
   continue to observe and compare the target PG route before resubmitting, so
   an ambiguous response can be confirmed and an unapplied command can be
   retried only while the target route remains exactly the preflight route.
+  A scripted Unix authority now drives the production plain and authenticated
+  checked acting-set clients against a durable two-PG state machine. Unrelated
+  PG epoch churn is injected between target preflight and the first mutation,
+  while a shrinkable generated operation sequence composes and reorders
+  further unrelated churn, authority restart, pending-command recovery,
+  recovery convergence, conflicting target progress, and response loss after
+  apply. Retry classification, confirmation, authentication, and resubmission
+  therefore execute through the real client and RPC paths rather than a
+  reimplemented client loop. A declarative phase truth table, independent of
+  the production route predicate, permits resubmission only while the target
+  remains the original Active route. The harness counts target mutations and
+  checks after every completed transition that unrelated churn and restart
+  preserve the target acting set, pending recovery prevents resubmission,
+  target conflicts fail closed, ambiguous applied updates are confirmed
+  without a second mutation, and the live and persisted snapshots remain
+  equal. Deterministic cases pin conflict rejection and pending -> restart ->
+  recovery -> lost applied response -> restart composition.
   Plain and authenticated Unix regressions each pin mutation apply, response
   loss, all four typed serving gaps during confirmation, and eventual target-
   route confirmation.
