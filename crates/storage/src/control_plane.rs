@@ -23973,15 +23973,18 @@ mod tests {
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
         let high_water = authority.snapshot().max_committed_timestamp_ms();
-        let wall_ms = high_water.unwrap() + CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1;
+        let wall_ms = crate::clock::current_time_millis();
         let mut clock = ControlPlaneAuthorityClock::new(high_water, wall_ms, Some(50)).unwrap();
         let verifier = admin_auth_verifier("auth-cluster", "admin-1");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
             let mut delayed_response = None;
-            for request_number in 0..3 {
+            let mut release_delayed_response = None;
+            let mut confirmation_written = false;
+            for _ in 0..64 {
                 let (mut stream, _addr) = listener.accept().unwrap();
                 let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let request_kind = request.kind;
                 let now_ms = ControlPlaneAuthEnvelope::decode_frame(
                     &request.payload,
                     CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
@@ -24005,15 +24008,37 @@ mod tests {
                     || Ok(now_ms),
                 )
                 .unwrap();
-                if request_number == 1 {
+                let established = clock
+                    .status(authority.authority_clock_context().unwrap())
+                    .established();
+                if request_kind == ControlPlaneRpcKind::ReestablishAuthorityClock
+                    && delayed_response.is_none()
+                {
+                    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+                    release_delayed_response = Some(release_tx);
                     delayed_response = Some(std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(200));
+                        release_rx.recv().unwrap();
                         let _ = write_control_plane_unix_response(&mut stream, response);
                     }));
                 } else {
-                    write_control_plane_unix_response(&mut stream, response).unwrap();
+                    if request_kind == ControlPlaneRpcKind::AuthorityClockStatus && established {
+                        if let Some(release) = release_delayed_response.take() {
+                            release.send(()).unwrap();
+                        }
+                    }
+                    if write_control_plane_unix_response(&mut stream, response).is_ok()
+                        && request_kind == ControlPlaneRpcKind::AuthorityClockStatus
+                        && established
+                    {
+                        confirmation_written = true;
+                        break;
+                    }
                 }
             }
+            assert!(
+                confirmation_written,
+                "client should confirm the applied clock recovery"
+            );
             if let Some(delayed_response) = delayed_response {
                 delayed_response.join().unwrap();
             }
@@ -24024,13 +24049,12 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             admin_auth_credential("auth-cluster", "admin-1"),
         );
-        let status = crate::clock::with_time_override(wall_ms, || {
-            client.reestablish_authority_clock_with_attempt_timeout(
+        let status = client
+            .reestablish_authority_clock_with_attempt_timeout(
                 wall_ms,
-                Duration::from_millis(50),
+                CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT,
             )
-        })
-        .unwrap();
+            .unwrap();
         assert!(status.established());
         assert_eq!(status, server.join().unwrap());
     }
