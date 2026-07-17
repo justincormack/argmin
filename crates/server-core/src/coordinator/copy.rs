@@ -13,12 +13,13 @@ use super::{
     maybe_run_upload_part_copy_stream_session_hook,
 };
 use super::{
-    AuthorizedCopyObject, AuthorizedFinalizeStreamPutRequest, AuthorizedMultipartPartWrite,
-    AuthorizedUploadPartCopy, AuthorizedWriteTags, BeginStreamPartResult, ChecksumClaim,
-    Coordinator, CopyObjectRequest, CopyObjectResult, FinalizeStreamPartRequest, MetadataDirective,
-    MultipartObjectRequest, ReadHandle, ReadObjectContext, StreamingChecksumAccumulator,
-    TaggingDirective, UploadPartCopyRequest, UploadPartCopyResult, WriteEncryptionRequest,
-    INTERNAL_SEGMENT_SIZE, MAX_OBJECT_SIZE, TRACE_TARGET,
+    AuthorizedCopyObject, AuthorizedCopySourceRead, AuthorizedFinalizeStreamPutRequest,
+    AuthorizedMultipartPartWrite, AuthorizedUploadPartCopy, AuthorizedWriteTags,
+    BeginStreamPartResult, ChecksumClaim, Coordinator, CopyObjectRequest, CopyObjectResult,
+    FinalizeStreamPartRequest, MetadataDirective, MultipartObjectRequest, ReadHandle,
+    ReadObjectContext, StreamingChecksumAccumulator, TaggingDirective, UploadPartCopyRequest,
+    UploadPartCopyResult, WriteEncryptionRequest, INTERNAL_SEGMENT_SIZE, MAX_OBJECT_SIZE,
+    TRACE_TARGET,
 };
 use crate::conditional::check_copy_source_conditions;
 use crate::error::ServerError;
@@ -46,6 +47,8 @@ impl Coordinator {
             multipart_parts,
             multipart_part_segments,
         } = snapshot;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket.as_str(), key.as_str());
         let src_record = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         match src_record.layout {
             ObjectLayout::MultipartManifest { .. } => {
@@ -67,8 +70,6 @@ impl Coordinator {
                         source_sse_customer.cloned(),
                     )?
                 };
-                #[cfg(test)]
-                maybe_run_object_read_snapshot_hook(bucket.as_str(), key.as_str());
                 #[cfg(test)]
                 maybe_run_multipart_snapshot_hook(bucket.as_str(), key.as_str());
                 Ok(body)
@@ -93,8 +94,6 @@ impl Coordinator {
                         Some(src_record.etag.crc64()),
                     )?
                 };
-                #[cfg(test)]
-                maybe_run_object_read_snapshot_hook(bucket.as_str(), key.as_str());
                 Ok(body)
             }
         }
@@ -202,6 +201,10 @@ impl Coordinator {
             destination: dst_authorized,
         } = self.authorize_copy_object_with_storage_node(&storage_node, req)?;
 
+        let AuthorizedCopySourceRead {
+            snapshot: source_snapshot,
+            payload_lease: source_payload_lease,
+        } = source_snapshot;
         let (src_metadata, src_system_metadata, src_tags, copy_source_version_id, mut source_body) = {
             let src_stored = source_snapshot.stored.clone();
             let src_record = match &src_stored {
@@ -269,6 +272,9 @@ impl Coordinator {
                 source_snapshot,
                 source_sse_customer,
             )?;
+            // The broad lease must outlive acquisition of the read handle's
+            // shard-specific lease, closing the snapshot-to-reader reclaim gap.
+            drop(source_payload_lease);
 
             let src_metadata = Self::deserialize_user_metadata(src_record.metadata_blob.as_ref())?;
             let src_system_metadata = self.deserialize_visible_system_metadata(
@@ -443,6 +449,11 @@ impl Coordinator {
             destination,
         } = self.authorize_upload_part_copy_with_storage_node(&storage_node, req)?;
 
+        let AuthorizedCopySourceRead {
+            snapshot: source,
+            payload_lease: source_payload_lease,
+        } = source;
+
         let (copy_source_version_id, mut source_body) = {
             let src_stored = source.stored.clone();
 
@@ -500,6 +511,9 @@ impl Coordinator {
                 (read_start as usize, read_end as usize),
                 source_sse_customer,
             )?;
+            // Hand off from the broad snapshot lease only after the range read
+            // handle has acquired its shard-specific lease.
+            drop(source_payload_lease);
             (
                 copy_source_response_version_id(src_version_id, src_record.version_id),
                 body,

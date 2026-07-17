@@ -40,10 +40,12 @@ use crate::metadata_command::{
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::node_client::StorageNodeClient;
 use crate::node_client::{
     BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
     CreateStreamUploadPrecondition, MetadataCommandNodeClient, ObjectListingMetadataNodeClient,
-    ShardAckNodeClient, StorageNodeClient,
+    ObjectPayloadLeaseNodeLease, ShardAckNodeClient,
 };
 pub use crate::peering::PgMetadataTransferArtifact;
 use crate::peering::{
@@ -68,15 +70,15 @@ use crate::types::{
     BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectSegmentRecord, PgId,
-    PgState, PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
-    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
-    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
-    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
-    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, SegmentStoredBytesRequest, SessionId,
-    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
-    ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
+    ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
+    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
+    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
+    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
+    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq, RouteMapValidity,
+    SegmentStoredBytesRequest, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
     ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
     StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
     StreamUploadTarget, VersionId, WriteAck, WrittenShardAck,
@@ -923,7 +925,7 @@ enum PlacedSegmentShardHealthReadMode {
 
 pub struct ObjectPayloadLease {
     cluster: Weak<StorageCluster>,
-    storage_clients: Vec<Arc<dyn StorageNodeClient>>,
+    node_leases: Vec<Box<dyn ObjectPayloadLeaseNodeLease>>,
     runtime_state: Arc<LocalClusterRuntimeState>,
     bucket: BucketName,
     key: ObjectKey,
@@ -932,10 +934,16 @@ pub struct ObjectPayloadLease {
     released: bool,
 }
 
+pub struct LeasedObjectReadSnapshotOutcome<T> {
+    pub value: T,
+    pub snapshot: ObjectReadSnapshot,
+    pub payload_lease: Option<ObjectPayloadLease>,
+}
+
 impl ObjectPayloadLease {
     fn new(
         cluster: Weak<StorageCluster>,
-        storage_clients: Vec<Arc<dyn StorageNodeClient>>,
+        node_leases: Vec<Box<dyn ObjectPayloadLeaseNodeLease>>,
         runtime_state: Arc<LocalClusterRuntimeState>,
         bucket: BucketName,
         key: ObjectKey,
@@ -944,7 +952,7 @@ impl ObjectPayloadLease {
     ) -> Self {
         Self {
             cluster,
-            storage_clients,
+            node_leases,
             runtime_state,
             bucket,
             key,
@@ -955,12 +963,7 @@ impl ObjectPayloadLease {
     }
 
     pub fn release(mut self) -> ReleasedObjectPayloadLease {
-        let remaining = release_object_payload_lease_from_storage_clients(
-            &self.storage_clients,
-            &self.bucket,
-            &self.key,
-            self.generation_id,
-        );
+        let remaining = release_object_payload_node_leases(&mut self.node_leases);
         self.released = true;
         ReleasedObjectPayloadLease {
             cluster: self.cluster.clone(),
@@ -977,25 +980,17 @@ impl ObjectPayloadLease {
 impl Drop for ObjectPayloadLease {
     fn drop(&mut self) {
         if !self.released {
-            let _ = release_object_payload_lease_from_storage_clients(
-                &self.storage_clients,
-                &self.bucket,
-                &self.key,
-                self.generation_id,
-            );
+            let _ = release_object_payload_node_leases(&mut self.node_leases);
         }
     }
 }
 
-fn release_object_payload_lease_from_storage_clients(
-    storage_clients: &[Arc<dyn StorageNodeClient>],
-    bucket: &BucketName,
-    key: &ObjectKey,
-    generation_id: GenerationId,
+fn release_object_payload_node_leases(
+    node_leases: &mut [Box<dyn ObjectPayloadLeaseNodeLease>],
 ) -> usize {
-    storage_clients
-        .iter()
-        .map(|storage_node| storage_node.release_object_payload_lease(bucket, key, generation_id))
+    node_leases
+        .iter_mut()
+        .filter_map(|lease| lease.release().ok())
         .max()
         .unwrap_or(0)
 }

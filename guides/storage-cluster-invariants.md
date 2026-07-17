@@ -246,10 +246,10 @@ script in the same change.
 | `begin_bucket_delete` | Epoch-fenced routed metadata PG fanout |
 | `try_finalize_bucket_delete` | Epoch-fenced routed metadata PG fanout plus storage-node object-payload read-handle checks and local runtime worker queue |
 | `load_available_bucket_execution_generation_batches` | Best-effort routed metadata PG |
-| `try_probe_object_pg_available`, `load_object_if`, `load_existing_live_object`, `load_object_read_snapshot_if`, `payload_reclaim_exists`, `get_object_tags_if`, `get_object_legal_hold_if`, `get_object_retention_if` | Epoch-fenced routed metadata PG |
+| `try_probe_object_pg_available`, `load_object_if`, `load_existing_live_object`, `load_object_read_snapshot_if`, `load_leased_object_read_snapshot_if`, `payload_reclaim_exists`, `get_object_tags_if`, `get_object_legal_hold_if`, `get_object_retention_if` | Epoch-fenced routed metadata PG. The leased snapshot helper acquires a broad payload-generation lease before exact snapshot validation, retries if the authorization subject changed, and returns the snapshot and lease together |
 | `put_object_tags_if`, `delete_object_tags_if`, `put_object_retention_if`, `put_object_legal_hold_if`, `put_object_acl_if`, `delete_specific_object_version_if`, `delete_current_object_if`, `insert_current_delete_marker_if`, `expire_current_object_if_due`, `delete_noncurrent_live_versions_if_due`, `delete_expired_delete_marker_if_due` | Epoch-fenced routed metadata PG command apply |
 | `list_all_objects_for_bucket`, `list_all_object_versions_for_bucket`, `list_all_multipart_uploads_for_bucket`, `list_objects_for_bucket`, `list_object_versions_for_bucket` | Epoch-fenced routed metadata PG fanout |
-| `acquire_object_payload_lease`, `acquire_object_payload_lease_for_shard_locations` | Epoch-fenced routed metadata PG plus volatile storage-node-owned object-payload read handles. Production reads acquire all-or-release handles for every shard-owner node of the selected segments, including parity/recovery candidates; the coarse generation helper is test-hooks-only and the boundary script rejects production callers and direct payload-byte read bypasses |
+| `acquire_object_payload_lease`, `acquire_object_payload_lease_for_shard_locations` | Epoch-fenced routed metadata PG plus volatile storage-node-owned object-payload read handles. Copy-source snapshot loading acquires the coarse generation lease through the actual storage-node clients, so it remains visible to refreshed runtime maps and other frontends, then hands off without a gap to the shard-location helper. Payload reads acquire all-or-release handles for every shard-owner node of the selected segments, including parity/recovery candidates; the boundary script rejects direct payload-byte read bypasses |
 | `enqueue_object_payload_reclaim`, `enqueue_bucket_delete_finalize`, `wait_for_reclaim_work`, `wake_reclaim_workers` | Best-effort local runtime worker queue |
 | `reclaim_object_payload_if_unleased` | Epoch-fenced routed object metadata PG command apply for reclaim-row deletion, storage-node-owned read-handle/delete fencing, and placed payload cleanup |
 | `complete_multipart_upload_commit_serialized` | Bucket-PG-primary multipart completion barrier, then epoch-fenced routed object metadata PG command apply for completed-object publication, deterministic object write sequencing, selected streamed part segment metadata, object-version-scoped replay metadata, and omitted staging cleanup. The barrier advances one fixed-size bucket scalar and retains no upload history |
@@ -264,10 +264,19 @@ script in the same change.
 ## Associated Token Types
 
 `ObjectPayloadLease::release` is the current active token release path. It must
-release against the local storage-node handle state captured at acquisition time
-and must not depend on the current cluster epoch. Phase 9.5 keeps these handles
-volatile: if the process/node serving the read fails, the client retries from a
-fresh snapshot.
+release against the actual storage-node sessions captured at acquisition time
+and must not depend on the frontend's current cluster epoch or runtime-map
+generation. Unix session disconnect releases the server-side generation lease.
+Long-lived Unix generation-lease sessions count against both the aggregate RPC
+admission limit and its shared non-control budget. All lease acquisition stops
+one slot short of that shared budget, preserving narrow-lease to read-handle
+progress. Broad acquisition stops one additional slot earlier, preventing new
+broad leases from consuming the broad-to-narrow transition slot during
+one-at-a-time handoff to shard-scoped leases. Releasing each broad lease after
+its successor is acquired preserves the same slot for the next handoff. The
+remaining reserved capacity allows short reclaim/control operations.
+Phase 9.5 keeps these handles volatile: if the process/node serving the read
+fails, the client retries from a fresh snapshot.
 
 Storage-node read-handle and reclaim-fence primitives are crate-local. The
 production surface is `StorageCluster` read-handle acquisition plus the

@@ -4,7 +4,8 @@ pub(crate) struct UnixStorageNodeReadHandleSession {
     node_id: NodeId,
     stream: UnixStream,
     next_request_id: u64,
-    _rpc_permit: UnixStorageNodeRpcAdmissionPermit,
+    _rpc_permit: Option<UnixStorageNodeRpcAdmissionPermit>,
+    _object_payload_lease_permit: Option<UnixStorageNodeObjectPayloadLeaseAdmissionPermit>,
 }
 
 pub(crate) struct UnixStorageNodeMetadataCommandSession {
@@ -27,7 +28,20 @@ struct UnixStorageNodeReadHandleLease {
     released: bool,
 }
 
+struct UnixObjectPayloadLease {
+    session: UnixStorageNodeReadHandleSession,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+    released: bool,
+}
+
 impl UnixStorageNodeClient {
+    #[cfg(test)]
+    pub(crate) fn active_admitted_session_count_for_test(&self) -> usize {
+        self.rpc_admission.active_session_count_for_test()
+    }
+
     pub(crate) fn open_read_handle_session(
         &self,
     ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
@@ -44,8 +58,89 @@ impl UnixStorageNodeClient {
             node_id: self.node_id,
             stream,
             next_request_id: 1,
-            _rpc_permit: rpc_permit,
+            _rpc_permit: Some(rpc_permit),
+            _object_payload_lease_permit: None,
         })
+    }
+
+    fn open_object_payload_lease_session(
+        &self,
+        kind: ObjectPayloadLeaseKind,
+    ) -> Result<UnixStorageNodeReadHandleSession, StoreError> {
+        let lease_permit = self.acquire_object_payload_lease_session_admission(kind)?;
+        let stream = UnixStream::connect(&self.socket_path).map_err(|source| StoreError::Io {
+            context: "connect storage-node object-payload lease RPC socket",
+            source,
+        })?;
+        configure_storage_rpc_stream_timeout(
+            &stream,
+            "configure storage-node object-payload lease RPC socket timeout",
+        )?;
+        Ok(UnixStorageNodeReadHandleSession {
+            node_id: self.node_id,
+            stream,
+            next_request_id: 1,
+            _rpc_permit: None,
+            _object_payload_lease_permit: Some(lease_permit),
+        })
+    }
+
+    fn acquire_object_payload_lease_session_admission(
+        &self,
+        kind: ObjectPayloadLeaseKind,
+    ) -> Result<UnixStorageNodeObjectPayloadLeaseAdmissionPermit, StoreError> {
+        let wait_timeout = self
+            .rpc_admission
+            .wait_timeout_for_class(UnixStorageNodeRpcAdmissionClass::Read);
+        let broad = kind == ObjectPayloadLeaseKind::BroadSnapshot;
+        match self.rpc_admission.acquire_object_payload_lease(broad) {
+            UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::Acquired(permit) => Ok(permit),
+            UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut => {
+                Err(StoreError::StorageRpcResourceExhausted {
+                    node_id: self.node_id.as_u32(),
+                    operation: match kind {
+                        ObjectPayloadLeaseKind::BroadSnapshot => {
+                            "broad object payload lease acquire"
+                        }
+                        ObjectPayloadLeaseKind::ShardLocations => {
+                            "shard object payload lease acquire"
+                        }
+                    },
+                    message: format!(
+                        "storage-node client object-payload lease session limit {} is exhausted after waiting {} ms",
+                        self.rpc_admission.limit,
+                        wait_timeout.as_millis()
+                    ),
+                })
+            }
+        }
+    }
+
+    fn object_payload_lease_control_request(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        operation: StorageRpcObjectPayloadLeaseControlOperation,
+    ) -> Result<u64, StoreError> {
+        let request = StorageRpcObjectPayloadLeaseControlRequest {
+            node_id: self.node_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            operation,
+        };
+        let payload = encode_object_payload_lease_control_request(&request);
+        let response =
+            self.rpc_request(StorageRpcMessageKind::ObjectPayloadLeaseControl, payload)?;
+        let response =
+            decode_object_payload_lease_control_response(&response).map_err(|error| {
+                self.rpc_payload_error(
+                    "decode object-payload lease control response",
+                    error.to_string(),
+                )
+            })?;
+        Ok(response.value)
     }
 
     pub(crate) fn open_metadata_command_critical_section(
@@ -126,6 +221,33 @@ impl UnixStorageNodeReadHandleSession {
             self.rpc_payload_error("decode read handle release response", error.to_string())
         })?;
         Ok(())
+    }
+
+    fn object_payload_lease_control(
+        &mut self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        operation: StorageRpcObjectPayloadLeaseControlOperation,
+    ) -> Result<u64, StoreError> {
+        let request = StorageRpcObjectPayloadLeaseControlRequest {
+            node_id: self.node_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            operation,
+        };
+        let payload = encode_object_payload_lease_control_request(&request);
+        let response =
+            self.rpc_request(StorageRpcMessageKind::ObjectPayloadLeaseControl, payload)?;
+        let response =
+            decode_object_payload_lease_control_response(&response).map_err(|error| {
+                self.rpc_payload_error(
+                    "decode object-payload lease control response",
+                    error.to_string(),
+                )
+            })?;
+        Ok(response.value)
     }
 
     fn rpc_request(
@@ -1504,6 +1626,151 @@ impl ShardReadHandleNodeClient for UnixStorageNodeClient {
     }
 }
 
+impl ObjectPayloadLeaseNodeClient for UnixStorageNodeClient {
+    fn acquire_object_payload_lease(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        kind: ObjectPayloadLeaseKind,
+    ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
+        let mut session = self.open_object_payload_lease_session(kind)?;
+        let acquired = session.object_payload_lease_control(
+            bucket,
+            key,
+            generation_id,
+            StorageRpcObjectPayloadLeaseControlOperation::Acquire,
+        )?;
+        match acquired {
+            0 => Ok(None),
+            1 => Ok(Some(Box::new(UnixObjectPayloadLease {
+                session,
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id,
+                released: false,
+            }))),
+            _ => Err(StoreError::Io {
+                context: "validate storage-node object-payload lease acquire response",
+                source: io::Error::new(io::ErrorKind::InvalidData, "invalid acquired value"),
+            }),
+        }
+    }
+
+    fn try_begin_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, StoreError> {
+        match self.object_payload_lease_control_request(
+            bucket,
+            key,
+            generation_id,
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin,
+        )? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(StoreError::Io {
+                context: "validate storage-node object-payload reclaim begin response",
+                source: io::Error::new(io::ErrorKind::InvalidData, "invalid acquired value"),
+            }),
+        }
+    }
+
+    fn finish_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        keep_fence: bool,
+    ) -> Result<(), StoreError> {
+        let operation = if keep_fence {
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence
+        } else {
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinish
+        };
+        let mut last_error = None;
+        for _ in 0..2 {
+            let result = self
+                .object_payload_lease_control_request(bucket, key, generation_id, operation)
+                .map(|_| ());
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.expect("object-payload reclaim finish attempted at least once"))
+    }
+
+    fn clear_object_payload_reclaim_fence(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<(), StoreError> {
+        let mut last_error = None;
+        for _ in 0..2 {
+            let result = self
+                .object_payload_lease_control_request(
+                    bucket,
+                    key,
+                    generation_id,
+                    StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear,
+                )
+                .map(|_| ());
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.expect("object-payload reclaim fence clear attempted at least once"))
+    }
+
+    fn object_payload_lease_count(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<usize, StoreError> {
+        let count = self.object_payload_lease_control_request(
+            bucket,
+            key,
+            generation_id,
+            StorageRpcObjectPayloadLeaseControlOperation::Count,
+        )?;
+        usize::try_from(count).map_err(|_| StoreError::Io {
+            context: "validate storage-node object-payload lease count response",
+            source: io::Error::new(io::ErrorKind::InvalidData, "lease count exceeds usize"),
+        })
+    }
+}
+
+impl ObjectPayloadLeaseNodeLease for UnixObjectPayloadLease {
+    fn release(&mut self) -> Result<usize, StoreError> {
+        if self.released {
+            return Ok(0);
+        }
+        let remaining = self.session.object_payload_lease_control(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+            StorageRpcObjectPayloadLeaseControlOperation::Release,
+        )?;
+        self.released = true;
+        usize::try_from(remaining).map_err(|_| StoreError::Io {
+            context: "validate storage-node object-payload lease release response",
+            source: io::Error::new(io::ErrorKind::InvalidData, "lease count exceeds usize"),
+        })
+    }
+}
+
+impl Drop for UnixObjectPayloadLease {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 impl ShardReadHandleLease for UnixStorageNodeReadHandleLease {
     fn release(&mut self) -> Result<(), StoreError> {
         if self.released {
@@ -1550,7 +1817,8 @@ mod tests {
             node_id: NodeId::new(8),
             stream: read_stream,
             next_request_id: 1,
-            _rpc_permit: test_rpc_admission_permit(),
+            _rpc_permit: Some(test_rpc_admission_permit()),
+            _object_payload_lease_permit: None,
         };
         let err = StorageRpcErrorResponse {
             code: StorageRpcErrorCode::ResourceExhausted,

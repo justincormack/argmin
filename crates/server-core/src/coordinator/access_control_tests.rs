@@ -1586,7 +1586,10 @@ fn copy_object_bucket_policy_copy_source_controls_access() {
             object_lock: ObjectLockState::default(),
         })
         .unwrap();
-    assert!(matches!(authorized.source.stored, StoredObject::Live(_)));
+    assert!(matches!(
+        authorized.source.snapshot.stored,
+        StoredObject::Live(_)
+    ));
     drop(authorized);
 
     let copied = coord

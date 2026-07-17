@@ -24,9 +24,9 @@ use self::modern::BoeLoadedBucketHandle;
 pub(super) use self::modern::ModernReadAction;
 use super::authz_results::{
     AuthorizedAbortMultipartUpload, AuthorizedBeginStreamPart, AuthorizedBucketConfigAccess,
-    AuthorizedCompleteMultipartUpload, AuthorizedCopyObject, AuthorizedCreateBucket,
-    AuthorizedCreateMultipartUpload, AuthorizedDeleteBucket, AuthorizedDeleteBucketCors,
-    AuthorizedDeleteBucketEncryption, AuthorizedDeleteBucketLifecycle,
+    AuthorizedCompleteMultipartUpload, AuthorizedCopyObject, AuthorizedCopySourceRead,
+    AuthorizedCreateBucket, AuthorizedCreateMultipartUpload, AuthorizedDeleteBucket,
+    AuthorizedDeleteBucketCors, AuthorizedDeleteBucketEncryption, AuthorizedDeleteBucketLifecycle,
     AuthorizedDeleteBucketPolicy, AuthorizedDeleteBucketTagging, AuthorizedDeleteObject,
     AuthorizedGetBucketAbac, AuthorizedGetBucketAcl, AuthorizedGetBucketCors,
     AuthorizedGetBucketEncryption, AuthorizedGetBucketLifecycle, AuthorizedGetBucketLocation,
@@ -397,7 +397,7 @@ impl Coordinator {
         &self,
         storage_node: &Arc<StorageCluster>,
         req: CopySourceReadSnapshotRequest<'_>,
-    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
+    ) -> Result<AuthorizedCopySourceRead, ServerError> {
         let bucket = self.load_bucket_handle_for_object_policy_read_with_storage_node(
             storage_node,
             req.bucket,

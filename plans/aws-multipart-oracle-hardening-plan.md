@@ -351,6 +351,24 @@ choice.
   snapshot, complete replacement or deletion, and then require the old body,
   ETag, content type, and user metadata on resume. The overwrite case also
   verifies that the current source contains the distinct replacement state.
+  Source authorization now returns the exact snapshot with a broad generation
+  lease; CopyObject and UploadPartCopy retain it through condition, encryption,
+  and metadata processing and hand it off to the shard-specific read lease
+  without an unleased reclamation interval. The storage regression also pins
+  retry when the authorization subject changes before exact snapshot loading.
+  Broad leases are session-owned on the actual storage nodes rather than on
+  frontend topology placeholders; an installed-Unix A-to-B runtime-map refresh
+  regression proves that reclaim through B remains deferred until A releases.
+  Their long-lived Unix sessions consume one aggregate RPC admission limit and
+  its shared non-control budget. All lease acquisition stops one slot short of
+  that budget to preserve narrow-to-read progress; broad acquisition stops one
+  additional slot earlier so new broad work cannot consume the broad-to-narrow
+  transition slot. Minimum-limit saturation coverage performs the real
+  one-at-a-time handoff: acquire a shard-scoped successor, release its broad
+  predecessor, then reuse the transition slot. Direct narrow-lease saturation
+  coverage also proves an ordinary read handle can still open. Short
+  reclaim/count control RPCs progress, and aggregate live sessions never exceed
+  the configured limit.
 - [x] Probe conditional PutObject contention for both the direct and streamed
   paths, including aws-chunked requests. Cover simultaneous
   `If-None-Match: *` creates, competing `If-Match` overwrites, intervening

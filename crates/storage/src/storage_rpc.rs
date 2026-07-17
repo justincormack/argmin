@@ -344,6 +344,8 @@ const STORAGE_RPC_MAX_OBJECT_VERSION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_EXISTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 8;
+const STORAGE_RPC_MAX_OBJECT_PAYLOAD_LEASE_CONTROL_REQUEST_PAYLOAD_LEN: usize =
+    4 + STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN + 4 + STORAGE_RPC_MAX_OBJECT_KEY_LEN + 8 + 1;
 const STORAGE_RPC_OBJECT_PAYLOAD_RECLAIM_CLAIM_RECORD_MAX_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
         + 8
@@ -718,6 +720,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandPgLockAcquire = 121,
     MetadataCommandPgLockRelease = 122,
     ObjectPayloadReclaimClaimGet = 160,
+    ObjectPayloadLeaseControl = 161,
     BucketWriteDrainGet = 155,
     BucketDeleteAttemptOutcomeRecord = 156,
     BucketDeleteAttemptOutcomeGet = 157,
@@ -993,6 +996,7 @@ impl StorageRpcMessageKind {
             Self::ObjectPayloadReclaimClaimAcquire => "object payload reclaim claim acquire",
             Self::ObjectPayloadReclaimClaimRelease => "object payload reclaim claim release",
             Self::ObjectPayloadReclaimClaimGet => "object payload reclaim claim get",
+            Self::ObjectPayloadLeaseControl => "object payload lease control",
             Self::PlacedSegmentShardRepairRecord => "placed segment shard repair record",
             Self::PlacedSegmentShardRepairs => "placed segment shard repairs",
             Self::PlacedSegmentShardRepairResolve => "placed segment shard repair resolve",
@@ -1160,6 +1164,7 @@ impl StorageRpcMessageKind {
             158 => Ok(Self::BucketDeleteBeginRoots),
             159 => Ok(Self::BucketDeleteFinalizeClaimGet),
             160 => Ok(Self::ObjectPayloadReclaimClaimGet),
+            161 => Ok(Self::ObjectPayloadLeaseControl),
             124 => Ok(Self::BucketWriteDrainHeartbeat),
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
@@ -1482,6 +1487,32 @@ pub(crate) struct StorageRpcObjectGenerationReservationRequest {
 pub(crate) struct StorageRpcObjectPayloadReclaimExistsRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) generation_id: GenerationId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum StorageRpcObjectPayloadLeaseControlOperation {
+    Acquire = 1,
+    Release = 2,
+    ReclaimBegin = 3,
+    ReclaimFinish = 4,
+    ReclaimFinishKeepFence = 5,
+    ReclaimFenceClear = 6,
+    Count = 7,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectPayloadLeaseControlRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) generation_id: GenerationId,
+    pub(crate) operation: StorageRpcObjectPayloadLeaseControlOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageRpcObjectPayloadLeaseControlResponse {
+    pub(crate) value: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3436,6 +3467,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ReadHandlesRelease => {
             STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ObjectPayloadLeaseControl => {
+            STORAGE_RPC_MAX_OBJECT_PAYLOAD_LEASE_CONTROL_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::ShardRead | StorageRpcMessageKind::ShardHistoricalRead => {
             STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN
         }
@@ -4341,6 +4375,67 @@ pub(crate) fn decode_object_payload_reclaim_exists_request(
         object,
         generation_id,
     })
+}
+
+pub(crate) fn encode_object_payload_lease_control_request(
+    request: &StorageRpcObjectPayloadLeaseControlRequest,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_string(&mut out, request.bucket.as_str());
+    put_string(&mut out, request.key.as_str());
+    put_u64(&mut out, request.generation_id.get());
+    out.push(request.operation as u8);
+    out
+}
+
+pub(crate) fn decode_object_payload_lease_control_request(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectPayloadLeaseControlRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let bucket = decoder.read_bucket_name()?;
+    let key = decoder.read_object_key()?;
+    let generation_id = decoder.read_generation_id()?;
+    let operation = match decoder.read_u8()? {
+        1 => StorageRpcObjectPayloadLeaseControlOperation::Acquire,
+        2 => StorageRpcObjectPayloadLeaseControlOperation::Release,
+        3 => StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin,
+        4 => StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinish,
+        5 => StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence,
+        6 => StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear,
+        7 => StorageRpcObjectPayloadLeaseControlOperation::Count,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "unknown object payload lease control operation",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcObjectPayloadLeaseControlRequest {
+        node_id,
+        bucket,
+        key,
+        generation_id,
+        operation,
+    })
+}
+
+pub(crate) fn encode_object_payload_lease_control_response(
+    response: StorageRpcObjectPayloadLeaseControlResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, response.value);
+    out
+}
+
+pub(crate) fn decode_object_payload_lease_control_response(
+    bytes: &[u8],
+) -> Result<StorageRpcObjectPayloadLeaseControlResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let value = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcObjectPayloadLeaseControlResponse { value })
 }
 
 pub(crate) fn encode_object_payload_reclaim_response(
@@ -18961,6 +19056,59 @@ mod tests {
     }
 
     #[test]
+    fn object_payload_lease_control_request_and_response_round_trip() {
+        let operations = [
+            StorageRpcObjectPayloadLeaseControlOperation::Acquire,
+            StorageRpcObjectPayloadLeaseControlOperation::Release,
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin,
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinish,
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence,
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear,
+            StorageRpcObjectPayloadLeaseControlOperation::Count,
+        ];
+        for operation in operations {
+            let request = StorageRpcObjectPayloadLeaseControlRequest {
+                node_id: NodeId::new(7),
+                bucket: BucketName::new("lease-bucket").unwrap(),
+                key: ObjectKey::new("lease-key").unwrap(),
+                generation_id: GenerationId::new(11).unwrap(),
+                operation,
+            };
+            let encoded = encode_object_payload_lease_control_request(&request);
+            assert!(
+                encoded.len() <= STORAGE_RPC_MAX_OBJECT_PAYLOAD_LEASE_CONTROL_REQUEST_PAYLOAD_LEN
+            );
+            assert_eq!(
+                decode_object_payload_lease_control_request(&encoded).unwrap(),
+                request
+            );
+        }
+
+        let response = StorageRpcObjectPayloadLeaseControlResponse { value: 19 };
+        assert_eq!(
+            decode_object_payload_lease_control_response(
+                &encode_object_payload_lease_control_response(response)
+            )
+            .unwrap(),
+            response
+        );
+
+        let request = StorageRpcObjectPayloadLeaseControlRequest {
+            node_id: NodeId::new(7),
+            bucket: BucketName::new("lease-bucket").unwrap(),
+            key: ObjectKey::new("lease-key").unwrap(),
+            generation_id: GenerationId::new(11).unwrap(),
+            operation: StorageRpcObjectPayloadLeaseControlOperation::Acquire,
+        };
+        let mut corrupt = encode_object_payload_lease_control_request(&request);
+        *corrupt.last_mut().unwrap() = u8::MAX;
+        assert!(matches!(
+            decode_object_payload_lease_control_request(&corrupt),
+            Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(_))
+        ));
+    }
+
+    #[test]
     fn read_handle_acquire_request_rejects_corrupt_location_count_before_allocating() {
         let mut bytes = Vec::new();
         put_string(&mut bytes, "read-op-oom");
@@ -19057,6 +19205,11 @@ mod tests {
                 StorageRpcMessageKind::ReadHandlesRelease,
                 STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_READ_HANDLE_RELEASE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ObjectPayloadLeaseControl,
+                STORAGE_RPC_MAX_OBJECT_PAYLOAD_LEASE_CONTROL_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_OBJECT_PAYLOAD_LEASE_CONTROL_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::ShardRead,

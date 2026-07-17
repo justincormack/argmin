@@ -6316,7 +6316,7 @@ impl super::StorageCluster {
                     &root.bucket,
                     &root.key,
                     root.generation_id,
-                ) != 0
+                )? != 0
                 {
                     continue;
                 }
@@ -6338,7 +6338,7 @@ impl super::StorageCluster {
                     &root.bucket,
                     &root.key,
                     root.generation_id,
-                ) == 0
+                )? == 0
                 {
                     self.enqueue_object_payload_reclaim(
                         &root.bucket,
@@ -7891,6 +7891,64 @@ impl super::StorageCluster {
             context: "load object read snapshot stale retry limit exceeded",
             source: std::io::Error::other(
                 "object changed repeatedly while loading authorized read snapshot",
+            ),
+        }))
+    }
+
+    pub fn load_leased_object_read_snapshot_if<T, E>(
+        self: &Arc<Self>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        snapshot_mode: ObjectReadSnapshotMode,
+        mut action: impl FnMut(&StoredObject) -> Result<T, E>,
+    ) -> Result<Result<super::LeasedObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_read_client = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+            .object_read_metadata_client();
+
+        for _ in 0..OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT {
+            let subject =
+                object_read_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+            let value = match action(&subject.stored) {
+                Ok(value) => value,
+                Err(error) => return Ok(Err(error)),
+            };
+            let payload_lease = if let Some(live) = subject.stored.as_live() {
+                match self.acquire_object_payload_lease(bucket, key, live.generation_id) {
+                    Ok(lease) => Some(lease),
+                    Err(StoreError::NotFound) => continue,
+                    Err(error) => return Err(ObjectPgActionError::Store(error)),
+                }
+            } else {
+                None
+            };
+            match object_read_client.load_object_read_snapshot_for_subject(
+                pg_id,
+                bucket,
+                key,
+                version_id,
+                &subject.identity,
+                snapshot_mode,
+            ) {
+                Ok(snapshot) => {
+                    return Ok(Ok(super::LeasedObjectReadSnapshotOutcome {
+                        value,
+                        snapshot,
+                        payload_lease,
+                    }));
+                }
+                Err(ObjectPgActionError::StaleObjectReadSubject) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(ObjectPgActionError::Store(StoreError::Io {
+            context: "load leased object read snapshot stale retry limit exceeded",
+            source: std::io::Error::other(
+                "object changed repeatedly while loading leased authorized read snapshot",
             ),
         }))
     }
@@ -9707,7 +9765,6 @@ impl super::StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
     pub fn acquire_object_payload_lease(
         self: &std::sync::Arc<Self>,
         bucket: &BucketName,
@@ -9715,15 +9772,15 @@ impl super::StorageCluster {
         generation_id: GenerationId,
     ) -> Result<ObjectPayloadLease, StoreError> {
         let runtime_state = self.ensure_object_payload_lease_allowed(bucket, key, generation_id)?;
-        if !self
-            .local_map
-            .try_acquire_object_payload_lease(bucket, key, generation_id)
-        {
+        let node_leases =
+            self.local_map
+                .try_acquire_object_payload_lease(bucket, key, generation_id)?;
+        if node_leases.is_empty() {
             return Err(StoreError::NotFound);
         }
         Ok(ObjectPayloadLease::new(
             std::sync::Arc::downgrade(self),
-            self.local_map.object_payload_lease_storage_clients(),
+            node_leases,
             runtime_state,
             bucket.clone(),
             key.clone(),
@@ -9740,15 +9797,15 @@ impl super::StorageCluster {
         locations: &[super::ShardLocation],
     ) -> Result<ObjectPayloadLease, StoreError> {
         let runtime_state = self.ensure_object_payload_lease_allowed(bucket, key, generation_id)?;
-        let storage_nodes = self
+        let node_leases = self
             .local_map
             .try_acquire_object_payload_lease_on_locations(bucket, key, generation_id, locations)?;
-        if !locations.is_empty() && storage_nodes.is_empty() {
+        if !locations.is_empty() && node_leases.is_empty() {
             return Err(StoreError::NotFound);
         }
         Ok(ObjectPayloadLease::new(
             std::sync::Arc::downgrade(self),
-            storage_nodes,
+            node_leases,
             runtime_state,
             bucket.clone(),
             key.clone(),
@@ -9794,6 +9851,7 @@ impl super::StorageCluster {
         }
         self.local_map
             .object_payload_lease_count(bucket, key, generation_id)
+            .expect("test payload lease count should be readable")
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -10007,7 +10065,7 @@ impl super::StorageCluster {
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         if self
             .local_map
-            .object_payload_lease_count(bucket, key, generation_id)
+            .object_payload_lease_count(bucket, key, generation_id)?
             != 0
         {
             emit_outcome("deferred_lease");
@@ -10030,7 +10088,7 @@ impl super::StorageCluster {
                             bucket,
                             key,
                             generation_id,
-                        );
+                        )?;
                         emit_outcome("completed_existing_pending");
                         return Ok(super::ObjectPayloadReclaimAttempt::Completed);
                     }
@@ -10051,7 +10109,7 @@ impl super::StorageCluster {
         let reclaim = {
             if self
                 .local_map
-                .object_payload_lease_count(bucket, key, generation_id)
+                .object_payload_lease_count(bucket, key, generation_id)?
                 != 0
             {
                 emit_outcome("deferred_lease");
@@ -10118,7 +10176,7 @@ impl super::StorageCluster {
 
         if !self
             .local_map
-            .try_begin_object_payload_reclaim(bucket, key, generation_id)
+            .try_begin_object_payload_reclaim(bucket, key, generation_id)?
         {
             release_reclaim_claim()?;
             emit_outcome("deferred_active");
@@ -10255,7 +10313,7 @@ impl super::StorageCluster {
             key,
             generation_id,
             keep_reclaim_fence,
-        );
+        )?;
         result
     }
 
@@ -10334,12 +10392,24 @@ impl super::StorageCluster {
                 );
                 continue;
             }
-            if self.local_map.object_payload_lease_count(
+            let lease_count = match self.local_map.object_payload_lease_count(
                 &root.bucket,
                 &root.key,
                 root.generation_id,
-            ) != 0
-            {
+            ) {
+                Ok(count) => count,
+                Err(error) => {
+                    scan.errors += 1;
+                    emit_scan("error");
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "object_reclaim_durable_scan_lease_error",
+                        Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                    );
+                    continue;
+                }
+            };
+            if lease_count != 0 {
                 emit_scan("leased");
                 continue;
             }

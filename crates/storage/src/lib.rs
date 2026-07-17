@@ -49,13 +49,13 @@ pub mod traits;
 pub mod types;
 
 pub use cluster::{
-    BucketWriteSnapshotAction, LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
-    LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
-    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
-    ObjectPayloadLease, PgMetadataTransferArtifact, PlacedSegmentShardBackfillCopyTarget,
-    PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth, PlacedSegmentShardSetHealth,
-    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, ReleasedObjectPayloadLease,
-    ShardLocation, StorageCluster, StorageClusterRuntimeMapHandle,
+    BucketWriteSnapshotAction, LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStore,
+    LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
+    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
+    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
+    PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,
+    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
+    ReleasedObjectPayloadLease, ShardLocation, StorageCluster, StorageClusterRuntimeMapHandle,
     StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
     StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
     StorageClusterRuntimeMapRefreshLoopSuccess,

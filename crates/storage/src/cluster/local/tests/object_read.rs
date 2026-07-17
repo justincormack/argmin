@@ -122,6 +122,141 @@ fn object_read_snapshot_retries_when_object_changes_after_auth_subject_load() {
 }
 
 #[test]
+fn leased_object_read_snapshot_retries_when_subject_changes_before_exact_snapshot() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    let original = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [1; 16],
+        [1; 16],
+        b"first",
+    );
+    let mutated = std::cell::Cell::new(false);
+    let call_count = std::cell::Cell::new(0);
+
+    let outcome = cluster
+        .load_leased_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |stored| {
+                call_count.set(call_count.get() + 1);
+                let generation_id = stored
+                    .as_live()
+                    .expect("test object should be live")
+                    .generation_id;
+                if !mutated.replace(true) {
+                    assert_eq!(generation_id, original.generation_id);
+                    write_committed_direct_segment_for_with_versioning(
+                        &cluster,
+                        &bucket,
+                        &key,
+                        crate::BucketVersioningState::Disabled,
+                        [2; 16],
+                        [2; 16],
+                        b"second",
+                    );
+                }
+                Ok::<_, ()>(generation_id)
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    let snapshot_generation = outcome
+        .snapshot
+        .stored
+        .as_live()
+        .expect("snapshot should contain the replacement live object")
+        .generation_id;
+    assert_eq!(call_count.get(), 2);
+    assert_ne!(snapshot_generation, original.generation_id);
+    assert_eq!(outcome.value, snapshot_generation);
+    assert!(outcome.payload_lease.is_some());
+}
+
+#[test]
+fn leased_object_read_snapshot_blocks_reclaim_until_handoff() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    let original = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [1; 16],
+        [1; 16],
+        b"first",
+    );
+
+    let outcome = cluster
+        .load_leased_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    let payload_lease = outcome
+        .payload_lease
+        .expect("live leased snapshot should carry a payload lease");
+    write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [2; 16],
+        [2; 16],
+        b"second",
+    );
+    assert!(cluster
+        .payload_reclaim_exists(&bucket, &key, original.generation_id)
+        .unwrap());
+    assert!(
+        !cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, original.generation_id)
+            .unwrap(),
+        "broad snapshot lease must block reclaim before the read-handle lease handoff"
+    );
+
+    drop(payload_lease);
+    assert!(
+        cluster
+            .reclaim_object_payload_if_unleased(&bucket, &key, original.generation_id)
+            .unwrap(),
+        "reclaim should proceed after the broad snapshot lease is released"
+    );
+}
+
+#[test]
 fn object_read_snapshot_retries_when_object_disappears_after_auth_subject_load() {
     let tmp = test_util::tempdir();
     let map = Arc::new(

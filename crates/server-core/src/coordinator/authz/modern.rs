@@ -503,7 +503,7 @@ impl Coordinator {
         storage_node: &Arc<storage::StorageCluster>,
         req: CopySourceReadSnapshotRequest<'_>,
         bucket: BoeLoadedBucketHandle<'_>,
-    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
+    ) -> Result<AuthorizedCopySourceRead, ServerError> {
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
         let modern_bucket = BoeBucketSummary::assume_boe(&modern_bucket_info);
@@ -527,7 +527,7 @@ impl Coordinator {
                 req.version_id,
             )?;
         let outcome = storage_node
-            .load_object_read_snapshot_if(
+            .load_leased_object_read_snapshot_if(
                 &bucket.bucket().name,
                 req.key,
                 req.version_id,
@@ -561,7 +561,10 @@ impl Coordinator {
                     error,
                 )
             })??;
-        Ok(outcome.snapshot)
+        Ok(AuthorizedCopySourceRead {
+            snapshot: outcome.snapshot,
+            payload_lease: outcome.payload_lease,
+        })
     }
 
     pub(super) fn authorize_object_read_snapshot_boe(

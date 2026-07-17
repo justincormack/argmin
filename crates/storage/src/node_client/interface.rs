@@ -962,6 +962,55 @@ pub(crate) trait ShardReadHandleNodeClient: Send + Sync {
     ) -> Result<Box<dyn ShardReadHandleLease>, StoreError>;
 }
 
+pub(crate) trait ObjectPayloadLeaseNodeLease: Send {
+    fn release(&mut self) -> Result<usize, StoreError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectPayloadLeaseKind {
+    BroadSnapshot,
+    ShardLocations,
+}
+
+pub(crate) trait ObjectPayloadLeaseNodeClient: Send + Sync {
+    fn acquire_object_payload_lease(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        kind: ObjectPayloadLeaseKind,
+    ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError>;
+
+    fn try_begin_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, StoreError>;
+
+    fn finish_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        keep_fence: bool,
+    ) -> Result<(), StoreError>;
+
+    fn clear_object_payload_reclaim_fence(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<(), StoreError>;
+
+    fn object_payload_lease_count(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<usize, StoreError>;
+}
+
 pub(crate) trait ShardAckNodeClient: Send + Sync {
     fn register_written_shard_acks(
         &self,
@@ -1970,49 +2019,6 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
-
-    fn try_acquire_object_payload_lease(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> bool;
-
-    fn release_object_payload_lease(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> usize;
-
-    fn try_begin_object_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> bool;
-
-    fn finish_object_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        keep_fence: bool,
-    );
-
-    fn clear_object_payload_reclaim_fence(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    );
-
-    fn object_payload_lease_count(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> usize;
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize;

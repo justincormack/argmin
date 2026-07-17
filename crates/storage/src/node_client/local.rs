@@ -1,6 +1,35 @@
 use super::*;
 use crate::BucketAclSummary;
 
+struct LocalObjectPayloadLease {
+    storage_node: Arc<SharedStorageNode>,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+    released: bool,
+}
+
+impl ObjectPayloadLeaseNodeLease for LocalObjectPayloadLease {
+    fn release(&mut self) -> Result<usize, StoreError> {
+        if self.released {
+            return Ok(0);
+        }
+        let remaining = self.storage_node.release_object_payload_lease(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+        );
+        self.released = true;
+        Ok(remaining)
+    }
+}
+
+impl Drop for LocalObjectPayloadLease {
+    fn drop(&mut self) {
+        let _ = self.release();
+    }
+}
+
 impl LocalStorageNodeClient {
     pub(crate) fn new(node_id: NodeId, storage_node: Arc<SharedStorageNode>) -> Self {
         Self {
@@ -137,6 +166,75 @@ impl ShardReadHandleNodeClient for LocalStorageNodeClient {
         _entries: Vec<(crate::cluster::ShardLocation, ShardKey)>,
     ) -> Result<Box<dyn ShardReadHandleLease>, StoreError> {
         Ok(Box::new(LocalStorageNodeReadHandleLease))
+    }
+}
+
+impl ObjectPayloadLeaseNodeClient for LocalStorageNodeClient {
+    fn acquire_object_payload_lease(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        _kind: ObjectPayloadLeaseKind,
+    ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
+        if !self
+            .storage_node
+            .try_acquire_object_payload_lease(bucket, key, generation_id)
+        {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(LocalObjectPayloadLease {
+            storage_node: Arc::clone(&self.storage_node),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            released: false,
+        })))
+    }
+
+    fn try_begin_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .storage_node
+            .try_begin_object_payload_reclaim(bucket, key, generation_id))
+    }
+
+    fn finish_object_payload_reclaim(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        keep_fence: bool,
+    ) -> Result<(), StoreError> {
+        self.storage_node
+            .finish_object_payload_reclaim(bucket, key, generation_id, keep_fence);
+        Ok(())
+    }
+
+    fn clear_object_payload_reclaim_fence(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<(), StoreError> {
+        self.storage_node
+            .clear_object_payload_reclaim_fence(bucket, key, generation_id);
+        Ok(())
+    }
+
+    fn object_payload_lease_count(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<usize, StoreError> {
+        Ok(self
+            .storage_node
+            .object_payload_lease_count(bucket, key, generation_id))
     }
 }
 
@@ -1584,67 +1682,6 @@ impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {
 }
 
 impl StorageNodeClient for LocalStorageNodeClient {
-    fn try_acquire_object_payload_lease(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> bool {
-        self.storage_node
-            .try_acquire_object_payload_lease(bucket, key, generation_id)
-    }
-
-    fn release_object_payload_lease(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> usize {
-        self.storage_node
-            .release_object_payload_lease(bucket, key, generation_id)
-    }
-
-    fn try_begin_object_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> bool {
-        self.storage_node
-            .try_begin_object_payload_reclaim(bucket, key, generation_id)
-    }
-
-    fn finish_object_payload_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        keep_fence: bool,
-    ) {
-        self.storage_node
-            .finish_object_payload_reclaim(bucket, key, generation_id, keep_fence);
-    }
-
-    fn clear_object_payload_reclaim_fence(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) {
-        self.storage_node
-            .clear_object_payload_reclaim_fence(bucket, key, generation_id);
-    }
-
-    fn object_payload_lease_count(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> usize {
-        self.storage_node
-            .object_payload_lease_count(bucket, key, generation_id)
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
     fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
         self.storage_node.bucket_object_payload_lease_count(bucket)

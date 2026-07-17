@@ -1111,7 +1111,7 @@ impl Coordinator {
         storage_node: &Arc<storage::StorageCluster>,
         req: CopySourceReadSnapshotRequest<'_>,
         bucket: NonBoeLoadedBucketHandle<'_>,
-    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
+    ) -> Result<AuthorizedCopySourceRead, ServerError> {
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let bucket_tags = if bucket_policy.is_some() {
@@ -1132,7 +1132,7 @@ impl Coordinator {
                 req.version_id,
             )?;
         let outcome = storage_node
-            .load_object_read_snapshot_if(
+            .load_leased_object_read_snapshot_if(
                 &bucket.bucket().name,
                 req.key,
                 req.version_id,
@@ -1176,7 +1176,10 @@ impl Coordinator {
                     error,
                 )
             })??;
-        Ok(outcome.snapshot)
+        Ok(AuthorizedCopySourceRead {
+            snapshot: outcome.snapshot,
+            payload_lease: outcome.payload_lease,
+        })
     }
 
     pub(in crate::coordinator) fn map_object_read_snapshot_error(

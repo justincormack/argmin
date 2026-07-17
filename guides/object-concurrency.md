@@ -47,6 +47,20 @@ metadata paths (for example, `DeleteBucket` emptiness checks).
     per-upload completion or abort history.
 15. Exact completion replay metadata must publish atomically with the completed
     object version, and disappear only when that version is replaced or removed.
+16. Copy-source authorization must return its exact metadata snapshot together
+    with a broad payload-generation lease acquired on the actual storage nodes.
+    The lease must remain visible across frontend/runtime-map replacement.
+    Copy processing may replace it only after acquiring the shard-specific read
+    lease, so source overwrite/delete reclaim never observes an unleased
+    interval. Long-lived Unix generation-lease sessions consume the same
+    aggregate configured RPC admission limit and the shared non-control budget.
+    All lease acquisition stops one slot short of that shared budget, preserving
+    narrow-lease to read-handle progress. Broad acquisition stops one additional
+    slot earlier, so a new broad lease cannot consume the broad-to-narrow
+    transition slot while existing broad leases acquire shard-scoped
+    successors. Each broad lease is released after its successor is acquired.
+    The remaining reserved capacity must allow short completion/control
+    operations to progress.
 
 ## Required Coordinator APIs
 

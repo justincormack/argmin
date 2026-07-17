@@ -5923,6 +5923,11 @@ fn copy_object_is_consistent_during_concurrent_overwrite() {
 
 #[test]
 fn copy_object_uses_snapshotted_source_during_overwrite() {
+    const SOURCE_BUCKET: &str = "copy-snapshot-overwrite-source-bucket";
+    const SOURCE_KEY: &str = "copy-snapshot-overwrite-source-object";
+    const DESTINATION_BUCKET: &str = "copy-snapshot-overwrite-destination-bucket";
+    const DESTINATION_KEY: &str = "copy-snapshot-overwrite-destination-object";
+
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
@@ -5931,10 +5936,10 @@ fn copy_object_uses_snapshotted_source_during_overwrite() {
 
     let admin = make_coord();
     admin
-        .create_bucket_for_owner("default-owner", "src-bucket", false)
+        .create_bucket_for_owner("default-owner", SOURCE_BUCKET, false)
         .unwrap();
     admin
-        .create_bucket_for_owner("default-owner", "dst-bucket", false)
+        .create_bucket_for_owner("default-owner", DESTINATION_BUCKET, false)
         .unwrap();
 
     let original_body = vec![b'o'; (2 * 1024 * 1024) + 137];
@@ -5950,7 +5955,12 @@ fn copy_object_uses_snapshotted_source_during_overwrite() {
             encryption: WriteEncryptionRequest::none(),
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("src-bucket", "src", test_requester(), None),
+            object: object_request_with_expected_owner(
+                SOURCE_BUCKET,
+                SOURCE_KEY,
+                test_requester(),
+                None,
+            ),
             data: &original_body,
             metadata: &original_metadata,
             system_metadata: &original_system_metadata,
@@ -5962,14 +5972,14 @@ fn copy_object_uses_snapshotted_source_during_overwrite() {
     .unwrap();
     let original_etag = original.etag;
 
-    let sync = install_object_read_snapshot_race_hook("src-bucket", "src");
+    let sync = install_object_read_snapshot_race_hook(SOURCE_BUCKET, SOURCE_KEY);
     let copier = make_coord();
     let copy = thread::spawn(move || {
         copier.copy_object(&CopyObjectRequest {
-            source: copy_source("src-bucket", "src", None),
+            source: copy_source(SOURCE_BUCKET, SOURCE_KEY, None),
             destination: object_request_with_expected_owner(
-                "dst-bucket",
-                "dst",
+                DESTINATION_BUCKET,
+                DESTINATION_KEY,
                 test_requester(),
                 None,
             ),
@@ -5999,7 +6009,12 @@ fn copy_object_uses_snapshotted_source_during_overwrite() {
             encryption: WriteEncryptionRequest::none(),
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("src-bucket", "src", test_requester(), None),
+            object: object_request_with_expected_owner(
+                SOURCE_BUCKET,
+                SOURCE_KEY,
+                test_requester(),
+                None,
+            ),
             data: &replacement_body,
             metadata: &replacement_metadata,
             system_metadata: &replacement_system_metadata,
@@ -6020,8 +6035,8 @@ fn copy_object_uses_snapshotted_source_during_overwrite() {
         .get_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "dst-bucket",
-                "dst",
+                DESTINATION_BUCKET,
+                DESTINATION_KEY,
                 None,
                 test_requester(),
                 None,
@@ -6047,8 +6062,8 @@ fn copy_object_uses_snapshotted_source_during_overwrite() {
         .get_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "src-bucket",
-                "src",
+                SOURCE_BUCKET,
+                SOURCE_KEY,
                 None,
                 test_requester(),
                 None,
@@ -6073,6 +6088,11 @@ fn copy_object_uses_snapshotted_source_during_overwrite() {
 
 #[test]
 fn copy_object_uses_snapshotted_source_during_delete() {
+    const SOURCE_BUCKET: &str = "copy-snapshot-delete-source-bucket";
+    const SOURCE_KEY: &str = "copy-snapshot-delete-source-object";
+    const DESTINATION_BUCKET: &str = "copy-snapshot-delete-destination-bucket";
+    const DESTINATION_KEY: &str = "copy-snapshot-delete-destination-object";
+
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
@@ -6081,10 +6101,10 @@ fn copy_object_uses_snapshotted_source_during_delete() {
 
     let admin = make_coord();
     admin
-        .create_bucket_for_owner("default-owner", "src-bucket", false)
+        .create_bucket_for_owner("default-owner", SOURCE_BUCKET, false)
         .unwrap();
     admin
-        .create_bucket_for_owner("default-owner", "dst-bucket", false)
+        .create_bucket_for_owner("default-owner", DESTINATION_BUCKET, false)
         .unwrap();
 
     let source_body = vec![b's'; (2 * 1024 * 1024) + 137];
@@ -6100,7 +6120,12 @@ fn copy_object_uses_snapshotted_source_during_delete() {
             encryption: WriteEncryptionRequest::none(),
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("src-bucket", "src", test_requester(), None),
+            object: object_request_with_expected_owner(
+                SOURCE_BUCKET,
+                SOURCE_KEY,
+                test_requester(),
+                None,
+            ),
             data: &source_body,
             metadata: &source_metadata,
             system_metadata: &source_system_metadata,
@@ -6112,14 +6137,14 @@ fn copy_object_uses_snapshotted_source_during_delete() {
     .unwrap();
     let source_etag = source.etag;
 
-    let sync = install_object_read_snapshot_race_hook("src-bucket", "src");
+    let sync = install_object_read_snapshot_race_hook(SOURCE_BUCKET, SOURCE_KEY);
     let copier = make_coord();
     let copy = thread::spawn(move || {
         copier.copy_object(&CopyObjectRequest {
-            source: copy_source("src-bucket", "src", None),
+            source: copy_source(SOURCE_BUCKET, SOURCE_KEY, None),
             destination: object_request_with_expected_owner(
-                "dst-bucket",
-                "dst",
+                DESTINATION_BUCKET,
+                DESTINATION_KEY,
                 test_requester(),
                 None,
             ),
@@ -6137,8 +6162,8 @@ fn copy_object_uses_snapshotted_source_during_delete() {
     sync.snapshot_reached.wait();
 
     let deleted = admin.delete_object(&delete_object_request(
-        "src-bucket",
-        "src",
+        SOURCE_BUCKET,
+        SOURCE_KEY,
         None,
         test_requester(),
         false,
@@ -6155,8 +6180,8 @@ fn copy_object_uses_snapshotted_source_during_delete() {
         .get_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "dst-bucket",
-                "dst",
+                DESTINATION_BUCKET,
+                DESTINATION_KEY,
                 None,
                 test_requester(),
                 None,
@@ -6182,8 +6207,8 @@ fn copy_object_uses_snapshotted_source_during_delete() {
         admin.get_object(&GetObjectRequest {
             sse_customer: None,
             object: object_version_request_with_expected_owner(
-                "src-bucket",
-                "src",
+                SOURCE_BUCKET,
+                SOURCE_KEY,
                 None,
                 test_requester(),
                 None,

@@ -1917,12 +1917,17 @@ coarse_payload_lease_callers=$(
         update_function_context()
         if ($0 ~ /\.[[:space:]]*acquire_object_payload_lease\(/ \
             && current_fn != "acquire_object_payload_lease" \
+            && current_fn != "load_leased_object_read_snapshot_if<T, E>" \
+            && current_fn != "try_acquire_object_payload_lease" \
+            && current_fn != "try_acquire_object_payload_lease_on_locations" \
+            && current_fn != "acquire_object_payload_lease_session_admission" \
+            && current_fn != "object_payload_lease_control_response" \
             && !in_test_hook) {
             print FILENAME ":" current_fn
         }
     }
     ' $(find crates/storage/src crates/server-core/src -type f -name '*.rs' \
-        ! -path 'crates/storage/src/tests/*' \
+        ! -path '*/tests/*' \
         ! -name '*_tests.rs' \
         | sort) \
         | sort \
@@ -1930,7 +1935,7 @@ coarse_payload_lease_callers=$(
         | sed 's/^ *//'
 )
 fail_with_matches \
-    "Production reads must acquire payload handles for selected shard locations, not coarse generation-wide leases" \
+    "Production reads may use a coarse generation-wide lease only while loading an exact leased snapshot before shard-location handoff" \
     "$coarse_payload_lease_callers"
 
 legacy_payload_matches=$(

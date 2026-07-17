@@ -1,4 +1,5 @@
 use super::*;
+use crate::node_client::ObjectPayloadLeaseKind;
 use crate::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
@@ -138,6 +139,266 @@ fn unix_client_tempdir() -> (std::sync::MutexGuard<'static, ()>, test_util::Temp
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     (guard, test_util::tempdir())
+}
+
+#[test]
+fn unix_broad_payload_lease_survives_frontend_runtime_map_refresh() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(0);
+    let node_ids = [node_id];
+    let pg_id = PgId::new(0);
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let epoch = ClusterEpoch::INITIAL;
+    let socket_path = tmp.path().join("sockets").join("lease-refresh.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let route = StorageNodePgRoute {
+        pg_id: pg_id.get(),
+        cluster_epoch: epoch,
+        state: PgState::Active,
+        primary_node_id: node_id,
+        acting_set: node_ids.to_vec(),
+    };
+    let _server = spawn_storage_node_server(
+        StorageNodeServer::bind(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: epoch,
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join("lease-refresh-node"),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![pg_id.get()],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![route],
+            pending_metadata_command_recoveries: Vec::new(),
+            historical_pg_routes: Vec::new(),
+        })
+        .unwrap(),
+    );
+
+    let open_frontend_map = || {
+        let mut map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+            node_id,
+            node_ids,
+            &[pg_id.get()],
+            ec_shape,
+            epoch,
+        )
+        .unwrap();
+        map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+            node_id,
+            socket_path.clone(),
+        )])
+        .unwrap();
+        map
+    };
+    let map_a = Arc::new(open_frontend_map());
+    let cluster_a = StorageCluster::from_local_map(Arc::clone(&map_a)).unwrap();
+    let bucket = BucketName::new("lease-refresh-bucket").unwrap();
+    let key = ObjectKey::new("source").unwrap();
+    let original = write_committed_direct_segment_for(&cluster_a, &bucket, &key, b"original");
+    let broad_lease = cluster_a
+        .acquire_object_payload_lease(&bucket, &key, original.generation_id)
+        .unwrap();
+    write_committed_direct_segment_for(&cluster_a, &bucket, &key, b"replacement");
+    assert!(cluster_a
+        .payload_reclaim_exists(&bucket, &key, original.generation_id)
+        .unwrap());
+
+    let mut map_b = open_frontend_map();
+    map_b.inherit_process_local_state_from(&map_a);
+    let cluster_b = StorageCluster::from_local_map(Arc::new(map_b)).unwrap();
+    assert_eq!(
+        cluster_b
+            .reclaim_object_payload_if_unleased_with_outcome(&bucket, &key, original.generation_id,)
+            .unwrap(),
+        crate::cluster::ObjectPayloadReclaimAttempt::Deferred,
+        "refreshed frontend must observe the lease held through the original Unix client map"
+    );
+
+    drop(broad_lease);
+    assert_eq!(
+        cluster_b
+            .reclaim_object_payload_if_unleased_with_outcome(&bucket, &key, original.generation_id,)
+            .unwrap(),
+        crate::cluster::ObjectPayloadReclaimAttempt::Completed,
+        "reclaim should proceed through the refreshed map after lease release"
+    );
+}
+
+#[test]
+fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(0);
+    let pg_id = PgId::new(0);
+    let epoch = ClusterEpoch::INITIAL;
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let socket_path = tmp.path().join("sockets").join("lease-admission.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let _server = spawn_storage_node_server(
+        StorageNodeServer::bind(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: epoch,
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join("lease-admission-node"),
+            default_ec_shape: ec_shape,
+            pg_ids: vec![pg_id.get()],
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: pg_id.get(),
+                cluster_epoch: epoch,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            }],
+            pending_metadata_command_recoveries: Vec::new(),
+            historical_pg_routes: Vec::new(),
+        })
+        .unwrap(),
+    );
+    let admission_limit = LocalUnixStorageNodeClientConfig::MIN_RPC_ADMISSION_LIMIT;
+    let reserved_rpc_capacity = (admission_limit / 4).clamp(1, 4);
+    let shared_non_control_limit = admission_limit - reserved_rpc_capacity;
+    let lease_limit = shared_non_control_limit.saturating_sub(1).max(1);
+    let broad_lease_limit = lease_limit.saturating_sub(1).max(1);
+    let client = UnixStorageNodeClient::with_rpc_admission_settings(
+        node_id,
+        epoch,
+        socket_path,
+        LocalUnixStorageNodeClientAdmissionSettings {
+            rpc_admission_limit: admission_limit,
+            rpc_admission_wait_timeout: Duration::from_millis(20),
+            rpc_control_admission_wait_timeout: Duration::from_millis(20),
+        },
+    );
+    let bucket = BucketName::new("lease-admission-bucket").unwrap();
+    let object_key = ObjectKey::new("source").unwrap();
+    let generation_id = GenerationId::new(1).unwrap();
+    let mut broad_leases = Vec::new();
+    for _ in 0..broad_lease_limit {
+        broad_leases.push(
+            client
+                .acquire_object_payload_lease(
+                    &bucket,
+                    &object_key,
+                    generation_id,
+                    ObjectPayloadLeaseKind::BroadSnapshot,
+                )
+                .unwrap()
+                .expect("broad lease admission should reach its reserved child limit"),
+        );
+        assert!(
+            client.active_admitted_session_count_for_test() <= admission_limit,
+            "broad leases must remain within the aggregate RPC admission limit"
+        );
+    }
+    assert!(matches!(
+        client.acquire_object_payload_lease(
+            &bucket,
+            &object_key,
+            generation_id,
+            ObjectPayloadLeaseKind::BroadSnapshot,
+        ),
+        Err(StoreError::StorageRpcResourceExhausted {
+            operation: "broad object payload lease acquire",
+            ..
+        })
+    ));
+
+    let data_pg_id = DataPgId::new(pg_id);
+    let shard_key = ShardKey::new(&[0x5A; 16], generation_id.get(), 0);
+    let location = ShardLocation::new(epoch, data_pg_id, shard_key.shard_index(), node_id);
+    let mut narrow_leases = Vec::new();
+    while let Some(broad_lease) = broad_leases.pop() {
+        let narrow_lease = client
+            .acquire_object_payload_lease(
+                &bucket,
+                &object_key,
+                generation_id,
+                ObjectPayloadLeaseKind::ShardLocations,
+            )
+            .unwrap()
+            .expect("a saturated broad lease must retain one shard-lease handoff slot");
+        assert!(
+            client.active_admitted_session_count_for_test() <= admission_limit,
+            "broad-to-narrow overlap must remain within the aggregate admission limit"
+        );
+        drop(broad_lease);
+        narrow_leases.push(narrow_lease);
+        assert!(matches!(
+            client.acquire_object_payload_lease(
+                &bucket,
+                &object_key,
+                generation_id,
+                ObjectPayloadLeaseKind::BroadSnapshot,
+            ),
+            Err(StoreError::StorageRpcResourceExhausted {
+                operation: "broad object payload lease acquire",
+                ..
+            })
+        ));
+        assert!(
+            client.active_admitted_session_count_for_test() <= admission_limit,
+            "new broad leases must not consume the slot reserved for the next handoff"
+        );
+    }
+
+    narrow_leases.push(
+        client
+            .acquire_object_payload_lease(
+                &bucket,
+                &object_key,
+                generation_id,
+                ObjectPayloadLeaseKind::ShardLocations,
+            )
+            .unwrap()
+            .expect("lease pool should admit a final direct narrow lease"),
+    );
+    assert!(matches!(
+        client.acquire_object_payload_lease(
+            &bucket,
+            &object_key,
+            generation_id,
+            ObjectPayloadLeaseKind::ShardLocations,
+        ),
+        Err(StoreError::StorageRpcResourceExhausted {
+            operation: "shard object payload lease acquire",
+            ..
+        })
+    ));
+
+    let read_handle = client
+        .acquire_read_handles(
+            "narrow-to-read-handle-handoff",
+            vec![(location, shard_key.clone())],
+        )
+        .expect("narrow-lease saturation must retain one read-handle handoff slot");
+    assert!(
+        client.active_admitted_session_count_for_test() <= admission_limit,
+        "narrow-to-read-handle overlap must remain within the aggregate admission limit"
+    );
+    assert_eq!(
+        client
+            .object_payload_lease_count(&bucket, &object_key, generation_id)
+            .expect("short lease-control RPC must retain reserved admission"),
+        lease_limit
+    );
+    assert!(client.active_admitted_session_count_for_test() <= admission_limit);
+    assert!(
+        !client
+            .try_begin_object_payload_reclaim(&bucket, &object_key, generation_id)
+            .expect("reclaim control must retain reserved admission"),
+        "storage node must still observe every narrow lease"
+    );
+    assert!(client.active_admitted_session_count_for_test() <= admission_limit);
+
+    drop(read_handle);
+    drop(narrow_leases);
+    assert_eq!(client.active_admitted_session_count_for_test(), 0);
+    assert_eq!(
+        client
+            .object_payload_lease_count(&bucket, &object_key, generation_id)
+            .unwrap(),
+        0
+    );
 }
 
 fn assert_historical_pending_command_recovery_over_unix(

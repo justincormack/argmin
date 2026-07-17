@@ -43,6 +43,8 @@ impl UnixStorageNodeRpcAdmissionSettings {
 
 pub(crate) struct UnixStorageNodeRpcAdmission {
     pub(crate) limit: usize,
+    object_payload_lease_limit: usize,
+    object_payload_broad_admission_limit: usize,
     non_reserved_limit: usize,
     completion_limit: usize,
     pending_envelope_limit: usize,
@@ -63,6 +65,15 @@ pub(crate) struct UnixStorageNodeRpcAdmissionPermit {
     observed_active: bool,
 }
 
+pub(crate) struct UnixStorageNodeObjectPayloadLeaseAdmissionPermit {
+    admission: Arc<UnixStorageNodeRpcAdmission>,
+}
+
+pub(crate) enum UnixStorageNodeObjectPayloadLeaseAdmissionAcquire {
+    Acquired(UnixStorageNodeObjectPayloadLeaseAdmissionPermit),
+    TimedOut,
+}
+
 pub(crate) enum UnixStorageNodeRpcAdmissionAcquire {
     Acquired {
         permit: UnixStorageNodeRpcAdmissionPermit,
@@ -77,7 +88,8 @@ pub(crate) type UnixStorageNodeRpcAdmissionClass = observability::StorageRpcAdmi
 
 #[derive(Default)]
 struct UnixStorageNodeRpcAdmissionActive {
-    total: usize,
+    total_sessions: usize,
+    object_payload_leases: usize,
     completion: usize,
     pending_envelope: usize,
     progress: usize,
@@ -88,11 +100,11 @@ struct UnixStorageNodeRpcAdmissionActive {
 
 impl UnixStorageNodeRpcAdmissionActive {
     fn non_reserved(&self) -> usize {
-        self.progress + self.start_write + self.read + self.list
+        self.object_payload_leases + self.progress + self.start_write + self.read + self.list
     }
 
     fn acquire(&mut self, class: UnixStorageNodeRpcAdmissionClass, pending_envelope: bool) {
-        self.total += 1;
+        self.total_sessions += 1;
         match class {
             UnixStorageNodeRpcAdmissionClass::Control => {}
             UnixStorageNodeRpcAdmissionClass::Completion => {
@@ -109,8 +121,8 @@ impl UnixStorageNodeRpcAdmissionActive {
     }
 
     fn release(&mut self, class: UnixStorageNodeRpcAdmissionClass, pending_envelope: bool) {
-        self.total = self
-            .total
+        self.total_sessions = self
+            .total_sessions
             .checked_sub(1)
             .expect("Unix storage-node RPC admission release without acquire");
         match class {
@@ -179,8 +191,13 @@ impl UnixStorageNodeRpcAdmission {
         let start_write_floor = (limit / 8).clamp(1, 4).min(shared_limit);
         let completion_limit = limit.saturating_sub(start_write_floor).max(1);
         let pending_envelope_limit = (completion_limit / 2).max(1);
+        let object_payload_lease_limit = shared_limit.saturating_sub(1).max(1);
         Self {
             limit,
+            object_payload_lease_limit,
+            object_payload_broad_admission_limit: object_payload_lease_limit
+                .saturating_sub(1)
+                .max(1),
             non_reserved_limit: shared_limit,
             completion_limit,
             pending_envelope_limit,
@@ -200,7 +217,7 @@ impl UnixStorageNodeRpcAdmission {
         self: &Arc<Self>,
     ) -> Option<UnixStorageNodeRpcAdmissionPermit> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        if active.total >= self.limit {
+        if !self.can_admit(&active, UnixStorageNodeRpcAdmissionClass::Control, false) {
             return None;
         }
         active.acquire(UnixStorageNodeRpcAdmissionClass::Control, false);
@@ -213,6 +230,14 @@ impl UnixStorageNodeRpcAdmission {
             pending_envelope: false,
             observed_active: true,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_session_count_for_test(&self) -> usize {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .total_sessions
     }
 
     #[cfg(test)]
@@ -281,13 +306,59 @@ impl UnixStorageNodeRpcAdmission {
         }
     }
 
+    pub(crate) fn acquire_object_payload_lease(
+        self: &Arc<Self>,
+        broad: bool,
+    ) -> UnixStorageNodeObjectPayloadLeaseAdmissionAcquire {
+        let started_at = Instant::now();
+        let deadline = started_at + self.wait_timeout;
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if self.can_admit_object_payload_lease(&active, broad) {
+                active.total_sessions += 1;
+                active.object_payload_leases += 1;
+                return UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::Acquired(
+                    UnixStorageNodeObjectPayloadLeaseAdmissionPermit {
+                        admission: Arc::clone(self),
+                    },
+                );
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut;
+            };
+            let (next_active, wait_result) = self
+                .capacity_available
+                .wait_timeout(active, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            active = next_active;
+            if wait_result.timed_out() && !self.can_admit_object_payload_lease(&active, broad) {
+                return UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut;
+            }
+        }
+    }
+
+    fn can_admit_object_payload_lease(
+        &self,
+        active: &UnixStorageNodeRpcAdmissionActive,
+        broad: bool,
+    ) -> bool {
+        let lease_limit = if broad {
+            self.object_payload_broad_admission_limit
+        } else {
+            self.object_payload_lease_limit
+        };
+        active.total_sessions < self.limit
+            && active.non_reserved() < self.non_reserved_limit
+            && active.object_payload_leases < lease_limit
+    }
+
     fn can_admit(
         &self,
         active: &UnixStorageNodeRpcAdmissionActive,
         class: UnixStorageNodeRpcAdmissionClass,
         pending_envelope: bool,
     ) -> bool {
-        if active.total >= self.limit {
+        if active.total_sessions >= self.limit {
             return false;
         }
         match class {
@@ -348,6 +419,25 @@ impl Drop for UnixStorageNodeRpcAdmissionPermit {
             observability::storage_rpc_admission_class_released(self.class);
             self.observed_active = false;
         }
+    }
+}
+
+impl Drop for UnixStorageNodeObjectPayloadLeaseAdmissionPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .admission
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        active.total_sessions = active
+            .total_sessions
+            .checked_sub(1)
+            .expect("Unix storage-node object-payload lease session release without acquire");
+        active.object_payload_leases = active
+            .object_payload_leases
+            .checked_sub(1)
+            .expect("Unix storage-node object-payload lease admission release without acquire");
+        self.admission.capacity_available.notify_all();
     }
 }
 
@@ -520,6 +610,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandPgLockAcquire
         | StorageRpcMessageKind::MetadataCommandPgLockRelease
         | StorageRpcMessageKind::ReadHandlesRelease
+        | StorageRpcMessageKind::ObjectPayloadLeaseControl
         | StorageRpcMessageKind::ClaimHeartbeat
         | StorageRpcMessageKind::ClaimRelease
         | StorageRpcMessageKind::ProofRelease
@@ -729,6 +820,154 @@ mod tests {
         drop(list);
         drop(shard_read);
         drop(held_read_handle);
+    }
+
+    #[test]
+    fn object_payload_lease_saturation_preserves_minimum_rpc_admission_capacity() {
+        let admission = Arc::new(test_admission(
+            UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let mut broad_leases = Vec::new();
+        for _ in 0..admission.object_payload_broad_admission_limit {
+            let lease = match admission.acquire_object_payload_lease(true) {
+                UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::Acquired(permit) => permit,
+                UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut => {
+                    panic!("broad object-payload lease admission timed out before its cap")
+                }
+            };
+            broad_leases.push(lease);
+            assert!(
+                admission.active_session_count_for_test()
+                    <= UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT
+            );
+        }
+        assert!(matches!(
+            admission.acquire_object_payload_lease(true),
+            UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut
+        ));
+
+        let mut narrow_leases = Vec::new();
+        while let Some(broad_lease) = broad_leases.pop() {
+            let narrow_lease = match admission.acquire_object_payload_lease(false) {
+                UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::Acquired(permit) => permit,
+                UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut => {
+                    panic!("broad lease must retain capacity for its shard-lease successor")
+                }
+            };
+            assert!(
+                admission.active_session_count_for_test()
+                    <= UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT
+            );
+            drop(broad_lease);
+            narrow_leases.push(narrow_lease);
+            assert!(matches!(
+                admission.acquire_object_payload_lease(true),
+                UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut
+            ));
+            assert!(
+                admission.active_session_count_for_test()
+                    <= UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT
+            );
+        }
+
+        let final_narrow_lease = match admission.acquire_object_payload_lease(false) {
+            UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::Acquired(permit) => permit,
+            UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut => {
+                panic!("lease pool should admit a final direct narrow lease")
+            }
+        };
+        narrow_leases.push(final_narrow_lease);
+        assert!(matches!(
+            admission.acquire_object_payload_lease(false),
+            UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut
+        ));
+
+        let read_handle = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Read) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("narrow leases must retain capacity for read-handle handoff")
+            }
+        };
+        let completion = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Completion) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("lease and read-handle saturation must preserve completion capacity")
+            }
+        };
+        let control = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Control) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("lease and read-handle saturation must preserve control capacity")
+            }
+        };
+
+        assert_eq!(
+            admission.active_session_count_for_test(),
+            UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT
+        );
+        assert!(admission.try_acquire_for_test().is_none());
+
+        drop(control);
+        drop(completion);
+        drop(read_handle);
+        drop(narrow_leases);
+        assert_eq!(admission.active_session_count_for_test(), 0);
+    }
+
+    #[test]
+    fn direct_narrow_lease_saturation_preserves_read_handle_transition_capacity() {
+        let admission = Arc::new(test_admission(
+            UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+        let mut narrow_leases = Vec::new();
+        for _ in 0..admission.object_payload_lease_limit {
+            let lease = match admission.acquire_object_payload_lease(false) {
+                UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::Acquired(permit) => permit,
+                UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut => {
+                    panic!("direct narrow lease admission timed out before its child cap")
+                }
+            };
+            narrow_leases.push(lease);
+        }
+        assert!(matches!(
+            admission.acquire_object_payload_lease(false),
+            UnixStorageNodeObjectPayloadLeaseAdmissionAcquire::TimedOut
+        ));
+
+        let read_handle = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Read) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("direct narrow-lease saturation must preserve read-handle capacity")
+            }
+        };
+        let completion = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Completion) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("narrow-lease saturation must preserve completion capacity")
+            }
+        };
+        let control = match admission.acquire(UnixStorageNodeRpcAdmissionClass::Control) {
+            UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, .. } => permit,
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. } => {
+                panic!("narrow-lease saturation must preserve control capacity")
+            }
+        };
+
+        assert_eq!(
+            admission.active_session_count_for_test(),
+            UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT
+        );
+        assert!(admission.try_acquire_for_test().is_none());
+
+        drop(control);
+        drop(completion);
+        drop(read_handle);
+        drop(narrow_leases);
+        assert_eq!(admission.active_session_count_for_test(), 0);
     }
 
     #[test]

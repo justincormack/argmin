@@ -16,7 +16,8 @@ use storage::BucketObjectOwnership;
 use storage::{
     AuthorizedMultipartUploadRecord, BucketAclSummary, BucketEncryptionConfig, BucketName,
     BucketObjectLockConfig, BucketOwnershipControls, EffectiveBucketEncryptionConfig, ObjectKey,
-    ObjectLockState, ObjectReadSnapshot, OwnerIdentity, PublicAccessBlockConfig, UploadId,
+    ObjectLockState, ObjectPayloadLease, ObjectReadSnapshot, OwnerIdentity,
+    PublicAccessBlockConfig, UploadId,
 };
 
 #[derive(Debug)]
@@ -260,8 +261,13 @@ impl ObjectAttributePermissions {
     }
 }
 
+pub(super) struct AuthorizedCopySourceRead {
+    pub(super) snapshot: ObjectReadSnapshot,
+    pub(super) payload_lease: Option<ObjectPayloadLease>,
+}
+
 pub(super) struct AuthorizedCopyObject {
-    pub(super) source: ObjectReadSnapshot,
+    pub(super) source: AuthorizedCopySourceRead,
     pub(super) destination: AuthorizedPutObjectWrite,
 }
 
@@ -300,7 +306,7 @@ pub(super) struct AuthorizedMultipartPartWrite {
 }
 
 pub(super) struct AuthorizedUploadPartCopy {
-    pub(super) source: ObjectReadSnapshot,
+    pub(super) source: AuthorizedCopySourceRead,
     pub(super) destination: AuthorizedMultipartPartWrite,
 }
 

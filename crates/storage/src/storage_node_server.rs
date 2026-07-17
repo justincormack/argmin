@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -82,7 +82,7 @@ use crate::storage_rpc::{
     decode_multipart_completion_preflight_request, decode_multipart_completion_snapshot_request,
     decode_multipart_parts_list_request, decode_multipart_upload_load_request,
     decode_multipart_upload_match_request, decode_object_delete_snapshot_request,
-    decode_object_generation_reservation_request,
+    decode_object_generation_reservation_request, decode_object_payload_lease_control_request,
     decode_object_payload_reclaim_claim_acquire_request,
     decode_object_payload_reclaim_claim_record_request,
     decode_object_payload_reclaim_exists_request, decode_object_read_auth_subject_request,
@@ -146,6 +146,7 @@ use crate::storage_rpc::{
     encode_multipart_upload_match_response, encode_object_delete_snapshot_response,
     encode_object_generation_reservation_response, encode_object_generation_response,
     encode_object_lifecycle_version_list_response, encode_object_metadata_command_build_response,
+    encode_object_payload_lease_control_response,
     encode_object_payload_reclaim_claim_optional_record_response,
     encode_object_payload_reclaim_response, encode_object_read_auth_subject_response,
     encode_object_read_snapshot_response, encode_object_tags_for_subject_response,
@@ -248,7 +249,8 @@ use crate::storage_rpc::{
     StorageRpcObjectGenerationReservationOutcome, StorageRpcObjectGenerationReservationRequest,
     StorageRpcObjectGenerationReservationResponse, StorageRpcObjectGenerationResponse,
     StorageRpcObjectLifecycleVersionListResponse, StorageRpcObjectMetadataCommandBuildOutcome,
-    StorageRpcObjectMetadataCommandBuildResponse,
+    StorageRpcObjectMetadataCommandBuildResponse, StorageRpcObjectPayloadLeaseControlOperation,
+    StorageRpcObjectPayloadLeaseControlRequest, StorageRpcObjectPayloadLeaseControlResponse,
     StorageRpcObjectPayloadReclaimClaimAcquireRequest,
     StorageRpcObjectPayloadReclaimClaimOptionalRecordResponse,
     StorageRpcObjectPayloadReclaimClaimRecordRequest, StorageRpcObjectPayloadReclaimExistsRequest,
@@ -300,7 +302,8 @@ use crate::types::{
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
 };
 use crate::{
-    BucketName, EcShape, NodeId, ObjectPgActionError, RouteMapValidity, ShardKey, ShardLocation,
+    BucketName, EcShape, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey,
+    ShardLocation,
 };
 
 #[cfg(test)]
@@ -2866,7 +2869,8 @@ impl StorageNodeConnectionHandler {
         stream: &mut UnixStream,
         _session_guard: StorageNodeActiveSessionGuard,
     ) -> Result<(), StorageNodeServerError> {
-        let mut session = StorageNodeSession::new(Arc::clone(&self.read_handles));
+        let mut session =
+            StorageNodeSession::new(Arc::clone(&self.read_handles), Arc::clone(&self.node));
         loop {
             let frame = match read_storage_rpc_request_frame_from(stream) {
                 Ok(frame) => frame,
@@ -2886,9 +2890,7 @@ impl StorageNodeConnectionHandler {
                         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
                     ) =>
                 {
-                    if session.has_acquired_read_handles()
-                        && !session.has_metadata_command_pg_locks()
-                    {
+                    if session.has_active_read_state() && !session.has_metadata_command_pg_locks() {
                         continue;
                     }
                     return Ok(());
@@ -3007,6 +3009,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ReadHandlesRelease => {
                 match decode_read_handle_release_request(&frame.payload) {
                     Ok(request) => self.read_handles_release_response(session, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectPayloadLeaseControl => {
+                match decode_object_payload_lease_control_request(&frame.payload) {
+                    Ok(request) => self.object_payload_lease_control_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4432,6 +4443,76 @@ impl StorageNodeConnectionHandler {
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         session.release_read_handles(&request.read_operation_id);
         let payload = encode_read_handle_release_response(&StorageRpcReadHandleReleaseResponse);
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn object_payload_lease_control_response(
+        &self,
+        session: &mut StorageNodeSession,
+        request: StorageRpcObjectPayloadLeaseControlRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if request.node_id != self.config.node_id {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "object-payload lease request targets node {}, server is node {}",
+                    request.node_id.as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        let value = match request.operation {
+            StorageRpcObjectPayloadLeaseControlOperation::Acquire => {
+                u64::from(session.acquire_object_payload_lease(
+                    &request.bucket,
+                    &request.key,
+                    request.generation_id,
+                ))
+            }
+            StorageRpcObjectPayloadLeaseControlOperation::Release => session
+                .release_object_payload_lease(&request.bucket, &request.key, request.generation_id)
+                as u64,
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimBegin => {
+                u64::from(self.node.try_begin_object_payload_reclaim(
+                    &request.bucket,
+                    &request.key,
+                    request.generation_id,
+                ))
+            }
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinish => {
+                self.node.finish_object_payload_reclaim(
+                    &request.bucket,
+                    &request.key,
+                    request.generation_id,
+                    false,
+                );
+                0
+            }
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimFinishKeepFence => {
+                self.node.finish_object_payload_reclaim(
+                    &request.bucket,
+                    &request.key,
+                    request.generation_id,
+                    true,
+                );
+                0
+            }
+            StorageRpcObjectPayloadLeaseControlOperation::ReclaimFenceClear => {
+                self.node.clear_object_payload_reclaim_fence(
+                    &request.bucket,
+                    &request.key,
+                    request.generation_id,
+                );
+                0
+            }
+            StorageRpcObjectPayloadLeaseControlOperation::Count => self
+                .node
+                .object_payload_lease_count(&request.bucket, &request.key, request.generation_id)
+                as u64,
+        };
+        let payload = encode_object_payload_lease_control_response(
+            StorageRpcObjectPayloadLeaseControlResponse { value },
+        );
         Ok(encode_storage_rpc_success_response(&payload))
     }
 
@@ -11465,16 +11546,23 @@ impl Ord for ReadHandleShardKey {
 
 struct StorageNodeSession {
     shared_handles: Arc<Mutex<StorageNodeReadHandleState>>,
+    node: Arc<SharedStorageNode>,
     read_operations: BTreeMap<String, SessionReadHandle>,
+    object_payload_leases: HashSet<(BucketName, ObjectKey, GenerationId)>,
     metadata_command_guards: BTreeMap<PgId, StorageNodeMetadataCommandGuard>,
     current_rpc_context: Option<StorageNodeMetadataCommandLockContext>,
 }
 
 impl StorageNodeSession {
-    fn new(shared_handles: Arc<Mutex<StorageNodeReadHandleState>>) -> Self {
+    fn new(
+        shared_handles: Arc<Mutex<StorageNodeReadHandleState>>,
+        node: Arc<SharedStorageNode>,
+    ) -> Self {
         Self {
             shared_handles,
+            node,
             read_operations: BTreeMap::new(),
+            object_payload_leases: HashSet::new(),
             metadata_command_guards: BTreeMap::new(),
             current_rpc_context: None,
         }
@@ -11529,10 +11617,12 @@ impl StorageNodeSession {
         self.metadata_command_guards.remove(&pg_id);
     }
 
-    fn has_acquired_read_handles(&self) -> bool {
-        self.read_operations
-            .values()
-            .any(|existing| existing.is_acquired)
+    fn has_active_read_state(&self) -> bool {
+        !self.object_payload_leases.is_empty()
+            || self
+                .read_operations
+                .values()
+                .any(|existing| existing.is_acquired)
     }
 
     fn acquire_read_handles(
@@ -11597,6 +11687,44 @@ impl StorageNodeSession {
             .unwrap_or_else(|e| e.into_inner())
             .release(&existing.entries);
     }
+
+    fn acquire_object_payload_lease(
+        &mut self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        let root = (bucket.clone(), key.clone(), generation_id);
+        if self.object_payload_leases.contains(&root) {
+            return true;
+        }
+        if !self
+            .node
+            .try_acquire_object_payload_lease(bucket, key, generation_id)
+        {
+            return false;
+        }
+        self.object_payload_leases.insert(root);
+        true
+    }
+
+    fn release_object_payload_lease(
+        &mut self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> usize {
+        if !self
+            .object_payload_leases
+            .remove(&(bucket.clone(), key.clone(), generation_id))
+        {
+            return self
+                .node
+                .object_payload_lease_count(bucket, key, generation_id);
+        }
+        self.node
+            .release_object_payload_lease(bucket, key, generation_id)
+    }
 }
 
 impl Drop for StorageNodeSession {
@@ -11610,6 +11738,10 @@ impl Drop for StorageNodeSession {
                 shared_handles.release(&existing.entries);
                 existing.is_acquired = false;
             }
+        }
+        for (bucket, key, generation_id) in std::mem::take(&mut self.object_payload_leases) {
+            self.node
+                .release_object_payload_lease(&bucket, &key, generation_id);
         }
     }
 }
@@ -12702,7 +12834,8 @@ mod tests {
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let handler = server.connection_handler();
-        let mut session = StorageNodeSession::new(Arc::clone(&server.read_handles));
+        let mut session =
+            StorageNodeSession::new(Arc::clone(&server.read_handles), Arc::clone(&server._node));
         session
             .acquire_metadata_command_pg_lock(
                 &server.metadata_command_locks,
@@ -18714,7 +18847,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handler_for_thread = handler.clone();
         let join = thread::spawn(move || {
-            let session = StorageNodeSession::new(Arc::clone(&handler_for_thread.read_handles));
+            let session = StorageNodeSession::new(
+                Arc::clone(&handler_for_thread.read_handles),
+                Arc::clone(&handler_for_thread.node),
+            );
             let response = handler_for_thread
                 .metadata_command_pending_slot_insert_response(&session, request)
                 .unwrap();
@@ -19385,7 +19521,9 @@ mod tests {
     #[test]
     fn storage_node_session_rejects_read_operation_count_over_limit() {
         let shared_handles = Arc::new(Mutex::new(StorageNodeReadHandleState::default()));
-        let mut session = StorageNodeSession::new(Arc::clone(&shared_handles));
+        let node =
+            Arc::new(SharedStorageNode::topology_only(&[0], EcShape { k: 1, m: 0 }).unwrap());
+        let mut session = StorageNodeSession::new(Arc::clone(&shared_handles), node);
         let location = test_location(1, 0, 7);
 
         for i in 0..STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION {
@@ -19409,6 +19547,32 @@ mod tests {
         assert_eq!(
             shared_handles.lock().unwrap().count(location),
             STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION
+        );
+    }
+
+    #[test]
+    fn storage_node_session_disconnect_releases_object_payload_lease() {
+        let shared_handles = Arc::new(Mutex::new(StorageNodeReadHandleState::default()));
+        let node =
+            Arc::new(SharedStorageNode::topology_only(&[0], EcShape { k: 1, m: 0 }).unwrap());
+        let bucket = BucketName::new("lease-disconnect").unwrap();
+        let key = ObjectKey::new("source").unwrap();
+        let generation_id = GenerationId::new(1).unwrap();
+
+        {
+            let mut session =
+                StorageNodeSession::new(Arc::clone(&shared_handles), Arc::clone(&node));
+            assert!(session.acquire_object_payload_lease(&bucket, &key, generation_id));
+            assert!(session.has_active_read_state());
+            assert_eq!(
+                node.object_payload_lease_count(&bucket, &key, generation_id),
+                1
+            );
+        }
+
+        assert_eq!(
+            node.object_payload_lease_count(&bucket, &key, generation_id),
+            0
         );
     }
 
