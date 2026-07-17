@@ -33,6 +33,7 @@ pub mod control_plane_command;
 pub(crate) mod control_plane_lease;
 pub mod control_plane_raft;
 pub(crate) mod data_dir;
+pub(crate) mod durable_journal;
 pub mod error;
 pub(crate) mod metadata_command;
 pub mod node;

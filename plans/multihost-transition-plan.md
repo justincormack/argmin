@@ -11275,6 +11275,34 @@ Required production shape and implementation order:
    only after their journal record is durable. Partial/ambiguous journal writes
    poison the authority or fail-stop; they must not return an ordinary
    retryable error while memory and restart state may diverge.
+   Progress (2026-07-17): the Raft WAL and single-authority journal now share
+   one crate-internal physical journal implementation for versioned/checksummed
+   headers, length-framed records, CRC validation, fsync ambiguity
+   classification, torn-tail recovery, logical offsets, and atomic prefix
+   compaction. The single-authority logical records bind the durable authority
+   identity, previous/resulting canonical snapshot digests, and the existing
+   versioned/checksummed `ControlPlaneCommand` encoding. Recovery replays and
+   validates the retained command chain over the canonical checkpoint before
+   publishing state. Checkpoint anchors retain the exact checkpoint digest
+   after compaction, and checkpoint publication is bound to the previously
+   published digest so a stale capture is rejected before filesystem
+   mutation. Recovery requires an identity-bound checkpoint anchor and rejects
+   a missing, empty, or command-only journal rather than accepting a bare
+   checkpoint that could have lost an acknowledged suffix. The shared physical
+   journal uses a checked length/complement prefix and versioned file headers,
+   so first- or middle-frame length corruption is not misclassified as a
+   truncatable torn tail. Ambiguous command appends poison serving; a complete
+   fsynced record remains recoverable after restart.
+   The single-authority live/durable split now mirrors the Raft overlay rule:
+   covered heartbeat renewals remain volatile and append no journal bytes,
+   while a later durable command first promotes acknowledged lease deadlines
+   into the journal. Semantic heartbeats likewise promote the live lease before
+   durable apply, while exact heartbeat retransmissions derive mutation from
+   the actual snapshot delta and append nothing. Regressions cover no
+   per-command checkpoint rewrite, zero journal growth for covered renewals and
+   exact retries, promotion across unrelated commands, semantic heartbeats,
+   and restart, torn tails, corrupt frame lengths, missing anchors, foreign
+   identities, stale/off-chain checkpoints, and ambiguous-sync poisoning.
 5. Make full snapshots periodic compacted products, not the per-command write
    path. Checkpoint after bounded journal bytes/commands/time, atomically rotate
    the journal, and prove artifact-plus-journal replay reconstructs identical
@@ -11286,6 +11314,13 @@ Required production shape and implementation order:
    captured view is serialized and synced. Recovery reconstructs the same
    state from checkpoint plus its durable journal suffix; the checkpoint base
    alone is never treated as the current read state.
+   Progress (2026-07-17): the single-authority command path checkpoints and
+   compacts at 4,096 journaled commands or 64 MiB, with low-bound tests for
+   both triggers. The remaining slice is the 59.9-second background trigger,
+   immutable capture/persist split, and checkpoint observability/release gate.
+   Until that lands, threshold-triggered snapshot formatting and fsync still
+   run synchronously through the single-authority mutation boundary, so this
+   item is not closed.
 6. Apply the same rule to OpenRaft durability. The former
    checkpoint-before-ordinary-peer-response path was a conservative Phase 12.4
    correctness step, not the production endpoint. Before cutover, the
