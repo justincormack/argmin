@@ -4837,8 +4837,29 @@ impl ControlPlaneRaftAuthority {
                             .to_string(),
                 })?;
 
+        let capture_started = Instant::now();
+        let capture_deadline = capture_started
+            .checked_add(CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_BUDGET)
+            .expect("constant OpenRaft restart capture retry budget should fit Instant");
+        let mut attempts = 0_u64;
         let mut last_validation_error = None;
-        for _ in 0..CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS {
+        loop {
+            let now = Instant::now();
+            if !control_plane_raft_restart_capture_attempt_allowed(attempts, now, capture_deadline)
+            {
+                let elapsed = capture_started.elapsed();
+                let validation_error = last_validation_error.expect(
+                    "a denied OpenRaft restart capture retry must follow a validation failure",
+                );
+                return Err(ControlPlaneError::Io {
+                    context: "capture consistent control-plane OpenRaft durable restart artifact",
+                    source: raft_log_store_error(format!(
+                        "control-plane OpenRaft restart artifact capture exhausted its {:?} retry budget after {attempts} attempts and {elapsed:?}: {validation_error}",
+                        CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_BUDGET
+                    )),
+                });
+            }
+            attempts = attempts.saturating_add(1);
             // Capture the state machine first. If Raft advances concurrently,
             // the later log-store export may be ahead, which restart can
             // replay. The reverse order could persist state that the exported
@@ -4860,21 +4881,18 @@ impl ControlPlaneRaftAuthority {
                 log_store: log_store_artifact,
                 state_machine,
             };
-            match artifact.validate_restart_pair() {
+            let validation_error = match artifact.validate_restart_pair() {
                 Ok(()) => return Ok(artifact),
-                Err(error) => last_validation_error = Some(error),
-            }
-            ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(1)).await;
+                Err(error) => error,
+            };
+            last_validation_error = Some(validation_error);
+            let Some(retry_delay) =
+                control_plane_raft_restart_capture_retry_delay(Instant::now(), capture_deadline)
+            else {
+                continue;
+            };
+            ControlPlaneRaftTypeConfig::sleep(retry_delay).await;
         }
-
-        Err(ControlPlaneError::Io {
-            context: "capture consistent control-plane OpenRaft durable restart artifact",
-            source: last_validation_error.unwrap_or_else(|| {
-                raft_log_store_error(
-                    "control-plane OpenRaft restart artifact capture made no validation attempts",
-                )
-            }),
-        })
     }
 
     async fn capture_state_machine_restart_artifact(
@@ -5802,7 +5820,8 @@ const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 4;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC: &[u8] = b"ARGMINCPRAFTSEEN";
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION: u16 = 1;
-const CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS: usize = 16;
+const CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_BUDGET: Duration = Duration::from_secs(1);
+const CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const CONTROL_PLANE_RAFT_WAL_MAGIC: &[u8] = b"ARGMINCPRAFTWAL";
 const CONTROL_PLANE_RAFT_WAL_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN: usize = 8;
@@ -5838,6 +5857,24 @@ const CONTROL_PLANE_RAFT_TRANSFER_LEADER_RESPONSE_LOG_NOT_FLUSHED: u8 = 3;
 const RAFT_ENTRY_MIN_LEN: usize = 8 + 8 + 8 + 1;
 const RAFT_MEMBERSHIP_CONFIG_MIN_LEN: usize = 4;
 const RAFT_MEMBERSHIP_NODE_MIN_LEN: usize = 8 + 4;
+
+fn control_plane_raft_restart_capture_attempt_allowed(
+    completed_attempts: u64,
+    now: Instant,
+    deadline: Instant,
+) -> bool {
+    completed_attempts == 0 || now < deadline
+}
+
+fn control_plane_raft_restart_capture_retry_delay(
+    now: Instant,
+    deadline: Instant,
+) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .map(|remaining| CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY.min(remaining))
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ControlPlaneRaftLogStoreInner {
@@ -14172,6 +14209,56 @@ mod tests {
         assert_eq!(
             linearized_authority_readiness_from_flags(true, true, true, true),
             ControlPlaneRaftLinearizedAuthorityReadiness::Serving
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_restart_capture_retry_uses_elapsed_time_budget() {
+        let started = Instant::now();
+        let deadline = started + CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_BUDGET;
+        assert_eq!(
+            control_plane_raft_restart_capture_retry_delay(started, deadline),
+            Some(CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY)
+        );
+        assert_eq!(
+            control_plane_raft_restart_capture_retry_delay(
+                started + Duration::from_millis(16),
+                deadline
+            ),
+            Some(CONTROL_PLANE_RAFT_RESTART_CAPTURE_RETRY_DELAY),
+            "the former 16-attempt boundary must not exhaust the retry budget"
+        );
+        assert_eq!(
+            control_plane_raft_restart_capture_retry_delay(
+                deadline - Duration::from_micros(500),
+                deadline
+            ),
+            Some(Duration::from_micros(500)),
+            "the final retry sleep must not exceed the remaining budget"
+        );
+        assert_eq!(
+            control_plane_raft_restart_capture_retry_delay(deadline, deadline),
+            None
+        );
+        assert_eq!(
+            control_plane_raft_restart_capture_retry_delay(
+                deadline + Duration::from_millis(1),
+                deadline
+            ),
+            None
+        );
+        assert!(control_plane_raft_restart_capture_attempt_allowed(
+            0,
+            deadline + Duration::from_millis(1),
+            deadline
+        ));
+        assert!(
+            !control_plane_raft_restart_capture_attempt_allowed(
+                1,
+                deadline + Duration::from_millis(1),
+                deadline
+            ),
+            "an overslept final delay must not admit another capture attempt"
         );
     }
 

@@ -12258,6 +12258,10 @@ Phase 12.4 progress:
 - Split periodic OpenRaft checkpointing into an asynchronous immutable capture
   and a synchronous persistence phase. The authority captures the state
   machine before the retained log/WAL offset and validates that replay pair;
+  concurrent Raft advancement retries pair capture against a one-second
+  absolute deadline with a capped one-millisecond delay and rechecks that
+  deadline before every post-sleep attempt, rather than using a fixed attempt
+  count whose effective budget collapses under scheduler load;
   the process helper then leaves the Tokio runtime before encoding, syncing,
   and compacting on its dedicated checkpoint thread. Post-capture WAL records
   remain a replayable suffix after compaction. Focused regressions prove the
