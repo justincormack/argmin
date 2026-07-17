@@ -5896,6 +5896,19 @@ mod tests {
                 return false;
             };
             offset = line_end + 2;
+            if chunk_size == 0 {
+                // The last-chunk line is followed directly by the trailer
+                // section. With no trailers the section is one empty line,
+                // so the complete terminator is `0\r\n\r\n`; there is no
+                // additional chunk-data CRLF for the zero-sized last chunk.
+                if buf.len() < offset + 2 {
+                    return false;
+                }
+                if &buf[offset..offset + 2] == b"\r\n" {
+                    return true;
+                }
+                return buf[offset..].windows(4).any(|window| window == b"\r\n\r\n");
+            }
             let Some(chunk_end) = offset.checked_add(chunk_size) else {
                 return false;
             };
@@ -5909,15 +5922,27 @@ mod tests {
                 return false;
             }
             offset = chunk_crlf_end;
-            if chunk_size == 0 {
-                if buf.len() < offset + 2 {
-                    return false;
-                }
-                return &buf[offset..offset + 2] == b"\r\n";
-            }
         }
 
         false
+    }
+
+    #[test]
+    fn response_body_complete_recognizes_chunked_last_chunk_and_trailers() {
+        let headers = "HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked";
+        let header_end = headers.len();
+
+        let mut response = format!("{headers}\r\n\r\n").into_bytes();
+        response.extend_from_slice(b"5\r\nhello\r\n0\r\n\r\n");
+        assert!(response_body_complete(&response, header_end, headers));
+
+        let mut incomplete = format!("{headers}\r\n\r\n").into_bytes();
+        incomplete.extend_from_slice(b"5\r\nhello\r\n0\r\n");
+        assert!(!response_body_complete(&incomplete, header_end, headers));
+
+        let mut with_trailer = format!("{headers}\r\n\r\n").into_bytes();
+        with_trailer.extend_from_slice(b"5\r\nhello\r\n0\r\nx-test: value\r\n\r\n");
+        assert!(response_body_complete(&with_trailer, header_end, headers));
     }
 
     fn read_http_response(stream: &mut StdTcpStream, timeout: Duration) -> String {
@@ -5967,44 +5992,22 @@ mod tests {
         request_head: String,
         total_body_bytes: usize,
     ) -> (String, usize) {
-        const WRITE_CHUNK_BYTES: usize = 1024;
-        const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
+        const INITIAL_BODY_BYTES: usize = 8 * 1024;
         const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
         let mut stream = StdTcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
+        stream.write_all(request_head.as_bytes()).unwrap();
+        let prefix_len = total_body_bytes.min(INITIAL_BODY_BYTES);
+        let bytes_sent = stream.write(&vec![b'x'; prefix_len]).unwrap_or(0);
 
-        let mut writer = stream.try_clone().unwrap();
-        writer.set_nodelay(true).unwrap();
-
-        let bytes_sent = Arc::new(AtomicUsize::new(0));
-        let bytes_sent_writer = Arc::clone(&bytes_sent);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_writer = Arc::clone(&stop);
-        let body_chunk = vec![b'x'; WRITE_CHUNK_BYTES];
-        let writer_handle = std::thread::spawn(move || {
-            writer.write_all(request_head.as_bytes()).unwrap();
-            let chunk_count = total_body_bytes / WRITE_CHUNK_BYTES;
-            for _ in 0..chunk_count {
-                if stop_writer.load(Ordering::Relaxed) {
-                    break;
-                }
-                match writer.write_all(&body_chunk) {
-                    Ok(()) => {
-                        bytes_sent_writer.fetch_add(WRITE_CHUNK_BYTES, Ordering::Relaxed);
-                        std::thread::sleep(WRITE_CHUNK_DELAY);
-                    }
-                    Err(_) => break,
-                }
-            }
-            let _ = writer.shutdown(Shutdown::Write);
-        });
-
-        let response =
-            read_http_response_with_writer_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
-        stop.store(true, Ordering::Relaxed);
-        writer_handle.join().unwrap();
-        (response, bytes_sent.load(Ordering::Relaxed))
+        // Keep the request write half open with no more bytes in flight. The
+        // server must respond without the declared remainder, while its
+        // bounded rejection drain and lingering close can consume the prefix
+        // without an unread-data RST discarding a split error response body.
+        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
+        let _ = stream.shutdown(Shutdown::Write);
+        (response, bytes_sent)
     }
 
     fn response_before_request_body_sent(
