@@ -1825,6 +1825,10 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
         &mut recovered103,
         "argmin-s3 experimental durable OpenRaft control-plane manager using state",
     );
+    // Artifact publication and WAL compaction are crash ordered, but they are
+    // separate files. Stop the writer before direct inspection so the test
+    // cannot combine an old artifact read with a newly compacted WAL.
+    recovered103.stop();
     assert_eq!(
         artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
             .expect("recovered follower artifact plus WAL should expose log state")
