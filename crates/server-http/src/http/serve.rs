@@ -853,14 +853,20 @@ async fn handle(
     let streaming_op = match is_streaming_write(&parts) {
         Ok(op) => op,
         Err(err) => {
+            // Routing has rejected a request whose body has not been
+            // consumed. The connection cannot be reused safely: a client may
+            // still be sending the declared body, and an EOF after the early
+            // response would otherwise make Hyper report an incomplete
+            // request before the lingering-close path can retain the socket.
+            let resp = close_response_connection(S3Response::error_with_ids(&err, "", &wire_ids));
             return Ok(s3_response_to_hyper(
-                S3Response::error_with_ids(&err, "", &wire_ids),
+                resp,
                 Some(req_permit),
                 state.config.stream_read_chunk_size,
                 state.config.panic_on_500,
                 state.config.abort_on_500,
                 response_trace,
-            ))
+            ));
         }
     };
     if let Some(op) = streaming_op {
@@ -5946,10 +5952,18 @@ mod tests {
     }
 
     fn read_http_response(stream: &mut StdTcpStream, timeout: Duration) -> String {
-        read_http_response_with_writer_stop(stream, timeout, None)
+        read_http_response_inner(stream, timeout, None)
     }
 
-    fn read_http_response_with_writer_stop(
+    fn read_http_response_stopping_writer(
+        stream: &mut StdTcpStream,
+        timeout: Duration,
+        stop_writer: &AtomicBool,
+    ) -> String {
+        read_http_response_inner(stream, timeout, Some(stop_writer))
+    }
+
+    fn read_http_response_inner(
         stream: &mut StdTcpStream,
         timeout: Duration,
         stop_writer: Option<&AtomicBool>,
@@ -5992,22 +6006,7 @@ mod tests {
         request_head: String,
         total_body_bytes: usize,
     ) -> (String, usize) {
-        const INITIAL_BODY_BYTES: usize = 8 * 1024;
-        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
-
-        let mut stream = StdTcpStream::connect(addr).unwrap();
-        stream.set_nodelay(true).unwrap();
-        stream.write_all(request_head.as_bytes()).unwrap();
-        let prefix_len = total_body_bytes.min(INITIAL_BODY_BYTES);
-        let bytes_sent = stream.write(&vec![b'x'; prefix_len]).unwrap_or(0);
-
-        // Keep the request write half open with no more bytes in flight. The
-        // server must respond without the declared remainder, while its
-        // bounded rejection drain and lingering close can consume the prefix
-        // without an unread-data RST discarding a split error response body.
-        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
-        let _ = stream.shutdown(Shutdown::Write);
-        (response, bytes_sent)
+        response_before_request_body_sent(addr, request_head, total_body_bytes)
     }
 
     fn response_before_request_body_sent(
@@ -6045,13 +6044,12 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            let _ = writer.shutdown(Shutdown::Write);
         });
 
-        let response =
-            read_http_response_with_writer_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
+        let response = read_http_response_stopping_writer(&mut stream, RESPONSE_TIMEOUT, &stop);
         stop.store(true, Ordering::Relaxed);
         writer_handle.join().unwrap();
+        let _ = stream.shutdown(Shutdown::Write);
         (response, bytes_sent.load(Ordering::Relaxed))
     }
 
@@ -6061,22 +6059,44 @@ mod tests {
         file_prefix: Vec<u8>,
         total_file_bytes: usize,
     ) -> (String, usize) {
-        const INITIAL_FILE_BYTES: usize = 8 * 1024;
+        const WRITE_CHUNK_BYTES: usize = 1024;
+        const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
         const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
         let mut stream = StdTcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
         stream.write_all(request_head.as_bytes()).unwrap();
         stream.write_all(&file_prefix).unwrap();
-        let bytes_sent = total_file_bytes.min(INITIAL_FILE_BYTES);
-        stream.write_all(&vec![b'x'; bytes_sent]).unwrap();
 
-        // Keep the write half open while the server's bounded rejection drain
-        // expires. A complete response proves the server does not require the
-        // declared remainder before rejecting the streaming request.
-        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
+        let mut writer = stream.try_clone().unwrap();
+        writer.set_nodelay(true).unwrap();
+
+        let bytes_sent = Arc::new(AtomicUsize::new(0));
+        let bytes_sent_writer = Arc::clone(&bytes_sent);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = Arc::clone(&stop);
+        let body_chunk = vec![b'x'; WRITE_CHUNK_BYTES];
+        let writer_handle = std::thread::spawn(move || {
+            let chunk_count = total_file_bytes / WRITE_CHUNK_BYTES;
+            for _ in 0..chunk_count {
+                if stop_writer.load(Ordering::Relaxed) {
+                    break;
+                }
+                match writer.write_all(&body_chunk) {
+                    Ok(()) => {
+                        bytes_sent_writer.fetch_add(WRITE_CHUNK_BYTES, Ordering::Relaxed);
+                        std::thread::sleep(WRITE_CHUNK_DELAY);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let response = read_http_response_stopping_writer(&mut stream, RESPONSE_TIMEOUT, &stop);
+        stop.store(true, Ordering::Relaxed);
+        writer_handle.join().unwrap();
         let _ = stream.shutdown(Shutdown::Write);
-        (response, bytes_sent)
+        (response, bytes_sent.load(Ordering::Relaxed))
     }
 
     fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
@@ -7824,13 +7844,22 @@ Connection: keep-alive\r\n\r\n"
                 .unwrap();
             stream.write_all(b"x").unwrap();
 
-            // Keep the request write half open. Receiving the complete response
-            // proves routing did not wait for the declared body, its size limit,
-            // or the body idle timeout.
+            // This URI-level rejection does not consume the declared body.
+            // Keep the client write side open until the server's explicit
+            // Connection: close response is complete; half-closing as soon as
+            // headers arrive can make Hyper treat the incomplete request as a
+            // disconnect while it is still delivering the chunked XML body.
+            // Receiving the complete response first still proves routing did
+            // not wait for the declared body, its size limit, or the body idle
+            // timeout.
             let response = read_http_response(&mut stream, Duration::from_secs(3));
             let _ = stream.shutdown(Shutdown::Write);
 
             assert!(response.starts_with("HTTP/1.1 405"), "{response}");
+            assert!(
+                response.to_ascii_lowercase().contains("connection: close"),
+                "{response}"
+            );
             assert!(
                 response.contains("<Code>MethodNotAllowed</Code>"),
                 "{response}"
