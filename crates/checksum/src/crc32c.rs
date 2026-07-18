@@ -694,6 +694,10 @@ mod tests {
     }
 
     fn supported_backend_cases() -> Vec<BackendCase> {
+        #[cfg_attr(
+            not(any(target_arch = "aarch64", target_arch = "x86_64")),
+            allow(unused_mut)
+        )]
         let mut cases = vec![BackendCase {
             backend: PureRustBackend::Scalar,
             name: "scalar",

@@ -237,6 +237,10 @@ fn bench_override_backend() -> Option<Backend> {
 
 #[cfg(test)]
 pub(crate) fn supported_backends() -> Vec<Backend> {
+    #[cfg_attr(
+        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        allow(unused_mut)
+    )]
     let mut backends = vec![Backend::Scalar];
     #[cfg(target_arch = "aarch64")]
     if has_neon_aarch64() {
