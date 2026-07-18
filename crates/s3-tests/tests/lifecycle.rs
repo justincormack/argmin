@@ -1,5 +1,5 @@
 use base64::Engine;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{
@@ -269,6 +269,42 @@ async fn assert_list_parts_abort_header_eventually(
                 "expected x-amz-abort-date header on ListParts for key {key} after {MAX_ATTEMPTS} attempts"
             );
         }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn create_multipart_upload_until_specific_abort_rule(
+    bucket: &str,
+    key: &str,
+    rule_id: &str,
+) -> aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput {
+    let client = CTX.client();
+    let deadline = Instant::now() + Duration::from_secs(60);
+
+    loop {
+        let create = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        if create.abort_rule_id() == Some(rule_id) {
+            return create;
+        }
+        client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(create.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "expected x-amz-abort-rule-id {rule_id} on a new CreateMultipartUpload for key {key}, got {:?}",
+            create.abort_rule_id()
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -2229,6 +2265,109 @@ fn test_create_multipart_upload_and_list_parts_report_abort_headers() {
             .bucket(&bucket)
             .key("uploads/incomplete")
             .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_list_parts_abort_headers_follow_current_lifecycle_rule() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+        let key = "uploads/incomplete";
+
+        let initial_config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("abort-after-seven-days")
+                    .filter(LifecycleRuleFilter::builder().prefix("uploads/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .abort_incomplete_multipart_upload(
+                        AbortIncompleteMultipartUpload::builder()
+                            .days_after_initiation(7)
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        put_bucket_lifecycle_with_md5(client, &bucket, initial_config)
+            .send()
+            .await
+            .unwrap();
+
+        let create =
+            create_multipart_upload_until_abort_header(&bucket, key, "abort-after-seven-days")
+                .await;
+        let upload_id = create.upload_id().unwrap().to_string();
+        let initial_abort_date = create.abort_date().unwrap().secs();
+
+        let replacement_config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("abort-after-three-days")
+                    .filter(LifecycleRuleFilter::builder().prefix("uploads/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .abort_incomplete_multipart_upload(
+                        AbortIncompleteMultipartUpload::builder()
+                            .days_after_initiation(3)
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        put_bucket_lifecycle_with_md5(client, &bucket, replacement_config)
+            .send()
+            .await
+            .unwrap();
+
+        let replacement_canary = create_multipart_upload_until_specific_abort_rule(
+            &bucket,
+            "uploads/replacement-canary",
+            "abort-after-three-days",
+        )
+        .await;
+        let replacement_upload_id = replacement_canary.upload_id().unwrap().to_string();
+
+        let list_parts = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            list_parts.abort_rule_id(),
+            Some("abort-after-three-days"),
+            "an existing upload follows the current lifecycle abort rule after convergence"
+        );
+        assert_eq!(
+            list_parts.abort_date().unwrap().secs(),
+            initial_abort_date - 4 * 24 * 60 * 60,
+            "the current lifecycle rule is evaluated from the upload's original initiation time"
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("uploads/replacement-canary")
+            .upload_id(replacement_upload_id)
             .send()
             .await
             .unwrap();

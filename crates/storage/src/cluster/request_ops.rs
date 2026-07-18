@@ -235,8 +235,8 @@ type StreamPutCreatePendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 type StreamPutCreateCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
-#[cfg(test)]
-type StreamPutFinalizeCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
+#[cfg(any(test, feature = "test-hooks"))]
+pub type StreamPutFinalizeCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
@@ -289,7 +289,7 @@ static BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, StreamPutCreateCommandIdTestHook>>,
 > = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 static BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, StreamPutFinalizeCommandIdTestHook>>,
 > = OnceLock::new();
@@ -359,8 +359,8 @@ pub(crate) struct StreamPutCreateCommandIdTestHookGuard {
     scope_id: usize,
 }
 
-#[cfg(test)]
-pub(crate) struct StreamPutFinalizeCommandIdTestHookGuard {
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct StreamPutFinalizeCommandIdTestHookGuard {
     scope_id: usize,
 }
 
@@ -451,7 +451,7 @@ impl Drop for StreamPutCreateCommandIdTestHookGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for StreamPutFinalizeCommandIdTestHookGuard {
     fn drop(&mut self) {
         let hooks =
@@ -642,7 +642,7 @@ fn maybe_run_before_stream_put_create_command_id_hook(_scope_id: usize) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 fn maybe_run_before_stream_put_finalize_command_id_hook(_scope_id: usize) {
     let hook = BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1151,8 +1151,8 @@ impl super::StorageCluster {
         StreamPutCreateCommandIdTestHookGuard { scope_id }
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_install_before_stream_put_finalize_command_id_hook(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_stream_put_finalize_command_id_hook(
         &self,
         hook: StreamPutFinalizeCommandIdTestHook,
     ) -> StreamPutFinalizeCommandIdTestHookGuard {
@@ -11024,6 +11024,10 @@ impl super::StorageCluster {
                 return Err(error.into());
             }
         };
+        let mut stale_snapshot_work_budget =
+            super::RequestWorkBudget::new(super::STREAM_PUT_STALE_COMMIT_RETRY_BUDGET, None)
+                .for_operation("finalize_stream_put")
+                .for_pg(pg_id);
 
         let (command, new_pending_command, prepared) = loop {
             while let Some(command) = match self.pending_metadata_command_for_bucket(pg_id, bucket)
@@ -11145,7 +11149,7 @@ impl super::StorageCluster {
                         object_lock: prepared.object_lock,
                         encryption: prepared.encryption.clone(),
                     };
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-hooks"))]
                     maybe_run_before_stream_put_finalize_command_id_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
                     );
@@ -11163,7 +11167,15 @@ impl super::StorageCluster {
                         },
                     ) {
                         Ok(command) => command,
-                        Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => continue,
+                        Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
+                            if let Err(error) = stale_snapshot_work_budget.sleep_after_contention(
+                                "stream PUT stale commit snapshot retry budget exhausted",
+                            ) {
+                                release_caller_bucket_write_proof_if_unowned!()?;
+                                return Err(ObjectPgActionError::Store(error));
+                            }
+                            continue;
+                        }
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {

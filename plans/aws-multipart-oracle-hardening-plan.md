@@ -292,11 +292,23 @@ For each matrix:
 
 ### 6. Cross-feature multipart contracts
 
-- [ ] Inventory and fill oracle gaps for checksums, metadata, tagging, ACL/BOE,
-  SSE-C, managed encryption rejection, expected owner, requester pays, object
-  lock, and lifecycle abort headers.
-- [ ] Keep feature-specific setup in shared fixtures and run identical assertions
-  on AWS and local endpoints.
+- [x] Inventory and fill oracle gaps for checksums, metadata, tagging, ACL/BOE,
+  SSE-C, managed encryption rejection, expected owner, object lock, and
+  lifecycle abort headers. Existing endpoint-independent suites already cover
+  checksum creation/part/copy/completion contracts, initiation-time metadata
+  and tags, ACL and BOE ownership, SSE-C key propagation and copy, illegal
+  managed-encryption follow-on headers, the expected-owner operation matrix,
+  explicit/default Object Lock state, and lifecycle header presence and
+  filtering. Requester Pays is excluded because the product does not implement
+  that wider billing feature and the compatibility guide already records the
+  unsupported wire surface.
+- [x] Keep feature-specific setup in the owning shared `s3-tests` suites and run
+  identical assertions on AWS and local endpoints. The inventory found one
+  lifecycle gap: after a replacement lifecycle rule has visibly converged,
+  AWS recalculates an existing upload's ListParts abort rule and date using the
+  current rule and the upload's original initiation time. A positive canary
+  upload distinguishes this from ordinary lifecycle control-plane propagation;
+  the same oracle now passes locally.
 
 ### 7. Conditional operations beyond multipart completion
 
@@ -654,12 +666,19 @@ choice.
   evaluation. DeleteObject uses its separately pinned single-value grammar;
   DeleteObjects XML `<ETag>` remains an exact object-identifier field rather
   than HTTP conditional-header syntax.
-- [ ] Bound streamed PutObject/CopyObject stale-finalization retries. Direct PUT
+- [x] Bound streamed PutObject/CopyObject stale-finalization retries. Direct PUT
   already has a retry/deadline budget, while the streamed finalizer currently
   loops on `StaleStreamFinalizeSnapshot`. After the public contention oracle is
   known, return the appropriate retryable S3 error on exhaustion and add a
   deterministic regression proving no publication, preserved staged cleanup,
   and no `InternalError` or indefinitely held request/reservation.
+  Stream finalization now uses a one-second stale-snapshot work budget with
+  contention backoff and maps exhaustion to `OperationAborted`, matching the
+  established retryable public conflict branch. A deterministic intervening
+  destination write expires the budget after producing a real stale snapshot:
+  streamed PutObject preserves the competing object and its staged session for
+  caller cleanup, while CopyObject preserves its source and competing
+  destination and removes its internally owned destination stream.
 
 ## Completion
 

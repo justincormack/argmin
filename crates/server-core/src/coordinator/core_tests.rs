@@ -6715,6 +6715,115 @@ fn stream_put_finalize_version_reservation_maps_command_log_conflict_to_operatio
 }
 
 #[test]
+fn stream_put_finalize_stale_snapshot_budget_returns_operation_aborted_and_remains_cleanupable() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let competing_coord =
+        setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let stream_body = b"stream body that must not be published";
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    coord
+        .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, stream_body)
+        .unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let staged_segments = storage_cluster
+        .test_list_stream_segments(&bucket, &key, &session_id)
+        .unwrap();
+    assert_eq!(staged_segments.len(), 1);
+
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_closure = Arc::clone(&hook_ran);
+    let hook_guard = storage_cluster.test_install_before_stream_put_finalize_command_id_hook(
+        Arc::new(move || {
+            if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            test_helpers::put_object(
+                &competing_coord,
+                &PutObjectRequest {
+                    object: object_request("bucket", "key", test_requester()),
+                    data: b"competing object",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                },
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(1_100));
+        }),
+    );
+
+    let metadata = MetadataBlob::new();
+    let err = coord
+        .finalize_stream_put(&FinalizeStreamPutRequest {
+            object: object_request("bucket", "key", test_requester()),
+            session_id: &session_id,
+            crc64: checksum::crc64::checksum(stream_body),
+            total_size: stream_body.len() as u64,
+            metadata_blob: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            write_encryption: ActiveWriteEncryptionRef::None,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            requested_object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(hook_ran.load(Ordering::SeqCst));
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "stale stream finalization exhaustion must be retryable, got {err:?}"
+    );
+    drop(hook_guard);
+
+    let current = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request("bucket", "key", None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(current.body.read_all().unwrap(), b"competing object");
+    assert_eq!(
+        storage_cluster
+            .test_list_stream_segments(&bucket, &key, &session_id)
+            .unwrap(),
+        staged_segments,
+        "retry exhaustion must preserve the session for caller-owned cleanup"
+    );
+
+    coord
+        .abort_stream_put_session(&bucket, &key, &session_id)
+        .unwrap();
+    assert!(
+        storage_cluster
+            .test_list_stream_segments(&bucket, &key, &session_id)
+            .unwrap()
+            .is_empty(),
+        "caller cleanup must remove the staged stream segments"
+    );
+    assert!(
+        storage_cluster
+            .list_stream_upload_sessions_best_effort()
+            .iter()
+            .all(|session| session.session_id != session_id),
+        "caller cleanup must remove the stale stream session"
+    );
+}
+
+#[test]
 fn copy_object_destination_create_stream_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -6851,6 +6960,122 @@ fn copy_object_destination_finalize_maps_command_log_conflict_to_operation_abort
         "expected CopyObject destination finalize conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
+}
+
+#[test]
+fn copy_object_stale_destination_budget_returns_operation_aborted_and_cleans_stream() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let competing_coord =
+        setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"copy source that must not be published",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_closure = Arc::clone(&hook_ran);
+    let hook_guard = storage_cluster.test_install_before_stream_put_finalize_command_id_hook(
+        Arc::new(move || {
+            if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            test_helpers::put_object(
+                &competing_coord,
+                &PutObjectRequest {
+                    object: object_request("bucket", "dst", test_requester()),
+                    data: b"competing destination",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                },
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(1_100));
+        }),
+    );
+
+    let err = coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(hook_ran.load(Ordering::SeqCst));
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "stale CopyObject destination exhaustion must be retryable, got {err:?}"
+    );
+    drop(hook_guard);
+
+    let destination = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request("bucket", "dst", None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        destination.body.read_all().unwrap(),
+        b"competing destination"
+    );
+    let source = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request("bucket", "src", None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        source.body.read_all().unwrap(),
+        b"copy source that must not be published"
+    );
+    let leaked_sessions = storage_cluster.list_stream_upload_sessions_best_effort();
+    assert!(
+        leaked_sessions.is_empty(),
+        "failed CopyObject must clean its destination stream: {leaked_sessions:?}"
+    );
 }
 
 #[test]
