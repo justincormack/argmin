@@ -4242,6 +4242,157 @@ fn delete_unversioned_rechecks_current_object_at_execution() {
 }
 
 #[test]
+fn delete_unversioned_same_etag_replacement_at_execution_is_deleted() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let requester = test_helpers::requester("owner-a");
+
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+
+    let first = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"same-data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let cond = crate::conditional::DeleteCondition::IfMatch(first.etag.clone().into());
+    let authorized = coord
+        .authorize_delete_object(&DeleteObjectRequest {
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                requester.clone(),
+                None,
+            ),
+            bypass_governance: false,
+            cond: &cond,
+        })
+        .unwrap();
+
+    let replacement = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"same-data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(replacement.etag, first.etag);
+
+    coord
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
+        .unwrap();
+    let current = coord.get_object(&GetObjectRequest {
+        sse_customer: None,
+        object: object_version_request_with_expected_owner("bucket", "key", None, requester, None),
+        cond: NO_READ,
+    });
+    assert!(matches!(current, Err(ServerError::ObjectNotFound { .. })));
+}
+
+#[test]
+fn delete_objects_entry_rechecks_current_object_at_execution() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let requester = test_helpers::requester("owner-a");
+    coord
+        .create_bucket_for_owner("owner-a", "bucket", false)
+        .unwrap();
+
+    let first = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"first",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let entries = [DeleteEntry {
+        key: trusted_object_key("key"),
+        version_id: None,
+        cond: DeleteCondition::IfMatch(first.etag.into()),
+    }];
+    let request = DeleteObjectsRequest {
+        bucket: bucket_request_with_expected_owner("bucket", requester.clone(), None),
+        entries: &entries,
+        bypass_governance: false,
+    };
+    let authorized = coord
+        .authorize_delete_objects_entry(&request, &entries[0])
+        .unwrap();
+
+    let replacement = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"replacement",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let err = coord
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, &entries[0].cond)
+        .unwrap_err();
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
+    let current = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket", "key", None, requester, None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(current.etag, replacement.etag);
+    assert_eq!(current.body.read_all().unwrap(), b"replacement");
+}
+
+#[test]
 fn delete_current_marker_insert_rechecks_current_object_at_execution() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
@@ -4319,6 +4470,207 @@ fn delete_current_marker_insert_rechecks_current_object_at_execution() {
         .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
         .unwrap_err();
     assert!(matches!(err, ServerError::PreconditionFailed { .. }));
+}
+
+#[test]
+fn delete_current_marker_insert_rechecks_competing_delete_marker_at_execution() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let requester = test_helpers::requester("owner-a");
+
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Enabled,
+        requester.clone(),
+        None,
+    )
+    .unwrap();
+
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let cond = DeleteCondition::IfMatch(put.etag.into());
+    let authorized = coord
+        .authorize_delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            requester.clone(),
+            false,
+            &cond,
+        ))
+        .unwrap();
+
+    let first_marker = coord
+        .delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            requester.clone(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
+    assert!(first_marker.delete_marker);
+
+    let err = coord
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
+        .unwrap_err();
+    assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    let versions = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", requester, None),
+            prefix: Some("key"),
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 100,
+            requested_max_keys: Some(100),
+        })
+        .unwrap();
+    assert_eq!(versions.versions.len(), 2);
+    assert_eq!(
+        versions
+            .versions
+            .iter()
+            .filter(|version| version.is_delete_marker)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn delete_suspended_null_rechecks_replacement_at_execution() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let requester = test_helpers::requester("owner-a");
+    coord
+        .create_bucket_for_owner("owner-a", "bucket", false)
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Enabled,
+        requester.clone(),
+        None,
+    )
+    .unwrap();
+    let numbered = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"numbered",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        "bucket",
+        BucketVersioningState::Suspended,
+        requester.clone(),
+        None,
+    )
+    .unwrap();
+    let null = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"null",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(null.version_id, VersionId::Null);
+    let cond = DeleteCondition::IfMatch(null.etag.into());
+    let authorized = coord
+        .authorize_delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            requester.clone(),
+            false,
+            &cond,
+        ))
+        .unwrap();
+
+    let replacement = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"replacement",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(replacement.version_id, VersionId::Null);
+
+    let err = coord
+        .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
+        .unwrap_err();
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
+    let versions = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", requester, None),
+            prefix: Some("key"),
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 100,
+            requested_max_keys: Some(100),
+        })
+        .unwrap();
+    assert_eq!(versions.versions.len(), 2);
+    assert_eq!(versions.versions[0].version_id, VersionId::Null);
+    assert!(versions.versions[0].is_latest);
+    assert_eq!(versions.versions[0].etag, replacement.etag);
+    assert_eq!(versions.versions[1].version_id, numbered.version_id);
+    assert!(!versions.versions[1].is_latest);
 }
 
 #[test]

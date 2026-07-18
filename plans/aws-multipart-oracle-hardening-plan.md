@@ -625,12 +625,50 @@ choice.
   establish whether AWS binds object-dependent authorization to the initial
   destination state, the commit state, or another linearization point before
   changing the local capability model.
-- [ ] Probe DeleteObject and DeleteObjects races against same-ETag and
+- [x] Probe DeleteObject and DeleteObjects races against same-ETag and
   different-ETag replacement, current delete-marker insertion, enabled
   versioning, and suspended null replacement. Pin per-entry DeleteObjects
   results and final state. The local implementation already re-runs current
   object authorization and the ETag condition inside one storage callback;
   deterministic regressions must prove that invariant under replacement.
+
+  Shared AWS/local races now cover both endpoints across unversioned,
+  version-enabled, and suspended buckets. A different-ETag replacement leaves
+  the complete replacement visible and permits the conditional delete to have
+  serialized first, to return settled `PreconditionFailed`, or to return
+  `ConditionalRequestConflict` when AWS detects the overlapping generation.
+  Same-ETag unversioned replacement remains ETag-based: repeated AWS runs
+  serialized the delete successfully, with final state determined by which
+  successful mutation was last. Suspended null replacement exposes the
+  stronger overlap branch: even identical bytes and ETag can return
+  `ConditionalRequestConflict`; both DeleteObject and DeleteObjects pin that
+  branch, with the latter requiring any conflict to be a per-entry error while
+  its matched canary entry succeeds. A successful delete publishes the null marker
+  and a successful later replacement publishes the null live version.
+  Retained numbered versions, exact marker/version IDs, latest flags, metadata,
+  and bytes are asserted for every branch.
+
+  Racing an ETag-conditional delete with an ordinary marker insertion either
+  publishes the conditional marker, reports `NoSuchKey` after observing the
+  marker, or reports the concurrent-generation conflict. Two successful calls
+  may identify one idempotently shared marker or two retained markers, so the
+  matrix compares the exact unique returned IDs and requires exactly one latest
+  marker. DeleteObjects includes a separately matched canary entry in every
+  raced request, pins errors per key inside the successful batch response, and
+  has a settled current-marker oracle requiring per-entry `NoSuchKey`. When a
+  different-ETag versioned race successfully publishes a conditional marker,
+  both endpoint tests require that marker to be non-latest and the later
+  replacement version to be latest; accepting merely opposite latest flags
+  would hide stale marker publication.
+
+  Deterministic coordinator regressions pause conceptually between entry
+  authorization and the atomic storage callback. They prove that DeleteObject
+  and DeleteObjects re-read a different-ETag replacement, accept and delete a
+  same-ETag replacement, reject a newly current delete marker without adding
+  another marker, and preserve a replaced suspended null plus its numbered
+  history. No implementation change was required: the existing callback
+  already keeps current authorization and condition evaluation coupled to the
+  mutation.
 - [x] Add the remaining conditional input and precedence matrix for operations
   that accept ETag lists or dates: weak and unquoted tags, wildcard/list forms,
   duplicate headers, malformed dates, missing objects, authorization failures,

@@ -164,6 +164,11 @@ type PutObjectCallResult = Result<
     aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
 >;
 
+type DeleteObjectCallResult = Result<
+    aws_sdk_s3::operation::delete_object::DeleteObjectOutput,
+    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::delete_object::DeleteObjectError>,
+>;
+
 fn apply_racing_put_condition(
     request: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
     condition: &RacingPutCondition,
@@ -211,6 +216,49 @@ async fn send_coordinated_conditional_puts(
     let right = tasks.pop().unwrap();
     let left = tasks.pop().unwrap();
     (left.await.unwrap(), right.await.unwrap())
+}
+
+async fn race_conditional_delete_with_put(
+    bucket: &str,
+    key: &str,
+    etag: &str,
+    replacement_body: &'static [u8],
+    replacement_state: &'static str,
+) -> (DeleteObjectCallResult, PutObjectCallResult) {
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let delete_client = CTX.client().clone();
+    let delete_bucket = bucket.to_string();
+    let delete_key = key.to_string();
+    let delete_etag = etag.to_string();
+    let delete_barrier = Arc::clone(&barrier);
+    let delete = tokio::spawn(async move {
+        delete_barrier.wait().await;
+        delete_client
+            .delete_object()
+            .bucket(delete_bucket)
+            .key(delete_key)
+            .if_match(delete_etag)
+            .send()
+            .await
+    });
+
+    let put_client = CTX.client().clone();
+    let put_bucket = bucket.to_string();
+    let put_key = key.to_string();
+    let put = tokio::spawn(async move {
+        barrier.wait().await;
+        put_client
+            .put_object()
+            .bucket(put_bucket)
+            .key(put_key)
+            .metadata("replacement-state", replacement_state)
+            .body(ByteStream::from_static(replacement_body))
+            .send()
+            .await
+    });
+
+    let (delete, put) = tokio::join!(delete, put);
+    (delete.unwrap(), put.unwrap())
 }
 
 fn assert_one_conditional_put_winner(
@@ -2303,6 +2351,512 @@ fn test_delete_object_ifmatch_current_delete_marker_returns_no_such_key() {
             .await;
         assert_eq!(err_status(&result), 404);
         assert_s3_err_code(&result, "NoSuchKey");
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_delete_object_ifmatch_races_current_replacement_across_versioning_states() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let different_key = "delete-race-unversioned-different-etag";
+        let different_etag = put_object(&bucket, different_key, b"original").await;
+        let (different_delete, different_put) = race_conditional_delete_with_put(
+            &bucket,
+            different_key,
+            &different_etag,
+            b"different replacement",
+            "different-etag",
+        )
+        .await;
+        different_put.unwrap_or_else(|error| {
+            panic!("unversioned different-ETag replacement failed: {error:?}")
+        });
+        if let Err(error) = &different_delete {
+            match err_status(&different_delete) {
+                409 => assert_s3_err_code(&different_delete, "ConditionalRequestConflict"),
+                412 => assert_s3_err_code(&different_delete, "PreconditionFailed"),
+                status => panic!(
+                    "unversioned different-ETag conditional delete returned {status}: {error:?}"
+                ),
+            }
+        }
+        let different_current = client
+            .get_object()
+            .bucket(&bucket)
+            .key(different_key)
+            .send_retrying_operation_aborted(
+                "get unversioned different-ETag delete-race replacement",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            different_current
+                .metadata()
+                .and_then(|metadata| metadata.get("replacement-state"))
+                .map(String::as_str),
+            Some("different-etag")
+        );
+        assert_eq!(
+            different_current
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+                .as_ref(),
+            b"different replacement"
+        );
+
+        let same_key = "delete-race-unversioned-same-etag";
+        let same_etag = put_object(&bucket, same_key, b"same bytes").await;
+        let (same_delete, same_put) = race_conditional_delete_with_put(
+            &bucket,
+            same_key,
+            &same_etag,
+            b"same bytes",
+            "same-etag",
+        )
+        .await;
+        let same_put = same_put
+            .unwrap_or_else(|error| panic!("unversioned same-ETag replacement failed: {error:?}"));
+        assert_eq!(same_put.e_tag(), Some(same_etag.as_str()));
+        same_delete
+            .unwrap_or_else(|error| panic!("unversioned same-ETag delete failed: {error:?}"));
+        match client
+            .get_object()
+            .bucket(&bucket)
+            .key(same_key)
+            .send_retrying_operation_aborted("get unversioned same-ETag delete-race result")
+            .await
+        {
+            Ok(current) => {
+                assert_eq!(current.e_tag(), Some(same_etag.as_str()));
+                assert_eq!(
+                    current
+                        .metadata()
+                        .and_then(|metadata| metadata.get("replacement-state"))
+                        .map(String::as_str),
+                    Some("same-etag")
+                );
+                assert_eq!(
+                    current.body.collect().await.unwrap().into_bytes().as_ref(),
+                    b"same bytes"
+                );
+            }
+            Err(error) => {
+                assert_eq!(
+                    error
+                        .raw_response()
+                        .map(|response| response.status().as_u16()),
+                    Some(404),
+                    "{error:?}"
+                );
+                assert_eq!(error.code(), Some("NoSuchKey"));
+            }
+        }
+
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+
+        let versioned_key = "delete-race-versioned-different-etag";
+        let versioned_original = put_object_result_retrying_operation_aborted(
+            "put versioned conditional delete-race original",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(versioned_key)
+                    .body(ByteStream::from_static(b"versioned original"))
+            },
+        )
+        .await
+        .unwrap();
+        let original_version = versioned_original.version_id().unwrap().to_string();
+        let original_etag = versioned_original.e_tag().unwrap().to_string();
+        let (versioned_delete, versioned_put) = race_conditional_delete_with_put(
+            &bucket,
+            versioned_key,
+            &original_etag,
+            b"versioned replacement",
+            "versioned-different-etag",
+        )
+        .await;
+        let versioned_put =
+            versioned_put.unwrap_or_else(|error| panic!("versioned replacement failed: {error:?}"));
+        let replacement_version = versioned_put.version_id().unwrap().to_string();
+        assert_ne!(replacement_version, original_version);
+        let delete_marker_version = match versioned_delete {
+            Ok(deleted) => {
+                assert_eq!(deleted.delete_marker(), Some(true));
+                Some(deleted.version_id().unwrap().to_string())
+            }
+            Err(error) => {
+                match error
+                    .raw_response()
+                    .map(|response| response.status().as_u16())
+                {
+                    Some(409) => assert_eq!(error.code(), Some("ConditionalRequestConflict")),
+                    Some(412) => assert_eq!(error.code(), Some("PreconditionFailed")),
+                    status => panic!(
+                        "versioned different-ETag conditional delete returned {status:?}: {error:?}"
+                    ),
+                }
+                None
+            }
+        };
+        let versions = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix(versioned_key)
+            .send_retrying_operation_aborted(
+                "list versioned different-ETag conditional delete-race result",
+            )
+            .await
+            .unwrap();
+        assert_eq!(versions.versions().len(), 2);
+        let retained_versions: std::collections::HashSet<&str> = versions
+            .versions()
+            .iter()
+            .filter_map(|version| version.version_id())
+            .collect();
+        assert_eq!(
+            retained_versions,
+            std::collections::HashSet::from([
+                original_version.as_str(),
+                replacement_version.as_str()
+            ])
+        );
+        let original = versions
+            .versions()
+            .iter()
+            .find(|version| version.version_id() == Some(original_version.as_str()))
+            .unwrap();
+        assert!(!original.is_latest().unwrap_or(false));
+        let replacement = versions
+            .versions()
+            .iter()
+            .find(|version| version.version_id() == Some(replacement_version.as_str()))
+            .unwrap();
+        assert!(replacement.is_latest().unwrap_or(false));
+        assert_eq!(
+            versions.delete_markers().len(),
+            usize::from(delete_marker_version.is_some())
+        );
+        if let Some(delete_marker_version) = delete_marker_version {
+            assert_eq!(
+                versions.delete_markers()[0].version_id(),
+                Some(delete_marker_version.as_str())
+            );
+            assert!(!versions.delete_markers()[0].is_latest().unwrap_or(false));
+        }
+
+        let marker_race_key = "delete-race-versioned-current-marker";
+        let marker_original = put_object_result_retrying_operation_aborted(
+            "put current-marker conditional delete-race original",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(marker_race_key)
+                    .body(ByteStream::from_static(b"marker original"))
+            },
+        )
+        .await
+        .unwrap();
+        let marker_original_version = marker_original.version_id().unwrap().to_string();
+        let marker_etag = marker_original.e_tag().unwrap().to_string();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let conditional_client = client.clone();
+        let conditional_bucket = bucket.clone();
+        let conditional_barrier = Arc::clone(&barrier);
+        let conditional = tokio::spawn(async move {
+            conditional_barrier.wait().await;
+            conditional_client
+                .delete_object()
+                .bucket(conditional_bucket)
+                .key(marker_race_key)
+                .if_match(marker_etag)
+                .send()
+                .await
+        });
+        let marker_client = client.clone();
+        let marker_bucket = bucket.clone();
+        let marker = tokio::spawn(async move {
+            barrier.wait().await;
+            marker_client
+                .delete_object()
+                .bucket(marker_bucket)
+                .key(marker_race_key)
+                .send()
+                .await
+        });
+        let (conditional, marker) = tokio::join!(conditional, marker);
+        let conditional = conditional.unwrap();
+        let marker = marker
+            .unwrap()
+            .unwrap_or_else(|error| panic!("competing marker insertion failed: {error:?}"));
+        assert_eq!(marker.delete_marker(), Some(true));
+        let marker_version = marker.version_id().unwrap().to_string();
+        let conditional_marker = match conditional {
+            Ok(deleted) => {
+                assert_eq!(deleted.delete_marker(), Some(true));
+                Some(deleted.version_id().unwrap().to_string())
+            }
+            Err(error) => {
+                match error
+                    .raw_response()
+                    .map(|response| response.status().as_u16())
+                {
+                    Some(404) => assert_eq!(error.code(), Some("NoSuchKey")),
+                    Some(409) => assert_eq!(error.code(), Some("ConditionalRequestConflict")),
+                    status => {
+                        panic!("competing conditional marker returned {status:?}: {error:?}")
+                    }
+                }
+                None
+            }
+        };
+        let marker_versions = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix(marker_race_key)
+            .send_retrying_operation_aborted("list competing conditional delete markers")
+            .await
+            .unwrap();
+        assert_eq!(marker_versions.versions().len(), 1);
+        assert_eq!(
+            marker_versions.versions()[0].version_id(),
+            Some(marker_original_version.as_str())
+        );
+        let mut expected_marker_versions =
+            std::collections::HashSet::from([marker_version.as_str()]);
+        if let Some(conditional_marker) = conditional_marker.as_deref() {
+            expected_marker_versions.insert(conditional_marker);
+        }
+        let actual_marker_versions: std::collections::HashSet<&str> = marker_versions
+            .delete_markers()
+            .iter()
+            .filter_map(|marker| marker.version_id())
+            .collect();
+        assert_eq!(actual_marker_versions, expected_marker_versions);
+        assert_eq!(
+            marker_versions
+                .delete_markers()
+                .iter()
+                .filter(|marker| marker.is_latest().unwrap_or(false))
+                .count(),
+            1
+        );
+
+        let suspended_key = "delete-race-suspended-different-etag";
+        let suspended_same_key = "delete-race-suspended-same-etag";
+        let suspended_numbered = put_object_result_retrying_operation_aborted(
+            "put numbered suspended delete-race history",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(suspended_key)
+                    .body(ByteStream::from_static(b"numbered history"))
+            },
+        )
+        .await
+        .unwrap();
+        let suspended_numbered_version = suspended_numbered.version_id().unwrap().to_string();
+        let suspended_same_numbered = put_object_result_retrying_operation_aborted(
+            "put numbered suspended same-ETag delete-race history",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(suspended_same_key)
+                    .body(ByteStream::from_static(b"numbered same history"))
+            },
+        )
+        .await
+        .unwrap();
+        let suspended_same_numbered_version =
+            suspended_same_numbered.version_id().unwrap().to_string();
+
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Suspended)
+                    .build(),
+            )
+            .send_retrying_operation_aborted("suspend versioning for conditional delete races")
+            .await
+            .unwrap();
+
+        let suspended_null = put_object_result_retrying_operation_aborted(
+            "put null suspended delete-race original",
+            || {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(suspended_key)
+                    .body(ByteStream::from_static(b"suspended original"))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(suspended_null.version_id(), None);
+        let null_etag = suspended_null.e_tag().unwrap().to_string();
+        let (suspended_delete, suspended_put) = race_conditional_delete_with_put(
+            &bucket,
+            suspended_key,
+            &null_etag,
+            b"suspended replacement",
+            "suspended-different-etag",
+        )
+        .await;
+        suspended_put
+            .unwrap_or_else(|error| panic!("suspended null replacement failed: {error:?}"));
+        if let Err(error) = &suspended_delete {
+            match err_status(&suspended_delete) {
+                409 => assert_s3_err_code(&suspended_delete, "ConditionalRequestConflict"),
+                412 => assert_s3_err_code(&suspended_delete, "PreconditionFailed"),
+                status => panic!(
+                    "suspended different-ETag conditional delete returned {status}: {error:?}"
+                ),
+            }
+        }
+        let suspended_current = client
+            .get_object()
+            .bucket(&bucket)
+            .key(suspended_key)
+            .send_retrying_operation_aborted("get suspended conditional delete-race replacement")
+            .await
+            .unwrap();
+        assert_eq!(
+            suspended_current
+                .metadata()
+                .and_then(|metadata| metadata.get("replacement-state"))
+                .map(String::as_str),
+            Some("suspended-different-etag")
+        );
+        assert_eq!(
+            suspended_current
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+                .as_ref(),
+            b"suspended replacement"
+        );
+        let suspended_versions = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix(suspended_key)
+            .send_retrying_operation_aborted(
+                "list suspended different-ETag conditional delete-race result",
+            )
+            .await
+            .unwrap();
+        assert_eq!(suspended_versions.versions().len(), 2);
+        assert!(suspended_versions.delete_markers().is_empty());
+        assert!(suspended_versions.versions().iter().any(|version| {
+            version.version_id() == Some(suspended_numbered_version.as_str())
+                && !version.is_latest().unwrap_or(false)
+        }));
+        assert!(suspended_versions.versions().iter().any(|version| {
+            version.version_id() == Some("null") && version.is_latest().unwrap_or(false)
+        }));
+
+        let suspended_same = put_object(&bucket, suspended_same_key, b"suspended same bytes").await;
+        let (suspended_same_delete, suspended_same_put) = race_conditional_delete_with_put(
+            &bucket,
+            suspended_same_key,
+            &suspended_same,
+            b"suspended same bytes",
+            "suspended-same-etag",
+        )
+        .await;
+        let suspended_same_put = suspended_same_put
+            .unwrap_or_else(|error| panic!("suspended same-ETag replacement failed: {error:?}"));
+        assert_eq!(suspended_same_put.e_tag(), Some(suspended_same.as_str()));
+        let suspended_same_delete_succeeded = match suspended_same_delete {
+            Ok(deleted) => {
+                assert_eq!(deleted.delete_marker(), Some(true));
+                assert_eq!(deleted.version_id(), Some("null"));
+                true
+            }
+            Err(error) => {
+                assert_eq!(
+                    error
+                        .raw_response()
+                        .map(|response| response.status().as_u16()),
+                    Some(409),
+                    "{error:?}"
+                );
+                assert_eq!(error.code(), Some("ConditionalRequestConflict"));
+                false
+            }
+        };
+        let suspended_same_versions = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix(suspended_same_key)
+            .send_retrying_operation_aborted("list suspended same-ETag delete-race result")
+            .await
+            .unwrap();
+        assert!(suspended_same_versions.versions().len() <= 2);
+        assert!(suspended_same_versions.delete_markers().len() <= 1);
+        assert_eq!(
+            suspended_same_versions.versions().len()
+                + suspended_same_versions.delete_markers().len(),
+            2
+        );
+        assert!(suspended_same_versions.versions().iter().any(|version| {
+            version.version_id() == Some(suspended_same_numbered_version.as_str())
+                && !version.is_latest().unwrap_or(false)
+        }));
+        if let Some(version) = suspended_same_versions
+            .versions()
+            .iter()
+            .find(|version| version.version_id() == Some("null"))
+        {
+            assert!(version.is_latest().unwrap_or(false));
+            let current = client
+                .get_object()
+                .bucket(&bucket)
+                .key(suspended_same_key)
+                .send_retrying_operation_aborted(
+                    "get suspended same-ETag conditional delete-race replacement",
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                current
+                    .metadata()
+                    .and_then(|metadata| metadata.get("replacement-state"))
+                    .map(String::as_str),
+                Some("suspended-same-etag")
+            );
+        } else {
+            assert!(
+                suspended_same_delete_succeeded,
+                "a conflicted delete cannot publish a null delete marker"
+            );
+            let marker = &suspended_same_versions.delete_markers()[0];
+            assert_eq!(marker.version_id(), Some("null"));
+            assert!(marker.is_latest().unwrap_or(false));
+            let current = client
+                .get_object()
+                .bucket(&bucket)
+                .key(suspended_same_key)
+                .send_retrying_operation_aborted(
+                    "get suspended same-ETag conditional delete-race marker",
+                )
+                .await;
+            assert_eq!(err_status(&current), 404);
+        }
 
         cleanup_versioned_bucket(client, &bucket).await;
     });
