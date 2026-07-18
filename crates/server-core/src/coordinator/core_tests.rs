@@ -6023,6 +6023,141 @@ fn frontend_coordinators_share_one_reclaim_sweeper_per_storage_handle() {
 }
 
 #[test]
+fn reclaim_worker_rediscovers_capacity_deferred_root_while_idle() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("reclaim-worker-idle-return");
+
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let storage_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            storage_handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    let bucket = "bucket";
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let metadata_pg_id = storage_cluster.test_pg_ids()[0];
+    let keys = ["first-", "second-", "capacity-deferred-"].map(|prefix| {
+        find_key_for_object_metadata_pg_with_prefix(
+            &storage_cluster,
+            bucket,
+            metadata_pg_id,
+            prefix,
+        )
+    });
+    let bucket_name = trusted_bucket_name(bucket);
+    let mut reclaim_roots = Vec::new();
+    for key in &keys {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+                data: key.as_bytes(),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let object_key = trusted_object_key(key);
+        let generation_id = storage_cluster
+            .test_get_object_meta(&bucket_name, &object_key)
+            .unwrap()
+            .into_live()
+            .expect("put object should create a live object")
+            .generation_id;
+        coord
+            .delete_object(&delete_object_request(
+                bucket,
+                key,
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
+            .unwrap();
+        reclaim_roots.push((object_key, generation_id));
+    }
+    assert!(
+        reclaim_roots.iter().all(|(key, generation_id)| {
+            storage_cluster
+                .test_payload_reclaim_exists(&bucket_name, key, *generation_id)
+                .unwrap()
+        }),
+        "all durable roots must exist before the reclaim worker starts"
+    );
+
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let gate_for_hook = Arc::clone(&gate);
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(storage_cluster.process_local_registry_key()),
+        reclaim_worker_durable_scan_delay_override: Some(Duration::from_secs(3_600)),
+        force_reclaim_worker_durable_scan_after_idle_return: true,
+        after_reclaim_worker_idle_return: Some(Arc::new(move || {
+            gate_for_hook.wait_at(TOKEN);
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let _worker =
+        setup_coordinator_with_only_reclaim_worker(storage_handle, Arc::clone(&storage_cluster));
+    let _gate_release_guard = gate.release_on_drop();
+    gate.wait_until_arrived(Duration::from_secs(10));
+    let root_presence = reclaim_roots
+        .iter()
+        .map(|(key, generation_id)| {
+            storage_cluster.test_payload_reclaim_exists(&bucket_name, key, *generation_id)
+        })
+        .collect::<Vec<_>>();
+    gate.release();
+    let root_presence = root_presence
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        root_presence,
+        [false, false, true],
+        "the worker must return from an empty queue poll after the queued roots drain and before the capacity-deferred root is rediscovered"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = reclaim_roots
+            .iter()
+            .filter(|(key, generation_id)| {
+                storage_cluster
+                    .test_payload_reclaim_exists(&bucket_name, key, *generation_id)
+                    .unwrap()
+            })
+            .count();
+        if remaining == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle reclaim worker left {remaining} durable roots stranded"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn put_object_effective_policy_context_derives_explicit_sse_s3() {
     let metadata = MetadataBlob::default();
     let system_metadata = SystemMetadata::default();

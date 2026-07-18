@@ -7672,13 +7672,15 @@ Shard repair design:
   corruption. Reclaim sweepers now use the same process-local weak registry as
   the other sweepers. The managed worker owns the only durable-scan cadence;
   public wait primitives are explicitly queue-only and cannot launch a hidden
-  second scan. An expired map is rejected once before walking PGs, the first
-  epoch-wide stale-route result stops all remaining PG and scan-family work,
-  and the worker backs off for one second from scan completion pending map
-  refresh. Per-PG lifecycle errors such as one PG in `Peering` remain local and
-  do not suppress cleanup for healthy PGs. Real Unix storage-RPC and
-  multi-coordinator regressions pin the bounded scan and shared worker
-  behavior.
+  second scan. Each bounded idle queue poll returns to that outer scheduler so
+  capacity-deferred and newly eligible durable roots are rediscovered without
+  unrelated queue activity. An expired map is rejected once before walking
+  PGs, the first epoch-wide stale-route result stops all remaining PG and
+  scan-family work, and the worker backs off for one second from scan
+  completion pending map refresh. Per-PG lifecycle errors such as one PG in
+  `Peering` remain local and do not suppress cleanup for healthy PGs. Real Unix
+  storage-RPC and multi-coordinator regressions pin the bounded scan and shared
+  worker behavior.
 - Do not address the related global-epoch failure domain by accepting arbitrary
   old storage RPC epochs. Current frames carry only node ID, global cluster
   epoch, and PG ID, so the storage node cannot distinguish an unchanged PG

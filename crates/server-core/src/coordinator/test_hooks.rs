@@ -8,7 +8,11 @@ use super::Coordinator;
 #[derive(Default, Clone)]
 pub(super) struct ReclamationTestHooks {
     pub(super) target: Option<(String, String)>,
+    pub(super) target_reclaim_worker_registry_key: Option<usize>,
     pub(super) probe_multipart_complete_auth_lookup: bool,
+    pub(super) reclaim_worker_durable_scan_delay_override: Option<Duration>,
+    pub(super) force_reclaim_worker_durable_scan_after_idle_return: bool,
+    pub(super) after_reclaim_worker_idle_return: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_abort_multipart_bucket_summary: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -45,6 +49,16 @@ pub(super) struct DeterministicFaultGate {
     token: DeterministicFaultToken,
     state: Mutex<DeterministicFaultGateState>,
     changed: Condvar,
+}
+
+pub(super) struct DeterministicFaultGateReleaseGuard {
+    gate: Arc<DeterministicFaultGate>,
+}
+
+impl Drop for DeterministicFaultGateReleaseGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
 }
 
 impl DeterministicFaultGate {
@@ -85,6 +99,12 @@ impl DeterministicFaultGate {
         let mut state = self.state.lock().unwrap();
         state.released = true;
         self.changed.notify_all();
+    }
+
+    pub(super) fn release_on_drop(self: &Arc<Self>) -> DeterministicFaultGateReleaseGuard {
+        DeterministicFaultGateReleaseGuard {
+            gate: Arc::clone(self),
+        }
     }
 }
 
@@ -302,6 +322,39 @@ pub(super) fn maybe_run_shard_repair_worker_idle_timeout_hook(registry_key: usiz
     if let Some(hook) = hooks.after_idle_timeout {
         hook();
     }
+}
+
+pub(super) fn reclaim_worker_durable_scan_delay_override(registry_key: usize) -> Option<Duration> {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target_reclaim_worker_registry_key
+        .is_some_and(|target| target != registry_key)
+    {
+        return None;
+    }
+    hooks.reclaim_worker_durable_scan_delay_override
+}
+
+pub(super) fn maybe_run_reclaim_worker_idle_return_hook(registry_key: usize) -> bool {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target_reclaim_worker_registry_key
+        .is_some_and(|target| target != registry_key)
+    {
+        return false;
+    }
+    if let Some(hook) = hooks.after_reclaim_worker_idle_return {
+        hook();
+    }
+    hooks.force_reclaim_worker_durable_scan_after_idle_return
 }
 
 pub(super) fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {

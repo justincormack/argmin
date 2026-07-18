@@ -17,7 +17,10 @@ use storage::{
 use super::payload::SharedPayloadBuffer;
 use super::read_core::{PayloadLease, ReadRuntime, SegmentPayloadRecord};
 #[cfg(test)]
-use super::test_hooks::maybe_run_shard_repair_worker_idle_timeout_hook;
+use super::test_hooks::{
+    maybe_run_reclaim_worker_idle_return_hook, maybe_run_shard_repair_worker_idle_timeout_hook,
+    reclaim_worker_durable_scan_delay_override,
+};
 use super::TRACE_TARGET;
 use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS};
 #[cfg(test)]
@@ -575,7 +578,18 @@ fn enqueue_durable_reclaim_work_if_due(
         excluded_bucket_delete_begin_roots,
         excluded_bucket_delete_finalize_roots,
     );
-    *next_scan_at = next_reclaim_durable_scan_at(Instant::now(), outcome);
+    let scan_completed_at = Instant::now();
+    #[cfg(not(test))]
+    {
+        *next_scan_at = next_reclaim_durable_scan_at(scan_completed_at, outcome);
+    }
+    #[cfg(test)]
+    {
+        let scan_delay =
+            reclaim_worker_durable_scan_delay_override(storage_node.process_local_registry_key())
+                .unwrap_or_else(|| reclaim_durable_scan_delay(outcome));
+        *next_scan_at = scan_completed_at + scan_delay;
+    }
 }
 
 fn reclaim_durable_scan_delay(outcome: storage::DurableReclaimScanOutcome) -> Duration {
@@ -775,7 +789,17 @@ impl ReclaimSweeper {
                                 })
                         })
                         .or_else(|| {
-                            wait_for_runtime_map_reclaim_work(&storage_handle, &worker_stop)
+                            let work =
+                                wait_for_runtime_map_reclaim_work(&storage_handle, &worker_stop);
+                            #[cfg(test)]
+                            if work.is_none()
+                                && maybe_run_reclaim_worker_idle_return_hook(
+                                    worker_node.process_local_registry_key(),
+                                )
+                            {
+                                next_durable_scan_at = Instant::now();
+                            }
+                            work
                         })
                     else {
                         if worker_stop.load(Ordering::SeqCst) {
@@ -1020,13 +1044,12 @@ fn wait_for_runtime_map_reclaim_work(
     storage_handle: &StorageClusterRuntimeMapHandle,
     stop: &AtomicBool,
 ) -> Option<(Arc<StorageCluster>, ReclaimWorkItem)> {
-    while !stop.load(Ordering::SeqCst) {
-        let worker_node = storage_handle.current();
-        if let Some(work) = worker_node.wait_for_queued_reclaim_work_poll(stop) {
-            return Some((worker_node, work));
-        }
+    if stop.load(Ordering::SeqCst) {
+        return None;
     }
-    None
+    let worker_node = storage_handle.current();
+    let work = worker_node.wait_for_queued_reclaim_work_poll(stop)?;
+    Some((worker_node, work))
 }
 
 impl Drop for LifecycleSweeper {
