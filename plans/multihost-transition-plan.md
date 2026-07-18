@@ -11279,14 +11279,56 @@ Required production shape and implementation order:
    one crate-internal physical journal implementation for versioned/checksummed
    headers, length-framed records, CRC validation, fsync ambiguity
    classification, torn-tail recovery, logical offsets, and atomic prefix
-   compaction. The single-authority logical records bind the durable authority
-   identity, previous/resulting canonical snapshot digests, and the existing
-   versioned/checksummed `ControlPlaneCommand` encoding. Recovery replays and
-   validates the retained command chain over the canonical checkpoint before
-   publishing state. Checkpoint anchors retain the exact checkpoint digest
-   after compaction, and checkpoint publication is bound to the previously
-   published digest so a stale capture is rejected before filesystem
-   mutation. Recovery requires an identity-bound checkpoint anchor and rejects
+   compaction. Checkpoint anchors bind the durable authority identity and exact
+   canonical checkpoint digest. Between anchors, each logical record binds the
+   previous command-chain digest and existing versioned/checksummed
+   `ControlPlaneCommand` bytes; the resulting digest is derived from both.
+   Recovery verifies that chain and deterministically replays and validates
+   every retained command over the canonical checkpoint before publishing
+   state. This avoids formatting and hashing the complete retained-history
+   snapshot for every journaled command while preserving corruption,
+   reordering, interior-omission, and foreign-identity detection. A complete
+   terminal suffix whose append and `sync_all` completed before acknowledgement
+   is part of the required filesystem durability contract: arbitrary later
+   removal or truncation of that suffix is storage corruption, not a
+   process-crash/torn-write case that an in-file chain can independently
+   detect. Adding a separately synced terminal-head sidecar would double the
+   small-command sync path without protecting against correlated loss on the
+   same failure domain, so it is not part of this journal protocol.
+   Checkpoint publication is bound to the latest in-process publication state
+   so a stale capture is rejected before filesystem mutation. It first writes
+   and syncs a prepared snapshot and its parent directory, then appends and
+   syncs its identity-bound checkpoint anchor, then atomically renames the
+   prepared snapshot, and only then compacts the older journal prefix. The
+   parent-directory sync is before the anchor: no crash can preserve a durable
+   anchor while losing the prepared snapshot filename needed to recover it.
+   Bare relative state paths use `.` as their durability parent; they do not
+   bypass snapshot, journal, identity, or marker directory syncs. Process lock
+   startup and store publication share one state-directory creation primitive:
+   it creates each missing component from the nearest existing ancestor
+   outward and syncs that component's parent before creating the next component
+   or any durable state. Before that sequence it also syncs the nearest visible
+   ancestor's parent: an existing directory may be residue from a prior failed
+   sync or a concurrent creator and is not itself durable evidence. Therefore a
+   successful startup or retry cannot lose the complete newly created state
+   directory while retaining no initialization evidence.
+   Recovery considers both the published and prepared snapshots and selects
+   the candidate bound to the newest retained anchor. Therefore a crash before
+   anchor publication keeps the old checkpoint authoritative, while a crash
+   after anchor publication can complete from the prepared checkpoint; this
+   also covers restart-time authority-incarnation bumps that are not ordinary
+   journal commands. First creation additionally publishes an
+   identity-bound initialization-complete marker only after the first
+   checkpoint and anchor are durable. Identity/clock or prepared-snapshot
+   residue without that marker, journal, or published checkpoint is treated as
+   an interrupted first initialization and may restart from empty state. Once
+   the marker exists, missing checkpoint/journal state remains a hard failure,
+   so this recovery rule cannot silently reinitialize an established store.
+   The same pre-marker rule discards an empty journal, truncated file header,
+   or torn first frame left while creating the first anchor. Those shapes
+   remain fatal after the initialization marker or a published checkpoint
+   exists.
+   Recovery requires an identity-bound checkpoint anchor and rejects
    a missing, empty, or command-only journal rather than accepting a bare
    checkpoint that could have lost an acknowledged suffix. The shared physical
    journal uses a checked length/complement prefix and versioned file headers,
@@ -11302,7 +11344,23 @@ Required production shape and implementation order:
    per-command checkpoint rewrite, zero journal growth for covered renewals and
    exact retries, promotion across unrelated commands, semantic heartbeats,
    and restart, torn tails, corrupt frame lengths, missing anchors, foreign
-   identities, stale/off-chain checkpoints, and ambiguous-sync poisoning.
+   identities, stale/off-chain checkpoints, complete interior-record omission,
+   prepared-snapshot directory durability, journal-file-sync-before-directory-
+   sync failure, bare-relative-path parent selection, recursive state-directory
+   parent sync ordering, fail-closed interruption, and successful retry after
+   failed boundary publication, empty/truncated/torn first-journal creation,
+   pre-anchor first-initialization interruption,
+   anchor-before-snapshot crash recovery for threshold checkpoints and restart
+   bumps, and ambiguous-sync poisoning.
+   A 2026-07-18 standalone 216-PG route-change soak exposed the need for the
+   command chain: full checkpoint saves fell from 7,348 to one, but 2,714
+   retained journal records still formatted and hashed an approximately
+   1.4 MiB snapshot under the authority mutex. RPC lock/operation tails reached
+   5-6 seconds, causing heartbeat response loss and a transient serving-map
+   timeout despite all 216 authoritative routes being active. Journal record
+   version 2 therefore uses the bounded command chain above; regression
+   coverage proves ordinary journal suffix publication performs no canonical
+   full-snapshot digest computation.
 5. Make full snapshots periodic compacted products, not the per-command write
    path. Checkpoint after bounded journal bytes/commands/time, atomically rotate
    the journal, and prove artifact-plus-journal replay reconstructs identical

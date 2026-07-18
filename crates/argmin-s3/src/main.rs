@@ -28,8 +28,9 @@ use server_core::sse::{
 use storage::control_plane::{
     build_control_plane_authority_clock_admin_response_from_verified_with_context,
     build_control_plane_unix_admission_error_response,
-    build_control_plane_unix_response_from_verified, finish_control_plane_heartbeat_response,
-    invalidate_authority_clock_restart_checkpoint, load_authority_clock_restart_checkpoint,
+    build_control_plane_unix_response_from_verified, ensure_control_plane_state_parent_directory,
+    finish_control_plane_heartbeat_response, invalidate_authority_clock_restart_checkpoint,
+    load_authority_clock_restart_checkpoint,
     prepare_control_plane_heartbeat_response_from_verified,
     prepare_control_plane_heartbeat_response_with_lease_horizon_authority_from_verified,
     read_control_plane_unix_request, store_authority_clock_restart_checkpoint,
@@ -218,17 +219,12 @@ struct ControlPlaneStateLock {
 
 fn acquire_control_plane_state_lock(state_path: &Path) -> Result<ControlPlaneStateLock, String> {
     let lock_path = control_plane_state_lock_path(state_path)?;
-    if let Some(parent) = lock_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "failed to create control-plane lock directory {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
+    ensure_control_plane_state_parent_directory(state_path).map_err(|error| {
+        format!(
+            "failed to durably create control-plane state directory for {}: {error}",
+            state_path.display()
+        )
+    })?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)

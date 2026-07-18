@@ -88,10 +88,13 @@ const CONTROL_PLANE_CLOCK_CHECKPOINT_LEN: usize = 8 + 2 + 32 + 8 + 1 + 8 + 8 + 8
 const CONTROL_PLANE_STATE_IDENTITY_MAGIC: &[u8; 8] = b"ARGCPID\0";
 const CONTROL_PLANE_STATE_IDENTITY_VERSION: u16 = 1;
 const CONTROL_PLANE_STATE_IDENTITY_LEN: usize = 8 + 2 + 32 + 8;
+const SINGLE_AUTHORITY_INITIALIZED_MAGIC: &[u8; 8] = b"ARGCPINI";
+const SINGLE_AUTHORITY_INITIALIZED_VERSION: u16 = 1;
+const SINGLE_AUTHORITY_INITIALIZED_LEN: usize = 8 + 2 + 32 + 8;
 const SINGLE_AUTHORITY_JOURNAL_FILE_MAGIC: &[u8; 8] = b"ARGCPSJL";
 const SINGLE_AUTHORITY_JOURNAL_FILE_VERSION: u16 = 2;
 const SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC: &[u8; 8] = b"ARGCPSJR";
-const SINGLE_AUTHORITY_JOURNAL_RECORD_VERSION: u16 = 1;
+const SINGLE_AUTHORITY_JOURNAL_RECORD_VERSION: u16 = 2;
 const SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKSUM_LEN: usize = 8;
 const SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKPOINT: u8 = 1;
 const SINGLE_AUTHORITY_JOURNAL_RECORD_COMMAND: u8 = 2;
@@ -6856,6 +6859,15 @@ pub trait ControlPlaneStore {
     fn ensure_healthy(&self) -> Result<(), ControlPlaneError> {
         Ok(())
     }
+
+    #[cfg(test)]
+    fn checkpoint_manually_modified_snapshot_for_test(
+        &self,
+        previous_snapshot: &ClusterControlSnapshot,
+        next_snapshot: &ClusterControlSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        self.checkpoint(Some(previous_snapshot), next_snapshot)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -6865,12 +6877,15 @@ struct FileControlPlaneStoreDurability {
     poisoned: Option<String>,
     commands_since_checkpoint: u64,
     published_snapshot_digest: Option<u64>,
+    published_chain_digest: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct SingleAuthorityJournalObserver {
     #[cfg(test)]
     fail_next_file_sync: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    fail_next_directory_sync: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DurableJournalObserver for SingleAuthorityJournalObserver {
@@ -6891,9 +6906,19 @@ impl DurableJournalObserver for SingleAuthorityJournalObserver {
     }
 
     fn sync_parent(&self, path: &Path) -> Result<(), ControlPlaneError> {
-        let Some(parent) = state_parent(path) else {
-            return Ok(());
-        };
+        #[cfg(test)]
+        if self
+            .fail_next_directory_sync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ControlPlaneError::Io {
+                context: "sync single-authority control-plane journal directory",
+                source: std::io::Error::other(
+                    "injected single-authority control-plane journal directory sync failure",
+                ),
+            });
+        }
+        let parent = state_parent(path);
         std::fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|source| ControlPlaneError::Io {
@@ -6912,6 +6937,12 @@ pub struct FileControlPlaneStore {
     checkpoint_byte_limit: u64,
     #[cfg(test)]
     journal_observer: Arc<SingleAuthorityJournalObserver>,
+    #[cfg(test)]
+    fail_checkpoint_after_anchor: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    fail_initial_checkpoint_after_identity: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    fail_checkpoint_after_prepared_snapshot_sync: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FileControlPlaneStore {
@@ -6970,6 +7001,16 @@ impl FileControlPlaneStore {
             checkpoint_byte_limit,
             #[cfg(test)]
             journal_observer,
+            #[cfg(test)]
+            fail_checkpoint_after_anchor: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_initial_checkpoint_after_identity: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            #[cfg(test)]
+            fail_checkpoint_after_prepared_snapshot_sync: Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
         }
     }
 
@@ -6987,6 +7028,31 @@ impl FileControlPlaneStore {
     fn fail_next_journal_file_sync(&self) {
         self.journal_observer
             .fail_next_file_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_journal_directory_sync(&self) {
+        self.journal_observer
+            .fail_next_directory_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_checkpoint_after_anchor(&self) {
+        self.fail_checkpoint_after_anchor
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_initial_checkpoint_after_identity(&self) {
+        self.fail_initial_checkpoint_after_identity
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_checkpoint_after_prepared_snapshot_sync(&self) {
+        self.fail_checkpoint_after_prepared_snapshot_sync
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -7057,6 +7123,22 @@ fn single_authority_journal_path(path: &Path) -> PathBuf {
     PathBuf::from(journal_path)
 }
 
+fn single_authority_snapshot_tmp_path(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
+fn single_authority_initialized_path(path: &Path) -> PathBuf {
+    let mut initialized_path = path.as_os_str().to_os_string();
+    initialized_path.push(".initialized");
+    PathBuf::from(initialized_path)
+}
+
+fn single_authority_initialized_tmp_path(path: &Path) -> PathBuf {
+    let mut tmp_path = single_authority_initialized_path(path).into_os_string();
+    tmp_path.push(".tmp");
+    PathBuf::from(tmp_path)
+}
+
 fn read_fixed_control_plane_sidecar<const N: usize>(
     path: &Path,
     context: &'static str,
@@ -7107,12 +7189,8 @@ fn store_control_plane_sidecar(
     bytes: &[u8],
     contexts: ControlPlaneSidecarIoContexts,
 ) -> Result<(), ControlPlaneError> {
-    if let Some(parent) = state_parent(path) {
-        std::fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
-            context: contexts.create,
-            source,
-        })?;
-    }
+    let parent = state_parent(path);
+    create_control_plane_directory_all_durable(parent)?;
     {
         let mut file = std::fs::File::create(tmp_path).map_err(|source| ControlPlaneError::Io {
             context: contexts.create,
@@ -7132,14 +7210,12 @@ fn store_control_plane_sidecar(
         context: contexts.rename,
         source,
     })?;
-    if let Some(parent) = state_parent(path) {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| ControlPlaneError::Io {
-                context: contexts.directory,
-                source,
-            })?;
-    }
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ControlPlaneError::Io {
+            context: contexts.directory,
+            source,
+        })?;
     Ok(())
 }
 
@@ -7209,6 +7285,74 @@ fn store_single_authority_clock_checkpoint_binding(
     )
 }
 
+fn load_single_authority_initialized_binding(
+    durable_state_path: &Path,
+) -> Result<Option<ControlPlaneAuthorityClockCheckpointBinding>, ControlPlaneError> {
+    let initialized_path = single_authority_initialized_path(durable_state_path);
+    let Some(bytes) = read_fixed_control_plane_sidecar::<SINGLE_AUTHORITY_INITIALIZED_LEN>(
+        &initialized_path,
+        "load single-authority control-plane initialization marker",
+    )?
+    else {
+        return Ok(None);
+    };
+    let (body, checksum_bytes) = bytes.split_at(SINGLE_AUTHORITY_INITIALIZED_LEN - 8);
+    if checksum::crc64::checksum(body)
+        != u64::from_be_bytes(
+            checksum_bytes
+                .try_into()
+                .expect("initialization marker checksum has fixed length"),
+        )
+    {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "single-authority initialization marker checksum mismatch".to_owned(),
+        });
+    }
+    if &body[..8] != SINGLE_AUTHORITY_INITIALIZED_MAGIC {
+        return Err(ControlPlaneError::CommandDecode {
+            message: "single-authority initialization marker magic mismatch".to_owned(),
+        });
+    }
+    let version = u16::from_be_bytes(
+        body[8..10]
+            .try_into()
+            .expect("initialization marker version has fixed length"),
+    );
+    if version != SINGLE_AUTHORITY_INITIALIZED_VERSION {
+        return Err(ControlPlaneError::CommandDecode {
+            message: format!(
+                "unsupported single-authority initialization marker version {version}"
+            ),
+        });
+    }
+    let mut binding = [0; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
+    binding.copy_from_slice(&body[10..]);
+    Ok(Some(ControlPlaneAuthorityClockCheckpointBinding(binding)))
+}
+
+fn store_single_authority_initialized_binding(
+    durable_state_path: &Path,
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+) -> Result<(), ControlPlaneError> {
+    let mut bytes = Vec::with_capacity(SINGLE_AUTHORITY_INITIALIZED_LEN);
+    bytes.extend_from_slice(SINGLE_AUTHORITY_INITIALIZED_MAGIC);
+    bytes.extend_from_slice(&SINGLE_AUTHORITY_INITIALIZED_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&binding.0);
+    bytes.extend_from_slice(&checksum::crc64::checksum(&bytes).to_be_bytes());
+    store_control_plane_sidecar(
+        &single_authority_initialized_path(durable_state_path),
+        &single_authority_initialized_tmp_path(durable_state_path),
+        &bytes,
+        ControlPlaneSidecarIoContexts {
+            create: "create single-authority control-plane initialization marker",
+            write: "write single-authority control-plane initialization marker",
+            sync: "sync single-authority control-plane initialization marker",
+            rename: "commit single-authority control-plane initialization marker",
+            directory: "sync single-authority control-plane initialization marker directory",
+        },
+    )
+}
+
 pub fn load_authority_clock_restart_checkpoint(
     durable_state_path: &Path,
     expected_binding: ControlPlaneAuthorityClockCheckpointBinding,
@@ -7241,14 +7385,12 @@ pub fn invalidate_authority_clock_restart_checkpoint(
     if !removed {
         return Ok(());
     }
-    if let Some(parent) = state_parent(&checkpoint_path) {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| ControlPlaneError::Io {
-                context: "sync invalidated control-plane authority clock checkpoint directory",
-                source,
-            })?;
-    }
+    std::fs::File::open(state_parent(&checkpoint_path))
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ControlPlaneError::Io {
+            context: "sync invalidated control-plane authority clock checkpoint directory",
+            source,
+        })?;
     Ok(())
 }
 
@@ -7328,8 +7470,8 @@ fn store_authority_clock_restart_checkpoint_value(
 #[derive(Debug)]
 struct SingleAuthorityJournalRecord {
     binding: ControlPlaneAuthorityClockCheckpointBinding,
-    previous_snapshot_digest: u64,
-    resulting_snapshot_digest: u64,
+    previous_chain_digest: u64,
+    resulting_chain_digest: u64,
     command: Option<ControlPlaneCommand>,
 }
 
@@ -7362,8 +7504,8 @@ impl SingleAuthorityJournalRecord {
         out.extend_from_slice(SINGLE_AUTHORITY_JOURNAL_RECORD_MAGIC);
         out.extend_from_slice(&SINGLE_AUTHORITY_JOURNAL_RECORD_VERSION.to_be_bytes());
         out.extend_from_slice(&self.binding.0);
-        out.extend_from_slice(&self.previous_snapshot_digest.to_be_bytes());
-        out.extend_from_slice(&self.resulting_snapshot_digest.to_be_bytes());
+        out.extend_from_slice(&self.previous_chain_digest.to_be_bytes());
+        out.extend_from_slice(&self.resulting_chain_digest.to_be_bytes());
         out.push(kind);
         out.extend_from_slice(&command_len.to_be_bytes());
         out.extend_from_slice(&command);
@@ -7424,16 +7566,16 @@ impl SingleAuthorityJournalRecord {
         let mut binding = [0; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
         binding.copy_from_slice(&body[offset..offset + CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN]);
         offset += CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN;
-        let previous_snapshot_digest = u64::from_be_bytes(
+        let previous_chain_digest = u64::from_be_bytes(
             body[offset..offset + std::mem::size_of::<u64>()]
                 .try_into()
-                .expect("previous snapshot digest has fixed length"),
+                .expect("previous chain digest has fixed length"),
         );
         offset += std::mem::size_of::<u64>();
-        let resulting_snapshot_digest = u64::from_be_bytes(
+        let resulting_chain_digest = u64::from_be_bytes(
             body[offset..offset + std::mem::size_of::<u64>()]
                 .try_into()
-                .expect("resulting snapshot digest has fixed length"),
+                .expect("resulting chain digest has fixed length"),
         );
         offset += std::mem::size_of::<u64>();
         let kind = body[offset];
@@ -7459,16 +7601,7 @@ impl SingleAuthorityJournalRecord {
             });
         }
         let command = match kind {
-            SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKPOINT if command_len == 0 => {
-                if previous_snapshot_digest != resulting_snapshot_digest {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message:
-                            "single-authority control-plane checkpoint anchor changes snapshot digest"
-                                .to_owned(),
-                    });
-                }
-                None
-            }
+            SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKPOINT if command_len == 0 => None,
             SINGLE_AUTHORITY_JOURNAL_RECORD_COMMAND if command_len != 0 => {
                 Some(decode_control_plane_command(&body[offset..command_end])?)
             }
@@ -7490,46 +7623,79 @@ impl SingleAuthorityJournalRecord {
         };
         Ok(Self {
             binding: ControlPlaneAuthorityClockCheckpointBinding(binding),
-            previous_snapshot_digest,
-            resulting_snapshot_digest,
+            previous_chain_digest,
+            resulting_chain_digest,
             command,
         })
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static SINGLE_AUTHORITY_SNAPSHOT_DIGEST_COMPUTATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 fn single_authority_snapshot_digest(snapshot: &ClusterControlSnapshot) -> u64 {
+    #[cfg(test)]
+    SINGLE_AUTHORITY_SNAPSHOT_DIGEST_COMPUTATIONS
+        .with(|count| count.set(count.get().saturating_add(1)));
     checksum::crc64::checksum(format_snapshot(snapshot).as_bytes())
+}
+
+#[cfg(test)]
+fn single_authority_snapshot_digest_computations() -> u64 {
+    SINGLE_AUTHORITY_SNAPSHOT_DIGEST_COMPUTATIONS.with(std::cell::Cell::get)
+}
+
+fn single_authority_command_chain_digest(
+    previous_chain_digest: u64,
+    encoded_command: &[u8],
+) -> u64 {
+    let mut bytes =
+        Vec::with_capacity(std::mem::size_of::<u64>().saturating_add(encoded_command.len()));
+    bytes.extend_from_slice(&previous_chain_digest.to_be_bytes());
+    bytes.extend_from_slice(encoded_command);
+    checksum::crc64::checksum(&bytes)
 }
 
 impl ControlPlaneStore for FileControlPlaneStore {
     fn load(&self) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError> {
         let mut durability = self.lock_durability()?;
         self.ensure_healthy_locked(&durability)?;
-        let contents = match std::fs::read_to_string(&self.path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if self.journal.path().exists()
-                    || (single_authority_identity_path(&self.path).exists()
-                        && !durability.initial_identity_created)
-                {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message:
-                            "single-authority durable identity or journal exists without its control-plane checkpoint"
-                                .to_owned(),
-                    });
-                }
-                durability.initialized = true;
-                durability.published_snapshot_digest = None;
-                return Ok(None);
-            }
-            Err(source) => {
-                return Err(ControlPlaneError::Io {
+        let read_snapshot_candidate = |path: &Path| -> Result<Option<String>, ControlPlaneError> {
+            match std::fs::read_to_string(path) {
+                Ok(contents) => Ok(Some(contents)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(source) => Err(ControlPlaneError::Io {
                     context: "load control-plane state",
                     source,
-                });
+                }),
             }
         };
-        let mut snapshot = parse_snapshot(&contents)?;
+        let published_contents = read_snapshot_candidate(&self.path)?;
+        let prepared_path = single_authority_snapshot_tmp_path(&self.path);
+        let prepared_contents = read_snapshot_candidate(&prepared_path)?;
+        if published_contents.is_none() && prepared_contents.is_none() {
+            if single_authority_initialized_path(&self.path).exists() {
+                return Err(ControlPlaneError::CommandDecode {
+                    message:
+                        "single-authority durable identity or journal exists without its control-plane checkpoint"
+                            .to_owned(),
+                });
+            }
+            if !self.journal.path().exists() {
+                durability.initialized = true;
+                durability.initial_identity_created =
+                    single_authority_identity_path(&self.path).exists();
+                durability.published_snapshot_digest = None;
+                durability.published_chain_digest = None;
+                return Ok(None);
+            }
+        };
+        if let Some(contents) = published_contents.as_ref() {
+            parse_snapshot(contents)?;
+        }
         let binding =
             load_single_authority_clock_checkpoint_binding(&self.path)?.ok_or_else(|| {
                 ControlPlaneError::AuthorityClockCheckpoint {
@@ -7537,11 +7703,48 @@ impl ControlPlaneStore for FileControlPlaneStore {
                         .to_owned(),
                 }
             })?;
-        let offsets = self.journal.status_offsets()?;
-        let frames = self.journal.read_frames_from(offsets.base_offset)?;
+        let initialized_binding = load_single_authority_initialized_binding(&self.path)?;
+        if initialized_binding.is_some_and(|initialized_binding| initialized_binding != binding) {
+            return Err(ControlPlaneError::CommandDecode {
+                message:
+                    "single-authority initialization marker identity does not match durable state"
+                        .to_owned(),
+            });
+        }
+        if published_contents.is_none()
+            && !self.journal.path().exists()
+            && initialized_binding.is_none()
+        {
+            durability.initialized = true;
+            durability.initial_identity_created = true;
+            durability.published_snapshot_digest = None;
+            durability.published_chain_digest = None;
+            return Ok(None);
+        }
+        let incomplete_initialization =
+            published_contents.is_none() && initialized_binding.is_none();
+        let frames = match self
+            .journal
+            .status_offsets()
+            .and_then(|offsets| self.journal.read_frames_from(offsets.base_offset))
+        {
+            Ok(frames) => frames,
+            Err(_) if incomplete_initialization => {
+                self.discard_incomplete_initialization_locked(&mut durability)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         let mut records = Vec::with_capacity(frames.frames.len());
         for frame in frames.frames {
-            let record = SingleAuthorityJournalRecord::decode(&frame)?;
+            let record = match SingleAuthorityJournalRecord::decode(&frame) {
+                Ok(record) => record,
+                Err(_) if incomplete_initialization => {
+                    self.discard_incomplete_initialization_locked(&mut durability)?;
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
             if record.binding != binding {
                 return Err(ControlPlaneError::CommandDecode {
                     message:
@@ -7549,64 +7752,62 @@ impl ControlPlaneStore for FileControlPlaneStore {
                             .to_owned(),
                 });
             }
-            if let Some(previous) = records.last() {
-                let previous: &SingleAuthorityJournalRecord = previous;
-                if previous.resulting_snapshot_digest != record.previous_snapshot_digest {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message:
-                            "single-authority control-plane journal snapshot digest chain is discontinuous"
-                                .to_owned(),
-                    });
-                }
-            }
             records.push(record);
         }
-        if !records.iter().any(|record| record.command.is_none()) {
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "single-authority control-plane journal has no identity-bound checkpoint anchor"
-                        .to_owned(),
-            });
+        if incomplete_initialization && !records.iter().any(|record| record.command.is_none()) {
+            self.discard_incomplete_initialization_locked(&mut durability)?;
+            return Ok(None);
         }
-        let checkpoint_digest = single_authority_snapshot_digest(&snapshot);
-        let replay_start = if records
-            .first()
-            .is_some_and(|record| record.previous_snapshot_digest == checkpoint_digest)
-        {
-            0
-        } else {
-            let matching: Vec<_> = records
+        let (checkpoint_contents, checkpoint_digest, replay_start, prepared_checkpoint) = [
+            (published_contents.as_ref(), false),
+            (prepared_contents.as_ref(), true),
+        ]
+        .into_iter()
+        .filter_map(|(contents, prepared)| {
+            let contents = contents?;
+            let digest = checksum::crc64::checksum(contents.as_bytes());
+            records
                 .iter()
                 .enumerate()
                 .filter_map(|(index, record)| {
-                    (record.resulting_snapshot_digest == checkpoint_digest).then_some(index + 1)
+                    (record.command.is_none() && record.resulting_chain_digest == digest)
+                        .then_some(index + 1)
                 })
-                .collect();
-            match matching.as_slice() {
-                [replay_start] => *replay_start,
-                [] => {
-                    return Err(ControlPlaneError::CommandDecode {
-                        message:
-                            "single-authority control-plane checkpoint is not on the retained journal digest chain"
-                                .to_owned(),
-                    });
-                }
-                _ => *matching
-                    .last()
-                    .expect("matching journal records are non-empty"),
-            }
-        };
+                .next_back()
+                .map(|replay_start| (contents, digest, replay_start, prepared))
+        })
+        .max_by_key(|(_, _, replay_start, _)| *replay_start)
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message:
+                    "single-authority control-plane journal has no identity-bound checkpoint anchor for the durable snapshot"
+                        .to_owned(),
+            })?;
+        let mut snapshot = parse_snapshot(checkpoint_contents)?;
+        let mut chain_digest = checkpoint_digest;
         for record in &records[replay_start..] {
-            if single_authority_snapshot_digest(&snapshot) != record.previous_snapshot_digest {
+            let Some(command) = &record.command else {
                 return Err(ControlPlaneError::CommandDecode {
                     message:
-                        "single-authority control-plane journal previous snapshot digest mismatch"
+                        "single-authority control-plane journal has an unexpected checkpoint anchor in its replay suffix"
+                            .to_owned(),
+                });
+            };
+            if chain_digest != record.previous_chain_digest {
+                return Err(ControlPlaneError::CommandDecode {
+                    message:
+                        "single-authority control-plane journal command chain is discontinuous"
                             .to_owned(),
                 });
             }
-            let Some(command) = &record.command else {
-                continue;
-            };
+            let encoded_command = encode_control_plane_command(command)?;
+            let expected_resulting_chain_digest =
+                single_authority_command_chain_digest(chain_digest, &encoded_command);
+            if record.resulting_chain_digest != expected_resulting_chain_digest {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: "single-authority control-plane journal command chain digest mismatch"
+                        .to_owned(),
+                });
+            }
             let previous_snapshot = snapshot;
             let applied = previous_snapshot
                 .apply_control_plane_command(command.clone())
@@ -7628,16 +7829,13 @@ impl ControlPlaneStore for FileControlPlaneStore {
                 "single-authority control-plane journal replay produced invalid state",
                 &snapshot,
             )?;
-            if single_authority_snapshot_digest(&snapshot) != record.resulting_snapshot_digest {
-                return Err(ControlPlaneError::CommandDecode {
-                    message:
-                        "single-authority control-plane journal resulting snapshot digest mismatch"
-                            .to_owned(),
-                });
-            }
+            chain_digest = record.resulting_chain_digest;
         }
         if frames.truncated_tail {
             self.journal.truncate_to_clean_len(frames.clean_len)?;
+        }
+        if prepared_checkpoint {
+            self.publish_prepared_snapshot_file(&prepared_path)?;
         }
         durability.initialized = true;
         durability.commands_since_checkpoint = u64::try_from(
@@ -7648,6 +7846,7 @@ impl ControlPlaneStore for FileControlPlaneStore {
         )
         .unwrap_or(u64::MAX);
         durability.published_snapshot_digest = Some(single_authority_snapshot_digest(&snapshot));
+        durability.published_chain_digest = Some(chain_digest);
         Ok(Some(snapshot))
     }
 
@@ -7688,21 +7887,23 @@ impl ControlPlaneStore for FileControlPlaneStore {
                     .to_owned(),
             });
         }
-        let previous_snapshot_digest = single_authority_snapshot_digest(previous_snapshot);
-        if durability.published_snapshot_digest != Some(previous_snapshot_digest) {
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "single-authority control-plane command base does not match the latest durable snapshot"
-                        .to_owned(),
-            });
-        }
-        let resulting_snapshot_digest = single_authority_snapshot_digest(next_snapshot);
-        if resulting_snapshot_digest == previous_snapshot_digest {
+        if previous_snapshot == next_snapshot {
             return Err(ControlPlaneError::CommandDecode {
                 message: "single-authority control-plane journal refused a non-mutating command"
                     .to_owned(),
             });
         }
+        let previous_chain_digest =
+            durability
+                .published_chain_digest
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message:
+                        "single-authority control-plane command has no published journal chain"
+                            .to_owned(),
+                })?;
+        let encoded_command = encode_control_plane_command(command)?;
+        let resulting_chain_digest =
+            single_authority_command_chain_digest(previous_chain_digest, &encoded_command);
         let binding =
             load_single_authority_clock_checkpoint_binding(&self.path)?.ok_or_else(|| {
                 ControlPlaneError::AuthorityClockCheckpoint {
@@ -7712,8 +7913,8 @@ impl ControlPlaneStore for FileControlPlaneStore {
             })?;
         let record = SingleAuthorityJournalRecord {
             binding,
-            previous_snapshot_digest,
-            resulting_snapshot_digest,
+            previous_chain_digest,
+            resulting_chain_digest,
             command: Some(command.clone()),
         };
         let encoded = record.encode()?;
@@ -7731,7 +7932,8 @@ impl ControlPlaneStore for FileControlPlaneStore {
                 }
             };
         }
-        durability.published_snapshot_digest = Some(resulting_snapshot_digest);
+        durability.published_snapshot_digest = None;
+        durability.published_chain_digest = Some(resulting_chain_digest);
         durability.commands_since_checkpoint =
             durability.commands_since_checkpoint.saturating_add(1);
         let offsets = match self.journal.status_offsets() {
@@ -7765,6 +7967,17 @@ impl ControlPlaneStore for FileControlPlaneStore {
         let durability = self.lock_durability()?;
         self.ensure_healthy_locked(&durability)
     }
+
+    #[cfg(test)]
+    fn checkpoint_manually_modified_snapshot_for_test(
+        &self,
+        _previous_snapshot: &ClusterControlSnapshot,
+        next_snapshot: &ClusterControlSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        let mut durability = self.lock_durability()?;
+        self.ensure_healthy_locked(&durability)?;
+        self.checkpoint_snapshot_locked(next_snapshot, &mut durability)
+    }
 }
 
 impl FileControlPlaneStore {
@@ -7790,13 +8003,47 @@ impl FileControlPlaneStore {
         Ok(())
     }
 
+    fn discard_incomplete_initialization_locked(
+        &self,
+        durability: &mut FileControlPlaneStoreDurability,
+    ) -> Result<(), ControlPlaneError> {
+        let mut removed = false;
+        let prepared_path = single_authority_snapshot_tmp_path(&self.path);
+        for path in [self.journal.path(), prepared_path.as_path()] {
+            match std::fs::remove_file(path) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(ControlPlaneError::Io {
+                        context: "discard incomplete single-authority initialization",
+                        source,
+                    });
+                }
+            }
+        }
+        if removed {
+            std::fs::File::open(state_parent(&self.path))
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| ControlPlaneError::Io {
+                    context: "sync discarded single-authority initialization directory",
+                    source,
+                })?;
+        }
+        durability.initialized = true;
+        durability.initial_identity_created = true;
+        durability.commands_since_checkpoint = 0;
+        durability.published_snapshot_digest = None;
+        durability.published_chain_digest = None;
+        Ok(())
+    }
+
     fn checkpoint_snapshot_locked(
         &self,
         snapshot: &ClusterControlSnapshot,
         durability: &mut FileControlPlaneStoreDurability,
     ) -> Result<(), ControlPlaneError> {
         let compact_through = self.journal.clean_len()?;
-        self.save_snapshot_file(snapshot, durability)?;
+        let (prepared_path, snapshot_digest) = self.prepare_snapshot_file(snapshot, durability)?;
         let binding =
             load_single_authority_clock_checkpoint_binding(&self.path)?.ok_or_else(|| {
                 ControlPlaneError::AuthorityClockCheckpoint {
@@ -7805,41 +8052,65 @@ impl FileControlPlaneStore {
                             .to_owned(),
                 }
             })?;
-        let snapshot_digest = single_authority_snapshot_digest(snapshot);
         let anchor = SingleAuthorityJournalRecord {
             binding,
-            previous_snapshot_digest: snapshot_digest,
-            resulting_snapshot_digest: snapshot_digest,
+            previous_chain_digest: durability.published_chain_digest.unwrap_or(snapshot_digest),
+            resulting_chain_digest: snapshot_digest,
             command: None,
         }
         .encode()?;
         self.journal
             .append_frame(&anchor)
             .map_err(DurableJournalAppendError::into_control_plane_error)?;
+        #[cfg(test)]
+        if self
+            .fail_checkpoint_after_anchor
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ControlPlaneError::Io {
+                context: "publish prepared single-authority control-plane checkpoint",
+                source: std::io::Error::other(
+                    "injected failure after single-authority checkpoint anchor",
+                ),
+            });
+        }
+        self.publish_prepared_snapshot_file(&prepared_path)?;
         self.journal.compact_through(compact_through)?;
+        if load_single_authority_initialized_binding(&self.path)?.is_none() {
+            store_single_authority_initialized_binding(&self.path, binding)?;
+        }
         durability.initialized = true;
         durability.initial_identity_created = false;
         durability.commands_since_checkpoint = 0;
-        durability.published_snapshot_digest = Some(single_authority_snapshot_digest(snapshot));
+        durability.published_snapshot_digest = Some(snapshot_digest);
+        durability.published_chain_digest = Some(snapshot_digest);
         Ok(())
     }
 
-    fn save_snapshot_file(
+    fn prepare_snapshot_file(
         &self,
         snapshot: &ClusterControlSnapshot,
         durability: &mut FileControlPlaneStoreDurability,
-    ) -> Result<(), ControlPlaneError> {
+    ) -> Result<(PathBuf, u64), ControlPlaneError> {
         let state_existed = self.path.exists();
-        if let Some(parent) = state_parent(&self.path) {
-            std::fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
-                context: "create control-plane state directory",
-                source,
-            })?;
-        }
+        ensure_control_plane_state_parent_directory(&self.path)?;
         if !state_existed {
             let (binding, identity_created) =
                 self.load_or_create_authority_clock_checkpoint_binding_untracked()?;
             durability.initial_identity_created |= identity_created;
+            #[cfg(test)]
+            if identity_created
+                && self
+                    .fail_initial_checkpoint_after_identity
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ControlPlaneError::Io {
+                    context: "initialize single-authority control-plane checkpoint",
+                    source: std::io::Error::other(
+                        "injected failure after single-authority durable identity creation",
+                    ),
+                });
+            }
             if self
                 .load_authority_clock_restart_checkpoint(binding)?
                 .is_none()
@@ -7854,11 +8125,12 @@ impl FileControlPlaneStore {
         }
         let serialize_started = Instant::now();
         let formatted_snapshot = format_snapshot(snapshot);
+        let snapshot_digest = checksum::crc64::checksum(formatted_snapshot.as_bytes());
         observability::record_control_plane_snapshot_serialization(
             serialize_started.elapsed(),
             formatted_snapshot.len(),
         );
-        let tmp_path = self.path.with_extension("tmp");
+        let tmp_path = single_authority_snapshot_tmp_path(&self.path);
         {
             let mut tmp_file =
                 std::fs::File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
@@ -7879,20 +8151,45 @@ impl FileControlPlaneStore {
                 source,
             })?;
         }
-        std::fs::rename(&tmp_path, &self.path).map_err(|source| ControlPlaneError::Io {
+        let sync_started = Instant::now();
+        let sync_result =
+            std::fs::File::open(state_parent(&tmp_path)).and_then(|directory| directory.sync_all());
+        observability::record_control_plane_snapshot_sync(sync_started.elapsed());
+        sync_result.map_err(|source| ControlPlaneError::Io {
+            context: "sync prepared control-plane state directory",
+            source,
+        })?;
+        #[cfg(test)]
+        if self
+            .fail_checkpoint_after_prepared_snapshot_sync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ControlPlaneError::Io {
+                context: "anchor prepared single-authority control-plane checkpoint",
+                source: std::io::Error::other(
+                    "injected failure after prepared single-authority checkpoint sync",
+                ),
+            });
+        }
+        Ok((tmp_path, snapshot_digest))
+    }
+
+    fn publish_prepared_snapshot_file(
+        &self,
+        prepared_path: &Path,
+    ) -> Result<(), ControlPlaneError> {
+        std::fs::rename(prepared_path, &self.path).map_err(|source| ControlPlaneError::Io {
             context: "commit control-plane state",
             source,
         })?;
-        if let Some(parent) = state_parent(&self.path) {
-            let sync_started = Instant::now();
-            let sync_result =
-                std::fs::File::open(parent).and_then(|directory| directory.sync_all());
-            observability::record_control_plane_snapshot_sync(sync_started.elapsed());
-            sync_result.map_err(|source| ControlPlaneError::Io {
-                context: "sync control-plane state directory",
-                source,
-            })?;
-        }
+        let sync_started = Instant::now();
+        let sync_result = std::fs::File::open(state_parent(&self.path))
+            .and_then(|directory| directory.sync_all());
+        observability::record_control_plane_snapshot_sync(sync_started.elapsed());
+        sync_result.map_err(|source| ControlPlaneError::Io {
+            context: "sync control-plane state directory",
+            source,
+        })?;
         Ok(())
     }
 }
@@ -8562,8 +8859,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             "attempted to commit invalid control-plane snapshot",
             &next_snapshot,
         )?;
-        self.store
-            .checkpoint(Some(&self.durable_snapshot), &next_snapshot)?;
+        self.store.checkpoint_manually_modified_snapshot_for_test(
+            &self.durable_snapshot,
+            &next_snapshot,
+        )?;
         self.durable_snapshot = next_snapshot.clone();
         self.snapshot = next_snapshot;
         *self.runtime_map_content_certificate.lock().map_err(|_| {
@@ -19519,9 +19818,114 @@ fn hex_nibble(byte: u8) -> Option<u8> {
     }
 }
 
-fn state_parent(path: &Path) -> Option<&Path> {
+fn state_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn create_control_plane_directory_all_durable_with(
+    path: &Path,
+    mut sync_parent: impl FnMut(&Path) -> Result<(), ControlPlaneError>,
+) -> Result<(), ControlPlaneError> {
+    let mut missing = Vec::new();
+    let mut candidate = path;
+    loop {
+        match std::fs::metadata(candidate) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(ControlPlaneError::Io {
+                    context: "inspect control-plane state directory",
+                    source: std::io::Error::new(
+                        ErrorKind::NotADirectory,
+                        format!(
+                            "control-plane state directory component {} is not a directory",
+                            candidate.display()
+                        ),
+                    ),
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                missing.push(candidate.to_path_buf());
+            }
+            Err(source) => {
+                return Err(ControlPlaneError::Io {
+                    context: "inspect control-plane state directory",
+                    source,
+                });
+            }
+        }
+        let parent = state_parent(candidate);
+        if parent == candidate {
+            return Err(ControlPlaneError::Io {
+                context: "inspect control-plane state directory",
+                source: std::io::Error::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "control-plane state directory {} has no existing ancestor",
+                        path.display()
+                    ),
+                ),
+            });
+        }
+        candidate = parent;
+    }
+
+    // An existing component may be residue from a previous creator whose
+    // parent sync failed. Confirm its directory entry before trusting it as
+    // the durable boundary for any descendants.
+    sync_parent(state_parent(candidate))?;
+
+    for directory in missing.into_iter().rev() {
+        match std::fs::create_dir(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let metadata =
+                    std::fs::metadata(&directory).map_err(|source| ControlPlaneError::Io {
+                        context: "inspect concurrently created control-plane state directory",
+                        source,
+                    })?;
+                if !metadata.is_dir() {
+                    return Err(ControlPlaneError::Io {
+                        context: "create control-plane state directory",
+                        source: std::io::Error::new(
+                            ErrorKind::NotADirectory,
+                            format!(
+                                "control-plane state directory component {} is not a directory",
+                                directory.display()
+                            ),
+                        ),
+                    });
+                }
+            }
+            Err(source) => {
+                return Err(ControlPlaneError::Io {
+                    context: "create control-plane state directory",
+                    source,
+                });
+            }
+        }
+        sync_parent(state_parent(&directory))?;
+    }
+    Ok(())
+}
+
+fn create_control_plane_directory_all_durable(path: &Path) -> Result<(), ControlPlaneError> {
+    create_control_plane_directory_all_durable_with(path, |parent| {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| ControlPlaneError::Io {
+                context: "sync control-plane state directory parent",
+                source,
+            })
+    })
+}
+
+/// Durably creates every missing parent-directory component for a control-plane state file.
+pub fn ensure_control_plane_state_parent_directory(
+    state_path: &Path,
+) -> Result<(), ControlPlaneError> {
+    create_control_plane_directory_all_durable(state_parent(state_path))
 }
 
 #[cfg(test)]
@@ -20363,7 +20767,10 @@ mod tests {
         authority.durable_snapshot = authority.snapshot.clone();
         authority
             .store
-            .checkpoint(Some(&previous_snapshot), &authority.durable_snapshot)
+            .checkpoint_manually_modified_snapshot_for_test(
+                &previous_snapshot,
+                &authority.durable_snapshot,
+            )
             .unwrap();
     }
 
@@ -20375,6 +20782,11 @@ mod tests {
         std::fs::copy(
             single_authority_identity_path(source.path()),
             single_authority_identity_path(&destination_path),
+        )
+        .unwrap();
+        std::fs::copy(
+            single_authority_initialized_path(source.path()),
+            single_authority_initialized_path(&destination_path),
         )
         .unwrap();
         if source.journal_path().exists() {
@@ -32770,11 +33182,17 @@ mod tests {
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         let checkpoint_before = std::fs::read(store.path()).unwrap();
+        let digest_computations_before = single_authority_snapshot_digest_computations();
 
         authority
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
 
+        assert_eq!(
+            single_authority_snapshot_digest_computations(),
+            digest_computations_before,
+            "journal suffix commands must not format and digest the full snapshot"
+        );
         assert_eq!(
             std::fs::read(store.path()).unwrap(),
             checkpoint_before,
@@ -32813,7 +33231,7 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_authority_allows_same_store_identity_initialization_only() {
+    fn file_backed_authority_recovers_identity_only_initialization() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("control-plane.state");
         let initializing_store = FileControlPlaneStore::new(&path);
@@ -32821,12 +33239,90 @@ mod tests {
             .load_or_create_authority_clock_checkpoint_binding()
             .unwrap();
 
+        let authority =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)).unwrap();
+        assert_eq!(authority.snapshot().nodes().count(), 0);
+        assert!(single_authority_initialized_path(&path).exists());
+    }
+
+    #[test]
+    fn bare_control_plane_state_path_uses_current_directory_for_durability() {
+        assert_eq!(
+            state_parent(Path::new("control-plane.state")),
+            Path::new(".")
+        );
+        assert_eq!(
+            state_parent(Path::new("./control-plane.state")),
+            Path::new(".")
+        );
+    }
+
+    #[test]
+    fn control_plane_state_directory_creation_syncs_each_new_component_parent() {
+        let tmp = test_util::tempdir();
+        let first = tmp.path().join("first");
+        let second = first.join("second");
+        let mut synced_parents = Vec::new();
+
+        create_control_plane_directory_all_durable_with(&second, |parent| {
+            synced_parents.push(parent.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            synced_parents,
+            vec![
+                state_parent(tmp.path()).to_path_buf(),
+                tmp.path().to_path_buf(),
+                first
+            ]
+        );
+        assert!(second.is_dir());
+    }
+
+    #[test]
+    fn control_plane_state_directory_creation_reconfirms_failed_sync_on_retry() {
+        let tmp = test_util::tempdir();
+        let first = tmp.path().join("first");
+        let second = first.join("second");
+        let mut sync_attempts = 0;
+
+        let error = create_control_plane_directory_all_durable_with(&second, |_| {
+            sync_attempts += 1;
+            if sync_attempts == 2 {
+                Err(ControlPlaneError::Io {
+                    context: "injected control-plane state parent sync",
+                    source: std::io::Error::other("injected parent sync failure"),
+                })
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
         assert!(matches!(
-            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)),
-            Err(ControlPlaneError::CommandDecode { message })
-                if message.contains("identity or journal exists without its control-plane checkpoint")
+            error,
+            ControlPlaneError::Io {
+                context: "injected control-plane state parent sync",
+                ..
+            }
         ));
-        SingleAuthorityControlPlane::open(initializing_store).unwrap();
+        assert!(first.is_dir());
+        assert!(
+            !second.exists(),
+            "the next directory component must not be created before its parent link is durable"
+        );
+
+        let mut retry_synced_parents = Vec::new();
+        create_control_plane_directory_all_durable_with(&second, |parent| {
+            retry_synced_parents.push(parent.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(retry_synced_parents, vec![tmp.path().to_path_buf(), first]);
+        assert!(second.is_dir());
     }
 
     #[test]
@@ -32877,6 +33373,266 @@ mod tests {
                 NodeMembershipState::Active
             );
         }
+    }
+
+    #[test]
+    fn file_backed_authority_recovers_checkpoint_anchor_before_snapshot_publication() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::with_checkpoint_limits(path.clone(), 1, u64::MAX);
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        store.fail_next_checkpoint_after_anchor();
+
+        let error = authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("durability poisoned after checkpoint failure")
+        ));
+        assert!(single_authority_snapshot_tmp_path(&path).exists());
+        drop(authority);
+        let restarted =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)).unwrap();
+        assert_eq!(
+            restarted
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .membership(),
+            NodeMembershipState::Active
+        );
+        assert!(!single_authority_snapshot_tmp_path(&path).exists());
+    }
+
+    #[test]
+    fn file_backed_authority_recovers_anchor_file_sync_before_directory_sync() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&path);
+        let authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        let previous = authority.snapshot().clone();
+        let applied = previous
+            .clone()
+            .apply_control_plane_command(ControlPlaneCommand::SetNodeMembership {
+                node_id: NodeId::new(1),
+                membership: NodeMembershipState::Active,
+            })
+            .unwrap();
+        let mut next = applied.into_snapshot();
+        next.record_history_from(&previous);
+        store.fail_next_journal_directory_sync();
+
+        let error = store.checkpoint(Some(&previous), &next).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::Io {
+                context: "sync single-authority control-plane journal directory",
+                ..
+            }
+        ));
+        assert!(single_authority_snapshot_tmp_path(&path).exists());
+        drop(authority);
+        let restarted =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)).unwrap();
+        assert_eq!(
+            restarted
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .membership(),
+            NodeMembershipState::Active
+        );
+    }
+
+    #[test]
+    fn file_backed_authority_recovers_initial_identity_creation_interruption() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&path);
+        store.fail_next_initial_checkpoint_after_identity();
+
+        let error = SingleAuthorityControlPlane::open(store.clone()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::Io {
+                context: "initialize single-authority control-plane checkpoint",
+                ..
+            }
+        ));
+        assert!(single_authority_identity_path(&path).exists());
+        assert!(!path.exists());
+        let restarted =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)).unwrap();
+        assert_eq!(restarted.snapshot().nodes().count(), 0);
+        assert!(single_authority_initialized_path(&path).exists());
+    }
+
+    #[test]
+    fn file_backed_authority_recovers_initial_prepared_snapshot_interruption() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&path);
+        store.fail_next_checkpoint_after_prepared_snapshot_sync();
+
+        let error = SingleAuthorityControlPlane::open(store.clone()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::Io {
+                context: "anchor prepared single-authority control-plane checkpoint",
+                ..
+            }
+        ));
+        assert!(single_authority_snapshot_tmp_path(&path).exists());
+        assert!(!store.journal_path().exists());
+        let restarted =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)).unwrap();
+        assert_eq!(restarted.snapshot().nodes().count(), 0);
+        assert!(single_authority_initialized_path(&path).exists());
+    }
+
+    #[test]
+    fn file_backed_authority_recovers_torn_first_journal_creation() {
+        for shape in ["empty", "truncated-header", "torn-first-frame"] {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join(format!("control-plane-{shape}.state"));
+            let store = FileControlPlaneStore::new(&path);
+            store.fail_next_checkpoint_after_prepared_snapshot_sync();
+            SingleAuthorityControlPlane::open(store.clone()).unwrap_err();
+            let prepared =
+                std::fs::read_to_string(single_authority_snapshot_tmp_path(&path)).unwrap();
+            let snapshot_digest = checksum::crc64::checksum(prepared.as_bytes());
+            let binding = load_single_authority_clock_checkpoint_binding(&path)
+                .unwrap()
+                .unwrap();
+            let anchor = SingleAuthorityJournalRecord {
+                binding,
+                previous_chain_digest: snapshot_digest,
+                resulting_chain_digest: snapshot_digest,
+                command: None,
+            }
+            .encode()
+            .unwrap();
+            store.journal.append_frame(&anchor).unwrap();
+            let offsets = store.journal.status_offsets().unwrap();
+            let physical_len = std::fs::metadata(store.journal_path()).unwrap().len();
+            let header_len = physical_len - offsets.clean_len;
+            let truncated_len = match shape {
+                "empty" => 0,
+                "truncated-header" => header_len - 1,
+                "torn-first-frame" => physical_len - 1,
+                _ => unreachable!(),
+            };
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(store.journal_path())
+                .unwrap()
+                .set_len(truncated_len)
+                .unwrap();
+
+            let restarted =
+                SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)).unwrap();
+            assert_eq!(restarted.snapshot().nodes().count(), 0);
+            assert!(single_authority_initialized_path(&path).exists());
+        }
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_torn_established_first_journal_record() {
+        for shape in ["empty", "truncated-header", "torn-first-frame"] {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join(format!("control-plane-{shape}.state"));
+            let store = FileControlPlaneStore::new(&path);
+            SingleAuthorityControlPlane::open(store.clone()).unwrap();
+            let offsets = store.journal.status_offsets().unwrap();
+            let physical_len = std::fs::metadata(store.journal_path()).unwrap().len();
+            let header_len = physical_len - offsets.clean_len;
+            let truncated_len = match shape {
+                "empty" => 0,
+                "truncated-header" => header_len - 1,
+                "torn-first-frame" => physical_len - 1,
+                _ => unreachable!(),
+            };
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(store.journal_path())
+                .unwrap()
+                .set_len(truncated_len)
+                .unwrap();
+
+            assert!(
+                FileControlPlaneStore::new(&path).load().is_err(),
+                "established {shape} journal must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn file_backed_authority_recovers_initial_anchor_before_snapshot_publication() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&path);
+        store.fail_next_checkpoint_after_anchor();
+
+        let error = SingleAuthorityControlPlane::open(store).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::Io {
+                context: "publish prepared single-authority control-plane checkpoint",
+                ..
+            }
+        ));
+        assert!(!path.exists());
+        assert!(single_authority_snapshot_tmp_path(&path).exists());
+        let restarted =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)).unwrap();
+        assert_eq!(restarted.snapshot().nodes().count(), 0);
+        assert!(!single_authority_snapshot_tmp_path(&path).exists());
+    }
+
+    #[test]
+    fn file_backed_authority_recovers_restart_bump_anchor_before_snapshot_publication() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let incarnation_before = authority.snapshot().authority_incarnation();
+        drop(authority);
+
+        let failing_store = FileControlPlaneStore::new(&path);
+        failing_store.fail_next_checkpoint_after_anchor();
+        let error = SingleAuthorityControlPlane::open(failing_store).unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::Io {
+                context: "publish prepared single-authority control-plane checkpoint",
+                ..
+            }
+        ));
+
+        let restarted =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&path)).unwrap();
+        assert!(
+            restarted.snapshot().authority_incarnation() > incarnation_before,
+            "restart must recover and advance beyond the prepared incarnation"
+        );
+        assert_eq!(
+            restarted
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .membership(),
+            NodeMembershipState::Active
+        );
     }
 
     #[test]
@@ -32940,6 +33696,23 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_authority_rejects_missing_established_checkpoint_and_journal() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&path);
+        SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        assert!(single_authority_initialized_path(&path).exists());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(store.journal_path()).unwrap();
+
+        assert!(matches!(
+            FileControlPlaneStore::new(&path).load(),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message.contains("without its control-plane checkpoint")
+        ));
+    }
+
+    #[test]
     fn file_backed_authority_rejects_foreign_identity_journal() {
         let tmp = test_util::tempdir();
         let first = FileControlPlaneStore::new(tmp.path().join("first.state"));
@@ -32959,16 +33732,90 @@ mod tests {
     }
 
     #[test]
-    fn file_backed_authority_rejects_checkpoint_off_retained_journal_chain() {
+    fn file_backed_authority_rejects_checksum_valid_discontinuous_command_chain() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let binding = load_single_authority_clock_checkpoint_binding(store.path())
+            .unwrap()
+            .unwrap();
+        let command = ControlPlaneCommand::SetNodeMembership {
+            node_id: NodeId::new(2),
+            membership: NodeMembershipState::Active,
+        };
+        let encoded_command = encode_control_plane_command(&command).unwrap();
+        let published_chain_digest = store
+            .lock_durability()
+            .unwrap()
+            .published_chain_digest
+            .unwrap();
+        let wrong_previous_chain_digest = published_chain_digest ^ 1;
+        let record = SingleAuthorityJournalRecord {
+            binding,
+            previous_chain_digest: wrong_previous_chain_digest,
+            resulting_chain_digest: single_authority_command_chain_digest(
+                wrong_previous_chain_digest,
+                &encoded_command,
+            ),
+            command: Some(command),
+        };
+        store
+            .journal
+            .append_frame(&record.encode().unwrap())
+            .unwrap();
+
+        assert!(matches!(
+            FileControlPlaneStore::new(store.path()).load(),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message.contains("command chain is discontinuous")
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_complete_interior_command_omission() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&path);
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        let offsets = store.journal.status_offsets().unwrap();
+        let frames = store
+            .journal
+            .read_frames_from(offsets.base_offset)
+            .unwrap()
+            .frames;
+        assert_eq!(frames.len(), 3);
+        std::fs::remove_file(store.journal_path()).unwrap();
+        store.journal.append_frame(&frames[0]).unwrap();
+        store.journal.append_frame(&frames[2]).unwrap();
+
+        assert!(matches!(
+            FileControlPlaneStore::new(&path).load(),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message.contains("command chain is discontinuous")
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_checkpoint_off_retained_journal_chain() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::with_checkpoint_limits(
+            tmp.path().join("control-plane.state"),
+            1,
+            u64::MAX,
+        );
         let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         let initial_checkpoint = std::fs::read(store.path()).unwrap();
         authority
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
-            .unwrap();
-        store
-            .checkpoint(Some(authority.snapshot()), authority.snapshot())
             .unwrap();
         authority
             .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
@@ -32978,7 +33825,7 @@ mod tests {
         assert!(matches!(
             store.load(),
             Err(ControlPlaneError::CommandDecode { message })
-                if message.contains("checkpoint is not on the retained journal digest chain")
+                if message.contains("has no identity-bound checkpoint anchor for the durable snapshot")
         ));
     }
 
