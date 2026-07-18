@@ -11018,17 +11018,23 @@ impl super::StorageCluster {
                 .load_stream_put_finalize_snapshot(pg_id, bucket, key, session_id)
             {
                 Ok(snapshot) => snapshot,
-                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
-                    ..
-                })) if let Some(command) = pending_command.clone() => {
-                    if let Err(error) = self.apply_exact_pending_object_metadata_command(
-                        pg_id,
-                        super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
-                    ) {
-                        release_caller_bucket_write_proof_if_unowned!()?;
-                        return Err(error);
+                Err(
+                    error @ ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                        ..
+                    }),
+                ) => {
+                    if let Some(command) = pending_command.clone() {
+                        if let Err(error) = self.apply_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                        ) {
+                            release_caller_bucket_write_proof_if_unowned!()?;
+                            return Err(error);
+                        }
+                        continue;
                     }
-                    continue;
+                    release_caller_bucket_write_proof_if_unowned!()?;
+                    return Err(error);
                 }
                 Err(error) => {
                     release_caller_bucket_write_proof_if_unowned!()?;
@@ -12308,14 +12314,20 @@ impl super::StorageCluster {
                 part_number,
             ) {
                 Ok(snapshot) => snapshot,
-                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
-                    ..
-                })) if let Some(command) = pending_command.clone() => {
-                    self.apply_exact_pending_object_metadata_command(
-                        pg_id,
-                        super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
-                    )?;
-                    continue;
+                Err(
+                    error @ ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                        ..
+                    }),
+                ) => {
+                    if let Some(command) = pending_command.clone() {
+                        self.apply_exact_pending_object_metadata_command(
+                            pg_id,
+                            super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                        )?;
+                        continue;
+                    }
+                    release_bucket_write_proof_if_unowned!()?;
+                    return Err(error);
                 }
                 Err(error) => {
                     release_bucket_write_proof_if_unowned!()?;
