@@ -61,6 +61,16 @@ pub(crate) trait DurableJournalObserver: std::fmt::Debug + Send + Sync + 'static
 
     fn record_directory_sync(&self, _elapsed: Duration) {}
 
+    fn record_compaction(&self, _elapsed: Duration, _succeeded: bool) {}
+
+    fn record_compaction_lock_wait(&self, _elapsed: Duration) {}
+
+    fn record_compaction_bytes(&self, _bytes: usize) {}
+
+    fn record_compaction_file_sync(&self, _elapsed: Duration) {}
+
+    fn record_compaction_directory_sync(&self, _elapsed: Duration) {}
+
     fn before_file_sync(&self, _path: &Path) -> Result<(), ControlPlaneError> {
         Ok(())
     }
@@ -437,7 +447,19 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
     }
 
     pub(crate) fn compact_through(&self, replay_offset: u64) -> Result<(), ControlPlaneError> {
-        let _guard = self.lock()?;
+        let compact_started = Instant::now();
+        let result = self.compact_through_inner(replay_offset);
+        self.observer
+            .record_compaction(compact_started.elapsed(), result.is_ok());
+        result
+    }
+
+    fn compact_through_inner(&self, replay_offset: u64) -> Result<(), ControlPlaneError> {
+        let lock_started = Instant::now();
+        let guard = self.lock();
+        self.observer
+            .record_compaction_lock_wait(lock_started.elapsed());
+        let _guard = guard?;
         let mut bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -505,16 +527,25 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
                     context: self.contexts.write_compacted_temp,
                     source,
                 })?;
-            file.sync_all().map_err(|source| ControlPlaneError::Io {
+            self.observer.record_compaction_bytes(compacted.len());
+            let file_sync_started = Instant::now();
+            let file_sync_result = file.sync_all().map_err(|source| ControlPlaneError::Io {
                 context: self.contexts.sync_compacted_temp,
                 source,
-            })?;
+            });
+            self.observer
+                .record_compaction_file_sync(file_sync_started.elapsed());
+            file_sync_result?;
         }
         fs::rename(&tmp_path, &self.path).map_err(|source| ControlPlaneError::Io {
             context: self.contexts.commit_compacted,
             source,
         })?;
-        self.observer.sync_parent(&self.path)
+        let directory_sync_started = Instant::now();
+        let directory_sync_result = self.observer.sync_parent(&self.path);
+        self.observer
+            .record_compaction_directory_sync(directory_sync_started.elapsed());
+        directory_sync_result
     }
 
     pub(crate) fn encode_file_header(&self, base_offset: u64) -> Vec<u8> {

@@ -2210,8 +2210,12 @@ print_slowdown_summary() {
         latest_metric_family_top "$metrics_log" object_payload_reclaim_durable_scan_by_pg_total 10 >&2 || true
         echo "shard_repair_top event" >&2
         latest_metric_family_top "$metrics_log" shard_repair_event_by_pg_total 10 >&2 || true
+        echo "shard_repair_top error" >&2
+        latest_metric_family_top "$metrics_log" shard_repair_error_by_pg_total 10 >&2 || true
         echo "shard_backfill_top event" >&2
         latest_metric_family_top "$metrics_log" shard_backfill_event_by_pg_total 10 >&2 || true
+        echo "shard_backfill_top error" >&2
+        latest_metric_family_top "$metrics_log" shard_backfill_error_by_pg_total 10 >&2 || true
         echo "metadata_checkpoint_record_top error" >&2
         latest_metric_family_top "$metrics_log" metadata_command_checkpoint_record_error_by_pg_total 10 >&2 || true
         echo "background_work_top admission" >&2

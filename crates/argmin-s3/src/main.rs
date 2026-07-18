@@ -1601,10 +1601,13 @@ fn format_control_plane_runtime_map_diagnostics(
     format_control_plane_runtime_map_diagnostics_parts(
         (diagnostics.runtime_map(), diagnostics.node_leases()),
         diagnostics.rpc_metrics(),
-        diagnostics.snapshot_metrics(),
-        diagnostics.raft_checkpoint_metrics(),
-        diagnostics.raft_wal_metrics(),
-        diagnostics.raft_command_metrics(),
+        (
+            diagnostics.snapshot_metrics(),
+            diagnostics.journal_metrics(),
+            diagnostics.raft_checkpoint_metrics(),
+            diagnostics.raft_wal_metrics(),
+            diagnostics.raft_command_metrics(),
+        ),
         diagnostics.history_reference_samples(),
     )
 }
@@ -1615,13 +1618,17 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         &[storage::control_plane::ControlPlaneRuntimeMapNodeLeaseDiagnostic],
     ),
     rpc_metrics: &[observability::ControlPlaneRpcMetricSample],
-    snapshot: observability::ControlPlaneSnapshotMetricSnapshot,
-    raft_checkpoint: observability::ControlPlaneRaftCheckpointMetricSnapshot,
-    raft_wal: observability::ControlPlaneRaftWalMetricSnapshot,
-    raft_command: observability::ControlPlaneRaftCommandMetricSnapshot,
+    durability_metrics: (
+        observability::ControlPlaneSnapshotMetricSnapshot,
+        observability::ControlPlaneJournalMetricSnapshot,
+        observability::ControlPlaneRaftCheckpointMetricSnapshot,
+        observability::ControlPlaneRaftWalMetricSnapshot,
+        observability::ControlPlaneRaftCommandMetricSnapshot,
+    ),
     history_reference_samples: &[observability::ControlPlaneHistoryReferenceSample],
 ) -> String {
     let (runtime_map, node_leases) = runtime_map;
+    let (snapshot, journal, raft_checkpoint, raft_wal, raft_command) = durability_metrics;
     let active_serving_pg_routes = runtime_map
         .pg_routes()
         .iter()
@@ -1683,7 +1690,7 @@ fn format_control_plane_runtime_map_diagnostics_parts(
     for metric in rpc_metrics {
         output.push('\n');
         output.push_str(&format!(
-            "control_plane_rpc kind={} total={} lock_wait_us_total={} lock_wait_us_max={} operation_us_total={} operation_us_max={} response_write_us_total={} response_write_us_max={}",
+            "control_plane_rpc kind={} total={} lock_wait_us_total={} lock_wait_us_max={} operation_us_total={} operation_us_max={} response_write_us_total={} response_write_us_max={} response_write_error_total={} response_write_broken_pipe_total={} response_write_connection_reset_total={} response_write_timeout_total={} response_write_other_error_total={}",
             metric.kind.as_str(),
             metric.total,
             metric.lock_wait_us_total,
@@ -1692,6 +1699,11 @@ fn format_control_plane_runtime_map_diagnostics_parts(
             metric.operation_us_max,
             metric.response_write_us_total,
             metric.response_write_us_max,
+            metric.response_write_error_total,
+            metric.response_write_broken_pipe_total,
+            metric.response_write_connection_reset_total,
+            metric.response_write_timeout_total,
+            metric.response_write_other_error_total,
         ));
     }
     output.push('\n');
@@ -1710,6 +1722,40 @@ fn format_control_plane_runtime_map_diagnostics_parts(
         snapshot.bytes_total,
         snapshot.bytes_last,
         snapshot.bytes_max,
+    ));
+    output.push('\n');
+    output.push_str(&format!(
+        "control_plane_journal append_total={} append_error_total={} append_us_total={} append_us_max={} lock_wait_us_total={} lock_wait_us_max={} frame_bytes_total={} frame_bytes_last={} frame_bytes_max={} file_sync_total={} file_sync_us_total={} file_sync_us_max={} directory_sync_total={} directory_sync_us_total={} directory_sync_us_max={} compaction_total={} compaction_error_total={} compaction_us_total={} compaction_us_max={} compaction_lock_wait_us_total={} compaction_lock_wait_us_max={} compaction_bytes_total={} compaction_bytes_last={} compaction_bytes_max={} compaction_file_sync_total={} compaction_file_sync_us_total={} compaction_file_sync_us_max={} compaction_directory_sync_total={} compaction_directory_sync_us_total={} compaction_directory_sync_us_max={}",
+        journal.append_total,
+        journal.append_error_total,
+        journal.append_us_total,
+        journal.append_us_max,
+        journal.lock_wait_us_total,
+        journal.lock_wait_us_max,
+        journal.frame_bytes_total,
+        journal.frame_bytes_last,
+        journal.frame_bytes_max,
+        journal.file_sync_total,
+        journal.file_sync_us_total,
+        journal.file_sync_us_max,
+        journal.directory_sync_total,
+        journal.directory_sync_us_total,
+        journal.directory_sync_us_max,
+        journal.compaction_total,
+        journal.compaction_error_total,
+        journal.compaction_us_total,
+        journal.compaction_us_max,
+        journal.compaction_lock_wait_us_total,
+        journal.compaction_lock_wait_us_max,
+        journal.compaction_bytes_total,
+        journal.compaction_bytes_last,
+        journal.compaction_bytes_max,
+        journal.compaction_file_sync_total,
+        journal.compaction_file_sync_us_total,
+        journal.compaction_file_sync_us_max,
+        journal.compaction_directory_sync_total,
+        journal.compaction_directory_sync_us_total,
+        journal.compaction_directory_sync_us_max,
     ));
     output.push('\n');
     output.push_str(&format!(
@@ -4758,6 +4804,10 @@ fn spawn_control_plane_rpc_worker<T>(
             response_write_started.elapsed(),
         );
         if let Err(error) = response_result {
+            observability::record_control_plane_rpc_response_write_error(
+                metrics_kind,
+                control_plane_rpc_response_write_error_kind(&error),
+            );
             eprintln!("control-plane RPC response failed: {error}");
         }
     });
@@ -4790,7 +4840,31 @@ fn write_control_plane_rpc_admission_response(
         response_write_started.elapsed(),
     );
     if let Err(error) = response_result {
+        observability::record_control_plane_rpc_response_write_error(
+            metrics_kind,
+            control_plane_rpc_response_write_error_kind(&error),
+        );
         eprintln!("control-plane RPC admission response failed: {error}");
+    }
+}
+
+fn control_plane_rpc_response_write_error_kind(
+    error: &ControlPlaneError,
+) -> observability::ControlPlaneRpcResponseWriteErrorKind {
+    let ControlPlaneError::Io { source, .. } = error else {
+        return observability::ControlPlaneRpcResponseWriteErrorKind::Other;
+    };
+    match source.kind() {
+        io::ErrorKind::BrokenPipe => {
+            observability::ControlPlaneRpcResponseWriteErrorKind::BrokenPipe
+        }
+        io::ErrorKind::ConnectionReset => {
+            observability::ControlPlaneRpcResponseWriteErrorKind::ConnectionReset
+        }
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+            observability::ControlPlaneRpcResponseWriteErrorKind::Timeout
+        }
+        _ => observability::ControlPlaneRpcResponseWriteErrorKind::Other,
     }
 }
 
@@ -14022,6 +14096,33 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_response_write_errors_use_bounded_io_categories() {
+        let classify = |kind| {
+            control_plane_rpc_response_write_error_kind(&ControlPlaneError::Io {
+                context: "write test response",
+                source: io::Error::from(kind),
+            })
+        };
+
+        assert_eq!(
+            classify(io::ErrorKind::BrokenPipe),
+            observability::ControlPlaneRpcResponseWriteErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            classify(io::ErrorKind::ConnectionReset),
+            observability::ControlPlaneRpcResponseWriteErrorKind::ConnectionReset
+        );
+        assert_eq!(
+            classify(io::ErrorKind::WouldBlock),
+            observability::ControlPlaneRpcResponseWriteErrorKind::Timeout
+        );
+        assert_eq!(
+            classify(io::ErrorKind::PermissionDenied),
+            observability::ControlPlaneRpcResponseWriteErrorKind::Other
+        );
+    }
+
+    #[test]
     fn runtime_map_diagnostics_include_storage_history_floors() {
         let tmp = std::env::temp_dir().join(format!(
             "argmin-runtime-map-diagnostics-test-{}",
@@ -14116,6 +14217,11 @@ mod tests {
             operation_us_max: 13,
             response_write_us_total: 14,
             response_write_us_max: 15,
+            response_write_error_total: 5,
+            response_write_broken_pipe_total: 2,
+            response_write_connection_reset_total: 1,
+            response_write_timeout_total: 1,
+            response_write_other_error_total: 1,
         }];
         let diagnostics = format_control_plane_runtime_map_diagnostics_parts(
             (
@@ -14123,34 +14229,47 @@ mod tests {
                 diagnostic_snapshot.node_leases(),
             ),
             &rpc_metrics,
-            observability::ControlPlaneSnapshotMetricSnapshot {
-                save_total: 7,
-                bytes_last: 1234,
-                ..observability::ControlPlaneSnapshotMetricSnapshot::default()
-            },
-            observability::ControlPlaneRaftCheckpointMetricSnapshot {
-                store_total: 8,
-                file_sync_total: 9,
-                directory_sync_total: 10,
-                bytes_last: 5678,
-                compaction_total: 11,
-                ..observability::ControlPlaneRaftCheckpointMetricSnapshot::default()
-            },
-            observability::ControlPlaneRaftWalMetricSnapshot {
-                append_total: 12,
-                frame_bytes_last: 345,
-                file_sync_total: 13,
-                directory_sync_total: 14,
-                ..observability::ControlPlaneRaftWalMetricSnapshot::default()
-            },
-            observability::ControlPlaneRaftCommandMetricSnapshot {
-                submit_total: 15,
-                submit_error_total: 1,
-                queue_wait_us_total: 16,
-                queue_wait_us_max: 17,
-                operation_us_total: 18,
-                operation_us_max: 19,
-            },
+            (
+                observability::ControlPlaneSnapshotMetricSnapshot {
+                    save_total: 7,
+                    bytes_last: 1234,
+                    ..observability::ControlPlaneSnapshotMetricSnapshot::default()
+                },
+                observability::ControlPlaneJournalMetricSnapshot {
+                    append_total: 7,
+                    frame_bytes_last: 234,
+                    file_sync_total: 8,
+                    directory_sync_total: 9,
+                    compaction_total: 10,
+                    compaction_bytes_last: 345,
+                    compaction_file_sync_total: 11,
+                    compaction_directory_sync_total: 12,
+                    ..observability::ControlPlaneJournalMetricSnapshot::default()
+                },
+                observability::ControlPlaneRaftCheckpointMetricSnapshot {
+                    store_total: 8,
+                    file_sync_total: 9,
+                    directory_sync_total: 10,
+                    bytes_last: 5678,
+                    compaction_total: 11,
+                    ..observability::ControlPlaneRaftCheckpointMetricSnapshot::default()
+                },
+                observability::ControlPlaneRaftWalMetricSnapshot {
+                    append_total: 12,
+                    frame_bytes_last: 345,
+                    file_sync_total: 13,
+                    directory_sync_total: 14,
+                    ..observability::ControlPlaneRaftWalMetricSnapshot::default()
+                },
+                observability::ControlPlaneRaftCommandMetricSnapshot {
+                    submit_total: 15,
+                    submit_error_total: 1,
+                    queue_wait_us_total: 16,
+                    queue_wait_us_max: 17,
+                    operation_us_total: 18,
+                    operation_us_max: 19,
+                },
+            ),
             &[observability::ControlPlaneHistoryReferenceSample {
                 node_id: 2,
                 observed_epoch: floor_epoch.get(),
@@ -14172,7 +14291,13 @@ mod tests {
         );
         assert!(
             diagnostics.contains(
-                "control_plane_rpc kind=refresh_node_heartbeat total=9 lock_wait_us_total=10 lock_wait_us_max=11 operation_us_total=12 operation_us_max=13 response_write_us_total=14 response_write_us_max=15"
+                "control_plane_rpc kind=refresh_node_heartbeat total=9 lock_wait_us_total=10 lock_wait_us_max=11 operation_us_total=12 operation_us_max=13 response_write_us_total=14 response_write_us_max=15 response_write_error_total=5 response_write_broken_pipe_total=2 response_write_connection_reset_total=1 response_write_timeout_total=1 response_write_other_error_total=1"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "control_plane_journal append_total=7 append_error_total=0 append_us_total=0 append_us_max=0 lock_wait_us_total=0 lock_wait_us_max=0 frame_bytes_total=0 frame_bytes_last=234 frame_bytes_max=0 file_sync_total=8 file_sync_us_total=0 file_sync_us_max=0 directory_sync_total=9 directory_sync_us_total=0 directory_sync_us_max=0 compaction_total=10 compaction_error_total=0 compaction_us_total=0 compaction_us_max=0 compaction_lock_wait_us_total=0 compaction_lock_wait_us_max=0 compaction_bytes_total=0 compaction_bytes_last=345 compaction_bytes_max=0 compaction_file_sync_total=11 compaction_file_sync_us_total=0 compaction_file_sync_us_max=0 compaction_directory_sync_total=12"
             ),
             "{diagnostics}"
         );

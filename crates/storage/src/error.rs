@@ -413,6 +413,120 @@ pub enum StoreError {
     },
 }
 
+impl StoreError {
+    /// Return a bounded diagnostic category suitable for metrics labels.
+    #[must_use]
+    pub fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::IntegrityError { .. } => "integrity_error",
+            Self::ShardAckMismatch { .. } => "shard_ack_mismatch",
+            Self::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+            Self::ClusterMapHistoryReferenceLimitExceeded { .. } => {
+                "cluster_map_history_reference_limit_exceeded"
+            }
+            Self::PgNotFound { .. } => "pg_not_found",
+            Self::InvalidPgTopology { .. } => "invalid_pg_topology",
+            Self::ClusterPgNotFound { .. } => "cluster_pg_not_found",
+            Self::ShardPgNotFound { .. } => "shard_pg_not_found",
+            Self::PgNotActive { .. } => "pg_not_active",
+            Self::ShardPgNotActive { .. } => "shard_pg_not_active",
+            Self::ShardStore { source, .. } => source.diagnostic_kind(),
+            Self::StorageRpc { code, .. } => storage_rpc_error_diagnostic_kind(*code),
+            Self::StorageRpcResourceExhausted { .. } => "storage_rpc_resource_exhausted",
+            Self::StorageRpcShardDeleteInProgress { .. } => "storage_rpc_shard_delete_in_progress",
+            Self::StalePayloadOperation { .. } => "stale_payload_operation",
+            Self::StaleMetadataPrimaryBridge { .. } => "stale_metadata_primary_bridge",
+            Self::StaleMetadataOperation { .. } => "stale_metadata_operation",
+            Self::StaleMetadataRoute { .. } => "stale_metadata_route",
+            Self::RouteMapExpired { .. } => "route_map_expired",
+            Self::StaleMetadataCommand { .. } => "stale_metadata_command",
+            Self::MetadataCommandWrongPg { .. } => "metadata_command_wrong_pg",
+            Self::MetadataCommandFromNonPrimary { .. } => "metadata_command_from_non_primary",
+            Self::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
+            Self::MetadataCommandLogGap { .. } => "metadata_command_log_gap",
+            Self::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
+            Self::StaleShardOperation { .. } => "stale_shard_operation",
+            Self::StaleShardLocation { .. } => "stale_shard_location",
+            Self::MetadataCommandContention { .. } => "metadata_command_contention",
+            Self::MetadataTransferEmpty { .. } => "metadata_transfer_empty",
+            Self::MetadataCommandPendingOnNonPrimary { .. } => {
+                "metadata_command_pending_on_non_primary"
+            }
+            Self::MetadataCommandLogChecksumMismatch { .. } => {
+                "metadata_command_log_checksum_mismatch"
+            }
+            Self::MetadataCommandLogHashMismatch { .. } => "metadata_command_log_hash_mismatch",
+            Self::MetadataCommandReplicaStateMissing { .. } => {
+                "metadata_command_replica_state_missing"
+            }
+            Self::MetadataCommandReplicaStateDiverged { .. } => {
+                "metadata_command_replica_state_diverged"
+            }
+            Self::MetadataStateDigestMismatch { .. } => "metadata_state_digest_mismatch",
+            Self::MetadataTransferUnsupportedProof { .. } => "metadata_transfer_unsupported_proof",
+            Self::MetadataCheckpointInvalid { .. } => "metadata_checkpoint_invalid",
+            Self::NodeNotFound { .. } => "node_not_found",
+            Self::NodeNotInActingSet { .. } => "node_not_in_acting_set",
+            Self::ShardIndexMismatch { .. } => "shard_index_mismatch",
+            Self::ShardScavengerObservationWrongPg { .. } => "shard_scavenger_observation_wrong_pg",
+            Self::ShardScavengerObservationShardIndexMismatch { .. } => {
+                "shard_scavenger_observation_shard_index_mismatch"
+            }
+            Self::ShardScavengerObservationInconsistentReason { .. } => {
+                "shard_scavenger_observation_inconsistent_reason"
+            }
+            Self::InvalidKeyLength { .. } => "invalid_key_length",
+            Self::InvalidShardKeyHex => "invalid_shard_key_hex",
+            Self::ShardScavengerScanIncomplete { .. } => "shard_scavenger_scan_incomplete",
+            Self::Io { context, .. } if *context == "connect storage-node RPC socket" => {
+                "storage_rpc_socket_connect"
+            }
+            Self::Io { .. } => "io",
+            Self::Db { .. } => "db",
+            Self::ErasureCoding { .. } => "erasure_coding",
+        }
+    }
+}
+
+fn storage_rpc_error_diagnostic_kind(code: StorageRpcErrorCode) -> &'static str {
+    match code {
+        StorageRpcErrorCode::FrameDecode => "storage_rpc_frame_decode",
+        StorageRpcErrorCode::PayloadDecode => "storage_rpc_payload_decode",
+        StorageRpcErrorCode::UnknownNode => "storage_rpc_unknown_node",
+        StorageRpcErrorCode::UnknownPg => "storage_rpc_unknown_pg",
+        StorageRpcErrorCode::WrongClusterEpoch => "storage_rpc_wrong_cluster_epoch",
+        StorageRpcErrorCode::InactivePgRoute => "storage_rpc_inactive_pg_route",
+        StorageRpcErrorCode::StaleShardLocation => "storage_rpc_stale_shard_location",
+        StorageRpcErrorCode::NonActingSetAccess => "storage_rpc_non_acting_set_access",
+        StorageRpcErrorCode::UnsupportedOperation => "storage_rpc_unsupported_operation",
+        StorageRpcErrorCode::Internal => "storage_rpc_internal",
+        StorageRpcErrorCode::ResourceExhausted => "storage_rpc_resource_exhausted",
+        StorageRpcErrorCode::ReclaimClaimNotFound => "storage_rpc_reclaim_claim_not_found",
+        StorageRpcErrorCode::ShardDeleteInProgress => "storage_rpc_shard_delete_in_progress",
+        StorageRpcErrorCode::BucketWriteDrainConflict => "storage_rpc_bucket_write_drain_conflict",
+        StorageRpcErrorCode::BucketWriteDrainNotFound => "storage_rpc_bucket_write_drain_not_found",
+        StorageRpcErrorCode::ReclaimClaimConflict => "storage_rpc_reclaim_claim_conflict",
+        StorageRpcErrorCode::NotFound => "storage_rpc_not_found",
+        StorageRpcErrorCode::BucketWriteReservationConflict => {
+            "storage_rpc_bucket_write_reservation_conflict"
+        }
+        StorageRpcErrorCode::BucketWriteReservationNotFound => {
+            "storage_rpc_bucket_write_reservation_not_found"
+        }
+        StorageRpcErrorCode::MetadataCommandContention => "storage_rpc_metadata_command_contention",
+        StorageRpcErrorCode::MetadataTransferHistoricalRouteActive => {
+            "storage_rpc_metadata_transfer_historical_route_active"
+        }
+        StorageRpcErrorCode::TransportTimeout => "storage_rpc_transport_timeout",
+        StorageRpcErrorCode::TransportClosed => "storage_rpc_transport_closed",
+        StorageRpcErrorCode::ShardIntegrity => "storage_rpc_shard_integrity",
+        StorageRpcErrorCode::MultipartConditionalRequestConflict => {
+            "storage_rpc_multipart_conditional_request_conflict"
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ShardIoError {
     #[error(

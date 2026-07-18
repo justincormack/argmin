@@ -6368,6 +6368,7 @@ pub struct ControlPlaneRuntimeMapDiagnostics {
     runtime_map: ClusterRuntimeMapSnapshot,
     rpc_metrics: Vec<observability::ControlPlaneRpcMetricSample>,
     snapshot_metrics: observability::ControlPlaneSnapshotMetricSnapshot,
+    journal_metrics: observability::ControlPlaneJournalMetricSnapshot,
     raft_checkpoint_metrics: observability::ControlPlaneRaftCheckpointMetricSnapshot,
     raft_wal_metrics: observability::ControlPlaneRaftWalMetricSnapshot,
     raft_command_metrics: observability::ControlPlaneRaftCommandMetricSnapshot,
@@ -6454,6 +6455,11 @@ impl ControlPlaneRuntimeMapDiagnostics {
     #[must_use]
     pub fn snapshot_metrics(&self) -> observability::ControlPlaneSnapshotMetricSnapshot {
         self.snapshot_metrics
+    }
+
+    #[must_use]
+    pub fn journal_metrics(&self) -> observability::ControlPlaneJournalMetricSnapshot {
+        self.journal_metrics
     }
 
     #[must_use]
@@ -6889,6 +6895,46 @@ struct SingleAuthorityJournalObserver {
 }
 
 impl DurableJournalObserver for SingleAuthorityJournalObserver {
+    fn record_append(&self, elapsed: Duration, succeeded: bool) {
+        observability::record_control_plane_journal_append(elapsed, succeeded);
+    }
+
+    fn record_lock_wait(&self, elapsed: Duration) {
+        observability::record_control_plane_journal_lock_wait(elapsed);
+    }
+
+    fn record_frame_bytes(&self, bytes: usize) {
+        observability::record_control_plane_journal_frame_bytes(bytes);
+    }
+
+    fn record_file_sync(&self, elapsed: Duration) {
+        observability::record_control_plane_journal_file_sync(elapsed);
+    }
+
+    fn record_directory_sync(&self, elapsed: Duration) {
+        observability::record_control_plane_journal_directory_sync(elapsed);
+    }
+
+    fn record_compaction(&self, elapsed: Duration, succeeded: bool) {
+        observability::record_control_plane_journal_compaction(elapsed, succeeded);
+    }
+
+    fn record_compaction_lock_wait(&self, elapsed: Duration) {
+        observability::record_control_plane_journal_compaction_lock_wait(elapsed);
+    }
+
+    fn record_compaction_bytes(&self, bytes: usize) {
+        observability::record_control_plane_journal_compaction_bytes(bytes);
+    }
+
+    fn record_compaction_file_sync(&self, elapsed: Duration) {
+        observability::record_control_plane_journal_compaction_file_sync(elapsed);
+    }
+
+    fn record_compaction_directory_sync(&self, elapsed: Duration) {
+        observability::record_control_plane_journal_compaction_directory_sync(elapsed);
+    }
+
     fn before_file_sync(&self, _path: &Path) -> Result<(), ControlPlaneError> {
         #[cfg(test)]
         if self
@@ -14777,6 +14823,11 @@ fn write_control_plane_runtime_map_diagnostics(
         write_u64(out, sample.operation_us_max);
         write_u64(out, sample.response_write_us_total);
         write_u64(out, sample.response_write_us_max);
+        write_u64(out, sample.response_write_error_total);
+        write_u64(out, sample.response_write_broken_pipe_total);
+        write_u64(out, sample.response_write_connection_reset_total);
+        write_u64(out, sample.response_write_timeout_total);
+        write_u64(out, sample.response_write_other_error_total);
     }
     let snapshot = observability::control_plane_snapshot_metrics_snapshot();
     write_u64(out, snapshot.serialize_total);
@@ -14792,6 +14843,37 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, snapshot.bytes_total);
     write_u64(out, snapshot.bytes_last);
     write_u64(out, snapshot.bytes_max);
+    let journal = observability::control_plane_journal_metrics_snapshot();
+    write_u64(out, journal.append_total);
+    write_u64(out, journal.append_error_total);
+    write_u64(out, journal.append_us_total);
+    write_u64(out, journal.append_us_max);
+    write_u64(out, journal.lock_wait_us_total);
+    write_u64(out, journal.lock_wait_us_max);
+    write_u64(out, journal.frame_bytes_total);
+    write_u64(out, journal.frame_bytes_last);
+    write_u64(out, journal.frame_bytes_max);
+    write_u64(out, journal.file_sync_total);
+    write_u64(out, journal.file_sync_us_total);
+    write_u64(out, journal.file_sync_us_max);
+    write_u64(out, journal.directory_sync_total);
+    write_u64(out, journal.directory_sync_us_total);
+    write_u64(out, journal.directory_sync_us_max);
+    write_u64(out, journal.compaction_total);
+    write_u64(out, journal.compaction_error_total);
+    write_u64(out, journal.compaction_us_total);
+    write_u64(out, journal.compaction_us_max);
+    write_u64(out, journal.compaction_lock_wait_us_total);
+    write_u64(out, journal.compaction_lock_wait_us_max);
+    write_u64(out, journal.compaction_bytes_total);
+    write_u64(out, journal.compaction_bytes_last);
+    write_u64(out, journal.compaction_bytes_max);
+    write_u64(out, journal.compaction_file_sync_total);
+    write_u64(out, journal.compaction_file_sync_us_total);
+    write_u64(out, journal.compaction_file_sync_us_max);
+    write_u64(out, journal.compaction_directory_sync_total);
+    write_u64(out, journal.compaction_directory_sync_us_total);
+    write_u64(out, journal.compaction_directory_sync_us_max);
     let raft_checkpoint = observability::control_plane_raft_checkpoint_metrics_snapshot();
     write_u64(out, raft_checkpoint.encode_total);
     write_u64(out, raft_checkpoint.encode_us_total);
@@ -14879,7 +14961,7 @@ fn read_control_plane_runtime_map_diagnostics(
     reader: &mut PayloadReader<'_>,
 ) -> Result<ControlPlaneRuntimeMapDiagnostics, ControlPlaneError> {
     let runtime_map = read_runtime_map_snapshot(reader)?;
-    let metric_count = reader.read_collection_len("control-plane RPC metrics", 57)?;
+    let metric_count = reader.read_collection_len("control-plane RPC metrics", 97)?;
     if metric_count > 16 {
         return Err(ControlPlaneError::RpcProtocol {
             message: format!("control-plane RPC metric count {metric_count} exceeds 16"),
@@ -14903,6 +14985,11 @@ fn read_control_plane_runtime_map_diagnostics(
             operation_us_max: reader.read_u64()?,
             response_write_us_total: reader.read_u64()?,
             response_write_us_max: reader.read_u64()?,
+            response_write_error_total: reader.read_u64()?,
+            response_write_broken_pipe_total: reader.read_u64()?,
+            response_write_connection_reset_total: reader.read_u64()?,
+            response_write_timeout_total: reader.read_u64()?,
+            response_write_other_error_total: reader.read_u64()?,
         });
     }
     let snapshot_metrics = observability::ControlPlaneSnapshotMetricSnapshot {
@@ -14919,6 +15006,38 @@ fn read_control_plane_runtime_map_diagnostics(
         bytes_total: reader.read_u64()?,
         bytes_last: reader.read_u64()?,
         bytes_max: reader.read_u64()?,
+    };
+    let journal_metrics = observability::ControlPlaneJournalMetricSnapshot {
+        append_total: reader.read_u64()?,
+        append_error_total: reader.read_u64()?,
+        append_us_total: reader.read_u64()?,
+        append_us_max: reader.read_u64()?,
+        lock_wait_us_total: reader.read_u64()?,
+        lock_wait_us_max: reader.read_u64()?,
+        frame_bytes_total: reader.read_u64()?,
+        frame_bytes_last: reader.read_u64()?,
+        frame_bytes_max: reader.read_u64()?,
+        file_sync_total: reader.read_u64()?,
+        file_sync_us_total: reader.read_u64()?,
+        file_sync_us_max: reader.read_u64()?,
+        directory_sync_total: reader.read_u64()?,
+        directory_sync_us_total: reader.read_u64()?,
+        directory_sync_us_max: reader.read_u64()?,
+        compaction_total: reader.read_u64()?,
+        compaction_error_total: reader.read_u64()?,
+        compaction_us_total: reader.read_u64()?,
+        compaction_us_max: reader.read_u64()?,
+        compaction_lock_wait_us_total: reader.read_u64()?,
+        compaction_lock_wait_us_max: reader.read_u64()?,
+        compaction_bytes_total: reader.read_u64()?,
+        compaction_bytes_last: reader.read_u64()?,
+        compaction_bytes_max: reader.read_u64()?,
+        compaction_file_sync_total: reader.read_u64()?,
+        compaction_file_sync_us_total: reader.read_u64()?,
+        compaction_file_sync_us_max: reader.read_u64()?,
+        compaction_directory_sync_total: reader.read_u64()?,
+        compaction_directory_sync_us_total: reader.read_u64()?,
+        compaction_directory_sync_us_max: reader.read_u64()?,
     };
     let raft_checkpoint_metrics = observability::ControlPlaneRaftCheckpointMetricSnapshot {
         encode_total: reader.read_u64()?,
@@ -15087,6 +15206,7 @@ fn read_control_plane_runtime_map_diagnostics(
         runtime_map,
         rpc_metrics,
         snapshot_metrics,
+        journal_metrics,
         raft_checkpoint_metrics,
         raft_wal_metrics,
         raft_command_metrics,
@@ -30134,6 +30254,11 @@ mod tests {
             "the preceding durable mutation should be measured"
         );
         assert!(diagnostics.snapshot_metrics().bytes_last > 0);
+        assert!(
+            diagnostics.journal_metrics().append_total >= 1,
+            "durable commands after initial creation should be journaled"
+        );
+        assert!(diagnostics.journal_metrics().frame_bytes_last > 0);
         assert_eq!(
             diagnostics.history_reference_samples(),
             &[expected_stale_sample]
@@ -33373,6 +33498,31 @@ mod tests {
                 NodeMembershipState::Active
             );
         }
+    }
+
+    #[test]
+    fn file_backed_authority_checkpoint_compaction_reports_physical_io() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::with_checkpoint_limits(
+            tmp.path().join("control-plane.state"),
+            1,
+            u64::MAX,
+        );
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let before = observability::control_plane_journal_metrics_snapshot();
+
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+
+        let after = observability::control_plane_journal_metrics_snapshot();
+        assert!(after.compaction_total > before.compaction_total);
+        assert!(after.compaction_us_total >= before.compaction_us_total);
+        assert!(after.compaction_lock_wait_us_total >= before.compaction_lock_wait_us_total);
+        assert!(after.compaction_bytes_total > before.compaction_bytes_total);
+        assert!(after.compaction_bytes_last > 0);
+        assert!(after.compaction_file_sync_total > before.compaction_file_sync_total);
+        assert!(after.compaction_directory_sync_total > before.compaction_directory_sync_total);
     }
 
     #[test]

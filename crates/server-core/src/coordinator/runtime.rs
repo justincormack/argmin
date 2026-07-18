@@ -1427,6 +1427,11 @@ impl ShardRepairSweeper {
                                         shards_rewritten: None,
                                     },
                                 );
+                                observability::record_shard_repair_error(
+                                    None,
+                                    "durable_scan_failed",
+                                    error.diagnostic_kind(),
+                                );
                                 let _ = observability::event(
                                     TRACE_TARGET,
                                     "shard_repair_durable_scan_error",
@@ -1509,6 +1514,11 @@ impl ShardRepairSweeper {
                                     shards_rewritten: None,
                                 },
                             );
+                            observability::record_shard_repair_error(
+                                Some(work_item.request.data_pg_id),
+                                "claim_failed",
+                                error.diagnostic_kind(),
+                            );
                             let _ = observability::event(
                                 TRACE_TARGET,
                                 "shard_repair_claim_error",
@@ -1539,6 +1549,11 @@ impl ShardRepairSweeper {
                                 next_attempt_after,
                             )
                         {
+                            observability::record_shard_repair_error(
+                                Some(claim.work_item.request.data_pg_id),
+                                "record_error_failed",
+                                record_error.diagnostic_kind(),
+                            );
                             let _ = observability::emit_shard_repair_event(
                                 TRACE_TARGET,
                                 observability::ShardRepairEventSummary {
@@ -1610,6 +1625,11 @@ impl ShardRepairSweeper {
                                     );
                                 }
                                 Err(error) => {
+                                    observability::record_shard_repair_error(
+                                        Some(claim.work_item.request.data_pg_id),
+                                        "complete_failed",
+                                        error.diagnostic_kind(),
+                                    );
                                     let _ = observability::emit_shard_repair_event(
                                         TRACE_TARGET,
                                         observability::ShardRepairEventSummary {
@@ -1633,6 +1653,11 @@ impl ShardRepairSweeper {
                             } else {
                                 "failed"
                             };
+                            observability::record_shard_repair_error(
+                                Some(claim.work_item.request.data_pg_id),
+                                event,
+                                error.diagnostic_kind(),
+                            );
                             let _ = observability::emit_shard_repair_event(
                                 TRACE_TARGET,
                                 observability::ShardRepairEventSummary {
@@ -1651,6 +1676,11 @@ impl ShardRepairSweeper {
                                     next_attempt_after,
                                 )
                             {
+                                observability::record_shard_repair_error(
+                                    Some(claim.work_item.request.data_pg_id),
+                                    "record_error_failed",
+                                    record_error.diagnostic_kind(),
+                                );
                                 let _ = observability::emit_shard_repair_event(
                                     TRACE_TARGET,
                                     observability::ShardRepairEventSummary {
@@ -1799,6 +1829,11 @@ fn run_one_placed_segment_shard_backfill(
             }
             Err(error) => {
                 emit_shard_backfill_event(None, "claim_failed", queue_depth, None);
+                observability::record_shard_backfill_error(
+                    None,
+                    "claim_failed",
+                    error.diagnostic_kind(),
+                );
                 let _ = observability::event(
                     TRACE_TARGET,
                     "shard_backfill_claim_error",
@@ -1824,6 +1859,11 @@ fn run_one_placed_segment_shard_backfill(
             "background shard backfill admission denied",
             next_attempt_after,
         ) {
+            observability::record_shard_backfill_error(
+                Some(claim.work_item.request.data_pg_id),
+                "record_error_failed",
+                record_error.diagnostic_kind(),
+            );
             emit_shard_backfill_event(
                 Some(claim.work_item.request.data_pg_id),
                 "record_error_failed",
@@ -1876,6 +1916,11 @@ fn run_one_placed_segment_shard_backfill(
                     );
                 }
                 Err(error) => {
+                    observability::record_shard_backfill_error(
+                        Some(claim.work_item.request.data_pg_id),
+                        shard_backfill_completion_error_event(&error),
+                        error.diagnostic_kind(),
+                    );
                     emit_shard_backfill_event(
                         Some(claim.work_item.request.data_pg_id),
                         shard_backfill_completion_error_event(&error),
@@ -1896,6 +1941,11 @@ fn run_one_placed_segment_shard_backfill(
             } else {
                 "failed"
             };
+            observability::record_shard_backfill_error(
+                Some(claim.work_item.request.data_pg_id),
+                event,
+                error.diagnostic_kind(),
+            );
             emit_shard_backfill_event(Some(claim.work_item.request.data_pg_id), event, None, None);
             let _ = observability::event(
                 TRACE_TARGET,
@@ -1916,6 +1966,11 @@ fn run_one_placed_segment_shard_backfill(
                     next_attempt_after,
                 )
             {
+                observability::record_shard_backfill_error(
+                    Some(claim.work_item.request.data_pg_id),
+                    "record_error_failed",
+                    record_error.diagnostic_kind(),
+                );
                 emit_shard_backfill_event(
                     Some(claim.work_item.request.data_pg_id),
                     "record_error_failed",
@@ -1991,6 +2046,11 @@ fn shard_backfill_queue_depth(storage_cluster: &StorageCluster) -> Option<usize>
     match storage_cluster.placed_segment_shard_backfill_backlog_depth() {
         Ok(depth) => Some(depth),
         Err(error) => {
+            observability::record_shard_backfill_error(
+                None,
+                "backlog_depth_failed",
+                error.diagnostic_kind(),
+            );
             let _ = observability::event(
                 TRACE_TARGET,
                 "shard_backfill_backlog_depth_error",

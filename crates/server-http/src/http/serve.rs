@@ -1744,6 +1744,26 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
             pg_id, event, sample.count
         );
     }
+    for sample in observability::shard_repair_error_dimension_snapshot() {
+        let pg_id = debug_metric_optional_pg_id_label(sample.pg_id);
+        let event = debug_metric_label_value(sample.event);
+        let error_kind = debug_metric_label_value(sample.error_kind);
+        let _ = writeln!(
+            body,
+            "shard_repair_error_by_pg_total{{pg_id=\"{}\",event=\"{}\",error_kind=\"{}\"}} {}",
+            pg_id, event, error_kind, sample.count
+        );
+    }
+    for sample in observability::shard_backfill_error_dimension_snapshot() {
+        let pg_id = debug_metric_optional_pg_id_label(sample.pg_id);
+        let event = debug_metric_label_value(sample.event);
+        let error_kind = debug_metric_label_value(sample.error_kind);
+        let _ = writeln!(
+            body,
+            "shard_backfill_error_by_pg_total{{pg_id=\"{}\",event=\"{}\",error_kind=\"{}\"}} {}",
+            pg_id, event, error_kind, sample.count
+        );
+    }
     for sample in observability::metadata_command_checkpoint_record_error_dimension_snapshot() {
         let outcome = debug_metric_label_value(sample.outcome);
         let error_kind = debug_metric_label_value(sample.error_kind);

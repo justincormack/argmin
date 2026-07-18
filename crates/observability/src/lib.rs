@@ -212,6 +212,10 @@ static SHARD_REPAIR_EVENT_DIMENSIONS: OnceLock<Mutex<Vec<ShardRepairEventDimensi
     OnceLock::new();
 static SHARD_BACKFILL_EVENT_DIMENSIONS: OnceLock<Mutex<Vec<ShardBackfillEventDimensionCounter>>> =
     OnceLock::new();
+static SHARD_REPAIR_ERROR_DIMENSIONS: OnceLock<Mutex<Vec<ShardWorkerErrorDimensionCounter>>> =
+    OnceLock::new();
+static SHARD_BACKFILL_ERROR_DIMENSIONS: OnceLock<Mutex<Vec<ShardWorkerErrorDimensionCounter>>> =
+    OnceLock::new();
 static BACKGROUND_WORK_ADMISSION_DIMENSIONS: OnceLock<
     Mutex<Vec<BackgroundWorkAdmissionDimensionCounter>>,
 > = OnceLock::new();
@@ -278,6 +282,36 @@ static CONTROL_PLANE_RAFT_WAL_FILE_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_WAL_DIRECTORY_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_APPEND_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_APPEND_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_APPEND_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_APPEND_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_LOCK_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_LOCK_WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_FRAME_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_FRAME_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_FRAME_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_FILE_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_FILE_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_FILE_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_DIRECTORY_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_DIRECTORY_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_DIRECTORY_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_LOCK_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_LOCK_WAIT_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_BYTES_LAST: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_BYTES_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_FILE_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_FILE_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_FILE_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_DIRECTORY_SYNC_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_DIRECTORY_SYNC_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CONTROL_PLANE_JOURNAL_COMPACTION_DIRECTORY_SYNC_US_MAX: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_COMMAND_SUBMIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_COMMAND_SUBMIT_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static CONTROL_PLANE_RAFT_COMMAND_QUEUE_WAIT_US_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -376,6 +410,19 @@ struct ControlPlaneRpcMetricCounters {
     operation_us_max: AtomicU64,
     response_write_us_total: AtomicU64,
     response_write_us_max: AtomicU64,
+    response_write_error_total: AtomicU64,
+    response_write_broken_pipe_total: AtomicU64,
+    response_write_connection_reset_total: AtomicU64,
+    response_write_timeout_total: AtomicU64,
+    response_write_other_error_total: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlPlaneRpcResponseWriteErrorKind {
+    BrokenPipe,
+    ConnectionReset,
+    Timeout,
+    Other,
 }
 
 fn control_plane_rpc_metrics() -> &'static [ControlPlaneRpcMetricCounters; 16] {
@@ -436,6 +483,27 @@ pub fn record_control_plane_rpc_response_write(kind: ControlPlaneRpcMetricKind, 
     fetch_max_atomic(&counters.response_write_us_max, elapsed_us);
 }
 
+pub fn record_control_plane_rpc_response_write_error(
+    kind: ControlPlaneRpcMetricKind,
+    error_kind: ControlPlaneRpcResponseWriteErrorKind,
+) {
+    let counters = &control_plane_rpc_metrics()[kind.index()];
+    counters
+        .response_write_error_total
+        .fetch_add(1, Ordering::Relaxed);
+    let counter = match error_kind {
+        ControlPlaneRpcResponseWriteErrorKind::BrokenPipe => {
+            &counters.response_write_broken_pipe_total
+        }
+        ControlPlaneRpcResponseWriteErrorKind::ConnectionReset => {
+            &counters.response_write_connection_reset_total
+        }
+        ControlPlaneRpcResponseWriteErrorKind::Timeout => &counters.response_write_timeout_total,
+        ControlPlaneRpcResponseWriteErrorKind::Other => &counters.response_write_other_error_total,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
 #[must_use]
 pub fn control_plane_rpc_metrics_snapshot() -> Vec<ControlPlaneRpcMetricSample> {
     let counters = control_plane_rpc_metrics();
@@ -452,6 +520,21 @@ pub fn control_plane_rpc_metrics_snapshot() -> Vec<ControlPlaneRpcMetricSample> 
                 operation_us_max: counters.operation_us_max.load(Ordering::Relaxed),
                 response_write_us_total: counters.response_write_us_total.load(Ordering::Relaxed),
                 response_write_us_max: counters.response_write_us_max.load(Ordering::Relaxed),
+                response_write_error_total: counters
+                    .response_write_error_total
+                    .load(Ordering::Relaxed),
+                response_write_broken_pipe_total: counters
+                    .response_write_broken_pipe_total
+                    .load(Ordering::Relaxed),
+                response_write_connection_reset_total: counters
+                    .response_write_connection_reset_total
+                    .load(Ordering::Relaxed),
+                response_write_timeout_total: counters
+                    .response_write_timeout_total
+                    .load(Ordering::Relaxed),
+                response_write_other_error_total: counters
+                    .response_write_other_error_total
+                    .load(Ordering::Relaxed),
             }
         })
         .collect()
@@ -644,6 +727,137 @@ pub fn control_plane_raft_wal_metrics_snapshot() -> ControlPlaneRaftWalMetricSna
     }
 }
 
+pub fn record_control_plane_journal_append(elapsed: Duration, succeeded: bool) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_JOURNAL_APPEND_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !succeeded {
+        CONTROL_PLANE_JOURNAL_APPEND_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    CONTROL_PLANE_JOURNAL_APPEND_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_JOURNAL_APPEND_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_journal_lock_wait(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_JOURNAL_LOCK_WAIT_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_JOURNAL_LOCK_WAIT_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_journal_frame_bytes(bytes: usize) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    CONTROL_PLANE_JOURNAL_FRAME_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    CONTROL_PLANE_JOURNAL_FRAME_BYTES_LAST.store(bytes, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_JOURNAL_FRAME_BYTES_MAX, bytes);
+}
+
+pub fn record_control_plane_journal_file_sync(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_JOURNAL_FILE_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_JOURNAL_FILE_SYNC_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_JOURNAL_FILE_SYNC_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_journal_directory_sync(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_JOURNAL_DIRECTORY_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_JOURNAL_DIRECTORY_SYNC_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_JOURNAL_DIRECTORY_SYNC_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_journal_compaction(elapsed: Duration, succeeded: bool) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_JOURNAL_COMPACTION_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if !succeeded {
+        CONTROL_PLANE_JOURNAL_COMPACTION_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    CONTROL_PLANE_JOURNAL_COMPACTION_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_JOURNAL_COMPACTION_US_MAX, elapsed_us);
+}
+
+pub fn record_control_plane_journal_compaction_lock_wait(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_JOURNAL_COMPACTION_LOCK_WAIT_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(
+        &CONTROL_PLANE_JOURNAL_COMPACTION_LOCK_WAIT_US_MAX,
+        elapsed_us,
+    );
+}
+
+pub fn record_control_plane_journal_compaction_bytes(bytes: usize) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    CONTROL_PLANE_JOURNAL_COMPACTION_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    CONTROL_PLANE_JOURNAL_COMPACTION_BYTES_LAST.store(bytes, Ordering::Relaxed);
+    fetch_max_atomic(&CONTROL_PLANE_JOURNAL_COMPACTION_BYTES_MAX, bytes);
+}
+
+pub fn record_control_plane_journal_compaction_file_sync(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_JOURNAL_COMPACTION_FILE_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_JOURNAL_COMPACTION_FILE_SYNC_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(
+        &CONTROL_PLANE_JOURNAL_COMPACTION_FILE_SYNC_US_MAX,
+        elapsed_us,
+    );
+}
+
+pub fn record_control_plane_journal_compaction_directory_sync(elapsed: Duration) {
+    let elapsed_us = elapsed_us(elapsed);
+    CONTROL_PLANE_JOURNAL_COMPACTION_DIRECTORY_SYNC_TOTAL.fetch_add(1, Ordering::Relaxed);
+    CONTROL_PLANE_JOURNAL_COMPACTION_DIRECTORY_SYNC_US_TOTAL
+        .fetch_add(elapsed_us, Ordering::Relaxed);
+    fetch_max_atomic(
+        &CONTROL_PLANE_JOURNAL_COMPACTION_DIRECTORY_SYNC_US_MAX,
+        elapsed_us,
+    );
+}
+
+#[must_use]
+pub fn control_plane_journal_metrics_snapshot() -> ControlPlaneJournalMetricSnapshot {
+    ControlPlaneJournalMetricSnapshot {
+        append_total: CONTROL_PLANE_JOURNAL_APPEND_TOTAL.load(Ordering::Relaxed),
+        append_error_total: CONTROL_PLANE_JOURNAL_APPEND_ERROR_TOTAL.load(Ordering::Relaxed),
+        append_us_total: CONTROL_PLANE_JOURNAL_APPEND_US_TOTAL.load(Ordering::Relaxed),
+        append_us_max: CONTROL_PLANE_JOURNAL_APPEND_US_MAX.load(Ordering::Relaxed),
+        lock_wait_us_total: CONTROL_PLANE_JOURNAL_LOCK_WAIT_US_TOTAL.load(Ordering::Relaxed),
+        lock_wait_us_max: CONTROL_PLANE_JOURNAL_LOCK_WAIT_US_MAX.load(Ordering::Relaxed),
+        frame_bytes_total: CONTROL_PLANE_JOURNAL_FRAME_BYTES_TOTAL.load(Ordering::Relaxed),
+        frame_bytes_last: CONTROL_PLANE_JOURNAL_FRAME_BYTES_LAST.load(Ordering::Relaxed),
+        frame_bytes_max: CONTROL_PLANE_JOURNAL_FRAME_BYTES_MAX.load(Ordering::Relaxed),
+        file_sync_total: CONTROL_PLANE_JOURNAL_FILE_SYNC_TOTAL.load(Ordering::Relaxed),
+        file_sync_us_total: CONTROL_PLANE_JOURNAL_FILE_SYNC_US_TOTAL.load(Ordering::Relaxed),
+        file_sync_us_max: CONTROL_PLANE_JOURNAL_FILE_SYNC_US_MAX.load(Ordering::Relaxed),
+        directory_sync_total: CONTROL_PLANE_JOURNAL_DIRECTORY_SYNC_TOTAL.load(Ordering::Relaxed),
+        directory_sync_us_total: CONTROL_PLANE_JOURNAL_DIRECTORY_SYNC_US_TOTAL
+            .load(Ordering::Relaxed),
+        directory_sync_us_max: CONTROL_PLANE_JOURNAL_DIRECTORY_SYNC_US_MAX.load(Ordering::Relaxed),
+        compaction_total: CONTROL_PLANE_JOURNAL_COMPACTION_TOTAL.load(Ordering::Relaxed),
+        compaction_error_total: CONTROL_PLANE_JOURNAL_COMPACTION_ERROR_TOTAL
+            .load(Ordering::Relaxed),
+        compaction_us_total: CONTROL_PLANE_JOURNAL_COMPACTION_US_TOTAL.load(Ordering::Relaxed),
+        compaction_us_max: CONTROL_PLANE_JOURNAL_COMPACTION_US_MAX.load(Ordering::Relaxed),
+        compaction_lock_wait_us_total: CONTROL_PLANE_JOURNAL_COMPACTION_LOCK_WAIT_US_TOTAL
+            .load(Ordering::Relaxed),
+        compaction_lock_wait_us_max: CONTROL_PLANE_JOURNAL_COMPACTION_LOCK_WAIT_US_MAX
+            .load(Ordering::Relaxed),
+        compaction_bytes_total: CONTROL_PLANE_JOURNAL_COMPACTION_BYTES_TOTAL
+            .load(Ordering::Relaxed),
+        compaction_bytes_last: CONTROL_PLANE_JOURNAL_COMPACTION_BYTES_LAST.load(Ordering::Relaxed),
+        compaction_bytes_max: CONTROL_PLANE_JOURNAL_COMPACTION_BYTES_MAX.load(Ordering::Relaxed),
+        compaction_file_sync_total: CONTROL_PLANE_JOURNAL_COMPACTION_FILE_SYNC_TOTAL
+            .load(Ordering::Relaxed),
+        compaction_file_sync_us_total: CONTROL_PLANE_JOURNAL_COMPACTION_FILE_SYNC_US_TOTAL
+            .load(Ordering::Relaxed),
+        compaction_file_sync_us_max: CONTROL_PLANE_JOURNAL_COMPACTION_FILE_SYNC_US_MAX
+            .load(Ordering::Relaxed),
+        compaction_directory_sync_total: CONTROL_PLANE_JOURNAL_COMPACTION_DIRECTORY_SYNC_TOTAL
+            .load(Ordering::Relaxed),
+        compaction_directory_sync_us_total:
+            CONTROL_PLANE_JOURNAL_COMPACTION_DIRECTORY_SYNC_US_TOTAL.load(Ordering::Relaxed),
+        compaction_directory_sync_us_max: CONTROL_PLANE_JOURNAL_COMPACTION_DIRECTORY_SYNC_US_MAX
+            .load(Ordering::Relaxed),
+    }
+}
+
 pub fn record_control_plane_raft_command_submission(
     queue_wait: Duration,
     operation: Duration,
@@ -683,6 +897,11 @@ impl ControlPlaneRpcMetricCounters {
             operation_us_max: AtomicU64::new(0),
             response_write_us_total: AtomicU64::new(0),
             response_write_us_max: AtomicU64::new(0),
+            response_write_error_total: AtomicU64::new(0),
+            response_write_broken_pipe_total: AtomicU64::new(0),
+            response_write_connection_reset_total: AtomicU64::new(0),
+            response_write_timeout_total: AtomicU64::new(0),
+            response_write_other_error_total: AtomicU64::new(0),
         }
     }
 }
@@ -697,6 +916,11 @@ pub struct ControlPlaneRpcMetricSample {
     pub operation_us_max: u64,
     pub response_write_us_total: u64,
     pub response_write_us_max: u64,
+    pub response_write_error_total: u64,
+    pub response_write_broken_pipe_total: u64,
+    pub response_write_connection_reset_total: u64,
+    pub response_write_timeout_total: u64,
+    pub response_write_other_error_total: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -757,6 +981,40 @@ pub struct ControlPlaneRaftWalMetricSnapshot {
     pub directory_sync_total: u64,
     pub directory_sync_us_total: u64,
     pub directory_sync_us_max: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlPlaneJournalMetricSnapshot {
+    pub append_total: u64,
+    pub append_error_total: u64,
+    pub append_us_total: u64,
+    pub append_us_max: u64,
+    pub lock_wait_us_total: u64,
+    pub lock_wait_us_max: u64,
+    pub frame_bytes_total: u64,
+    pub frame_bytes_last: u64,
+    pub frame_bytes_max: u64,
+    pub file_sync_total: u64,
+    pub file_sync_us_total: u64,
+    pub file_sync_us_max: u64,
+    pub directory_sync_total: u64,
+    pub directory_sync_us_total: u64,
+    pub directory_sync_us_max: u64,
+    pub compaction_total: u64,
+    pub compaction_error_total: u64,
+    pub compaction_us_total: u64,
+    pub compaction_us_max: u64,
+    pub compaction_lock_wait_us_total: u64,
+    pub compaction_lock_wait_us_max: u64,
+    pub compaction_bytes_total: u64,
+    pub compaction_bytes_last: u64,
+    pub compaction_bytes_max: u64,
+    pub compaction_file_sync_total: u64,
+    pub compaction_file_sync_us_total: u64,
+    pub compaction_file_sync_us_max: u64,
+    pub compaction_directory_sync_total: u64,
+    pub compaction_directory_sync_us_total: u64,
+    pub compaction_directory_sync_us_max: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -879,6 +1137,14 @@ pub struct ShardBackfillEventDimensionSample {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardWorkerErrorDimensionSample {
+    pub pg_id: Option<u32>,
+    pub event: &'static str,
+    pub error_kind: &'static str,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundWorkAdmissionDimensionSample {
     pub class: &'static str,
     pub event: &'static str,
@@ -941,6 +1207,13 @@ struct ShardRepairEventDimensionCounter {
 struct ShardBackfillEventDimensionCounter {
     pg_id: Option<u32>,
     event: &'static str,
+    count: u64,
+}
+
+struct ShardWorkerErrorDimensionCounter {
+    pg_id: Option<u32>,
+    event: &'static str,
+    error_kind: &'static str,
     count: u64,
 }
 
@@ -1098,6 +1371,14 @@ fn shard_repair_event_dimensions() -> &'static Mutex<Vec<ShardRepairEventDimensi
 
 fn shard_backfill_event_dimensions() -> &'static Mutex<Vec<ShardBackfillEventDimensionCounter>> {
     SHARD_BACKFILL_EVENT_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn shard_repair_error_dimensions() -> &'static Mutex<Vec<ShardWorkerErrorDimensionCounter>> {
+    SHARD_REPAIR_ERROR_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn shard_backfill_error_dimensions() -> &'static Mutex<Vec<ShardWorkerErrorDimensionCounter>> {
+    SHARD_BACKFILL_ERROR_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn background_work_admission_dimensions(
@@ -1304,6 +1585,55 @@ fn increment_shard_backfill_dimension(pg_id: Option<u32>, event: &'static str) {
     }
 }
 
+fn increment_shard_worker_error_dimension(
+    counters: &Mutex<Vec<ShardWorkerErrorDimensionCounter>>,
+    pg_id: Option<u32>,
+    event: &'static str,
+    error_kind: &'static str,
+) {
+    let mut counters = counters.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters.iter_mut().find(|counter| {
+        counter.pg_id == pg_id && counter.event == event && counter.error_kind == error_kind
+    }) {
+        counter.count = counter.count.saturating_add(1);
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(ShardWorkerErrorDimensionCounter {
+            pg_id,
+            event,
+            error_kind,
+            count: 1,
+        });
+    }
+}
+
+pub fn record_shard_repair_error(
+    pg_id: Option<u32>,
+    event: &'static str,
+    error_kind: &'static str,
+) {
+    increment_shard_worker_error_dimension(
+        shard_repair_error_dimensions(),
+        pg_id,
+        event,
+        error_kind,
+    );
+}
+
+pub fn record_shard_backfill_error(
+    pg_id: Option<u32>,
+    event: &'static str,
+    error_kind: &'static str,
+) {
+    increment_shard_worker_error_dimension(
+        shard_backfill_error_dimensions(),
+        pg_id,
+        event,
+        error_kind,
+    );
+}
+
 fn increment_background_work_admission_dimension(
     class: &'static str,
     event: &'static str,
@@ -1500,6 +1830,32 @@ pub fn shard_backfill_event_dimension_snapshot() -> Vec<ShardBackfillEventDimens
             count: counter.count,
         })
         .collect()
+}
+
+fn shard_worker_error_dimension_snapshot(
+    counters: &Mutex<Vec<ShardWorkerErrorDimensionCounter>>,
+) -> Vec<ShardWorkerErrorDimensionSample> {
+    counters
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(|counter| ShardWorkerErrorDimensionSample {
+            pg_id: counter.pg_id,
+            event: counter.event,
+            error_kind: counter.error_kind,
+            count: counter.count,
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn shard_repair_error_dimension_snapshot() -> Vec<ShardWorkerErrorDimensionSample> {
+    shard_worker_error_dimension_snapshot(shard_repair_error_dimensions())
+}
+
+#[must_use]
+pub fn shard_backfill_error_dimension_snapshot() -> Vec<ShardWorkerErrorDimensionSample> {
+    shard_worker_error_dimension_snapshot(shard_backfill_error_dimensions())
 }
 
 #[must_use]
@@ -4711,6 +5067,103 @@ mod tests {
         assert_eq!(
             map.get("stream_upload_finalize_started_total").copied(),
             Some(66)
+        );
+    }
+
+    #[test]
+    fn shard_worker_error_dimensions_preserve_bounded_error_kinds() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let pg_id = Some(4_000_000_001);
+
+        record_shard_repair_error(pg_id, "claim_failed", "storage_rpc_transport_timeout");
+        record_shard_repair_error(pg_id, "claim_failed", "storage_rpc_transport_timeout");
+        record_shard_backfill_error(None, "durable_scan_failed", "db");
+
+        assert!(shard_repair_error_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id == pg_id
+                && sample.event == "claim_failed"
+                && sample.error_kind == "storage_rpc_transport_timeout"
+                && sample.count >= 2));
+        assert!(shard_backfill_error_dimension_snapshot()
+            .iter()
+            .any(|sample| sample.pg_id.is_none()
+                && sample.event == "durable_scan_failed"
+                && sample.error_kind == "db"
+                && sample.count >= 1));
+    }
+
+    #[test]
+    fn control_plane_journal_metrics_measure_durable_io() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let before = control_plane_journal_metrics_snapshot();
+
+        record_control_plane_journal_lock_wait(Duration::from_micros(2));
+        record_control_plane_journal_append(Duration::from_micros(3), true);
+        record_control_plane_journal_frame_bytes(41);
+        record_control_plane_journal_file_sync(Duration::from_micros(5));
+        record_control_plane_journal_directory_sync(Duration::from_micros(7));
+        record_control_plane_journal_compaction_lock_wait(Duration::from_micros(11));
+        record_control_plane_journal_compaction(Duration::from_micros(13), true);
+        record_control_plane_journal_compaction_bytes(43);
+        record_control_plane_journal_compaction_file_sync(Duration::from_micros(17));
+        record_control_plane_journal_compaction_directory_sync(Duration::from_micros(19));
+
+        let after = control_plane_journal_metrics_snapshot();
+        assert_eq!(after.append_total, before.append_total + 1);
+        assert_eq!(after.append_error_total, before.append_error_total);
+        assert!(after.append_us_total >= before.append_us_total + 3);
+        assert!(after.lock_wait_us_total >= before.lock_wait_us_total + 2);
+        assert_eq!(after.frame_bytes_total, before.frame_bytes_total + 41);
+        assert_eq!(after.frame_bytes_last, 41);
+        assert_eq!(after.file_sync_total, before.file_sync_total + 1);
+        assert_eq!(after.directory_sync_total, before.directory_sync_total + 1);
+        assert_eq!(after.compaction_total, before.compaction_total + 1);
+        assert_eq!(after.compaction_error_total, before.compaction_error_total);
+        assert!(after.compaction_us_total >= before.compaction_us_total + 13);
+        assert!(after.compaction_lock_wait_us_total >= before.compaction_lock_wait_us_total + 11);
+        assert_eq!(
+            after.compaction_bytes_total,
+            before.compaction_bytes_total + 43
+        );
+        assert_eq!(after.compaction_bytes_last, 43);
+        assert_eq!(
+            after.compaction_file_sync_total,
+            before.compaction_file_sync_total + 1
+        );
+        assert_eq!(
+            after.compaction_directory_sync_total,
+            before.compaction_directory_sync_total + 1
+        );
+    }
+
+    #[test]
+    fn control_plane_rpc_metrics_classify_response_write_errors() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let kind = ControlPlaneRpcMetricKind::Unknown;
+        let before = control_plane_rpc_metrics_snapshot()[kind.index()];
+
+        record_control_plane_rpc_response_write_error(
+            kind,
+            ControlPlaneRpcResponseWriteErrorKind::BrokenPipe,
+        );
+        record_control_plane_rpc_response_write_error(
+            kind,
+            ControlPlaneRpcResponseWriteErrorKind::Timeout,
+        );
+
+        let after = control_plane_rpc_metrics_snapshot()[kind.index()];
+        assert_eq!(
+            after.response_write_error_total,
+            before.response_write_error_total + 2
+        );
+        assert_eq!(
+            after.response_write_broken_pipe_total,
+            before.response_write_broken_pipe_total + 1
+        );
+        assert_eq!(
+            after.response_write_timeout_total,
+            before.response_write_timeout_total + 1
         );
     }
 

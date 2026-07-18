@@ -10777,7 +10777,22 @@ Required production shape and implementation order:
    and append-specific file and directory sync count/duration. Authority commit
    queue wait and guarded command duration are now measured through the real
    serialized authority update gate, closing the instrumentation prerequisite
-   for changing the peer acknowledgement boundary.
+   for changing the peer acknowledgement boundary. The equivalent standalone
+   durable journal now separately reports append count/errors and duration,
+   append lock wait, exact frame bytes, and append file/directory sync count and
+   duration, plus checkpoint-compaction count/errors and duration, compaction
+   lock wait, rewritten bytes, and compaction file/directory sync count and
+   duration through the same authenticated diagnostics response. Standalone
+   soak results no longer have to infer either journal append or checkpoint
+   compaction pressure from snapshot counters. Repair and
+   backfill workers also export capped `(PG, event, error_kind)` counters using
+   one exhaustive `StoreError` classifier. The labels contain stable protocol,
+   storage, database, and I/O categories rather than raw error text or object
+   identifiers, and UAT summaries print their leading values alongside the
+   existing event totals. Control-plane response publication separately counts
+   broken pipe, connection reset, timeout, and other failures per bounded RPC
+   kind so client abandonment can be distinguished from authority operation
+   latency.
 2. Classify heartbeat fields by recovery requirement before changing the write
    path. Durable state includes membership, node/process identity changes,
    endpoints used as authority, PG topology/state, committed peering or
