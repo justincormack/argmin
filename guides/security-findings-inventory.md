@@ -81,6 +81,7 @@ for the current local security suite.
 | `security/codex-470aa8a` Streaming UploadPart reuploads leave orphaned shard data | fixed | `./scripts/security-tests stateful` | Covered by streamed part reupload/orphan cleanup tests. |
 | `security/codex-b6ecc5a` Completed multipart upload tombstones accumulate indefinitely | fixed by removal | `cargo nextest run -p storage multipart_terminal_history_has_no_standalone_table` | Completed/aborted upload history is not stored. Exact completion replay is scoped to the retained object version, and abort idempotence uses authenticated upload IDs. |
 | `security/codex-ecef3a4` Unbounded reclaim queue allows memory exhaustion via reads | fixed | `./scripts/security-tests stateful` | Covered by reclaim queue and payload-lease regressions. |
+| `security/codex-62c20a2` Reclaim sweeper stops periodic durable scans when idle | fixed in `39554219` | `cargo nextest run -p server-core reclaim_worker_rediscovers_capacity_deferred_root_while_idle` | Each bounded idle queue poll returns to the managed worker scheduler, which continues durable discovery and reclaims capacity-deferred roots without unrelated queue activity. |
 | `security/codex-a09a766` Lifecycle sweep bypasses object-lock retention checks | invalid | `./scripts/security-tests lifecycle` | Invalid finding; retained here so object-lock/lifecycle retention coverage stays visible. |
 | `security/codex-cd48ea6` Object Lock headers accept past retention dates | fixed | `./scripts/security-tests lifecycle` | Covered by object-lock retention validation regressions. |
 

@@ -1,0 +1,189 @@
+Reclaim sweeper stops periodic durable scans when idle
+Link: https://chatgpt.com/codex/cloud/security/findings/c86ed56298548191938c8bdd78e5025c?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 62c20a2
+Author: justin@specialbusservice.com
+Created: 18/07/2026, 15:33:46
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit [`3955421907610177ff0bd2547322b89a1b1dd9b7`](https://github.com/justincormack/argmin/commit/3955421907610177ff0bd2547322b89a1b1dd9b7) (`Fix idle reclaim rescan scheduling`).
+
+`wait_for_runtime_map_reclaim_work()` now performs one bounded process-local
+queue poll and returns `None` when that poll expires. Control therefore returns
+to the reclaim worker's outer scheduler, which re-evaluates the durable scan
+deadline and rediscovers capacity-deferred or newly eligible roots without
+requiring unrelated queue activity. Durable discovery remains owned by the
+single managed-worker cadence; the public queue wait does not introduce a
+second hidden scan owner.
+
+The regression creates three deleted-object reclaim roots in one PG, filling
+the two-entry per-PG queue and leaving the third root capacity-deferred. A
+storage-instance-scoped test hook holds the next durable scan beyond the test
+window, waits until the worker has drained the first two roots and returned
+from an empty queue poll, and verifies that only the third root remains. It
+then releases the worker and forces the next outer-loop scan, proving the
+deferred root is rediscovered and reclaimed. This removes dependence on the
+normal 250 ms scan interval or on how long the first two reclaims take under
+load.
+
+The deterministic gate also has an RAII release guard declared after the
+worker. If the test times out or otherwise unwinds, the gate is released before
+the worker is dropped and joined, preventing the test process deadlock
+identified during review.
+
+Validation for the fixing commit:
+
+- `cargo nextest run -p server-core`: 1,203 tests passed.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- `cargo fmt --all` and `git diff --check`: passed.
+
+# Summary
+Introduced: the new wait_for_queued_reclaim_work_poll no longer performs durable discovery, and the caller's explicit scan cadence is bypassed while the worker is blocked inside wait_for_runtime_map_reclaim_work.
+The reclaim worker still schedules durable scans with next_durable_scan_at, but when no pending/deferred/in-memory queue work exists it calls wait_for_runtime_map_reclaim_work. That helper loops internally over wait_for_queued_reclaim_work_poll until a queued item appears or shutdown occurs. The poll has a timeout, but the timeout is consumed inside wait_for_runtime_map_reclaim_work, so control never returns to the outer worker loop to re-evaluate next_durable_scan_at. This is a regression from the previous wait path, which performed durable discovery on every poll. Durable reclaim roots that are intentionally not queued immediately, such as object payload reclaims deferred by per-PG capacity, lease-gated reclaims, or bucket-delete roots that become eligible after time passes, can therefore remain unreclaimed indefinitely unless unrelated new reclaim work wakes the queue. An authenticated user can create/delete enough objects in the same PG to hit the small per-PG reclaim queue capacity and leave deleted payloads on disk, causing persistent storage consumption and potential service-wide denial of service.
+
+# Validation
+## Rubric
+- [x] Confirm durable reclaim discovery is scheduled only by the outer worker loop and next_durable_scan_at.
+- [x] Confirm the idle worker path enters wait_for_runtime_map_reclaim_work instead of sleeping only until the next durable scan deadline.
+- [x] Confirm wait_for_runtime_map_reclaim_work loops internally over queue-only polling and does not return on poll timeout to let the outer loop rescan.
+- [x] Confirm a realistic durable root can be left unqueued by per-PG object payload reclaim capacity.
+- [x] Dynamically demonstrate a stranded eligible durable root persists beyond the 250ms scan cadence and is reclaimed once a manual durable scan queues it; corroborate the blocked wait path with LLDB.
+## Report
+Validated the finding against commit 62c20a2c242e841d6d8b1f6ae232a3a902b329ca. Code review showed durable reclaim scans are only initiated by the outer worker loop: crates/server-core/src/coordinator/runtime.rs:563-578 updates next_durable_scan_at after enqueue_durable_reclaim_work_excluding. When no immediate/deferred work exists, the worker calls wait_for_runtime_map_reclaim_work at runtime.rs:777-779. That helper loops internally at runtime.rs:1019-1030 and repeatedly calls wait_for_queued_reclaim_work_poll at line 1025. The storage-side queue wait explicitly does not perform durable discovery: crates/storage/src/cluster/request_ops.rs:10080-10090. The queue can capacity-defer object payload roots per PG at crates/storage/src/cluster/local.rs:1092-1099, leaving durable roots for later scans. I added a targeted in-crate PoC test that creates 3 deleted objects in one PG with background sweepers disabled. The first two roots fill the per-PG reclaim queue, and the third remains durable/capacity-deferred. After starting the real reclaim worker, it drains the first two queued roots, then idles. The PoC waits 900ms, well beyond the 250ms durable scan interval, and confirms the third root still exists. Then a manual durable scan queues the same stranded root and the worker reclaims it, proving the root was eligible but the idle worker did not rescan. Command output: `PoC: third capacity-deferred durable reclaim root still exists after 900ms idle wait: true` and `PoC: manual durable scan queued and worker reclaimed the stranded root`. LLDB confirmed the worker was in the suspected wait path: breakpoint at runtime.rs:1025 showed thread `argmin-reclaim` in `wait_for_runtime_map_reclaim_work`, called from `ReclaimSweeper::spawn` at runtime.rs:778. Crash/ASan/valgrind were considered: this is a logic/availability bug rather than a memory-corruption crash; valgrind is not installed, and Rust ASan via `-Z sanitizer=address` is unavailable on the stable toolchain.
+
+# Evidence
+crates/server-core/src/coordinator/runtime.rs (L1019 to 1030)
+  Note: This helper loops internally until queued work appears, so timeout polls do not return to the outer loop to run due durable scans.
+```
+fn wait_for_runtime_map_reclaim_work(
+    storage_handle: &StorageClusterRuntimeMapHandle,
+    stop: &AtomicBool,
+) -> Option<(Arc<StorageCluster>, ReclaimWorkItem)> {
+    while !stop.load(Ordering::SeqCst) {
+        let worker_node = storage_handle.current();
+        if let Some(work) = worker_node.wait_for_queued_reclaim_work_poll(stop) {
+            return Some((worker_node, work));
+        }
+    }
+    None
+}
+```
+
+crates/server-core/src/coordinator/runtime.rs (L563 to 579)
+  Note: Durable reclaim scanning is now driven by next_durable_scan_at in the outer worker loop.
+```
+fn enqueue_durable_reclaim_work_if_due(
+    storage_node: &StorageCluster,
+    excluded_object_payload_roots: &HashSet<ObjectPayloadReclaimRoot>,
+    excluded_bucket_delete_begin_roots: &HashSet<BucketDeleteBeginRoot>,
+    excluded_bucket_delete_finalize_roots: &HashSet<BucketName>,
+    next_scan_at: &mut Instant,
+) {
+    if Instant::now() < *next_scan_at {
+        return;
+    }
+    let outcome = storage_node.enqueue_durable_reclaim_work_excluding(
+        excluded_object_payload_roots,
+        excluded_bucket_delete_begin_roots,
+        excluded_bucket_delete_finalize_roots,
+    );
+    *next_scan_at = next_reclaim_durable_scan_at(Instant::now(), outcome);
+}
+```
+
+crates/server-core/src/coordinator/runtime.rs (L777 to 779)
+  Note: When there is no immediate or deferred work, the worker enters the blocking wait path instead of sleeping only until the next durable scan deadline.
+```
+                        .or_else(|| {
+                            wait_for_runtime_map_reclaim_work(&storage_handle, &worker_stop)
+                        })
+```
+
+crates/storage/src/cluster/local.rs (L1092 to 1099)
+  Note: Object payload reclaim enqueue can be capacity-deferred per PG, relying on later durable scans to rediscover and queue remaining roots.
+```
+        let outstanding = state
+            .object_payload_outstanding_by_pg
+            .get(&pg_id)
+            .copied()
+            .unwrap_or(0);
+        if outstanding >= OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG {
+            Self::emit_reclaim_queue_action(&state, "object_payload", "pg_capacity_deferred");
+            return ReclaimQueueInsert::PgCapacityDeferred;
+```
+
+crates/storage/src/cluster/request_ops.rs (L10080 to 10091)
+  Note: The renamed wait function explicitly polls only the process-local queue and no longer performs durable discovery.
+```
+    /// Poll for work already present in the process-local reclaim queue.
+    ///
+    /// Durable discovery is owned by the caller's explicit scan cadence and is
+    /// never performed by this queue wait.
+    pub fn wait_for_queued_reclaim_work_poll(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return None;
+        }
+        self.local_map
+            .runtime_state()
+            .wait_for_reclaim_work_poll(stop)
+    }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The original medium severity is appropriate. Evidence confirms a real logic bug in the main runtime: durable scans are scheduled only in the outer reclaim loop, while the idle wait helper loops over queue-only polling and never returns on timeout, and storage can capacity-defer object payload reclaim roots per PG. The vulnerability is reachable by an authenticated S3 client through normal object create/delete operations, and prior validation demonstrated a stranded eligible root persisted beyond multiple scan intervals. However, exploitation requires existing write/delete privilege and primarily causes availability/storage-capacity impact. There is no auth bypass, sensitive data disclosure, cross-tenant privilege escalation, or RCE, so high or critical would not be justified.
+## Likelihood
+high - The path uses normal network S3 PutObject/DeleteObject operations and only requires low-privileged write/delete access, and the per-PG queue limit is only two. Likelihood is moderated by the need for valid credentials or public-write policy, sufficient upload bandwidth/storage consumption, same-PG repetition, and an idle reclaim worker; no repository deployment manifests prove internet exposure. | Remote network vector
+## Impact
+medium - The demonstrated impact is persistent retention of deleted object payloads and possible disk exhaustion for the argmin-s3 service. This can affect availability for other clients sharing the same service, especially with large objects, but it does not bypass authentication, expose object data, corrupt live metadata, or enable code execution.
+## Assumptions
+- The argmin-s3 frontend is deployed where authenticated S3 clients can reach it over TCP.
+- The attacker has valid credentials or equivalent bucket policy permission to create and delete objects.
+- No external storage quota, filesystem cleanup, or operator intervention prevents accumulated deleted payloads from consuming disk.
+- The attacker can create enough objects that at least three deleted payload roots map to the same placement group; with the default PG count this is plausible by normal repeated object operations.
+- Reachable argmin-s3 HTTP listener
+- Valid S3 credentials or public-write/delete-equivalent bucket permission
+- Ability to upload and delete multiple objects, preferably large objects, in the same placement group
+- Reclaim worker reaches an idle state with no unrelated queued reclaim work
+## Path
+S3 client -> Put/Delete objects -> per-PG reclaim capacity exceeded -> queued roots drained -> idle sweeper waits only for queued work -> durable scan not re-run -> deleted payloads persist on disk
+## Path evidence
+- `crates/argmin-s3/src/config.rs:329-334` - Configuration documents the S3 service listen address and required credentials; default listen address is 127.0.0.1:9000, with TLS unset unless configured.
+- `crates/argmin-s3/src/config.rs:406-432` - Frontend roles require ARGMIN_ACCESS_KEY_ID, ARGMIN_SECRET_ACCESS_KEY, and ARGMIN_SSE_S3_WRAPPING_KEY; the HTTP listener address is environment-configurable.
+- `crates/argmin-s3/src/main.rs:6273-6352` - Main product binds the configured TCP listener and starts plain HTTP or TLS serving with connection and in-flight request limits.
+- `crates/server-http/src/http/mod.rs:3311-3325` - HTTP requests are authenticated through auth::authenticate_request; missing auth becomes anonymous, so write/delete exploitation generally requires authorized credentials or permissive bucket policy.
+- `crates/server-http/src/http/mod.rs:1765-1804` - Normal PutObject is an in-scope S3 operation that reaches coordinator.put_object with attacker-controlled bucket/key/body metadata after authentication/validation.
+- `crates/server-http/src/http/mod.rs:1966-1991` - Normal DeleteObject is an in-scope S3 operation that reaches coordinator.delete_object and can generate object payload reclaim work.
+- `crates/server-core/src/coordinator/runtime.rs:55-56` - Durable reclaim scans are intended to run every 250 ms, with a separate route-refresh backoff.
+- `crates/server-core/src/coordinator/runtime.rs:563-579` - Durable reclaim discovery is driven by enqueue_durable_reclaim_work_if_due in the outer worker loop and updates next_durable_scan_at.
+- `crates/server-core/src/coordinator/runtime.rs:710-720` - The reclaim worker initializes next_durable_scan_at and checks durable reclaim scan due-ness at the top of the outer loop.
+- `crates/server-core/src/coordinator/runtime.rs:777-779` - When no pending, immediate, or deferred work is selected, the worker enters the blocking wait_for_runtime_map_reclaim_work path.
+- `crates/server-core/src/coordinator/runtime.rs:1019-1030` - wait_for_runtime_map_reclaim_work loops until queued work or shutdown, so poll timeouts do not return control to the outer loop to re-evaluate next_durable_scan_at.
+- `crates/storage/src/cluster/request_ops.rs:10080-10091` - The queue wait function explicitly polls only already-present process-local reclaim queue work and never performs durable discovery.
+- `crates/storage/src/node.rs:65` - The object payload reclaim queue allows only two outstanding roots per placement group, making same-PG capacity deferral easy to reach.
+- `crates/storage/src/cluster/local.rs:1092-1099` - If the per-PG outstanding count reaches the limit, object payload reclaim insertion returns PgCapacityDeferred, leaving the durable root dependent on later scans.
+- `crates/server-core/src/coordinator.rs:235` - Objects may be up to 5 GiB, so each stranded deleted payload can represent meaningful persistent disk consumption.
+## Narrative
+This is a real in-scope availability vulnerability in the main argmin-s3 server. The product binds an HTTP listener from ARGMIN_LISTEN_ADDR, authenticates requests with SigV4, and dispatches normal PutObject/DeleteObject operations. Durable reclaim scanning is scheduled in the outer reclaim worker loop with a 250 ms interval, but when immediate and deferred queues are empty the worker calls wait_for_runtime_map_reclaim_work. That helper loops internally over wait_for_queued_reclaim_work_poll, which explicitly only polls the process-local queue and never performs durable discovery. Since object-payload reclaim insertion can be deferred once two outstanding roots exist for a PG, an authenticated client can create/delete enough same-PG objects to leave an eligible durable reclaim root unqueued. Once the worker drains the first queued roots and becomes idle, that root is not rediscovered until unrelated new reclaim work wakes the worker. Prior validation included an executable in-crate PoC showing the third capacity-deferred durable reclaim root still existed after 900 ms, then was reclaimed after a manual durable scan. The impact is persistent disk consumption and potential service-wide denial of service, with no evidence of data disclosure, authorization bypass, or code execution.
+## Controls
+- SigV4 request authentication
+- Bucket/object authorization and ACL enforcement in server-core
+- Default listener is localhost unless ARGMIN_LISTEN_ADDR is changed
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Connection semaphore ARGMIN_MAX_CONNECTIONS defaults to 512
+- In-flight request semaphore ARGMIN_MAX_INFLIGHT_REQUESTS defaults to 32
+- Process rejects running as root
+- SecretConfigValue Debug output is redacted
+- No repository evidence of Kubernetes network policies, load balancers, cloud IAM, or storage quotas
+## Blindspots
+- Static review found no IaC, container, Kubernetes, or load-balancer manifests, so actual public exposure cannot be determined from the repository.
+- Repository artifacts do not show deployed filesystem capacity, quotas, monitoring, or external cleanup controls.
+- The exact number of repeated object operations needed for service-wide disk exhaustion depends on PG distribution, object sizes, workload timing, and whether unrelated reclaim work wakes the worker.
+- Prior validation PoC was considered as provided evidence, but this attack-path stage did not re-run dynamic tests.
