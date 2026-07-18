@@ -30,7 +30,7 @@ The adjacent `test_multipart_upload_id_authorization_precedence` separately
 pins `AccessDenied` for an active upload ID versus `NoSuchUpload` for an invalid
 ID across UploadPart, CompleteMultipartUpload, ListParts, and
 AbortMultipartUpload. Both tests run unchanged against AWS and Argmin. The
-completed item in `plans/aws-multipart-oracle-hardening-plan.md`, section 1,
+completed item in `plans/completed/aws-multipart-oracle-hardening-plan.md`, section 1,
 records the same active/nonexistent upload ID, well-formed/malformed XML, and
 primary/alternate-principal cross-product.
 

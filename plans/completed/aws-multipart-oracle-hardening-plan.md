@@ -432,7 +432,7 @@ choice.
   stale-condition failure, and non-mutation pin the same static semantics
   without introducing a transport-specific rule. The 128 MiB probes remain
   documentary.
-- [ ] Audit the earlier blanket authorization-at-entry assumption anywhere a
+- [x] Audit the earlier blanket authorization-at-entry assumption anywhere a
   long-running operation can observe mutable authorization state. Keep bucket
   control-plane state (policy, ownership controls, public-access settings, and
   bucket tags) separate from strongly consistent object owner, ACL, and tag
@@ -579,12 +579,13 @@ choice.
 
   Repeat mutable bucket-policy cases for ObjectWriter rather than inferring
   them from the bucket ACL result. Cover direct PutObject, streamed PutObject,
-  aws-chunked PutObject, CopyObject, and POST Object independently, including
-  absent keys, live objects, and current delete markers. Use object tag
-  conditions only on AWS actions for which they are evaluable; notably,
-  `s3:ExistingObjectTag/*` is policy-invalid for destination PutObject. Do not
-  change commit authorization until this matrix identifies each operation's
-  actual authorization points.
+  aws-chunked PutObject, and POST Object independently, including absent keys,
+  live objects, and current delete markers. Assess CopyObject separately
+  because it has no request body with which to establish a controllable race
+  interval. Use object tag conditions only on AWS actions for which they are
+  evaluable; notably, `s3:ExistingObjectTag/*` is policy-invalid for destination
+  PutObject. Do not change commit authorization without an oracle result that
+  identifies an operation's actual authorization points.
 
   The maintained ObjectWriter bucket-policy matrix now covers direct and
   streamed ordinary PutObject, signed aws-chunked PutObject, and POST Object
@@ -615,16 +616,18 @@ choice.
   branch for one of the same cases. Local consistently preserves its
   entry-bound model (initial allow succeeds; initial deny remains denied), and
   every local result is one of the AWS-permitted, fully state-checked branches.
-  CopyObject remains open: it has no request body with which to hold the
-  operation across control-plane convergence, so a useful AWS race needs a
-  separately established controllable interval rather than a header-flush
-  test that will normally complete before the policy changes.
-- [ ] Probe CopyObject destination contention with the same destination-state
-  and authorization matrix. Copy's source read creates a naturally longer
-  interval between destination authorization and publication, so explicitly
-  establish whether AWS binds object-dependent authorization to the initial
-  destination state, the commit state, or another linearization point before
-  changing the local capability model.
+  CopyObject was considered separately. It has no request body with which to
+  hold the operation across control-plane convergence, and its server-side
+  source read cannot be paced or acknowledged by the client.
+- [x] Conclude that CopyObject destination-authorization timing is not usefully
+  observable through the public API. A large source can only make the request
+  probabilistically remain outstanding; it cannot establish whether
+  destination authorization happened before, during, or after the source read.
+  Any observed success or denial would remain compatible with several
+  authorization models and would not justify changing the local implementation.
+  Do not add an expensive timing-dependent oracle that cannot distinguish those
+  models. Keep CopyObject entry-authorized locally unless a future independently
+  controllable AWS behavior exposes new evidence.
 - [x] Probe DeleteObject and DeleteObjects races against same-ETag and
   different-ETag replacement, current delete-marker insertion, enabled
   versioning, and suspended null replacement. Pin per-entry DeleteObjects
