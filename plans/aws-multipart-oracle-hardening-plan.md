@@ -255,7 +255,12 @@ For each matrix:
   timeout after publication preserves both metadata and every shard. Multipart
   management lookup drains a concurrent durable terminal command before
   classification, preserving AWS's idempotent abort result when completion
-  wins the race.
+  wins the race. AWS can also return transient `OperationAborted` after its SDK
+  retry allowance is exhausted when versioned completions race each other or a
+  versioned delete. Those tests release the first requests together, then
+  retry only `OperationAborted` under the shared elapsed-time test budget; the
+  exact final version IDs, retained bytes, single delete marker, and replay
+  assertions still detect duplicate or lost mutations.
 - [x] Cover versioned buckets, delete markers, conditional completion, and object
   replacement without relying on timing-sensitive exact boundaries. Concurrent
   completions of distinct uploads in a versioned bucket both publish retained,

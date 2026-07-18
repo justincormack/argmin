@@ -228,10 +228,27 @@ fn s3_error_code<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) 
     err.as_service_error().and_then(ProvideErrorMetadata::code)
 }
 
+#[derive(Clone, Copy)]
+enum OperationContentionRetryScope {
+    OperationAbortedOnly,
+    OperationAbortedOrSlowDown,
+}
+
+impl OperationContentionRetryScope {
+    fn includes(self, code: Option<&str>) -> bool {
+        match self {
+            Self::OperationAbortedOnly => code == Some("OperationAborted"),
+            Self::OperationAbortedOrSlowDown => {
+                matches!(code, Some("OperationAborted" | "SlowDown"))
+            }
+        }
+    }
+}
+
 fn is_retryable_operation_contention<E: ProvideErrorMetadata>(
     err: &aws_sdk_s3::error::SdkError<E>,
 ) -> bool {
-    matches!(s3_error_code(err), Some("OperationAborted" | "SlowDown"))
+    OperationContentionRetryScope::OperationAbortedOrSlowDown.includes(s3_error_code(err))
 }
 
 pub async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
@@ -320,21 +337,69 @@ pub trait SendRetryingOperationAborted: Clone {
         self,
         _description: &str,
     ) -> impl Future<Output = Result<Self::Output, aws_sdk_s3::error::SdkError<Self::Error>>> {
-        async move {
-            const RETRY_DELAY: Duration = Duration::from_millis(100);
-            let deadline = std::time::Instant::now() + configured_test_timeout();
+        send_with_operation_contention_retry(
+            self,
+            OperationContentionRetryScope::OperationAbortedOrSlowDown,
+        )
+    }
 
-            loop {
-                match self.clone().send_once().await {
-                    Err(err)
-                        if is_retryable_operation_contention(&err)
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        tokio::time::sleep(RETRY_DELAY).await;
-                    }
-                    result => return result,
-                }
+    fn send_retrying_exact_operation_aborted(
+        self,
+        _description: &str,
+    ) -> impl Future<Output = Result<Self::Output, aws_sdk_s3::error::SdkError<Self::Error>>> {
+        send_with_operation_contention_retry(
+            self,
+            OperationContentionRetryScope::OperationAbortedOnly,
+        )
+    }
+}
+
+fn operation_contention_retry_delay(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> Option<Duration> {
+    const RETRY_DELAY: Duration = Duration::from_millis(100);
+
+    let remaining = deadline.checked_duration_since(now)?;
+    (!remaining.is_zero()).then_some(RETRY_DELAY.min(remaining))
+}
+
+async fn send_with_operation_contention_retry<B>(
+    builder: B,
+    scope: OperationContentionRetryScope,
+) -> Result<B::Output, aws_sdk_s3::error::SdkError<B::Error>>
+where
+    B: SendRetryingOperationAborted,
+{
+    let deadline = std::time::Instant::now() + configured_test_timeout();
+    send_with_operation_contention_retry_until(builder, scope, deadline).await
+}
+
+async fn send_with_operation_contention_retry_until<B>(
+    builder: B,
+    scope: OperationContentionRetryScope,
+    deadline: std::time::Instant,
+) -> Result<B::Output, aws_sdk_s3::error::SdkError<B::Error>>
+where
+    B: SendRetryingOperationAborted,
+{
+    let mut retry_error = None;
+
+    loop {
+        if let Some(err) = retry_error.take() {
+            let Some(delay) = operation_contention_retry_delay(deadline, std::time::Instant::now())
+            else {
+                return Err(err);
+            };
+            tokio::time::sleep(delay).await;
+            if std::time::Instant::now() >= deadline {
+                return Err(err);
             }
+        }
+
+        match builder.clone().send_once().await {
+            Err(err) if scope.includes(s3_error_code(&err)) => retry_error = Some(err),
+            result => return result,
         }
     }
 }
@@ -2659,6 +2724,113 @@ pub fn is_sdk_stream_disconnect_or_status<E: std::fmt::Debug>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct FakeRetryBuilder {
+        calls: Arc<AtomicUsize>,
+        first_error_code: &'static str,
+    }
+
+    impl SendRetryingOperationAborted for FakeRetryBuilder {
+        type Output = ();
+        type Error = aws_sdk_s3::operation::delete_object::DeleteObjectError;
+
+        fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if call == 0 {
+                    let metadata = aws_smithy_types::error::ErrorMetadata::builder()
+                        .code(self.first_error_code)
+                        .build();
+                    let response = hyper::http::Response::builder()
+                        .status(409)
+                        .body(aws_smithy_types::body::SdkBody::empty())
+                        .expect("build fake retry response")
+                        .try_into()
+                        .expect("convert fake retry response");
+                    Err(aws_sdk_s3::error::SdkError::service_error(
+                        aws_sdk_s3::operation::delete_object::DeleteObjectError::generic(metadata),
+                        response,
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn exact_operation_aborted_retry_scope_does_not_include_slow_down() {
+        let exact = OperationContentionRetryScope::OperationAbortedOnly;
+        assert!(exact.includes(Some("OperationAborted")));
+        assert!(!exact.includes(Some("SlowDown")));
+        assert!(!exact.includes(Some("InternalError")));
+        assert!(!exact.includes(None));
+
+        let contention = OperationContentionRetryScope::OperationAbortedOrSlowDown;
+        assert!(contention.includes(Some("OperationAborted")));
+        assert!(contention.includes(Some("SlowDown")));
+    }
+
+    #[test]
+    fn operation_contention_retry_delay_is_capped_and_rejects_expired_deadline() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            operation_contention_retry_delay(now + Duration::from_millis(250), now),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            operation_contention_retry_delay(now + Duration::from_millis(25), now),
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(operation_contention_retry_delay(now, now), None);
+        assert_eq!(
+            operation_contention_retry_delay(now, now + Duration::from_millis(1)),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_operation_aborted_retry_returns_slow_down_without_retrying() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let result = send_with_operation_contention_retry_until(
+            FakeRetryBuilder {
+                calls: Arc::clone(&calls),
+                first_error_code: "SlowDown",
+            },
+            OperationContentionRetryScope::OperationAbortedOnly,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            result.as_ref().err().and_then(s3_error_code),
+            Some("SlowDown")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn operation_contention_retry_does_not_send_after_deadline() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let result = send_with_operation_contention_retry_until(
+            FakeRetryBuilder {
+                calls: Arc::clone(&calls),
+                first_error_code: "OperationAborted",
+            },
+            OperationContentionRetryScope::OperationAbortedOnly,
+            std::time::Instant::now(),
+        )
+        .await;
+
+        assert_eq!(
+            result.as_ref().err().and_then(s3_error_code),
+            Some("OperationAborted")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn request_signing_combines_duplicate_header_values_in_wire_order() {

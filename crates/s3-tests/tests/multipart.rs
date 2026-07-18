@@ -386,6 +386,30 @@ fn spawn_barrier_single_part_completion(
     })
 }
 
+fn spawn_barrier_single_part_completion_retrying_operation_aborted(
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    key: &'static str,
+    upload_id: String,
+    part_number: i32,
+    etag: String,
+    barrier: Arc<tokio::sync::Barrier>,
+) -> tokio::task::JoinHandle<CompleteMultipartResult> {
+    tokio::spawn(async move {
+        barrier.wait().await;
+        client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(single_part_completion(&etag, part_number))
+            .send_retrying_exact_operation_aborted(
+                "versioned multipart completion after raced OperationAborted",
+            )
+            .await
+    })
+}
+
 async fn create_single_part_upload(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -7007,7 +7031,7 @@ fn test_versioned_simultaneous_completions_retain_both_object_versions() {
                 create_single_part_upload(client, &bucket, key, 1, b"second version").await;
 
             let barrier = Arc::new(tokio::sync::Barrier::new(2));
-            let first = spawn_barrier_single_part_completion(
+            let first = spawn_barrier_single_part_completion_retrying_operation_aborted(
                 client.clone(),
                 bucket.clone(),
                 key,
@@ -7016,7 +7040,7 @@ fn test_versioned_simultaneous_completions_retain_both_object_versions() {
                 first_etag.clone(),
                 Arc::clone(&barrier),
             );
-            let second = spawn_barrier_single_part_completion(
+            let second = spawn_barrier_single_part_completion_retrying_operation_aborted(
                 client.clone(),
                 bucket.clone(),
                 key,
@@ -7120,7 +7144,7 @@ fn test_versioned_completion_racing_delete_retains_version_and_marker() {
                 create_single_part_upload(client, &bucket, key, 1, b"retained version").await;
 
             let barrier = Arc::new(tokio::sync::Barrier::new(2));
-            let completion = spawn_barrier_single_part_completion(
+            let completion = spawn_barrier_single_part_completion_retrying_operation_aborted(
                 client.clone(),
                 bucket.clone(),
                 key,
@@ -7137,7 +7161,9 @@ fn test_versioned_completion_racing_delete_retains_version_and_marker() {
                     .delete_object()
                     .bucket(delete_bucket)
                     .key(key)
-                    .send()
+                    .send_retrying_exact_operation_aborted(
+                        "versioned delete after raced OperationAborted",
+                    )
                     .await
             });
             let (completion, delete) = tokio::join!(completion, delete);
