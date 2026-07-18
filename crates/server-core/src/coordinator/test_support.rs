@@ -105,7 +105,7 @@ fn stop_reclaim_sweeper_for_test(coord: &mut Coordinator) {
         .stop
         .store(true, std::sync::atomic::Ordering::SeqCst);
     coord.storage_node().wake_reclaim_workers();
-    if let Some(handle) = coord._reclaim_sweeper.handle.take() {
+    if let Some(handle) = lock_mutex_unpoisoned(&coord._reclaim_sweeper.handle).take() {
         let _ = handle.join();
     }
 }

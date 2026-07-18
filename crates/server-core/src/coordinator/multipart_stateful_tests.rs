@@ -2070,8 +2070,7 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
     let lease = runtime.acquire_object_payload_lease("bucket", "key", generation_id);
     runtime.enqueue_object_payload_reclaim("bucket", "key", generation_id);
 
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    match runtime.storage_node.wait_for_reclaim_work(&stop) {
+    match runtime.storage_node.try_take_reclaim_work() {
         Some(ReclaimWorkItem::ObjectPayload((bucket, key, queued_generation_id))) => {
             assert_eq!(bucket, "bucket");
             assert_eq!(key, "key");

@@ -514,7 +514,7 @@ pub struct Coordinator {
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
     managed_key_provider: Option<StaticManagedKeyProvider>,
-    _reclaim_sweeper: ReclaimSweeper,
+    _reclaim_sweeper: Arc<ReclaimSweeper>,
     _shard_scavenger_sweeper: Arc<ShardScavengerSweeper>,
     _shard_repair_sweeper: Arc<ShardRepairSweeper>,
     _shard_backfill_sweeper: Arc<ShardBackfillSweeper>,

@@ -541,7 +541,7 @@ impl Coordinator {
             stream_session_sweeper_factory,
         ) = background_sweepers;
         let reclaim_sweeper = if start_reclaim_worker {
-            ReclaimSweeper::spawn(storage_handle.clone(), read_runtime.clone())?
+            ReclaimSweeper::acquire_shared(&storage_handle, read_runtime.clone())?
         } else {
             ReclaimSweeper::disabled(Arc::clone(&storage_cluster))
         };

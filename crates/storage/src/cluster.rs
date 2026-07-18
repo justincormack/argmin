@@ -19,7 +19,7 @@ pub use local::{
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientConfig,
 };
 use local::{LocalClusterRuntimeState, MetadataCommandRecoveryAdmission};
-pub use request_ops::BucketIdentityGenerations;
+pub use request_ops::{BucketIdentityGenerations, DurableReclaimScanOutcome};
 
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource,

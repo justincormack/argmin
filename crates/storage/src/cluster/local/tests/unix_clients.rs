@@ -1693,6 +1693,67 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
 }
 
 #[test]
+fn frontend_unix_durable_reclaim_scan_stops_after_first_stale_route() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(1);
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let frontend_epoch = ClusterEpoch::INITIAL;
+    let storage_epoch = ClusterEpoch::new(2).unwrap();
+    let socket_path = tmp.path().join("sockets").join("stale-reclaim.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let storage_routes = pg_ids
+        .iter()
+        .copied()
+        .map(|pg_id| StorageNodePgRoute {
+            pg_id,
+            cluster_epoch: storage_epoch,
+            state: PgState::Active,
+            primary_node_id: node_id,
+            acting_set: vec![node_id],
+        })
+        .collect();
+    let server = StorageNodeServer::bind(StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: storage_epoch,
+        route_map_validity: RouteMapValidity::Forever,
+        data_dir: tmp.path().join("stale-reclaim-node"),
+        default_ec_shape: ec_shape,
+        pg_ids: pg_ids.to_vec(),
+        socket_path: socket_path.clone(),
+        pg_routes: storage_routes,
+        pending_metadata_command_recoveries: Vec::new(),
+        historical_pg_routes: Vec::new(),
+    })
+    .unwrap();
+    let _server_guard = spawn_storage_node_server(server);
+
+    let mut map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        node_id,
+        [node_id],
+        &pg_ids,
+        ec_shape,
+        frontend_epoch,
+    )
+    .unwrap();
+    map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+        node_id,
+        socket_path,
+    )])
+    .unwrap();
+    let cluster = StorageCluster::from_local_map(Arc::new(map)).unwrap();
+
+    let scan = cluster.enqueue_durable_object_payload_reclaim_roots_excluding(&HashSet::new());
+    assert_eq!(scan.errors, 1, "one stale response must end the PG scan");
+    assert!(scan.route_refresh_required);
+    assert_eq!(
+        cluster.enqueue_durable_reclaim_work(),
+        crate::DurableReclaimScanOutcome::RouteRefreshRequired,
+        "the aggregate scan must skip subsequent bucket scans after the stale response"
+    );
+}
+
+#[test]
 fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);

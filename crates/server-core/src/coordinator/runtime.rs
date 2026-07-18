@@ -30,6 +30,8 @@ use crate::sse::{
 
 static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleSweeper>>>> =
     OnceLock::new();
+static RECLAIM_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<ReclaimSweeper>>>> =
+    OnceLock::new();
 static SHARD_SCAVENGER_SWEEPER_REGISTRY: OnceLock<
     Mutex<HashMap<usize, Weak<ShardScavengerSweeper>>>,
 > = OnceLock::new();
@@ -51,6 +53,7 @@ const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis
 const BUCKET_DELETE_BEGIN_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const BUCKET_DELETE_FINALIZE_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const RECLAIM_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+const RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
 const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const SHARD_REPAIR_CLAIM_LEASE_MILLIS: u64 = 30_000;
 const SHARD_REPAIR_ERROR_BACKOFF_MILLIS: u64 = 1_000;
@@ -564,23 +567,38 @@ fn enqueue_durable_reclaim_work_if_due(
     excluded_bucket_delete_finalize_roots: &HashSet<BucketName>,
     next_scan_at: &mut Instant,
 ) {
-    let now = Instant::now();
-    if now < *next_scan_at {
+    if Instant::now() < *next_scan_at {
         return;
     }
-    storage_node.enqueue_durable_reclaim_work_excluding(
+    let outcome = storage_node.enqueue_durable_reclaim_work_excluding(
         excluded_object_payload_roots,
         excluded_bucket_delete_begin_roots,
         excluded_bucket_delete_finalize_roots,
     );
-    *next_scan_at = now + RECLAIM_DURABLE_SCAN_INTERVAL;
+    *next_scan_at = next_reclaim_durable_scan_at(Instant::now(), outcome);
+}
+
+fn reclaim_durable_scan_delay(outcome: storage::DurableReclaimScanOutcome) -> Duration {
+    match outcome {
+        storage::DurableReclaimScanOutcome::Complete => RECLAIM_DURABLE_SCAN_INTERVAL,
+        storage::DurableReclaimScanOutcome::RouteRefreshRequired => {
+            RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF
+        }
+    }
+}
+
+fn next_reclaim_durable_scan_at(
+    scan_completed_at: Instant,
+    outcome: storage::DurableReclaimScanOutcome,
+) -> Instant {
+    scan_completed_at + reclaim_durable_scan_delay(outcome)
 }
 
 /// The coordinator ties together EC, storage, and metadata.
 pub(super) struct ReclaimSweeper {
     pub(super) storage_handle: StorageClusterRuntimeMapHandle,
     pub(super) stop: Arc<AtomicBool>,
-    pub(super) handle: Option<JoinHandle<()>>,
+    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 pub(super) struct LifecycleSweeper {
@@ -633,20 +651,45 @@ impl Drop for ReclaimSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.storage_handle.current().wake_reclaim_workers();
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
             let _ = handle.join();
         }
     }
 }
 
 impl ReclaimSweeper {
-    pub(super) fn spawn(
+    pub(super) fn acquire_shared(
+        storage_handle: &StorageClusterRuntimeMapHandle,
+        runtime: ReadRuntime,
+    ) -> Result<Arc<Self>, ServerError> {
+        let registry = RECLAIM_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ReclaimSweeper>>> =
+            lock_mutex_unpoisoned(registry);
+        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
+
+        let storage_cluster = storage_handle.current();
+        let key = storage_cluster.process_local_registry_key();
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+
+        let sweeper = Self::spawn(storage_handle.clone(), runtime)?;
+        registry.insert(key, Arc::downgrade(&sweeper));
+        Ok(sweeper)
+    }
+
+    fn spawn(
         storage_handle: StorageClusterRuntimeMapHandle,
         runtime: ReadRuntime,
-    ) -> Result<Self, ServerError> {
+    ) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let storage_handle_for_drop = storage_handle.clone();
+        let sweeper = Arc::new(Self {
+            storage_handle: storage_handle_for_drop,
+            stop,
+            handle: Mutex::new(None),
+        });
         let handle = std::thread::Builder::new()
             .name("argmin-reclaim".to_string())
             .spawn(move || {
@@ -960,19 +1003,16 @@ impl ReclaimSweeper {
             .map_err(|e| ServerError::InternalError {
                 reason: format!("failed to start reclaim worker: {e}"),
             })?;
-        Ok(Self {
-            storage_handle: storage_handle_for_drop,
-            stop,
-            handle: Some(handle),
-        })
+        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
+        Ok(sweeper)
     }
 
-    pub(super) fn disabled(storage_cluster: Arc<StorageCluster>) -> Self {
-        Self {
+    pub(super) fn disabled(storage_cluster: Arc<StorageCluster>) -> Arc<Self> {
+        Arc::new(Self {
             storage_handle: StorageClusterRuntimeMapHandle::new(storage_cluster),
             stop: Arc::new(AtomicBool::new(true)),
-            handle: None,
-        }
+            handle: Mutex::new(None),
+        })
     }
 }
 
@@ -982,7 +1022,7 @@ fn wait_for_runtime_map_reclaim_work(
 ) -> Option<(Arc<StorageCluster>, ReclaimWorkItem)> {
     while !stop.load(Ordering::SeqCst) {
         let worker_node = storage_handle.current();
-        if let Some(work) = worker_node.wait_for_reclaim_work_poll(stop) {
+        if let Some(work) = worker_node.wait_for_queued_reclaim_work_poll(stop) {
             return Some((worker_node, work));
         }
     }
@@ -3024,6 +3064,30 @@ mod tests {
 
     use super::super::payload::PayloadBufferPool;
     use super::*;
+
+    #[test]
+    fn reclaim_durable_scan_backs_off_while_route_refresh_is_required() {
+        assert_eq!(
+            reclaim_durable_scan_delay(storage::DurableReclaimScanOutcome::Complete),
+            RECLAIM_DURABLE_SCAN_INTERVAL
+        );
+        assert_eq!(
+            reclaim_durable_scan_delay(storage::DurableReclaimScanOutcome::RouteRefreshRequired),
+            RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF
+        );
+        assert!(RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF > RECLAIM_DURABLE_SCAN_INTERVAL);
+
+        let scan_started_at = Instant::now();
+        let scan_completed_at = scan_started_at + Duration::from_secs(2);
+        assert_eq!(
+            next_reclaim_durable_scan_at(
+                scan_completed_at,
+                storage::DurableReclaimScanOutcome::RouteRefreshRequired,
+            ),
+            scan_completed_at + RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF,
+            "route-refresh backoff must start after a potentially slow scan completes"
+        );
+    }
 
     #[test]
     fn bucket_delete_finalize_retry_sleep_waits_for_cooled_deferred_root() {

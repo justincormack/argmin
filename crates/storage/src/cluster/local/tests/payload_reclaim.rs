@@ -670,6 +670,22 @@ fn durable_reclaim_scan_continues_after_unavailable_pg() {
 }
 
 #[test]
+fn durable_reclaim_scan_defers_before_pg_walk_when_route_map_expired() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_local_map(map).unwrap();
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(0).unwrap());
+
+    assert_eq!(
+        cluster.enqueue_durable_reclaim_work(),
+        crate::DurableReclaimScanOutcome::RouteRefreshRequired
+    );
+}
+
+#[test]
 fn payload_lease_blocks_reclaim_across_cluster_handles() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

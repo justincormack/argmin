@@ -7660,6 +7660,36 @@ Shard repair design:
   and `OpportunisticScan` for shard scavenger integrity scans that can always
   defer because durable findings are recorded separately. Later
   backfill/migration/scanner output still needs to enter the same framework.
+- Retained replicated route-change tracing exposed a separate background-scan
+  multiplier. Four HTTP workers each constructed an independent reclaim
+  sweeper, so every 250 ms each process walked every PG four times for object
+  payload reclaim, bucket-delete begin, and bucket-delete finalization. During
+  a control-plane failover, the frontend's still-bound old runtime map first
+  produced one `StaleShardLocation` RPC per PG after storage installed the next
+  epoch, then one local `RouteMapExpired` diagnostic per PG after the lease
+  fence. A 186.7-second retained run produced about 148,500 stale storage RPCs
+  and 1.9 million expired-map per-PG scan failures without finding storage
+  corruption. Reclaim sweepers now use the same process-local weak registry as
+  the other sweepers. The managed worker owns the only durable-scan cadence;
+  public wait primitives are explicitly queue-only and cannot launch a hidden
+  second scan. An expired map is rejected once before walking PGs, the first
+  epoch-wide stale-route result stops all remaining PG and scan-family work,
+  and the worker backs off for one second from scan completion pending map
+  refresh. Per-PG lifecycle errors such as one PG in `Peering` remain local and
+  do not suppress cleanup for healthy PGs. Real Unix storage-RPC and
+  multi-coordinator regressions pin the bounded scan and shared worker
+  behavior.
+- Do not address the related global-epoch failure domain by accepting arbitrary
+  old storage RPC epochs. Current frames carry only node ID, global cluster
+  epoch, and PG ID, so the storage node cannot distinguish an unchanged PG
+  from a changed PG whose old primary must be fenced. Before replicated-mode
+  production cutover, add a canonical per-PG route generation or digest to
+  every route-authorized storage RPC and authenticate it with the frame. Storage
+  admission must accept an older global map only when that exact per-PG route
+  identity still equals the current route, while rejecting a changed acting
+  set, primary, state, lease/fence generation, or absent PG. Add route-change
+  tests proving an unrelated PG transition does not interrupt unchanged-PG
+  reads/background scans and that the changed PG's old primary remains fenced.
 - Added the first adaptive admission policy hook. `KnownDamageRepair` and
   the concrete cleanup classes currently keep fixed nonzero lanes so known
   repair, reclaim/bucket finalization, lifecycle cleanup, and stream-session

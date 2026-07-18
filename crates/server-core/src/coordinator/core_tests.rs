@@ -6000,6 +6000,29 @@ fn phase_10_6_remote_frontend_worker_mode_enables_routed_workers() {
 }
 
 #[test]
+fn frontend_coordinators_share_one_reclaim_sweeper_per_storage_handle() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let storage_handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+    let first = setup_coordinator_with_only_reclaim_worker(
+        storage_handle.clone(),
+        Arc::clone(&storage_cluster),
+    );
+    let second =
+        setup_coordinator_with_only_reclaim_worker(storage_handle, Arc::clone(&storage_cluster));
+
+    assert!(
+        Arc::ptr_eq(&first._reclaim_sweeper, &second._reclaim_sweeper),
+        "coordinators over one process-local storage handle must not multiply durable scans"
+    );
+    drop(first);
+    assert!(
+        !second._reclaim_sweeper.stop.load(Ordering::SeqCst),
+        "dropping one coordinator must leave the shared reclaim worker serving its peer"
+    );
+}
+
+#[test]
 fn put_object_effective_policy_context_derives_explicit_sse_s3() {
     let metadata = MetadataBlob::default();
     let system_metadata = SystemMetadata::default();

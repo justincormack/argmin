@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::MutexGuard;
@@ -65,18 +65,55 @@ const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = BUCKET_WRITE_RESERVATION_LEAS
 pub(crate) struct DurableObjectPayloadReclaimScan {
     pub queued: usize,
     pub errors: usize,
+    pub route_refresh_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableBucketDeleteFinalizeScan {
     pub queued: usize,
     pub errors: usize,
+    pub route_refresh_required: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableBucketDeleteBeginScan {
     pub queued: usize,
     pub errors: usize,
+    pub route_refresh_required: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum DurableReclaimScanOutcome {
+    Complete,
+    RouteRefreshRequired,
+}
+
+fn durable_reclaim_scan_requires_route_refresh(error: &StoreError) -> bool {
+    match error {
+        StoreError::StalePayloadOperation { .. }
+        | StoreError::StaleMetadataPrimaryBridge { .. }
+        | StoreError::StaleMetadataOperation { .. }
+        | StoreError::StaleMetadataRoute { .. }
+        | StoreError::RouteMapExpired { .. }
+        | StoreError::StaleShardOperation { .. }
+        | StoreError::StaleShardLocation { .. } => true,
+        StoreError::ShardStore { source, .. } => {
+            durable_reclaim_scan_requires_route_refresh(source)
+        }
+        StoreError::StorageRpc { code, .. } => matches!(
+            code,
+            StorageRpcErrorCode::StaleShardLocation | StorageRpcErrorCode::WrongClusterEpoch
+        ),
+        _ => false,
+    }
+}
+
+fn durable_reclaim_bucket_scan_requires_route_refresh(error: &BucketSnapshotLoadError) -> bool {
+    match error {
+        BucketSnapshotLoadError::Store(error) => durable_reclaim_scan_requires_route_refresh(error),
+        BucketSnapshotLoadError::Metadata(_) => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10000,12 +10037,12 @@ impl super::StorageCluster {
         self.local_map.runtime_state().try_take_reclaim_work()
     }
 
-    pub fn enqueue_durable_reclaim_work(&self) {
+    pub fn enqueue_durable_reclaim_work(&self) -> DurableReclaimScanOutcome {
         self.enqueue_durable_reclaim_work_excluding(
             &HashSet::new(),
             &HashSet::new(),
             &HashSet::new(),
-        );
+        )
     }
 
     pub fn enqueue_durable_reclaim_work_excluding(
@@ -10013,41 +10050,41 @@ impl super::StorageCluster {
         excluded_object_payload_roots: &HashSet<(BucketName, ObjectKey, GenerationId)>,
         excluded_bucket_delete_begin_roots: &HashSet<BucketDeleteBeginRoot>,
         excluded_bucket_delete_finalize_roots: &HashSet<BucketName>,
-    ) {
-        if self.operation_epoch() != self.cluster_epoch() {
-            return;
+    ) -> DurableReclaimScanOutcome {
+        if self.operation_epoch() != self.cluster_epoch()
+            || self.require_route_map_valid_now().is_err()
+        {
+            return DurableReclaimScanOutcome::RouteRefreshRequired;
         }
-        self.enqueue_durable_object_payload_reclaim_roots_excluding(excluded_object_payload_roots);
-        self.enqueue_durable_bucket_delete_begin_roots_excluding(
+
+        let object_payload = self
+            .enqueue_durable_object_payload_reclaim_roots_excluding(excluded_object_payload_roots);
+        if object_payload.route_refresh_required {
+            return DurableReclaimScanOutcome::RouteRefreshRequired;
+        }
+        let bucket_begin = self.enqueue_durable_bucket_delete_begin_roots_excluding(
             excluded_bucket_delete_begin_roots,
         );
-        self.enqueue_durable_bucket_delete_finalize_roots_excluding(
+        if bucket_begin.route_refresh_required {
+            return DurableReclaimScanOutcome::RouteRefreshRequired;
+        }
+        let bucket_finalize = self.enqueue_durable_bucket_delete_finalize_roots_excluding(
             excluded_bucket_delete_finalize_roots,
         );
+        if bucket_finalize.route_refresh_required {
+            return DurableReclaimScanOutcome::RouteRefreshRequired;
+        }
+        DurableReclaimScanOutcome::Complete
     }
 
-    pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+    /// Poll for work already present in the process-local reclaim queue.
+    ///
+    /// Durable discovery is owned by the caller's explicit scan cadence and is
+    /// never performed by this queue wait.
+    pub fn wait_for_queued_reclaim_work_poll(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
         if self.operation_epoch() != self.cluster_epoch() {
             return None;
         }
-        while !stop.load(Ordering::SeqCst) {
-            self.enqueue_durable_reclaim_work();
-            if let Some(work) = self
-                .local_map
-                .runtime_state()
-                .wait_for_reclaim_work_poll(stop)
-            {
-                return Some(work);
-            }
-        }
-        None
-    }
-
-    pub fn wait_for_reclaim_work_poll(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
-        if self.operation_epoch() != self.cluster_epoch() {
-            return None;
-        }
-        self.enqueue_durable_reclaim_work();
         self.local_map
             .runtime_state()
             .wait_for_reclaim_work_poll(stop)
@@ -10377,6 +10414,10 @@ impl super::StorageCluster {
                         "object_reclaim_durable_scan_pg_error",
                         Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
                     );
+                    if durable_reclaim_scan_requires_route_refresh(&error) {
+                        scan.route_refresh_required = true;
+                        return scan;
+                    }
                     continue;
                 }
             };
@@ -10393,6 +10434,10 @@ impl super::StorageCluster {
                         "object_reclaim_durable_scan_pg_error",
                         Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
                     );
+                    if durable_reclaim_bucket_scan_requires_route_refresh(&error) {
+                        scan.route_refresh_required = true;
+                        return scan;
+                    }
                     continue;
                 }
             };
@@ -10433,6 +10478,10 @@ impl super::StorageCluster {
                         "object_reclaim_durable_scan_lease_error",
                         Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
                     );
+                    if durable_reclaim_scan_requires_route_refresh(&error) {
+                        scan.route_refresh_required = true;
+                        return scan;
+                    }
                     continue;
                 }
             };
@@ -10482,6 +10531,10 @@ impl super::StorageCluster {
                         "bucket_begin_durable_scan_pg_error",
                         Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
                     );
+                    if durable_reclaim_scan_requires_route_refresh(&error) {
+                        scan.route_refresh_required = true;
+                        return scan;
+                    }
                     continue;
                 }
             };
@@ -10505,6 +10558,10 @@ impl super::StorageCluster {
                             "bucket_begin_durable_scan_pg_error",
                             Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
                         );
+                        if durable_reclaim_bucket_scan_requires_route_refresh(&error) {
+                            scan.route_refresh_required = true;
+                            return scan;
+                        }
                         break;
                     }
                 };
@@ -10565,6 +10622,10 @@ impl super::StorageCluster {
                         "bucket_finalize_durable_scan_pg_error",
                         Some(format_args!("pg_id={} error={:?}", pg_id, error)),
                     );
+                    if durable_reclaim_scan_requires_route_refresh(&error) {
+                        scan.route_refresh_required = true;
+                        return scan;
+                    }
                     continue;
                 }
             };
@@ -10583,6 +10644,10 @@ impl super::StorageCluster {
                         "bucket_finalize_durable_scan_pg_error",
                         Some(format_args!("pg_id={} error={:?}", pg_id, error)),
                     );
+                    if durable_reclaim_bucket_scan_requires_route_refresh(&error) {
+                        scan.route_refresh_required = true;
+                        return scan;
+                    }
                     continue;
                 }
             };
