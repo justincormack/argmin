@@ -1,6 +1,44 @@
 # Bounded AWS-Chunked Streaming Plan
 
-Status: planned
+Status: implemented; pending archive
+
+## Implementation Update
+
+The bounded decoder implementation landed in commit `bfbab3b5` (`Bound
+aws-chunked streaming memory`). Production `PutObject` and `UploadPart` paths
+split incoming wire frames into bounded 64 KiB decoder feeds. The decoder emits
+payload from each feed without retaining the current data chunk, hashes signed
+chunks incrementally, validates remaining decoded length, and bounds retained
+header and trailer parser state.
+
+Coverage added after the original implementation now pins the remaining
+security properties:
+
+- a 2 MiB signed decoder unit case feeds one declared chunk in 64 KiB pieces,
+  asserts each emitted payload is bounded, and verifies payload never enters
+  retained parser storage
+- endpoint-neutral AWS/local tests successfully store a 256 KiB single signed
+  chunk through both `PutObject` and `UploadPart`, including multipart
+  completion and object-byte verification
+- endpoint-neutral AWS/local `UploadPart` cases send more than one decoder feed
+  before bad data-signature, decoded-length mismatch, and post-emission
+  `InvalidChunkSize` failures, then assert that the active upload still has no
+  parts
+- a local HTTP integration case crosses the internal 8 MiB segment boundary,
+  fails the terminal signature, and verifies the promoted UploadPart session is
+  removed and no part is visible
+
+The proposed decoder-specific observability was intentionally not added.
+Decoded emitted bytes are already represented by the streaming request's
+`body_bytes_received` totals, while malformed-body and signature failures flow
+through the existing request error response and flight-recorder diagnostics.
+Maximum decoder retention is a structural invariant enforced by the 64 KiB
+production feed size, explicit header/trailer limits, and the bounded-emission
+unit regression. Adding duplicate hot-path counters would not provide an
+independent correctness signal for this invariant.
+
+The original context and design discussion below are retained as the historical
+rationale for the implementation.
 
 ## Context
 
@@ -222,10 +260,13 @@ this work.
    - keep checksum trailer extraction semantics
    - verify signed trailers after terminal chunk
    - ensure trailers are available before finalization
-6. Add observability:
-   - maximum decoder buffered bytes per request
-   - decoded bytes emitted from chunked decoder
-   - decoder abort reason for malformed body/signature failure
+6. Decoder-specific observability was considered and intentionally omitted:
+   - existing streaming request telemetry already records decoded body bytes
+     and request error diagnostics
+   - maximum retained bytes are enforced and regression-tested as structural
+     bounds rather than measured after the fact
+   - duplicate decoder counters would add hot-path bookkeeping without an
+     independent correctness signal
 7. Decide the future of `decode_chunked_body`:
    - either keep it explicitly test-only and whole-buffered, with comments that
      it is not a production memory model

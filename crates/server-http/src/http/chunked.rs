@@ -1020,6 +1020,50 @@ mod tests {
 
     // ── IncrementalChunkedDecoder tests ──────────────────────────────
 
+    fn signed_chunk_fixture(chunk_data: &[u8]) -> (StreamingSigningContext, String, String) {
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let date = "20130524";
+        let region = "us-east-1";
+        let service = "s3";
+        let timestamp = "20130524T000000Z";
+        let scope = format!("{date}/{region}/{service}/aws4_request");
+
+        let signing_key = auth::sigv4::derive_signing_key(
+            &auth::SecretKey::new(secret.to_string()),
+            date,
+            region,
+            service,
+        );
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(signing_key.as_ref());
+
+        let seed_sig = "seed0000000000000000000000000000000000000000000000000000000000ab";
+        let ctx = StreamingSigningContext {
+            signing_key: key_bytes,
+            seed_signature: seed_sig.to_string(),
+            scope: scope.clone(),
+            timestamp: timestamp.to_string(),
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            seed_canonical_request:
+                "PUT\\n/\\n\\nhost:h\\n\\nhost\\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
+        };
+
+        let empty_hash = auth::canonical::sha256_hex(b"");
+        let chunk_hash = auth::canonical::sha256_hex(chunk_data);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{seed_sig}\n{empty_hash}\n{chunk_hash}"
+        );
+        let chunk_sig = hex_encode(hmac::sign(&key, sts.as_bytes()).as_ref());
+
+        let sts_terminal = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{chunk_sig}\n{empty_hash}\n{empty_hash}"
+        );
+        let terminal_sig = hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
+
+        (ctx, chunk_sig, terminal_sig)
+    }
+
     #[test]
     fn incremental_single_feed() {
         let mut dec = IncrementalChunkedDecoder::new(None, false);
@@ -1164,50 +1208,8 @@ mod tests {
 
     #[test]
     fn incremental_signed_verification() {
-        // Reuse the same signing setup as the batch decoder test.
         let chunk_data = b"Hello";
-        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
-        let date = "20130524";
-        let region = "us-east-1";
-        let service = "s3";
-        let timestamp = "20130524T000000Z";
-        let scope = format!("{date}/{region}/{service}/aws4_request");
-
-        let signing_key = auth::sigv4::derive_signing_key(
-            &auth::SecretKey::new(secret.to_string()),
-            date,
-            region,
-            service,
-        );
-        let mut key_bytes = [0u8; 32];
-        key_bytes.copy_from_slice(signing_key.as_ref());
-
-        let seed_sig = "seed0000000000000000000000000000000000000000000000000000000000ab";
-
-        let ctx = StreamingSigningContext {
-            signing_key: key_bytes,
-            seed_signature: seed_sig.to_string(),
-            scope: scope.clone(),
-            timestamp: timestamp.to_string(),
-            access_key_id: "AKIDEXAMPLE".to_string(),
-            seed_canonical_request:
-                "PUT\\n/\\n\\nhost:h\\n\\nhost\\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
-        };
-
-        let empty_hash = auth::canonical::sha256_hex(b"");
-        let chunk_hash = auth::canonical::sha256_hex(chunk_data);
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &key_bytes);
-
-        let sts = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{seed_sig}\n{empty_hash}\n{chunk_hash}"
-        );
-        let chunk_sig = hex_encode(hmac::sign(&key, sts.as_bytes()).as_ref());
-
-        let terminal_hash = auth::canonical::sha256_hex(b"");
-        let sts_terminal = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{chunk_sig}\n{empty_hash}\n{terminal_hash}"
-        );
-        let terminal_sig = hex_encode(hmac::sign(&key, sts_terminal.as_bytes()).as_ref());
+        let (ctx, chunk_sig, terminal_sig) = signed_chunk_fixture(chunk_data);
 
         let wire = format!(
             "5;chunk-signature={chunk_sig}\r\nHello\r\n0;chunk-signature={terminal_sig}\r\n\r\n"
@@ -1216,6 +1218,41 @@ mod tests {
         let mut dec = IncrementalChunkedDecoder::new(Some(ctx), false);
         let payload = dec.feed(wire.as_bytes()).unwrap();
         assert_eq!(payload, b"Hello");
+        assert!(dec.is_done());
+    }
+
+    #[test]
+    fn incremental_large_signed_chunk_emits_bounded_payload_without_buffering_it() {
+        const DATA_LEN: usize = 2 * 1024 * 1024;
+        const FEED_BYTES: usize = 64 * 1024;
+
+        let chunk_data = vec![b'L'; DATA_LEN];
+        let (ctx, chunk_sig, terminal_sig) = signed_chunk_fixture(&chunk_data);
+        let mut dec = IncrementalChunkedDecoder::new_with_expected_len(
+            Some(ctx),
+            false,
+            Some(DATA_LEN as u64),
+        );
+
+        let header = format!("{DATA_LEN:x};chunk-signature={chunk_sig}\r\n");
+        assert!(dec.feed(header.as_bytes()).unwrap().is_empty());
+        assert!(dec.buf.is_empty());
+
+        let mut emitted = 0;
+        for piece in chunk_data.chunks(FEED_BYTES) {
+            let payload = dec.feed(piece).unwrap();
+            assert_eq!(payload, piece);
+            assert!(payload.len() <= FEED_BYTES);
+            assert!(
+                dec.buf.is_empty(),
+                "payload bytes must not accumulate in decoder parser storage"
+            );
+            emitted += payload.len();
+        }
+        assert_eq!(emitted, DATA_LEN);
+
+        let terminal = format!("\r\n0;chunk-signature={terminal_sig}\r\n\r\n");
+        assert!(dec.feed(terminal.as_bytes()).unwrap().is_empty());
         assert!(dec.is_done());
     }
 }

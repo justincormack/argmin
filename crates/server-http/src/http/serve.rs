@@ -6379,6 +6379,30 @@ Connection: close\r\n\r\n",
         );
     }
 
+    fn assert_signed_list_parts_empty(addr: &str, bucket: &str, key: &str, upload_id: &str) {
+        let uri = format!("/{bucket}/{key}?uploadId={upload_id}");
+        let signed = sign_headers("GET", &uri, addr, &[], &[]);
+        let request = format!(
+            "GET {uri} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Connection: close\r\n\r\n",
+            signed.authorization, signed.amz_date, signed.amz_content_sha256
+        );
+        let response = send_raw_http_request(addr, &request, &[]);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "expected ListParts success, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            !response.contains("<Part>"),
+            "aborted streaming UploadPart left a visible part: {response}"
+        );
+    }
+
     fn sign_post_policy_fields(
         bucket: &str,
         key: &str,
@@ -7449,6 +7473,52 @@ Connection: close\r\n\r\n",
             0,
             "streaming session leaked after UploadPart bad checksum"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_upload_part_bad_terminal_signature_aborts_promoted_session() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let upload_id = create_test_bucket_and_upload(&frontend, "mybucket", "mykey");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let body = vec![b'p'; crate::coordinator::INTERNAL_SEGMENT_SIZE + 1];
+        let uri = format!("/mybucket/mykey?partNumber=1&uploadId={upload_id}");
+        let signed = sign_streaming_headers("PUT", &uri, &addr, body.len(), &[]);
+        let wire = build_signed_chunked_body_with_bad_terminal_signature(&signed, &body);
+        let request = format!(
+            "PUT {uri} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+content-encoding: aws-chunked\r\n\
+x-amz-decoded-content-length: {}\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n",
+            signed.authorization,
+            signed.amz_date,
+            signed.amz_content_sha256,
+            body.len(),
+            wire.len()
+        );
+        let response = send_raw_http_request(&addr, &request, &wire);
+
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "expected 403 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains("<Code>SignatureDoesNotMatch</Code>"),
+            "expected SignatureDoesNotMatch body, got: {response}"
+        );
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming session leaked after UploadPart bad terminal signature"
+        );
+        assert_signed_list_parts_empty(&addr, "mybucket", "mykey", &upload_id);
     }
 
     #[tokio::test(flavor = "multi_thread")]

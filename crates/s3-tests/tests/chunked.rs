@@ -1,7 +1,11 @@
 /// Integration tests for aws-chunked transfer encoding.
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::{primitives::ByteStream, Client};
+use aws_sdk_s3::{
+    primitives::ByteStream,
+    types::{CompletedMultipartUpload, CompletedPart},
+    Client,
+};
 use ring::{digest, hmac};
 use s3_tests::{
     assert_s3_err_code, build_client_with_ca, build_test_agent,
@@ -35,6 +39,10 @@ const STREAMING_TOKEN_MESSAGE: &str = "x-amz-content-sha256 must be UNSIGNED-PAY
      STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, \
      STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD, \
      STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER or a valid sha256 value.";
+
+/// Large enough to cross the production decoder's bounded 64 KiB feed size,
+/// without making routine AWS oracle runs unnecessarily expensive.
+const LARGE_SIGNED_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Assert the full error body template; callers assert the status.
 fn assert_error_body(body: &str, expected_template: String) {
@@ -632,6 +640,84 @@ fn build_signed_chunked_body_with_bad_terminal_signature(
     wire
 }
 
+fn build_signed_chunked_body_with_bad_data_signature(data: &[u8]) -> Vec<u8> {
+    let bad_sig = "0".repeat(64);
+    let mut wire = Vec::new();
+    wire.extend_from_slice(format!("{:x};chunk-signature={bad_sig}\r\n", data.len()).as_bytes());
+    wire.extend_from_slice(data);
+    wire.extend_from_slice(b"\r\n");
+    wire.extend_from_slice(format!("0;chunk-signature={bad_sig}\r\n\r\n").as_bytes());
+    wire
+}
+
+#[derive(Clone, Copy)]
+struct UploadPartTarget<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    upload_id: &'a str,
+    part_number: i32,
+}
+
+fn send_chunked_upload_part(
+    target: UploadPartTarget<'_>,
+    content_sha256: &str,
+    decoded_content_length: usize,
+    extra_signed_headers: &[(&str, &str)],
+    build_wire: impl FnOnce(&SignResult) -> Vec<u8>,
+) -> s3_tests::Response {
+    let path = format!("/{}/{}", target.bucket, target.key);
+    let encoded_upload_id: String =
+        url::form_urlencoded::byte_serialize(target.upload_id.as_bytes()).collect();
+    let query = format!(
+        "partNumber={}&uploadId={encoded_upload_id}",
+        target.part_number
+    );
+    let request_uri = format!("{path}?{query}");
+    let sign = sign_streaming_request_custom_with_query(
+        "PUT",
+        &request_uri,
+        content_sha256,
+        decoded_content_length,
+        extra_signed_headers,
+        false,
+        false,
+    );
+    let wire = build_wire(&sign);
+
+    let url = format!("{}{}?{}", CTX.endpoint(), path, query);
+    let mut request = agent()
+        .put(&url)
+        .header("Authorization", &sign.authorization)
+        .header("x-amz-date", &sign.amz_date)
+        .header("x-amz-content-sha256", content_sha256)
+        .header("content-encoding", "aws-chunked")
+        .header(
+            "x-amz-decoded-content-length",
+            decoded_content_length.to_string(),
+        )
+        .header("content-length", wire.len().to_string());
+    for (name, value) in extra_signed_headers {
+        request = request.header(*name, *value);
+    }
+    request.send(&wire).expect("transport error")
+}
+
+async fn assert_upload_has_no_parts(bucket: &str, key: &str, upload_id: &str, context: &str) {
+    let listed = CTX
+        .client()
+        .list_parts()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("{context}: ListParts failed: {error:?}"));
+    assert!(
+        listed.parts().is_empty(),
+        "{context}: decoder failure must not stage an upload part"
+    );
+}
+
 /// Compute a chunk signature.
 fn chunk_signature(
     signing_key: &[u8],
@@ -952,6 +1038,35 @@ fn test_signed_chunked_put() {
         assert_eq!(head.content_encoding(), None);
 
         cleanup(&bucket, &["signed-chunked"]).await;
+    });
+}
+
+#[test]
+fn test_large_single_signed_chunked_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "large-single-signed-chunk";
+        let data = vec![b'L'; LARGE_SIGNED_CHUNK_BYTES];
+
+        let (status, body) = send_signed_chunked_put_with_headers(&bucket, key, &data, &[]);
+        assert_eq!(status, 200, "large signed chunk PUT failed: {body}");
+
+        let stored = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(stored.as_ref(), data.as_slice());
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
@@ -3184,6 +3299,184 @@ fn test_streaming_upload_part_with_inline_checksum() {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_number(), Some(1));
         assert_eq!(parts[0].checksum_crc32(), Some(expected_crc.as_str()));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_large_single_signed_chunked_upload_part_completes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "large-single-signed-chunk-part";
+        let data = vec![b'P'; LARGE_SIGNED_CHUNK_BYTES];
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let response = send_chunked_upload_part(
+            UploadPartTarget {
+                bucket: &bucket,
+                key,
+                upload_id: &upload_id,
+                part_number: 1,
+            },
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            data.len(),
+            &[],
+            |sign| build_signed_chunked_body(sign, &data),
+        );
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "large signed chunk UploadPart failed: {:?}",
+            response.body_read_error()
+        );
+        let etag = response
+            .headers()
+            .get("etag")
+            .expect("UploadPart response missing ETag")
+            .to_str()
+            .expect("UploadPart ETag is not valid ASCII")
+            .to_string();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let stored = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(stored.as_ref(), data.as_slice());
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_chunked_upload_part_decoder_failures_do_not_stage_parts() {
+    s3_tests::run(async {
+        use base64::Engine;
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "streaming-upload-part-decoder-failures";
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let bad_signature_data = vec![b'B'; LARGE_SIGNED_CHUNK_BYTES];
+        let mut response = send_chunked_upload_part(
+            UploadPartTarget {
+                bucket: &bucket,
+                key,
+                upload_id: &upload_id,
+                part_number: 1,
+            },
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            bad_signature_data.len(),
+            &[],
+            |_| build_signed_chunked_body_with_bad_data_signature(&bad_signature_data),
+        );
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 403, "bad data signature returned {status}: {body}");
+        assert_signature_mismatch_body(&body);
+        assert_upload_has_no_parts(&bucket, key, &upload_id, "bad data signature").await;
+
+        let mismatch_data = vec![b'M'; LARGE_SIGNED_CHUNK_BYTES];
+        let claimed_length = mismatch_data.len() + 100;
+        let crc = checksum::crc32::checksum(&mismatch_data);
+        let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+        let trailer = format!("x-amz-checksum-crc32:{crc_b64}");
+        let mut response = send_chunked_upload_part(
+            UploadPartTarget {
+                bucket: &bucket,
+                key,
+                upload_id: &upload_id,
+                part_number: 2,
+            },
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            claimed_length,
+            &[("x-amz-trailer", "x-amz-checksum-crc32")],
+            |_| build_unsigned_chunked_body_with_trailer(&mismatch_data, &trailer),
+        );
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(
+            status, 400,
+            "decoded length mismatch returned {status}: {body}"
+        );
+        assert_upload_has_no_parts(&bucket, key, &upload_id, "decoded length mismatch").await;
+
+        let first_chunk = vec![b'V'; LARGE_SIGNED_CHUNK_BYTES];
+        let small_chunk = b"small";
+        let final_chunk = b"another chunk";
+        let decoded_length = first_chunk.len() + small_chunk.len() + final_chunk.len();
+        let mut response = send_chunked_upload_part(
+            UploadPartTarget {
+                bucket: &bucket,
+                key,
+                upload_id: &upload_id,
+                part_number: 3,
+            },
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            decoded_length,
+            &[],
+            |sign| {
+                build_signed_chunked_body_multi(
+                    sign,
+                    &[first_chunk.as_slice(), small_chunk, final_chunk],
+                )
+            },
+        );
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(
+            status, 403,
+            "small non-final chunk returned {status}: {body}"
+        );
+        assert_error_body(&body, expected_error::invalid_chunk_size(3, 5));
+        assert_upload_has_no_parts(&bucket, key, &upload_id, "small non-final chunk").await;
 
         client
             .abort_multipart_upload()
