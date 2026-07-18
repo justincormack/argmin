@@ -247,12 +247,15 @@ For each matrix:
   object and leaves the upload and selected part intact. Object-version and
   generation reservation, direct PUT publication, object reads, reservation
   release, and stream-segment append likewise use elapsed-time contention
-  budgets rather than scheduling-sensitive attempt counts. A stream append
-  relinquishes eager payload-cleanup ownership before metadata-command
-  installation, because an idempotent reissue may publish the same logical
-  segment and shard keys even when its pending slot has already been cleared;
-  deterministic visible-pending and cleared-slot collision coverage proves
-  timeout after publication preserves both metadata and every shard. Multipart
+  budgets rather than scheduling-sensitive attempt counts. Once stream-append
+  metadata-command ownership becomes ambiguous, cleanup fences new command
+  installation and checks the whole acting set before deleting the staged
+  payload. This preserves shard keys published by an idempotent reissue even
+  when its pending slot has already been cleared, while still deleting
+  unreferenced shards after unrelated contention. Deterministic
+  visible-pending, cleared-slot collision, unrelated-pending duplicate, and
+  unrelated retry-exhaustion and failed LogConflict-drain coverage pins both
+  sides of that rule. Multipart
   management lookup drains a concurrent durable terminal command before
   classification, preserving AWS's idempotent abort result when completion
   wins the race. AWS can also return transient `OperationAborted` after its SDK

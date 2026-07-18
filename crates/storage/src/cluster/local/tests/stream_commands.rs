@@ -1,5 +1,6 @@
 use super::*;
 use crate::cluster::{segment_payload_placement_key, StreamAppendCommitRequest};
+use crate::metadata_command::ReleaseObjectGenerationCommand;
 
 #[test]
 fn stream_put_create_partial_apply_retry_reuses_existing_session() {
@@ -1297,6 +1298,536 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
         )
         .unwrap();
     assert_eq!(readback, payload);
+}
+
+#[test]
+fn stream_append_log_conflict_drain_failure_cleans_unreferenced_payload() {
+    let _apply_serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("3b".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"stream append failed log-conflict drain";
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
+                segment_okh: [104; 16],
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+
+    let collision_reservation_id = crate::SessionId::try_from("3c".repeat(16)).unwrap();
+    let pending_reservation_id = crate::SessionId::try_from("3d".repeat(16)).unwrap();
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_pending_reservation_id = pending_reservation_id.clone();
+    let hook_once = Arc::new(AtomicBool::new(true));
+    let hook_once_for_closure = Arc::clone(&hook_once);
+    let _command_guard = cluster.test_install_after_stream_append_command_id_allocated_hook(
+        Arc::new(move |command_id| {
+            assert!(
+                hook_once_for_closure.swap(false, Ordering::SeqCst),
+                "selected command-ID collision hook must run exactly once"
+            );
+            let pg_id = command_id.pg_id();
+            let collision = MetadataCommandEnvelope::new(
+                command_id,
+                MetadataCommandPayload::ReleaseObjectGeneration(
+                    ReleaseObjectGenerationCommand::new(
+                        hook_bucket.clone(),
+                        hook_key.clone(),
+                        collision_reservation_id.clone(),
+                    ),
+                ),
+            );
+            let mut nodes = hook_map
+                .metadata_pg_acting_nodes(command_id.cluster_epoch(), pg_id)
+                .unwrap();
+            let primary_node_id = hook_map
+                .metadata_pg_primary_node(command_id.cluster_epoch(), pg_id)
+                .unwrap()
+                .node_id();
+            nodes.sort_by_key(|node| node.node_id() != primary_node_id);
+            for node in nodes {
+                node.metadata_command_client()
+                    .apply_metadata_command_and_record(pg_id, &collision)
+                    .unwrap();
+            }
+
+            let pending = MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    command_id.cluster_epoch(),
+                    pg_id,
+                    hook_map.test_next_metadata_command_log_index(pg_id),
+                ),
+                MetadataCommandPayload::ReleaseObjectGeneration(
+                    ReleaseObjectGenerationCommand::new(
+                        hook_bucket.clone(),
+                        hook_key.clone(),
+                        hook_pending_reservation_id.clone(),
+                    ),
+                ),
+            );
+            insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &pending);
+        }),
+    );
+
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = Arc::clone(&fail_once);
+    let failure_bucket = bucket.clone();
+    let failure_key = key.clone();
+    let failure_reservation_id = pending_reservation_id.clone();
+    let _apply_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::ReleaseObjectGeneration(release)
+                    if release.matches_request(
+                        &failure_bucket,
+                        &failure_key,
+                        &failure_reservation_id,
+                    )
+            ) && node_id == NodeId::new(2)
+                && fail_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                return Err(StoreError::Io {
+                    context: "injected stream append log-conflict drain failure",
+                    source: std::io::Error::other(
+                        "injected stream append log-conflict drain failure",
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let error = cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::ObjectPgActionError::Store(StoreError::Io {
+                context: "injected stream append log-conflict drain failure",
+                ..
+            })
+        ),
+        "expected injected LogConflict drain failure, got {error:?}"
+    );
+    assert!(!hook_once.load(Ordering::SeqCst));
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+        "failed unrelated drain must retain its pending command for recovery"
+    );
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        assert!(
+            crate::PgMetadataStore::list_stream_segments(&*pg, &session_id)
+                .unwrap()
+                .is_empty(),
+            "failed unrelated drain must not publish the staged stream segment"
+        );
+    }
+
+    let placement_key = segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
+    let locations = cluster
+        .place_payload_shards(
+            DataPgId::new(PgId::new(segment.data_pg_id)),
+            ec_shape,
+            &placement_key,
+        )
+        .unwrap();
+    for (location, written) in locations.iter().zip(&written_shards) {
+        assert!(
+            cluster
+                .read_payload_shard(*location, &written.key, written.ack)
+                .is_err(),
+            "failed unrelated LogConflict drain must delete staged shard {}",
+            written.key
+        );
+    }
+}
+
+#[test]
+fn stream_append_unrelated_pending_duplicate_cleans_staged_payload() {
+    let _cleanup_serial = lock_payload_cleanup_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("37".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+
+    let published_payload = b"published stream segment";
+    let (_target, published_segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: published_payload.len() as u64,
+                segment_crc64: checksum::crc64::checksum(published_payload),
+                payload_crc64: checksum::crc64::checksum(published_payload),
+                segment_okh: [101; 16],
+            },
+        )
+        .unwrap();
+    let conflicting_payload = b"unreferenced conflicting stream segment";
+    let (_target, conflicting_segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: conflicting_payload.len() as u64,
+                segment_crc64: checksum::crc64::checksum(conflicting_payload),
+                payload_crc64: checksum::crc64::checksum(conflicting_payload),
+                segment_okh: [102; 16],
+            },
+        )
+        .unwrap();
+    assert_ne!(
+        published_segment.segment_vid,
+        conflicting_segment.segment_vid
+    );
+
+    let published_shards = cluster
+        .write_stream_segment_payload_shards(&published_segment, published_payload)
+        .unwrap();
+    let published_shard_batch = published_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            published_segment.segment_index,
+            &published_segment,
+            &published_shard_batch,
+        )
+        .unwrap();
+
+    let conflicting_shards = cluster
+        .write_stream_segment_payload_shards(&conflicting_segment, conflicting_payload)
+        .unwrap();
+    let conflicting_shard_batch = conflicting_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+
+    let pg_id = PgId::new(object_pg);
+    let unrelated = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReleaseObjectGeneration(ReleaseObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::SessionId::try_from("38".repeat(16)).unwrap(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &unrelated);
+
+    let cleanup_attempts = Arc::new(AtomicUsize::new(0));
+    let cleanup_attempts_hook = Arc::clone(&cleanup_attempts);
+    let _cleanup_guard =
+        cluster.test_install_before_placed_payload_shard_delete_hook(Arc::new(move |_| {
+            cleanup_attempts_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+
+    let error = cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            conflicting_segment.segment_index,
+            &conflicting_segment,
+            &conflicting_shard_batch,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::ObjectPgActionError::InvalidRequest { ref reason }
+                if reason == "duplicate segment_index 0"
+        ),
+        "expected conflicting segment rejection, got {error:?}"
+    );
+    assert!(
+        cleanup_attempts.load(Ordering::SeqCst) >= conflicting_shards.len(),
+        "unrelated pending-command drainage must not suppress staged payload cleanup"
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::list_stream_segments(&*pg, &session_id).unwrap(),
+            vec![published_segment.clone()]
+        );
+    }
+
+    let placement_key = segment_payload_placement_key(
+        &conflicting_segment.segment_okh,
+        conflicting_segment.segment_vid,
+    );
+    let locations = cluster
+        .place_payload_shards(
+            DataPgId::new(PgId::new(conflicting_segment.data_pg_id)),
+            ec_shape,
+            &placement_key,
+        )
+        .unwrap();
+    for (location, written) in locations.iter().zip(&conflicting_shards) {
+        assert!(
+            cluster
+                .read_payload_shard(*location, &written.key, written.ack)
+                .is_err(),
+            "unreferenced conflicting shard {} must be deleted",
+            written.key
+        );
+    }
+
+    let mut readback = Vec::new();
+    cluster
+        .read_segment_payload_stored_bytes_into(
+            crate::SegmentStoredBytesRequest {
+                data_pg_id: published_segment.data_pg_id,
+                segment_okh: published_segment.segment_okh,
+                segment_vid: published_segment.segment_vid,
+                stored_size: published_payload.len(),
+                segment_crc64: checksum::crc64::checksum(published_payload),
+                ec: ec_shape,
+            },
+            &mut readback,
+        )
+        .unwrap();
+    assert_eq!(readback, published_payload);
+}
+
+#[test]
+fn stream_append_unrelated_install_contention_cleans_staged_payload() {
+    let _cleanup_serial = lock_payload_cleanup_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("39".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"stream append unrelated install contention";
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
+                segment_okh: [103; 16],
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_once = Arc::new(AtomicBool::new(true));
+    let hook_once_for_closure = Arc::clone(&hook_once);
+    let _command_guard =
+        cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
+            if !hook_once_for_closure.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let pg_id = PgId::new(object_pg);
+            let command = MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    ClusterEpoch::INITIAL,
+                    pg_id,
+                    hook_map.test_next_metadata_command_log_index(pg_id),
+                ),
+                MetadataCommandPayload::ReleaseObjectGeneration(
+                    ReleaseObjectGenerationCommand::new(
+                        hook_bucket.clone(),
+                        hook_key.clone(),
+                        crate::SessionId::try_from("3a".repeat(16)).unwrap(),
+                    ),
+                ),
+            );
+            insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
+        }));
+
+    let cleanup_attempts = Arc::new(AtomicUsize::new(0));
+    let cleanup_attempts_hook = Arc::clone(&cleanup_attempts);
+    let _cleanup_guard =
+        cluster.test_install_before_placed_payload_shard_delete_hook(Arc::new(move |_| {
+            cleanup_attempts_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+
+    let error = cluster
+        .test_commit_stream_segment_append_with_max_attempts(
+            StreamAppendCommitRequest {
+                bucket: &bucket,
+                key: &key,
+                session_id: &session_id,
+                segment_index: segment.segment_index,
+                segment_record: &segment,
+                shard_batch: &shard_batch,
+            },
+            1,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                context: "stream append pending retry budget exhausted"
+            })
+        ),
+        "expected deterministic unrelated contention exhaustion, got {error:?}"
+    );
+    assert!(!hook_once.load(Ordering::SeqCst));
+    assert!(
+        cleanup_attempts.load(Ordering::SeqCst) >= written_shards.len(),
+        "unrelated install contention must clean staged payload"
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        assert!(
+            crate::PgMetadataStore::list_stream_segments(&*pg, &session_id)
+                .unwrap()
+                .is_empty(),
+            "unrelated contention must not publish the staged segment"
+        );
+    }
+
+    let placement_key = segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
+    let locations = cluster
+        .place_payload_shards(
+            DataPgId::new(PgId::new(segment.data_pg_id)),
+            ec_shape,
+            &placement_key,
+        )
+        .unwrap();
+    for (location, written) in locations.iter().zip(&written_shards) {
+        assert!(
+            cluster
+                .read_payload_shard(*location, &written.key, written.ack)
+                .is_err(),
+            "unreferenced staged shard {} must be deleted",
+            written.key
+        );
+    }
 }
 
 #[test]

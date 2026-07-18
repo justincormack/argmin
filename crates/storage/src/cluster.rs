@@ -2115,7 +2115,7 @@ enum StreamAppendCommandApplyOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamAppendPayloadCleanup {
     EagerAllowed,
-    DeferredToSessionRecovery,
+    ReferenceCheckRequired,
 }
 
 struct StreamAppendCommitRequest<'a> {
@@ -8980,11 +8980,18 @@ impl StorageCluster {
         let mut payload_cleanup = StreamAppendPayloadCleanup::EagerAllowed;
         macro_rules! cleanup_stream_append_payload {
             () => {
-                if payload_cleanup == StreamAppendPayloadCleanup::EagerAllowed {
-                    self.delete_stream_segment_payload_shard_keys_best_effort(
-                        segment_record,
-                        shard_batch.iter().map(|(key, _)| (*key).clone()),
-                    )
+                match payload_cleanup {
+                    StreamAppendPayloadCleanup::EagerAllowed => self
+                        .delete_stream_segment_payload_shard_keys_best_effort(
+                            segment_record,
+                            shard_batch.iter().map(|(key, _)| (*key).clone()),
+                        ),
+                    StreamAppendPayloadCleanup::ReferenceCheckRequired => self
+                        .delete_stream_append_payload_if_unreferenced_best_effort(
+                            pg_id,
+                            segment_record,
+                            shard_batch.iter().map(|(key, _)| (*key).clone()),
+                        ),
                 }
             };
         }
@@ -9016,14 +9023,22 @@ impl StorageCluster {
                 }
                 // Once another command is visible, it may be an idempotent
                 // reissue of this logical segment and may publish these exact
-                // shard keys. Session recovery must own any later cleanup.
-                payload_cleanup = StreamAppendPayloadCleanup::DeferredToSessionRecovery;
+                // shard keys. Any later cleanup must first resolve whether the
+                // payload is now referenced.
+                payload_cleanup = StreamAppendPayloadCleanup::ReferenceCheckRequired;
                 let outcome =
-                    self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
+                    match self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            cleanup_stream_append_payload!();
+                            return Err(error);
+                        }
+                    };
                 if matches!(
                     outcome,
                     PendingMetadataCommandOutcome::RetryPartialExactConflict
                 ) {
+                    cleanup_stream_append_payload!();
                     return Err(conflicting_pending_object_metadata_command(
                         "retryable partial pending stream append drain",
                     ));
@@ -9072,7 +9087,7 @@ impl StorageCluster {
             // index, publish this exact logical segment, and clear its pending
             // slot before our install result is visible. No install outcome
             // can prove that these shard keys remain exclusively ours.
-            payload_cleanup = StreamAppendPayloadCleanup::DeferredToSessionRecovery;
+            payload_cleanup = StreamAppendPayloadCleanup::ReferenceCheckRequired;
             self.maybe_run_before_metadata_command_pending_install_hook();
             let command = match self.try_install_object_pg_pending_command_with_fresh_id(
                 pg_id,
@@ -9094,16 +9109,26 @@ impl StorageCluster {
             ) {
                 Ok(ObjectPgPendingCommandInstall::Installed(command)) => command,
                 Ok(ObjectPgPendingCommandInstall::Pending(command)) => {
-                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command)
+                    {
+                        cleanup_stream_append_payload!();
+                        return Err(error);
+                    }
                     if let Err(error) = work_budget
                         .sleep_after_contention("stream append pending retry budget exhausted")
                     {
+                        cleanup_stream_append_payload!();
                         return Err(ObjectPgActionError::Store(error));
                     }
                     continue;
                 }
                 Ok(ObjectPgPendingCommandInstall::LogConflict { pending_visible }) => {
-                    self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
+                    if let Err(error) =
+                        self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)
+                    {
+                        cleanup_stream_append_payload!();
+                        return Err(error);
+                    }
                     if let Err(error) = work_budget
                         .sleep_after_contention("stream append log conflict retry budget exhausted")
                     {
@@ -9117,19 +9142,27 @@ impl StorageCluster {
                     return Err(error);
                 }
             };
-            match self.apply_new_stream_append_command(
+            let apply_outcome = match self.apply_new_stream_append_command(
                 pg_id,
                 bucket,
                 &command,
                 segment_record,
                 shard_batch,
-            )? {
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    cleanup_stream_append_payload!();
+                    return Err(error);
+                }
+            };
+            match apply_outcome {
                 StreamAppendCommandApplyOutcome::Applied => return Ok(()),
                 StreamAppendCommandApplyOutcome::RetryFromFreshSnapshot => {
-                    payload_cleanup = StreamAppendPayloadCleanup::DeferredToSessionRecovery;
+                    payload_cleanup = StreamAppendPayloadCleanup::ReferenceCheckRequired;
                     if let Err(error) = work_budget.sleep_after_contention(
                         "stream append fresh snapshot retry budget exhausted",
                     ) {
+                        cleanup_stream_append_payload!();
                         return Err(ObjectPgActionError::Store(error));
                     }
                     continue;
@@ -11846,6 +11879,92 @@ impl StorageCluster {
             segment.segment_vid,
             shard_keys,
         );
+    }
+
+    fn delete_stream_append_payload_if_unreferenced_best_effort(
+        &self,
+        object_pg_id: PgId,
+        segment: &StreamUploadSegmentRecord,
+        shard_keys: impl IntoIterator<Item = ShardKey>,
+    ) {
+        let shard_keys = shard_keys.into_iter().collect::<Vec<_>>();
+        let cleanup = (|| -> Result<(), StoreError> {
+            // The process-local lock serializes embedded clients. The storage
+            // node critical section extends that fence across Unix clients so
+            // no new metadata command can publish this payload between the
+            // reference scan and deletion.
+            let pg_lock = self
+                .local_map
+                .runtime_state()
+                .metadata_command_pg_lock(object_pg_id);
+            let _pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+            let primary = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), object_pg_id)?;
+            let primary_metadata_client = primary.metadata_command_client();
+            let _critical_section = primary_metadata_client
+                .open_metadata_command_critical_section(object_pg_id, self.operation_epoch())?;
+
+            for node in self
+                .local_map
+                .metadata_pg_acting_nodes(self.operation_epoch(), object_pg_id)?
+            {
+                let references = node
+                    .shard_scavenger_client()
+                    .list_shard_scavenger_payload_references(object_pg_id)?;
+                if references.iter().any(|reference| {
+                    self.shard_scavenger_reference_matches_stream_segment(reference, segment)
+                }) {
+                    return Ok(());
+                }
+            }
+
+            self.delete_stream_segment_payload_shard_keys_best_effort(segment, shard_keys);
+            Ok(())
+        })();
+        if let Err(error) = cleanup {
+            // A failed ownership check must fail closed: retaining an
+            // unclassified payload is safer than deleting data that another
+            // command may already have published.
+            self.emit_best_effort_payload_cleanup_error(
+                "resolve staged stream append payload ownership",
+                &error,
+            );
+        }
+    }
+
+    fn shard_scavenger_reference_matches_stream_segment(
+        &self,
+        reference: &ShardScavengerPayloadReference,
+        segment: &StreamUploadSegmentRecord,
+    ) -> bool {
+        match reference {
+            ShardScavengerPayloadReference::Placed(reference) => {
+                reference.data_pg_id == segment.data_pg_id
+                    && reference.okh == segment.segment_okh
+                    && reference.generation_id == segment.segment_vid
+                    && reference.placement_cluster_epoch == segment.placement_cluster_epoch
+            }
+            ShardScavengerPayloadReference::ReclaimOnly(reference) => {
+                reference.data_pg_id == segment.data_pg_id
+                    && reference.okh == segment.segment_okh
+                    && reference.generation_id == segment.segment_vid
+            }
+            ShardScavengerPayloadReference::RoutedMultipartPart(reference) => {
+                self.local_map
+                    .object_generation_multipart_part_data_pg(
+                        &reference.bucket,
+                        &reference.key,
+                        reference.object_generation_id,
+                        reference.part_number,
+                    )
+                    .get()
+                    == segment.data_pg_id
+                    && reference.part_okh == segment.segment_okh
+                    && reference.part_vid == segment.segment_vid
+                    && reference.placement_cluster_epoch == segment.placement_cluster_epoch
+            }
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
