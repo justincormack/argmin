@@ -1,0 +1,203 @@
+Stream append contention can leak staged shard payloads
+Link: https://chatgpt.com/codex/cloud/security/findings/1daf62da76648191ad7bece9ae323a2f?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 96e713b
+Author: justin@specialbusservice.com
+Created: 17/07/2026, 13:04:11
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit `1e8fde2d` (`Safely clean up conflicted stream appends`).
+
+The fix replaces the unsafe `DeferredToSessionRecovery` no-op state with
+reference-checked cleanup once command ownership becomes ambiguous. Before
+deleting staged stream-append shards, cleanup now fences metadata-command
+installation and scans the complete acting set for both durable segment
+metadata and pending metadata commands that reference the exact shard keys.
+Referenced payload is preserved, including when an idempotent competing append
+has already published it or still owns it through a pending command. Payload
+that has no exact reference is deleted. If the ownership scan cannot complete,
+cleanup fails closed and retains the shards rather than risking deletion of
+published data.
+
+All ambiguous contention exits now invoke this reference-checked cleanup,
+including unrelated pending-command failures, retry-budget exhaustion,
+cleared-slot log collisions, and errors returned while draining a
+`LogConflict`. The last case closes the remaining path where
+`drain_after_object_pg_log_conflict` previously returned through `?` without
+attempting cleanup.
+
+Deterministic storage regressions cover both sides of the ownership decision:
+
+- exact visible-pending and already-published competing appends retain their
+  referenced payload and remain reconstructable;
+- unrelated pending commands, unrelated install contention, duplicate
+  segments, and a failed `LogConflict` drain remove unreferenced staged shards
+  without publishing segment metadata.
+
+Validation for the resolved implementation passed strict Clippy, focused
+contention regressions, and the full repository suite: 7,037 tests passed.
+
+# Summary
+Introduced: the new deferred cleanup state suppresses deletion too early and too broadly. The previous implementation deleted the staged stream segment payload on errors before command ownership was established. The new implementation can skip cleanup even when no command owns the staged shard keys.
+In commit 96e713b, stream append cleanup was changed from unconditional best-effort deletion on pre-commit errors to a state machine that skips cleanup once `payload_cleanup` is set to `DeferredToSessionRecovery`. The code sets this deferred state whenever any same-bucket pending metadata command is observed, and again before attempting to install the append command, without proving that the competing command is an idempotent append for the same session/segment or that it has adopted the same shard keys. After that point, several error paths either use `?` or invoke `cleanup_stream_append_payload!()`, but the macro becomes a no-op. If the pending command is unrelated, or if contention causes retry-budget exhaustion before this append is published, the payload shards written earlier are neither referenced by stream metadata nor deleted. A writer who can create same-bucket metadata contention can repeatedly upload large streaming segments and force append failures, leaving API-invisible shard files that can consume disk space.
+
+# Validation
+## Rubric
+- [x] Confirm staged stream payload cleanup is gated by `StreamAppendPayloadCleanup::EagerAllowed` and becomes a no-op after deferral.
+- [x] Confirm the code enters `DeferredToSessionRecovery` on any visible same-bucket pending command without checking that it owns or can publish the same shard keys.
+- [x] Reproduce an error path after such unrelated pending-command drain, before the attempted staged payload is published to stream metadata.
+- [x] Verify the error path returns without invoking shard deletion and without referencing the staged payload from stream metadata.
+- [x] Verify the unreferenced staged shard files remain on disk/readable, demonstrating API-invisible storage consumption.
+## Report
+Validated the finding with a targeted Rust unit-test PoC and an LLDB trace. Code review confirmed the cleanup guard: `crates/storage/src/cluster.rs:8980-8988` only deletes staged stream payload shards while `payload_cleanup == EagerAllowed`. The state is set to `DeferredToSessionRecovery` for any same-bucket pending command before proving relation to the current append at `cluster.rs:9017-9022`. Later, the duplicate segment error path calls `cleanup_stream_append_payload!()` at `cluster.rs:9044-9046`, but the macro is a no-op once deferred.
+
+I added `validation_unrelated_pending_duplicate_segment_leaks_staged_payload` in `crates/storage/src/cluster/local/tests/stream_commands.rs:4937-5124`. The test commits a legitimate stream segment, writes a second conflicting staged payload for the same segment index, injects an unrelated same-bucket pending `CreateStreamUpload` command (`stream_commands.rs:5034-5064`), then calls the real `commit_stream_segment_append` path (`stream_commands.rs:5075-5084`). The command fails with `InvalidRequest { reason: "duplicate segment_index 0" }`, but the cleanup hook count remains zero and all staged shard files remain on disk (`stream_commands.rs:5085-5106`). Metadata still lists only the original committed segment, while direct shard reads using the leaked shard keys/acks succeed (`stream_commands.rs:5112-5123`).
+
+Reproduction command output: `cargo test -p storage validation_unrelated_pending_duplicate_segment_leaks_staged_payload -- --nocapture` produced: `validation_error=InvalidRequest { reason: "duplicate segment_index 0" }`, `cleanup_attempts=0`, and three `leaked_shard_exists=true` shard paths, then the test passed. A normal crash attempt was not applicable because this is a logical cleanup/leak bug, not memory corruption. Valgrind was not available in the container. GDB was not installed, but LLDB was available. LLDB breakpoint at `cluster.rs:9046` showed execution on the duplicate error path immediately after the cleanup macro call, with `frame variable payload_cleanup` reporting `DeferredToSessionRecovery`, proving the deletion call was suppressed.
+
+# Evidence
+crates/storage/src/cluster.rs (L8980 to 8988)
+  Note: The cleanup macro now deletes staged stream payload shards only while the state is EagerAllowed; once the new deferred state is set, later cleanup calls become no-ops.
+```
+        let mut payload_cleanup = StreamAppendPayloadCleanup::EagerAllowed;
+        macro_rules! cleanup_stream_append_payload {
+            () => {
+                if payload_cleanup == StreamAppendPayloadCleanup::EagerAllowed {
+                    self.delete_stream_segment_payload_shard_keys_best_effort(
+                        segment_record,
+                        shard_batch.iter().map(|(key, _)| (*key).clone()),
+                    )
+                }
+```
+
+crates/storage/src/cluster.rs (L9017 to 9022)
+  Note: The code switches to DeferredToSessionRecovery for any same-bucket pending command before verifying that the command is an idempotent append for the same session/segment. The following drain call can also return via `?` with cleanup suppressed.
+```
+                // Once another command is visible, it may be an idempotent
+                // reissue of this logical segment and may publish these exact
+                // shard keys. Session recovery must own any later cleanup.
+                payload_cleanup = StreamAppendPayloadCleanup::DeferredToSessionRecovery;
+                let outcome =
+                    self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
+```
+
+crates/storage/src/cluster.rs (L9032 to 9048)
+  Note: After cleanup has been deferred, later load errors or duplicate-segment errors call the cleanup macro, but the macro no longer deletes the staged payload.
+```
+            let existing_stream_segment =
+                match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
+                    Ok(segments) => segments
+                        .into_iter()
+                        .find(|segment| segment.segment_index == segment_index),
+                    Err(error) => {
+                        cleanup_stream_append_payload!();
+                        return Err(error);
+                    }
+                };
+            match existing_stream_segment {
+                Some(existing) if existing == *segment_record => return Ok(()),
+                Some(_) => {
+                    cleanup_stream_append_payload!();
+                    return Err(ObjectPgActionError::InvalidRequest {
+                        reason: format!("duplicate segment_index {segment_index}"),
+                    });
+```
+
+crates/storage/src/cluster.rs (L9071 to 9111)
+  Note: Cleanup is also deferred before pending-command installation. If installation loses to an unrelated pending command or the retry budget is exhausted, the error path returns without deleting the staged shard files.
+```
+            // From this point another caller can consume the selected log
+            // index, publish this exact logical segment, and clear its pending
+            // slot before our install result is visible. No install outcome
+            // can prove that these shard keys remain exclusively ours.
+            payload_cleanup = StreamAppendPayloadCleanup::DeferredToSessionRecovery;
+            self.maybe_run_before_metadata_command_pending_install_hook();
+            let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+                pg_id,
+                bucket,
+                false,
+                |command_id| {
+                    self.maybe_run_after_stream_append_command_id_allocated_hook(command_id);
+                    MetadataCommandEnvelope::new(
+                        command_id,
+                        MetadataCommandPayload::AppendStreamSegment(Box::new(
+                            AppendStreamSegmentCommand {
+                                bucket: bucket.clone(),
+                                key: key.clone(),
+                                segment: segment_record.clone(),
+                            },
+                        )),
+                    )
+                },
+            ) {
+                Ok(ObjectPgPendingCommandInstall::Installed(command)) => command,
+                Ok(ObjectPgPendingCommandInstall::Pending(command)) => {
+                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                    if let Err(error) = work_budget
+                        .sleep_after_contention("stream append pending retry budget exhausted")
+                    {
+                        return Err(ObjectPgActionError::Store(error));
+                    }
+                    continue;
+                }
+                Ok(ObjectPgPendingCommandInstall::LogConflict { pending_visible }) => {
+                    self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
+                    if let Err(error) = work_budget
+                        .sleep_after_contention("stream append log conflict retry budget exhausted")
+                    {
+                        cleanup_stream_append_payload!();
+                        return Err(ObjectPgActionError::Store(error));
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The finding is in-scope and real: production HTTP streaming PutObject reaches server-core and storage commit_stream_segment_append, and current code suppresses staged-shard cleanup too early. The security impact is availability via disk consumption by an authenticated/public-write writer. It should not be raised to high or critical because repository evidence shows normal authz gates remain in place, exploitation depends on contention/race conditions, and the demonstrated impact is orphaned attacker-supplied shard data rather than credential exposure, unauthorized object access, integrity compromise, or RCE.
+## Likelihood
+high - The vulnerable path is reachable through normal S3 PutObject streaming, but exploitation requires write permission or public-write configuration and carefully induced same-bucket metadata contention/retry exhaustion. That makes exploitation plausible but not trivial. | Remote network vector
+## Impact
+medium - The bug can leave unreferenced local shard files that are not visible through S3 metadata and are not deleted on the failing append path. Repeated exploitation can consume disk and cause service-wide availability loss. It does not provide auth bypass, code execution, or cross-user data disclosure.
+## Assumptions
+- No deployment manifests were present in the checkout, so public internet exposure is not proven from repository artifacts.
+- A realistic attacker for this path is an authenticated S3 writer, or an anonymous client only when the target bucket is intentionally public-write.
+- The attacker can issue concurrent same-bucket write/control operations to create metadata-command contention while sending streaming-sized object bodies.
+- argmin-s3 frontend reachable over its configured TCP listener
+- attacker has PutObject/write permission on a bucket or the bucket is public-write
+- request body large enough to use the streaming PutObject segment path
+- same-bucket metadata contention, retry-budget exhaustion, or a conflicting append state during stream segment commit
+## Path
+S3 writer -> HTTP/SigV4/authz -> streaming PutObject -> write shard payloads -> commit_stream_segment_append contention -> cleanup no-op -> orphaned shard files -> disk exhaustion
+## Path evidence
+- `crates/argmin-s3/Cargo.toml:2-8` - Defines the production argmin-s3 binary entrypoint.
+- `crates/argmin-s3/src/config.rs:329-335` - Documents required S3 credentials and default network listener 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:6277-6294` - Binds the configured TCP listener and starts HTTP or HTTPS serving.
+- `crates/server-http/src/http/mod.rs:4073-4075` - Streaming PutObject setup authenticates the request and enforces bucket region before accepting the write path.
+- `crates/server-http/src/http/mod.rs:4150-4165` - HTTP PutObject prepares an authorized write against the coordinator/storage node.
+- `crates/server-http/src/http/serve.rs:3701-3718` - Large request bodies are chunked into INTERNAL_SEGMENT_SIZE buffers and appended via the streaming path.
+- `crates/server-core/src/coordinator/streaming.rs:534-550` - The coordinator writes stream segment payload shards first, then calls commit_stream_segment_append with the shard keys/acks.
+- `crates/storage/src/cluster.rs:8978-8988` - The cleanup macro deletes staged stream payload shards only when payload_cleanup remains EagerAllowed.
+- `crates/storage/src/cluster.rs:9017-9022` - Any same-bucket pending command causes cleanup to be deferred before proving it owns the current staged shard keys.
+- `crates/storage/src/cluster.rs:9032-9048` - Duplicate segment and load-error paths call the cleanup macro after it may have been made a no-op.
+- `crates/storage/src/cluster.rs:9071-9117` - Cleanup is deferred before pending-command installation; pending/log-conflict retry-budget exhaustion and errors can return without deleting staged shard files.
+- `crates/storage/src/cluster.rs:11833-11847` - Shows the intended best-effort deletion primitive for staged stream segment shard keys.
+## Narrative
+This is a real runtime availability vulnerability. The argmin-s3 binary exposes an S3-compatible HTTP listener and routes authenticated PutObject requests into a streaming path for large bodies. That path writes stream segment payload shards before calling storage commit_stream_segment_append. In the vulnerable storage code, the cleanup macro deletes staged shards only while payload_cleanup is EagerAllowed, but the code changes the state to DeferredToSessionRecovery when it observes any same-bucket pending metadata command and again before pending-command installation. Later failure paths still call the cleanup macro or return via ?, but cleanup becomes a no-op. Prior validation demonstrated an executable Rust test where a conflicting staged payload failed with duplicate_segment, cleanup_attempts stayed 0, and leaked shard files remained readable by direct shard key. The impact is availability: repeated authorized/public-write streaming uploads under contention can leave API-invisible shard files and eventually exhaust local storage. It is not high/critical because exploitation requires write capability plus contention/race conditions and does not bypass auth, disclose private data, or execute code.
+## Controls
+- SigV4 authentication and presigned URL validation
+- Bucket ACL and bucket policy authorization for PutObject
+- Public access block controls can disable public ACLs/policies
+- Connection and in-flight request semaphores with idle/timeouts
+- Per-object size limit on streaming uploads
+- Process refuses to run as root
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+## Blindspots
+- No Kubernetes, Terraform, Docker, or other deployment manifests were found to prove whether the service is publicly exposed in a real environment.
+- Static review cannot measure how easy it is to win the contention window in production workloads.
+- The provided validation was an executable storage-layer unit test with injected contention rather than an end-to-end HTTP exploit.
+- Repository review did not fully evaluate whether any later background shard scavenger could eventually reclaim these exact orphaned files.
