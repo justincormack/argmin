@@ -243,6 +243,22 @@ impl OperationContentionRetryScope {
             }
         }
     }
+
+    fn includes_sdk_error<E: ProvideErrorMetadata>(
+        self,
+        error: &aws_sdk_s3::error::SdkError<E>,
+        retry_unmodeled_conflict: bool,
+    ) -> bool {
+        let code = s3_error_code(error);
+        self.includes(code)
+            || (retry_unmodeled_conflict
+                && code.is_none()
+                && error
+                    .raw_response()
+                    .map(|response| response.status().as_u16())
+                    == Some(409)
+                && self.includes(Some("OperationAborted")))
+    }
 }
 
 fn is_retryable_operation_contention<E: ProvideErrorMetadata>(
@@ -331,6 +347,8 @@ pub trait SendRetryingOperationAborted: Clone {
     type Output;
     type Error: ProvideErrorMetadata;
 
+    const RETRY_UNMODELED_CONFLICT: bool = false;
+
     fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error>;
 
     fn send_retrying_operation_aborted(
@@ -398,7 +416,9 @@ where
         }
 
         match builder.clone().send_once().await {
-            Err(err) if scope.includes(s3_error_code(&err)) => retry_error = Some(err),
+            Err(err) if scope.includes_sdk_error(&err, B::RETRY_UNMODELED_CONFLICT) => {
+                retry_error = Some(err);
+            }
             result => return result,
         }
     }
@@ -409,6 +429,21 @@ macro_rules! impl_send_retrying_operation_aborted {
         impl SendRetryingOperationAborted for $builder {
             type Output = $output;
             type Error = $error;
+
+            fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error> {
+                Box::pin(async move { self.send().await })
+            }
+        }
+    };
+}
+
+macro_rules! impl_send_retrying_head_operation_aborted {
+    ($builder:path, $output:path, $error:path) => {
+        impl SendRetryingOperationAborted for $builder {
+            type Output = $output;
+            type Error = $error;
+
+            const RETRY_UNMODELED_CONFLICT: bool = true;
 
             fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error> {
                 Box::pin(async move { self.send().await })
@@ -562,12 +597,12 @@ impl_send_retrying_operation_aborted!(
     aws_sdk_s3::operation::get_object_tagging::GetObjectTaggingOutput,
     aws_sdk_s3::operation::get_object_tagging::GetObjectTaggingError
 );
-impl_send_retrying_operation_aborted!(
+impl_send_retrying_head_operation_aborted!(
     aws_sdk_s3::operation::head_object::builders::HeadObjectFluentBuilder,
     aws_sdk_s3::operation::head_object::HeadObjectOutput,
     aws_sdk_s3::operation::head_object::HeadObjectError
 );
-impl_send_retrying_operation_aborted!(
+impl_send_retrying_head_operation_aborted!(
     aws_sdk_s3::operation::head_bucket::builders::HeadBucketFluentBuilder,
     aws_sdk_s3::operation::head_bucket::HeadBucketOutput,
     aws_sdk_s3::operation::head_bucket::HeadBucketError
@@ -2892,20 +2927,23 @@ mod tests {
     #[derive(Clone)]
     struct FakeRetryBuilder {
         calls: Arc<AtomicUsize>,
-        first_error_code: &'static str,
+        first_error_code: Option<&'static str>,
     }
 
     impl SendRetryingOperationAborted for FakeRetryBuilder {
         type Output = ();
         type Error = aws_sdk_s3::operation::delete_object::DeleteObjectError;
 
+        const RETRY_UNMODELED_CONFLICT: bool = true;
+
         fn send_once(self) -> RetrySendFuture<Self::Output, Self::Error> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if call == 0 {
-                    let metadata = aws_smithy_types::error::ErrorMetadata::builder()
-                        .code(self.first_error_code)
-                        .build();
+                    let mut metadata = aws_smithy_types::error::ErrorMetadata::builder();
+                    if let Some(code) = self.first_error_code {
+                        metadata = metadata.code(code);
+                    }
                     let response = hyper::http::Response::builder()
                         .status(409)
                         .body(aws_smithy_types::body::SdkBody::empty())
@@ -2913,7 +2951,9 @@ mod tests {
                         .try_into()
                         .expect("convert fake retry response");
                     Err(aws_sdk_s3::error::SdkError::service_error(
-                        aws_sdk_s3::operation::delete_object::DeleteObjectError::generic(metadata),
+                        aws_sdk_s3::operation::delete_object::DeleteObjectError::generic(
+                            metadata.build(),
+                        ),
                         response,
                     ))
                 } else {
@@ -2960,7 +3000,7 @@ mod tests {
         let result = send_with_operation_contention_retry_until(
             FakeRetryBuilder {
                 calls: Arc::clone(&calls),
-                first_error_code: "SlowDown",
+                first_error_code: Some("SlowDown"),
             },
             OperationContentionRetryScope::OperationAbortedOnly,
             std::time::Instant::now() + Duration::from_secs(1),
@@ -2975,12 +3015,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_operation_retries_unmodeled_conflict() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let result = send_with_operation_contention_retry_until(
+            FakeRetryBuilder {
+                calls: Arc::clone(&calls),
+                first_error_code: None,
+            },
+            OperationContentionRetryScope::OperationAbortedOnly,
+            std::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(result.is_ok(), "unmodeled HEAD conflict should retry");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn non_head_operation_does_not_retry_unmodeled_conflict() {
+        let metadata = aws_smithy_types::error::ErrorMetadata::builder().build();
+        let response = hyper::http::Response::builder()
+            .status(409)
+            .body(aws_smithy_types::body::SdkBody::empty())
+            .expect("build fake conflict response")
+            .try_into()
+            .expect("convert fake conflict response");
+        let error = aws_sdk_s3::error::SdkError::service_error(
+            aws_sdk_s3::operation::delete_object::DeleteObjectError::generic(metadata),
+            response,
+        );
+
+        assert!(
+            !OperationContentionRetryScope::OperationAbortedOnly.includes_sdk_error(&error, false)
+        );
+        assert!(
+            OperationContentionRetryScope::OperationAbortedOnly.includes_sdk_error(&error, true)
+        );
+    }
+
+    #[tokio::test]
     async fn operation_contention_retry_does_not_send_after_deadline() {
         let calls = Arc::new(AtomicUsize::new(0));
         let result = send_with_operation_contention_retry_until(
             FakeRetryBuilder {
                 calls: Arc::clone(&calls),
-                first_error_code: "OperationAborted",
+                first_error_code: Some("OperationAborted"),
             },
             OperationContentionRetryScope::OperationAbortedOnly,
             std::time::Instant::now(),
