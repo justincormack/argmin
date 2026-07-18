@@ -127,11 +127,11 @@ fn dates_for_epoch(epoch: u64) -> (String, String) {
     (short, full)
 }
 
-fn build_multipart(
+pub fn build_post_object_multipart_body(
     fields: &[(&str, &str)],
     file_data: &[u8],
     file_name: &str,
-) -> (String, Vec<u8>) {
+) -> (String, Vec<u8>, usize) {
     let boundary = "----TestBoundary7MA4YWxkTrZu0gW";
     let mut body = Vec::new();
 
@@ -153,12 +153,13 @@ fn build_multipart(
         .as_bytes(),
     );
     body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+    let file_offset = body.len();
     body.extend_from_slice(file_data);
     body.extend_from_slice(b"\r\n");
     body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
     let content_type = format!("multipart/form-data; boundary={}", boundary);
-    (content_type, body)
+    (content_type, body, file_offset)
 }
 
 pub fn sigv4_post_fields_for_credentials(
@@ -326,7 +327,7 @@ pub fn post_object_to_test_endpoint_with_headers(
     headers: &[(&str, &str)],
 ) -> (u16, String) {
     let url = format!("{}/{}", endpoint, bucket);
-    let (content_type, body) = build_multipart(fields, file_data, file_name);
+    let (content_type, body, _) = build_post_object_multipart_body(fields, file_data, file_name);
     let agent = build_test_agent(endpoint, tls_ca_pem, crate::configured_test_timeout());
     let deadline = Instant::now() + crate::configured_test_timeout();
 
@@ -360,7 +361,8 @@ pub fn post_object_raw_to_test_endpoint_with_headers(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    let (content_type, body) = build_multipart(&field_refs, file_data, file_name);
+    let (content_type, body, _) =
+        build_post_object_multipart_body(&field_refs, file_data, file_name);
     let agent = build_test_agent(endpoint, tls_ca_pem, crate::configured_test_timeout());
     let deadline = Instant::now() + crate::configured_test_timeout();
 

@@ -573,6 +573,40 @@ choice.
   `s3:ExistingObjectTag/*` is policy-invalid for destination PutObject. Do not
   change commit authorization until this matrix identifies each operation's
   actual authorization points.
+
+  The maintained ObjectWriter bucket-policy matrix now covers direct and
+  streamed ordinary PutObject, signed aws-chunked PutObject, and POST Object
+  over absent keys, live versions, and current delete markers. Each raw request
+  writes and flushes a complete prefix (including a complete signed
+  aws-chunked data chunk or multipart/form-data file prefix), continues making
+  body progress while the replacement policy converges, and accepts only the
+  operation's success status or `403 AccessDenied`. Success must publish the
+  exact complete decoded/file body as one new current version without changing
+  any prior version or marker identity; denial must leave the complete
+  version history and visible baseline body unchanged. All staged bodies are
+  completed concurrently before the slower state assertions so AWS cannot
+  expire a later socket while an earlier case is being inspected.
+  The ordinary streamed cases use
+  `server_core::coordinator::INTERNAL_SEGMENT_SIZE + 1`, with compile-time
+  assertions keeping the direct case at or below that shared threshold and the
+  streamed case above it. This pins local coverage of promotion from the
+  single-segment path into streaming storage and its separate finalization.
+
+  AWS confirms that these outcomes follow the unobservable ingress handoff,
+  not a destination-state-specific authorization rule. In one corrected plain
+  run and the aws-chunked run, deny -> allow returned success for all three
+  states and allow -> deny returned 403 for all three; an earlier corrected
+  plain run mixed success and denial within deny -> allow. POST Object also
+  mixed branches: the latest run returned 403 for absent/live and 204 for the
+  current-marker case under deny -> allow, then 204 for absent/live and 403 for
+  the marker case under allow -> deny. An earlier run selected a different
+  branch for one of the same cases. Local consistently preserves its
+  entry-bound model (initial allow succeeds; initial deny remains denied), and
+  every local result is one of the AWS-permitted, fully state-checked branches.
+  CopyObject remains open: it has no request body with which to hold the
+  operation across control-plane convergence, so a useful AWS race needs a
+  separately established controllable interval rather than a header-flush
+  test that will normally complete before the policy changes.
 - [ ] Probe CopyObject destination contention with the same destination-state
   and authorization matrix. Copy's source read creates a naturally longer
   interval between destination authorization and publication, so explicitly

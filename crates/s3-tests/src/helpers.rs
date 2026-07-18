@@ -1123,11 +1123,34 @@ pub struct SignedRequestHeaders {
     headers: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedAwsChunkedRequest {
+    headers: Vec<(String, String)>,
+    wire_body: Vec<u8>,
+    first_chunk_wire_len: usize,
+}
+
 impl SignedRequestHeaders {
     pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
         self.headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
+impl SignedAwsChunkedRequest {
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    pub fn wire_body(&self) -> &[u8] {
+        &self.wire_body
+    }
+
+    pub fn first_chunk_wire_len(&self) -> usize {
+        self.first_chunk_wire_len
     }
 }
 
@@ -1477,6 +1500,126 @@ where
         credentials,
         true,
     )
+}
+
+pub fn sign_aws_chunked_request_with_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    chunks: &[&[u8]],
+    extra_headers: I,
+    credentials: SignedRequestCredentials<'_>,
+) -> SignedAwsChunkedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    const CONTENT_SHA256: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+    let parsed = url::Url::parse(url_str).expect("parse aws-chunked signed URL");
+    assert!(
+        parsed.query().is_none(),
+        "aws-chunked test signer does not support query parameters"
+    );
+    let amz_date = format_amz_date(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    );
+    let date_stamp = &amz_date[..8];
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            if let Some(port) = parsed.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+        .expect("aws-chunked signed URL host");
+    let decoded_content_length = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
+
+    let mut canonical_headers = vec![
+        ("content-encoding".to_string(), "aws-chunked".to_string()),
+        ("host".to_string(), host),
+        (
+            "x-amz-content-sha256".to_string(),
+            CONTENT_SHA256.to_string(),
+        ),
+        ("x-amz-date".to_string(), amz_date.clone()),
+        (
+            "x-amz-decoded-content-length".to_string(),
+            decoded_content_length.to_string(),
+        ),
+    ];
+    canonical_headers.extend(extra_headers.into_iter().map(|(name, value)| {
+        (
+            name.as_ref().to_ascii_lowercase(),
+            value.as_ref().to_string(),
+        )
+    }));
+    canonical_headers.sort_by(|left, right| left.0.cmp(&right.0));
+    let signed_headers = canonical_headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_header_block = canonical_headers
+        .iter()
+        .map(|(name, value)| format!("{name}:{value}\n"))
+        .collect::<String>();
+    let canonical_request = format!(
+        "{method}\n{}\n\n{canonical_header_block}\n{signed_headers}\n{CONTENT_SHA256}",
+        parsed.path()
+    );
+    let scope = format!("{date_stamp}/{}/s3/aws4_request", credentials.region);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = derive_signing_key_with_service(
+        credentials.secret_key,
+        date_stamp,
+        credentials.region,
+        "s3",
+    );
+    let seed_signature = hex_encode(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={seed_signature}",
+        credentials.access_key
+    );
+
+    let mut wire_body = Vec::new();
+    let mut previous_signature = seed_signature;
+    let mut first_chunk_wire_len = None;
+    for chunk in chunks {
+        let signature =
+            aws_chunk_signature(&signing_key, &amz_date, &scope, &previous_signature, chunk);
+        wire_body.extend_from_slice(
+            format!("{:x};chunk-signature={signature}\r\n", chunk.len()).as_bytes(),
+        );
+        wire_body.extend_from_slice(chunk);
+        wire_body.extend_from_slice(b"\r\n");
+        first_chunk_wire_len.get_or_insert(wire_body.len());
+        previous_signature = signature;
+    }
+    let terminal_signature =
+        aws_chunk_signature(&signing_key, &amz_date, &scope, &previous_signature, b"");
+    wire_body
+        .extend_from_slice(format!("0;chunk-signature={terminal_signature}\r\n\r\n").as_bytes());
+
+    let mut headers = canonical_headers
+        .into_iter()
+        .filter(|(name, _)| name != "host")
+        .collect::<Vec<_>>();
+    headers.push(("authorization".to_string(), authorization));
+
+    SignedAwsChunkedRequest {
+        headers,
+        wire_body,
+        first_chunk_wire_len: first_chunk_wire_len.unwrap_or(0),
+    }
 }
 
 fn sign_request_headers_for_service_with_credentials<K, V, I>(
@@ -2196,6 +2339,25 @@ fn sha256_hex(data: &[u8]) -> String {
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let key = hmac::Key::new(hmac::HMAC_SHA256, key);
     hmac::sign(&key, data).as_ref().to_vec()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn aws_chunk_signature(
+    signing_key: &[u8],
+    timestamp: &str,
+    scope: &str,
+    previous_signature: &str,
+    chunk: &[u8],
+) -> String {
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{previous_signature}\n{}\n{}",
+        sha256_hex(b""),
+        sha256_hex(chunk)
+    );
+    hex_encode(&hmac_sha256(signing_key, string_to_sign.as_bytes()))
 }
 
 pub(crate) fn format_amz_date(epoch_secs: u64) -> String {

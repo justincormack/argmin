@@ -28,16 +28,17 @@ pub use helpers::{
     send_signed_request_for_service_with_credentials,
     send_signed_request_to_endpoint_for_service_with_credentials,
     send_signed_request_with_credentials, send_signed_request_with_unsigned_headers,
-    send_signed_request_without_host_signed_header, sign_request_headers_with_credentials,
-    sse_c_header_values, test_sse_c_key, unique_account_regional_bucket, unique_bucket,
-    wait_for_versioned_writes_visible, PresignedRequest, RawAltObjectRequest, RawResponse,
-    SendRetryingOperationAborted, SignedRequestCredentials, SignedRequestHeaders,
+    send_signed_request_without_host_signed_header, sign_aws_chunked_request_with_credentials,
+    sign_request_headers_with_credentials, sse_c_header_values, test_sse_c_key,
+    unique_account_regional_bucket, unique_bucket, wait_for_versioned_writes_visible,
+    PresignedRequest, RawAltObjectRequest, RawResponse, SendRetryingOperationAborted,
+    SignedAwsChunkedRequest, SignedRequestCredentials, SignedRequestHeaders,
 };
 pub use post_form::{
-    post_object_raw_to_test_endpoint_with_headers, post_object_to_test_endpoint,
-    post_object_to_test_endpoint_with_headers, sigv4_post_fields_for_credentials,
-    sigv4_post_fields_for_credentials_at_epoch, sigv4_post_fields_for_service_with_credentials,
-    sigv4_post_sse_c_fields_for_credentials,
+    build_post_object_multipart_body, post_object_raw_to_test_endpoint_with_headers,
+    post_object_to_test_endpoint, post_object_to_test_endpoint_with_headers,
+    sigv4_post_fields_for_credentials, sigv4_post_fields_for_credentials_at_epoch,
+    sigv4_post_fields_for_service_with_credentials, sigv4_post_sse_c_fields_for_credentials,
 };
 pub use raw_http_client::{
     open_flushed_partial_request, write_partial_request_and_disconnect, Agent,
