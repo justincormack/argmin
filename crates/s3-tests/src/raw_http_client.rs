@@ -12,8 +12,9 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use rustls::pki_types::{pem::PemObject, CertificateDer};
 use rustls::{ClientConfig, RootCertStore};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
 type HyperHttpsConnector = HttpsConnector<HyperHttpConnector>;
@@ -62,6 +63,24 @@ pub struct RequestBuilder {
 struct RequestOptions {
     auto_content_length: bool,
     allow_response_body_error: bool,
+}
+
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin {}
+
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin {}
+
+pub struct FlushedPartialRequest {
+    stream: Box<dyn AsyncReadWrite + Send>,
+    declared_content_length: usize,
+    written: usize,
+    response_bytes: Vec<u8>,
+    deadline: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlushedResponse {
+    status: u16,
+    body: Vec<u8>,
 }
 
 impl Agent {
@@ -229,6 +248,16 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl FlushedResponse {
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+}
+
 /// Write a deliberately incomplete HTTP request body onto the connection and
 /// disconnect only after the partial body has been flushed.
 pub async fn write_partial_request_and_disconnect(
@@ -239,6 +268,54 @@ pub async fn write_partial_request_and_disconnect(
     headers: &[(&str, &str)],
     tls_ca_pem: Option<&[u8]>,
 ) -> Result<(), Error> {
+    open_flushed_partial_request(
+        method,
+        uri,
+        declared_content_length,
+        partial_body,
+        headers,
+        tls_ca_pem,
+    )
+    .await
+    .map(drop)
+}
+
+/// Open a raw HTTP/1.1 request, write its headers and body prefix, and return
+/// only after the underlying TCP/TLS stream has acknowledged a flush.
+///
+/// The caller retains the connection and may mutate external state before
+/// writing the rest of the declared body. This is deliberately lower-level
+/// than a Hyper body: successful return proves the prefix reached the
+/// transport, rather than merely that a body producer was polled.
+pub async fn open_flushed_partial_request(
+    method: &str,
+    uri: &str,
+    declared_content_length: usize,
+    partial_body: &[u8],
+    headers: &[(&str, &str)],
+    tls_ca_pem: Option<&[u8]>,
+) -> Result<FlushedPartialRequest, Error> {
+    open_flushed_partial_request_with_timeout(
+        method,
+        uri,
+        declared_content_length,
+        partial_body,
+        headers,
+        tls_ca_pem,
+        crate::configured_test_timeout(),
+    )
+    .await
+}
+
+async fn open_flushed_partial_request_with_timeout(
+    method: &str,
+    uri: &str,
+    declared_content_length: usize,
+    partial_body: &[u8],
+    headers: &[(&str, &str)],
+    tls_ca_pem: Option<&[u8]>,
+    timeout: Duration,
+) -> Result<FlushedPartialRequest, Error> {
     if partial_body.len() >= declared_content_length {
         return Err(Error::new(
             "partial body must be shorter than the declared Content-Length",
@@ -292,12 +369,13 @@ pub async fn write_partial_request_and_disconnect(
     }
     head.push_str("\r\n");
 
-    tokio::time::timeout(crate::configured_test_timeout(), async {
+    let deadline = Instant::now() + timeout;
+    tokio::time::timeout_at(deadline, async {
         let stream = TcpStream::connect((host, port))
             .await
             .map_err(|err| Error::new(format!("connect raw request: {err}")))?;
-        match parsed.scheme() {
-            "http" => write_partial_request(stream, head.as_bytes(), partial_body).await,
+        let mut stream: Box<dyn AsyncReadWrite + Send> = match parsed.scheme() {
+            "http" => Box::new(stream),
             "https" => {
                 let _ = rustls::crypto::ring::default_provider().install_default();
                 let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
@@ -307,15 +385,25 @@ pub async fn write_partial_request_and_disconnect(
                     .connect(server_name, stream)
                     .await
                     .map_err(|err| Error::new(format!("connect raw request TLS: {err}")))?;
-                write_partial_request(stream, head.as_bytes(), partial_body).await
+                Box::new(stream)
             }
-            scheme => Err(Error::new(format!(
-                "unsupported raw request URI scheme: {scheme}"
-            ))),
-        }
+            scheme => {
+                return Err(Error::new(format!(
+                    "unsupported raw request URI scheme: {scheme}"
+                )));
+            }
+        };
+        write_partial_request(&mut stream, head.as_bytes(), partial_body).await?;
+        Ok(FlushedPartialRequest {
+            stream,
+            declared_content_length,
+            written: partial_body.len(),
+            response_bytes: Vec::new(),
+            deadline,
+        })
     })
     .await
-    .map_err(|err| Error::new(format!("partial raw request timed out: {err}")))?
+    .map_err(|_| Error::new("partial raw request deadline exceeded"))?
 }
 
 async fn write_partial_request<S: AsyncWrite + Unpin>(
@@ -335,6 +423,259 @@ async fn write_partial_request<S: AsyncWrite + Unpin>(
         .flush()
         .await
         .map_err(|err| Error::new(format!("flush raw request partial body: {err}")))
+}
+
+impl FlushedPartialRequest {
+    pub async fn write_and_flush(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let new_written = self
+            .written
+            .checked_add(bytes.len())
+            .ok_or_else(|| Error::new("raw request body length overflow"))?;
+        if new_written > self.declared_content_length {
+            return Err(Error::new(
+                "raw request body exceeds its declared Content-Length",
+            ));
+        }
+        tokio::time::timeout_at(self.deadline, async {
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                match self.stream.write(remaining).await {
+                    Ok(0) => {
+                        return Err(Error::new("write raw request body returned zero bytes"));
+                    }
+                    Ok(written) => {
+                        self.written += written;
+                        remaining = &remaining[written..];
+                    }
+                    Err(err) => {
+                        return Err(Error::new(format!("write raw request body: {err}")));
+                    }
+                }
+            }
+            self.stream
+                .flush()
+                .await
+                .map_err(|err| Error::new(format!("flush raw request body: {err}")))
+        })
+        .await
+        .map_err(|_| {
+            Error::new("raw request deadline exceeded while writing or flushing body")
+        })??;
+        debug_assert_eq!(self.written, new_written);
+        Ok(())
+    }
+
+    pub fn written_body_bytes(&self) -> usize {
+        self.written
+    }
+
+    /// Return a response status if one becomes visible before `duration`.
+    ///
+    /// The request uses `Connection: close`, so a complete response normally
+    /// reaches EOF. A parsed status line is also sufficient when a timeout
+    /// races with response-body delivery.
+    pub async fn response_status_within(
+        &mut self,
+        duration: Duration,
+    ) -> Result<Option<u16>, Error> {
+        let probe_deadline = Instant::now() + duration;
+        let read_deadline = std::cmp::min(probe_deadline, self.deadline);
+        match tokio::time::timeout_at(
+            read_deadline,
+            self.stream.read_to_end(&mut self.response_bytes),
+        )
+        .await
+        {
+            Ok(Ok(_)) => parse_raw_response_status(&self.response_bytes).map(Some),
+            Ok(Err(err)) => Err(Error::new(format!("read raw HTTP response: {err}"))),
+            Err(_) if read_deadline == self.deadline => Err(Error::new(
+                "raw request deadline exceeded while reading response",
+            )),
+            Err(_) => match parse_raw_response_status(&self.response_bytes) {
+                Ok(status) => Ok(Some(status)),
+                Err(_) if self.response_bytes.is_empty() => Ok(None),
+                Err(err) => Err(err),
+            },
+        }
+    }
+
+    pub async fn finish_and_read_response(mut self) -> Result<FlushedResponse, Error> {
+        if self.written != self.declared_content_length {
+            return Err(Error::new(format!(
+                "raw request body is incomplete: wrote {} of {} bytes",
+                self.written, self.declared_content_length
+            )));
+        }
+        self.read_to_end_until_deadline().await?;
+        parse_raw_response(&self.response_bytes)
+    }
+
+    pub async fn read_response(mut self) -> Result<FlushedResponse, Error> {
+        self.read_to_end_until_deadline().await?;
+        parse_raw_response(&self.response_bytes)
+    }
+
+    async fn read_to_end_until_deadline(&mut self) -> Result<(), Error> {
+        tokio::time::timeout_at(
+            self.deadline,
+            self.stream.read_to_end(&mut self.response_bytes),
+        )
+        .await
+        .map_err(|_| Error::new("raw request deadline exceeded while reading response"))?
+        .map(|_| ())
+        .map_err(|err| Error::new(format!("read raw HTTP response: {err}")))
+    }
+}
+
+fn parse_raw_response_status(response: &[u8]) -> Result<u16, Error> {
+    let line_end = response
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .ok_or_else(|| Error::new("raw HTTP response has no complete status line"))?;
+    let status_line = std::str::from_utf8(&response[..line_end])
+        .map_err(|err| Error::new(format!("raw HTTP response status is not UTF-8: {err}")))?;
+    let mut fields = status_line.split_ascii_whitespace();
+    let version = fields
+        .next()
+        .ok_or_else(|| Error::new("raw HTTP response status line is empty"))?;
+    if !version.starts_with("HTTP/") {
+        return Err(Error::new(
+            "raw HTTP response status line has no HTTP version",
+        ));
+    }
+    fields
+        .next()
+        .ok_or_else(|| Error::new("raw HTTP response status line has no status code"))?
+        .parse()
+        .map_err(|err: std::num::ParseIntError| {
+            Error::new(format!("raw HTTP response status code is invalid: {err}"))
+        })
+}
+
+fn parse_raw_response(response: &[u8]) -> Result<FlushedResponse, Error> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| Error::new("raw HTTP response has no complete header section"))?;
+    let status = parse_raw_response_status(response)?;
+    let header_text = std::str::from_utf8(&response[..header_end])
+        .map_err(|err| Error::new(format!("raw HTTP response headers are not UTF-8: {err}")))?;
+    let mut chunked = false;
+    let mut content_length = None;
+    for line in header_text.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(Error::new("raw HTTP response contains a malformed header"));
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"));
+        } else if name.eq_ignore_ascii_case("content-length") {
+            let parsed =
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|err: std::num::ParseIntError| {
+                        Error::new(format!(
+                            "raw HTTP response Content-Length is invalid: {err}"
+                        ))
+                    })?;
+            if content_length.replace(parsed).is_some() {
+                return Err(Error::new(
+                    "raw HTTP response contains duplicate Content-Length headers",
+                ));
+            }
+        }
+    }
+
+    let encoded_body = &response[header_end + 4..];
+    let body = if chunked {
+        decode_chunked_response_body(encoded_body)?
+    } else if let Some(content_length) = content_length {
+        if encoded_body.len() != content_length {
+            return Err(Error::new(format!(
+                "raw HTTP response body length {} does not match Content-Length {content_length}",
+                encoded_body.len()
+            )));
+        }
+        encoded_body.to_vec()
+    } else {
+        encoded_body.to_vec()
+    };
+    Ok(FlushedResponse { status, body })
+}
+
+fn decode_chunked_response_body(mut encoded: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = encoded
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| Error::new("chunked raw HTTP response has no complete chunk size"))?;
+        let size_text = std::str::from_utf8(&encoded[..line_end]).map_err(|err| {
+            Error::new(format!(
+                "chunked raw HTTP response size is not UTF-8: {err}"
+            ))
+        })?;
+        let size_text = size_text.split(';').next().unwrap_or_default().trim();
+        let size = usize::from_str_radix(size_text, 16).map_err(|err| {
+            Error::new(format!("chunked raw HTTP response size is invalid: {err}"))
+        })?;
+        encoded = &encoded[line_end + 2..];
+        if size == 0 {
+            validate_chunked_response_trailers(encoded)?;
+            return Ok(decoded);
+        }
+        let framed_len = size
+            .checked_add(2)
+            .ok_or_else(|| Error::new("chunked raw HTTP response size overflow"))?;
+        if encoded.len() < framed_len {
+            return Err(Error::new("chunked raw HTTP response body is incomplete"));
+        }
+        if &encoded[size..framed_len] != b"\r\n" {
+            return Err(Error::new(
+                "chunked raw HTTP response chunk has no terminator",
+            ));
+        }
+        decoded.extend_from_slice(&encoded[..size]);
+        encoded = &encoded[framed_len..];
+    }
+}
+
+fn validate_chunked_response_trailers(mut encoded: &[u8]) -> Result<(), Error> {
+    loop {
+        let line_end = encoded
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .ok_or_else(|| Error::new("chunked raw HTTP response trailer section is incomplete"))?;
+        let line = &encoded[..line_end];
+        encoded = &encoded[line_end + 2..];
+        if line.is_empty() {
+            if encoded.is_empty() {
+                return Ok(());
+            }
+            return Err(Error::new(
+                "chunked raw HTTP response has data after its trailer terminator",
+            ));
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(|| Error::new("chunked raw HTTP response contains a malformed trailer"))?;
+        HeaderName::from_bytes(&line[..colon]).map_err(|err| {
+            Error::new(format!(
+                "chunked raw HTTP response trailer name is invalid: {err}"
+            ))
+        })?;
+        let value = line[colon + 1..]
+            .strip_prefix(b" ")
+            .unwrap_or(&line[colon + 1..]);
+        HeaderValue::from_bytes(value).map_err(|err| {
+            Error::new(format!(
+                "chunked raw HTTP response trailer value is invalid: {err}"
+            ))
+        })?;
+    }
 }
 
 async fn execute_request(
@@ -472,8 +813,9 @@ fn build_tls_client_config(tls_ca_pem: Option<&[u8]>) -> ClientConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::Agent;
+    use super::{open_flushed_partial_request_with_timeout, parse_raw_response, Agent};
     use std::time::Duration;
+    use tokio::net::TcpListener;
 
     #[test]
     fn request_accepts_extension_method_tokens() {
@@ -481,5 +823,120 @@ mod tests {
         let request = agent.request("X-ARGMIN-PROBE", "http://127.0.0.1/");
 
         assert_eq!(request.method.as_str(), "X-ARGMIN-PROBE");
+    }
+
+    #[test]
+    fn parses_chunked_response_body() {
+        let response = parse_raw_response(
+            b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n\
+              7\r\n<Error>\r\n\
+              19\r\n<Code>AccessDenied</Code>\r\n\
+              8\r\n</Error>\r\n\
+              0\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), 403);
+        assert_eq!(response.body(), b"<Error><Code>AccessDenied</Code></Error>");
+    }
+
+    #[test]
+    fn rejects_chunked_response_with_truncated_trailer_section() {
+        let error = parse_raw_response(
+            b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n\
+              0\r\n",
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("trailer section is incomplete"),
+            "unexpected parser error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_chunked_response_with_data_after_trailer_terminator() {
+        let error = parse_raw_response(
+            b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n\
+              0\r\n\r\ntrailing",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("data after its trailer terminator"),
+            "unexpected parser error: {error}"
+        );
+    }
+
+    #[test]
+    fn partial_request_response_read_honors_retained_deadline() {
+        crate::RT.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (_stream, _) = listener.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+            let request = open_flushed_partial_request_with_timeout(
+                "PUT",
+                &format!("http://{address}/object"),
+                2,
+                b"x",
+                &[],
+                None,
+                Duration::from_millis(250),
+            )
+            .await
+            .unwrap();
+
+            let result = tokio::time::timeout(Duration::from_secs(1), request.read_response())
+                .await
+                .expect("retained raw response deadline must prevent a hung read")
+                .unwrap_err();
+            assert!(
+                result.to_string().contains("deadline exceeded"),
+                "unexpected read error: {result}"
+            );
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn partial_request_body_write_honors_retained_deadline_under_backpressure() {
+        crate::RT.block_on(async {
+            const REMAINING_BYTES: usize = 64 * 1024 * 1024;
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (_stream, _) = listener.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+            let mut request = open_flushed_partial_request_with_timeout(
+                "PUT",
+                &format!("http://{address}/object"),
+                REMAINING_BYTES + 1,
+                b"x",
+                &[],
+                None,
+                Duration::from_millis(250),
+            )
+            .await
+            .unwrap();
+            let body = vec![b'x'; REMAINING_BYTES];
+
+            let result =
+                tokio::time::timeout(Duration::from_secs(1), request.write_and_flush(&body))
+                    .await
+                    .expect("retained raw request deadline must prevent a hung write")
+                    .unwrap_err();
+            assert!(
+                result.to_string().contains("deadline exceeded"),
+                "unexpected write error: {result}"
+            );
+            server.abort();
+        });
     }
 }

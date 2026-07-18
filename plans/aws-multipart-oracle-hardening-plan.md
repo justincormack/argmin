@@ -385,17 +385,33 @@ choice.
   metadata or tags. Record the first AWS response without the OperationAborted
   retry helper, then assert permitted 409/412 outcomes, final object bytes and
   metadata, retry behavior, and absence of partial writes. Coordinated
-  first-body-poll probes now force two ordinary PutObject requests to start
-  together; the multi-segment variant paces both bodies to retain overlap. AWS
-  and local publish exactly one complete writer, with the loser returning
-  either `409 ConditionalRequestConflict` or `412 PreconditionFailed`; a
-  settled retry returns 412. A slow `If-Match` PUT that loses to an intervening
-  different-ETag replacement returns 409 or 412 and cannot disturb the
-  replacement. Replacing the source state with identical bytes but different
-  metadata and tags retains the ETag, so AWS permits the in-flight conditional
-  PUT to publish; local matches this ETag-based rule. Signed aws-chunked
-  success, stale-condition failure, and non-mutation pin the same semantics
-  without introducing a transport-specific rule.
+  first-body-poll probes start two ordinary PutObject clients together; the
+  multi-segment variant paces both bodies to retain likely overlap. AWS and
+  local publish exactly one complete writer, with the loser returning either
+  `409 ConditionalRequestConflict` or `412 PreconditionFailed`; a settled
+  retry returns 412. The body-poll notification is not a transport handoff
+  acknowledgement, so the earlier intervening-replacement cases establish
+  outcomes but not their internal check point. Replacing destination state
+  before a request is handled with identical bytes but different metadata and
+  tags retains the ETag and permits the conditional PUT.
+
+  One-off raw SigV4 probes now establish the stronger late conditional rule.
+  A bucket-owner `If-Match` PUT wrote and flushed 64 MiB of a 128 MiB body
+  before a different-ETag replacement; AWS returned
+  `412 PreconditionFailed`, published none of the conditional body, and
+  retained the replacement. In an ObjectWriter bucket, a bucket-owner request
+  crossed the same boundary before the alternate account installed an
+  identical-byte, same-ETag private replacement. No response arrived during
+  the two-second post-replacement window; after the remaining body was sent,
+  AWS returned `409 ConditionalRequestConflict`. Direct inspection confirmed
+  the retained object was still the 27-byte alternate-owned replacement with
+  its original ETag and sole-owner ACL. Thus authorization may latch at ingress
+  while conditional publication remains tied to the later atomic destination
+  state: a now-false ETag condition returns 412, while a same-ETag intervening
+  generation can still conflict with 409. Signed aws-chunked success,
+  stale-condition failure, and non-mutation pin the same static semantics
+  without introducing a transport-specific rule. The 128 MiB probes remain
+  documentary.
 - [ ] Audit the earlier blanket authorization-at-entry assumption anywhere a
   long-running operation can observe mutable authorization state. Keep bucket
   control-plane state (policy, ownership controls, public-access settings, and
@@ -416,8 +432,13 @@ choice.
   requester's bucket ACL write grant, waiting until fresh PUTs consistently
   return 403, and then resuming a request started while the grant existed also
   returns 403 and publishes nothing. An already-denied paused PUT did not
-  expose its 403 until the body completed. These establish later ObjectWriter
-  authorization behavior but do not demonstrate a client-visible entry check.
+  expose its 403 until the body completed. Subsequent raw probes below narrow
+  the first result to conditional `If-Match` PUT; it is not a general
+  current-object authorization rule for unconditional PutObject. These
+  ObjectWriter timing cases are documentary because a small flushed prefix
+  does not establish the internal handoff, and accepting every resulting
+  200/403/409 branch would not make a useful maintained regression. The bucket
+  ACL result remains a separate authorization-source transition.
 
   The attempted shared commit-time implementation was removed because it also
   changed unresolved CopyObject and POST Object timing and treated current
@@ -425,17 +446,125 @@ choice.
   entry-only model until the complete matrix supports operation-specific token
   capabilities and explicit live-object/delete-marker normalization.
 
-  For BOE, begin with an anonymous PutObject to a private bucket using a paused
-  large body and record whether AWS returns AccessDenied before requesting the
-  body, after receiving a flushed partial body, or only after completion.
-  Repeat with authenticated bucket-policy denial and with a grant revoked after
-  the body starts and policy convergence is observable. Repeat mutable
-  bucket-policy and tag cases for ObjectWriter rather than inferring them from
-  the bucket ACL result. Cover direct PutObject, streamed PutObject,
+  The corrected BOE PutObject oracle slice writes HTTP/1.1 headers and body
+  bytes directly to TCP/TLS and waits for `flush()` before changing external
+  state. The earlier SDK-body acknowledgement occurred before Hyper accepted
+  the frame and did not prove transport delivery; none of the earlier timing
+  conclusions rely on it now. With raw Authorization-header SigV4, AWS returns
+  an existing `AccessDenied` only after the client has finished writing the
+  exploratory 256 KiB and 4 MiB bodies. The same is true for anonymous private
+  PUTs at those sizes. Local returned anonymous denial after flushed headers
+  and signed denial after the flushed 64 KiB prefix. Response-stage and stable
+  denial cases are no longer maintained because their size/buffering outcome
+  is not itself a useful compatibility invariant.
+
+  Corrected one-off 128 MiB probes did not require the complete body. For an
+  anonymous request AWS closed with `403 AccessDenied` after the raw client had
+  successfully written 16,984,136 of 134,217,728 bytes. A valid
+  Authorization-header SigV4 request from the alternate principal, after its
+  explicit policy denial was observed as stable, similarly closed with 403
+  after 17,085,614 bytes. Those counts are the transport write points at which
+  the client observed the close, not claimed AWS buffering thresholds. Their
+  proximity makes an anonymous-only early-denial path unlikely. They prove
+  that AWS can emit a denial before receiving a large authenticated body in
+  full, but do not establish where authorization occurs internally. In
+  particular, a bounded ingress buffer followed by a one-time authorization
+  check on entry to the operation system is consistent with these results:
+  small bodies could fit before handoff, while large bodies force an earlier
+  handoff. The bandwidth-heavy cases remain documentary.
+
+  Correct transport acknowledgement also removes the apparent mutable-policy
+  asymmetry. After a signed prefix is flushed, allow -> stable explicit deny
+  returned `403` for both exploratory sizes; stable explicit deny -> allow
+  returns 200. A deny -> allow -> deny sandwich, with each state visible to
+  canaries for 30 seconds and body bytes flushed throughout, returns 403.
+  These outcomes show that the decisive authorization was not fixed before the
+  flushed prefix and followed a later converged policy state in each probe.
+  They do not place that decision at body completion or prove reauthorization.
+  The flushed 64 KiB prefix may still have been held in a transport/ingress
+  layer that is outside the operation's logical authorization entry point.
+
+  A further one-off boundary probe strongly supports the later-handoff model.
+  With the allow already stable, the signed client wrote and flushed 64 MiB of
+  a 128 MiB body and observed no response. It then installed an explicit deny,
+  kept the body active while fresh PutObject canaries observed that deny
+  continuously for 30 seconds, and sent the remainder. AWS returned 200 and
+  published the complete 128 MiB object. Combined with the 64 KiB-prefix case
+  returning 403 and fixed denials becoming observable around 17 MiB, this
+  supports a successful authorization decision being made and latched at a
+  size-driven ingress handoff before the policy transition. It argues against
+  authorization being deferred until commit or unconditionally repeated at
+  commit. The observations still do not expose an exact internal threshold:
+  client, TLS, and service buffering affect the byte counts, and AWS provides
+  no handoff acknowledgement. Local remains entry-bound at its HTTP operation
+  layer: it returns 200 for allow -> deny and the original 403 for deny ->
+  allow.
+
+  The maintained timing-dependent PUT coverage is deliberately narrower: one
+  4 MiB allow -> deny case and one deny -> allow case. Each permits only 200 or
+  403 because either authorization state can legitimately win the unobservable
+  handoff race. A 200 must expose the exact complete body; a 403 must leave the
+  key absent and carry an `AccessDenied` XML code, so a broken signature cannot
+  satisfy the denial branch. The tests do not assert response stage. Their raw
+  TCP/TLS request retains one configured deadline from connection setup
+  through every later body write, flush, and response read; focused
+  backpressure and non-responding-peer regressions prevent a timing oracle from
+  hanging the test process. Duplicate sizes, stable denial stage probes, the
+  deny -> allow -> deny sandwich, and the small-prefix ObjectWriter timing
+  cases were removed; their observed AWS results remain documentary here.
+
+  Strongly consistent object-state probes now establish a narrower GetObject
+  rule without relying on control-plane convergence. AWS and local both allow
+  an already-started streamed GetObject to return its complete original bytes
+  after either its canonical-user READ ACL is replaced by a private ACL or its
+  policy-authorizing `s3:ExistingObjectTag/security=allow` tag is replaced by
+  `deny`. Each test reads the replacement ACL/tag back, verifies a fresh HEAD
+  is denied, and only then drains the original response. This pins
+  authorization to the established GetObject response rather than requiring
+  continuing authorization throughout response streaming; it does not imply
+  the same rule for writes or server-side copies.
+
+  The documentary ObjectWriter matrix shows that conditional `If-Match` PUT
+  differs from unconditional PutObject, but the ingress-buffer findings narrow
+  what can be inferred about authorization timing. An alternate-account writer
+  flushes a 64 KiB signed prefix against its own private object; replacing it
+  with identical bytes and ETag under the bucket owner's private ACL before
+  body completion makes AWS return `403 AccessDenied`. Reversing that
+  transition also returns 403. However, a one-off attempt to extend the first
+  request to a 64 MiB prefix had its connection closed before crossing that
+  boundary, even before the replacement; the temporary helper did not retain
+  the response status. That direction therefore failed to establish an allowed
+  post-handoff start. The small-body 403 does not prove a current-object
+  authorization recheck; it can represent an initial denial whose response was
+  deferred while the body was buffered.
+
+  Reversing principals gave the bucket owner's request an unquestionably
+  allowed start and crossed the 64 MiB handoff before the alternate account
+  installed the same-ETag private object. That request returned 409 after body
+  completion, not 403, and left the alternate-owned replacement untouched.
+  This proves a late conditional generation conflict but does not prove late
+  ACL authorization. Do not implement current-object reauthorization from the
+  earlier 403 pair. Local's differing small-body statuses remain useful
+  observations, not evidence for the final capability model.
+
+  This is not ordinary PutObject authorization against the current object's
+  ACL. A settled alternate-account unconditional overwrite of a private
+  bucket-owner object succeeds on AWS and local when bucket ACL WRITE permits
+  it. A staged unconditional PUT that starts against an alternate-owned object,
+  is paused while the bucket owner installs a private replacement, and then
+  completes also succeeds and publishes an alternate-owned object on both.
+  Therefore a general commit-time reauthorization based on current object
+  owner/ACL would be incorrect. The established late behavior belongs to
+  conditional mutation/conflict semantics, not yet to authorization.
+
+  Repeat mutable bucket-policy cases for ObjectWriter rather than inferring
+  them from the bucket ACL result. Cover direct PutObject, streamed PutObject,
   aws-chunked PutObject, CopyObject, and POST Object independently, including
-  absent keys, live objects, and current delete markers. Do not change commit
-  authorization until this matrix identifies each operation's actual
-  authorization points.
+  absent keys, live objects, and current delete markers. Use object tag
+  conditions only on AWS actions for which they are evaluable; notably,
+  `s3:ExistingObjectTag/*` is policy-invalid for destination PutObject. Do not
+  change commit authorization until this matrix identifies each operation's
+  actual authorization points.
 - [ ] Probe CopyObject destination contention with the same destination-state
   and authorization matrix. Copy's source read creates a naturally longer
   interval between destination authorization and publication, so explicitly

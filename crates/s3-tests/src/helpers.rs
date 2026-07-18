@@ -1053,6 +1053,19 @@ pub struct PresignedRequest {
     headers: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedRequestHeaders {
+    headers: Vec<(String, String)>,
+}
+
+impl SignedRequestHeaders {
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
 impl PresignedRequest {
     pub fn uri(&self) -> &str {
         &self.uri
@@ -1376,6 +1389,109 @@ where
         .collect();
 
     PresignedRequest { uri, headers }
+}
+
+pub fn sign_request_headers_with_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    credentials: SignedRequestCredentials<'_>,
+) -> SignedRequestHeaders
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    sign_request_headers_for_service_with_credentials(
+        method,
+        url_str,
+        body,
+        extra_headers,
+        "s3",
+        credentials,
+        true,
+    )
+}
+
+fn sign_request_headers_for_service_with_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    service: &str,
+    credentials: SignedRequestCredentials<'_>,
+    include_host_signed_header: bool,
+) -> SignedRequestHeaders
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let parsed = url::Url::parse(url_str).expect("parse signed URL");
+    let path = parsed.path();
+    let query = normalize_query(parsed.query().unwrap_or(""));
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let amz_date = format_amz_date(secs);
+    let date_stamp = amz_date[..8].to_string();
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            if let Some(port) = parsed.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+        .expect("URL host");
+    let payload_hash = sha256_hex(body);
+
+    let mut request_headers: Vec<(String, String)> = vec![
+        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+        ("x-amz-date".to_string(), amz_date),
+    ];
+    if include_host_signed_header {
+        request_headers.push(("host".to_string(), host));
+    }
+    for (name, value) in extra_headers {
+        request_headers.push((name.as_ref().to_lowercase(), value.as_ref().to_string()));
+    }
+    let (signed_headers, canonical_headers) = canonicalize_request_headers(&mut request_headers);
+    let canonical_request =
+        format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+
+    let scope = format!("{date_stamp}/{}/{service}/aws4_request", credentials.region);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",
+        request_headers
+            .iter()
+            .find(|(name, _)| name == "x-amz-date")
+            .map(|(_, value)| value.as_str())
+            .expect("signed request contains x-amz-date"),
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = derive_signing_key_with_service(
+        credentials.secret_key,
+        &date_stamp,
+        credentials.region,
+        service,
+    );
+    let signature: String = hmac_sha256(&signing_key, string_to_sign.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+        credentials.access_key
+    );
+    request_headers.push(("authorization".to_string(), authorization));
+
+    SignedRequestHeaders {
+        headers: request_headers,
+    }
 }
 
 /// Send a raw signed S3 request, bypassing SDK auto-checksum behavior.
@@ -1845,17 +1961,7 @@ where
         credentials.tls_ca_pem,
         crate::configured_test_timeout(),
     );
-    let path = signed_parsed.path();
-    let query = normalize_query(signed_parsed.query().unwrap_or(""));
-
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let amz_date = format_amz_date(secs);
-    let date_stamp = &amz_date[..8];
-
-    let host = signed_parsed
+    let host_header = signed_parsed
         .host_str()
         .map(|host| {
             if let Some(port) = signed_parsed.port() {
@@ -1865,41 +1971,14 @@ where
             }
         })
         .expect("URL host");
-    let host_header = host.clone();
-    let payload_hash = sha256_hex(body);
-
-    let mut request_headers: Vec<(String, String)> = vec![
-        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-        ("x-amz-date".to_string(), amz_date.clone()),
-    ];
-    if include_host_signed_header {
-        request_headers.push(("host".to_string(), host));
-    }
-    for (name, value) in extra_headers {
-        request_headers.push((name.as_ref().to_lowercase(), value.as_ref().to_string()));
-    }
-    let (signed_headers, canonical_headers) = canonicalize_request_headers(&mut request_headers);
-    let canonical_request =
-        format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
-
-    let scope = format!("{date_stamp}/{}/{service}/aws4_request", credentials.region);
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
-        sha256_hex(canonical_request.as_bytes())
-    );
-    let signing_key = derive_signing_key_with_service(
-        credentials.secret_key,
-        date_stamp,
-        credentials.region,
+    let signed_request = sign_request_headers_for_service_with_credentials(
+        method,
+        signed_url_str,
+        body,
+        extra_headers,
         service,
-    );
-    let signature: String = hmac_sha256(&signing_key, string_to_sign.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-        credentials.access_key
+        credentials,
+        include_host_signed_header,
     );
 
     const MAX_SLOWDOWN_RETRIES: u32 = 4;
@@ -1908,14 +1987,9 @@ where
     let mut attempt = 0;
     loop {
         let response_result = if method == "HEAD" {
-            let mut request = agent
-                .head(connect_url_str)
-                .header("Authorization", &authorization)
-                .header("x-amz-date", &amz_date)
-                .header("Host", &host_header)
-                .header("x-amz-content-sha256", &payload_hash);
-            for (name, value) in &request_headers {
-                if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
+            let mut request = agent.head(connect_url_str).header("Host", &host_header);
+            for (name, value) in &signed_request.headers {
+                if name == "host" {
                     continue;
                 }
                 request = request.header(name, value);
@@ -1925,14 +1999,9 @@ where
             }
             request.call()
         } else if method == "GET" {
-            let mut request = agent
-                .get(connect_url_str)
-                .header("Authorization", &authorization)
-                .header("x-amz-date", &amz_date)
-                .header("Host", &host_header)
-                .header("x-amz-content-sha256", &payload_hash);
-            for (name, value) in &request_headers {
-                if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
+            let mut request = agent.get(connect_url_str).header("Host", &host_header);
+            for (name, value) in &signed_request.headers {
+                if name == "host" {
                     continue;
                 }
                 request = request.header(name, value);
@@ -1942,14 +2011,9 @@ where
             }
             request.call()
         } else if method == "DELETE" {
-            let mut request = agent
-                .delete(connect_url_str)
-                .header("Authorization", &authorization)
-                .header("x-amz-date", &amz_date)
-                .header("Host", &host_header)
-                .header("x-amz-content-sha256", &payload_hash);
-            for (name, value) in &request_headers {
-                if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
+            let mut request = agent.delete(connect_url_str).header("Host", &host_header);
+            for (name, value) in &signed_request.headers {
+                if name == "host" {
                     continue;
                 }
                 request = request.header(name, value);
@@ -1964,12 +2028,9 @@ where
                 "POST" => agent.post(connect_url_str),
                 other => agent.request(other, connect_url_str),
             }
-            .header("Authorization", &authorization)
-            .header("x-amz-date", &amz_date)
-            .header("Host", &host_header)
-            .header("x-amz-content-sha256", &payload_hash);
-            for (name, value) in &request_headers {
-                if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
+            .header("Host", &host_header);
+            for (name, value) in &signed_request.headers {
+                if name == "host" {
                     continue;
                 }
                 request = request.header(name, value);
