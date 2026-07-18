@@ -533,7 +533,7 @@ These assertions run against the embedded server on every
 `cargo nextest run` and against AWS via `./scripts/aws-tests`; the same
 expectations must hold on both endpoints, and tests never branch on the
 endpoint. The full conversion history is in
-plans/diff-test-consolidation-plan.md.
+plans/completed/diff-test-consolidation-plan.md.
 
 #### Writing a golden shape test
 

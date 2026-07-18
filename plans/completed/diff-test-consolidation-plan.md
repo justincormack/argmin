@@ -401,7 +401,7 @@ allows"/"explicit deny in a resource-based policy" variants belong to
 that wave), so message-level drift is expected elsewhere too — a
 periodic full `./scripts/aws-tests` run is the detector.
 
-### Phase 6 — expand shape coverage (the actual goal, open-ended)
+### Phase 6 — expand shape coverage (DONE)
 
 With helpers frozen and the old crate gone, adopt a convention for new and
 existing tests:
@@ -589,7 +589,9 @@ conditional (33), ownership (27), checksums (25), bucket_acl (22) —
 many of these sit next to now-golden tests and can be upgraded
 opportunistically when those files are touched.
 
-This phase is open-ended; track progress in this plan as batches land.
+All surveyed priority gaps are complete. Full-shape assertions remain the
+ongoing convention for new tests and opportunistic strengthening of existing
+weak assertions, rather than an unfinished work item in this plan.
 
 ## Risks and notes
 

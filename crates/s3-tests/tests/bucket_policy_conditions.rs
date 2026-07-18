@@ -1,5 +1,5 @@
 //! Bucket-policy condition scenario matrices, migrated from the standalone
-//! AWS-vs-local diff suite (see plans/diff-test-consolidation-plan.md).
+//! AWS-vs-local diff suite (see plans/completed/diff-test-consolidation-plan.md).
 //!
 //! Each scenario installs a policy, drives the operation with the alternate
 //! (non-owner) client, and asserts the golden Allow/Reject outcome; the same
