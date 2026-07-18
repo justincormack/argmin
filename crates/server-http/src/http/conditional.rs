@@ -13,10 +13,12 @@ use crate::http::response::parse_http_date;
 /// Extract read conditions from an S3 request's headers.
 pub fn read_condition_from_headers(req: &S3Request) -> ReadCondition {
     ReadCondition {
-        if_match: req.header("if-match").map(EtagMatchList::from_header_value),
+        if_match: req
+            .header("if-match")
+            .map(|_| EtagMatchList::from_header_values(req.header_values("if-match"))),
         if_none_match: req
             .header("if-none-match")
-            .map(EtagMatchList::from_header_value),
+            .map(|_| EtagMatchList::from_header_values(req.header_values("if-none-match"))),
         if_modified_since: req.header("if-modified-since").and_then(parse_http_date),
         if_unmodified_since: req.header("if-unmodified-since").and_then(parse_http_date),
     }
@@ -91,8 +93,19 @@ pub fn delete_condition_from_headers(req: &S3Request) -> Result<DeleteCondition,
                 .to_string(),
         });
     }
+    if req.header_count("if-match") > 1 {
+        return Err(ServerError::InvalidRequest {
+            reason: "Duplicate header name found: If-Match".to_string(),
+        });
+    }
+    if req
+        .header("if-match")
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(ServerError::DeleteObjectEmptyIfMatch);
+    }
     Ok(match req.header("if-match") {
-        Some(val) => DeleteCondition::IfMatch(EtagMatchList::from_header_value(val)),
+        Some(val) => DeleteCondition::IfMatch(EtagMatchList::from_delete_header_value(val)),
         None => DeleteCondition::None,
     })
 }
@@ -100,12 +113,12 @@ pub fn delete_condition_from_headers(req: &S3Request) -> Result<DeleteCondition,
 /// Extract copy-source conditions from an S3 request's `x-amz-copy-source-if-*` headers.
 pub fn copy_source_condition_from_headers(req: &S3Request) -> ReadCondition {
     ReadCondition {
-        if_match: req
-            .header("x-amz-copy-source-if-match")
-            .map(EtagMatchList::from_header_value),
-        if_none_match: req
-            .header("x-amz-copy-source-if-none-match")
-            .map(EtagMatchList::from_header_value),
+        if_match: req.header("x-amz-copy-source-if-match").map(|_| {
+            EtagMatchList::from_header_values(req.header_values("x-amz-copy-source-if-match"))
+        }),
+        if_none_match: req.header("x-amz-copy-source-if-none-match").map(|_| {
+            EtagMatchList::from_header_values(req.header_values("x-amz-copy-source-if-none-match"))
+        }),
         if_modified_since: req
             .header("x-amz-copy-source-if-modified-since")
             .and_then(parse_http_date),
@@ -134,6 +147,32 @@ mod tests {
             vec![],
             0,
         )
+    }
+
+    #[test]
+    fn read_repeated_etag_headers_extend_one_match_list() {
+        let req = make_req_with_headers(vec![
+            ("if-match", "\"wrong\""),
+            ("if-match", "\"matching\""),
+            ("if-none-match", "\"matching\""),
+            ("if-none-match", "\"wrong\""),
+        ]);
+        let cond = read_condition_from_headers(&req);
+        assert!(cond.if_match.unwrap().matches("\"matching\""));
+        assert!(cond.if_none_match.unwrap().matches("\"matching\""));
+    }
+
+    #[test]
+    fn copy_source_repeated_etag_headers_extend_one_match_list() {
+        let req = make_req_with_headers(vec![
+            ("x-amz-copy-source-if-match", "\"wrong\""),
+            ("x-amz-copy-source-if-match", "\"matching\""),
+            ("x-amz-copy-source-if-none-match", "\"matching\""),
+            ("x-amz-copy-source-if-none-match", "\"wrong\""),
+        ]);
+        let cond = copy_source_condition_from_headers(&req);
+        assert!(cond.if_match.unwrap().matches("\"matching\""));
+        assert!(cond.if_none_match.unwrap().matches("\"matching\""));
     }
 
     // ── Write condition validation (501 rejection) ────────────────────

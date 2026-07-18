@@ -221,6 +221,12 @@ impl S3Request {
         })
     }
 
+    pub fn header_values(&self, name: &str) -> impl Iterator<Item = &str> {
+        self.headers.get_all(name).iter().map(|value| {
+            std::str::from_utf8(value.as_bytes()).expect("S3Request stores only validated UTF-8")
+        })
+    }
+
     #[must_use]
     pub fn header_count(&self, name: &str) -> usize {
         self.headers.get_all(name).iter().count()

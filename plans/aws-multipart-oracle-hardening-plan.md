@@ -619,11 +619,41 @@ choice.
   results and final state. The local implementation already re-runs current
   object authorization and the ETag condition inside one storage callback;
   deterministic regressions must prove that invariant under replacement.
-- [ ] Add the remaining conditional input and precedence matrix for operations
+- [x] Add the remaining conditional input and precedence matrix for operations
   that accept ETag lists or dates: weak and unquoted tags, wildcard/list forms,
   duplicate headers, malformed dates, missing objects, authorization failures,
   and GET/HEAD combined-condition ordering. Only retain parser behavior after
   it has been observed on AWS.
+
+  The GET/HEAD slice is now oracle-pinned. AWS treats matching weak and
+  unquoted ETags as matches, accepts comma lists, and combines repeated
+  `If-Match` or `If-None-Match` field lines into one list regardless of field
+  order. Empty `If-Match` returns 412, while empty `If-None-Match` and malformed
+  conditional dates are ignored. Missing keys return `NoSuchKey` before
+  condition evaluation for an authorized principal; an unauthorized principal
+  receives `AccessDenied` for both existing and missing keys regardless of
+  matching ETag conditions. GET and HEAD share the same status and precedence
+  matrix, including ETag conditions suppressing their paired date conditions
+  and `If-Match` failure taking priority over `If-None-Match`.
+
+  CopyObject source conditions follow the same grammar: weak/unquoted matches,
+  comma lists, repeated field-line combination, empty values, and malformed
+  dates select the analogous success or 412 branch. Every successful case
+  copies the exact source bytes, while every rejection leaves its unique
+  destination absent.
+
+  DeleteObject deliberately differs. Its `If-Match` accepts one unquoted or
+  quoted ETag or the raw `*` wildcard. A weak tag and a comma list both fail
+  with 412 even when they contain the current ETag; repeated `If-Match` field
+  lines return `400 InvalidRequest`, and an empty value returns
+  `400 InvalidArgument` with `ArgumentName` `If-Match`. Every rejected case
+  retains the exact object bytes and every 204 case removes the object.
+
+  Local now combines repeated read and copy-source condition headers and
+  implements AWS's weak ETag equivalence only in GET/HEAD and CopyObject source
+  evaluation. DeleteObject uses its separately pinned single-value grammar;
+  DeleteObjects XML `<ETag>` remains an exact object-identifier field rather
+  than HTTP conditional-header syntax.
 - [ ] Bound streamed PutObject/CopyObject stale-finalization retries. Direct PUT
   already has a retry/deadline budget, while the streamed finalizer currently
   loops on `StaleStreamFinalizeSnapshot`. After the public contention oracle is

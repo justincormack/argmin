@@ -9,9 +9,9 @@ use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
-    raw_object_with,
+    raw_alt_object_request, raw_object_with,
     shape::{assert_shape, error_response_headers, expected_error, shape},
-    unique_bucket, SendRetryingOperationAborted, CTX,
+    unique_bucket, RawAltObjectRequest, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -4682,6 +4682,484 @@ fn test_delete_object_version_if_match_not_implemented() {
         assert_eq!(&data[..], b"hello");
 
         cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_read_conditional_header_grammar_matrix() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "read-condition-grammar";
+        let etag = put_object(&bucket, key, b"conditional grammar").await;
+        let unquoted_etag = etag.trim_matches('"').to_string();
+        let weak_etag = format!("W/{etag}");
+        let wrong_etag = "\"00000000000000000000000000000000\"";
+        let list = format!("{wrong_etag}, {etag}");
+
+        let owned_cases = [
+            ("if-match-weak", vec![("If-Match", weak_etag.as_str())], 200),
+            (
+                "if-match-unquoted",
+                vec![("If-Match", unquoted_etag.as_str())],
+                200,
+            ),
+            ("if-match-list", vec![("If-Match", list.as_str())], 200),
+            (
+                "if-match-duplicate-wrong-first",
+                vec![("If-Match", wrong_etag), ("If-Match", etag.as_str())],
+                200,
+            ),
+            (
+                "if-match-duplicate-match-first",
+                vec![("If-Match", etag.as_str()), ("If-Match", wrong_etag)],
+                200,
+            ),
+            (
+                "if-none-match-weak",
+                vec![("If-None-Match", weak_etag.as_str())],
+                304,
+            ),
+            (
+                "if-none-match-unquoted",
+                vec![("If-None-Match", unquoted_etag.as_str())],
+                304,
+            ),
+            (
+                "if-none-match-list",
+                vec![("If-None-Match", list.as_str())],
+                304,
+            ),
+            (
+                "if-none-match-duplicate-wrong-first",
+                vec![
+                    ("If-None-Match", wrong_etag),
+                    ("If-None-Match", etag.as_str()),
+                ],
+                304,
+            ),
+            (
+                "if-none-match-duplicate-match-first",
+                vec![
+                    ("If-None-Match", etag.as_str()),
+                    ("If-None-Match", wrong_etag),
+                ],
+                304,
+            ),
+            ("if-match-empty", vec![("If-Match", "")], 412),
+            ("if-none-match-empty", vec![("If-None-Match", "")], 200),
+            (
+                "if-modified-since-malformed",
+                vec![("If-Modified-Since", "not-a-date")],
+                200,
+            ),
+            (
+                "if-unmodified-since-malformed",
+                vec![("If-Unmodified-Since", "not-a-date")],
+                200,
+            ),
+        ];
+
+        for method in ["GET", "HEAD"] {
+            for (name, headers, expected_status) in &owned_cases {
+                let response = raw_object_with(method, &bucket, key, b"", headers);
+                assert_eq!(
+                    response.status, *expected_status,
+                    "{method} {name}: {response:?}"
+                );
+                if method == "GET" && *expected_status == 200 {
+                    assert_eq!(response.body, "conditional grammar", "{name}");
+                }
+                if method == "HEAD" || *expected_status == 304 {
+                    assert!(response.body.is_empty(), "{method} {name}: {response:?}");
+                }
+            }
+        }
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_read_conditional_missing_and_auth_precedence() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "read-condition-auth";
+        let missing_key = "read-condition-missing";
+        let etag = put_object(&bucket, key, b"conditional authorization").await;
+        let primary_cases = [
+            ("if-match-star", vec![("If-Match", "*")]),
+            ("if-none-match-star", vec![("If-None-Match", "*")]),
+            (
+                "if-modified-since",
+                vec![("If-Modified-Since", "Thu, 01 Jan 1970 00:00:00 GMT")],
+            ),
+            (
+                "if-unmodified-since",
+                vec![("If-Unmodified-Since", "Mon, 01 Jan 2100 00:00:00 GMT")],
+            ),
+        ];
+        let alt_cases = [
+            ("no-condition", Vec::new()),
+            ("matching-if-match", vec![("If-Match", etag.as_str())]),
+            (
+                "matching-if-none-match",
+                vec![("If-None-Match", etag.as_str())],
+            ),
+        ];
+
+        for method in ["GET", "HEAD"] {
+            let canary = raw_object_with(method, &bucket, key, b"", &[]);
+            assert_eq!(
+                canary.status, 200,
+                "{method} positive read canary: {canary:?}"
+            );
+            if method == "GET" {
+                assert_eq!(canary.body, "conditional authorization");
+            } else {
+                assert!(canary.body.is_empty());
+            }
+
+            for (name, headers) in &primary_cases {
+                let response = raw_object_with(method, &bucket, missing_key, b"", headers);
+                assert_eq!(
+                    response.status, 404,
+                    "primary missing {method} {name}: {response:?}"
+                );
+                if method == "GET" {
+                    assert_eq!(
+                        s3_tests::shape::xml_tag_text(&response.body, "Code"),
+                        Some("NoSuchKey"),
+                        "{name}: {response:?}"
+                    );
+                } else {
+                    assert!(response.body.is_empty(), "{name}: {response:?}");
+                }
+            }
+            for target_key in [key, missing_key] {
+                for (name, headers) in &alt_cases {
+                    let response = raw_alt_object_request(
+                        RawAltObjectRequest::new(method, &bucket, target_key)
+                            .extra_headers(headers),
+                    );
+                    assert_eq!(
+                        response.status, 403,
+                        "alternate {target_key} {method} {name}: {response:?}"
+                    );
+                    if method == "GET" {
+                        assert_eq!(
+                            s3_tests::shape::xml_tag_text(&response.body, "Code"),
+                            Some("AccessDenied"),
+                            "{target_key} {name}: {response:?}"
+                        );
+                    } else {
+                        assert!(
+                            response.body.is_empty(),
+                            "{target_key} {name}: {response:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_read_conditional_combined_header_precedence_matrix() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "read-condition-precedence";
+        let etag = put_object(&bucket, key, b"conditional precedence").await;
+        let wrong_etag = "\"00000000000000000000000000000000\"";
+        let past = "Thu, 01 Jan 1970 00:00:00 GMT";
+        let future = "Mon, 01 Jan 2100 00:00:00 GMT";
+        let cases = [
+            (
+                "if-match-failure-wins-over-passing-unmodified-since",
+                vec![("If-Match", wrong_etag), ("If-Unmodified-Since", future)],
+                412,
+            ),
+            (
+                "if-match-success-suppresses-failing-unmodified-since",
+                vec![("If-Match", etag.as_str()), ("If-Unmodified-Since", past)],
+                200,
+            ),
+            (
+                "if-none-match-success-wins-over-modified-since",
+                vec![
+                    ("If-None-Match", etag.as_str()),
+                    ("If-Modified-Since", past),
+                ],
+                304,
+            ),
+            (
+                "if-none-match-failure-suppresses-future-modified-since",
+                vec![("If-None-Match", wrong_etag), ("If-Modified-Since", future)],
+                200,
+            ),
+            (
+                "if-match-failure-wins-over-if-none-match-success",
+                vec![("If-Match", wrong_etag), ("If-None-Match", etag.as_str())],
+                412,
+            ),
+            (
+                "matching-if-none-match-follows-matching-if-match",
+                vec![
+                    ("If-Match", etag.as_str()),
+                    ("If-None-Match", etag.as_str()),
+                ],
+                304,
+            ),
+            (
+                "both-etag-conditions-pass",
+                vec![("If-Match", etag.as_str()), ("If-None-Match", wrong_etag)],
+                200,
+            ),
+            (
+                "if-match-failure-wins-when-both-etag-conditions-fail",
+                vec![("If-Match", wrong_etag), ("If-None-Match", wrong_etag)],
+                412,
+            ),
+            (
+                "unmodified-since-failure-wins-over-modified-since",
+                vec![("If-Unmodified-Since", past), ("If-Modified-Since", past)],
+                412,
+            ),
+            (
+                "both-date-conditions-pass",
+                vec![
+                    ("If-Unmodified-Since", future),
+                    ("If-Modified-Since", future),
+                ],
+                200,
+            ),
+        ];
+
+        for method in ["GET", "HEAD"] {
+            for (name, headers, expected_status) in &cases {
+                let response = raw_object_with(method, &bucket, key, b"", headers);
+                assert_eq!(
+                    response.status, *expected_status,
+                    "{method} {name}: {response:?}"
+                );
+                if method == "GET" && *expected_status == 200 {
+                    assert_eq!(response.body, "conditional precedence", "{name}");
+                }
+                if method == "HEAD" || *expected_status == 304 {
+                    assert!(response.body.is_empty(), "{method} {name}: {response:?}");
+                }
+            }
+        }
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_copy_source_conditional_header_grammar_matrix() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let source_key = "copy-condition-grammar-source";
+        let etag = put_object(&bucket, source_key, b"copy conditional grammar").await;
+        let unquoted_etag = etag.trim_matches('"').to_string();
+        let weak_etag = format!("W/{etag}");
+        let wrong_etag = "\"00000000000000000000000000000000\"";
+        let list = format!("{wrong_etag}, {etag}");
+        let copy_source = format!("{bucket}/{source_key}");
+        let cases = [
+            (
+                "if-match-weak",
+                vec![("x-amz-copy-source-if-match", weak_etag.as_str())],
+                200,
+            ),
+            (
+                "if-match-unquoted",
+                vec![("x-amz-copy-source-if-match", unquoted_etag.as_str())],
+                200,
+            ),
+            (
+                "if-match-list",
+                vec![("x-amz-copy-source-if-match", list.as_str())],
+                200,
+            ),
+            (
+                "if-match-duplicate-wrong-first",
+                vec![
+                    ("x-amz-copy-source-if-match", wrong_etag),
+                    ("x-amz-copy-source-if-match", etag.as_str()),
+                ],
+                200,
+            ),
+            (
+                "if-match-duplicate-match-first",
+                vec![
+                    ("x-amz-copy-source-if-match", etag.as_str()),
+                    ("x-amz-copy-source-if-match", wrong_etag),
+                ],
+                200,
+            ),
+            (
+                "if-none-match-weak",
+                vec![("x-amz-copy-source-if-none-match", weak_etag.as_str())],
+                412,
+            ),
+            (
+                "if-none-match-unquoted",
+                vec![("x-amz-copy-source-if-none-match", unquoted_etag.as_str())],
+                412,
+            ),
+            (
+                "if-none-match-list",
+                vec![("x-amz-copy-source-if-none-match", list.as_str())],
+                412,
+            ),
+            (
+                "if-none-match-duplicate-wrong-first",
+                vec![
+                    ("x-amz-copy-source-if-none-match", wrong_etag),
+                    ("x-amz-copy-source-if-none-match", etag.as_str()),
+                ],
+                412,
+            ),
+            (
+                "if-none-match-duplicate-match-first",
+                vec![
+                    ("x-amz-copy-source-if-none-match", etag.as_str()),
+                    ("x-amz-copy-source-if-none-match", wrong_etag),
+                ],
+                412,
+            ),
+            (
+                "if-match-empty",
+                vec![("x-amz-copy-source-if-match", "")],
+                412,
+            ),
+            (
+                "if-none-match-empty",
+                vec![("x-amz-copy-source-if-none-match", "")],
+                200,
+            ),
+            (
+                "if-modified-since-malformed",
+                vec![("x-amz-copy-source-if-modified-since", "not-a-date")],
+                200,
+            ),
+            (
+                "if-unmodified-since-malformed",
+                vec![("x-amz-copy-source-if-unmodified-since", "not-a-date")],
+                200,
+            ),
+        ];
+        let mut destination_keys = Vec::new();
+
+        for (index, (name, conditional_headers, expected_status)) in cases.iter().enumerate() {
+            let destination_key = format!("copy-condition-grammar-{index}");
+            let mut headers = vec![("x-amz-copy-source", copy_source.as_str())];
+            headers.extend(conditional_headers.iter().copied());
+            let response = raw_object_with("PUT", &bucket, &destination_key, b"", &headers);
+            assert_eq!(
+                response.status, *expected_status,
+                "CopyObject {name}: {response:?}"
+            );
+            let copied = CTX
+                .client()
+                .get_object()
+                .bucket(&bucket)
+                .key(&destination_key)
+                .send()
+                .await;
+            if *expected_status == 200 {
+                let body = copied.unwrap().body.collect().await.unwrap().into_bytes();
+                assert_eq!(&body[..], b"copy conditional grammar", "{name}");
+            } else {
+                assert_eq!(err_status(&copied), 404, "{name}: {copied:?}");
+            }
+            destination_keys.push(destination_key);
+        }
+
+        let mut cleanup_keys = vec![source_key];
+        cleanup_keys.extend(destination_keys.iter().map(String::as_str));
+        cleanup(&bucket, &cleanup_keys).await;
+    });
+}
+
+#[test]
+fn test_delete_conditional_header_grammar_matrix() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let body = b"delete conditional grammar";
+        let wrong_etag = "\"00000000000000000000000000000000\"";
+        let expected = [
+            (412, Some("PreconditionFailed")),
+            (204, None),
+            (412, Some("PreconditionFailed")),
+            (400, Some("InvalidRequest")),
+            (400, Some("InvalidRequest")),
+            (400, Some("InvalidArgument")),
+            (204, None),
+            (412, Some("PreconditionFailed")),
+        ];
+        let mut keys = Vec::new();
+
+        for (case_index, (expected_status, expected_code)) in expected.into_iter().enumerate() {
+            let key = format!("delete-condition-grammar-{case_index}");
+            let etag = put_object(&bucket, &key, body).await;
+            let unquoted_etag = etag.trim_matches('"').to_string();
+            let weak_etag = format!("W/{etag}");
+            let list = format!("{wrong_etag}, {etag}");
+            let headers = match case_index {
+                0 => vec![("If-Match", weak_etag.as_str())],
+                1 => vec![("If-Match", unquoted_etag.as_str())],
+                2 => vec![("If-Match", list.as_str())],
+                3 => vec![("If-Match", wrong_etag), ("If-Match", etag.as_str())],
+                4 => vec![("If-Match", etag.as_str()), ("If-Match", wrong_etag)],
+                5 => vec![("If-Match", "")],
+                6 => vec![("If-Match", "*")],
+                7 => vec![("If-Match", wrong_etag)],
+                _ => unreachable!(),
+            };
+            let response = raw_object_with("DELETE", &bucket, &key, b"", &headers);
+            assert_eq!(
+                response.status, expected_status,
+                "DeleteObject grammar case {case_index}: {response:?}"
+            );
+            assert_eq!(
+                s3_tests::shape::xml_tag_text(&response.body, "Code"),
+                expected_code,
+                "DeleteObject grammar case {case_index}: {response:?}"
+            );
+            if case_index == 5 {
+                assert_shape(
+                    "DeleteObject empty If-Match",
+                    &response,
+                    &shape()
+                        .status(400)
+                        .headers(error_response_headers())
+                        .body(expected_error::invalid_argument(
+                            "The value provided for the If-Match query parameter cannot be empty for this API.",
+                            "If-Match",
+                        )),
+                );
+            }
+            let current = CTX
+                .client()
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await;
+            if expected_status == 204 {
+                assert_eq!(err_status(&current), 404, "case {case_index}: {current:?}");
+            } else {
+                let current_body = current.unwrap().body.collect().await.unwrap().into_bytes();
+                assert_eq!(&current_body[..], body, "case {case_index}");
+            }
+            keys.push(key);
+        }
+
+        let cleanup_keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        cleanup(&bucket, &cleanup_keys).await;
     });
 }
 

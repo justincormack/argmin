@@ -63,15 +63,32 @@ impl EtagMatchList {
     /// Parse a raw header value into wildcard/specific match tokens.
     #[must_use]
     pub fn from_header_value(value: &str) -> Self {
-        let trimmed = value.trim();
-        if trimmed == "*" {
-            return Self(vec![EtagMatchToken::Any]);
-        }
+        Self::from_header_values(std::iter::once(value))
+    }
 
+    /// Parse the restricted single-value `DeleteObject` `If-Match` grammar.
+    #[must_use]
+    pub fn from_delete_header_value(value: &str) -> Self {
+        let value = value.trim();
+        if value == "*" {
+            Self(vec![EtagMatchToken::Any])
+        } else {
+            Self(vec![EtagMatchToken::Specific(
+                SpecificEtag::new(value.to_string())
+                    .expect("DeleteObject wildcard handled before specific ETag construction"),
+            )])
+        }
+    }
+
+    /// Parse every field line of a potentially repeated conditional header.
+    ///
+    /// HTTP defines these entity-tag fields as comma lists, so repeated field
+    /// lines extend the same logical list rather than selecting one value.
+    pub fn from_header_values<'a>(values: impl IntoIterator<Item = &'a str>) -> Self {
         Self(
-            trimmed
-                .split(',')
-                .map(str::trim)
+            values
+                .into_iter()
+                .flat_map(|value| value.trim().split(',').map(str::trim))
                 .map(|entry| {
                     if entry == "*" {
                         EtagMatchToken::Any
@@ -91,6 +108,16 @@ impl EtagMatchList {
         self.0.iter().any(|token| match token {
             EtagMatchToken::Any => true,
             EtagMatchToken::Specific(etag) => etag_matches_one(etag.as_str(), object_etag),
+        })
+    }
+
+    fn matches_read(&self, object_etag: &str) -> bool {
+        self.0.iter().any(|token| match token {
+            EtagMatchToken::Any => true,
+            EtagMatchToken::Specific(etag) => {
+                let value = etag.as_str().strip_prefix("W/").unwrap_or(etag.as_str());
+                etag_matches_one(value, object_etag)
+            }
         })
     }
 }
@@ -203,7 +230,7 @@ pub fn check_read_conditions(
 ) -> Result<(), ServerError> {
     // Step 1: If-Match — `*` always passes, otherwise 412 if no etag in list matches
     if let Some(ref required) = cond.if_match {
-        if !required.matches(etag) {
+        if !required.matches_read(etag) {
             return Err(ServerError::PreconditionFailed {
                 condition: "If-Match",
             });
@@ -224,7 +251,7 @@ pub fn check_read_conditions(
 
     // Step 3: If-None-Match — `*` always triggers 304, otherwise 304 if any etag matches
     if let Some(ref unwanted) = cond.if_none_match {
-        if unwanted.matches(etag) {
+        if unwanted.matches_read(etag) {
             return Err(ServerError::NotModified {
                 etag: etag.to_string(),
                 last_modified,
@@ -335,7 +362,7 @@ pub fn check_copy_source_conditions(
 ) -> Result<(), ServerError> {
     // Step 1: If-Match
     if let Some(ref required) = cond.if_match {
-        if !required.matches(etag) {
+        if !required.matches_read(etag) {
             return Err(ServerError::PreconditionFailed {
                 condition: "x-amz-copy-source-If-Match",
             });
@@ -356,7 +383,7 @@ pub fn check_copy_source_conditions(
 
     // Step 3: If-None-Match — returns 412 (not 304)
     if let Some(ref unwanted) = cond.if_none_match {
-        if unwanted.matches(etag) {
+        if unwanted.matches_read(etag) {
             return Err(ServerError::PreconditionFailed {
                 condition: "x-amz-copy-source-If-None-Match",
             });
@@ -546,6 +573,35 @@ mod tests {
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed { .. }));
+    }
+
+    #[test]
+    fn read_like_conditions_treat_weak_etags_as_aws_equivalent_without_generalizing_delete() {
+        let weak = format!("W/{}", test_etag());
+        let list = EtagMatchList::from_header_value(&weak);
+        assert!(
+            !list.matches(&test_etag()),
+            "generic matching remains strict until delete behavior is oracle-pinned"
+        );
+
+        let if_match = ReadCondition {
+            if_match: Some(list.clone()),
+            ..Default::default()
+        };
+        assert!(check_read_conditions(&if_match, &test_etag(), 1000).is_ok());
+
+        let if_none_match = ReadCondition {
+            if_none_match: Some(list),
+            ..Default::default()
+        };
+        assert!(matches!(
+            check_read_conditions(&if_none_match, &test_etag(), 1000),
+            Err(ServerError::NotModified { .. })
+        ));
+        assert!(matches!(
+            check_copy_source_conditions(&if_none_match, &test_etag(), 1000),
+            Err(ServerError::PreconditionFailed { .. })
+        ));
     }
 
     // ── Write conditions ──────────────────────────────────────────────

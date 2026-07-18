@@ -464,6 +464,10 @@ fn client_error_message(err: &ServerError) -> String {
             "The value provided for the If-Match query parameter cannot be empty for this API."
                 .to_string()
         }
+        ServerError::DeleteObjectEmptyIfMatch => {
+            "The value provided for the If-Match query parameter cannot be empty for this API."
+                .to_string()
+        }
         ServerError::CompleteMultipartIfNoneMatchNotImplemented => {
             "A header you provided implies functionality that is not implemented".to_string()
         }
@@ -1307,6 +1311,16 @@ impl S3Response {
             }
             ServerError::CompleteMultipartEmptyIfMatch => {
                 let body = xml::invalid_argument_error_xml_no_decl(
+                    &client_error_message(err),
+                    "If-Match",
+                    None,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::DeleteObjectEmptyIfMatch => {
+                let body = xml::invalid_argument_error_xml(
                     &client_error_message(err),
                     "If-Match",
                     None,

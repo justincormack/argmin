@@ -358,6 +358,9 @@ pub enum ServerError {
     #[error("CompleteMultipartUpload If-Match value is empty")]
     CompleteMultipartEmptyIfMatch,
 
+    #[error("DeleteObject If-Match value is empty")]
+    DeleteObjectEmptyIfMatch,
+
     #[error("CompleteMultipartUpload does not support this If-None-Match value")]
     CompleteMultipartIfNoneMatchNotImplemented,
 
@@ -630,9 +633,9 @@ impl ServerError {
             Self::CompleteMultipartMissingPartChecksum { .. }
             | Self::CompleteMultipartChecksumHeaderInvalid { .. }
             | Self::CompleteMultipartExpectedSizeHeaderInvalid { .. } => "InvalidRequest",
-            Self::CompleteMultipartEmptyIfMatch | Self::CompleteMultipartTooManyParts => {
-                "InvalidArgument"
-            }
+            Self::CompleteMultipartEmptyIfMatch
+            | Self::DeleteObjectEmptyIfMatch
+            | Self::CompleteMultipartTooManyParts => "InvalidArgument",
             Self::UploadPartCopyInvalidRange { .. } => "InvalidArgument",
             Self::UploadPartCopyPreconditionFailed { .. } => "PreconditionFailed",
             Self::EntityTooSmall { .. } => "EntityTooSmall",
@@ -723,6 +726,7 @@ impl ServerError {
             | Self::CompleteMultipartMissingPartChecksum { .. }
             | Self::CompleteMultipartChecksumHeaderInvalid { .. }
             | Self::CompleteMultipartEmptyIfMatch
+            | Self::DeleteObjectEmptyIfMatch
             | Self::CompleteMultipartTooManyParts
             | Self::CompleteMultipartExpectedSizeHeaderInvalid { .. }
             | Self::UploadPartCopyInvalidRange { .. }
