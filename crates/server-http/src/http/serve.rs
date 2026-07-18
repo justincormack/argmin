@@ -688,18 +688,20 @@ async fn serve_connection<IO>(
             }),
         );
     // Lingering close: take the IO back from hyper instead of letting it
-    // shut down the socket the moment the connection is done. Closing a
-    // socket that still holds unread request bytes makes the kernel send
-    // RST rather than FIN, and an RST discards response data the client
-    // has buffered but not yet read — losing, for example, the error body
-    // of a rejected streaming upload the client is still sending. Drain
-    // and discard whatever the client keeps sending until it goes quiet,
-    // reaches EOF, or exceeds the bound, then shut down cleanly.
+    // close the socket the moment the connection is done. Closing a socket
+    // that still holds unread request bytes makes the kernel send RST, which
+    // can discard response data the client has not yet read. First shut down
+    // the response side, after Hyper has finished writing it, then drain and
+    // discard whatever the client keeps sending until it goes quiet, reaches
+    // EOF, or exceeds the bound. Keeping the read side alive during that
+    // interval prevents the eventual socket close from replacing the
+    // completed response with a reset.
     let Ok(mut parts) = conn.without_shutdown().await else {
         return;
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let io = parts.io.inner_mut();
+    let _ = io.shutdown().await;
     let deadline = tokio::time::Instant::now() + LINGERING_CLOSE_MAX;
     let mut discard = [0u8; 8192];
     loop {
@@ -717,7 +719,6 @@ async fn serve_connection<IO>(
             Err(_) => break,
         }
     }
-    let _ = io.shutdown().await;
 }
 
 /// Handle a single HTTP request: parse, route streaming writes, or buffer body
