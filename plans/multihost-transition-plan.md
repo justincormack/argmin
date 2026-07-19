@@ -11419,13 +11419,36 @@ Required production shape and implementation order:
    captured view is serialized and synced. Recovery reconstructs the same
    state from checkpoint plus its durable journal suffix; the checkpoint base
    alone is never treated as the current read state.
-   Progress (2026-07-17): the single-authority command path checkpoints and
-   compacts at 4,096 journaled commands or 64 MiB, with low-bound tests for
-   both triggers. The remaining slice is the 59.9-second background trigger,
-   immutable capture/persist split, and checkpoint observability/release gate.
-   Until that lands, threshold-triggered snapshot formatting and fsync still
-   run synchronously through the single-authority mutation boundary, so this
-   item is not closed.
+   Progress (2026-07-19): the single-authority command path no longer performs
+   threshold checkpoint I/O synchronously. It records the first uncheckpointed
+   mutation plus exact framed command bytes, and a 100 ms process monitor
+   captures after 4,096 journaled commands, 64 MiB, or 59.9 seconds. Capture
+   clones one immutable durable snapshot and its exact journal chain/offset
+   while holding the authority mutex; formatting, snapshot and directory sync,
+   checkpoint anchoring, publication, and journal compaction happen after that
+   mutex is released.
+   Commands appended after capture remain a durable suffix. Publication
+   atomically replaces the captured journal prefix with the new checkpoint
+   anchor, rebases every concurrently appended command-chain record over that
+   anchor, and retains the suffix for replay. Capture uses the guarded,
+   incrementally maintained logical clean offset rather than scanning the
+   journal under the authority mutex. A retained suffix inherits the
+   conservative capture timestamp, so checkpoint work cannot extend its
+   maximum uncheckpointed age. The prepared snapshot is
+   directory-synced before the replacement journal, so either side of every
+   crash boundary has a matching snapshot/anchor pair. Checkpoint tokens are
+   store-instance-bound and generation-checked; stale or foreign tokens fail
+   before filesystem mutation and do not poison a healthy store. Any failure
+   after durable journal replacement latches durability poison before
+   releasing the guarded publication state, so a waiting command cannot append
+   against the superseded chain. All checkpoint publishers share one
+   store-owned publication gate.
+   Focused release tests pin command, byte, and time triggers, persistence
+   without the authority mutex, post-capture suffix recovery, stale/foreign
+   rejection, and physical snapshot/journal compaction accounting. Process
+   monitor failure is fail-stop. The remaining work in this blocker is the
+   cross-host dedicated-device quantitative run after the earlier static
+   config/authenticated-TCP slice, not synchronous standalone checkpointing.
 6. Apply the same rule to OpenRaft durability. The former
    checkpoint-before-ordinary-peer-response path was a conservative Phase 12.4
    correctness step, not the production endpoint. Before cutover, the
@@ -12185,6 +12208,23 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   blocker above before replicated-mode production cutover. TCP/auth/config work
   may proceed in parallel, but it must not cause the expensive
   checkpoint/heartbeat shape to become the production default by accident.
+- Finish the bounded standalone checkpoint slice first, then move the initial
+  static cluster configuration file and authenticated TCP control-plane
+  transports ahead of the dedicated-device quantitative release gate. The
+  reference workload needs one authority and one real durability device per
+  host to measure fsync, checkpoint, WAL, and network costs without pretending
+  that several logical authorities sharing one disk represent the production
+  failure-domain or capacity model. This earlier TCP slice remains static:
+  cluster identity, node ids, endpoints, state paths, credentials, and bounded
+  transport policy only. It does not pull dynamic topology activation, storage
+  expansion, or Raft membership evolution forward.
+- After static authenticated TCP Raft and control-plane RPCs exist, run the
+  116-PG/256-retained-epoch reference workload across at least three hosts with
+  independently persisted authority state. Keep the existing tmpfs and
+  shared-disk runs as CPU/locking and overload profiles, respectively; neither
+  substitutes for the per-host durable-write profile. Add authenticated
+  storage RPC over Unix and then TCP before treating the workload as a complete
+  multihost data-plane release gate.
 - Add shared authenticated test helpers first, in
   [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
   so all replicated process and UAT tests can configure authenticated Unix

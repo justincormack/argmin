@@ -100,6 +100,7 @@ const SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKPOINT: u8 = 1;
 const SINGLE_AUTHORITY_JOURNAL_RECORD_COMMAND: u8 = 2;
 const SINGLE_AUTHORITY_JOURNAL_CHECKPOINT_COMMAND_LIMIT: u64 = 4_096;
 const SINGLE_AUTHORITY_JOURNAL_CHECKPOINT_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+const SINGLE_AUTHORITY_JOURNAL_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(59_900);
 
 fn non_serving_runtime_map_validity(now_ms: u64) -> RouteMapValidity {
     RouteMapValidity::until_ms_saturating(now_ms.saturating_add(MAX_HEARTBEAT_LEASE_MS))
@@ -6881,7 +6882,11 @@ struct FileControlPlaneStoreDurability {
     initialized: bool,
     initial_identity_created: bool,
     poisoned: Option<String>,
+    journal_clean_offset: u64,
     commands_since_checkpoint: u64,
+    bytes_since_checkpoint: u64,
+    first_uncheckpointed_at: Option<Instant>,
+    checkpoint_generation: u64,
     published_snapshot_digest: Option<u64>,
     published_chain_digest: Option<u64>,
 }
@@ -6979,8 +6984,10 @@ pub struct FileControlPlaneStore {
     path: PathBuf,
     journal: DurableJournalFile<SingleAuthorityJournalObserver>,
     durability: Arc<Mutex<FileControlPlaneStoreDurability>>,
+    checkpoint_publication: Arc<Mutex<()>>,
     checkpoint_command_limit: u64,
     checkpoint_byte_limit: u64,
+    checkpoint_interval: Duration,
     #[cfg(test)]
     journal_observer: Arc<SingleAuthorityJournalObserver>,
     #[cfg(test)]
@@ -6989,22 +6996,81 @@ pub struct FileControlPlaneStore {
     fail_initial_checkpoint_after_identity: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     fail_checkpoint_after_prepared_snapshot_sync: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    checkpoint_after_journal_replacement_gate: Arc<(
+        Mutex<CheckpointAfterJournalReplacementGate>,
+        std::sync::Condvar,
+    )>,
+    #[cfg(test)]
+    commit_before_durability_lock_signal:
+        Arc<(Mutex<CommitBeforeDurabilityLockSignal>, std::sync::Condvar)>,
+}
+
+struct FileControlPlaneCheckpointCapture {
+    store_instance: Arc<Mutex<FileControlPlaneStoreDurability>>,
+    checkpoint_generation: u64,
+    journal_offset: u64,
+    chain_digest: u64,
+    captured_at: Instant,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct CheckpointAfterJournalReplacementGate {
+    pause: bool,
+    reached: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct CommitBeforeDurabilityLockSignal {
+    armed: bool,
+    reached: bool,
+}
+
+pub struct SingleAuthorityDurableCheckpoint {
+    store: FileControlPlaneStore,
+    capture: FileControlPlaneCheckpointCapture,
+    snapshot: ClusterControlSnapshot,
+}
+
+impl SingleAuthorityDurableCheckpoint {
+    pub fn persist(self) -> Result<(), ControlPlaneError> {
+        self.store
+            .persist_captured_checkpoint(self.capture, &self.snapshot)
+    }
 }
 
 impl FileControlPlaneStore {
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self::with_checkpoint_limits(
+        Self::with_checkpoint_policy(
             path.into(),
             SINGLE_AUTHORITY_JOURNAL_CHECKPOINT_COMMAND_LIMIT,
             SINGLE_AUTHORITY_JOURNAL_CHECKPOINT_BYTE_LIMIT,
+            SINGLE_AUTHORITY_JOURNAL_CHECKPOINT_INTERVAL,
         )
     }
 
+    #[cfg(test)]
     fn with_checkpoint_limits(
         path: PathBuf,
         checkpoint_command_limit: u64,
         checkpoint_byte_limit: u64,
+    ) -> Self {
+        Self::with_checkpoint_policy(
+            path,
+            checkpoint_command_limit,
+            checkpoint_byte_limit,
+            SINGLE_AUTHORITY_JOURNAL_CHECKPOINT_INTERVAL,
+        )
+    }
+
+    fn with_checkpoint_policy(
+        path: PathBuf,
+        checkpoint_command_limit: u64,
+        checkpoint_byte_limit: u64,
+        checkpoint_interval: Duration,
     ) -> Self {
         let journal_observer = Arc::new(SingleAuthorityJournalObserver::default());
         let journal = DurableJournalFile::new(
@@ -7043,8 +7109,10 @@ impl FileControlPlaneStore {
             path,
             journal,
             durability: Arc::new(Mutex::new(FileControlPlaneStoreDurability::default())),
+            checkpoint_publication: Arc::new(Mutex::new(())),
             checkpoint_command_limit,
             checkpoint_byte_limit,
+            checkpoint_interval,
             #[cfg(test)]
             journal_observer,
             #[cfg(test)]
@@ -7057,6 +7125,16 @@ impl FileControlPlaneStore {
             fail_checkpoint_after_prepared_snapshot_sync: Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            #[cfg(test)]
+            checkpoint_after_journal_replacement_gate: Arc::new((
+                Mutex::new(CheckpointAfterJournalReplacementGate::default()),
+                std::sync::Condvar::new(),
+            )),
+            #[cfg(test)]
+            commit_before_durability_lock_signal: Arc::new((
+                Mutex::new(CommitBeforeDurabilityLockSignal::default()),
+                std::sync::Condvar::new(),
+            )),
         }
     }
 
@@ -7100,6 +7178,76 @@ impl FileControlPlaneStore {
     fn fail_next_checkpoint_after_prepared_snapshot_sync(&self) {
         self.fail_checkpoint_after_prepared_snapshot_sync
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn pause_next_checkpoint_after_journal_replacement(&self) {
+        let (state, _) = &*self.checkpoint_after_journal_replacement_gate;
+        let mut state = state.lock().unwrap();
+        state.pause = true;
+        state.reached = false;
+    }
+
+    #[cfg(test)]
+    fn wait_for_checkpoint_journal_replacement(&self, timeout: Duration) -> bool {
+        let (state, reached) = &*self.checkpoint_after_journal_replacement_gate;
+        let state = state.lock().unwrap();
+        let (state, _) = reached
+            .wait_timeout_while(state, timeout, |state| !state.reached)
+            .unwrap();
+        state.reached
+    }
+
+    #[cfg(test)]
+    fn release_checkpoint_after_journal_replacement(&self) {
+        let (state, released) = &*self.checkpoint_after_journal_replacement_gate;
+        let mut state = state.lock().unwrap();
+        state.pause = false;
+        released.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait_after_checkpoint_journal_replacement_if_requested(&self) {
+        let (state, released) = &*self.checkpoint_after_journal_replacement_gate;
+        let mut state = state.lock().unwrap();
+        if !state.pause {
+            return;
+        }
+        state.reached = true;
+        released.notify_all();
+        while state.pause {
+            state = released.wait(state).unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    fn arm_commit_before_durability_lock_signal(&self) {
+        let (state, _) = &*self.commit_before_durability_lock_signal;
+        let mut state = state.lock().unwrap();
+        state.armed = true;
+        state.reached = false;
+    }
+
+    #[cfg(test)]
+    fn signal_commit_before_durability_lock_if_armed(&self) {
+        let (state, reached) = &*self.commit_before_durability_lock_signal;
+        let mut state = state.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        state.armed = false;
+        state.reached = true;
+        reached.notify_all();
+    }
+
+    #[cfg(test)]
+    fn wait_for_commit_before_durability_lock(&self, timeout: Duration) -> bool {
+        let (state, reached) = &*self.commit_before_durability_lock_signal;
+        let state = state.lock().unwrap();
+        let (state, _) = reached
+            .wait_timeout_while(state, timeout, |state| !state.reached)
+            .unwrap();
+        state.reached
     }
 
     pub fn load_authority_clock_restart_checkpoint(
@@ -7734,6 +7882,10 @@ impl ControlPlaneStore for FileControlPlaneStore {
                 durability.initialized = true;
                 durability.initial_identity_created =
                     single_authority_identity_path(&self.path).exists();
+                durability.journal_clean_offset = 0;
+                durability.commands_since_checkpoint = 0;
+                durability.bytes_since_checkpoint = 0;
+                durability.first_uncheckpointed_at = None;
                 durability.published_snapshot_digest = None;
                 durability.published_chain_digest = None;
                 return Ok(None);
@@ -7763,6 +7915,10 @@ impl ControlPlaneStore for FileControlPlaneStore {
         {
             durability.initialized = true;
             durability.initial_identity_created = true;
+            durability.journal_clean_offset = 0;
+            durability.commands_since_checkpoint = 0;
+            durability.bytes_since_checkpoint = 0;
+            durability.first_uncheckpointed_at = None;
             durability.published_snapshot_digest = None;
             durability.published_chain_digest = None;
             return Ok(None);
@@ -7884,6 +8040,7 @@ impl ControlPlaneStore for FileControlPlaneStore {
             self.publish_prepared_snapshot_file(&prepared_path)?;
         }
         durability.initialized = true;
+        durability.journal_clean_offset = frames.clean_len;
         durability.commands_since_checkpoint = u64::try_from(
             records[replay_start..]
                 .iter()
@@ -7891,6 +8048,19 @@ impl ControlPlaneStore for FileControlPlaneStore {
                 .count(),
         )
         .unwrap_or(u64::MAX);
+        durability.bytes_since_checkpoint = records[replay_start..]
+            .iter()
+            .filter(|record| record.command.is_some())
+            .map(|record| {
+                record.encode().map(|frame| {
+                    DurableJournalFile::<SingleAuthorityJournalObserver>::framed_len(frame.len())
+                })
+            })
+            .try_fold(0u64, |total, frame_len| {
+                frame_len.map(|frame_len| total.saturating_add(frame_len))
+            })?;
+        durability.first_uncheckpointed_at =
+            (durability.commands_since_checkpoint != 0).then(Instant::now);
         durability.published_snapshot_digest = Some(single_authority_snapshot_digest(&snapshot));
         durability.published_chain_digest = Some(chain_digest);
         Ok(Some(snapshot))
@@ -7901,6 +8071,12 @@ impl ControlPlaneStore for FileControlPlaneStore {
         previous_snapshot: Option<&ClusterControlSnapshot>,
         next_snapshot: &ClusterControlSnapshot,
     ) -> Result<(), ControlPlaneError> {
+        let _publication =
+            self.checkpoint_publication
+                .lock()
+                .map_err(|_| ControlPlaneError::CommandDecode {
+                    message: "single-authority checkpoint publication lock poisoned".to_owned(),
+                })?;
         let save_started = Instant::now();
         let result = (|| {
             let mut durability = self.lock_durability()?;
@@ -7925,6 +8101,8 @@ impl ControlPlaneStore for FileControlPlaneStore {
         command: &ControlPlaneCommand,
         next_snapshot: &ClusterControlSnapshot,
     ) -> Result<(), ControlPlaneError> {
+        #[cfg(test)]
+        self.signal_commit_before_durability_lock_if_armed();
         let mut durability = self.lock_durability()?;
         self.ensure_healthy_locked(&durability)?;
         if !durability.initialized {
@@ -7964,6 +8142,14 @@ impl ControlPlaneStore for FileControlPlaneStore {
             command: Some(command.clone()),
         };
         let encoded = record.encode()?;
+        let encoded_frame_len =
+            DurableJournalFile::<SingleAuthorityJournalObserver>::framed_len(encoded.len());
+        let next_journal_clean_offset = durability
+            .journal_clean_offset
+            .checked_add(encoded_frame_len)
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "single-authority control-plane journal offset overflows".to_owned(),
+            })?;
         if let Err(error) = self.journal.append_frame(&encoded) {
             return match error {
                 DurableJournalAppendError::BeforeReplayableRecord(error) => Err(error),
@@ -7980,31 +8166,14 @@ impl ControlPlaneStore for FileControlPlaneStore {
         }
         durability.published_snapshot_digest = None;
         durability.published_chain_digest = Some(resulting_chain_digest);
+        durability.journal_clean_offset = next_journal_clean_offset;
         durability.commands_since_checkpoint =
             durability.commands_since_checkpoint.saturating_add(1);
-        let offsets = match self.journal.status_offsets() {
-            Ok(offsets) => offsets,
-            Err(error) => {
-                durability.poisoned = Some(error.to_string());
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "single-authority control-plane durability poisoned after journal status failure: {error}"
-                    ),
-                });
-            }
-        };
-        let suffix_bytes = offsets.clean_len.saturating_sub(offsets.base_offset);
-        if durability.commands_since_checkpoint >= self.checkpoint_command_limit
-            || suffix_bytes >= self.checkpoint_byte_limit
-        {
-            if let Err(error) = self.checkpoint_snapshot_locked(next_snapshot, &mut durability) {
-                durability.poisoned = Some(error.to_string());
-                return Err(ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "single-authority control-plane durability poisoned after checkpoint failure: {error}"
-                    ),
-                });
-            }
+        durability.bytes_since_checkpoint = durability
+            .bytes_since_checkpoint
+            .saturating_add(encoded_frame_len);
+        if durability.first_uncheckpointed_at.is_none() {
+            durability.first_uncheckpointed_at = Some(Instant::now());
         }
         Ok(())
     }
@@ -8020,6 +8189,12 @@ impl ControlPlaneStore for FileControlPlaneStore {
         _previous_snapshot: &ClusterControlSnapshot,
         next_snapshot: &ClusterControlSnapshot,
     ) -> Result<(), ControlPlaneError> {
+        let _publication =
+            self.checkpoint_publication
+                .lock()
+                .map_err(|_| ControlPlaneError::CommandDecode {
+                    message: "single-authority checkpoint publication lock poisoned".to_owned(),
+                })?;
         let mut durability = self.lock_durability()?;
         self.ensure_healthy_locked(&durability)?;
         self.checkpoint_snapshot_locked(next_snapshot, &mut durability)
@@ -8047,6 +8222,255 @@ impl FileControlPlaneStore {
             });
         }
         Ok(())
+    }
+
+    fn capture_checkpoint_if_due(
+        &self,
+        now: Instant,
+    ) -> Result<Option<FileControlPlaneCheckpointCapture>, ControlPlaneError> {
+        let durability = self.lock_durability()?;
+        self.ensure_healthy_locked(&durability)?;
+        let Some(first_uncheckpointed_at) = durability.first_uncheckpointed_at else {
+            return Ok(None);
+        };
+        if durability.commands_since_checkpoint < self.checkpoint_command_limit
+            && durability.bytes_since_checkpoint < self.checkpoint_byte_limit
+            && now.saturating_duration_since(first_uncheckpointed_at) < self.checkpoint_interval
+        {
+            return Ok(None);
+        }
+        let chain_digest =
+            durability
+                .published_chain_digest
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: "single-authority checkpoint capture has no published journal chain"
+                        .to_owned(),
+                })?;
+        Ok(Some(FileControlPlaneCheckpointCapture {
+            store_instance: Arc::clone(&self.durability),
+            checkpoint_generation: durability.checkpoint_generation,
+            journal_offset: durability.journal_clean_offset,
+            chain_digest,
+            captured_at: now,
+        }))
+    }
+
+    fn persist_captured_checkpoint(
+        &self,
+        capture: FileControlPlaneCheckpointCapture,
+        snapshot: &ClusterControlSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        let _publication =
+            self.checkpoint_publication
+                .lock()
+                .map_err(|_| ControlPlaneError::CommandDecode {
+                    message: "single-authority checkpoint publication lock poisoned".to_owned(),
+                })?;
+        self.validate_checkpoint_capture(&capture)?;
+        let save_started = Instant::now();
+        let result = self.persist_captured_checkpoint_inner(capture, snapshot);
+        observability::record_control_plane_snapshot_save(save_started.elapsed(), result.is_ok());
+        if let Err(error) = &result {
+            if let Ok(mut durability) = self.lock_durability() {
+                durability.poisoned.get_or_insert_with(|| error.to_string());
+            }
+        }
+        result
+    }
+
+    fn validate_checkpoint_capture(
+        &self,
+        capture: &FileControlPlaneCheckpointCapture,
+    ) -> Result<(), ControlPlaneError> {
+        let durability = self.lock_durability()?;
+        self.ensure_healthy_locked(&durability)?;
+        if !Arc::ptr_eq(&capture.store_instance, &self.durability) {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "single-authority checkpoint capture belongs to another store instance"
+                    .to_owned(),
+            });
+        }
+        if capture.checkpoint_generation != durability.checkpoint_generation {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "single-authority checkpoint capture is stale".to_owned(),
+            });
+        }
+        if capture.journal_offset > durability.journal_clean_offset {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "single-authority checkpoint capture is beyond the published journal"
+                    .to_owned(),
+            });
+        }
+        let offsets = self.journal.status_offsets()?;
+        if capture.journal_offset < offsets.base_offset
+            || capture.journal_offset > offsets.clean_len
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: "single-authority checkpoint capture is outside the retained journal"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn persist_captured_checkpoint_inner(
+        &self,
+        capture: FileControlPlaneCheckpointCapture,
+        snapshot: &ClusterControlSnapshot,
+    ) -> Result<(), ControlPlaneError> {
+        let (prepared_path, snapshot_digest) = self.write_prepared_snapshot_file(snapshot)?;
+
+        let mut durability = self.lock_durability()?;
+        self.ensure_healthy_locked(&durability)?;
+        let publication_result = (|| {
+            debug_assert_eq!(
+                capture.checkpoint_generation, durability.checkpoint_generation,
+                "checkpoint publication lock prevents another checkpoint"
+            );
+            let suffix = self.journal.read_frames_from(capture.journal_offset)?;
+            if suffix.truncated_tail {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: "single-authority checkpoint found a torn live journal suffix"
+                        .to_owned(),
+                });
+            }
+
+            let binding =
+                load_single_authority_clock_checkpoint_binding(&self.path)?.ok_or_else(|| {
+                    ControlPlaneError::AuthorityClockCheckpoint {
+                    message:
+                        "single-authority durable identity is missing before checkpoint anchoring"
+                            .to_owned(),
+                }
+                })?;
+            let anchor = SingleAuthorityJournalRecord {
+                binding,
+                previous_chain_digest: capture.chain_digest,
+                resulting_chain_digest: snapshot_digest,
+                command: None,
+            }
+            .encode()?;
+            let mut replacement = vec![anchor];
+            let mut original_chain_digest = capture.chain_digest;
+            let mut resulting_chain_digest = snapshot_digest;
+            let mut suffix_bytes = 0u64;
+            for frame in suffix.frames {
+                let record = SingleAuthorityJournalRecord::decode(&frame)?;
+                if record.binding != binding {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message:
+                            "single-authority checkpoint suffix belongs to another durable identity"
+                                .to_owned(),
+                    });
+                }
+                let command =
+                    record.command.ok_or_else(|| {
+                        ControlPlaneError::CommandDecode {
+                    message:
+                        "single-authority checkpoint suffix contains an unexpected checkpoint anchor"
+                            .to_owned(),
+                }
+                    })?;
+                if record.previous_chain_digest != original_chain_digest {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message:
+                            "single-authority checkpoint suffix command chain is discontinuous"
+                                .to_owned(),
+                    });
+                }
+                let encoded_command = encode_control_plane_command(&command)?;
+                let expected_original_digest =
+                    single_authority_command_chain_digest(original_chain_digest, &encoded_command);
+                if record.resulting_chain_digest != expected_original_digest {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: "single-authority checkpoint suffix command chain digest mismatch"
+                            .to_owned(),
+                    });
+                }
+                original_chain_digest = record.resulting_chain_digest;
+                let rebased_digest =
+                    single_authority_command_chain_digest(resulting_chain_digest, &encoded_command);
+                let rebased = SingleAuthorityJournalRecord {
+                    binding,
+                    previous_chain_digest: resulting_chain_digest,
+                    resulting_chain_digest: rebased_digest,
+                    command: Some(command),
+                }
+                .encode()?;
+                suffix_bytes = suffix_bytes.saturating_add(DurableJournalFile::<
+                    SingleAuthorityJournalObserver,
+                >::framed_len(
+                    rebased.len()
+                ));
+                replacement.push(rebased);
+                resulting_chain_digest = rebased_digest;
+            }
+            if durability.published_chain_digest != Some(original_chain_digest) {
+                return Err(ControlPlaneError::CommandDecode {
+                    message:
+                        "single-authority checkpoint suffix does not reach the published journal chain"
+                            .to_owned(),
+                });
+            }
+            let replacement_bytes = replacement.iter().try_fold(0u64, |total, frame| {
+                total
+                    .checked_add(
+                        DurableJournalFile::<SingleAuthorityJournalObserver>::framed_len(
+                            frame.len(),
+                        ),
+                    )
+                    .ok_or_else(|| ControlPlaneError::CommandDecode {
+                        message: "single-authority checkpoint replacement length overflows"
+                            .to_owned(),
+                    })
+            })?;
+            let replaced_clean_offset = capture
+                .journal_offset
+                .checked_add(replacement_bytes)
+                .ok_or_else(|| ControlPlaneError::CommandDecode {
+                    message: "single-authority checkpoint journal offset overflows".to_owned(),
+                })?;
+
+            self.journal
+                .replace_from(capture.journal_offset, suffix.clean_len, &replacement)?;
+            #[cfg(test)]
+            self.wait_after_checkpoint_journal_replacement_if_requested();
+            #[cfg(test)]
+            if self
+                .fail_checkpoint_after_anchor
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(ControlPlaneError::Io {
+                    context: "publish prepared single-authority control-plane checkpoint",
+                    source: std::io::Error::other(
+                        "injected failure after single-authority checkpoint anchor",
+                    ),
+                });
+            }
+            self.publish_prepared_snapshot_file(&prepared_path)?;
+            if load_single_authority_initialized_binding(&self.path)?.is_none() {
+                store_single_authority_initialized_binding(&self.path, binding)?;
+            }
+
+            let suffix_commands =
+                u64::try_from(replacement.len().saturating_sub(1)).unwrap_or(u64::MAX);
+            durability.initialized = true;
+            durability.initial_identity_created = false;
+            durability.journal_clean_offset = replaced_clean_offset;
+            durability.commands_since_checkpoint = suffix_commands;
+            durability.bytes_since_checkpoint = suffix_bytes;
+            durability.first_uncheckpointed_at =
+                (suffix_commands != 0).then_some(capture.captured_at);
+            durability.checkpoint_generation = durability.checkpoint_generation.saturating_add(1);
+            durability.published_snapshot_digest =
+                (suffix_commands == 0).then_some(snapshot_digest);
+            durability.published_chain_digest = Some(resulting_chain_digest);
+            Ok(())
+        })();
+        if let Err(error) = &publication_result {
+            durability.poisoned = Some(error.to_string());
+        }
+        publication_result
     }
 
     fn discard_incomplete_initialization_locked(
@@ -8077,7 +8501,10 @@ impl FileControlPlaneStore {
         }
         durability.initialized = true;
         durability.initial_identity_created = true;
+        durability.journal_clean_offset = 0;
         durability.commands_since_checkpoint = 0;
+        durability.bytes_since_checkpoint = 0;
+        durability.first_uncheckpointed_at = None;
         durability.published_snapshot_digest = None;
         durability.published_chain_digest = None;
         Ok(())
@@ -8088,7 +8515,7 @@ impl FileControlPlaneStore {
         snapshot: &ClusterControlSnapshot,
         durability: &mut FileControlPlaneStoreDurability,
     ) -> Result<(), ControlPlaneError> {
-        let compact_through = self.journal.clean_len()?;
+        let compact_through = durability.journal_clean_offset;
         let (prepared_path, snapshot_digest) = self.prepare_snapshot_file(snapshot, durability)?;
         let binding =
             load_single_authority_clock_checkpoint_binding(&self.path)?.ok_or_else(|| {
@@ -8105,6 +8532,13 @@ impl FileControlPlaneStore {
             command: None,
         }
         .encode()?;
+        let checkpoint_clean_offset = compact_through
+            .checked_add(
+                DurableJournalFile::<SingleAuthorityJournalObserver>::framed_len(anchor.len()),
+            )
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "single-authority checkpoint journal offset overflows".to_owned(),
+            })?;
         self.journal
             .append_frame(&anchor)
             .map_err(DurableJournalAppendError::into_control_plane_error)?;
@@ -8127,7 +8561,11 @@ impl FileControlPlaneStore {
         }
         durability.initialized = true;
         durability.initial_identity_created = false;
+        durability.journal_clean_offset = checkpoint_clean_offset;
         durability.commands_since_checkpoint = 0;
+        durability.bytes_since_checkpoint = 0;
+        durability.first_uncheckpointed_at = None;
+        durability.checkpoint_generation = durability.checkpoint_generation.saturating_add(1);
         durability.published_snapshot_digest = Some(snapshot_digest);
         durability.published_chain_digest = Some(snapshot_digest);
         Ok(())
@@ -8169,6 +8607,14 @@ impl FileControlPlaneStore {
                 )?;
             }
         }
+        self.write_prepared_snapshot_file(snapshot)
+    }
+
+    fn write_prepared_snapshot_file(
+        &self,
+        snapshot: &ClusterControlSnapshot,
+    ) -> Result<(PathBuf, u64), ControlPlaneError> {
+        ensure_control_plane_state_parent_directory(&self.path)?;
         let serialize_started = Instant::now();
         let formatted_snapshot = format_snapshot(snapshot);
         let snapshot_digest = checksum::crc64::checksum(formatted_snapshot.as_bytes());
@@ -8246,6 +8692,22 @@ pub struct SingleAuthorityControlPlane<S> {
     durable_snapshot: ClusterControlSnapshot,
     snapshot: ClusterControlSnapshot,
     runtime_map_content_certificate: Mutex<Option<RuntimeMapContentCertificate>>,
+}
+
+impl SingleAuthorityControlPlane<FileControlPlaneStore> {
+    pub fn capture_durable_checkpoint_if_due(
+        &self,
+        now: Instant,
+    ) -> Result<Option<SingleAuthorityDurableCheckpoint>, ControlPlaneError> {
+        let Some(capture) = self.store.capture_checkpoint_if_due(now)? else {
+            return Ok(None);
+        };
+        Ok(Some(SingleAuthorityDurableCheckpoint {
+            store: self.store.clone(),
+            capture,
+            snapshot: self.durable_snapshot.clone(),
+        }))
+    }
 }
 
 impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
@@ -10082,9 +10544,8 @@ impl UnixControlPlaneClient {
     ) -> Result<Vec<u8>, ControlPlaneError> {
         let deadline = Instant::now() + retry_budget;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
             let response_payload =
-                self.send_liveness_request_raw_response(kind, payload, remaining)?;
+                self.send_liveness_request_raw_response_until(kind, payload, deadline)?;
             match decode_control_plane_rpc_response(response_payload) {
                 Err(error)
                     if error.is_control_plane_leader_routing_rejection()
@@ -10102,19 +10563,13 @@ impl UnixControlPlaneClient {
         }
     }
 
-    fn send_liveness_request_raw_response(
+    fn send_liveness_request_raw_response_until(
         &self,
         kind: ControlPlaneRpcKind,
         payload: &[u8],
-        retry_budget: Duration,
+        deadline: Instant,
     ) -> Result<Vec<u8>, ControlPlaneError> {
         debug_assert_eq!(kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
-        if retry_budget.is_zero() {
-            return Err(ControlPlaneError::RpcUnconfirmed {
-                message: "heartbeat retry budget is exhausted before the first request".to_owned(),
-            });
-        }
-        let deadline = Instant::now() + retry_budget;
         let mut retry_started = false;
         let mut last_retryable_error = None;
         loop {
@@ -10135,7 +10590,8 @@ impl UnixControlPlaneClient {
                 };
             }
             let read_timeout = remaining.min(CONTROL_PLANE_RPC_LIVENESS_IO_TIMEOUT);
-            match self.send_request_raw_response_with_timeout(kind, payload, read_timeout) {
+            let attempt_deadline = now + read_timeout;
+            match self.send_request_raw_response_until(kind, payload, attempt_deadline) {
                 Ok(payload) => return Ok(payload),
                 Err(error) if error.is_retryable_control_plane_rpc_transport_error() => {
                     let now = Instant::now();
@@ -13071,10 +13527,27 @@ impl AuthenticatedUnixControlPlaneClient {
     fn refresh_node_heartbeat_with_clock<F>(
         &mut self,
         heartbeat: NodeHeartbeat,
-        mut authority_now_ms: F,
+        authority_now_ms: F,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError>
     where
         F: FnMut() -> Result<u64, ControlPlaneError>,
+    {
+        self.refresh_node_heartbeat_with_clock_and_before_dispatch(
+            heartbeat,
+            authority_now_ms,
+            || {},
+        )
+    }
+
+    fn refresh_node_heartbeat_with_clock_and_before_dispatch<F, G>(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        mut authority_now_ms: F,
+        mut before_dispatch: G,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError>
+    where
+        F: FnMut() -> Result<u64, ControlPlaneError>,
+        G: FnMut(),
     {
         if heartbeat.requested_lease_duration_ms == 0 {
             return Err(ControlPlaneError::InvalidLeaseDuration);
@@ -13112,10 +13585,11 @@ impl AuthenticatedUnixControlPlaneClient {
                         .to_owned(),
                 });
             }
-            let response = self.inner.send_liveness_request_raw_response(
+            before_dispatch();
+            let response = self.inner.send_liveness_request_raw_response_until(
                 ControlPlaneRpcKind::RefreshNodeHeartbeat,
                 &request,
-                remaining,
+                deadline,
             )?;
             let response = self.verify_runtime_map_response(
                 ControlPlaneRpcKind::RefreshNodeHeartbeat,
@@ -27603,6 +28077,57 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_unix_control_plane_client_does_not_recreate_heartbeat_deadline() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_millis(100);
+            loop {
+                match listener.accept() {
+                    Ok((_stream, _addr)) => return true,
+                    Err(error)
+                        if error.kind() == ErrorKind::WouldBlock
+                            && Instant::now() < accept_deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => return false,
+                    Err(error) => panic!("accept authenticated heartbeat: {error}"),
+                }
+            }
+        });
+
+        let mut client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            storage_node_auth_credential("auth-cluster", 1, 42),
+        );
+        let error = client
+            .refresh_node_heartbeat_with_clock_and_before_dispatch(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 42,
+                    endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                    observed_epoch: ClusterEpoch::new(1).unwrap(),
+                    requested_lease_duration_ms: 10,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                || Ok(2_000),
+                || std::thread::sleep(Duration::from_millis(30)),
+            )
+            .expect_err("expired authenticated heartbeat must not start transport");
+
+        assert!(!server.join().unwrap());
+        assert!(
+            matches!(error, ControlPlaneError::RpcUnconfirmed { ref message }
+                if message.contains("expired before the first request")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn authenticated_storage_node_heartbeat_accepts_overlapping_credentials() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -33472,6 +33997,12 @@ mod tests {
                     .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
                     .unwrap();
             }
+            authority
+                .capture_durable_checkpoint_if_due(Instant::now())
+                .unwrap()
+                .expect("checkpoint threshold should be due")
+                .persist()
+                .unwrap();
 
             assert_ne!(
                 std::fs::read(store.path()).unwrap(),
@@ -33501,6 +34032,317 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_authority_checkpoint_is_due_at_time_bound() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::with_checkpoint_policy(
+            tmp.path().join("control-plane.state"),
+            u64::MAX,
+            u64::MAX,
+            Duration::ZERO,
+        );
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        let checkpoint_before = std::fs::read(store.path()).unwrap();
+
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .expect("time threshold should be due")
+            .persist()
+            .unwrap();
+
+        assert_ne!(std::fs::read(store.path()).unwrap(), checkpoint_before);
+    }
+
+    #[test]
+    fn captured_checkpoint_rebases_commands_appended_during_persistence() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::with_checkpoint_limits(path.clone(), 1, u64::MAX);
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let checkpoint = authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .expect("command threshold should be due");
+
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        checkpoint.persist().unwrap();
+
+        let offsets = store.journal.status_offsets().unwrap();
+        let retained = store.journal.read_frames_from(offsets.base_offset).unwrap();
+        assert_eq!(retained.frames.len(), 2);
+        assert!(SingleAuthorityJournalRecord::decode(&retained.frames[0])
+            .unwrap()
+            .command
+            .is_none());
+        let restarted =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(path)).unwrap();
+        assert_eq!(
+            restarted
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .membership(),
+            NodeMembershipState::Active
+        );
+        assert_eq!(
+            restarted
+                .snapshot()
+                .node(NodeId::new(2))
+                .unwrap()
+                .membership(),
+            NodeMembershipState::Active
+        );
+    }
+
+    #[test]
+    fn checkpoint_failure_latches_poison_before_concurrent_command_can_append() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::with_checkpoint_limits(path.clone(), 1, u64::MAX);
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let checkpoint = authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .unwrap();
+        let previous_snapshot = authority.durable_snapshot.clone();
+        let command = ControlPlaneCommand::SetNodeMembership {
+            node_id: NodeId::new(2),
+            membership: NodeMembershipState::Active,
+        };
+        let mut next_snapshot = previous_snapshot
+            .apply_control_plane_command(command.clone())
+            .unwrap()
+            .into_snapshot();
+        next_snapshot.record_history_from(&previous_snapshot);
+        drop(authority);
+
+        store.pause_next_checkpoint_after_journal_replacement();
+        store.fail_next_checkpoint_after_anchor();
+        let checkpoint_worker = std::thread::spawn(move || checkpoint.persist());
+        let replacement_reached =
+            store.wait_for_checkpoint_journal_replacement(Duration::from_secs(2));
+
+        store.arm_commit_before_durability_lock_signal();
+        let concurrent_store = store.clone();
+        let command_worker = std::thread::spawn(move || {
+            concurrent_store.commit_command(&previous_snapshot, &command, &next_snapshot)
+        });
+        let command_reached_durability_lock =
+            store.wait_for_commit_before_durability_lock(Duration::from_secs(2));
+        store.release_checkpoint_after_journal_replacement();
+
+        let checkpoint_error = checkpoint_worker.join().unwrap().unwrap_err();
+        let command_error = command_worker.join().unwrap().unwrap_err();
+        assert!(
+            replacement_reached,
+            "checkpoint should pause after durable journal replacement"
+        );
+        assert!(
+            command_reached_durability_lock,
+            "concurrent command should reach the durability lock while checkpoint publication is paused"
+        );
+        assert!(matches!(
+            checkpoint_error,
+            ControlPlaneError::Io {
+                context: "publish prepared single-authority control-plane checkpoint",
+                ..
+            }
+        ));
+        assert!(matches!(
+            command_error,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("durability is poisoned")
+        ));
+
+        let restarted =
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(path)).unwrap();
+        assert!(restarted.snapshot().node(NodeId::new(1)).is_some());
+        assert!(
+            restarted.snapshot().node(NodeId::new(2)).is_none(),
+            "the waiting command must not append after replacement failure"
+        );
+    }
+
+    #[test]
+    fn captured_checkpoint_preserves_conservative_suffix_age() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::with_checkpoint_limits(
+            tmp.path().join("control-plane.state"),
+            1,
+            u64::MAX,
+        );
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let captured_at = Instant::now();
+        let checkpoint = authority
+            .capture_durable_checkpoint_if_due(captured_at)
+            .unwrap()
+            .unwrap();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+
+        checkpoint.persist().unwrap();
+
+        let durability = store.lock_durability().unwrap();
+        assert_eq!(durability.commands_since_checkpoint, 1);
+        assert_eq!(durability.first_uncheckpointed_at, Some(captured_at));
+    }
+
+    #[test]
+    fn checkpoint_capture_uses_tracked_offset_without_scanning_journal() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::with_checkpoint_limits(
+            tmp.path().join("control-plane.state"),
+            1,
+            u64::MAX,
+        );
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let expected_offset = store.lock_durability().unwrap().journal_clean_offset;
+        std::fs::write(store.journal_path(), b"not a valid journal").unwrap();
+
+        let checkpoint = authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .expect("capture must not read the journal")
+            .expect("command threshold should be due");
+
+        assert_eq!(checkpoint.capture.journal_offset, expected_offset);
+    }
+
+    #[test]
+    fn stale_captured_checkpoint_is_rejected_before_publication() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::with_checkpoint_limits(
+            tmp.path().join("control-plane.state"),
+            1,
+            u64::MAX,
+        );
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let stale = authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .unwrap();
+        let current = authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .unwrap();
+        current.persist().unwrap();
+        let checkpoint_before = std::fs::read(store.path()).unwrap();
+        let journal_before = std::fs::read(store.journal_path()).unwrap();
+
+        let error = stale.persist().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("checkpoint capture is stale")
+        ));
+        assert_eq!(std::fs::read(store.path()).unwrap(), checkpoint_before);
+        assert_eq!(std::fs::read(store.journal_path()).unwrap(), journal_before);
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .expect("stale checkpoint rejection must not poison the store");
+    }
+
+    #[test]
+    fn captured_checkpoint_is_bound_to_its_store_instance() {
+        let tmp = test_util::tempdir();
+        let first_store = FileControlPlaneStore::with_checkpoint_limits(
+            tmp.path().join("first.state"),
+            1,
+            u64::MAX,
+        );
+        let mut first = SingleAuthorityControlPlane::open(first_store).unwrap();
+        first
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let checkpoint = first
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .unwrap();
+        let SingleAuthorityDurableCheckpoint {
+            capture, snapshot, ..
+        } = checkpoint;
+        let second_store = FileControlPlaneStore::new(tmp.path().join("second.state"));
+        SingleAuthorityControlPlane::open(second_store.clone()).unwrap();
+        let checkpoint_before = std::fs::read(second_store.path()).unwrap();
+        let journal_before = std::fs::read(second_store.journal_path()).unwrap();
+
+        let error = second_store
+            .persist_captured_checkpoint(capture, &snapshot)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("belongs to another store instance")
+        ));
+        assert_eq!(
+            std::fs::read(second_store.path()).unwrap(),
+            checkpoint_before
+        );
+        assert_eq!(
+            std::fs::read(second_store.journal_path()).unwrap(),
+            journal_before
+        );
+        second_store.ensure_healthy().unwrap();
+    }
+
+    #[test]
+    fn captured_checkpoint_persists_without_authority_mutex() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::with_checkpoint_limits(
+            tmp.path().join("control-plane.state"),
+            1,
+            u64::MAX,
+        );
+        let authority = Arc::new(Mutex::new(
+            SingleAuthorityControlPlane::open(store).unwrap(),
+        ));
+        let checkpoint = {
+            let mut authority = authority.lock().unwrap();
+            authority
+                .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+                .unwrap();
+            authority
+                .capture_durable_checkpoint_if_due(Instant::now())
+                .unwrap()
+                .unwrap()
+        };
+        let authority_guard = authority.lock().unwrap();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            completed_tx.send(checkpoint.persist()).unwrap();
+        });
+
+        completed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("checkpoint persistence must not wait for the authority mutex")
+            .unwrap();
+        drop(authority_guard);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn file_backed_authority_checkpoint_compaction_reports_physical_io() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::with_checkpoint_limits(
@@ -33513,6 +34355,12 @@ mod tests {
 
         authority
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .expect("command threshold should be due")
+            .persist()
             .unwrap();
 
         let after = observability::control_plane_journal_metrics_snapshot();
@@ -33533,14 +34381,22 @@ mod tests {
         let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         store.fail_next_checkpoint_after_anchor();
 
-        let error = authority
+        authority
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let error = authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .expect("command threshold should be due")
+            .persist()
             .unwrap_err();
 
         assert!(matches!(
             error,
-            ControlPlaneError::CommandDecode { message }
-                if message.contains("durability poisoned after checkpoint failure")
+            ControlPlaneError::Io {
+                context: "publish prepared single-authority control-plane checkpoint",
+                ..
+            }
         ));
         assert!(single_authority_snapshot_tmp_path(&path).exists());
         drop(authority);
@@ -33969,6 +34825,12 @@ mod tests {
             .unwrap();
         authority
             .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .expect("command threshold should be due")
+            .persist()
             .unwrap();
         std::fs::write(store.path(), initial_checkpoint).unwrap();
 

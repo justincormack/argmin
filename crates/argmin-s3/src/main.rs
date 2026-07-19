@@ -99,6 +99,7 @@ const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_WAL_SUFFIX_BYTES: u64 = 64 * 1024 *
 const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_MUTATIONS: u64 = 4_096;
 const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(60);
 const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CONTROL_PLANE_STANDALONE_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 macro_rules! process_info {
     ($($arg:tt)*) => {{
@@ -1823,6 +1824,37 @@ fn format_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_owned(), |value| value.to_string())
 }
 
+fn checkpoint_standalone_control_plane_if_due(
+    authority: &Arc<Mutex<SingleAuthorityControlPlane<FileControlPlaneStore>>>,
+    now: Instant,
+) -> Result<bool, ControlPlaneError> {
+    let checkpoint = authority
+        .lock()
+        .map_err(|_| ControlPlaneError::CommandDecode {
+            message: "standalone control-plane authority mutex poisoned".to_owned(),
+        })?
+        .capture_durable_checkpoint_if_due(now)?;
+    let Some(checkpoint) = checkpoint else {
+        return Ok(false);
+    };
+    checkpoint.persist()?;
+    Ok(true)
+}
+
+fn spawn_standalone_control_plane_checkpoint_loop(
+    authority: Arc<Mutex<SingleAuthorityControlPlane<FileControlPlaneStore>>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        if let Err(error) = checkpoint_standalone_control_plane_if_due(&authority, Instant::now()) {
+            eprintln!(
+                "standalone control-plane bounded journal checkpoint failed; exiting to avoid serving after durability failure: {error}"
+            );
+            std::process::exit(1);
+        }
+        thread::sleep(CONTROL_PLANE_STANDALONE_CHECKPOINT_POLL_INTERVAL);
+    })
+}
+
 fn run_control_plane_process(config: &ServerConfig) -> ! {
     if config.control_plane_experimental_raft {
         run_experimental_raft_control_plane_process(config);
@@ -1909,6 +1941,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         binding: authority_clock_checkpoint_binding,
     });
     let authority = Arc::new(Mutex::new(authority));
+    let _checkpoint_loop = spawn_standalone_control_plane_checkpoint_loop(Arc::clone(&authority));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
     let active_recovery_rpc_workers = Arc::new(AtomicUsize::new(0));
     let auth_verifier = build_control_plane_unix_auth_verifier(config)

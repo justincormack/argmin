@@ -137,6 +137,10 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         &self.path
     }
 
+    pub(crate) fn framed_len(frame_len: usize) -> u64 {
+        u64::try_from(frame_len.saturating_add(FRAME_PREFIX_LEN)).unwrap_or(u64::MAX)
+    }
+
     pub(crate) fn append_frame(&self, frame: &[u8]) -> Result<(), DurableJournalAppendError> {
         let append_started = Instant::now();
         let result = self.append_frame_inner(frame);
@@ -452,6 +456,112 @@ impl<O: DurableJournalObserver> DurableJournalFile<O> {
         self.observer
             .record_compaction(compact_started.elapsed(), result.is_ok());
         result
+    }
+
+    pub(crate) fn replace_from(
+        &self,
+        replay_offset: u64,
+        expected_clean_len: u64,
+        frames: &[Vec<u8>],
+    ) -> Result<(), ControlPlaneError> {
+        let compact_started = Instant::now();
+        let result = self.replace_from_inner(replay_offset, expected_clean_len, frames);
+        self.observer
+            .record_compaction(compact_started.elapsed(), result.is_ok());
+        result
+    }
+
+    fn replace_from_inner(
+        &self,
+        replay_offset: u64,
+        expected_clean_len: u64,
+        frames: &[Vec<u8>],
+    ) -> Result<(), ControlPlaneError> {
+        let lock_started = Instant::now();
+        let guard = self.lock();
+        self.observer
+            .record_compaction_lock_wait(lock_started.elapsed());
+        let _guard = guard?;
+
+        let bytes = fs::read(&self.path).map_err(|source| ControlPlaneError::Io {
+            context: self.contexts.read_for_compaction,
+            source,
+        })?;
+        let (base_offset, header_len) = self.decode_file_header(&bytes)?;
+        if replay_offset < base_offset {
+            return Err(self.protocol_error(format!(
+                "{} replacement offset {replay_offset} is before base offset {base_offset}",
+                self.format.label
+            )));
+        }
+        let physical_payload_len = bytes.len().checked_sub(header_len).ok_or_else(|| {
+            self.protocol_error(format!("truncated {} file header", self.format.label))
+        })?;
+        let clean_len = base_offset
+            .checked_add(u64::try_from(physical_payload_len).unwrap_or(u64::MAX))
+            .ok_or_else(|| {
+                self.protocol_error(format!("{} clean length overflows", self.format.label))
+            })?;
+        if clean_len != expected_clean_len {
+            return Err(self.protocol_error(format!(
+                "{} changed during checkpoint replacement: expected clean length {expected_clean_len}, actual {clean_len}",
+                self.format.label
+            )));
+        }
+        if replay_offset > clean_len {
+            return Err(self.protocol_error(format!(
+                "{} replacement offset {replay_offset} exceeds clean length {clean_len}",
+                self.format.label
+            )));
+        }
+
+        let mut replacement = Vec::new();
+        for frame in frames {
+            let frame_len = u32::try_from(frame.len()).map_err(|_| {
+                self.protocol_error(format!(
+                    "{} replacement frame length {} exceeds u32::MAX",
+                    self.format.label,
+                    frame.len()
+                ))
+            })?;
+            if frame_len == 0 {
+                return Err(self.protocol_error(format!("zero-length {} frame", self.format.label)));
+            }
+            replacement.extend_from_slice(&frame_len.to_be_bytes());
+            replacement.extend_from_slice(&(!frame_len).to_be_bytes());
+            replacement.extend_from_slice(frame);
+        }
+        let compacted = self.encode_file_bytes(replay_offset, &replacement);
+        let tmp_path = self.tmp_path();
+        {
+            let mut file = File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
+                context: self.contexts.create_compacted_temp,
+                source,
+            })?;
+            file.write_all(&compacted)
+                .map_err(|source| ControlPlaneError::Io {
+                    context: self.contexts.write_compacted_temp,
+                    source,
+                })?;
+            self.observer.record_compaction_bytes(compacted.len());
+            let file_sync_started = Instant::now();
+            let file_sync_result = file.sync_all().map_err(|source| ControlPlaneError::Io {
+                context: self.contexts.sync_compacted_temp,
+                source,
+            });
+            self.observer
+                .record_compaction_file_sync(file_sync_started.elapsed());
+            file_sync_result?;
+        }
+        fs::rename(&tmp_path, &self.path).map_err(|source| ControlPlaneError::Io {
+            context: self.contexts.commit_compacted,
+            source,
+        })?;
+        let directory_sync_started = Instant::now();
+        let directory_sync_result = self.observer.sync_parent(&self.path);
+        self.observer
+            .record_compaction_directory_sync(directory_sync_started.elapsed());
+        directory_sync_result
     }
 
     fn compact_through_inner(&self, replay_offset: u64) -> Result<(), ControlPlaneError> {

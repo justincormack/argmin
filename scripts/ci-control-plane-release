@@ -12,6 +12,15 @@ cargo nextest run --release -p storage \
     control_plane_raft_captured_checkpoint_preserves_post_capture_wal_suffix \
     command_apply_rejects_invalid_snapshot_before_publication \
     direct_snapshot_commit_validates_control_plane_invariants \
+    captured_checkpoint_is_bound_to_its_store_instance \
+    captured_checkpoint_persists_without_authority_mutex \
+    captured_checkpoint_preserves_conservative_suffix_age \
+    captured_checkpoint_rebases_commands_appended_during_persistence \
+    checkpoint_capture_uses_tracked_offset_without_scanning_journal \
+    checkpoint_failure_latches_poison_before_concurrent_command_can_append \
+    file_backed_authority_checkpoint_is_due_at_time_bound \
+    file_backed_authority_checkpoints_at_command_and_byte_bounds \
+    stale_captured_checkpoint_is_rejected_before_publication \
     open_validates_control_plane_invariants_before_saving \
     replicated_control_plane_state_machine_fatal_invariant_does_not_advance \
     replicated_state_machine_constructor_validates_control_plane_invariants \
