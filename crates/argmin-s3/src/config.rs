@@ -10,6 +10,7 @@ use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE
 use storage::LocalUnixStorageNodeClientConfig;
 
 const LOCAL_DEBUG_ENDPOINT_COMPILED_IN: bool = cfg!(any(test, feature = "local-debug-endpoints"));
+const MAX_LOCAL_NODE_COUNT: u32 = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessRole {
@@ -264,7 +265,7 @@ impl fmt::Debug for SecretConfigValue {
     }
 }
 
-/// Server configuration, loaded from environment variables.
+/// Resolved server configuration, loaded from one supported configuration mode.
 /// Configuration for the S3 server.
 #[derive(Debug, Clone)]
 pub(crate) struct ServerConfig {
@@ -274,7 +275,7 @@ pub(crate) struct ServerConfig {
     pub(crate) tls_key_path: Option<String>,
     pub(crate) data_dir: String,
     pub(crate) pg_count: u32,
-    pub(crate) local_node_count: u32,
+    pub(crate) storage_node_ids: Vec<u32>,
     pub(crate) storage_node_id: Option<u32>,
     pub(crate) storage_node_data_dir: Option<String>,
     pub(crate) storage_node_socket_path: Option<String>,
@@ -324,7 +325,7 @@ pub(crate) struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Load configuration from environment variables.
+    /// Resolve configuration values from an environment-style lookup.
     ///
     /// Required: `ARGMIN_ACCOUNT_ID`, `ARGMIN_ACCESS_KEY_ID`,
     /// `ARGMIN_SECRET_ACCESS_KEY`
@@ -380,13 +381,9 @@ impl ServerConfig {
     ///   `ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY`
     ///   `ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID`
     ///   `ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY`
-    pub(crate) fn from_env() -> Result<Self, String> {
-        Self::from_lookup(|key| std::env::var(key).ok())
-    }
-
     /// Build configuration from an arbitrary key-lookup function.
-    /// Used by `from_env` (with `std::env::var`) and directly by tests.
-    fn from_lookup<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
+    /// Used by the environment/static-manifest loader and directly by tests.
+    pub(crate) fn from_lookup<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
         let process_role = match get("ARGMIN_PROCESS_ROLE") {
             Some(value) => parse_process_role(&value)?,
             None => ProcessRole::LegacyLocal,
@@ -466,6 +463,15 @@ impl ServerConfig {
             None => u32::try_from(ec_config.total_shards())
                 .map_err(|_| "ARGMIN_LOCAL_NODE_COUNT default is too large".to_string())?,
         };
+        if local_node_count == 0 {
+            return Err("ARGMIN_LOCAL_NODE_COUNT must be > 0".to_string());
+        }
+        if local_node_count > MAX_LOCAL_NODE_COUNT {
+            return Err(format!(
+                "ARGMIN_LOCAL_NODE_COUNT must be <= {MAX_LOCAL_NODE_COUNT}"
+            ));
+        }
+        let storage_node_ids: Vec<u32> = (0..local_node_count).collect();
         let region = get("ARGMIN_REGION").unwrap_or_else(|| "us-east-1".to_string());
         let workers: u32 = get("ARGMIN_WORKERS")
             .unwrap_or_else(|| "4".to_string())
@@ -598,9 +604,6 @@ impl ServerConfig {
             return Err("ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string());
         }
         let storage_pg_ids = parse_storage_pg_ids(get("ARGMIN_STORAGE_PG_IDS"), pg_count)?;
-        if local_node_count == 0 {
-            return Err("ARGMIN_LOCAL_NODE_COUNT must be > 0".to_string());
-        }
         let storage_node_sockets = parse_storage_node_sockets(
             get("ARGMIN_STORAGE_NODE_SOCKETS"),
             local_node_count,
@@ -612,9 +615,10 @@ impl ServerConfig {
             let storage_node_id = storage_node_id.ok_or_else(|| {
                 "ARGMIN_STORAGE_NODE_ID is required for storage roles".to_string()
             })?;
-            if storage_node_id >= local_node_count {
+            if !storage_node_ids.contains(&storage_node_id) {
                 return Err(
-                    "ARGMIN_STORAGE_NODE_ID must be less than ARGMIN_LOCAL_NODE_COUNT".to_string(),
+                    "ARGMIN_STORAGE_NODE_ID must identify a configured local storage node"
+                        .to_string(),
                 );
             }
             if storage_node_socket_path.is_none() {
@@ -936,7 +940,7 @@ impl ServerConfig {
             tls_key_path,
             data_dir,
             pg_count,
-            local_node_count,
+            storage_node_ids,
             storage_node_id,
             storage_node_data_dir,
             storage_node_socket_path,
@@ -1878,7 +1882,7 @@ mod tests {
         assert_eq!(cfg.tls_key_path, None);
         assert_eq!(cfg.data_dir, "./data");
         assert_eq!(cfg.pg_count, 16);
-        assert_eq!(cfg.local_node_count, 6);
+        assert_eq!(cfg.storage_node_ids, (0..6).collect::<Vec<_>>());
         assert_eq!(cfg.storage_node_id, None);
         assert_eq!(cfg.storage_node_data_dir, None);
         assert_eq!(cfg.storage_node_socket_path, None);
@@ -2125,7 +2129,7 @@ mod tests {
             cfg.control_plane_heartbeat_lease_duration,
             Duration::from_millis(2900)
         );
-        assert_eq!(cfg.local_node_count, 12);
+        assert_eq!(cfg.storage_node_ids, (0..12).collect::<Vec<_>>());
         assert_eq!(cfg.ec_k, 8);
         assert_eq!(cfg.ec_m, 4);
         assert_eq!(cfg.account_id, "444455556666");
@@ -3610,13 +3614,26 @@ mod tests {
     }
 
     #[test]
+    fn local_node_count_rejects_value_above_allocation_bound() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_LOCAL_NODE_COUNT",
+            "4294967295",
+        )]))
+        .unwrap_err();
+        assert_eq!(
+            err,
+            format!("ARGMIN_LOCAL_NODE_COUNT must be <= {MAX_LOCAL_NODE_COUNT}")
+        );
+    }
+
+    #[test]
     fn local_node_count_defaults_to_ec_shape_total() {
         let cfg = ServerConfig::from_lookup(make_required_env(&[
             ("ARGMIN_EC_K", "8"),
             ("ARGMIN_EC_M", "4"),
         ]))
         .unwrap();
-        assert_eq!(cfg.local_node_count, 12);
+        assert_eq!(cfg.storage_node_ids, (0..12).collect::<Vec<_>>());
     }
 
     #[test]
@@ -3651,7 +3668,7 @@ mod tests {
             ("ARGMIN_EC_M", "2"),
         ]))
         .unwrap();
-        assert_eq!(cfg.local_node_count, 6);
+        assert_eq!(cfg.storage_node_ids, (0..6).collect::<Vec<_>>());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::config::ServerConfig;
 use ec::EcConfig;
 use placement::{
     ClusterMap, Level, NodeId, NodeInfo, PlacementConfig, PlacementConstraint, Placer, TopologyKey,
@@ -32,6 +33,37 @@ const INITIAL_PG_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin-initial-pg-placement-v1"
 const TOPOLOGY_IDENTITY_DOMAIN: &str = "argmin-static-cluster-topology-v1";
 const PROCESS_IDENTITY_DOMAIN: &str = "argmin-static-cluster-process-identity-v1";
 const FULL_CONFIG_FINGERPRINT_DOMAIN: &str = "argmin-static-cluster-full-config-v1";
+const LEGACY_CLUSTER_ENV_KEYS: &[&str] = &[
+    "ARGMIN_PROCESS_ROLE",
+    "ARGMIN_HOST_ID",
+    "ARGMIN_DATA_DIR",
+    "ARGMIN_PG_COUNT",
+    "ARGMIN_STORAGE_CLUSTER_EPOCH",
+    "ARGMIN_STORAGE_PG_IDS",
+    "ARGMIN_EC_K",
+    "ARGMIN_EC_M",
+    "ARGMIN_LOCAL_NODE_COUNT",
+    "ARGMIN_STORAGE_NODE_ID",
+    "ARGMIN_STORAGE_NODE_DATA_DIR",
+    "ARGMIN_STORAGE_NODE_SOCKET_PATH",
+    "ARGMIN_STORAGE_NODE_SOCKETS",
+    "ARGMIN_CONTROL_PLANE_STATE_PATH",
+    "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+    "ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS",
+    "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+    "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS",
+    "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+    "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+    "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID",
+    "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+    "ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT",
+    "ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME",
+    "ARGMIN_CONTROL_PLANE_RAFT_NODE_ID",
+    "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+    "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+    "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+    "ARGMIN_REGION",
+];
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -303,6 +335,85 @@ impl ValidatedStaticClusterManifest {
         &self.full_config_fingerprint
     }
 
+    fn standalone_legacy_server_config<F>(&self, get: F) -> Result<ServerConfig, String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if self.manifest.deployment.mode != DeploymentMode::Standalone {
+            return Err(
+                "replicated cluster manifests require the static secret and transport runtime slices"
+                    .to_string(),
+            );
+        }
+        if self.manifest.deployment.internal_auth != InternalAuth::Disabled
+            || !self.manifest.auth_credentials.is_empty()
+            || !self.manifest.tls_identities.is_empty()
+            || !self.manifest.tls_trust_bundles.is_empty()
+            || self
+                .manifest
+                .endpoints
+                .iter()
+                .any(|endpoint| !endpoint.advertise.starts_with("unix://"))
+        {
+            return Err(
+                "standalone manifest runtime mapping currently requires Unix endpoints with internal auth disabled and no unresolved secret references"
+                    .to_string(),
+            );
+        }
+
+        let selected = &self.manifest.processes[self.selected_process_index];
+        if selected.kind != ProcessKind::AllInOne {
+            return Err(
+                "standalone manifest runtime mapping requires an all-in-one process".to_string(),
+            );
+        }
+        let storage_node = self
+            .manifest
+            .storage_nodes
+            .iter()
+            .find(|storage_node| storage_node.process_id == selected.id)
+            .ok_or_else(|| "all-in-one process has no storage node".to_string())?;
+        let disk = self
+            .manifest
+            .disks
+            .iter()
+            .find(|disk| disk.id == storage_node.disk_id)
+            .ok_or_else(|| "storage node disk disappeared after validation".to_string())?;
+        let mut manifest_values = BTreeMap::<&'static str, String>::new();
+        manifest_values.insert("ARGMIN_PROCESS_ROLE", "legacy-local".to_string());
+        manifest_values.insert(
+            "ARGMIN_DATA_DIR",
+            disk.mount_path.to_string_lossy().into_owned(),
+        );
+        manifest_values.insert(
+            "ARGMIN_PG_COUNT",
+            self.manifest.storage.pg_count.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_STORAGE_CLUSTER_EPOCH",
+            self.manifest.storage.initial_cluster_epoch.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_EC_K",
+            self.manifest.storage.ec_data_shards.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_EC_M",
+            self.manifest.storage.ec_parity_shards.to_string(),
+        );
+        manifest_values.insert("ARGMIN_LOCAL_NODE_COUNT", "1".to_string());
+        manifest_values.insert("ARGMIN_REGION", self.manifest.cluster.region.clone());
+        manifest_values.insert("ARGMIN_HOST_ID", selected.host_id.clone());
+
+        let mut config = ServerConfig::from_lookup(|key| {
+            manifest_values.get(key).cloned().or_else(|| get(key))
+        })?;
+        config.storage_node_ids = vec![storage_node.node_id];
+        config.storage_node_id = Some(storage_node.node_id);
+        config.storage_node_data_dir = Some(storage_node.data_dir.to_string_lossy().into_owned());
+        Ok(config)
+    }
+
     #[cfg(test)]
     fn initial_pg_acting_sets(&self) -> &[Vec<u32>] {
         &self.initial_pg_acting_sets
@@ -311,6 +422,51 @@ impl ValidatedStaticClusterManifest {
     #[cfg(test)]
     fn canonical_raft_peer_endpoints(&self) -> &BTreeMap<u64, String> {
         &self.canonical_raft_peer_endpoints
+    }
+}
+
+pub(crate) fn load_server_config_from_environment() -> Result<ServerConfig, String> {
+    let config_path = std::env::var_os("ARGMIN_CLUSTER_CONFIG_PATH");
+    let process_id = std::env::var_os("ARGMIN_PROCESS_ID");
+    let config_path = config_path.as_deref().map(Path::new);
+    let process_id = process_id
+        .as_deref()
+        .map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "ARGMIN_PROCESS_ID must contain valid UTF-8".to_string())
+        })
+        .transpose()?;
+    load_server_config_from_inputs(config_path, process_id, |key| std::env::var(key).ok())
+}
+
+fn load_server_config_from_inputs<F>(
+    config_path: Option<&Path>,
+    process_id: Option<&str>,
+    get: F,
+) -> Result<ServerConfig, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    match (config_path, process_id) {
+        (None, None) => ServerConfig::from_lookup(get),
+        (Some(_), None) => {
+            Err("ARGMIN_PROCESS_ID is required with ARGMIN_CLUSTER_CONFIG_PATH".to_string())
+        }
+        (None, Some(_)) => {
+            Err("ARGMIN_CLUSTER_CONFIG_PATH is required with ARGMIN_PROCESS_ID".to_string())
+        }
+        (Some(config_path), Some(process_id)) => {
+            for key in LEGACY_CLUSTER_ENV_KEYS {
+                if get(key).is_some() {
+                    return Err(format!(
+                        "{key} cannot be set when ARGMIN_CLUSTER_CONFIG_PATH is active"
+                    ));
+                }
+            }
+            let manifest = load_static_cluster_manifest(config_path, process_id)?;
+            manifest.standalone_legacy_server_config(get)
+        }
     }
 }
 
@@ -2688,9 +2844,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProcessRole;
     use std::fmt::Write as _;
     use std::fs::File;
     use std::io::Write;
+
+    fn standalone_runtime_environment() -> BTreeMap<&'static str, String> {
+        BTreeMap::from([
+            ("ARGMIN_ACCOUNT_ID", "111122223333".to_string()),
+            ("ARGMIN_ACCESS_KEY_ID", "test-access-key".to_string()),
+            (
+                "ARGMIN_SECRET_ACCESS_KEY",
+                "test-secret-access-key".to_string(),
+            ),
+            (
+                "ARGMIN_SSE_S3_WRAPPING_KEY",
+                "dGVzdC13cmFwcGluZy1rZXk=".to_string(),
+            ),
+        ])
+    }
+
+    fn write_manifest(contents: &str) -> (test_util::TempDir, PathBuf) {
+        let dir = test_util::tempdir();
+        let path = dir.path().join("cluster.toml");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
 
     fn standalone_manifest() -> String {
         r#"
@@ -3009,6 +3188,149 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
         let debug = format!("{manifest:?}");
         assert!(debug.contains("test-cluster"));
         assert!(!debug.contains("/srv/argmin"));
+    }
+
+    #[test]
+    fn static_cluster_manifest_maps_standalone_process_to_legacy_runtime_config() {
+        let manifest = parse_static_cluster_manifest(&standalone_manifest(), "all-1").unwrap();
+        let mut environment = standalone_runtime_environment();
+        environment.insert("ARGMIN_LISTEN_ADDR", "127.0.0.1:19000".to_string());
+        environment.insert("ARGMIN_WORKERS", "7".to_string());
+
+        let config = manifest
+            .standalone_legacy_server_config(|key| environment.get(key).cloned())
+            .unwrap();
+
+        assert_eq!(config.process_role, ProcessRole::LegacyLocal);
+        assert_eq!(config.listen_addr, "127.0.0.1:19000");
+        assert_eq!(config.workers, 7);
+        assert_eq!(config.host_id.as_deref(), Some("host-1"));
+        assert_eq!(config.region, "us-east-1");
+        assert_eq!(config.data_dir, "/srv/argmin");
+        assert_eq!(config.pg_count, 16);
+        assert_eq!(config.storage_cluster_epoch, 1);
+        assert_eq!((config.ec_k, config.ec_m), (1, 0));
+        assert_eq!(config.storage_node_ids, vec![1]);
+        assert_eq!(config.storage_node_id, Some(1));
+        assert_eq!(
+            config.storage_node_data_dir.as_deref(),
+            Some("/srv/argmin/data")
+        );
+        assert_eq!(config.storage_node_socket_path, None);
+        assert!(config.storage_node_sockets.is_empty());
+        assert_eq!(config.control_plane_state_path, None);
+        assert_eq!(config.control_plane_socket_path, None);
+        assert!(config.control_plane_client_socket_paths.is_empty());
+    }
+
+    #[test]
+    fn static_cluster_standalone_runtime_does_not_start_unserved_refresh_path() {
+        let dir = test_util::tempdir();
+        let disk_path = dir.path().join("disk");
+        let socket_path = dir.path().join("run");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        let source = standalone_manifest()
+            .replace("/srv/argmin", disk_path.to_str().unwrap())
+            .replace("/run/argmin", socket_path.to_str().unwrap());
+        let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
+        let environment = standalone_runtime_environment();
+        let config = manifest
+            .standalone_legacy_server_config(|key| environment.get(key).cloned())
+            .unwrap();
+        let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
+
+        let cluster = crate::build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
+        let handle = storage::StorageClusterRuntimeMapHandle::new(cluster);
+
+        assert!(crate::maybe_spawn_frontend_control_plane_refresh_loop(handle, &config).is_none());
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn static_cluster_runtime_loader_requires_complete_file_mode_selection() {
+        let environment = standalone_runtime_environment();
+
+        assert!(
+            load_server_config_from_inputs(Some(Path::new("/cluster.toml")), None, |key| {
+                environment.get(key).cloned()
+            })
+            .unwrap_err()
+            .contains("ARGMIN_PROCESS_ID is required")
+        );
+        assert!(load_server_config_from_inputs(None, Some("all-1"), |key| {
+            environment.get(key).cloned()
+        })
+        .unwrap_err()
+        .contains("ARGMIN_CLUSTER_CONFIG_PATH is required"));
+    }
+
+    #[test]
+    fn static_cluster_runtime_loader_rejects_mixed_cluster_environment() {
+        let (_dir, path) = write_manifest(&standalone_manifest());
+        let mut environment = standalone_runtime_environment();
+        environment.insert("ARGMIN_PG_COUNT", "999".to_string());
+
+        let error = load_server_config_from_inputs(Some(&path), Some("all-1"), |key| {
+            environment.get(key).cloned()
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "ARGMIN_PG_COUNT cannot be set when ARGMIN_CLUSTER_CONFIG_PATH is active"
+        );
+        assert!(!error.contains("999"));
+    }
+
+    #[test]
+    fn static_cluster_runtime_loader_keeps_env_only_compatibility_mode() {
+        let mut environment = standalone_runtime_environment();
+        environment.insert("ARGMIN_PG_COUNT", "3".to_string());
+        environment.insert("ARGMIN_EC_K", "1".to_string());
+        environment.insert("ARGMIN_EC_M", "0".to_string());
+        environment.insert("ARGMIN_LOCAL_NODE_COUNT", "1".to_string());
+
+        let config =
+            load_server_config_from_inputs(None, None, |key| environment.get(key).cloned())
+                .unwrap();
+
+        assert_eq!(config.process_role, ProcessRole::LegacyLocal);
+        assert_eq!(config.pg_count, 3);
+        assert_eq!(config.storage_node_ids, vec![0]);
+    }
+
+    #[test]
+    fn static_cluster_runtime_loader_rejects_profiles_not_yet_runtime_mapped() {
+        let (_dir, replicated_path) = write_manifest(&replicated_manifest());
+        let environment = standalone_runtime_environment();
+        let error =
+            load_server_config_from_inputs(Some(&replicated_path), Some("control-1"), |key| {
+                environment.get(key).cloned()
+            })
+            .unwrap_err();
+        assert!(error.contains("replicated cluster manifests require"));
+
+        let credentialed = format!(
+            "{}{}",
+            replace_once(&standalone_manifest(), "auth_credentials = []", ""),
+            r#"
+[[auth_credentials]]
+principal = "storage-node"
+node_id = 1
+credential_id = "storage-1"
+credential_version = 1
+use_for_signing = false
+accept_from_ms = 0
+secret_ref = "file:/run/argmin-secrets/storage-1.key"
+"#
+        );
+        let (_dir, credentialed_path) = write_manifest(&credentialed);
+        let error =
+            load_server_config_from_inputs(Some(&credentialed_path), Some("all-1"), |key| {
+                environment.get(key).cloned()
+            })
+            .unwrap_err();
+        assert!(error.contains("no unresolved secret references"));
     }
 
     #[test]

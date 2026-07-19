@@ -770,10 +770,29 @@ Progress as of 2026-07-19:
   vectors pin the encoding, and mutation tests distinguish topology/process
   identity from credential, TLS, path, bind-address, region, and timeout
   changes. The validation command emits the three redacted SHA-256 identities.
+- Slice 3's compatibility mapping is implemented: server startup selects file
+  mode only when both `ARGMIN_CLUSTER_CONFIG_PATH` and `ARGMIN_PROCESS_ID` are
+  present, rejects every legacy environment variable that can alter
+  cluster-owned topology or identity, and otherwise retains the env-only
+  standalone/test path. A validated standalone `all-in-one` process maps to the
+  existing local runtime while preserving the manifest's explicit storage-node
+  id and exact data directory. Authority state and internal endpoint fields are
+  deliberately not activated in this compatibility profile because
+  `LegacyLocal` does not host those listeners; their runtime mapping remains
+  part of the replicated/embedded-service slices. Local listener and
+  user-facing S3 settings remain schema-external as specified above. Mapping
+  and runtime regressions cover mixed-mode rejection, unchanged env-only
+  behavior, nonzero storage-node identity, exact data-directory use, and the
+  absence of an unserved control-plane refresh path.
+- This Slice 3 activation is deliberately limited to standalone, Unix-only,
+  internal-auth-disabled manifests with no secret or TLS references.
+  Replicated, TCP, and secret-bearing manifests fail before runtime
+  construction. Existing process-level Unix test fixtures still need to move
+  to shared manifest builders as those process profiles are activated.
 - Selected-host filesystem/device checks remain with secret/filesystem
-  resolution rather than the structural parser. Slices 3 onward remain open:
-  no startup `ServerConfig` mapping, env-mode exclusion, durable identity
-  binding, secret resolution, or TCP transport is introduced by Slices 1-2.
+  resolution rather than the structural parser. Durable identity binding,
+  secret resolution, production replicated mapping, and TCP transport remain
+  open.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;

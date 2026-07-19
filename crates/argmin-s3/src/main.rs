@@ -293,7 +293,7 @@ fn main() {
 }
 
 async fn async_main() {
-    let config = match ServerConfig::from_env() {
+    let config = match static_cluster_config::load_server_config_from_environment() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("configuration error: {e}");
@@ -1121,8 +1121,8 @@ fn transfer_control_plane_pg_metadata_live(
     pg_id: PgId,
     acting_set: Vec<NodeId>,
 ) -> Result<MetadataTransferLiveSummary, String> {
-    let config =
-        ServerConfig::from_env().map_err(|error| format!("configuration error: {error}"))?;
+    let config = static_cluster_config::load_server_config_from_environment()
+        .map_err(|error| format!("configuration error: {error}"))?;
     let ec_config = EcConfig::new(config.ec_k, config.ec_m)
         .map_err(|error| format!("invalid EC config: {error}"))?;
     let read_control_plane =
@@ -5940,14 +5940,23 @@ fn build_storage_node_process_config(
     let socket_path = config.storage_node_socket_path.clone().ok_or_else(|| {
         "ARGMIN_STORAGE_NODE_SOCKET_PATH is required for storage roles".to_string()
     })?;
-    let acting_set: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
+    let acting_set: Vec<NodeId> = config
+        .storage_node_ids
+        .iter()
+        .copied()
+        .map(NodeId::new)
+        .collect();
+    let primary_node_id = acting_set
+        .first()
+        .copied()
+        .ok_or_else(|| "storage configuration has no node ids".to_string())?;
     let pg_routes = pg_ids
         .iter()
         .map(|&pg_id| StorageNodePgRoute {
             pg_id,
             cluster_epoch,
             state: PgState::Active,
-            primary_node_id: NodeId::new(0),
+            primary_node_id,
             acting_set: acting_set.clone(),
         })
         .collect();
@@ -6061,16 +6070,8 @@ fn build_control_plane_storage_node_process_config(
 }
 
 async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
-    let pg_ids: Vec<u32> = (0..config.pg_count).collect();
-    let data_dir = Path::new(&config.data_dir);
-    let ec_shape = storage::EcShape {
-        k: ec_config.data_shards(),
-        m: ec_config.parity_shards(),
-    };
-
-    let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
-    let storage_cluster = StorageCluster::open_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape)
-        .unwrap_or_else(|e| {
+    let storage_cluster =
+        build_legacy_local_storage_cluster(&config, &ec_config).unwrap_or_else(|e| {
             eprintln!("failed to open local storage cluster: {e}");
             std::process::exit(1);
         });
@@ -6082,6 +6083,45 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
         server_core::coordinator::BackgroundWorkerMode::all(),
     )
     .await;
+}
+
+fn build_legacy_local_storage_cluster(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+) -> Result<Arc<StorageCluster>, String> {
+    let pg_ids: Vec<u32> = (0..config.pg_count).collect();
+    let data_dir = Path::new(&config.data_dir);
+    let ec_shape = storage::EcShape {
+        k: ec_config.data_shards(),
+        m: ec_config.parity_shards(),
+    };
+
+    let node_ids: Vec<NodeId> = config
+        .storage_node_ids
+        .iter()
+        .copied()
+        .map(NodeId::new)
+        .collect();
+    let storage_cluster = if node_ids.len() == 1 {
+        let node_id = node_ids[0];
+        let node_data_dir = config
+            .storage_node_data_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join(format!("node-{:04}", node_id.as_u32())));
+        let local_map = LocalClusterMap::open_with_configs(
+            node_id,
+            [storage::LocalNodeStoreConfig::new(node_id, node_data_dir)],
+            &pg_ids,
+            ec_shape,
+        )
+        .map_err(|error| error.to_string())?;
+        StorageCluster::from_local_map(Arc::new(local_map)).map_err(|error| error.to_string())?
+    } else {
+        StorageCluster::open_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape)
+            .map_err(|error| error.to_string())?
+    };
+    Ok(storage_cluster)
 }
 
 async fn run_remote_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
@@ -6203,9 +6243,18 @@ fn build_remote_frontend_storage_cluster(
         k: ec_config.data_shards(),
         m: ec_config.parity_shards(),
     };
-    let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
+    let node_ids: Vec<NodeId> = config
+        .storage_node_ids
+        .iter()
+        .copied()
+        .map(NodeId::new)
+        .collect();
+    let metadata_primary_node_id = node_ids
+        .first()
+        .copied()
+        .ok_or_else(|| "storage configuration has no node ids".to_string())?;
     let mut local_map = LocalClusterMap::open_frontend_topology_only_with_epoch(
-        NodeId::new(0),
+        metadata_primary_node_id,
         node_ids,
         &config.storage_pg_ids,
         ec_shape,
@@ -7022,7 +7071,7 @@ mod tests {
             tls_key_path: None,
             data_dir: "/tmp/argmin-test".to_string(),
             pg_count: 8,
-            local_node_count: 6,
+            storage_node_ids: (0..6).collect(),
             storage_node_id: Some(2),
             storage_node_data_dir: Some("/tmp/argmin-test/node-0002".to_string()),
             storage_node_socket_path: Some("/tmp/argmin-test/node-0002.sock".to_string()),
@@ -14523,6 +14572,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_local_storage_cluster_preserves_explicit_node_id_and_data_dir() {
+        let tmp = test_util::tempdir();
+        let node_data_dir = tmp.path().join("manifest-node-data");
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.data_dir = tmp.path().join("unused-dense-layout").display().to_string();
+        config.pg_count = 2;
+        config.storage_node_ids = vec![17];
+        config.storage_node_id = Some(17);
+        config.storage_node_data_dir = Some(node_data_dir.display().to_string());
+
+        let cluster = build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
+
+        assert_eq!(
+            cluster.local_node_ids().collect::<Vec<_>>(),
+            [NodeId::new(17)]
+        );
+        assert_eq!(cluster.local_node_count(), 1);
+        for pg_id in [0, 1] {
+            let route = cluster.local_pg_route(PgId::new(pg_id)).unwrap();
+            assert_eq!(route.primary_node_id(), NodeId::new(17));
+            assert_eq!(route.acting_set(), &[NodeId::new(17)]);
+        }
+        assert!(node_data_dir.exists());
+        assert!(!Path::new(&config.data_dir).exists());
+    }
+
+    #[test]
     fn remote_frontend_storage_cluster_uses_configured_epoch_and_socket_clients() {
         let tmp = std::env::temp_dir().join(format!(
             "argmin-remote-frontend-cluster-test-{}",
@@ -14533,7 +14610,7 @@ mod tests {
         let mut config = test_server_config();
         config.process_role = ProcessRole::Frontend;
         config.data_dir = tmp.join("frontend").display().to_string();
-        config.local_node_count = 1;
+        config.storage_node_ids = vec![0];
         config.pg_count = 2;
         config.storage_pg_ids = vec![0, 1];
         config.storage_cluster_epoch = 9;
@@ -14968,7 +15045,6 @@ mod tests {
         let ec_config = EcConfig::new(1, 0).unwrap();
         let mut config = test_server_config();
         config.process_role = ProcessRole::Frontend;
-        config.local_node_count = 1;
         config.pg_count = 1;
         config.storage_pg_ids = vec![0];
         config.storage_node_id = None;
@@ -15005,7 +15081,6 @@ mod tests {
         let ec_config = EcConfig::new(1, 0).unwrap();
         let mut config = test_server_config();
         config.process_role = ProcessRole::Frontend;
-        config.local_node_count = 4;
         config.pg_count = 1;
         config.storage_pg_ids = vec![0];
         config.storage_node_id = None;
@@ -15042,7 +15117,6 @@ mod tests {
         let ec_config = EcConfig::new(1, 0).unwrap();
         let mut config = test_server_config();
         config.process_role = ProcessRole::Frontend;
-        config.local_node_count = 1;
         config.pg_count = 1;
         config.storage_pg_ids = vec![0];
         config.storage_node_id = None;
@@ -15197,7 +15271,6 @@ mod tests {
         let ec_config = EcConfig::new(1, 0).unwrap();
         let mut frontend_config = test_server_config();
         frontend_config.process_role = ProcessRole::Frontend;
-        frontend_config.local_node_count = 2;
         frontend_config.pg_count = 1;
         frontend_config.storage_pg_ids = vec![0];
         frontend_config.storage_node_id = None;
@@ -15265,7 +15338,6 @@ mod tests {
         let ec_config = EcConfig::new(1, 0).unwrap();
         let mut config = test_server_config();
         config.process_role = ProcessRole::StorageNode;
-        config.local_node_count = 1;
         config.pg_count = 1;
         config.storage_pg_ids = vec![0];
         config.storage_node_id = Some(0);
@@ -15305,7 +15377,6 @@ mod tests {
         let ec_config = EcConfig::new(1, 0).unwrap();
         let mut config = test_server_config();
         config.process_role = ProcessRole::StorageNode;
-        config.local_node_count = 1;
         config.pg_count = 1;
         config.storage_pg_ids = vec![0];
         config.storage_node_id = Some(0);
@@ -15349,7 +15420,6 @@ mod tests {
         let ec_config = EcConfig::new(1, 0).unwrap();
         let mut config = test_server_config();
         config.process_role = ProcessRole::StorageNode;
-        config.local_node_count = 1;
         config.pg_count = 1;
         config.storage_pg_ids = vec![0];
         config.storage_node_id = Some(0);
