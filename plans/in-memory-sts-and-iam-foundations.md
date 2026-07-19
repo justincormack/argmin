@@ -2,8 +2,10 @@
 
 ## Status
 
-Proposed plan. The first implementation target is a test-enablement vertical
-slice, not a production identity service.
+Phase 0 design, AWS-oracle, and fixture work is complete for the first usable
+`AssumeRole` milestone as of 2026-07-19. Implementation has not begun. The
+first implementation target is a test-enablement vertical slice, not a
+production identity service.
 
 The first public STS operation will be `AssumeRole`. It will be exposed on the
 existing HTTP listener and backed by process-local, in-memory role state. Issued
@@ -199,9 +201,9 @@ add focused AWS probes for:
   session-token inputs on every S3 signing mode
 - token, expiry, signature, region, and service error precedence
 - invalid signatures combined with role deletion and policy changes, separating
-  issuer-credential invalidation from mutable authorization behavior; inject
-  issuer-liveness and authorization-provider failures independently in the
-  equivalent local tests
+  issuer-credential invalidation from mutable authorization behavior; record
+  the distinct issuer-liveness and authorization-provider failure regressions
+  required from the equivalent Phase 2 and Phase 3 local tests
 - exact success XML, namespaces, timestamps, headers, request IDs, error XML,
   status codes, error codes, and messages
 - immediate use near issuance and the exact expiry boundary
@@ -250,17 +252,25 @@ payload tampering fail authentication before any decoded field is trusted.
 Introduce structured public-request identity rather than continuing to add
 optional fields to `AccountIdentity`.
 
-The exact Rust types should be settled during the illegal-states review, but
-the model needs to distinguish at least:
+The Phase 0 identity decision is to retain `AccountIdentity` as the stable
+account/owner value already used by S3 metadata and compose it with a separate
+typed principal identity for authenticated requests. Do not add optional
+user, role, or session fields to `AccountIdentity`, and do not replace its
+account-level meaning with a universal principal enum. `AuthContext`,
+`Requester`, and later identity records should carry an authenticated identity
+whose account and principal kind are both mandatory; anonymous requests remain
+a separate state. Authenticated principal kinds must distinguish at least:
 
-- `Account`: account ID, canonical user ID, display name
-- `IamUser`: user ARN, stable user ID, user name/path, account
-- `IamRole`: IAM role ARN, stable role ID, separately stored role name and path,
-  and account
+- existing configured/root-style principals used by current tests
+- `IamUser`: user ARN, stable user ID, and user name/path
 - `AssumedRoleSession`: role identity, path-free STS session principal ARN,
   assumed-role ID, session name, issuer/caller, issue/expiry times, source
   identity, and tags
-- existing configured/root-style principals used by current tests
+
+An `IamRole` is a separate stored issuer/authorization identity containing its
+IAM role ARN, stable role ID, and separately stored role name and path; it must
+not become a directly authenticated request-principal variant merely to reuse
+the same enum.
 
 `Requester` and policy request context should receive this structured identity.
 The model must expose distinct typed accessors rather than one ambiguous
@@ -581,12 +591,13 @@ policy after remaining valid through authentication, and a bad signature is
 rejected before the policy deny is evaluated. Matching local tests must inject
 issuer-liveness and authorization-provider failures separately.
 
-The precise error mapping for missing, malformed, wrong-key, tampered, mismatched,
-and expired tokens must come from AWS probes. Existing evidence
-already says expired temporary credentials win over signature mismatch, while
-unexpected token input on a static credential is checked after signature
-comparison. Add committed regressions for all paths once real temporary
-credentials exist.
+The completed Phase 0 matrices pin the precise service-facing mappings and
+precedence for missing, malformed, wrong-key, tampered, mismatched, expired,
+and inactive credential/token inputs. They establish, among other cases, that
+expired temporary credentials win over signature mismatch, while unexpected
+token input on an active static credential is checked after signature
+comparison. Transfer those observations into committed implementation
+regressions once real temporary credentials exist.
 
 Do not conflate the service-facing error mapping with the shared internal
 credential-validation decision. The AWS STS Query endpoint maps missing,
@@ -596,11 +607,11 @@ S3 SigV4 header path maps the equivalent observed cases to
 rendering the AWS-pinned service-specific response.
 
 A stateless verifier cannot recover expiry or identity when the token is
-missing. Phase 0 must pin AWS's missing-token precedence. If Argmin needs to
-recognize one of its own issued access key IDs without a token, use a
-cryptographically self-identifying access-key encoding or another authenticated
-stateless technique; an Argmin namespace prefix alone is only a routing hint and
-must not be treated as proof that Argmin issued the key.
+missing. The completed Phase 0 credential matrices pin AWS's missing-token
+precedence, and the Argmin-owned `ARGS` namespace selects the corresponding
+temporary-credential error path. The prefix remains only a routing hint and
+must not be treated as proof that Argmin issued the key; authentication still
+requires successfully opening and binding the token.
 
 Presigned and POST requests need the same semantics as header auth. Streaming
 requests must bind the seed request to the temporary credential and must not
@@ -609,13 +620,55 @@ drop the validated session identity when constructing streaming signing state.
 ### 6. Introduce a reusable IAM policy core
 
 Do not fork bucket-policy parsing into unrelated trust and identity evaluators.
-Extract or build a shared policy core that can represent the common IAM grammar
-while retaining typed wrappers for:
+The Phase 0 policy decision is to extract the common language and matching
+mechanics behind the existing `BucketPolicy` API while retaining typed policy
+documents, typed decision inputs, and policy-kind-specific composition rules.
+The existing S3 bucket-policy API, S3 action type, S3 resource construction,
+condition-input loading, public-policy classification, and S3 authorization
+composition must remain explicit rather than becoming one universal request
+context full of optional IAM and S3 fields.
+
+The shared core should own the reusable policy-language pieces:
+
+- policy version and effect
+- common JSON scalar-or-list parsing
+- condition clauses, operators, variables, and wildcard matching
+- action and resource pattern matching
+- explicit-deny and statement-match primitives
+- validated common value types and lookups for tags and other global condition
+  facts
+
+Common data does not imply ambiguous provenance. Use shared validated tag key,
+tag value, and tag-collection types, but retain typed sources for principal,
+role, session, request, resource, existing-object, and requested-object tags.
+Those sources map deliberately to condition-key families such as
+`aws:PrincipalTag`, `aws:RequestTag`, and `s3:ExistingObjectTag`. Likewise,
+current time, source IP, secure transport, requested region, and structured
+principal identity are shared condition facts supplied through typed
+service/request adapters. An unavailable input must remain distinguishable
+from an available but empty value.
+
+Build typed validated wrappers over that core for:
 
 - S3 bucket/resource policies, which contain `Principal`
 - role trust policies, which contain `Principal` and authorize STS actions
 - identity policies, which omit `Principal`
 - inline session policies, which restrict but never expand role permissions
+
+Each wrapper must enforce its own allowed and required statement shape,
+action namespaces, resource applicability, condition inputs, and size limits.
+A permissive parsed statement containing optional `Principal` or `Resource`
+may exist only as an internal parse stage; authorization-facing types must make
+the policy kind's valid shape explicit. Trust, identity, session, and S3
+resource-policy evaluation should feed different typed request data into the
+shared matcher rather than reuse the S3 bucket/key request structure.
+
+Implement this incrementally: first introduce structured authenticated
+identity, then extract common policy primitives behind behavior-preserving
+`BucketPolicy` interfaces, then add typed trust and identity policy documents,
+and finally add their explicit decision-composition layer. Do not build a
+parallel IAM parser/evaluator, and do not replace the mature S3 path with a
+single universal policy/request type.
 
 The first evaluator slice only needs actions/resources/conditions required by
 the initial tests, but its combination rules must be real:
@@ -663,15 +716,51 @@ caller/role pair. Trust policies and caller identity policies must be separate
 records so tests can independently remove or deny either side of the
 authorization decision.
 
-The embedded test server can receive deterministic constructor-supplied role
-fixtures. The standalone UAT binary may use explicitly named UAT-only fixture
-configuration, following the existing extra-credential pattern. This is test
-setup, not a public account-management API and not the future config-file
-backend.
+Separate S3 identity bootstrap from normal identity-backend contents. Static
+server configuration needs enough S3-side authority to establish initial
+accounts, their root principals, and initial root or administrative credential
+references. It must not thereby become the long-term database for users,
+access keys, roles, and policies. Model the boundary as a typed identity
+provider configuration containing:
+
+- bootstrap accounts with stable account/canonical identity and initial root or
+  administrative credential references
+- an explicit backend kind and credential domain
+- backend-specific configured records
+
+The initial process-local backend's configured records contain the principals,
+long-lived credentials, roles, trust and permission policies, and policy
+attachments required by the first tests. Reapplying those records at each
+process start is expected because this backend is deliberately volatile. A
+future config-file provider may treat its versioned file as authoritative
+static identity data. A future persistent provider instead consumes bootstrap
+authority only when its identity store is genuinely uninitialized, records
+that initialization atomically, and thereafter treats the durable store as
+authoritative. Restart must never recreate a deleted account, credential, role,
+or policy merely because an old bootstrap entry remains configured; conflicting
+bootstrap identity must fail closed rather than merge or replace live state.
+
+Keep user-facing S3 identity configuration separate from cluster topology and
+placement identity. The emerging static cluster manifest deliberately excludes
+S3 accounts and credentials; a versioned S3 identity section or sibling
+configuration may be selected by server configuration, but its users and roles
+must not enter the cluster topology digest. Production-shaped secrets remain
+references rather than inline values. Test constructors may inject already
+resolved fixture secrets without changing the file grammar.
+
+The embedded test server constructs the typed process-local identity
+configuration directly. The standalone UAT wrapper generates the equivalent
+versioned identity configuration and starts the ordinary `argmin-s3` binary
+with it. The configured callers and roles are ordinary process-local backend
+records, not special UAT principal variants or a privileged fixture backdoor.
+Do not add per-role, per-policy, or policy-JSON UAT environment variables; any
+temporary external selector should identify the generated configuration, not
+encode an alternative role database.
 
 The first public role-management surface comes later through IAM-compatible
-Query APIs. There must be no undocumented production environment-variable
-format that becomes an accidental long-term role database.
+Query APIs. The later persistent-account plan owns durable bootstrap
+transactions and lifecycle semantics; this plan establishes the provider and
+typed-configuration seams without claiming production-quality persistence.
 
 ### 8. Generalize the existing S3 Control routing before S3 routing
 
@@ -761,7 +850,9 @@ endpoint family deliberately emulated by `SharedRegional`; there must be no
 implicit fallback based on whichever parser happens to run first. Ordinary
 unambiguous versioned-tag requests should map to the S3 Control observation and
 ordinary unambiguous Query requests to the STS observation, while every mixed
-case remains unresolved until that table is committed.
+case was deliberately left unresolved at this design point. The completed
+Phase 0 tables below resolve the named bounded cases before Phase 4
+implementation.
 
 The AWS probes do not verify the local Host/authority trust boundary. Add
 separate `SharedRegional` tests that hold method, target, body, query, signing
@@ -1022,8 +1113,8 @@ acceptable test shortcut.
   wrapper without weakening the existing broad test-user policies unnecessarily
 - add raw HTTP probes for Query protocol and error precedence
 - probe authentication precedence independently from mutable role deletion and
-  policy-change outcomes; cover injected provider failure in the matching local
-  test
+  policy-change outcomes, and record the distinct local provider-failure
+  requirements for the implementation phases
 - pin session-principal matching separately from `aws:PrincipalArn`, and pin an
   `aws:TokenIssueTime` deny boundary
 - decide the exact first supported `AssumeRole` parameter set from evidence
@@ -1051,12 +1142,13 @@ The initial Query-protocol slice completed on 2026-07-13:
   namespace, AWSFault error namespace, exact core `InvalidAction` messages,
   `text/xml` response type, and request-ID agreement
 
-Before Phase 0 can satisfy the first-milestone exit condition, it still needs
-to explicitly disposition the remaining architecture decisions listed below.
-The credential-precedence matrix, bounded Query-parser limits, temporary
-access-key namespace, generation shape, session-token envelope,
-credential-domain binding, and key-overlap semantics are now fixed by
-completed Phase 0 slices.
+The architecture decisions required by Phase 0's first-milestone exit condition
+are now fixed. They include structured identity composition; the shared policy
+core with typed policy wrappers and decision inputs; S3 identity bootstrap
+separated from backend contents; typed process-local and standalone-UAT
+configuration; the credential-precedence matrix; bounded Query-parser limits;
+the temporary access-key namespace and generation shape; the session-token
+envelope; credential-domain binding; and key-overlap semantics.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
 remain unsupported compatibility gaps and must never be silently ignored.
@@ -1086,7 +1178,9 @@ action separately; the cleanup command sends the `/argmin-sts-oracle/` path
 prefix and applies stricter returned-path and role-name checks before deletion.
 Every role except the dedicated bounded mutation fixture remains
 permissionless. These temporary grants and the persistent boundary policy
-should be removed with the oracle after Phase 0.
+remain only while the AWS oracle is needed. Remove them after its observations
+have been transferred into implementation-facing conformance coverage in
+Phase 5; completing Phase 0 alone is not the removal trigger.
 
 The disabled-credential fixture also uses the ordinary primary test user. Its
 IAM grants can create, inspect, deactivate, and delete only permissionless
@@ -2288,13 +2382,18 @@ record exists.
 - add deterministic clock boundary tests
 - add concurrency, token redaction, malformed/tampered-token, wrong-key,
   access-key-binding, and unknown-version tests
+- add injected provider-failure regressions for long-lived credential lookup
+  and stable issuer-role liveness, distinguishing each failure from an unknown
+  credential or deleted issuer and requiring the internal fail-closed response
 - exercise each SigV4 mode at the authentication boundary without claiming that
   a role session yet has usable S3 permissions
 
 Exit condition: directly sealed session credentials authenticate with
 AWS-pinned token/signature/expiry precedence on every SigV4 mode and produce a
-typed authenticated session. Temporary role credentials remain documented as
-unsupported for end-to-end S3 use until Phase 3 supplies role authorization.
+typed authenticated session; injected credential and issuer-liveness provider
+failures remain distinct from invalid credentials and deleted issuers.
+Temporary role credentials remain documented as unsupported for end-to-end S3
+use until Phase 3 supplies role authorization.
 
 ### Phase 3: IAM policy and role core
 
@@ -2310,13 +2409,17 @@ unsupported for end-to-end S3 use until Phase 3 supplies role authorization.
 - integrate role identity policy decisions into the S3 authorization paths
   required by the first conformance suite
 - implement correct explicit-deny/intersection/resource-policy composition
+- inject current-role authorization-provider failure independently from stable
+  issuer liveness and require authorization to fail closed after successful
+  authentication
 - seed deterministic roles in embedded tests and UAT-only setup
 
 Exit condition: a constructed role session can authenticate and use S3 with
 only the AWS-equivalent permissions of its current role, sealed session, and
 resource-policy combination. The configured caller's identity-policy path is
 also capable of representing `sts:AssumeRole`; no broad profile shortcut is
-involved.
+involved. An injected current-role authorization-provider failure fails closed
+without being misreported as an authentication failure.
 
 ### Phase 4: STS Query endpoint and core `AssumeRole`
 
@@ -2516,14 +2619,6 @@ HTTP because ordinary AWS S3 regional endpoints document both HTTP and HTTPS.
 `AssumeRole` responses contain bearer credentials, so this is a hard transport
 invariant rather than a documentation warning. No session response or request
 body may appear in traces.
-
-## Remaining Decisions To Resolve During Phase 0
-
-1. Which existing identity/policy types can be generalized without making S3
-   bucket-policy code less explicit?
-2. Should the first standalone UAT role be injected through a dedicated
-   test-only constructor/config object or through explicitly UAT-only
-   environment variables?
 
 ## Definition Of The First Usable Milestone
 
