@@ -1238,7 +1238,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_stream_upload_session(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -1352,7 +1352,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_stream_upload_segments(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -1482,7 +1482,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn prepare_stream_segment_append(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
@@ -1494,7 +1494,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_stream_put_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -1506,7 +1506,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn update_stream_upload_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -1527,7 +1527,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_stream_part_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -2821,7 +2821,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_stream_upload_session(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -3032,7 +3032,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_stream_upload_segments(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -3066,7 +3066,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn prepare_stream_segment_append(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
@@ -3258,7 +3258,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_stream_put_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -3269,7 +3269,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn update_stream_upload_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -3396,7 +3396,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             encryption: request.commit.encryption.clone(),
         };
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;
@@ -3420,7 +3420,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_stream_part_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -3499,7 +3499,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             });
         }
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;

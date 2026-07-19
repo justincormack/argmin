@@ -8932,9 +8932,9 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        mutation_client.load_stream_upload_session(pg_id, bucket, key, session_id)
+        mutation_client.load_stream_upload_session(object_pg_id, bucket, key, session_id)
     }
 
     pub fn prepare_stream_segment_append(
@@ -8943,11 +8943,12 @@ impl StorageCluster {
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
     ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let (target, mut segment_record) =
-            mutation_client.prepare_stream_segment_append(pg_id, bucket, key, request)?;
+            mutation_client.prepare_stream_segment_append(object_pg_id, bucket, key, request)?;
         segment_record.placement_cluster_epoch = self.operation_epoch();
         Ok((target, segment_record))
     }
@@ -9024,7 +9025,8 @@ impl StorageCluster {
             segment_record,
             shard_batch,
         } = request;
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let ec = EcShape {
             k: segment_record.ec_k,
             m: segment_record.ec_m,
@@ -9096,16 +9098,20 @@ impl StorageCluster {
                     ));
                 }
             }
-            let existing_stream_segment =
-                match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
-                    Ok(segments) => segments
-                        .into_iter()
-                        .find(|segment| segment.segment_index == segment_index),
-                    Err(error) => {
-                        cleanup_stream_append_payload!();
-                        return Err(error);
-                    }
-                };
+            let existing_stream_segment = match mutation_client.load_stream_upload_segments(
+                object_pg_id,
+                bucket,
+                key,
+                session_id,
+            ) {
+                Ok(segments) => segments
+                    .into_iter()
+                    .find(|segment| segment.segment_index == segment_index),
+                Err(error) => {
+                    cleanup_stream_append_payload!();
+                    return Err(error);
+                }
+            };
             match existing_stream_segment {
                 Some(existing) if existing == *segment_record => return Ok(()),
                 Some(_) => {
@@ -9689,22 +9695,27 @@ impl StorageCluster {
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(AbortStreamUploadSession);
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let mut pending_completed_session =
             self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
-        let observed_stream_session =
-            match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
-                Ok(_) => true,
-                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
-                    ..
-                })) if pending_completed_session => {
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            };
+        let observed_stream_session = match mutation_client.load_stream_upload_segments(
+            object_pg_id,
+            bucket,
+            key,
+            session_id,
+        ) {
+            Ok(_) => true,
+            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. }))
+                if pending_completed_session =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
 
         #[cfg(any(test, feature = "test-hooks"))]
         self.maybe_run_before_stream_abort_storage_hook();
@@ -9714,26 +9725,34 @@ impl StorageCluster {
                 self.pending_command_completes_stream_session(pg_id, bucket, key, session_id)?;
             self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
 
-            let stream_session =
-                match mutation_client.load_stream_upload_session(pg_id, bucket, key, session_id) {
-                    Ok(stream_session) => stream_session,
-                    Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
-                        ..
-                    })) if pending_completed_session || observed_stream_session => {
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error),
-                };
-            let staged_segments =
-                match mutation_client.load_stream_upload_segments(pg_id, bucket, key, session_id) {
-                    Ok(staged_segments) => staged_segments,
-                    Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
-                        ..
-                    })) if pending_completed_session || observed_stream_session => {
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error),
-                };
+            let stream_session = match mutation_client.load_stream_upload_session(
+                object_pg_id,
+                bucket,
+                key,
+                session_id,
+            ) {
+                Ok(stream_session) => stream_session,
+                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                    ..
+                })) if pending_completed_session || observed_stream_session => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            let staged_segments = match mutation_client.load_stream_upload_segments(
+                object_pg_id,
+                bucket,
+                key,
+                session_id,
+            ) {
+                Ok(staged_segments) => staged_segments,
+                Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                    ..
+                })) if pending_completed_session || observed_stream_session => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             let command_id = match self.next_object_metadata_command_id(pg_id) {
                 Ok(command_id) => command_id,
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {

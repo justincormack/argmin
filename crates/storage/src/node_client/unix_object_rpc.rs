@@ -1572,13 +1572,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_stream_upload_session(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, ObjectPgActionError> {
         let request = StorageRpcStreamUploadSessionRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             session_id: session_id.clone(),
         };
         let payload = encode_stream_upload_session_request(&request);
@@ -2121,13 +2121,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_stream_upload_segments(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<Vec<StreamUploadSegmentRecord>, ObjectPgActionError> {
         let request = StorageRpcStreamUploadSessionRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             session_id: session_id.clone(),
         };
         let payload = encode_stream_upload_session_request(&request);
@@ -2550,7 +2550,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn prepare_stream_segment_append(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
@@ -2559,7 +2559,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             self.load_stream_upload_session(pg_id, bucket, key, &request.session_id)?;
         let expected_target = expected_session.target;
         let rpc_request = StorageRpcStreamSegmentAppendPrepareRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             request: request.clone(),
         };
         let payload = encode_stream_segment_append_prepare_request(&rpc_request);
@@ -2606,13 +2606,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_stream_put_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
         let request = StorageRpcStreamPutFinalizeSnapshotRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             session_id: session_id.clone(),
         };
         let payload = encode_stream_put_finalize_snapshot_request(&request);
@@ -2640,7 +2640,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn update_stream_upload_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -2648,7 +2648,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         renewed: &BucketWriteReservationProof,
     ) -> Result<(), ObjectPgActionError> {
         let request = StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             session_id: session_id.clone(),
             current: current.clone(),
             renewed: renewed.clone(),
@@ -2675,7 +2675,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         request: BuildStreamPutCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         let rpc_request = StorageRpcStreamPutCommitCommandBuildRequest {
-            object: self.object_request(request.pg_id, request.bucket, request.key),
+            object: self.object_request(request.pg_id.pg_id(), request.bucket, request.key),
             session_id: request.session_id.clone(),
             total_size: request.total_size,
             expected_snapshot: request.expected_snapshot.clone(),
@@ -2722,7 +2722,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 cluster_epoch,
                 log_index,
             } => Err(self.metadata_command_log_conflict_error(
-                request.pg_id,
+                request.pg_id.pg_id(),
                 "decode stream PUT commit command build response",
                 node_id,
                 conflict_pg_id,
@@ -2734,7 +2734,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_stream_part_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -2742,7 +2742,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         part_number: u32,
     ) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError> {
         let request = StorageRpcStreamPartFinalizeSnapshotRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             upload_id: upload_id.clone(),
             session_id: session_id.clone(),
             part_number,
@@ -2777,7 +2777,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         request: BuildStreamPartCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         let rpc_request = StorageRpcStreamPartCommitCommandBuildRequest {
-            object: self.object_request(request.pg_id, request.bucket, request.key),
+            object: self.object_request(request.pg_id.pg_id(), request.bucket, request.key),
             upload_id: request.upload_id.clone(),
             session_id: request.session_id.clone(),
             part_number: request.part_number,
@@ -2826,7 +2826,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 cluster_epoch,
                 log_index,
             } => Err(self.metadata_command_log_conflict_error(
-                request.pg_id,
+                request.pg_id.pg_id(),
                 "decode stream part commit command build response",
                 node_id,
                 conflict_pg_id,

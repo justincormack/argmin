@@ -485,7 +485,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_stream_upload_session(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -556,7 +556,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_stream_upload_segments(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -634,7 +634,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn prepare_stream_segment_append(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
@@ -642,7 +642,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_stream_put_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -650,7 +650,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn update_stream_upload_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -665,7 +665,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_stream_part_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -740,7 +740,7 @@ pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
@@ -790,7 +790,7 @@ pub(crate) struct BuildCreateMultipartUploadCommandReq<'a> {
 }
 
 pub(crate) struct BuildStreamPartCommitCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
@@ -1767,7 +1767,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_stream_upload_session(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -1799,7 +1799,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_stream_upload_segments(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -1822,7 +1822,7 @@ pub(crate) trait StorageNodeClient:
 
     fn prepare_stream_segment_append(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         request: &PrepareStreamUploadSegmentAppendReq,
@@ -1844,7 +1844,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_stream_put_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -1852,7 +1852,7 @@ pub(crate) trait StorageNodeClient:
 
     fn update_stream_upload_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
@@ -1867,7 +1867,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_stream_part_finalize_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,

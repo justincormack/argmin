@@ -3199,16 +3199,26 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
     let mutation_client = Arc::clone(map.node(node_id).unwrap().object_mutation_metadata_client());
 
     let loaded = mutation_client
-        .load_stream_upload_session(PgId::new(0), &bucket, &key, &session_id)
+        .load_stream_upload_session(
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            &session_id,
+        )
         .unwrap();
     assert_eq!(loaded.session_id, session_id);
     let segments = mutation_client
-        .load_stream_upload_segments(PgId::new(0), &bucket, &key, &loaded.session_id)
+        .load_stream_upload_segments(
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            &loaded.session_id,
+        )
         .unwrap();
     assert!(segments.is_empty());
     let (target, segment) = mutation_client
         .prepare_stream_segment_append(
-            PgId::new(0),
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
             &bucket,
             &key,
             &crate::PrepareStreamUploadSegmentAppendReq {

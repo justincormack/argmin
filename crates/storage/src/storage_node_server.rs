@@ -6286,7 +6286,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let outcome = match ObjectMutationMetadataNodeClient::load_stream_upload_session(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             &request.session_id,
@@ -6330,7 +6330,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             &request.session_id,
@@ -6364,7 +6364,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let outcome = match ObjectMutationMetadataNodeClient::load_stream_upload_segments(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             &request.session_id,
@@ -6725,7 +6725,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let outcome = match ObjectMutationMetadataNodeClient::prepare_stream_segment_append(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             &request.request,
@@ -7192,7 +7192,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let snapshot = match ObjectMutationMetadataNodeClient::load_stream_put_finalize_snapshot(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             &request.session_id,
@@ -7223,7 +7223,8 @@ impl StorageNodeConnectionHandler {
         let response = match ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
             &local_client,
             BuildStreamPutCommitCommandReq {
-                pg_id: request.object.pg_id,
+                pg_id: self
+                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 cluster_epoch: request.object.cluster_epoch,
                 bucket: &request.object.bucket,
                 key: &request.object.key,
@@ -7274,7 +7275,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let snapshot = match ObjectMutationMetadataNodeClient::load_stream_part_finalize_snapshot(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             &request.upload_id,
@@ -7307,7 +7308,8 @@ impl StorageNodeConnectionHandler {
         let response = match ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
             &local_client,
             BuildStreamPartCommitCommandReq {
-                pg_id: request.object.pg_id,
+                pg_id: self
+                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 cluster_epoch: request.object.cluster_epoch,
                 bucket: &request.object.bucket,
                 key: &request.object.key,

@@ -3145,7 +3145,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        let object_pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
         let upload = self
             .object_mutation_metadata_primary_client(bucket, key)?
             .load_stream_upload_session(object_pg_id, bucket, key, session_id)?;
@@ -3901,7 +3901,7 @@ impl super::StorageCluster {
         self.object_mutation_metadata_primary_client(&upload.bucket, &upload.key)
             .map_err(BucketWriteDrainError::Store)?
             .update_stream_upload_bucket_write_reservation(
-                PgId::new(self.object_metadata_pg_id(&upload.bucket, &upload.key)),
+                self.object_metadata_pg(&upload.bucket, &upload.key),
                 &upload.bucket,
                 &upload.key,
                 &upload.session_id,
@@ -3940,7 +3940,7 @@ impl super::StorageCluster {
         let renewed = BucketWriteReservationProof::from(&current);
         self.object_mutation_metadata_primary_client(&upload.bucket, &upload.key)?
             .update_stream_upload_bucket_write_reservation(
-                PgId::new(self.object_metadata_pg_id(&upload.bucket, &upload.key)),
+                self.object_metadata_pg(&upload.bucket, &upload.key),
                 &upload.bucket,
                 &upload.key,
                 &upload.session_id,
@@ -11190,7 +11190,8 @@ impl super::StorageCluster {
         mut action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(FinalizePutObjectStream);
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let effective_bucket_write_reservation = bucket_write_reservation;
         let mut bucket_write_proof_command_owned = false;
         macro_rules! release_caller_bucket_write_proof_if_unowned {
@@ -11269,9 +11270,12 @@ impl super::StorageCluster {
                 bucket_write_proof_command_owned = true;
             }
 
-            let storage_snapshot = match mutation_client
-                .load_stream_put_finalize_snapshot(pg_id, bucket, key, session_id)
-            {
+            let storage_snapshot = match mutation_client.load_stream_put_finalize_snapshot(
+                object_pg_id,
+                bucket,
+                key,
+                session_id,
+            ) {
                 Ok(snapshot) => snapshot,
                 Err(
                     error @ ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
@@ -11341,7 +11345,7 @@ impl super::StorageCluster {
                     );
                     let command = match mutation_client.build_stream_put_commit_command(
                         BuildStreamPutCommitCommandReq {
-                            pg_id,
+                            pg_id: object_pg_id,
                             cluster_epoch: self.operation_epoch(),
                             bucket,
                             key,
@@ -12529,7 +12533,8 @@ impl super::StorageCluster {
         mut action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(FinalizeUploadPartStream);
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
@@ -12580,7 +12585,7 @@ impl super::StorageCluster {
             }
 
             let storage_snapshot = match mutation_client.load_stream_part_finalize_snapshot(
-                pg_id,
+                object_pg_id,
                 bucket,
                 key,
                 upload_id,
@@ -12655,7 +12660,7 @@ impl super::StorageCluster {
             } else {
                 let command = match mutation_client.build_stream_part_commit_command(
                     BuildStreamPartCommitCommandReq {
-                        pg_id,
+                        pg_id: object_pg_id,
                         cluster_epoch: self.operation_epoch(),
                         bucket,
                         key,

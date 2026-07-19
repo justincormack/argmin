@@ -803,6 +803,38 @@ Ninth Phase 3 slice:
   regressions, the boundary checker, formatting, workspace-wide strict Clippy,
   and the full workspace suite (7,150 tests).
 
+Tenth Phase 3 slice:
+
+- exact-object stream mutation now requires `ObjectMetadataPgId` for session
+  and staged-segment reads, segment-append preparation, PutObject and
+  UploadPart finalization snapshots, bucket-write-reservation renewal, and
+  both final commit command request values. The duplicate methods on the
+  transitional `StorageNodeClient` aggregate carry the same role.
+- cluster stream creation heartbeat, append, abort, and finalization paths
+  derive one exact-object role for `(bucket, key)`. Its raw projection remains
+  only around generic pending-command routing, command installation,
+  application, and recovery helpers.
+- local adapters erase the role only at the private raw-node boundary. Unix
+  adapters serialize its raw route evidence and validate command responses
+  against the raw projection. The Unix server reconstructs the role only
+  after route, primary, exact object-placement, and, for final commit builders,
+  bucket-write-reservation validation.
+- a dedicated two-PG Unix regression installs equivalent PutObject stream
+  state, generation reservations, stored bucket-write proofs, multipart
+  uploads, and UploadPart stream sessions on the correct and wrong PGs.
+  Correct session, segment, append-preparation, proof-renewal, both
+  finalization, and UploadPart command-build calls are positive canaries.
+  Test-forged wrong roles must fail with the exact `PayloadDecode` placement
+  error for those operations and both final commit builders. The wrong-PG
+  append case submits the append-preparation RPC directly so a preliminary
+  session-load rejection cannot mask missing validation on that endpoint.
+- multipart read/management/completion, bucket-wide stream scans,
+  reclaim/scan, and data-client signatures, `DataPgId` construction, and
+  request-scoped route capability values remain open in Phase 3.
+- the tenth slice passed its focused correct/wrong stream-metadata PG Unix
+  regressions, the boundary checker, formatting, workspace-wide strict Clippy,
+  and the full workspace suite (7,151 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
