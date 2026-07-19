@@ -2910,12 +2910,28 @@ fn assert_s3_expired_token(
     credentials: SignedRequestCredentials<'_>,
     security_token: &str,
 ) {
+    assert_s3_expired_token_with_presented_tokens(
+        label,
+        response,
+        credentials,
+        security_token,
+        &[security_token],
+    );
+}
+
+fn assert_s3_expired_token_with_presented_tokens(
+    label: &str,
+    response: &RawResponse,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+    presented_tokens: &[&str],
+) {
     assert!(
         required_xml_text(response, "Token-0", label) == security_token,
         "{label}: S3 did not echo the expired session token"
     );
     let response =
-        s3_response_with_sanitized_body(response, credentials.access_key, &[security_token]);
+        s3_response_with_sanitized_body(response, credentials.access_key, presented_tokens);
     assert_s3_expired_token_shape(label, &response);
 }
 
@@ -2925,6 +2941,22 @@ fn assert_s3_duplicate_expired_token(
     credentials: SignedRequestCredentials<'_>,
     security_token: &str,
 ) {
+    assert_s3_duplicate_expired_token_with_presented_tokens(
+        label,
+        response,
+        credentials,
+        security_token,
+        &[security_token],
+    );
+}
+
+fn assert_s3_duplicate_expired_token_with_presented_tokens(
+    label: &str,
+    response: &RawResponse,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+    presented_tokens: &[&str],
+) {
     for token_element in ["Token-0", "Token-1"] {
         assert!(
             required_xml_text(response, token_element, label) == security_token,
@@ -2932,7 +2964,7 @@ fn assert_s3_duplicate_expired_token(
         );
     }
     let response =
-        s3_response_with_sanitized_body(response, credentials.access_key, &[security_token]);
+        s3_response_with_sanitized_body(response, credentials.access_key, presented_tokens);
     assert_shape(
         label,
         &response,
@@ -7182,6 +7214,275 @@ fn run_s3_presigned_expiry_input_probes(
     }
 }
 
+#[derive(Clone, Copy)]
+enum S3PresignedHeaderExpiryExpected {
+    ExpiredToken,
+    ExpiredDuplicateToken,
+    InvalidAccessKey,
+    InvalidToken,
+}
+
+fn run_s3_presigned_header_expiry_input_probes(
+    auth_endpoint: &str,
+    scope_endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+    other_live_security_token: &str,
+) {
+    let wrong_secret = "0".repeat(40);
+    let malformed_security_token = "malformed-session-token";
+    let bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..credentials
+    };
+    for (case, query_tokens, signed_header_tokens, expected) in [
+        (
+            "expired-token",
+            vec![],
+            vec![security_token],
+            S3PresignedHeaderExpiryExpected::ExpiredToken,
+        ),
+        (
+            "empty-token",
+            vec![],
+            vec![""],
+            S3PresignedHeaderExpiryExpected::InvalidAccessKey,
+        ),
+        (
+            "malformed-token",
+            vec![],
+            vec![malformed_security_token],
+            S3PresignedHeaderExpiryExpected::InvalidToken,
+        ),
+        (
+            "mismatched-live-token",
+            vec![],
+            vec![other_live_security_token],
+            S3PresignedHeaderExpiryExpected::InvalidAccessKey,
+        ),
+        (
+            "identical-duplicate-token",
+            vec![],
+            vec![security_token, security_token],
+            S3PresignedHeaderExpiryExpected::ExpiredDuplicateToken,
+        ),
+        (
+            "conflicting-duplicate-token",
+            vec![],
+            vec![security_token, other_live_security_token],
+            S3PresignedHeaderExpiryExpected::InvalidAccessKey,
+        ),
+        (
+            "conflicting-duplicate-token-reversed",
+            vec![],
+            vec![other_live_security_token, security_token],
+            S3PresignedHeaderExpiryExpected::InvalidAccessKey,
+        ),
+        (
+            "expired-token-overrides-live-query",
+            vec![other_live_security_token],
+            vec![security_token],
+            S3PresignedHeaderExpiryExpected::ExpiredToken,
+        ),
+        (
+            "live-token-overrides-expired-query",
+            vec![security_token],
+            vec![other_live_security_token],
+            S3PresignedHeaderExpiryExpected::InvalidAccessKey,
+        ),
+        (
+            "empty-token-overrides-expired-query",
+            vec![security_token],
+            vec![""],
+            S3PresignedHeaderExpiryExpected::InvalidAccessKey,
+        ),
+        (
+            "malformed-token-overrides-expired-query",
+            vec![security_token],
+            vec![malformed_security_token],
+            S3PresignedHeaderExpiryExpected::InvalidToken,
+        ),
+        (
+            "identical-duplicate-overrides-live-query",
+            vec![other_live_security_token],
+            vec![security_token, security_token],
+            S3PresignedHeaderExpiryExpected::ExpiredDuplicateToken,
+        ),
+        (
+            "conflicting-duplicate-overrides-expired-query",
+            vec![security_token],
+            vec![security_token, other_live_security_token],
+            S3PresignedHeaderExpiryExpected::InvalidAccessKey,
+        ),
+        (
+            "conflicting-duplicate-reversed-overrides-expired-query",
+            vec![security_token],
+            vec![other_live_security_token, security_token],
+            S3PresignedHeaderExpiryExpected::InvalidAccessKey,
+        ),
+    ] {
+        for (signature, signing_credentials) in [
+            ("valid-signature", credentials),
+            ("bad-signature", bad_signature_credentials),
+        ] {
+            let label =
+                format!("s3-presigned-auth-expired-deleted-signed-header-{case}-{signature}");
+            let presigned = build_s3_root_presigned_request_for_service(
+                auth_endpoint,
+                signing_credentials,
+                &query_tokens,
+                &signed_header_tokens,
+                "s3",
+            );
+            assert_presigned_signed_header_wire_order(&label, &presigned, &signed_header_tokens);
+            let response = fetch_s3_presigned_request(auth_endpoint, &presigned, None);
+            let presented_tokens = query_tokens
+                .iter()
+                .chain(&signed_header_tokens)
+                .copied()
+                .collect::<Vec<_>>();
+            match expected {
+                S3PresignedHeaderExpiryExpected::ExpiredToken => {
+                    assert_s3_expired_token_with_presented_tokens(
+                        &label,
+                        &response,
+                        signing_credentials,
+                        security_token,
+                        &presented_tokens,
+                    );
+                }
+                S3PresignedHeaderExpiryExpected::ExpiredDuplicateToken => {
+                    assert_s3_duplicate_expired_token_with_presented_tokens(
+                        &label,
+                        &response,
+                        signing_credentials,
+                        security_token,
+                        &presented_tokens,
+                    );
+                }
+                S3PresignedHeaderExpiryExpected::InvalidAccessKey => assert_s3_invalid_access_key(
+                    &label,
+                    &response,
+                    credentials.access_key,
+                    &presented_tokens,
+                ),
+                S3PresignedHeaderExpiryExpected::InvalidToken => assert_s3_invalid_token(
+                    &label,
+                    &response,
+                    credentials.access_key,
+                    &presented_tokens,
+                    malformed_security_token,
+                ),
+            }
+        }
+    }
+
+    for (case, query_tokens, unsigned_header_token) in [
+        ("expired-token-without-query", vec![], security_token),
+        (
+            "expired-token-with-expired-query",
+            vec![security_token],
+            security_token,
+        ),
+        (
+            "live-token-with-expired-query",
+            vec![security_token],
+            other_live_security_token,
+        ),
+        (
+            "malformed-token-with-expired-query",
+            vec![security_token],
+            malformed_security_token,
+        ),
+    ] {
+        for (signature, signing_credentials) in [
+            ("valid-signature", credentials),
+            ("bad-signature", bad_signature_credentials),
+        ] {
+            let label =
+                format!("s3-presigned-auth-expired-deleted-unsigned-header-{case}-{signature}");
+            let presigned = build_s3_root_presigned_request_for_service(
+                auth_endpoint,
+                signing_credentials,
+                &query_tokens,
+                &[],
+                "s3",
+            );
+            let response =
+                fetch_s3_presigned_request(auth_endpoint, &presigned, Some(unsigned_header_token));
+            let presented_tokens = query_tokens
+                .iter()
+                .copied()
+                .chain([unsigned_header_token])
+                .collect::<Vec<_>>();
+            assert_s3_headers_not_signed(
+                &label,
+                &response,
+                credentials.access_key,
+                &presented_tokens,
+            );
+        }
+    }
+
+    let wrong_region = if credentials.region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    };
+    for (scope, scoped_credentials, service) in [
+        (
+            "wrong-region",
+            SignedRequestCredentials {
+                region: wrong_region,
+                ..credentials
+            },
+            "s3",
+        ),
+        ("wrong-service", credentials, "sts"),
+    ] {
+        let bad_scope_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..scoped_credentials
+        };
+        for (signature, signing_credentials) in [
+            ("valid-signature", scoped_credentials),
+            ("bad-signature", bad_scope_signature_credentials),
+        ] {
+            let label = format!(
+                "s3-presigned-scope-expired-deleted-{scope}-signed-header-expired-token-{signature}"
+            );
+            let signed_header_tokens = [security_token];
+            let presigned = build_s3_root_presigned_request_for_service(
+                scope_endpoint,
+                signing_credentials,
+                &[],
+                &signed_header_tokens,
+                service,
+            );
+            assert_presigned_signed_header_wire_order(&label, &presigned, &signed_header_tokens);
+            let response = fetch_s3_presigned_request(scope_endpoint, &presigned, None);
+            if service == "s3" {
+                assert_s3_presigned_wrong_region_scope(
+                    &label,
+                    &response,
+                    wrong_region,
+                    credentials.region,
+                    credentials.access_key,
+                    &signed_header_tokens,
+                );
+            } else {
+                assert_s3_presigned_wrong_service_scope(
+                    &label,
+                    &response,
+                    credentials.region,
+                    credentials.access_key,
+                    &signed_header_tokens,
+                );
+            }
+        }
+    }
+}
+
 fn run_s3_post_expiry_input_probes(
     endpoint: &str,
     bucket: &str,
@@ -7707,6 +8008,13 @@ fn run_expired_deleted_session_probes(
         assert_s3_expired_token(label, &response, signing_credentials, security_token);
     }
     run_s3_presigned_expiry_input_probes(
+        s3_endpoint,
+        s3_bucket_endpoint,
+        credentials,
+        security_token,
+        other_live_security_token,
+    );
+    run_s3_presigned_header_expiry_input_probes(
         s3_endpoint,
         s3_bucket_endpoint,
         credentials,

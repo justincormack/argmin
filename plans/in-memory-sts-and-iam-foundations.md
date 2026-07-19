@@ -1909,9 +1909,42 @@ endpoint, so endpoint style is not an uncontrolled response-shape variable.
 Together with the prior expiry-versus-signature and expiry-versus-liveness
 probes, this pins, for each mode's tested primary token location, the ordering
 as scope, then mode-specific token structure/selection/opening/binding, then
-expiry, then issuer liveness, then signature verification. Alternate presigned
-signed-header and unsigned-header locations retain the narrower ordering
-documented by their own matrices.
+expiry, then issuer liveness, then signature verification.
+
+The presigned alternate-header expiry extension completed on 2026-07-19 using
+the same expired/deleted credential and independently live token. For a signed
+`x-amz-security-token` header, a single expired token returns the exact
+`ExpiredToken` golden with correct and bad HMACs. Empty and independently live
+mismatched headers return `InvalidAccessKeyId`, a malformed header returns
+`InvalidToken`, two identical expired headers reach `ExpiredToken` and preserve
+both values as `Token-0` and `Token-1`, and conflicting expired/live headers
+return `InvalidAccessKeyId` in both wire orders. Every case has correct- and
+bad-HMAC variants and asserts the duplicate header wire order before sending.
+
+The same extension pins signed-header selection against the query location.
+An expired signed header overrides an independently live query token and
+returns `ExpiredToken`; an independently live signed header overrides the
+expired query token and returns `InvalidAccessKeyId` because it cannot bind to
+the access key. Empty and malformed signed headers likewise override the
+otherwise matching expired query token. Identical expired signed headers
+override a live query token and reach duplicate-token `ExpiredToken`, while
+conflicting signed headers are not rescued by a matching expired query token
+in either header order. These results close the presigned signed-header path to
+the same ordering already established for the primary query location: scope,
+signed-header structure and authoritative location selection, token
+opening/access-key binding, expiry, issuer liveness, then HMAC comparison.
+The exact wrong-region and wrong-service goldens also win over an expired
+signed-header token with both correct and bad HMACs, directly establishing the
+scope-before-expiry edge for this alternate location.
+
+A present but unsigned `x-amz-security-token` remains a coverage error rather
+than an alternate authenticated token location. It returns the exact
+`HeadersNotSigned` golden before expiry, header-token decoding/binding, and HMAC
+comparison when the expired query token is present and the uncovered header is
+expired, independently live, or malformed, and when the expired uncovered
+header is present without any query token. Each case is pinned with correct and
+bad HMACs. The separately established scope matrix places presigned scope
+validation before this coverage error.
 
 During this slice, one newly created role produced one successful STS
 assumption followed immediately by `AccessDenied` for the same request. The
@@ -2431,8 +2464,9 @@ body may appear in traces.
    modes additionally pin empty, malformed, identical-duplicate, and
    conflicting-duplicate inputs in their primary token locations. Disabled-
    credential collisions are not yet pinned. Presigned signed-header
-   authentication and scope collisions are pinned, but expiry collisions for
-   that alternate token location remain unresolved.
+   authentication, scope, and expiry collisions are pinned; present unsigned
+   token headers are pinned as coverage failures rather than credential
+   locations.
 3. Should the first standalone UAT role be injected through a dedicated
    test-only constructor/config object or through explicitly UAT-only
    environment variables?
