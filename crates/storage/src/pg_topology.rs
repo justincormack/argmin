@@ -2,9 +2,7 @@ use std::num::NonZeroUsize;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 
-use crate::types::{
-    BucketName, BucketPgId, DataPgId, GenerationId, ObjectKey, ObjectMetadataPgId, PgId,
-};
+use crate::types::{BucketName, DataPgId, GenerationId, ObjectKey, PgId};
 
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const PG_HASH_STACK_LIMIT: usize = 32 + 63 + 1 + 1024 + 1 + 20 + 1 + 10;
@@ -89,14 +87,6 @@ impl PgTopology {
         self.object_pg(bucket.as_str(), key.as_str())
     }
 
-    pub fn object_metadata_pg_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> ObjectMetadataPgId {
-        ObjectMetadataPgId::new(PgId::new(self.object_pg_for(bucket, key)))
-    }
-
     /// Derive the bucket metadata PG for `bucket`.
     ///
     /// Bucket rows and bucket subresources remain PG-sharded. They do not move
@@ -108,10 +98,6 @@ impl PgTopology {
 
     pub fn bucket_pg_for(&self, bucket: &BucketName) -> u32 {
         self.bucket_pg(bucket.as_str())
-    }
-
-    pub fn bucket_metadata_pg_for(&self, bucket: &BucketName) -> BucketPgId {
-        BucketPgId::new(PgId::new(self.bucket_pg_for(bucket)))
     }
 
     pub fn object_data_pg_set_width(&self) -> usize {
@@ -362,18 +348,15 @@ mod tests {
     }
 
     #[test]
-    fn typed_metadata_pg_wrappers_match_raw_pg_ids() {
+    fn typed_placement_inputs_match_string_placement() {
         let topo = PgTopology::new(&[1, 2, 8]).unwrap();
         let bucket = BucketName::try_from("bucket").unwrap();
         let key = ObjectKey::try_from("key").unwrap();
 
+        assert_eq!(topo.bucket_pg_for(&bucket), topo.bucket_pg(bucket.as_str()));
         assert_eq!(
-            topo.bucket_metadata_pg_for(&bucket).get(),
-            topo.bucket_pg_for(&bucket)
-        );
-        assert_eq!(
-            topo.object_metadata_pg_for(&bucket, &key).get(),
-            topo.object_pg_for(&bucket, &key)
+            topo.object_pg_for(&bucket, &key),
+            topo.object_pg(bucket.as_str(), key.as_str())
         );
     }
 

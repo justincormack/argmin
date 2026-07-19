@@ -7698,15 +7698,17 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        if let Err(error) =
+            self.validate_primary_pg_for_bucket(request.pg_id, &request.bucket, "bucket head")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let result = if filtered {
-            BucketMetadataNodeClient::head_bucket_info(
-                &local_client,
-                request.pg_id,
-                &request.bucket,
-            )
+            BucketMetadataNodeClient::head_bucket_info(&local_client, bucket_pg_id, &request.bucket)
         } else {
-            BucketMetadataNodeClient::head_bucket_raw(&local_client, request.pg_id, &request.bucket)
+            BucketMetadataNodeClient::head_bucket_raw(&local_client, bucket_pg_id, &request.bucket)
         };
         match result {
             Ok(info) => {
@@ -7745,10 +7747,11 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
+        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketMetadataNodeClient::load_bucket_snapshot(
             &local_client,
-            request.bucket.pg_id,
+            bucket_pg_id,
             &request.bucket.bucket,
             request.request,
         ) {
@@ -7786,12 +7789,18 @@ impl StorageNodeConnectionHandler {
                 return encode_storage_rpc_error_response(&error);
             }
         }
+        let source_bucket_pg_id = self
+            .node
+            .bucket_metadata_pg_for(&request.source.bucket.bucket);
+        let destination_bucket_pg_id = self
+            .node
+            .bucket_metadata_pg_for(&request.destination.bucket.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketMetadataNodeClient::load_bucket_snapshot_pair(
             &local_client,
-            request.source.bucket.pg_id,
+            source_bucket_pg_id,
             (&request.source.bucket.bucket, request.source.request),
-            request.destination.bucket.pg_id,
+            destination_bucket_pg_id,
             (
                 &request.destination.bucket.bucket,
                 request.destination.request,
@@ -7830,11 +7839,19 @@ impl StorageNodeConnectionHandler {
                 message: "request bucket must match create-bucket config name".to_string(),
             });
         }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.pg_id,
+            &request.bucket,
+            "create bucket command build",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let config = request.config.as_create_bucket_config();
         match BucketMetadataNodeClient::build_create_bucket_command(
             &local_client,
-            request.pg_id,
+            bucket_pg_id,
             &request.bucket,
             request.command_id,
             &config,
@@ -7875,10 +7892,11 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
+        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketMetadataNodeClient::build_advance_multipart_completion_barrier_command(
             &local_client,
-            request.pg_id,
+            bucket_pg_id,
             &request.bucket,
             request.command_id,
             &request.completion_target_context,
@@ -7907,6 +7925,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
+        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let result = match (&request.mutation, request.command.payload()) {
             (
@@ -7914,7 +7933,7 @@ impl StorageNodeConnectionHandler {
                 MetadataCommandPayload::MarkBucketDeleting(command),
             ) => BucketMetadataNodeClient::pending_mark_bucket_deleting_command_matches_current(
                 &local_client,
-                request.bucket.pg_id,
+                bucket_pg_id,
                 &request.bucket.bucket,
                 command,
             ),
@@ -7923,7 +7942,7 @@ impl StorageNodeConnectionHandler {
                 MetadataCommandPayload::PutBucketVersioning(command),
             ) => BucketMetadataNodeClient::pending_put_bucket_versioning_command_matches_current(
                 &local_client,
-                request.bucket.pg_id,
+                bucket_pg_id,
                 &request.bucket.bucket,
                 command,
                 *state,
@@ -7936,7 +7955,7 @@ impl StorageNodeConnectionHandler {
                 MetadataCommandPayload::PutBucketAcl(command),
             ) => BucketMetadataNodeClient::pending_put_bucket_acl_command_matches_current(
                 &local_client,
-                request.bucket.pg_id,
+                bucket_pg_id,
                 &request.bucket.bucket,
                 command,
                 acl_grants,
@@ -7947,7 +7966,7 @@ impl StorageNodeConnectionHandler {
                 MetadataCommandPayload::PutBucketProperty(command),
             ) => BucketMetadataNodeClient::pending_put_bucket_property_command_matches_current(
                 &local_client,
-                request.bucket.pg_id,
+                bucket_pg_id,
                 &request.bucket.bucket,
                 command,
                 mutation,
@@ -7981,6 +8000,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
+        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let result = match &request.mutation {
             StorageRpcBucketMetadataControlMutation::MarkDeleting => {
@@ -7992,7 +8012,7 @@ impl StorageNodeConnectionHandler {
             StorageRpcBucketMetadataControlMutation::Versioning(state) => {
                 BucketMetadataNodeClient::build_put_bucket_versioning_command(
                     &local_client,
-                    request.bucket.pg_id,
+                    bucket_pg_id,
                     &request.bucket.bucket,
                     request.command_id,
                     *state,
@@ -8003,7 +8023,7 @@ impl StorageNodeConnectionHandler {
                 summary,
             } => BucketMetadataNodeClient::build_put_bucket_acl_command(
                 &local_client,
-                request.bucket.pg_id,
+                bucket_pg_id,
                 &request.bucket.bucket,
                 request.command_id,
                 acl_grants,
@@ -8012,7 +8032,7 @@ impl StorageNodeConnectionHandler {
             StorageRpcBucketMetadataControlMutation::Property(mutation) => {
                 BucketMetadataNodeClient::build_put_bucket_property_command(
                     &local_client,
-                    request.bucket.pg_id,
+                    bucket_pg_id,
                     &request.bucket.bucket,
                     request.command_id,
                     mutation,
@@ -8021,7 +8041,7 @@ impl StorageNodeConnectionHandler {
             StorageRpcBucketMetadataControlMutation::Subresource(mutation) => {
                 BucketMetadataNodeClient::build_put_bucket_subresource_command(
                     &local_client,
-                    request.bucket.pg_id,
+                    bucket_pg_id,
                     &request.bucket.bucket,
                     request.command_id,
                     mutation,
@@ -8049,17 +8069,18 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
+        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketMetadataNodeClient::build_mark_bucket_deleting_command(
             &local_client,
-            request.bucket.pg_id,
+            bucket_pg_id,
             &request.bucket.bucket,
             request.command_id,
         ) {
             Ok(MarkBucketDeletingCommandBuild::AlreadyDeleting) => {
                 let info = match BucketMetadataNodeClient::head_bucket_raw(
                     &local_client,
-                    request.bucket.pg_id,
+                    bucket_pg_id,
                     &request.bucket.bucket,
                 ) {
                     Ok(info) if info.state == BucketState::Deleting => info,
@@ -8106,10 +8127,11 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketMetadataNodeClient::get_bucket_subresource(
             &local_client,
-            request.bucket.pg_id,
+            bucket_pg_id,
             &request.bucket.bucket,
             request.kind,
         ) {
@@ -8135,10 +8157,14 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_primary_pg(request.pg_id, "bucket list") {
             return encode_storage_rpc_error_response(&error);
         }
+        let bucket_pg_id = self
+            .node
+            .bucket_metadata_pg(request.pg_id)
+            .expect("validated bucket-list PG must belong to the installed topology");
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketMetadataNodeClient::list_buckets(
             &local_client,
-            request.pg_id,
+            bucket_pg_id,
             &request.owner_canonical_id,
         ) {
             Ok(buckets) => {
@@ -8159,10 +8185,14 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let bucket_pg_id = self
+            .node
+            .bucket_metadata_pg(request.pg_id)
+            .expect("validated bucket-batch PG must belong to the installed topology");
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketMetadataNodeClient::load_bucket_execution_generations(
             &local_client,
-            request.pg_id,
+            bucket_pg_id,
             &request.buckets,
         ) {
             Ok(generations) => {
@@ -8184,10 +8214,14 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let bucket_pg_id = self
+            .node
+            .bucket_metadata_pg(request.pg_id)
+            .expect("validated bucket-batch PG must belong to the installed topology");
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketMetadataNodeClient::load_bucket_fast_path_identities(
             &local_client,
-            request.pg_id,
+            bucket_pg_id,
             &request.buckets,
         ) {
             Ok(identities) => {

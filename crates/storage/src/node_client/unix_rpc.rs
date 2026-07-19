@@ -3166,23 +3166,23 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
 impl BucketMetadataNodeClient for UnixStorageNodeClient {
     fn head_bucket_raw(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.head_bucket_with_kind(StorageRpcMessageKind::BucketHeadRaw, pg_id, bucket)
+        self.head_bucket_with_kind(StorageRpcMessageKind::BucketHeadRaw, pg_id.pg_id(), bucket)
     }
 
     fn head_bucket_info(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.head_bucket_with_kind(StorageRpcMessageKind::BucketHeadInfo, pg_id, bucket)
+        self.head_bucket_with_kind(StorageRpcMessageKind::BucketHeadInfo, pg_id.pg_id(), bucket)
     }
 
     fn load_bucket_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
@@ -3190,7 +3190,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             bucket: StorageRpcBucketRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
             },
             request,
@@ -3222,9 +3222,9 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_bucket_snapshot_pair(
         &self,
-        source_pg_id: PgId,
+        source_pg_id: BucketPgId,
         source: (&BucketName, BucketSnapshotRequest),
-        destination_pg_id: PgId,
+        destination_pg_id: BucketPgId,
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
         let request = StorageRpcBucketSnapshotPairRequest {
@@ -3232,7 +3232,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
                 bucket: StorageRpcBucketRequest {
                     node_id: self.node_id,
                     cluster_epoch: self.cluster_epoch,
-                    pg_id: source_pg_id,
+                    pg_id: source_pg_id.pg_id(),
                     bucket: source.0.clone(),
                 },
                 request: source.1,
@@ -3241,7 +3241,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
                 bucket: StorageRpcBucketRequest {
                     node_id: self.node_id,
                     cluster_epoch: self.cluster_epoch,
-                    pg_id: destination_pg_id,
+                    pg_id: destination_pg_id.pg_id(),
                     bucket: destination.0.clone(),
                 },
                 request: destination.1,
@@ -3269,7 +3269,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn build_create_bucket_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
@@ -3277,7 +3277,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         let request = StorageRpcCreateBucketCommandBuildRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             bucket: bucket.clone(),
             command_id,
             config: StorageRpcCreateBucketConfig {
@@ -3321,7 +3321,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn build_advance_multipart_completion_barrier_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         completion_target_context: &str,
@@ -3330,7 +3330,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         let request = StorageRpcMultipartCompletionBarrierCommandBuildRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             bucket: bucket.clone(),
             command_id,
             completion_target_context: completion_target_context.to_string(),
@@ -3367,20 +3367,20 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn pending_mark_bucket_deleting_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &MarkBucketDeletingCommand,
     ) -> Result<bool, BucketSnapshotLoadError> {
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 self.cluster_epoch,
-                pg_id,
+                pg_id.pg_id(),
                 MetadataCommandLogIndex::new(1).expect("nonzero log index"),
             ),
             MetadataCommandPayload::MarkBucketDeleting(command.clone()),
         );
         self.bucket_metadata_control_pending_match(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             &command,
             StorageRpcBucketMetadataControlMutation::MarkDeleting,
@@ -3389,7 +3389,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn build_mark_bucket_deleting_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
     ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError> {
@@ -3397,7 +3397,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             bucket: StorageRpcBucketRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
             },
             command_id,
@@ -3438,7 +3438,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketVersioningCommand,
         state: BucketVersioningState,
@@ -3446,13 +3446,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 self.cluster_epoch,
-                pg_id,
+                pg_id.pg_id(),
                 MetadataCommandLogIndex::new(1).expect("nonzero log index"),
             ),
             MetadataCommandPayload::PutBucketVersioning(command.clone()),
         );
         self.bucket_metadata_control_pending_match(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             &command,
             StorageRpcBucketMetadataControlMutation::Versioning(state),
@@ -3461,13 +3461,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn build_put_bucket_versioning_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         state: BucketVersioningState,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
         self.bucket_metadata_control_command_build(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             command_id,
             StorageRpcBucketMetadataControlMutation::Versioning(state),
@@ -3476,7 +3476,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn pending_put_bucket_acl_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
@@ -3485,13 +3485,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 self.cluster_epoch,
-                pg_id,
+                pg_id.pg_id(),
                 MetadataCommandLogIndex::new(1).expect("nonzero log index"),
             ),
             MetadataCommandPayload::PutBucketAcl(command.clone()),
         );
         self.bucket_metadata_control_pending_match(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             &command,
             StorageRpcBucketMetadataControlMutation::Acl {
@@ -3503,14 +3503,14 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn build_put_bucket_acl_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
         self.bucket_metadata_control_command_build(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             command_id,
             StorageRpcBucketMetadataControlMutation::Acl {
@@ -3522,7 +3522,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn pending_put_bucket_property_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketPropertyCommand,
         mutation: &BucketPropertyMutation,
@@ -3530,13 +3530,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 self.cluster_epoch,
-                pg_id,
+                pg_id.pg_id(),
                 MetadataCommandLogIndex::new(1).expect("nonzero log index"),
             ),
             MetadataCommandPayload::PutBucketProperty(command.clone()),
         );
         self.bucket_metadata_control_pending_match(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             &command,
             StorageRpcBucketMetadataControlMutation::Property(mutation.clone()),
@@ -3545,13 +3545,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn build_put_bucket_property_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketPropertyMutation,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
         self.bucket_metadata_control_command_build(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             command_id,
             StorageRpcBucketMetadataControlMutation::Property(mutation.clone()),
@@ -3560,13 +3560,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn build_put_bucket_subresource_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketSubresourceMutation,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
         self.bucket_metadata_control_command_build(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             command_id,
             StorageRpcBucketMetadataControlMutation::Subresource(mutation.clone()),
@@ -3575,7 +3575,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn get_bucket_subresource(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
@@ -3583,7 +3583,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             bucket: StorageRpcBucketRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
             },
             kind,
@@ -3602,13 +3602,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn list_buckets(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
         let request = StorageRpcBucketListRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             owner_canonical_id: owner_canonical_id.to_string(),
         };
         let payload = encode_bucket_list_request(&request).map_err(|error| {
@@ -3640,13 +3640,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_bucket_execution_generations(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
         let request = StorageRpcBucketBatchRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             buckets: buckets.to_vec(),
         };
         let payload = encode_bucket_batch_request(&request).map_err(|error| {
@@ -3678,13 +3678,13 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_bucket_fast_path_identities(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError> {
         let request = StorageRpcBucketBatchRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             buckets: buckets.to_vec(),
         };
         let payload = encode_bucket_batch_request(&request).map_err(|error| {

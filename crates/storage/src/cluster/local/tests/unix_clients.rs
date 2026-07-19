@@ -1675,7 +1675,7 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
             .node(node_id)
             .unwrap()
             .bucket_metadata_client()
-            .head_bucket_raw(PgId::new(0), &bucket),
+            .head_bucket_raw(crate::BucketPgId::new_for_test(PgId::new(0)), &bucket),
         Err(crate::BucketSnapshotLoadError::Metadata(
             crate::MetadataError::BucketNotFound { .. }
         ))
@@ -1854,7 +1854,7 @@ fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
         map.node(node_id)
             .unwrap()
             .bucket_metadata_client()
-            .head_bucket_raw(PgId::new(0), &bucket)
+            .head_bucket_raw(crate::BucketPgId::new_for_test(PgId::new(0)), &bucket)
             .unwrap()
             .state,
         crate::BucketState::Deleting
@@ -1961,7 +1961,7 @@ fn frontend_unix_delete_bucket_adopts_live_drain_from_older_epoch() {
         map.node(node_id)
             .unwrap()
             .bucket_metadata_client()
-            .head_bucket_raw(PgId::new(0), &bucket)
+            .head_bucket_raw(crate::BucketPgId::new_for_test(PgId::new(0)), &bucket)
             .unwrap()
             .state,
         crate::BucketState::Deleting

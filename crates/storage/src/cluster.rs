@@ -88,6 +88,7 @@ use crate::types::{
     MultipartReclaimRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
     PutLiveObjectReq,
 };
+use crate::BucketPgId;
 use crate::ObjectEtag;
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 
@@ -5495,6 +5496,16 @@ impl StorageCluster {
 
     fn bucket_metadata_pg_id(&self, bucket: &BucketName) -> u32 {
         self.local_map.bucket_pg_for(bucket)
+    }
+
+    fn bucket_metadata_pg(&self, bucket: &BucketName) -> BucketPgId {
+        self.local_map.bucket_metadata_pg_for(bucket)
+    }
+
+    fn validated_bucket_metadata_pg(&self, pg_id: PgId) -> BucketPgId {
+        self.local_map
+            .bucket_metadata_pg(pg_id)
+            .expect("routed bucket metadata PG must belong to the installed topology")
     }
 
     pub fn object_payload_reclaim_pg_id(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {

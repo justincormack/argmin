@@ -553,7 +553,7 @@ impl ShardScavengerNodeClient for LocalStorageNodeClient {
 impl BucketMetadataNodeClient for LocalStorageNodeClient {
     fn head_bucket_raw(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::head_bucket_raw(self, pg_id, bucket)
@@ -561,7 +561,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn head_bucket_info(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::head_bucket_info(self, pg_id, bucket)
@@ -569,7 +569,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_bucket_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
@@ -578,9 +578,9 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_bucket_snapshot_pair(
         &self,
-        source_pg_id: PgId,
+        source_pg_id: BucketPgId,
         source: (&BucketName, BucketSnapshotRequest),
-        destination_pg_id: PgId,
+        destination_pg_id: BucketPgId,
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::load_bucket_snapshot_pair(
@@ -594,7 +594,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn build_create_bucket_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
@@ -606,7 +606,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn build_advance_multipart_completion_barrier_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         completion_target_context: &str,
@@ -624,7 +624,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn pending_mark_bucket_deleting_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &MarkBucketDeletingCommand,
     ) -> Result<bool, BucketSnapshotLoadError> {
@@ -640,7 +640,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn build_mark_bucket_deleting_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
     ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError> {
@@ -662,7 +662,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketVersioningCommand,
         state: BucketVersioningState,
@@ -674,7 +674,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn build_put_bucket_versioning_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         state: BucketVersioningState,
@@ -686,7 +686,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn pending_put_bucket_acl_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
@@ -699,7 +699,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn build_put_bucket_acl_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
@@ -712,7 +712,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn pending_put_bucket_property_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketPropertyCommand,
         mutation: &BucketPropertyMutation,
@@ -724,7 +724,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn build_put_bucket_property_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketPropertyMutation,
@@ -736,7 +736,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn build_put_bucket_subresource_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketSubresourceMutation,
@@ -748,7 +748,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn get_bucket_subresource(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
@@ -757,7 +757,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn list_buckets(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -766,7 +766,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_bucket_execution_generations(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -775,7 +775,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_bucket_fast_path_identities(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1917,7 +1917,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_bucket_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
@@ -1929,9 +1929,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_bucket_snapshot_pair(
         &self,
-        source_pg_id: PgId,
+        source_pg_id: BucketPgId,
         source: (&BucketName, BucketSnapshotRequest),
-        destination_pg_id: PgId,
+        destination_pg_id: BucketPgId,
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
         if source.0 == destination.0 {
@@ -1967,7 +1967,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn head_bucket_raw(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1976,7 +1976,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn head_bucket_info(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1985,7 +1985,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn build_create_bucket_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
@@ -2010,7 +2010,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn build_advance_multipart_completion_barrier_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         completion_target_context: &str,
@@ -2033,7 +2033,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         }
         <Self as StorageNodeClient>::validate_bucket_write_reservation_proof(
             self,
-            pg_id,
+            pg_id.pg_id(),
             bucket_write_reservation,
         )?;
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -2069,7 +2069,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketVersioningCommand,
         state: BucketVersioningState,
@@ -2096,7 +2096,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn build_put_bucket_versioning_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         state: BucketVersioningState,
@@ -2124,7 +2124,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn pending_put_bucket_acl_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
@@ -2144,7 +2144,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn build_put_bucket_acl_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
@@ -2165,7 +2165,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn pending_put_bucket_property_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketPropertyCommand,
         mutation: &BucketPropertyMutation,
@@ -2183,7 +2183,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn build_put_bucket_property_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketPropertyMutation,
@@ -2204,7 +2204,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn build_put_bucket_subresource_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketSubresourceMutation,
@@ -2223,7 +2223,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn get_bucket_subresource(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {

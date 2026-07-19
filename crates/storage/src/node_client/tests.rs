@@ -100,7 +100,7 @@ fn multipart_completion_barrier_rejects_non_completion_bucket_write_reservation(
     let proof = BucketWriteReservationProof::from(&reservation);
     let err = BucketMetadataNodeClient::build_advance_multipart_completion_barrier_command(
         &client,
-        PgId::new(0),
+        BucketPgId::new_for_test(PgId::new(0)),
         &bucket,
         command_id,
         "object-key",

@@ -5,6 +5,64 @@
 //! boundary. Crate-facing contracts are re-exported through narrow facade
 //! modules in `lib.rs`.
 
+use crate::types::PgId;
+
+/// PG containing bucket metadata for one bucket name.
+///
+/// The private field lives inside the node-runtime boundary so a standalone
+/// placement-only `PgTopology` cannot mint this role. Installed local runtime
+/// maps and storage nodes construct it after topology/route validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BucketPgId(PgId);
+
+impl BucketPgId {
+    #[cfg(test)]
+    pub(crate) const fn new_for_test(pg_id: PgId) -> Self {
+        Self(pg_id)
+    }
+
+    #[must_use]
+    pub const fn pg_id(self) -> PgId {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl From<BucketPgId> for PgId {
+    fn from(value: BucketPgId) -> Self {
+        value.pg_id()
+    }
+}
+
+/// PG containing object metadata for one `(bucket, key)` namespace entry.
+///
+/// Like `BucketPgId`, this role can only be minted inside an installed
+/// node-runtime authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ObjectMetadataPgId(PgId);
+
+impl ObjectMetadataPgId {
+    #[must_use]
+    pub const fn pg_id(self) -> PgId {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl From<ObjectMetadataPgId> for PgId {
+    fn from(value: ObjectMetadataPgId) -> Self {
+        value.pg_id()
+    }
+}
+
 #[allow(dead_code)]
 #[path = "node.rs"]
 mod engine;
@@ -49,6 +107,10 @@ pub(super) mod node_facade {
         BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome,
         ReclaimWorkItem,
     };
+}
+
+pub(super) mod role_facade {
+    pub use super::{BucketPgId, ObjectMetadataPgId};
 }
 
 pub(super) mod client_facade {

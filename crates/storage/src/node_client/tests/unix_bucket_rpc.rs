@@ -1786,9 +1786,13 @@ fn unix_bucket_metadata_client_loads_bucket_snapshot() {
         lifecycle: false,
         cors: true,
     };
-    let snapshot =
-        BucketMetadataNodeClient::load_bucket_snapshot(&client, PgId::new(0), &bucket, request)
-            .unwrap();
+    let snapshot = BucketMetadataNodeClient::load_bucket_snapshot(
+        &client,
+        BucketPgId::new_for_test(PgId::new(0)),
+        &bucket,
+        request,
+    )
+    .unwrap();
     assert_eq!(snapshot.bucket.name, bucket);
     assert_eq!(snapshot.request, request);
     assert_eq!(
@@ -1872,7 +1876,7 @@ fn unix_bucket_metadata_client_loads_bucket_snapshot_pair() {
 
     let pair = BucketMetadataNodeClient::load_bucket_snapshot_pair(
         &client,
-        PgId::new(0),
+        BucketPgId::new_for_test(PgId::new(0)),
         (
             &source_bucket,
             BucketSnapshotRequest {
@@ -1880,7 +1884,7 @@ fn unix_bucket_metadata_client_loads_bucket_snapshot_pair() {
                 ..Default::default()
             },
         ),
-        PgId::new(0),
+        BucketPgId::new_for_test(PgId::new(0)),
         (
             &destination_bucket,
             BucketSnapshotRequest {
@@ -1962,7 +1966,7 @@ fn unix_bucket_metadata_client_builds_multipart_completion_barrier_command() {
     let (barrier_sequence, command) =
         BucketMetadataNodeClient::build_advance_multipart_completion_barrier_command(
             &client,
-            PgId::new(0),
+            BucketPgId::new_for_test(PgId::new(0)),
             &bucket,
             command_id,
             "object-key",
@@ -2041,7 +2045,7 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
 
     let versioning = BucketMetadataNodeClient::build_put_bucket_versioning_command(
         &client,
-        PgId::new(0),
+        BucketPgId::new_for_test(PgId::new(0)),
         &bucket,
         command_id(1),
         BucketVersioningState::Enabled,
@@ -2054,7 +2058,7 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
     assert!(
         BucketMetadataNodeClient::pending_put_bucket_versioning_command_matches_current(
             &client,
-            PgId::new(0),
+            BucketPgId::new_for_test(PgId::new(0)),
             &bucket,
             versioning_command,
             BucketVersioningState::Enabled,
@@ -2064,7 +2068,7 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
 
     let acl = BucketMetadataNodeClient::build_put_bucket_acl_command(
         &client,
-        PgId::new(0),
+        BucketPgId::new_for_test(PgId::new(0)),
         &bucket,
         command_id(2),
         &crate::AclGrants::default(),
@@ -2085,7 +2089,7 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
 
     let property = BucketMetadataNodeClient::build_put_bucket_property_command(
         &client,
-        PgId::new(0),
+        BucketPgId::new_for_test(PgId::new(0)),
         &bucket,
         command_id(3),
         &BucketPropertyMutation::AbacEnabled(true),
@@ -2106,7 +2110,7 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
     };
     let subresource_command = BucketMetadataNodeClient::build_put_bucket_subresource_command(
         &client,
-        PgId::new(0),
+        BucketPgId::new_for_test(PgId::new(0)),
         &bucket,
         command_id(4),
         &subresource,
@@ -2121,7 +2125,7 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
 
     let policy = BucketMetadataNodeClient::get_bucket_subresource(
         &client,
-        PgId::new(0),
+        BucketPgId::new_for_test(PgId::new(0)),
         &bucket,
         BucketSubresourceKind::Policy,
     )
@@ -2293,6 +2297,109 @@ fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn unix_bucket_metadata_client_rejects_wrong_bucket_pg_for_head_and_create_build() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes = vec![
+        StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: crate::types::PgState::Active,
+            primary_node_id: NodeId::new(7),
+            acting_set: vec![NodeId::new(7)],
+        },
+        StorageNodePgRoute {
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: crate::types::PgState::Active,
+            primary_node_id: NodeId::new(7),
+            acting_set: vec![NodeId::new(7)],
+        },
+    ];
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let acl_grants = crate::AclGrants::default();
+    let (bucket, wrong_pg_id) = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let (bucket, correct_pg_id) = (0..100)
+            .map(|index| crate::tests::bucket_name(format!("bucket-rpc-wrong-pg-{index}")))
+            .map(|bucket| {
+                let pg_id = node.pg_topology().bucket_pg_for(&bucket);
+                (bucket, pg_id)
+            })
+            .find(|(_, pg_id)| *pg_id < 2)
+            .expect("two-PG topology must place a test bucket");
+        let pg = node.get_pg(correct_pg_id).unwrap();
+        PgMetadataStore::create_bucket(&*pg, &bucket, "owner", &owner, &acl_grants, false, false)
+            .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        (bucket, if correct_pg_id == 0 { 1 } else { 0 })
+    };
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..2)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        config.socket_path.clone(),
+    );
+    let wrong_bucket_pg = BucketPgId::new_for_test(PgId::new(wrong_pg_id));
+
+    let head_error =
+        BucketMetadataNodeClient::head_bucket_raw(&client, wrong_bucket_pg, &bucket).unwrap_err();
+    assert!(matches!(
+        head_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc { .. })
+    ));
+
+    let create_config = crate::CreateBucketConfig {
+        name: bucket.as_str(),
+        owner_principal: "owner",
+        owner_canonical_id: &owner,
+        acl_grants: &acl_grants,
+        public_read: false,
+        public_write: false,
+        versioning: crate::BucketVersioningState::Disabled,
+        object_lock: crate::BucketObjectLockConfig::default(),
+        ownership_controls: crate::BucketOwnershipControls {
+            object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+        },
+    };
+    let command_id = MetadataCommandId::new(
+        ClusterEpoch::new(1).unwrap(),
+        PgId::new(wrong_pg_id),
+        MetadataCommandLogIndex::new(1).unwrap(),
+    );
+    let create_error = BucketMetadataNodeClient::build_create_bucket_command(
+        &client,
+        wrong_bucket_pg,
+        &bucket,
+        command_id,
+        &create_config,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        create_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc { .. })
+    ));
+
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]

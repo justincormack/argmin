@@ -16,34 +16,34 @@ pub(crate) enum CreateBucketCommandBuild {
 pub(crate) trait BucketMetadataNodeClient: Send + Sync {
     fn head_bucket_raw(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError>;
 
     fn head_bucket_info(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError>;
 
     fn load_bucket_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError>;
 
     fn load_bucket_snapshot_pair(
         &self,
-        source_pg_id: PgId,
+        source_pg_id: BucketPgId,
         source: (&BucketName, BucketSnapshotRequest),
-        destination_pg_id: PgId,
+        destination_pg_id: BucketPgId,
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError>;
 
     fn build_create_bucket_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
@@ -51,7 +51,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn build_advance_multipart_completion_barrier_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         completion_target_context: &str,
@@ -60,21 +60,21 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn pending_mark_bucket_deleting_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &MarkBucketDeletingCommand,
     ) -> Result<bool, BucketSnapshotLoadError>;
 
     fn build_mark_bucket_deleting_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
     ) -> Result<MarkBucketDeletingCommandBuild, BucketSnapshotLoadError>;
 
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketVersioningCommand,
         state: BucketVersioningState,
@@ -82,7 +82,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn build_put_bucket_versioning_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         state: BucketVersioningState,
@@ -90,7 +90,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn pending_put_bucket_acl_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
@@ -99,7 +99,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn build_put_bucket_acl_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
@@ -108,7 +108,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn pending_put_bucket_property_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketPropertyCommand,
         mutation: &BucketPropertyMutation,
@@ -116,7 +116,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn build_put_bucket_property_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketPropertyMutation,
@@ -124,7 +124,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn build_put_bucket_subresource_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketSubresourceMutation,
@@ -132,26 +132,26 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 
     fn get_bucket_subresource(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError>;
 
     fn list_buckets(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError>;
 
     fn load_bucket_execution_generations(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, u64>, BucketSnapshotLoadError>;
 
     fn load_bucket_fast_path_identities(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         buckets: &[BucketName],
     ) -> Result<HashMap<BucketName, BucketFastPathIdentity>, BucketSnapshotLoadError>;
 }
@@ -1479,34 +1479,34 @@ pub(crate) trait StorageNodeClient:
 
     fn load_bucket_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError>;
 
     fn load_bucket_snapshot_pair(
         &self,
-        source_pg_id: PgId,
+        source_pg_id: BucketPgId,
         source: (&BucketName, BucketSnapshotRequest),
-        destination_pg_id: PgId,
+        destination_pg_id: BucketPgId,
         destination: (&BucketName, BucketSnapshotRequest),
     ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError>;
 
     fn head_bucket_raw(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError>;
 
     fn head_bucket_info(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError>;
 
     fn build_create_bucket_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         config: &CreateBucketConfig<'_>,
@@ -1514,7 +1514,7 @@ pub(crate) trait StorageNodeClient:
 
     fn build_advance_multipart_completion_barrier_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         completion_target_context: &str,
@@ -1523,7 +1523,7 @@ pub(crate) trait StorageNodeClient:
 
     fn pending_put_bucket_versioning_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketVersioningCommand,
         state: BucketVersioningState,
@@ -1531,7 +1531,7 @@ pub(crate) trait StorageNodeClient:
 
     fn build_put_bucket_versioning_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         state: BucketVersioningState,
@@ -1539,7 +1539,7 @@ pub(crate) trait StorageNodeClient:
 
     fn pending_put_bucket_acl_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
@@ -1548,7 +1548,7 @@ pub(crate) trait StorageNodeClient:
 
     fn build_put_bucket_acl_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
@@ -1557,7 +1557,7 @@ pub(crate) trait StorageNodeClient:
 
     fn pending_put_bucket_property_command_matches_current(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command: &PutBucketPropertyCommand,
         mutation: &BucketPropertyMutation,
@@ -1565,7 +1565,7 @@ pub(crate) trait StorageNodeClient:
 
     fn build_put_bucket_property_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketPropertyMutation,
@@ -1573,7 +1573,7 @@ pub(crate) trait StorageNodeClient:
 
     fn build_put_bucket_subresource_command(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
         mutation: &BucketSubresourceMutation,
@@ -1581,7 +1581,7 @@ pub(crate) trait StorageNodeClient:
 
     fn get_bucket_subresource(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError>;

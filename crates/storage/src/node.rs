@@ -25,6 +25,7 @@ use super::clients::{
     ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
     PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
 };
+use super::{BucketPgId, ObjectMetadataPgId};
 use crate::control_plane::{
     NodeHeartbeat, NodePgHeartbeatObservation, PendingMetadataCommandObservation, PgMetadataProof,
 };
@@ -482,6 +483,22 @@ impl LocalNodeRuntime {
         self.node.pg_topology()
     }
 
+    pub(crate) fn bucket_metadata_pg_for(&self, bucket: &BucketName) -> BucketPgId {
+        self.node.bucket_metadata_pg_for(bucket)
+    }
+
+    pub(crate) fn bucket_metadata_pg(&self, pg_id: PgId) -> Option<BucketPgId> {
+        self.node.bucket_metadata_pg(pg_id)
+    }
+
+    pub(crate) fn object_metadata_pg_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> ObjectMetadataPgId {
+        self.node.object_metadata_pg_for(bucket, key)
+    }
+
     pub(crate) fn write_erasure_coded_segment_shards_with<F>(
         &self,
         segment_okh: &[u8; 16],
@@ -691,6 +708,28 @@ impl SharedStorageNode {
 
     pub fn pg_topology(&self) -> &PgTopology {
         &self.pg_topology
+    }
+
+    pub(in crate::node_runtime) fn bucket_metadata_pg_for(
+        &self,
+        bucket: &BucketName,
+    ) -> BucketPgId {
+        BucketPgId(PgId::new(self.pg_topology.bucket_pg_for(bucket)))
+    }
+
+    pub(in crate::node_runtime) fn bucket_metadata_pg(&self, pg_id: PgId) -> Option<BucketPgId> {
+        self.pg_id_list
+            .binary_search(&pg_id.get())
+            .ok()
+            .map(|_| BucketPgId(pg_id))
+    }
+
+    pub(in crate::node_runtime) fn object_metadata_pg_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> ObjectMetadataPgId {
+        ObjectMetadataPgId(PgId::new(self.pg_topology.object_pg_for(bucket, key)))
     }
 
     pub fn cluster_map_history_reference_summary(

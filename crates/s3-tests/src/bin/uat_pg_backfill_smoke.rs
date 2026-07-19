@@ -249,7 +249,7 @@ fn find_key_with_distinct_data_pg_in_topology(
     excluded_metadata_pgs: &BTreeSet<u32>,
 ) -> Option<(String, u32)> {
     let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
-    let bucket_pg = topology.bucket_metadata_pg_for(&bucket_name).get();
+    let bucket_pg = topology.bucket_pg_for(&bucket_name);
     if excluded_metadata_pgs.contains(&bucket_pg) {
         return None;
     }
@@ -276,9 +276,7 @@ fn find_key_with_distinct_data_pg_in_topology(
     for suffix in 0..search_limit {
         let key = format!("{key_prefix}-{suffix:04}");
         let object_key = ObjectKey::try_from(key.clone()).expect("UAT key must be valid");
-        let object_pg = topology
-            .object_metadata_pg_for(&bucket_name, &object_key)
-            .get();
+        let object_pg = topology.object_pg_for(&bucket_name, &object_key);
         let data_pg = topology
             .object_generation_segment_data_pg(&bucket_name, &object_key, generation_id, 0)
             .get();
@@ -350,9 +348,7 @@ fn key_with_metadata_pg_and_distinct_data_pg(
     for suffix in 0..10_000u32 {
         let key = format!("{key_prefix}-{suffix:04}");
         let object_key = ObjectKey::try_from(key.clone()).expect("UAT key must be valid");
-        let object_pg = topology
-            .object_metadata_pg_for(&bucket_name, &object_key)
-            .get();
+        let object_pg = topology.object_pg_for(&bucket_name, &object_key);
         let data_pg = topology
             .object_generation_segment_data_pg(&bucket_name, &object_key, generation_id, 0)
             .get();
@@ -371,7 +367,7 @@ fn choose_bucket_key_with_metadata_pg_and_distinct_data_pg(
     for _ in 0..10_000u32 {
         let bucket = unique_bucket();
         let bucket_name = BucketName::try_from(bucket.clone()).expect("UAT bucket must be valid");
-        if topology.bucket_metadata_pg_for(&bucket_name).get() != target_metadata_pg {
+        if topology.bucket_pg_for(&bucket_name) != target_metadata_pg {
             continue;
         }
         if let Some((key, data_pg)) = key_with_metadata_pg_and_distinct_data_pg(
@@ -391,7 +387,7 @@ fn choose_bucket_with_metadata_pg(target_metadata_pg: u32) -> String {
     for _ in 0..10_000u32 {
         let bucket = unique_bucket();
         let bucket_name = BucketName::try_from(bucket.clone()).expect("UAT bucket must be valid");
-        if topology.bucket_metadata_pg_for(&bucket_name).get() == target_metadata_pg {
+        if topology.bucket_pg_for(&bucket_name) == target_metadata_pg {
             return bucket;
         }
     }
@@ -405,7 +401,7 @@ fn choose_existing_bucket_key_with_metadata_pg_and_distinct_data_pg(
 ) -> (String, u32) {
     let topology = pg_topology_from_env();
     let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
-    let bucket_pg = topology.bucket_metadata_pg_for(&bucket_name).get();
+    let bucket_pg = topology.bucket_pg_for(&bucket_name);
     assert_eq!(
         bucket_pg, target_metadata_pg,
         "bucket metadata PG must match requested metadata PG"

@@ -98,6 +98,7 @@ pub use node::{
 pub use node::{
     BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome, ReclaimWorkItem,
 };
+pub use node_runtime::role_facade::{BucketPgId, ObjectMetadataPgId};
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) use pg_store::PgStore;
 pub use pg_store::{
@@ -129,15 +130,15 @@ pub use types::{
     BucketDeleteDebugPendingCommand, BucketDeleteDebugSnapshot, BucketDeleteFinalizeClaimRecord,
     BucketDeleteFinalizeRoot, BucketEncryptionConfig, BucketFastPathIdentity, BucketFastPathInfo,
     BucketFastPathPolicy, BucketFastPathTags, BucketInfo, BucketName, BucketNameError,
-    BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls, BucketPgId,
-    BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest,
-    BucketState, BucketSubresourceAux, BucketSubresourceKind, BucketVersioningState,
-    BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord, CanonicalUserId,
-    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitDirectPutObjectReq,
-    CommitMultipartReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitOutcome,
-    CompleteMultipartCommitRequest, CompletedMultipartStalePayload, CreateBucketConfig,
-    CreateMultipartUploadOutcome, CreateMultipartUploadReq, CreateStreamUploadReq, DataLayout,
-    DataPgId, DeleteCurrentObjectOutcome, DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome,
+    BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot,
+    BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
+    BucketSubresourceAux, BucketSubresourceKind, BucketVersioningState, BucketWriteDrainRecord,
+    BucketWriteDrainState, BucketWriteReservationRecord, CanonicalUserId, ChecksumAlgorithm,
+    ChecksumBytes, ChecksumType, ClusterEpoch, CommitDirectPutObjectReq, CommitMultipartReq,
+    CompleteMultipartCommitCleanup, CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest,
+    CompletedMultipartStalePayload, CreateBucketConfig, CreateMultipartUploadOutcome,
+    CreateMultipartUploadReq, CreateStreamUploadReq, DataLayout, DataPgId,
+    DeleteCurrentObjectOutcome, DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome,
     DeletedCurrentObject, DeletedSpecificObjectVersion, DirectPutCommitSnapshot,
     DirectPutCommitStorageSnapshot, DirectPutWrittenSegment, EcShape,
     EffectiveBucketEncryptionConfig, EtagKind, ExpireCurrentObjectOutcome,
@@ -156,7 +157,7 @@ pub use types::{
     MultipartUploadIdKey, MultipartUploadListMarker, MultipartUploadManagementLookup,
     MultipartUploadRecord, ObjectEncryption, ObjectEncryptionDecodeError, ObjectEncryptionType,
     ObjectEtag, ObjectKey, ObjectKeyError, ObjectLayout, ObjectLockDefaultRetention,
-    ObjectLockMode, ObjectLockState, ObjectMetadataPgId, ObjectPartRangeRecord, ObjectPartRecord,
+    ObjectLockMode, ObjectLockState, ObjectPartRangeRecord, ObjectPartRecord,
     ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectReadAuthSubject,
     ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ObjectReadSnapshotMode,
     ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,

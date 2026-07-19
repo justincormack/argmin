@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–2 complete
+Status: active — Phases 0–2 complete; Phase 3 in progress
 
 ## Goal
 
@@ -522,6 +522,61 @@ Completion:
 - stale, expired, transitioned, or subject-mismatched capabilities fail without
   mutation on both local and Unix paths
 - route and PG-role grep checks are retired or reduced to API-surface checks
+
+Node-client role classification (2026-07-19):
+
+| Interface | PG role | Capability direction |
+| --- | --- | --- |
+| `BucketMetadataNodeClient` | bucket metadata | active bucket route; reads may later receive a read-only projection |
+| `BucketWriteReservationNodeClient` | bucket metadata | active bucket route for acquire/heartbeat; retained subject-bound cleanup for release/drain recovery |
+| `ObjectGenerationMetadataNodeClient`, `ObjectVersionMetadataNodeClient`, `DirectPutMetadataNodeClient` | object metadata | active object route, with completion-specific admission represented as a narrower operation class |
+| `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
+| `ObjectMutationMetadataNodeClient` | object metadata | active object route; stale-payload cleanup requires a separate retained cleanup authority |
+| `ObjectReadMetadataNodeClient` | object metadata | active object route plus the existing subject identity/read lease |
+| `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active data route; historical inspection/deletion requires retained data cleanup authority |
+| `ShardScavengerNodeClient` | data for shard rows/files, generic metadata PG for durable observation rows | active or retained authority according to the scanned location; observation publication is primary-only |
+| `ShardReadHandleNodeClient` | data locations carried in the handle request | active/retained authority is inherited from each validated `ShardLocation`; the lease itself remains non-cloneable |
+| `ObjectPayloadLeaseNodeClient` | object subject rather than a caller-supplied PG | subject-bound payload lease/reclaim capability; placement is validated when shard locations are acquired |
+| `MetadataCommandNodeClient` | genuinely generic metadata PG | active publisher authority, retained recovery authority, or peering/transfer authority selected from the command/recovery operation class |
+| `StorageNodeClient` | transitional mixed aggregate | must not preserve raw role-specific duplicates; split/delegate to the typed interfaces before Phase 3 completes |
+
+The generic classifications are intentional. A metadata command can target a
+bucket or object PG, and recovery/transfer operates on a PG before a request
+bucket/object identity exists. Those calls require a route capability and
+command/operation binding rather than a falsely specific PG-role wrapper.
+
+Implementation update (2026-07-19, first Phase 3 slice):
+
+- `BucketPgId` and `ObjectMetadataPgId` now live inside the private
+  `node_runtime` boundary with private fields and no raw public or
+  crate-visible constructor. The freely constructible public `PgTopology`
+  remains a placement-only calculator returning raw PG numbers; only an
+  installed `LocalNodeRuntime` or `SharedStorageNode` can mint role IDs.
+  Unit tests retain an explicit `BucketPgId::new_for_test` escape hatch under
+  `cfg(test)` only.
+- every `BucketMetadataNodeClient` method, including the duplicate methods on
+  the transitional `StorageNodeClient` aggregate, now requires `BucketPgId`.
+  The local adapter erases the role only when entering the private raw node,
+  and the Unix adapter erases it only while encoding RPC route evidence.
+- the Unix server constructs its own bucket role only after validating the
+  raw route evidence. This work exposed and closed missing bucket-placement
+  validation on bucket-head and create-bucket-command-build RPCs; both had
+  previously checked route existence without proving that the request PG was
+  the bucket's routed primary.
+- an adversarial Unix regression uses the test-only constructor to submit a
+  configured but wrong bucket PG and requires both head and create-command
+  build to fail before node access.
+- `DataPgId` construction, the remaining object/data client signatures,
+  bucket reservation typing, and request-scoped route capability values remain
+  open in Phase 3.
+- review correction: the initial implementation incorrectly exposed role
+  constructors on public `PgTopology`, which allowed an arbitrary singleton
+  topology to mint either role. Those constructors were removed; external
+  placement-only callers, including the PG-backfill UAT, use `bucket_pg_for`
+  and `object_pg_for` instead.
+- the corrected slice passed the boundary checker, formatting, workspace-wide
+  strict Clippy, the PG-backfill UAT build, the focused wrong-bucket-PG Unix
+  regression, and the full workspace suite (7,106 tests).
 
 ### Phase 4 — type metadata-command publication
 

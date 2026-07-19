@@ -108,60 +108,6 @@ impl std::fmt::Display for PgId {
     }
 }
 
-/// PG containing bucket metadata for one bucket name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BucketPgId(PgId);
-
-impl BucketPgId {
-    #[must_use]
-    pub const fn new(pg_id: PgId) -> Self {
-        Self(pg_id)
-    }
-
-    #[must_use]
-    pub const fn pg_id(self) -> PgId {
-        self.0
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0.get()
-    }
-}
-
-impl From<BucketPgId> for PgId {
-    fn from(value: BucketPgId) -> Self {
-        value.pg_id()
-    }
-}
-
-/// PG containing object metadata for one `(bucket, key)` namespace entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ObjectMetadataPgId(PgId);
-
-impl ObjectMetadataPgId {
-    #[must_use]
-    pub const fn new(pg_id: PgId) -> Self {
-        Self(pg_id)
-    }
-
-    #[must_use]
-    pub const fn pg_id(self) -> PgId {
-        self.0
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0.get()
-    }
-}
-
-impl From<ObjectMetadataPgId> for PgId {
-    fn from(value: ObjectMetadataPgId) -> Self {
-        value.pg_id()
-    }
-}
-
 /// PG containing payload shard data for an object segment or multipart part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DataPgId(PgId);
@@ -4493,21 +4439,6 @@ mod tests {
         assert_eq!(epoch.get(), generation.get());
         assert!(ClusterEpoch::new(0).is_none());
         assert!(GenerationId::new(0).is_none());
-    }
-
-    #[test]
-    fn typed_pg_ids_preserve_raw_id_but_not_role() {
-        let raw = PgId::new(7);
-        let bucket_pg = BucketPgId::new(raw);
-        let object_pg = ObjectMetadataPgId::new(raw);
-        let data_pg = DataPgId::new(raw);
-
-        assert_eq!(bucket_pg.get(), 7);
-        assert_eq!(object_pg.get(), 7);
-        assert_eq!(data_pg.get(), 7);
-        assert_eq!(PgId::from(bucket_pg), raw);
-        assert_eq!(PgId::from(object_pg), raw);
-        assert_eq!(PgId::from(data_pg), raw);
     }
 
     #[test]
