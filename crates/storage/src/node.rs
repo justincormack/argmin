@@ -16,6 +16,15 @@ use s3_types::VersionId;
 #[cfg(test)]
 use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId};
 
+#[cfg(any(test, feature = "test-hooks"))]
+use super::clients::StorageNodeClient;
+use super::clients::{
+    BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
+    LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
+    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
+    ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
+    PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
+};
 use crate::control_plane::{
     NodeHeartbeat, NodePgHeartbeatObservation, PendingMetadataCommandObservation, PgMetadataProof,
 };
@@ -28,21 +37,12 @@ use crate::metadata_command::{
     CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
     MetadataCommandPayload,
 };
-#[cfg(any(test, feature = "test-hooks"))]
-use crate::node_client::StorageNodeClient;
-use crate::node_client::{
-    BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
-    LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
-    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
-    ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
-    PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
-};
-use crate::pg_store::{
+use crate::node_runtime::pg_store::{
     PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReferences, PgStore,
     PgStoreRecoveryContext, ScavengerShardFileScan,
 };
+use crate::node_runtime::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::pg_topology::PgTopology;
-use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 #[cfg(test)]
 use crate::types::CreateBucketConfig;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -72,10 +72,15 @@ use crate::{ClusterEpoch, PgId, PgState};
 const TRACE_TARGET: &str = "storage";
 const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 pub(crate) const OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG: usize = 2;
+#[path = "node/bucket_ops.rs"]
 mod bucket_ops;
+#[path = "node/multipart_ops.rs"]
 mod multipart_ops;
+#[path = "node/object_metadata_ops.rs"]
 mod object_metadata_ops;
+#[path = "node/object_read_ops.rs"]
 mod object_read_ops;
+#[path = "node/stream_ops.rs"]
 mod stream_ops;
 
 struct PgDataPaths {
@@ -210,30 +215,30 @@ fn maybe_run_bucket_scoped_test_hook(
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(super) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
+pub(crate) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_write_drain_wait)
 }
 
 #[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_bucket_write_drain_wait_hook(_: &BucketName) {}
+pub(crate) fn maybe_run_bucket_write_drain_wait_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(super) fn maybe_run_before_lifecycle_context_load_hook(bucket: &BucketName) {
+pub(crate) fn maybe_run_before_lifecycle_context_load_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_lifecycle_context_load)
 }
 
 #[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_before_lifecycle_context_load_hook(_: &BucketName) {}
+pub(crate) fn maybe_run_before_lifecycle_context_load_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(super) fn maybe_run_before_lifecycle_bucket_write_proof_acquire_hook(bucket: &BucketName) {
+pub(crate) fn maybe_run_before_lifecycle_bucket_write_proof_acquire_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| {
         hooks.before_lifecycle_bucket_write_proof_acquire
     })
 }
 
 #[cfg(not(any(test, feature = "test-hooks")))]
-pub(super) fn maybe_run_before_lifecycle_bucket_write_proof_acquire_hook(_: &BucketName) {}
+pub(crate) fn maybe_run_before_lifecycle_bucket_write_proof_acquire_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName) {

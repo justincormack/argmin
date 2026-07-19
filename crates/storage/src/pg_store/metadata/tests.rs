@@ -2,7 +2,7 @@ use super::*;
 use crate::metadata_command::{
     MetadataCommandId, MetadataCommandLogIndex, MetadataTransferCommand,
 };
-use crate::traits::PgMetadataStore;
+use crate::node_runtime::traits::PgMetadataStore;
 use crate::PgTopology;
 
 fn test_owner() -> OwnerIdentity {
@@ -1839,7 +1839,7 @@ fn assert_metadata_state_digest_covers_mutation(
 }
 
 fn assert_cached_metadata_digest_matches_materialized(store: &PgStore) {
-    for table in crate::pg_store::command_log::METADATA_DIGEST_TABLES {
+    for table in crate::node_runtime::pg_store::command_log::METADATA_DIGEST_TABLES {
         let cached = store.cached_metadata_table_digest(table).unwrap();
         let materialized = store.metadata_table_digest(table).unwrap();
         assert_eq!(
@@ -2135,7 +2135,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
             create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-reservation"));
             PgMetadataStore::acquire_durable_bucket_write_reservation(
                 store,
-                crate::traits::DurableBucketWriteReservationAcquire {
+                crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                     name: &trusted_bucket_name("commit-fail-reservation"),
                     reservation_id: "reservation-id",
                     owner_token: "owner-token",
@@ -2940,7 +2940,7 @@ fn metadata_command_apply_tracks_multipart_upload_create_digest() {
 
     assert_cached_metadata_digest_matches_materialized(&store);
     let before_reopen: Vec<(&'static str, u64, u64)> =
-        crate::pg_store::command_log::METADATA_DIGEST_TABLES
+        crate::node_runtime::pg_store::command_log::METADATA_DIGEST_TABLES
             .iter()
             .map(|table| {
                 (
@@ -2959,7 +2959,7 @@ fn metadata_command_apply_tracks_multipart_upload_create_digest() {
     let reopened = PgStore::open(tmp.path(), 1).unwrap();
     assert_cached_metadata_digest_matches_materialized(&reopened);
     for (table_name, cached_before, materialized_before) in before_reopen {
-        let table = crate::pg_store::command_log::METADATA_DIGEST_TABLES
+        let table = crate::node_runtime::pg_store::command_log::METADATA_DIGEST_TABLES
             .iter()
             .find(|table| table.name == table_name)
             .unwrap();
@@ -6746,7 +6746,7 @@ fn durable_bucket_write_coordination_does_not_dirty_metadata_command_state() {
 
     let reservation = store
         .acquire_durable_bucket_write_reservation(
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "reservation-1",
                 owner_token: "owner-token-1",
@@ -6823,7 +6823,7 @@ fn metadata_command_bucket_write_release_is_idempotent_after_cleanup() {
 
     let reservation = store
         .acquire_durable_bucket_write_reservation(
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "reservation-1",
                 owner_token: "owner-token-1",
@@ -6859,7 +6859,7 @@ fn metadata_command_bucket_write_release_allows_heartbeated_lease() {
 
     let reservation = store
         .acquire_durable_bucket_write_reservation(
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "reservation-1",
                 owner_token: "owner-token-1",
@@ -6875,7 +6875,7 @@ fn metadata_command_bucket_write_release_allows_heartbeated_lease() {
 
     store
         .heartbeat_durable_bucket_write_reservation(
-            crate::traits::DurableBucketWriteReservationHeartbeat {
+            crate::node_runtime::traits::DurableBucketWriteReservationHeartbeat {
                 name: &bucket,
                 reservation_id: &reservation.reservation_id,
                 owner_token: &reservation.owner_token,

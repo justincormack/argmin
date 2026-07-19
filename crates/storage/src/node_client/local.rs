@@ -42,7 +42,7 @@ impl LocalStorageNodeClient {
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        pg: &crate::PgStore,
+        pg: &PgStore,
     ) -> Result<MetadataCommandId, StoreError> {
         self.next_metadata_command_id_from_locked_pg_at_least(
             pg_id,
@@ -56,7 +56,7 @@ impl LocalStorageNodeClient {
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        pg: &crate::PgStore,
+        pg: &PgStore,
         min_log_index: MetadataCommandLogIndex,
     ) -> Result<MetadataCommandId, StoreError> {
         let max_log_index = pg.max_metadata_command_log_index(cluster_epoch)?;

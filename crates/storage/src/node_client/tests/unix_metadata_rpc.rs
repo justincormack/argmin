@@ -459,7 +459,10 @@ fn unix_storage_node_client_adopts_metadata_transfer_state() {
 
 fn test_metadata_checkpoint_with_bucket(
     bucket_name: &str,
-) -> (BucketName, crate::pg_store::MetadataCommandCheckpoint) {
+) -> (
+    BucketName,
+    crate::node_runtime::pg_store::MetadataCommandCheckpoint,
+) {
     let source_tmp = test_util::tempdir();
     let source_node = SharedStorageNode::open(source_tmp.path(), &[0]).unwrap();
     let bucket = crate::tests::bucket_name(bucket_name);

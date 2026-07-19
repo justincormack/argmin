@@ -12238,4 +12238,5 @@ impl PgStore {
 }
 
 #[cfg(test)]
+#[path = "metadata/tests.rs"]
 mod tests;

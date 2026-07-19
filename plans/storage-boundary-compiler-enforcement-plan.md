@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–1 complete; Phase 2 in progress
+Status: active — Phases 0–2 complete
 
 ## Goal
 
@@ -458,17 +458,37 @@ Implementation update (2026-07-19):
 - direct raw-node calls in request operations were replaced by the test-only
   accessor, preserving the internal fault-injection and durable-state tests
   without exposing that path in production builds.
-- moving `node_client/local.rs` alone under `node` is not a sound boundary:
-  it currently depends on a large private snapshot/validation helper unit in
-  `node_client.rs`, while `storage_node_server.rs` also constructs the local
-  adapter. A file-only move would require widening raw `PgStore` helpers to
-  the crate or duplicating them. The next structural slice will instead move
-  the local adapter, its private local-store helpers, and the storage-node
-  server beneath one private node-runtime parent (leaving shared client
-  contracts and Unix codecs in `node_client`), then narrow
-  `SharedStorageNode` to that subtree.
-- the transitional boundary check, strict all-target/all-feature Clippy, and
-  the full 7,106-test nextest suite pass for this slice.
+- moving `node_client/local.rs` alone under `node` was not a sound boundary:
+  it depends on the shared client snapshot/validation helpers, while the
+  storage-node server also needs the concrete adapter and raw node. Instead,
+  the raw node engine, client implementation, storage-node server, `PgStore`,
+  and raw storage traits now share one private `node_runtime` parent. Narrow
+  facade modules preserve the established `node_client` contracts and public
+  `storage_node_server` path without exporting implementation types.
+- `LocalStorageNodeClient` is visible only to descendants of
+  `node_runtime`. Production cluster code can name the local/Unix client
+  traits and value contracts, but cannot name the concrete local adapter,
+  `SharedStorageNode`, `PgStore`, or `PgMetadataStore`. Raw engine/store
+  exposure remains available only to crate tests and `test-hooks`.
+- the raw cluster-node, raw shard-file, migrated shard-owner, and production
+  `PgMetadataStore` allowlist scans were retired. Their boundary property is
+  now enforced by Rust module visibility. The client-level placed-delete and
+  placed-read caller inventories remain until Phase 3 supplies the
+  corresponding capabilities; other remaining checker inventories likewise
+  retain semantic checks that module privacy cannot express.
+- the transitional boundary check, strict all-target/all-feature Clippy, the
+  2,141-test default-feature `storage` suite, and the full 7,106-test nextest
+  suite pass for this slice. The explicit default-feature run prevents
+  workspace feature unification from masking internal test-facade gaps.
+
+Retired migration checks and their compiler replacements:
+
+| Retired check | Replacement |
+| --- | --- |
+| `production_cluster_direct_local_node_bypasses` | `SharedStorageNode` is reachable only through the private `node_runtime::engine` subtree, with test-only facade exposure. |
+| `direct_shard_matches` | Raw shard-file methods are on the private engine; cluster code can name only placed-shard client contracts. |
+| `migrated_storage_node_bypasses` | `LocalNodeStore` owns an opaque `LocalNodeRuntime` and trait objects, with no production raw-node accessor. |
+| `production_metadata_methods` | `PgStore` and `PgMetadataStore` are private `node_runtime` implementation details and are facade-exposed only to tests or `test-hooks`. |
 
 ### Phase 3 — adopt role-specific PG IDs and route capabilities
 

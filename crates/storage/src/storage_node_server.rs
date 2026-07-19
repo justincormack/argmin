@@ -11,6 +11,8 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use super::clients::LocalStorageNodeClient;
+use super::engine::SharedStorageNode;
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatRuntimeMapSource,
     ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PendingMetadataCommandObservation,
@@ -24,7 +26,6 @@ use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
 };
-use crate::node::SharedStorageNode;
 use crate::node_client::{
     complete_multipart_expected_object_parts, BucketMetadataNodeClient,
     BucketWriteReservationNodeClient, BuildAbortMultipartUploadCommandReq,
@@ -34,13 +35,14 @@ use crate::node_client::{
     BuildDirectPutCommitCommandReq, BuildInsertDeleteMarkerCommandReq,
     BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
-    DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, LocalStorageNodeClient,
-    MarkBucketDeletingCommandBuild, ObjectGenerationMetadataNodeClient,
-    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
-    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, ShardAckNodeClient,
-    ShardScavengerNodeClient,
+    DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
+    ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
+    ObjectMutationMetadataNodeClient, ObjectReadMetadataNodeClient,
+    ObjectVersionMetadataNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
 };
-use crate::pg_store::{MetadataCommandCheckpoint, PgStore};
+use crate::node_runtime::pg_store::{MetadataCommandCheckpoint, PgStore};
+use crate::node_runtime::traits::DurableBucketWriteReservationAcquire;
+use crate::node_runtime::traits::ShardStore;
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_request, decode_abort_multipart_command_build_request,
     decode_authorized_abort_multipart_command_build_request, decode_bucket_batch_request,
@@ -294,8 +296,6 @@ use crate::storage_rpc::{
     STORAGE_RPC_FRAME_ENCODING_VERSION, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_PAYLOAD_LEN, STORAGE_RPC_SERVER_IDLE_TIMEOUT,
 };
-use crate::traits::DurableBucketWriteReservationAcquire;
-use crate::traits::ShardStore;
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
 use crate::types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
@@ -1357,7 +1357,7 @@ fn emit_storage_node_metadata_command_log_conflict(
 }
 
 fn metadata_command_log_conflict_kind_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     node_id: u32,
     cluster_epoch: ClusterEpoch,
     log_index: u64,
@@ -1377,7 +1377,7 @@ fn metadata_command_log_conflict_kind_from_pg(
 }
 
 fn emit_storage_node_metadata_command_log_conflict_for_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     node_id: u32,
     pg_id: u32,
     cluster_epoch: ClusterEpoch,
@@ -9355,7 +9355,7 @@ impl StorageNodeConnectionHandler {
     fn next_metadata_command_id_from_pg(
         &self,
         pg_id: PgId,
-        pg: &crate::PgStore,
+        pg: &PgStore,
         min_log_index: MetadataCommandLogIndex,
     ) -> Result<MetadataCommandId, StoreError> {
         let cluster_epoch = self.config.cluster_epoch;
@@ -12578,6 +12578,7 @@ mod tests {
         MetadataCommandPayload, MetadataTransferCommand, PutBucketAclCommand,
         ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
     };
+    use crate::node_runtime::traits::{PgMetadataStore, ShardStore};
     use crate::storage_rpc::{
         decode_bucket_mark_deleting_command_build_response, decode_health_response,
         decode_metadata_command_acceptance_response,
@@ -12624,7 +12625,6 @@ mod tests {
         StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
         StorageRpcShardWriteRequest,
     };
-    use crate::traits::{PgMetadataStore, ShardStore};
     use crate::types::{
         BucketName, BucketSubresourceAux, BucketSubresourceKind, CreateBucketConfig, DataPgId,
         GenerationId, PgId, PlacedSegmentShardBackfillClaimRecord,
@@ -14886,7 +14886,7 @@ mod tests {
         )
     }
 
-    fn create_probe_bucket_direct(store: &crate::PgStore, bucket: &BucketName) {
+    fn create_probe_bucket_direct(store: &PgStore, bucket: &BucketName) {
         let owner = crate::OwnerIdentity::from_principal("owner");
         store
             .create_bucket_with_config(&CreateBucketConfig {
@@ -14905,7 +14905,7 @@ mod tests {
             .unwrap();
     }
 
-    fn put_probe_lifecycle_direct(store: &crate::PgStore, bucket: &BucketName) {
+    fn put_probe_lifecycle_direct(store: &PgStore, bucket: &BucketName) {
         store
             .put_bucket_subresource(
                 bucket,
@@ -14920,7 +14920,10 @@ mod tests {
 
     fn test_metadata_checkpoint_with_bucket(
         bucket_name: &str,
-    ) -> (BucketName, crate::pg_store::MetadataCommandCheckpoint) {
+    ) -> (
+        BucketName,
+        crate::node_runtime::pg_store::MetadataCommandCheckpoint,
+    ) {
         let source_tmp = test_util::tempdir();
         let source_node = crate::node::SharedStorageNode::open(source_tmp.path(), &[0]).unwrap();
         let bucket = crate::tests::bucket_name(bucket_name);
@@ -17454,7 +17457,7 @@ mod tests {
             crate::storage_rpc::decode_metadata_command_log_compact_response(&payload).unwrap();
         assert_eq!(
             decoded.status,
-            crate::pg_store::MetadataCommandLogCompactionStatus::Compacted {
+            crate::node_runtime::pg_store::MetadataCommandLogCompactionStatus::Compacted {
                 deleted_entries: 1,
                 compacted_before: 2,
             }

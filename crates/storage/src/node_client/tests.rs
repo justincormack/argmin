@@ -77,7 +77,7 @@ fn multipart_completion_barrier_rejects_non_completion_bucket_write_reservation(
     .unwrap();
     let reservation = crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
         &*pg,
-        crate::traits::DurableBucketWriteReservationAcquire {
+        crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
             name: &bucket,
             reservation_id: "put-object-reservation",
             owner_token: "put-object-owner",
@@ -454,6 +454,9 @@ fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope 
     )
 }
 
+#[path = "tests/unix_bucket_rpc.rs"]
 mod unix_bucket_rpc;
+#[path = "tests/unix_metadata_rpc.rs"]
 mod unix_metadata_rpc;
+#[path = "tests/unix_object_rpc.rs"]
 mod unix_object_rpc;

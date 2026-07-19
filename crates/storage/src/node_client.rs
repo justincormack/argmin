@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use placement::NodeId;
 use s3_types::{AclGrants, BucketVersioningState};
 
+use super::engine::SharedStorageNode;
 use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceMultipartCompletionBarrierCommand, BucketPropertyMutation,
@@ -24,9 +25,14 @@ use crate::metadata_command::{
     PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
     COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
 };
-use crate::node::SharedStorageNode;
-use crate::pg_store::MetadataCommandLogCompactionStatus;
-use crate::pg_store::{MetadataCommandCheckpoint, ScavengerShardFileScan, ScavengerShardRow};
+use crate::node_runtime::pg_store::{
+    MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus, PgStore, ScavengerShardFileScan,
+    ScavengerShardRow,
+};
+use crate::node_runtime::traits::{
+    DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
+    ShardStore,
+};
 use crate::pg_topology::PgTopology;
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_response,
@@ -236,10 +242,6 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
     STORAGE_RPC_CLIENT_WRITE_TIMEOUT,
 };
-use crate::traits::{
-    DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
-    ShardStore,
-};
 #[cfg(test)]
 use crate::types::BucketSnapshotTagsRequest;
 use crate::types::{
@@ -273,12 +275,19 @@ use crate::types::{
 };
 use crate::BucketDeleteBeginRoot;
 
+#[path = "node_client/interface.rs"]
 mod interface;
+#[path = "node_client/local.rs"]
 mod local;
+#[path = "node_client/unix_admission.rs"]
 mod unix_admission;
+#[path = "node_client/unix_helpers.rs"]
 mod unix_helpers;
+#[path = "node_client/unix_object_rpc.rs"]
 mod unix_object_rpc;
+#[path = "node_client/unix_rpc.rs"]
 mod unix_rpc;
+#[path = "node_client/unix_sessions.rs"]
 mod unix_sessions;
 
 pub(crate) use interface::*;
@@ -450,7 +459,7 @@ pub(crate) fn complete_multipart_expected_object_parts(
 }
 
 fn load_multipart_upload_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     upload_id: &UploadId,
@@ -465,7 +474,7 @@ fn load_multipart_upload_from_pg(
 }
 
 fn load_in_progress_multipart_upload_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     upload_id: &UploadId,
@@ -558,7 +567,7 @@ fn multipart_upload_matches_command(
 }
 
 fn reject_duplicate_stream_segment_index(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     session_id: &SessionId,
     segment_index: u32,
 ) -> Result<(), ObjectPgActionError> {
@@ -611,7 +620,7 @@ fn validate_stream_part_finalize_session(
 }
 
 fn load_stream_put_finalize_snapshot_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     session_id: &SessionId,
@@ -639,7 +648,7 @@ fn load_stream_put_finalize_snapshot_from_pg(
 }
 
 fn load_stream_part_finalize_snapshot_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     upload_id: &UploadId,
@@ -674,7 +683,7 @@ fn load_stream_part_finalize_snapshot_from_pg(
 }
 
 fn load_direct_put_commit_snapshot_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     node_id: NodeId,
     bucket: &BucketName,
     key: &ObjectKey,
@@ -748,7 +757,7 @@ fn load_direct_put_commit_snapshot_from_pg(
 }
 
 fn applied_direct_put_stale_generation_id_from_log(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     node_id: NodeId,
     bucket: &BucketName,
     key: &ObjectKey,
@@ -784,7 +793,7 @@ fn applied_direct_put_stale_generation_id_from_log(
 }
 
 fn snapshot_upload_part_stream_cleanup_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     upload_id: &UploadId,
 ) -> Result<
     (
@@ -825,7 +834,7 @@ fn snapshot_upload_part_stream_cleanup_from_pg(
 }
 
 fn snapshot_complete_multipart_cleanup_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     upload_id: &UploadId,
     selected_part_numbers: &BTreeSet<u32>,
 ) -> Result<
@@ -874,7 +883,7 @@ fn snapshot_complete_multipart_cleanup_from_pg(
 }
 
 fn snapshot_direct_put_stale_payload_command(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     created_at: u64,
@@ -895,7 +904,7 @@ fn snapshot_direct_put_stale_payload_command(
 }
 
 fn snapshot_direct_put_stale_payload_for_snapshot(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     created_at: u64,
@@ -914,7 +923,7 @@ fn snapshot_direct_put_stale_payload_for_snapshot(
 }
 
 fn load_null_live_stale_payload_source_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
 ) -> Result<Option<StoredObject>, MetadataError> {
@@ -1050,7 +1059,7 @@ fn lifecycle_sweep_claim_identity_matches(
 }
 
 fn snapshot_live_object_payload_reclaim_command(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     record: &LiveObjectRecord,
@@ -1111,7 +1120,7 @@ fn snapshot_live_object_payload_reclaim_command(
 }
 
 fn load_current_object_optional_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
 ) -> Result<Option<StoredObject>, MetadataError> {
@@ -1123,7 +1132,7 @@ fn load_current_object_optional_from_pg(
 }
 
 fn load_object_version_optional_from_pg(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     version_id: VersionId,
@@ -1136,7 +1145,7 @@ fn load_object_version_optional_from_pg(
 }
 
 fn delete_command_target_from_stored(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     stored: Option<&StoredObject>,
@@ -1158,7 +1167,7 @@ fn delete_command_target_from_stored(
 }
 
 fn load_object_delete_snapshot_from_stored(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     stored: Option<StoredObject>,
@@ -1168,7 +1177,7 @@ fn load_object_delete_snapshot_from_stored(
 }
 
 fn live_delete_command_target(
-    pg: &crate::PgStore,
+    pg: &PgStore,
     bucket: &BucketName,
     key: &ObjectKey,
     record: &LiveObjectRecord,
@@ -1225,7 +1234,7 @@ fn bucket_property_command_matches_mutation(
 }
 
 #[derive(Clone)]
-pub(crate) struct LocalStorageNodeClient {
+pub(in crate::node_runtime) struct LocalStorageNodeClient {
     node_id: NodeId,
     storage_node: Arc<SharedStorageNode>,
 }
@@ -1518,4 +1527,5 @@ struct MetadataCommandLogConflictRpcFields {
 }
 
 #[cfg(test)]
+#[path = "node_client/tests.rs"]
 mod tests;

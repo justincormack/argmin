@@ -36,25 +36,36 @@ pub(crate) mod data_dir;
 pub(crate) mod durable_journal;
 pub mod error;
 pub(crate) mod metadata_command;
-// Phase 1 makes the legacy raw engine private before Phase 2 removes or
-// relocates methods retained only by its internal tests and migration work.
-// Keep that transitional dead-code debt explicit and confined to these raw
-// implementation modules.
-#[allow(dead_code)]
-mod node;
-pub(crate) mod node_client;
+mod node_runtime;
 pub(crate) mod peering;
-#[allow(dead_code)]
-mod pg_store;
 pub mod pg_topology;
 pub mod schema;
 pub mod shard_key_hash;
-pub mod storage_node_server;
 #[allow(dead_code)]
 pub(crate) mod storage_rpc;
-#[allow(dead_code)]
-mod traits;
 pub mod types;
+
+// Narrow facades preserve the crate's established module paths while the
+// concrete engine, adapters, and server share a private compiler boundary.
+mod node {
+    pub use crate::node_runtime::node_facade::*;
+}
+
+pub(crate) mod node_client {
+    pub use crate::node_runtime::client_facade::*;
+}
+
+pub mod storage_node_server {
+    pub use crate::node_runtime::server_facade::*;
+}
+
+mod pg_store {
+    pub use crate::node_runtime::pg_store_facade::*;
+}
+
+mod traits {
+    pub(crate) use crate::node_runtime::traits_facade::*;
+}
 
 pub use cluster::{
     BucketWriteSnapshotAction, DurableReclaimScanOutcome, LeasedObjectReadSnapshotOutcome,
@@ -87,6 +98,7 @@ pub use node::{
 pub use node::{
     BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome, ReclaimWorkItem,
 };
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) use pg_store::PgStore;
 pub use pg_store::{
     MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,

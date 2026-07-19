@@ -44,20 +44,25 @@ use crate::metadata_command::{
     PutBucketSubresourceCommand, PutBucketVersioningCommand, PutObjectMetadataCommand,
     ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
-use crate::schema::init_pg_schema;
-use crate::traits::{
+use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
     ShardStore,
 };
+use crate::schema::init_pg_schema;
 use crate::types::*;
 use placement::NodeId;
 
 const TRACE_TARGET: &str = "storage";
 
+#[path = "pg_store/command_log.rs"]
 mod command_log;
+#[path = "pg_store/metadata.rs"]
 mod metadata;
+#[path = "pg_store/rows.rs"]
 mod rows;
+#[path = "pg_store/scavenger.rs"]
 mod scavenger;
+#[path = "pg_store/shards.rs"]
 mod shards;
 
 pub(crate) use command_log::METADATA_CANONICAL_STATE_ENCODING_VERSION;

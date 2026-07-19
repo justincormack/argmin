@@ -1045,7 +1045,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
     let record = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
         &client,
         PgId::new(0),
-        crate::traits::DurableBucketWriteReservationAcquire {
+        crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
             name: &bucket,
             reservation_id: "reservation-remote-1",
             owner_token: "owner-token-remote-1",
@@ -1146,7 +1146,7 @@ fn unix_bucket_write_reservation_identity_uses_current_route_after_epoch_change(
         .unwrap();
         let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "reservation-old-epoch-release",
                 owner_token: "owner-token-old-epoch-release",
@@ -1261,7 +1261,7 @@ fn unix_bucket_write_reservation_client_preserves_draining_signal() {
     let err = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
         &client,
         PgId::new(0),
-        crate::traits::DurableBucketWriteReservationAcquire {
+        crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
             name: &bucket,
             reservation_id: "reservation-remote-1",
             owner_token: "owner-token-remote-1",
@@ -1297,7 +1297,7 @@ fn unix_bucket_write_reservation_client_preserves_bucket_not_found() {
     let err = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
         &client,
         PgId::new(0),
-        crate::traits::DurableBucketWriteReservationAcquire {
+        crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
             name: &bucket,
             reservation_id: "reservation-remote-1",
             owner_token: "owner-token-remote-1",
@@ -1344,7 +1344,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         .unwrap();
         PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "reservation-for-drain-list",
                 owner_token: "reservation-owner-for-drain-list",
@@ -1930,7 +1930,7 @@ fn unix_bucket_metadata_client_builds_multipart_completion_barrier_command() {
         .unwrap();
         let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "completed-order-reservation",
                 owner_token: "completed-order-owner",
@@ -2162,7 +2162,7 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
         .unwrap();
         let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "reservation-1",
                 owner_token: "owner-token-1",
@@ -2244,7 +2244,7 @@ fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
         .unwrap();
         let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "reservation-1",
                 owner_token: "owner-token-1",
@@ -2347,7 +2347,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
         .unwrap();
         let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "reservation-1",
                 owner_token: "owner-token-1",
@@ -2434,7 +2434,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_on_non_primary() {
         .unwrap();
         PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            crate::traits::DurableBucketWriteReservationAcquire {
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
                 name: &bucket,
                 reservation_id: "reservation-1",
                 owner_token: "owner-token-1",
