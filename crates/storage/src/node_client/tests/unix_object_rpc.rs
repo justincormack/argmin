@@ -128,23 +128,27 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             })
             .find(|(_, _, pg_id)| *pg_id < 2)
             .expect("two-PG topology must place a test object");
+        let wrong_pg_id = if correct_pg_id == 0 { 1 } else { 0 };
         let pg = node.get_pg(correct_pg_id).unwrap();
         let reserved_generation =
             PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id)
                 .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
-        (
-            bucket,
-            key,
-            correct_pg_id,
-            if correct_pg_id == 0 { 1 } else { 0 },
-            reserved_generation,
-        )
+        let wrong_pg = node.get_pg(wrong_pg_id).unwrap();
+        let wrong_pg_reserved_generation =
+            PgMetadataStore::reserve_object_generation(&*wrong_pg, &bucket, &key, &reservation_id)
+                .unwrap();
+        wrong_pg.refresh_metadata_command_state_digest().unwrap();
+        assert_eq!(
+            wrong_pg_reserved_generation, reserved_generation,
+            "equivalent wrong-PG state must make an unguarded direct-PUT lookup succeed"
+        );
+        (bucket, key, correct_pg_id, wrong_pg_id, reserved_generation)
     };
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..3)
+    let server_threads: Vec<_> = (0..6)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -156,6 +160,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         config.socket_path.clone(),
     );
     let wrong_object_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
+    let correct_object_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id));
 
     let reservation_error = ObjectGenerationMetadataNodeClient::object_generation_reservation(
         &client,
@@ -167,7 +172,10 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     .unwrap_err();
     assert!(matches!(
         reservation_error,
-        ObjectPgActionError::Store(StoreError::StorageRpc { .. })
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
     ));
 
     let version_error = ObjectVersionMetadataNodeClient::next_object_version_id(
@@ -179,13 +187,16 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     .unwrap_err();
     assert!(matches!(
         version_error,
-        ObjectPgActionError::Store(StoreError::StorageRpc { .. })
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
     ));
 
     assert_eq!(
         ObjectGenerationMetadataNodeClient::object_generation_reservation(
             &client,
-            ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id)),
+            correct_object_pg,
             &bucket,
             &key,
             &reservation_id,
@@ -193,6 +204,91 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         .unwrap(),
         reserved_generation
     );
+
+    let snapshot_error = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
+        &client,
+        wrong_object_pg,
+        &bucket,
+        &key,
+        &reservation_id,
+        reserved_generation,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        snapshot_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let snapshot = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
+        &client,
+        correct_object_pg,
+        &bucket,
+        &key,
+        &reservation_id,
+        reserved_generation,
+    )
+    .unwrap();
+    let bucket_write_reservation = BucketWriteReservationProof {
+        bucket: bucket.clone(),
+        reservation_id: "wrong-object-pg-proof".to_string(),
+        owner_token: "wrong-object-pg-owner".to_string(),
+        cluster_epoch: ClusterEpoch::new(1).unwrap(),
+        bucket_execution_generation: 1,
+        bucket_incarnation_generation: 1,
+        operation_kind: "direct-put".to_string(),
+        created_at: 10,
+        lease_deadline: 20,
+        target_context: Some(key.as_str().to_string()),
+    };
+    let direct_put_request = CommitDirectPutObjectReq {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        generation_reservation_id: reservation_id.clone(),
+        versioning: BucketVersioningState::Suspended,
+        owner: OwnerIdentity {
+            principal: "owner".to_string(),
+            canonical_id: crate::CanonicalUserId::from_principal("owner"),
+        },
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        generation_id: reserved_generation,
+        size: 12,
+        etag_crc64: 99,
+        ec: EcShape { k: 4, m: 2 },
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        segment_index: 0,
+        segment_crc64: 99,
+        segment_okh: [7; 16],
+        segment_vid: GenerationId::new(10).unwrap(),
+        data_pg_id: 0,
+        bucket_write_reservation: bucket_write_reservation.clone(),
+    };
+    let command_error = DirectPutMetadataNodeClient::build_direct_put_commit_command(
+        &client,
+        BuildDirectPutCommitCommandReq {
+            pg_id: wrong_object_pg,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            request: &direct_put_request,
+            version_id: VersionId::Null,
+            expected_snapshot: &snapshot,
+            bucket_write_reservation: &bucket_write_reservation,
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        command_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
 
     for thread in server_threads {
         thread.join().unwrap();
@@ -1491,7 +1587,7 @@ fn unix_direct_put_metadata_client_loads_commit_snapshot() {
 
     let snapshot = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         &reservation_id,
@@ -1578,7 +1674,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
     };
     let snapshot = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         &reservation_id,
@@ -1589,7 +1685,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
     let command = DirectPutMetadataNodeClient::build_direct_put_commit_command(
         &client,
         BuildDirectPutCommitCommandReq {
-            pg_id: PgId::new(0),
+            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             request: &request,
             version_id: VersionId::Null,
@@ -1630,7 +1726,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         .validate_direct_put_command_build_response(
             &bad_command,
             &BuildDirectPutCommitCommandReq {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &request,
                 version_id: VersionId::Null,

@@ -1113,7 +1113,7 @@ impl ObjectVersionMetadataNodeClient for LocalStorageNodeClient {
 impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
     fn load_direct_put_commit_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,
@@ -3140,7 +3140,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_direct_put_commit_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,
@@ -3237,7 +3237,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             encryption: request.request.encryption.clone(),
         };
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;

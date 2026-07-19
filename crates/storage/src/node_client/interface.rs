@@ -385,7 +385,7 @@ pub(crate) trait ObjectVersionMetadataNodeClient: Send + Sync {
 pub(crate) trait DirectPutMetadataNodeClient: Send + Sync {
     fn load_direct_put_commit_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,
@@ -752,7 +752,7 @@ pub(crate) struct BuildStreamPutCommitCommandReq<'a> {
 }
 
 pub(crate) struct BuildDirectPutCommitCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CommitDirectPutObjectReq,
     pub(crate) version_id: VersionId,
@@ -1830,7 +1830,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_direct_put_commit_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,

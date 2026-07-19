@@ -627,6 +627,36 @@ Third Phase 3 slice:
   object-version tests, the boundary checker, formatting, workspace-wide
   strict Clippy, and the full workspace suite (7,132 tests).
 
+Fourth Phase 3 slice:
+
+- `DirectPutMetadataNodeClient`, its duplicate snapshot method on the
+  transitional `StorageNodeClient` aggregate, and
+  `BuildDirectPutCommitCommandReq` now require `ObjectMetadataPgId`. This
+  closes both raw-PG entry points: snapshot loading accepted a direct
+  argument, while command construction previously carried a raw PG inside its
+  request value.
+- direct PUT finalization derives one object role for the exact
+  `(bucket, key)` from the installed runtime topology and uses its raw
+  projection only for generic pending-command routing. Local command-ID
+  allocation erases the role at the private store boundary; Unix request and
+  response validation erase it only at the RPC boundary.
+- the Unix server reconstructs the direct-PUT object role only after route,
+  primary, and exact object-placement validation. The two-PG adversarial
+  regression now also requires a test-forged wrong object PG to fail for both
+  direct-PUT snapshot loading and command construction, while a correctly
+  routed snapshot canary succeeds.
+- review correction: the adversarial fixture seeds the same generation
+  reservation on both PGs and requires the exact `PayloadDecode` placement
+  error. An implementation that reached the wrong PG would therefore succeed
+  at snapshot lookup and proceed with command construction rather than
+  satisfying the test through an unrelated missing-reservation error.
+- object listing/mutation/read and data-client signatures, `DataPgId`
+  construction, and request-scoped route capability values remain open in
+  Phase 3.
+- the fourth slice passed its focused direct-PUT and wrong-object-PG Unix
+  regressions, the boundary checker, formatting, workspace-wide strict
+  Clippy, and the full workspace suite (7,132 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

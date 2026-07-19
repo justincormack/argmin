@@ -1411,7 +1411,7 @@ impl UnixStorageNodeClient {
 impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
     fn load_direct_put_commit_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,
@@ -1421,7 +1421,7 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
             object: StorageRpcObjectRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
                 key: key.clone(),
             },
@@ -1450,7 +1450,7 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
             object: StorageRpcObjectRequest {
                 node_id: self.node_id,
                 cluster_epoch: request.cluster_epoch,
-                pg_id: request.pg_id,
+                pg_id: request.pg_id.pg_id(),
                 bucket: request.request.bucket.clone(),
                 key: request.request.key.clone(),
             },

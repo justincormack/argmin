@@ -7871,7 +7871,8 @@ impl StorageCluster {
         crate::metadata_command::metadata_command_publisher!(
             CommitDirectPutObjectFromPayloadShards
         );
-        let pg_id = PgId::new(self.object_metadata_pg_id(&req.bucket, &req.key));
+        let object_pg_id = self.object_metadata_pg(&req.bucket, &req.key);
+        let pg_id = object_pg_id.pg_id();
         let effective_bucket_write_reservation = req.bucket_write_reservation.clone();
         let mut bucket_write_proof_command_owned = false;
         macro_rules! release_caller_bucket_write_proof_if_unowned {
@@ -7955,7 +7956,7 @@ impl StorageCluster {
                     })
                 else {
                     let snapshot = match direct_put_metadata_client.load_direct_put_commit_snapshot(
-                        pg_id,
+                        object_pg_id,
                         &req.bucket,
                         &req.key,
                         &req.generation_reservation_id,
@@ -8003,7 +8004,7 @@ impl StorageCluster {
                     }
                     let command = match direct_put_metadata_client.build_direct_put_commit_command(
                         BuildDirectPutCommitCommandReq {
-                            pg_id,
+                            pg_id: object_pg_id,
                             cluster_epoch: self.operation_epoch(),
                             request: req,
                             version_id,

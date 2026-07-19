@@ -1744,7 +1744,7 @@ impl UnixStorageNodeClient {
         request: &BuildDirectPutCommitCommandReq<'_>,
     ) -> Result<(), ObjectPgActionError> {
         if command.id().cluster_epoch() != request.cluster_epoch
-            || command.id().pg_id() != request.pg_id
+            || command.id().pg_id() != request.pg_id.pg_id()
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "validate direct PUT commit command build response",
