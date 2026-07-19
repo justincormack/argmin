@@ -246,6 +246,15 @@ pub(crate) struct ConfiguredCredential {
     pub(crate) authorization_profile: ConfiguredCredentialProfile,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredStaticClusterIdentity {
+    pub(crate) cluster_id: String,
+    pub(crate) topology_generation: u64,
+    pub(crate) topology_digest: String,
+    pub(crate) process_id: String,
+    pub(crate) process_identity_digest: String,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SecretConfigValue(String);
 
@@ -278,6 +287,7 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_ids: Vec<u32>,
     pub(crate) storage_node_id: Option<u32>,
     pub(crate) storage_node_data_dir: Option<String>,
+    pub(crate) static_cluster_identity: Option<ConfiguredStaticClusterIdentity>,
     pub(crate) storage_node_socket_path: Option<String>,
     pub(crate) storage_node_sockets: Vec<ConfiguredStorageNodeSocket>,
     pub(crate) storage_node_rpc_admission_limit: usize,
@@ -943,6 +953,7 @@ impl ServerConfig {
             storage_node_ids,
             storage_node_id,
             storage_node_data_dir,
+            static_cluster_identity: None,
             storage_node_socket_path,
             storage_node_sockets,
             storage_node_rpc_admission_limit,

@@ -36,6 +36,28 @@ fn opens_distinct_local_node_stores_with_static_epoch() {
 }
 
 #[test]
+fn opens_fresh_local_node_stores_at_configured_noninitial_epoch() {
+    let tmp = test_util::tempdir();
+    let node_id = NodeId::new(7);
+    let epoch = ClusterEpoch::new(9).unwrap();
+    let map = LocalClusterMap::open_with_configs_and_epoch(
+        node_id,
+        [LocalNodeStoreConfig::new(node_id, tmp.path())],
+        &[0],
+        EcShape { k: 1, m: 0 },
+        epoch,
+    )
+    .unwrap();
+
+    assert_eq!(map.epoch(), epoch);
+    let pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
+    assert_eq!(
+        pg.metadata_command_replica_state().unwrap().cluster_epoch,
+        epoch
+    );
+}
+
+#[test]
 fn opens_frontend_topology_only_map_without_pg_stores() {
     let node_ids = [NodeId::new(0), NodeId::new(1)];
     let ec_shape = EcShape { k: 1, m: 1 };

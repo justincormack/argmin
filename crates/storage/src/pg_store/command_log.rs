@@ -1076,7 +1076,10 @@ impl PgStore {
         format!("argmin_metadata_row_digest({})", args.join(", "))
     }
 
-    pub(super) fn ensure_metadata_command_replica_state(&self) -> Result<(), StoreError> {
+    pub(super) fn ensure_metadata_command_replica_state(
+        &self,
+        initial_cluster_epoch: ClusterEpoch,
+    ) -> Result<(), StoreError> {
         let exists = self.query_row_cached_optional(
             "SELECT 1 FROM metadata_command_replica_state WHERE singleton = 0",
             [],
@@ -1095,7 +1098,7 @@ impl PgStore {
             "INSERT INTO metadata_command_replica_state \
              (singleton, cluster_epoch, applied_log_index, applied_log_hash, state_digest) \
              VALUES (0, ?1, 0, 0, ?2)",
-            params![ClusterEpoch::INITIAL.get() as i64, state_digest as i64],
+            params![initial_cluster_epoch.get() as i64, state_digest as i64],
             "initialize metadata command replica state",
         )?;
         Ok(())

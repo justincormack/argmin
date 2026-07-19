@@ -27,6 +27,9 @@ pub enum StoreError {
     #[error("payload shard set mismatch: {reason}")]
     PayloadShardSetMismatch { reason: String },
 
+    #[error("PG {pg_id} durable identity is invalid: {reason}")]
+    PgDurableIdentityInvalid { pg_id: u32, reason: String },
+
     #[error("cluster-map history route reference count {count} exceeds maximum {max}")]
     ClusterMapHistoryReferenceLimitExceeded { count: usize, max: usize },
 
@@ -422,6 +425,7 @@ impl StoreError {
             Self::IntegrityError { .. } => "integrity_error",
             Self::ShardAckMismatch { .. } => "shard_ack_mismatch",
             Self::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+            Self::PgDurableIdentityInvalid { .. } => "pg_durable_identity_invalid",
             Self::ClusterMapHistoryReferenceLimitExceeded { .. } => {
                 "cluster_map_history_reference_limit_exceeded"
             }

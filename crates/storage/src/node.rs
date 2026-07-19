@@ -420,11 +420,13 @@ impl LocalNodeRuntime {
         data_dir: &Path,
         pg_ids: &[u32],
         default_ec_shape: EcShape,
+        initial_cluster_epoch: ClusterEpoch,
     ) -> Result<Self, StoreError> {
-        let node = Arc::new(SharedStorageNode::open_with_default_ec_shape(
+        let node = Arc::new(SharedStorageNode::open_with_default_ec_shape_and_epoch(
             data_dir,
             pg_ids,
             default_ec_shape,
+            initial_cluster_epoch,
         )?);
         Ok(Self::from_node(node_id, node))
     }
@@ -638,6 +640,20 @@ impl SharedStorageNode {
         pg_ids: &[u32],
         default_ec_shape: EcShape,
     ) -> Result<Self, StoreError> {
+        Self::open_with_default_ec_shape_and_epoch(
+            data_dir,
+            pg_ids,
+            default_ec_shape,
+            ClusterEpoch::INITIAL,
+        )
+    }
+
+    pub(crate) fn open_with_default_ec_shape_and_epoch(
+        data_dir: &Path,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        initial_cluster_epoch: ClusterEpoch,
+    ) -> Result<Self, StoreError> {
         EcConfig::new(default_ec_shape.k, default_ec_shape.m).map_err(|error| {
             StoreError::ErasureCoding {
                 context: "validate storage default ec shape",
@@ -655,7 +671,8 @@ impl SharedStorageNode {
 
         for &pg_id in pg_ids {
             let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
-            let store = PgStore::open(&pg_dir, pg_id)?;
+            let store =
+                PgStore::open_with_initial_cluster_epoch(&pg_dir, pg_id, initial_cluster_epoch)?;
             let shards_dir = pg_dir.join("shards");
             let tmp_dir = pg_dir.join("tmp");
             stores.insert(pg_id, Mutex::new(store));

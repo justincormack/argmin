@@ -1,5 +1,6 @@
 mod config;
 mod static_cluster_config;
+mod static_cluster_state;
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -388,6 +389,48 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
             }
             Err(error) => {
                 eprintln!("cluster manifest validation failed: {error}");
+                Some(1)
+            }
+        };
+    }
+    if command == "initialize-cluster-state" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some(process_id) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        let Some(process_id) = process_id.to_str() else {
+            eprintln!("cluster manifest process id must contain valid UTF-8");
+            return Some(2);
+        };
+        return match static_cluster_config::load_static_cluster_manifest(
+            Path::new(&path),
+            process_id,
+        )
+        .and_then(|manifest| manifest.initialize_standalone_storage())
+        {
+            Ok(()) => {
+                println!("initialized static standalone cluster state");
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("static cluster state initialization failed: {error}");
                 Some(1)
             }
         };
@@ -6073,11 +6116,12 @@ fn build_control_plane_storage_node_process_config(
 }
 
 async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
-    let storage_cluster =
-        build_legacy_local_storage_cluster(&config, &ec_config).unwrap_or_else(|e| {
+    let opened_storage_cluster = build_legacy_local_storage_cluster(&config, &ec_config)
+        .unwrap_or_else(|e| {
             eprintln!("failed to open local storage cluster: {e}");
             std::process::exit(1);
         });
+    let storage_cluster = opened_storage_cluster.cluster();
 
     run_frontend_server(
         config,
@@ -6086,12 +6130,32 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
         server_core::coordinator::BackgroundWorkerMode::all(),
     )
     .await;
+    drop(opened_storage_cluster);
+}
+
+struct OpenedLegacyLocalStorageCluster {
+    cluster: Arc<StorageCluster>,
+    _static_storage_runtime_lock: Option<static_cluster_state::StaticStorageRuntimeLock>,
+}
+
+impl OpenedLegacyLocalStorageCluster {
+    fn cluster(&self) -> Arc<StorageCluster> {
+        Arc::clone(&self.cluster)
+    }
+}
+
+impl std::ops::Deref for OpenedLegacyLocalStorageCluster {
+    type Target = StorageCluster;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cluster
+    }
 }
 
 fn build_legacy_local_storage_cluster(
     config: &ServerConfig,
     ec_config: &EcConfig,
-) -> Result<Arc<StorageCluster>, String> {
+) -> Result<OpenedLegacyLocalStorageCluster, String> {
     let pg_ids: Vec<u32> = (0..config.pg_count).collect();
     let data_dir = Path::new(&config.data_dir);
     let ec_shape = storage::EcShape {
@@ -6105,6 +6169,7 @@ fn build_legacy_local_storage_cluster(
         .copied()
         .map(NodeId::new)
         .collect();
+    let mut static_storage_runtime_lock = None;
     let storage_cluster = if node_ids.len() == 1 {
         let node_id = node_ids[0];
         let node_data_dir = config
@@ -6112,11 +6177,24 @@ fn build_legacy_local_storage_cluster(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join(format!("node-{:04}", node_id.as_u32())));
-        let local_map = LocalClusterMap::open_with_configs(
+        if let Some(identity) = &config.static_cluster_identity {
+            static_storage_runtime_lock = Some(
+                static_cluster_state::lock_and_verify_standalone_storage_startup(
+                    identity,
+                    node_id.as_u32(),
+                    &node_data_dir,
+                    &pg_ids,
+                )?,
+            );
+        }
+        let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
+            .ok_or_else(|| "configured storage cluster epoch must be > 0".to_string())?;
+        let local_map = LocalClusterMap::open_with_configs_and_epoch(
             node_id,
             [storage::LocalNodeStoreConfig::new(node_id, node_data_dir)],
             &pg_ids,
             ec_shape,
+            cluster_epoch,
         )
         .map_err(|error| error.to_string())?;
         StorageCluster::from_local_map(Arc::new(local_map)).map_err(|error| error.to_string())?
@@ -6124,7 +6202,10 @@ fn build_legacy_local_storage_cluster(
         StorageCluster::open_local_nodes(data_dir, &node_ids, &pg_ids, ec_shape)
             .map_err(|error| error.to_string())?
     };
-    Ok(storage_cluster)
+    Ok(OpenedLegacyLocalStorageCluster {
+        cluster: storage_cluster,
+        _static_storage_runtime_lock: static_storage_runtime_lock,
+    })
 }
 
 async fn run_remote_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
@@ -7078,6 +7159,7 @@ mod tests {
             storage_node_ids: (0..6).collect(),
             storage_node_id: Some(2),
             storage_node_data_dir: Some("/tmp/argmin-test/node-0002".to_string()),
+            static_cluster_identity: None,
             storage_node_socket_path: Some("/tmp/argmin-test/node-0002.sock".to_string()),
             storage_node_sockets: Vec::new(),
             storage_node_rpc_admission_limit:

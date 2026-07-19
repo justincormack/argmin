@@ -20,6 +20,13 @@ pub(crate) struct ScavengerShardRow {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ShardInventoryRow {
+    pub(crate) key: ShardKey,
+    pub(crate) ack: WriteAck,
+    pub(crate) status: ShardStatus,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct ScavengerShardFile {
     pub(crate) key: ShardKey,
     pub(crate) size: u64,
@@ -1588,15 +1595,26 @@ impl PgStore {
     }
 
     pub(crate) fn list_scavenger_shard_rows(&self) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        Ok(self
+            .list_shard_inventory_rows()?
+            .into_iter()
+            .map(|row| ScavengerShardRow {
+                key: row.key,
+                ack: row.ack,
+            })
+            .collect())
+    }
+
+    pub(crate) fn list_shard_inventory_rows(&self) -> Result<Vec<ShardInventoryRow>, StoreError> {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT shard_key, data_size, crc64_nvme \
+                "SELECT shard_key, data_size, crc64_nvme, status \
                  FROM shards \
                  ORDER BY shard_key",
             )
             .map_err(|source| StoreError::Db {
-                context: "list scavenger shard rows (prepare)",
+                context: "list shard inventory rows (prepare)",
                 source,
             })?;
         let rows = stmt
@@ -1605,27 +1623,36 @@ impl PgStore {
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .map_err(|source| StoreError::Db {
-                context: "list scavenger shard rows",
+                context: "list shard inventory rows",
                 source,
             })?;
-        let mut shard_rows = Vec::new();
+        let mut inventory_rows = Vec::new();
         for row in rows {
-            let (key, stored_size, crc64) = row.map_err(|source| StoreError::Db {
-                context: "read scavenger shard row",
+            let (key, stored_size, crc64, status) = row.map_err(|source| StoreError::Db {
+                context: "read shard inventory row",
                 source,
             })?;
-            shard_rows.push(ScavengerShardRow {
+            let status = u8::try_from(status)
+                .ok()
+                .and_then(ShardStatus::from_u8)
+                .ok_or_else(|| StoreError::ShardScavengerScanIncomplete {
+                    context: "read shard inventory rows",
+                    errors: format!("shard row has invalid status {status}"),
+                })?;
+            inventory_rows.push(ShardInventoryRow {
                 key: ShardKey::from_bytes(&key)?,
                 ack: WriteAck {
                     stored_size: stored_size as u64,
                     crc64: crc64 as u64,
                 },
+                status,
             });
         }
-        Ok(shard_rows)
+        Ok(inventory_rows)
     }
 
     fn extend_scavenger_encrypted_placed_references(

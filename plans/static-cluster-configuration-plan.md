@@ -100,6 +100,33 @@ and deployment-policy validation as startup will use, and emits only redacted
 cluster/process identity diagnostics. It does not resolve secret bytes, open
 mutable state, or start listeners.
 
+Standalone file-mode storage is initialized explicitly:
+
+```text
+argmin-s3 initialize-cluster-state /etc/argmin/cluster.toml all-1
+```
+
+The command writes a process-identity-bound initialization marker before
+creating PG state, syncs every initialized PG and directory, then atomically
+publishes the durable identity sentinel. Each PG database carries the same
+deployment identity plus its PG id, so a copied root sentinel cannot bless an
+empty or unrelated SQLite database. The same storage-layer verifier used by
+future replicated startup separately reports the indexed shard-file inventory:
+identity failure is always fatal, while authoritative non-deleting shard loss is
+profile policy. Inventory validation is non-mutating and delegates cleanup of
+safe crash residue, such as unindexed published files or missing files for
+`Deleting` rows, to the normal PG recovery/scavenger boundary. Standalone has
+no repair source and therefore rejects missing or truncated live shards;
+replicated mode will admit such a node only as fenced/non-serving until repair
+completes. Initialization is idempotent for the same complete state and can
+resume a matching interrupted first initialization. A nonempty unbound
+directory, marker-only normal startup, wrong process/cluster/generation, or
+identity-only relocation fails closed.
+Normal startup acquires the same exclusive storage-directory lock before
+identity or PG verification and retains it for the complete local storage
+cluster lifetime. A second process selecting the same process identity and data
+directory therefore fails before opening mutable PG state.
+
 ## Version 1 TOML Shape
 
 The following example is a three-host replicated deployment with EC 2+1 and
@@ -685,9 +712,18 @@ timeout tuning, or state relocation does not invalidate durable state.
 
 Path exclusion does not permit implicit reinitialization. Normal server startup
 requires each configured durable authority/storage path to contain its complete
-identity-bound state set and durable existence sentinel. An empty or partially
-copied destination is rejected; the server never interprets it as a new
-instance merely because the manifest still names the same node id.
+identity-bound metadata state set and durable existence sentinel. Startup
+inspects the authoritative shard-row/file inventory independently. The shared
+inspection rejects symlinked/cross-device shard roots, distinguishes safe
+crash residue from missing or truncated live shards, and does not perform
+recovery itself. Standalone rejects authoritative inventory loss because it
+has no repair source; replicated mode starts
+the affected node fenced and repairs from surviving failure domains. An
+explicit relocation command nevertheless requires a complete authoritative
+inventory before it
+publishes destination completion. An empty or partially copied destination is
+never interpreted as a new instance merely because the manifest still names
+the same node id.
 
 Durable state has three explicit lifecycle operations:
 
@@ -804,8 +840,21 @@ Progress as of 2026-07-19:
   Replicated, TCP, and secret-bearing manifests fail before runtime
   construction. Existing process-level Unix test fixtures still need to move
   to shared manifest builders as those process profiles are activated.
-- Durable identity binding, secret resolution, production replicated mapping,
-  and TCP transport remain open.
+- Slice 4's standalone storage sub-slice is implemented: file-mode
+  `all-in-one` configuration carries the process identity into runtime,
+  `initialize-cluster-state` durably publishes identity only after complete PG
+  initialization, each PG database is bound to that identity, and ordinary
+  startup uses the shared durable-identity and shard-inventory verifier.
+  Standalone requires a complete authoritative inventory; replicated startup
+  will reuse the report to remain fenced while recoverable live-shard loss is
+  repaired. Safe crash residue remains owned by PG recovery/scavenging. The
+  configured initial cluster epoch is used by both initialization and normal
+  runtime open. Complete path relocation is accepted because paths remain
+  outside durable identity, while empty, partial, wrong-cluster,
+  wrong-generation, and wrong-process state is rejected.
+- Raft/control-plane durable identity and authenticated-frame binding,
+  replicated initialization/replacement lifecycle, secret resolution,
+  production replicated mapping, and TCP transport remain open.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;

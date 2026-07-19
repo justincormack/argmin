@@ -1,4 +1,4 @@
-use crate::config::ServerConfig;
+use crate::config::{ConfiguredStaticClusterIdentity, ServerConfig};
 use ec::EcConfig;
 use placement::{
     ClusterMap, Level, NodeId, NodeInfo, PlacementConfig, PlacementConstraint, Placer, TopologyKey,
@@ -335,6 +335,46 @@ impl ValidatedStaticClusterManifest {
         &self.full_config_fingerprint
     }
 
+    pub(crate) fn initialize_standalone_storage(&self) -> Result<(), String> {
+        if self.manifest.deployment.mode != DeploymentMode::Standalone {
+            return Err(
+                "initialize-cluster-state currently supports standalone manifests only".to_string(),
+            );
+        }
+        let selected = &self.manifest.processes[self.selected_process_index];
+        if selected.kind != ProcessKind::AllInOne {
+            return Err(
+                "standalone state initialization requires an all-in-one process".to_string(),
+            );
+        }
+        let storage_node = self
+            .manifest
+            .storage_nodes
+            .iter()
+            .find(|storage_node| storage_node.process_id == selected.id)
+            .ok_or_else(|| "all-in-one process has no storage node".to_string())?;
+        let identity = ConfiguredStaticClusterIdentity {
+            cluster_id: self.manifest.cluster.id.clone(),
+            topology_generation: self.manifest.cluster.topology_generation,
+            topology_digest: self.topology_digest.clone(),
+            process_id: selected.id.clone(),
+            process_identity_digest: self.process_identity_digest.clone(),
+        };
+        let pg_ids: Vec<u32> = (0..self.manifest.storage.pg_count).collect();
+        crate::static_cluster_state::initialize_standalone_storage(
+            &identity,
+            storage_node.node_id,
+            &storage_node.data_dir,
+            &pg_ids,
+            storage::EcShape {
+                k: self.manifest.storage.ec_data_shards,
+                m: self.manifest.storage.ec_parity_shards,
+            },
+            storage::ClusterEpoch::new(self.manifest.storage.initial_cluster_epoch)
+                .expect("validated static initial cluster epoch is nonzero"),
+        )
+    }
+
     fn standalone_legacy_server_config<F>(&self, get: F) -> Result<ServerConfig, String>
     where
         F: Fn(&str) -> Option<String>,
@@ -411,6 +451,13 @@ impl ValidatedStaticClusterManifest {
         config.storage_node_ids = vec![storage_node.node_id];
         config.storage_node_id = Some(storage_node.node_id);
         config.storage_node_data_dir = Some(storage_node.data_dir.to_string_lossy().into_owned());
+        config.static_cluster_identity = Some(ConfiguredStaticClusterIdentity {
+            cluster_id: self.manifest.cluster.id.clone(),
+            topology_generation: self.manifest.cluster.topology_generation,
+            topology_digest: self.topology_digest.clone(),
+            process_id: selected.id.clone(),
+            process_identity_digest: self.process_identity_digest.clone(),
+        });
         Ok(config)
     }
 
@@ -3525,6 +3572,20 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
             config.storage_node_data_dir.as_deref(),
             Some("/srv/argmin/data")
         );
+        assert_eq!(
+            config
+                .static_cluster_identity
+                .as_ref()
+                .map(|identity| identity.process_id.as_str()),
+            Some("all-1")
+        );
+        assert_eq!(
+            config
+                .static_cluster_identity
+                .as_ref()
+                .map(|identity| identity.process_identity_digest.as_str()),
+            Some(manifest.process_identity_digest())
+        );
         assert_eq!(config.storage_node_socket_path, None);
         assert!(config.storage_node_sockets.is_empty());
         assert_eq!(config.control_plane_state_path, None);
@@ -3540,6 +3601,74 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
         std::fs::create_dir_all(&disk_path).unwrap();
         let source = standalone_manifest()
             .replace("/srv/argmin", disk_path.to_str().unwrap())
+            .replace("/run/argmin", socket_path.to_str().unwrap())
+            .replace("initial_cluster_epoch = 1", "initial_cluster_epoch = 7");
+        let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
+        let environment = standalone_runtime_environment();
+        let config = manifest
+            .standalone_legacy_server_config(|key| environment.get(key).cloned())
+            .unwrap();
+        let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
+        manifest.initialize_standalone_storage().unwrap();
+
+        let cluster = crate::build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
+        let handle = storage::StorageClusterRuntimeMapHandle::new(cluster.cluster());
+
+        assert_eq!(
+            handle.current().cluster_epoch(),
+            storage::ClusterEpoch::new(7).unwrap()
+        );
+        assert!(crate::maybe_spawn_frontend_control_plane_refresh_loop(handle, &config).is_none());
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn static_cluster_standalone_runtime_exclusively_owns_storage_directory() {
+        let dir = test_util::tempdir();
+        let disk_path = dir.path().join("disk");
+        let socket_path = dir.path().join("run");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        let source = standalone_manifest()
+            .replace("/srv/argmin", disk_path.to_str().unwrap())
+            .replace("/run/argmin", socket_path.to_str().unwrap());
+        let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
+        let environment = standalone_runtime_environment();
+        let config = manifest
+            .standalone_legacy_server_config(|key| environment.get(key).cloned())
+            .unwrap();
+        let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
+        manifest.initialize_standalone_storage().unwrap();
+        let first = crate::build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
+        let data_dir = Path::new(config.storage_node_data_dir.as_deref().unwrap());
+        let identity_path = data_dir.join(".argmin-static-storage.identity");
+        let held_identity_path = data_dir.join(".argmin-static-storage.identity.held");
+        std::fs::rename(&identity_path, &held_identity_path).unwrap();
+
+        let error = match crate::build_legacy_local_storage_cluster(&config, &ec_config) {
+            Ok(_) => panic!("second static runtime must not open the same storage directory"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("initialization or runtime is already active"));
+        assert!(
+            !error.contains("identity is missing"),
+            "runtime lock must be acquired before identity and PG verification"
+        );
+        std::fs::rename(&held_identity_path, &identity_path).unwrap();
+        assert_eq!(first.local_node_count(), 1);
+        drop(first);
+        crate::build_legacy_local_storage_cluster(&config, &ec_config)
+            .expect("storage directory lock must be released with runtime");
+    }
+
+    #[test]
+    fn static_cluster_standalone_runtime_requires_initialized_storage_state() {
+        let dir = test_util::tempdir();
+        let disk_path = dir.path().join("disk");
+        let socket_path = dir.path().join("run");
+        std::fs::create_dir_all(&disk_path).unwrap();
+        let source = standalone_manifest()
+            .replace("/srv/argmin", disk_path.to_str().unwrap())
             .replace("/run/argmin", socket_path.to_str().unwrap());
         let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
         let environment = standalone_runtime_environment();
@@ -3548,11 +3677,13 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
             .unwrap();
         let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
 
-        let cluster = crate::build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
-        let handle = storage::StorageClusterRuntimeMapHandle::new(cluster);
+        let error = match crate::build_legacy_local_storage_cluster(&config, &ec_config) {
+            Ok(_) => panic!("uninitialized static storage must fail closed"),
+            Err(error) => error,
+        };
 
-        assert!(crate::maybe_spawn_frontend_control_plane_refresh_loop(handle, &config).is_none());
-        assert!(!socket_path.exists());
+        assert!(error.contains("initialize-cluster-state"));
+        assert!(!disk_path.join("data").exists());
     }
 
     #[test]
@@ -3606,6 +3737,7 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
         assert_eq!(config.process_role, ProcessRole::LegacyLocal);
         assert_eq!(config.pg_count, 3);
         assert_eq!(config.storage_node_ids, vec![0]);
+        assert_eq!(config.static_cluster_identity, None);
     }
 
     #[test]

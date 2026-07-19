@@ -1818,6 +1818,7 @@ impl LocalClusterMap {
                 &canonical_data_dir,
                 &storage_pg_ids,
                 default_ec_shape,
+                cluster_epoch,
             )
             .map_err(|source| ClusterBuildError::OpenLocalNode {
                 node_id: node_id.as_u32(),

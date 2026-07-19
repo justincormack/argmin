@@ -652,6 +652,19 @@ CREATE TABLE IF NOT EXISTS pg_counters (
     next_bucket_execution_generation INTEGER NOT NULL DEFAULT 0 CHECK (next_bucket_execution_generation >= 0)
 ) STRICT";
 
+/// Optional deployment identity binding for a configured PG store.
+///
+/// Environment-configured compatibility stores leave this table empty. Static
+/// cluster initialization writes one row before publishing its root identity,
+/// allowing later startup to distinguish the original PG database from an
+/// empty or unrelated SQLite database copied under that root identity.
+const CREATE_PG_DURABLE_IDENTITY_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS pg_durable_identity (
+    singleton      INTEGER PRIMARY KEY CHECK (singleton = 0),
+    pg_id          INTEGER NOT NULL CHECK (pg_id >= 0),
+    identity_bytes BLOB NOT NULL CHECK (length(identity_bytes) BETWEEN 1 AND 1024)
+) STRICT";
+
 /// Per-PG metadata command log entries accepted by this replica.
 const CREATE_METADATA_COMMAND_LOG_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS metadata_command_log (
@@ -810,6 +823,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_LIFECYCLE_SWEEP_CLAIMS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     conn.execute(CREATE_PG_COUNTERS_TABLE, [])?;
+    conn.execute(CREATE_PG_DURABLE_IDENTITY_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_PENDING_SLOT_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;

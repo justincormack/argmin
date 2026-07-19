@@ -14,6 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,7 +22,8 @@ use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::types::ValueRef;
 use rusqlite::{
-    params, params_from_iter, Connection, Error as SqlError, OptionalExtension, Params, Row,
+    params, params_from_iter, Connection, Error as SqlError, OpenFlags, OptionalExtension, Params,
+    Row,
 };
 
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
@@ -115,6 +117,37 @@ pub struct PgClusterMapHistoryReferenceSummary {
 }
 
 pub const MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES: usize = 4096;
+pub const MAX_PG_DURABLE_IDENTITY_BYTES: usize = 1024;
+
+/// Read-only comparison of the durable shard index with the local shard tree.
+///
+/// Identity validation and inventory completeness are intentionally separate:
+/// every deployment mode must reject a foreign/unbound PG database, while a
+/// replicated node may start fenced and repair an incomplete local inventory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PgShardInventoryInspection {
+    pub shard_row_count: usize,
+    pub shard_file_count: usize,
+    pub authoritative_missing_file_count: usize,
+    pub authoritative_size_mismatch_count: usize,
+    pub recoverable_missing_file_count: usize,
+    pub recoverable_size_mismatch_count: usize,
+    pub recoverable_unindexed_file_count: usize,
+}
+
+impl PgShardInventoryInspection {
+    /// Whether every authoritative non-deleting shard row has a matching payload.
+    pub fn authoritative_inventory_is_complete(self) -> bool {
+        self.authoritative_missing_file_count == 0 && self.authoritative_size_mismatch_count == 0
+    }
+
+    /// Whether crash residue remains for the PG recovery/scavenger path.
+    pub fn has_recoverable_residue(self) -> bool {
+        self.recoverable_missing_file_count != 0
+            || self.recoverable_size_mismatch_count != 0
+            || self.recoverable_unindexed_file_count != 0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PgClusterMapHistoryRouteReferenceKind {
@@ -593,12 +626,259 @@ impl PgStoreRecoveryContext {
     }
 }
 
+/// Bind an initialized PG database to its configured deployment identity.
+///
+/// This operation is idempotent for an exact identity and fails closed if the
+/// database was already bound differently. It checkpoints the identity row
+/// into the main database before returning so publishing an outer/root
+/// identity cannot get ahead of the per-PG binding.
+pub fn initialize_pg_durable_identity(
+    pg_dir: &Path,
+    pg_id: u32,
+    identity_bytes: &[u8],
+) -> Result<(), StoreError> {
+    validate_pg_durable_identity_bytes(pg_id, identity_bytes)?;
+    let store = PgStore::open(pg_dir, pg_id)?;
+    let existing = store
+        .conn
+        .query_row(
+            "SELECT pg_id, identity_bytes FROM pg_durable_identity WHERE singleton = 0",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|source| StoreError::Db {
+            context: "load PG durable identity",
+            source,
+        })?;
+    match existing {
+        Some((stored_pg_id, stored_identity))
+            if stored_pg_id == i64::from(pg_id) && stored_identity == identity_bytes => {}
+        Some(_) => {
+            return Err(StoreError::PgDurableIdentityInvalid {
+                pg_id,
+                reason: "database is already bound to a different identity".to_string(),
+            });
+        }
+        None => {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO pg_durable_identity (singleton, pg_id, identity_bytes) \
+                     VALUES (0, ?1, ?2)",
+                    params![i64::from(pg_id), identity_bytes],
+                )
+                .map_err(|source| StoreError::Db {
+                    context: "persist PG durable identity",
+                    source,
+                })?;
+        }
+    }
+    store
+        .conn
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .map_err(|source| StoreError::Db {
+            context: "checkpoint PG durable identity",
+            source,
+        })
+}
+
+/// Verify a PG database's configured identity without creating or migrating it.
+pub fn verify_pg_durable_identity(
+    pg_dir: &Path,
+    pg_id: u32,
+    expected_identity_bytes: &[u8],
+) -> Result<(), StoreError> {
+    validate_pg_durable_identity_bytes(pg_id, expected_identity_bytes)?;
+    let conn = open_existing_pg_database_read_only(pg_dir)?;
+    let quick_check = conn
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
+        .map_err(|source| StoreError::Db {
+            context: "check PG database integrity",
+            source,
+        })?;
+    if quick_check != "ok" {
+        return Err(StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: "database integrity check failed".to_string(),
+        });
+    }
+    let stored = conn
+        .query_row(
+            "SELECT pg_id, identity_bytes FROM pg_durable_identity WHERE singleton = 0",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|source| StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: format!("database has no valid durable identity schema: {source}"),
+        })?;
+    let Some((stored_pg_id, stored_identity)) = stored else {
+        return Err(StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: "database has no durable identity".to_string(),
+        });
+    };
+    if stored_pg_id != i64::from(pg_id) {
+        return Err(StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: "database is bound to a different PG".to_string(),
+        });
+    }
+    if stored_identity != expected_identity_bytes {
+        return Err(StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: "database is bound to a different deployment identity".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Compare a PG's indexed shard inventory with its canonical on-disk tree.
+///
+/// The caller decides whether an incomplete result is fatal or recoverable.
+/// Structural scan failures remain errors because no trustworthy inventory can
+/// be produced from them.
+pub fn inspect_pg_shard_inventory(
+    pg_dir: &Path,
+    pg_id: u32,
+) -> Result<PgShardInventoryInspection, StoreError> {
+    let pg_metadata = fs::symlink_metadata(pg_dir).map_err(|source| StoreError::Io {
+        context: "inspect PG directory for shard inventory",
+        source,
+    })?;
+    if pg_metadata.file_type().is_symlink() || !pg_metadata.is_dir() {
+        return Err(StoreError::ShardScavengerScanIncomplete {
+            context: "inspect PG shard inventory",
+            errors: "PG path is not a real directory".to_string(),
+        });
+    }
+    let shards_dir = pg_dir.join("shards");
+    let shards_metadata = fs::symlink_metadata(&shards_dir).map_err(|source| StoreError::Io {
+        context: "inspect shard root for PG inventory",
+        source,
+    })?;
+    if shards_metadata.file_type().is_symlink() || !shards_metadata.is_dir() {
+        return Err(StoreError::ShardScavengerScanIncomplete {
+            context: "inspect PG shard inventory",
+            errors: "shard root is not a real directory".to_string(),
+        });
+    }
+    if pg_metadata.dev() != shards_metadata.dev() {
+        return Err(StoreError::ShardScavengerScanIncomplete {
+            context: "inspect PG shard inventory",
+            errors: "shard root is on a different filesystem from its PG directory".to_string(),
+        });
+    }
+    let conn = open_existing_pg_database_read_only(pg_dir)?;
+    let store = PgStore {
+        pg_id,
+        shards_dir,
+        tmp_dir: pg_dir.join("tmp"),
+        conn,
+        clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
+        #[cfg(test)]
+        fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        metadata_command_log_prefix_fast_path_hits: AtomicU64::new(0),
+        #[cfg(test)]
+        metadata_command_log_replay_validation_entries: AtomicU64::new(0),
+    };
+    let rows = store.list_shard_inventory_rows()?;
+    let scan = store.list_scavenger_shard_files()?;
+    if !scan.errors.is_empty() {
+        return Err(StoreError::ShardScavengerScanIncomplete {
+            context: "inspect PG shard inventory",
+            errors: scan.errors.join("; "),
+        });
+    }
+
+    let mut inspection = PgShardInventoryInspection {
+        shard_row_count: rows.len(),
+        shard_file_count: scan.files.len(),
+        ..PgShardInventoryInspection::default()
+    };
+    let mut row_index = 0;
+    let mut file_index = 0;
+    while row_index < rows.len() && file_index < scan.files.len() {
+        let row = &rows[row_index];
+        let file = &scan.files[file_index];
+        match row.key.as_bytes().cmp(file.key.as_bytes()) {
+            std::cmp::Ordering::Less => {
+                if row.status == ShardStatus::Deleting {
+                    inspection.recoverable_missing_file_count += 1;
+                } else {
+                    inspection.authoritative_missing_file_count += 1;
+                }
+                row_index += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                inspection.recoverable_unindexed_file_count += 1;
+                file_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if row.ack.stored_size != file.size {
+                    if row.status == ShardStatus::Deleting {
+                        inspection.recoverable_size_mismatch_count += 1;
+                    } else {
+                        inspection.authoritative_size_mismatch_count += 1;
+                    }
+                }
+                row_index += 1;
+                file_index += 1;
+            }
+        }
+    }
+    for row in &rows[row_index..] {
+        if row.status == ShardStatus::Deleting {
+            inspection.recoverable_missing_file_count += 1;
+        } else {
+            inspection.authoritative_missing_file_count += 1;
+        }
+    }
+    inspection.recoverable_unindexed_file_count += scan.files.len() - file_index;
+    Ok(inspection)
+}
+
+fn validate_pg_durable_identity_bytes(pg_id: u32, identity_bytes: &[u8]) -> Result<(), StoreError> {
+    if identity_bytes.is_empty() || identity_bytes.len() > MAX_PG_DURABLE_IDENTITY_BYTES {
+        return Err(StoreError::PgDurableIdentityInvalid {
+            pg_id,
+            reason: format!(
+                "identity length {} is outside 1..={MAX_PG_DURABLE_IDENTITY_BYTES}",
+                identity_bytes.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn open_existing_pg_database_read_only(pg_dir: &Path) -> Result<Connection, StoreError> {
+    Connection::open_with_flags(
+        pg_dir.join("metadata.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|source| StoreError::Db {
+        context: "open existing PG database read-only",
+        source,
+    })
+}
+
 impl PgStore {
     /// Open (or create) a PG store at the given directory.
     ///
     /// Creates `shards/` and `tmp/` subdirectories if they don't exist.
     /// Initializes the SQLite schema (idempotent).
     pub fn open(pg_dir: &Path, pg_id: u32) -> Result<Self, StoreError> {
+        Self::open_with_initial_cluster_epoch(pg_dir, pg_id, ClusterEpoch::INITIAL)
+    }
+
+    pub(crate) fn open_with_initial_cluster_epoch(
+        pg_dir: &Path,
+        pg_id: u32,
+        initial_cluster_epoch: ClusterEpoch,
+    ) -> Result<Self, StoreError> {
         let shards_dir = pg_dir.join("shards");
         let tmp_dir = pg_dir.join("tmp");
 
@@ -660,7 +940,7 @@ impl PgStore {
         })
         .and_then(|store| {
             store.ensure_metadata_digest_bootstrap()?;
-            store.ensure_metadata_command_replica_state()?;
+            store.ensure_metadata_command_replica_state(initial_cluster_epoch)?;
             Ok(store)
         })
     }
@@ -945,5 +1225,150 @@ impl PgStore {
     #[cfg(any(test, feature = "test-hooks"))]
     fn now_millis() -> u64 {
         crate::clock::current_time_millis()
+    }
+}
+
+#[cfg(test)]
+mod durable_identity_tests {
+    use super::*;
+
+    const TEST_IDENTITY: &[u8] = b"test-static-cluster-identity";
+
+    #[test]
+    fn pg_durable_identity_rejects_valid_empty_sqlite_database() {
+        let temp = test_util::tempdir();
+        fs::create_dir(temp.path().join("shards")).unwrap();
+        let conn = Connection::open(temp.path().join("metadata.db")).unwrap();
+        conn.execute_batch("CREATE TABLE unrelated (id INTEGER PRIMARY KEY) STRICT")
+            .unwrap();
+        drop(conn);
+
+        let error = verify_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::PgDurableIdentityInvalid { pg_id: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn pg_shard_inventory_reports_database_rows_whose_payload_files_are_missing() {
+        let temp = test_util::tempdir();
+        initialize_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap();
+        let store = PgStore::open(temp.path(), 3).unwrap();
+        let key = ShardKey::new(&[7; 16], 11, 0);
+        store.write_shard(&key, b"durable shard payload").unwrap();
+        drop(store);
+
+        let complete = inspect_pg_shard_inventory(temp.path(), 3).unwrap();
+        assert!(complete.authoritative_inventory_is_complete());
+        assert!(!complete.has_recoverable_residue());
+        fs::remove_file(PgStore::shard_path_for_shards_dir(
+            &temp.path().join("shards"),
+            &key,
+        ))
+        .unwrap();
+
+        let incomplete = inspect_pg_shard_inventory(temp.path(), 3).unwrap();
+        assert_eq!(
+            incomplete,
+            PgShardInventoryInspection {
+                shard_row_count: 1,
+                shard_file_count: 0,
+                authoritative_missing_file_count: 1,
+                authoritative_size_mismatch_count: 0,
+                recoverable_missing_file_count: 0,
+                recoverable_size_mismatch_count: 0,
+                recoverable_unindexed_file_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn pg_shard_inventory_classifies_unindexed_files_as_recoverable_crash_residue() {
+        let temp = test_util::tempdir();
+        initialize_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap();
+        let key = ShardKey::new(&[8; 16], 12, 0);
+        PgStore::write_shard_file_durable(
+            &temp.path().join("tmp"),
+            &temp.path().join("shards"),
+            &key,
+            b"durable unregistered shard payload",
+        )
+        .unwrap();
+
+        let inspection = inspect_pg_shard_inventory(temp.path(), 3).unwrap();
+
+        assert!(inspection.authoritative_inventory_is_complete());
+        assert!(inspection.has_recoverable_residue());
+        assert_eq!(inspection.recoverable_unindexed_file_count, 1);
+    }
+
+    #[test]
+    fn pg_shard_inventory_classifies_missing_deleting_file_as_recoverable_crash_residue() {
+        let temp = test_util::tempdir();
+        initialize_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap();
+        let store = PgStore::open(temp.path(), 3).unwrap();
+        let key = ShardKey::new(&[9; 16], 13, 0);
+        store.write_shard(&key, b"shard being deleted").unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE shards SET status = ?1 WHERE shard_key = ?2",
+                params![ShardStatus::Deleting as u8, key.as_bytes().as_slice()],
+            )
+            .unwrap();
+        fs::remove_file(PgStore::shard_path_for_shards_dir(
+            &temp.path().join("shards"),
+            &key,
+        ))
+        .unwrap();
+        drop(store);
+
+        let inspection = inspect_pg_shard_inventory(temp.path(), 3).unwrap();
+
+        assert!(inspection.authoritative_inventory_is_complete());
+        assert!(inspection.has_recoverable_residue());
+        assert_eq!(inspection.recoverable_missing_file_count, 1);
+    }
+
+    #[test]
+    fn pg_shard_inventory_reports_truncated_authoritative_payload() {
+        let temp = test_util::tempdir();
+        initialize_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap();
+        let store = PgStore::open(temp.path(), 3).unwrap();
+        let key = ShardKey::new(&[10; 16], 14, 0);
+        store.write_shard(&key, b"complete shard payload").unwrap();
+        fs::write(
+            PgStore::shard_path_for_shards_dir(&temp.path().join("shards"), &key),
+            b"short",
+        )
+        .unwrap();
+        drop(store);
+
+        let inspection = inspect_pg_shard_inventory(temp.path(), 3).unwrap();
+
+        assert!(!inspection.authoritative_inventory_is_complete());
+        assert_eq!(inspection.authoritative_size_mismatch_count, 1);
+        assert!(!inspection.has_recoverable_residue());
+    }
+
+    #[test]
+    fn pg_shard_inventory_rejects_symlinked_shard_root() {
+        let temp = test_util::tempdir();
+        initialize_pg_durable_identity(temp.path(), 3, TEST_IDENTITY).unwrap();
+        let external = test_util::tempdir();
+        fs::remove_dir(temp.path().join("shards")).unwrap();
+        std::os::unix::fs::symlink(external.path(), temp.path().join("shards")).unwrap();
+
+        let error = inspect_pg_shard_inventory(temp.path(), 3).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::ShardScavengerScanIncomplete {
+                context: "inspect PG shard inventory",
+                ..
+            }
+        ));
     }
 }

@@ -103,12 +103,14 @@ pub use node_runtime::role_facade::{BucketPgId, ObjectMetadataPgId};
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) use pg_store::PgStore;
 pub use pg_store::{
+    initialize_pg_durable_identity, inspect_pg_shard_inventory, verify_pg_durable_identity,
     MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
     MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandCheckpointValidationError,
     MetadataCommandLogCompactionStatus, MetadataCommandLogStats,
     PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
     PgClusterMapHistoryRouteReferenceKind, PgClusterMapHistoryRouteReferences,
-    MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+    PgShardInventoryInspection, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+    MAX_PG_DURABLE_IDENTITY_BYTES,
 };
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;
