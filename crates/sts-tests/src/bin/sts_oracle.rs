@@ -267,6 +267,27 @@ fn assert_assumed_role_caller_identity(
     println!("{label}: ok");
 }
 
+fn assert_iam_user_caller_identity(
+    label: &str,
+    response: &RawResponse,
+    account_id: &str,
+    user_arn: &str,
+) {
+    assert!(
+        required_xml_text(response, "Arn", label) == user_arn,
+        "{label}: unexpected IAM user ARN"
+    );
+    let user_id = required_xml_text(response, "UserId", label);
+    assert!(
+        user_id.len() == 21
+            && user_id.starts_with("AIDA")
+            && user_id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+        "{label}: caller UserId has an unexpected IAM user ID shape"
+    );
+    assert_get_caller_identity_success(label, response, account_id);
+    println!("{label}: ok");
+}
+
 fn send_get_caller_identity(
     endpoint: &str,
     credentials: SignedRequestCredentials<'_>,
@@ -615,6 +636,36 @@ fn assert_s3_invalid_access_key(
     );
     let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
     assert_s3_invalid_access_key_shape(label, &response);
+}
+
+fn assert_s3_invalid_access_key_with_bucket_region(
+    label: &str,
+    response: &RawResponse,
+    access_key: &str,
+    security_tokens: &[&str],
+    expected_region: &str,
+) {
+    assert!(
+        required_xml_text(response, "AWSAccessKeyId", label) == access_key,
+        "{label}: S3 did not echo the session access key"
+    );
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .header("x-amz-bucket-region", expected_region)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>InvalidAccessKeyId</Code>\
+                 <Message>The AWS Access Key Id you provided does not exist in our records.</Message>\
+                 <AWSAccessKeyId>SESSION_ACCESS_KEY</AWSAccessKeyId>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{label}: ok");
 }
 
 fn assert_s3_invalid_token(
@@ -1033,28 +1084,43 @@ fn assert_s3_list_bucket_access_denied(
     response: &RawResponse,
     fixture: S3ListBucketDeniedFixture<'_>,
 ) {
-    let response = s3_response_with_sanitized_body(
-        response,
-        fixture.credentials.access_key,
-        &[fixture.security_token],
-    );
     let assumed_role_arn = format!(
         "arn:aws:sts::{}:assumed-role/{}/{}",
         fixture.account_id, fixture.role_name, fixture.role_session_name
     );
+    assert_s3_list_bucket_access_denied_for_principal(
+        label,
+        response,
+        fixture.bucket,
+        &assumed_role_arn,
+        fixture.credentials,
+        &[fixture.security_token],
+    );
+}
+
+fn assert_s3_list_bucket_access_denied_for_principal(
+    label: &str,
+    response: &RawResponse,
+    bucket: &str,
+    principal_arn: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_tokens: &[&str],
+) {
+    let response =
+        s3_response_with_sanitized_body(response, credentials.access_key, security_tokens);
     assert_shape(
         label,
         &response,
         &shape()
             .status(403)
             .headers(error_response_headers())
-            .header("x-amz-bucket-region", fixture.credentials.region)
-            .sub("assumed_role_arn", assumed_role_arn)
-            .sub("bucket", fixture.bucket)
+            .header("x-amz-bucket-region", credentials.region)
+            .sub("principal_arn", principal_arn)
+            .sub("bucket", bucket)
             .body(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                  <Error><Code>AccessDenied</Code>\
-                 <Message>User: {assumed_role_arn} is not authorized to perform: \
+                 <Message>User: {principal_arn} is not authorized to perform: \
                  s3:ListBucket on resource: \"arn:aws:s3:::{bucket}\" because no \
                  identity-based policy allows the s3:ListBucket action</Message>\
                  <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
@@ -2780,6 +2846,37 @@ fn s3_post_response_with_sanitized_body(
     }
 }
 
+fn assert_s3_put_object_access_denied(
+    label: &str,
+    response: &RawResponse,
+    bucket: &str,
+    key: &str,
+    principal_arn: &str,
+    access_key: &str,
+    security_tokens: &[&str],
+) {
+    let response = s3_response_with_sanitized_body(response, access_key, security_tokens);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("principal_arn", principal_arn)
+            .sub("bucket", bucket)
+            .sub("key", key)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>User: {principal_arn} is not authorized to perform: \
+                 s3:PutObject on resource: \"arn:aws:s3:::{bucket}/{key}\" because no \
+                 identity-based policy allows the s3:PutObject action</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{label}: ok");
+}
+
 fn assert_s3_post_access_denied(
     probe: S3PostProbe<'_>,
     result: &S3PostResult,
@@ -2787,31 +2884,25 @@ fn assert_s3_post_access_denied(
     assumed_role_arn: &str,
     security_tokens: &[&str],
 ) {
-    let response = s3_post_response_with_sanitized_body(
-        &result.response,
-        probe.credentials.access_key,
-        security_tokens,
-        &result.policy,
-    );
-    assert_shape(
+    let response = RawResponse {
+        status: result.response.status,
+        headers: result.response.headers.clone(),
+        body: result
+            .response
+            .body
+            .replace(&spaced_hex(&result.policy), "POST_POLICY_BYTES")
+            .replace(&result.policy, "POST_POLICY"),
+        body_read_error: result.response.body_read_error.clone(),
+    };
+    assert_s3_put_object_access_denied(
         probe.label,
         &response,
-        &shape()
-            .status(403)
-            .headers(error_response_headers())
-            .sub("assumed_role_arn", assumed_role_arn)
-            .sub("bucket", bucket)
-            .sub("key", probe.label)
-            .body(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                 <Error><Code>AccessDenied</Code>\
-                 <Message>User: {assumed_role_arn} is not authorized to perform: \
-                 s3:PutObject on resource: \"arn:aws:s3:::{bucket}/{key}\" because no \
-                 identity-based policy allows the s3:PutObject action</Message>\
-                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
-            ),
+        bucket,
+        probe.label,
+        assumed_role_arn,
+        probe.credentials.access_key,
+        security_tokens,
     );
-    println!("{}: ok", probe.label);
 }
 
 fn assert_s3_post_invalid_access_key(
@@ -5174,6 +5265,8 @@ fn run_assume_role_probes(
     let overlong_invalid_external_id = "!".repeat(1225);
     let multibyte_external_id = "é".repeat(613);
     let supplementary_external_id = "😀".repeat(613);
+    let short_invalid_external_id_pattern_first_message = r"2 validation errors detected: Value '!' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@:\/-]*; Value '!' at 'externalId' failed to satisfy constraint: Member must have length greater than or equal to 2";
+    let short_invalid_external_id_length_first_message = r"2 validation errors detected: Value '!' at 'externalId' failed to satisfy constraint: Member must have length greater than or equal to 2; Value '!' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@:\/-]*";
     let unknown_role_message = format!(
         "User: {caller_arn} is not authorized to perform: sts:AssumeRole on resource: {missing_role_arn}"
     );
@@ -5214,8 +5307,11 @@ fn run_assume_role_probes(
     let supplementary_2048_role_message = format!(
         "1 validation error detected: Value '{supplementary_2048_role_arn}' at 'roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: {role_arn_pattern}"
     );
-    let supplementary_2049_role_message = format!(
+    let supplementary_2049_role_pattern_first_message = format!(
         "2 validation errors detected: Value '{supplementary_2049_role_arn}' at 'roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: {role_arn_pattern}; Value '{supplementary_2049_role_arn}' at 'roleArn' failed to satisfy constraint: Member must have length less than or equal to 2048"
+    );
+    let supplementary_2049_role_length_first_message = format!(
+        "2 validation errors detected: Value '{supplementary_2049_role_arn}' at 'roleArn' failed to satisfy constraint: Member must have length less than or equal to 2048; Value '{supplementary_2049_role_arn}' at 'roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: {role_arn_pattern}"
     );
     let decomposed_1025_role_message = format!(
         "1 validation error detected: Value '{decomposed_1025_role_arn}' at 'roleArn' failed to satisfy constraint: Member must have length less than or equal to 2048"
@@ -5251,11 +5347,6 @@ fn run_assume_role_probes(
             supplementary_2048_role_message.as_str(),
         ),
         (
-            "assume-role-overlong-supplementary-role-arn",
-            supplementary_2049_role_arn.as_str(),
-            supplementary_2049_role_message.as_str(),
-        ),
-        (
             "assume-role-unnormalized-decomposed-role-arn",
             decomposed_1025_role_arn.as_str(),
             decomposed_1025_role_message.as_str(),
@@ -5276,6 +5367,23 @@ fn run_assume_role_probes(
             Some(message),
         );
     }
+    assert_assume_role_error_with_observed_messages(
+        "assume-role-overlong-supplementary-role-arn",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", supplementary_2049_role_arn.as_str()),
+            ("RoleSessionName", role_session_name),
+        ],
+        400,
+        "ValidationError",
+        &[
+            &supplementary_2049_role_pattern_first_message,
+            &supplementary_2049_role_length_first_message,
+        ],
+    );
 
     assert_assume_role_error(
         "assume-role-missing-role-arn",
@@ -5453,11 +5561,6 @@ fn run_assume_role_probes(
             r"1 validation error detected: Value 'bad value' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@:\/-]*",
         ),
         (
-            "assume-role-short-invalid-external-id",
-            "!",
-            r"2 validation errors detected: Value '!' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@:\/-]*; Value '!' at 'externalId' failed to satisfy constraint: Member must have length greater than or equal to 2",
-        ),
-        (
             "assume-role-overlong-external-id",
             overlong_external_id.as_str(),
             overlong_external_id_message.as_str(),
@@ -5494,6 +5597,24 @@ fn run_assume_role_probes(
             Some(message),
         );
     }
+    assert_assume_role_error_with_observed_messages(
+        "assume-role-short-invalid-external-id",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+            ("ExternalId", "!"),
+        ],
+        400,
+        "ValidationError",
+        &[
+            short_invalid_external_id_pattern_first_message,
+            short_invalid_external_id_length_first_message,
+        ],
+    );
 
     for (label, value, code, message) in [
         (
@@ -6781,6 +6902,42 @@ where
     );
 }
 
+fn wait_for_aws_response_convergence<F>(
+    label: &str,
+    expected_status: u16,
+    expected_code: Option<&str>,
+    mut send: F,
+) where
+    F: FnMut() -> RawResponse,
+{
+    let mut consecutive_results = 0;
+    let mut last_status = 0;
+    let mut last_code = None;
+    for attempt in 1..=30 {
+        let response = send();
+        last_status = response.status;
+        last_code = xml_tag_text(&response.body, "Code").map(str::to_string);
+        if response.status == expected_status && last_code.as_deref() == expected_code {
+            consecutive_results += 1;
+            if consecutive_results == 3 {
+                println!("{label}-converged: ok");
+                return;
+            }
+        } else {
+            consecutive_results = 0;
+        }
+        if attempt < 30 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+    panic!(
+        "{label}: AWS did not converge to three consecutive status {expected_status}, code {}; \
+         last status was {last_status}, last code was {}",
+        expected_code.unwrap_or("missing"),
+        last_code.as_deref().unwrap_or("missing")
+    );
+}
+
 fn run_s3_deleted_issuer_convergence_probes(
     s3_endpoint: &str,
     bucket: &str,
@@ -7819,6 +7976,778 @@ fn run_s3_streaming_expiry_input_probes(
             }
         }
     }
+}
+
+fn run_disabled_credential_active_controls(
+    sts_endpoint: &str,
+    s3_endpoint: &str,
+    s3_bucket_endpoint: &str,
+    bucket: &str,
+    credentials: SignedRequestCredentials<'_>,
+    account_id: &str,
+    user_arn: &str,
+) {
+    wait_for_aws_response_convergence("disabled-credential-active-sts", 200, None, || {
+        send_get_caller_identity(sts_endpoint, credentials, None)
+    });
+    let response = send_get_caller_identity(sts_endpoint, credentials, None);
+    assert_iam_user_caller_identity(
+        "disabled-credential-active-sts",
+        &response,
+        account_id,
+        user_arn,
+    );
+
+    wait_for_aws_response_convergence(
+        "disabled-credential-active-s3-header",
+        403,
+        Some("AccessDenied"),
+        || {
+            send_signed_request_for_service_with_credentials(
+                "GET",
+                s3_endpoint,
+                b"",
+                std::iter::empty::<(&str, &str)>(),
+                "s3",
+                credentials,
+            )
+        },
+    );
+    let response = send_signed_request_for_service_with_credentials(
+        "GET",
+        s3_endpoint,
+        b"",
+        std::iter::empty::<(&str, &str)>(),
+        "s3",
+        credentials,
+    );
+    assert_s3_list_buckets_access_denied(
+        "disabled-credential-active-s3-header",
+        &response,
+        user_arn,
+        credentials.access_key,
+        &[],
+    );
+
+    wait_for_aws_response_convergence(
+        "disabled-credential-active-s3-presigned",
+        403,
+        Some("AccessDenied"),
+        || {
+            let presigned = build_s3_root_presigned_request(s3_endpoint, credentials, None, None);
+            fetch_s3_presigned_request(s3_endpoint, &presigned, None)
+        },
+    );
+    let presigned = build_s3_root_presigned_request(s3_endpoint, credentials, None, None);
+    let response = fetch_s3_presigned_request(s3_endpoint, &presigned, None);
+    assert_s3_list_buckets_access_denied(
+        "disabled-credential-active-s3-presigned",
+        &response,
+        user_arn,
+        credentials.access_key,
+        &[],
+    );
+
+    wait_for_aws_response_convergence(
+        "disabled-credential-active-s3-header-scope-endpoint",
+        403,
+        Some("AccessDenied"),
+        || {
+            send_signed_request_for_service_with_credentials(
+                "GET",
+                s3_bucket_endpoint,
+                b"",
+                std::iter::empty::<(&str, &str)>(),
+                "s3",
+                credentials,
+            )
+        },
+    );
+    let response = send_signed_request_for_service_with_credentials(
+        "GET",
+        s3_bucket_endpoint,
+        b"",
+        std::iter::empty::<(&str, &str)>(),
+        "s3",
+        credentials,
+    );
+    assert_s3_list_bucket_access_denied_for_principal(
+        "disabled-credential-active-s3-header-scope-endpoint",
+        &response,
+        bucket,
+        user_arn,
+        credentials,
+        &[],
+    );
+
+    wait_for_aws_response_convergence(
+        "disabled-credential-active-s3-presigned-scope-endpoint",
+        403,
+        Some("AccessDenied"),
+        || {
+            let presigned =
+                build_s3_root_presigned_request(s3_bucket_endpoint, credentials, None, None);
+            fetch_s3_presigned_request(s3_bucket_endpoint, &presigned, None)
+        },
+    );
+    let presigned = build_s3_root_presigned_request(s3_bucket_endpoint, credentials, None, None);
+    let response = fetch_s3_presigned_request(s3_bucket_endpoint, &presigned, None);
+    assert_s3_list_bucket_access_denied_for_principal(
+        "disabled-credential-active-s3-presigned-scope-endpoint",
+        &response,
+        bucket,
+        user_arn,
+        credentials,
+        &[],
+    );
+
+    wait_for_aws_response_convergence(
+        "disabled-credential-active-s3-post",
+        403,
+        Some("AccessDenied"),
+        || {
+            let probe = S3PostProbe {
+                label: "disabled-credential-active-s3-post",
+                credentials,
+                policy_token: None,
+                form_tokens: S3PostFormTokens::Missing,
+                header_token: None,
+                expected: S3PostAuthExpected::AccessDenied,
+            };
+            send_s3_post_probe(s3_endpoint, bucket, probe).response
+        },
+    );
+    let probe = S3PostProbe {
+        label: "disabled-credential-active-s3-post",
+        credentials,
+        policy_token: None,
+        form_tokens: S3PostFormTokens::Missing,
+        header_token: None,
+        expected: S3PostAuthExpected::AccessDenied,
+    };
+    let result = send_s3_post_probe(s3_endpoint, bucket, probe);
+    assert_s3_post_access_denied(probe, &result, bucket, user_arn, &[]);
+
+    wait_for_aws_response_convergence(
+        "disabled-credential-active-s3-streaming",
+        403,
+        Some("AccessDenied"),
+        || {
+            send_s3_streaming_request(
+                s3_endpoint,
+                bucket,
+                S3StreamingRequest {
+                    label: "disabled-credential-active-s3-streaming",
+                    credentials,
+                    tokens: S3StreamingTokens::Missing,
+                    sign_token_header: true,
+                    bad_chunk_signature: false,
+                    service: "s3",
+                },
+            )
+            .response
+        },
+    );
+    let result = send_s3_streaming_request(
+        s3_endpoint,
+        bucket,
+        S3StreamingRequest {
+            label: "disabled-credential-active-s3-streaming",
+            credentials,
+            tokens: S3StreamingTokens::Missing,
+            sign_token_header: true,
+            bad_chunk_signature: false,
+            service: "s3",
+        },
+    );
+    assert_s3_put_object_access_denied(
+        "disabled-credential-active-s3-streaming",
+        &result.response,
+        bucket,
+        "disabled-credential-active-s3-streaming",
+        user_arn,
+        credentials.access_key,
+        &[],
+    );
+}
+
+fn run_disabled_credential_convergence_controls(
+    sts_endpoint: &str,
+    s3_endpoint: &str,
+    s3_bucket_endpoint: &str,
+    bucket: &str,
+    credentials: SignedRequestCredentials<'_>,
+) {
+    wait_for_aws_response_convergence(
+        "disabled-credential-inactive-sts",
+        403,
+        Some("InvalidClientTokenId"),
+        || send_get_caller_identity(sts_endpoint, credentials, None),
+    );
+    wait_for_aws_response_convergence(
+        "disabled-credential-inactive-s3-header",
+        403,
+        Some("InvalidAccessKeyId"),
+        || {
+            send_signed_request_for_service_with_credentials(
+                "GET",
+                s3_endpoint,
+                b"",
+                std::iter::empty::<(&str, &str)>(),
+                "s3",
+                credentials,
+            )
+        },
+    );
+    wait_for_aws_response_convergence(
+        "disabled-credential-inactive-s3-presigned",
+        403,
+        Some("InvalidAccessKeyId"),
+        || {
+            let presigned = build_s3_root_presigned_request(s3_endpoint, credentials, None, None);
+            fetch_s3_presigned_request(s3_endpoint, &presigned, None)
+        },
+    );
+    wait_for_aws_response_convergence(
+        "disabled-credential-inactive-s3-header-scope-endpoint",
+        403,
+        Some("InvalidAccessKeyId"),
+        || {
+            send_signed_request_for_service_with_credentials(
+                "GET",
+                s3_bucket_endpoint,
+                b"",
+                std::iter::empty::<(&str, &str)>(),
+                "s3",
+                credentials,
+            )
+        },
+    );
+    let response = send_signed_request_for_service_with_credentials(
+        "GET",
+        s3_bucket_endpoint,
+        b"",
+        std::iter::empty::<(&str, &str)>(),
+        "s3",
+        credentials,
+    );
+    assert_s3_invalid_access_key_with_bucket_region(
+        "disabled-credential-inactive-s3-header-scope-endpoint",
+        &response,
+        credentials.access_key,
+        &[],
+        credentials.region,
+    );
+    wait_for_aws_response_convergence(
+        "disabled-credential-inactive-s3-presigned-scope-endpoint",
+        403,
+        Some("InvalidAccessKeyId"),
+        || {
+            let presigned =
+                build_s3_root_presigned_request(s3_bucket_endpoint, credentials, None, None);
+            fetch_s3_presigned_request(s3_bucket_endpoint, &presigned, None)
+        },
+    );
+    let presigned = build_s3_root_presigned_request(s3_bucket_endpoint, credentials, None, None);
+    let response = fetch_s3_presigned_request(s3_bucket_endpoint, &presigned, None);
+    assert_s3_invalid_access_key_with_bucket_region(
+        "disabled-credential-inactive-s3-presigned-scope-endpoint",
+        &response,
+        credentials.access_key,
+        &[],
+        credentials.region,
+    );
+    wait_for_aws_response_convergence(
+        "disabled-credential-inactive-s3-post",
+        403,
+        Some("InvalidAccessKeyId"),
+        || {
+            send_s3_post_probe(
+                s3_endpoint,
+                bucket,
+                S3PostProbe {
+                    label: "disabled-credential-inactive-s3-post",
+                    credentials,
+                    policy_token: None,
+                    form_tokens: S3PostFormTokens::Missing,
+                    header_token: None,
+                    expected: S3PostAuthExpected::InvalidAccessKey,
+                },
+            )
+            .response
+        },
+    );
+    wait_for_aws_response_convergence(
+        "disabled-credential-inactive-s3-streaming",
+        403,
+        Some("InvalidAccessKeyId"),
+        || {
+            send_s3_streaming_request(
+                s3_endpoint,
+                bucket,
+                S3StreamingRequest {
+                    label: "disabled-credential-inactive-s3-streaming",
+                    credentials,
+                    tokens: S3StreamingTokens::Missing,
+                    sign_token_header: true,
+                    bad_chunk_signature: false,
+                    service: "s3",
+                },
+            )
+            .response
+        },
+    );
+}
+
+fn run_disabled_credential_probes(
+    sts_endpoint: &str,
+    s3_endpoint: &str,
+    s3_bucket_endpoint: &str,
+    bucket: &str,
+    credentials: SignedRequestCredentials<'_>,
+    live_security_token: &str,
+    expired_security_token: &str,
+) {
+    run_disabled_credential_convergence_controls(
+        sts_endpoint,
+        s3_endpoint,
+        s3_bucket_endpoint,
+        bucket,
+        credentials,
+    );
+
+    let wrong_secret = "0".repeat(40);
+    let wrong_region = if credentials.region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    };
+    let bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..credentials
+    };
+    let token_cases = [
+        ("missing-token", None),
+        ("mismatched-live-token", Some(live_security_token)),
+        ("mismatched-expired-token", Some(expired_security_token)),
+    ];
+    let sts_invalid_token_message = "The security token included in the request is invalid.";
+
+    for (token_case, security_token) in token_cases {
+        for (signature, signing_credentials) in [
+            ("valid-signature", credentials),
+            ("bad-signature", bad_signature_credentials),
+        ] {
+            let label = format!("disabled-credential-sts-{token_case}-{signature}");
+            let response =
+                send_get_caller_identity(sts_endpoint, signing_credentials, security_token);
+            assert_error_probe(
+                &label,
+                &response,
+                403,
+                STS_XMLNS,
+                "InvalidClientTokenId",
+                Some(sts_invalid_token_message),
+            );
+            println!("{label}: ok");
+        }
+
+        for (scope, scoped_credentials, service, expected_message) in [
+            (
+                "wrong-region",
+                SignedRequestCredentials {
+                    region: wrong_region,
+                    ..credentials
+                },
+                "sts",
+                STS_WRONG_REGION_SCOPE_MESSAGE,
+            ),
+            (
+                "wrong-service",
+                credentials,
+                "s3",
+                STS_WRONG_SERVICE_SCOPE_MESSAGE,
+            ),
+        ] {
+            for (signature, secret_key) in [
+                ("valid-signature", credentials.secret_key),
+                ("bad-signature", wrong_secret.as_str()),
+            ] {
+                let signing_credentials = SignedRequestCredentials {
+                    secret_key,
+                    ..scoped_credentials
+                };
+                let label = format!("disabled-credential-sts-{token_case}-{scope}-{signature}");
+                let response = send_get_caller_identity_with_scope(
+                    sts_endpoint,
+                    signing_credentials,
+                    security_token,
+                    service,
+                );
+                assert_signing_scope_error(&label, &response, expected_message);
+            }
+        }
+    }
+
+    for (token_case, security_token) in token_cases {
+        let headers = security_token
+            .map(|value| vec![("x-amz-security-token", value)])
+            .unwrap_or_default();
+        let sensitive_tokens = security_token.as_slice();
+        for (signature, signing_credentials) in [
+            ("valid-signature", credentials),
+            ("bad-signature", bad_signature_credentials),
+        ] {
+            let label = format!("disabled-credential-s3-header-{token_case}-{signature}");
+            let response = send_signed_request_for_service_with_credentials(
+                "GET",
+                s3_endpoint,
+                b"",
+                headers.iter().copied(),
+                "s3",
+                signing_credentials,
+            );
+            assert_s3_invalid_access_key(
+                &label,
+                &response,
+                credentials.access_key,
+                sensitive_tokens,
+            );
+        }
+
+        for (scope, scoped_credentials, service) in [
+            (
+                "wrong-region",
+                SignedRequestCredentials {
+                    region: wrong_region,
+                    ..credentials
+                },
+                "s3",
+            ),
+            ("wrong-service", credentials, "sts"),
+        ] {
+            for (signature, secret_key) in [
+                ("valid-signature", credentials.secret_key),
+                ("bad-signature", wrong_secret.as_str()),
+            ] {
+                let signing_credentials = SignedRequestCredentials {
+                    secret_key,
+                    ..scoped_credentials
+                };
+                let label =
+                    format!("disabled-credential-s3-header-{token_case}-{scope}-{signature}");
+                let response = send_signed_request_for_service_with_credentials(
+                    "GET",
+                    s3_bucket_endpoint,
+                    b"",
+                    headers.iter().copied(),
+                    service,
+                    signing_credentials,
+                );
+                if scope == "wrong-region" {
+                    assert_s3_header_wrong_region_scope(
+                        &label,
+                        &response,
+                        wrong_region,
+                        credentials.region,
+                        credentials.access_key,
+                        sensitive_tokens,
+                    );
+                } else {
+                    assert_s3_header_wrong_service_scope(
+                        &label,
+                        &response,
+                        credentials.region,
+                        credentials.access_key,
+                        sensitive_tokens,
+                    );
+                }
+            }
+        }
+    }
+
+    for (token_case, security_token) in token_cases {
+        let query_tokens = security_token.into_iter().collect::<Vec<_>>();
+        for (signature, signing_credentials) in [
+            ("valid-signature", credentials),
+            ("bad-signature", bad_signature_credentials),
+        ] {
+            let label = format!("disabled-credential-s3-presigned-{token_case}-{signature}");
+            let presigned = build_s3_root_presigned_request_for_service(
+                s3_endpoint,
+                signing_credentials,
+                &query_tokens,
+                &[],
+                "s3",
+            );
+            let response = fetch_s3_presigned_request(s3_endpoint, &presigned, None);
+            assert_s3_invalid_access_key(&label, &response, credentials.access_key, &query_tokens);
+        }
+
+        for (scope, scoped_credentials, service) in [
+            (
+                "wrong-region",
+                SignedRequestCredentials {
+                    region: wrong_region,
+                    ..credentials
+                },
+                "s3",
+            ),
+            ("wrong-service", credentials, "sts"),
+        ] {
+            for (signature, secret_key) in [
+                ("valid-signature", credentials.secret_key),
+                ("bad-signature", wrong_secret.as_str()),
+            ] {
+                let signing_credentials = SignedRequestCredentials {
+                    secret_key,
+                    ..scoped_credentials
+                };
+                let label =
+                    format!("disabled-credential-s3-presigned-{token_case}-{scope}-{signature}");
+                let presigned = build_s3_root_presigned_request_for_service(
+                    s3_bucket_endpoint,
+                    signing_credentials,
+                    &query_tokens,
+                    &[],
+                    service,
+                );
+                let response = fetch_s3_presigned_request(s3_bucket_endpoint, &presigned, None);
+                if scope == "wrong-region" {
+                    assert_s3_presigned_wrong_region_scope(
+                        &label,
+                        &response,
+                        wrong_region,
+                        credentials.region,
+                        credentials.access_key,
+                        &query_tokens,
+                    );
+                } else {
+                    assert_s3_presigned_wrong_service_scope(
+                        &label,
+                        &response,
+                        credentials.region,
+                        credentials.access_key,
+                        &query_tokens,
+                    );
+                }
+            }
+        }
+    }
+
+    for (token_case, security_token) in token_cases {
+        let form_tokens = security_token
+            .map(S3PostFormTokens::One)
+            .unwrap_or(S3PostFormTokens::Missing);
+        for (signature, signing_credentials) in [
+            ("valid-signature", credentials),
+            ("bad-signature", bad_signature_credentials),
+        ] {
+            let label = format!("disabled-credential-s3-post-{token_case}-{signature}");
+            let probe = S3PostProbe {
+                label: &label,
+                credentials: signing_credentials,
+                policy_token: security_token,
+                form_tokens,
+                header_token: None,
+                expected: S3PostAuthExpected::InvalidAccessKey,
+            };
+            let result = send_s3_post_probe(s3_endpoint, bucket, probe);
+            assert_s3_post_invalid_access_key(probe, &result, security_token.as_slice());
+        }
+
+        for (scope, scoped_credentials, service) in [
+            (
+                "wrong-region",
+                SignedRequestCredentials {
+                    region: wrong_region,
+                    ..credentials
+                },
+                "s3",
+            ),
+            ("wrong-service", credentials, "sts"),
+        ] {
+            for (signature, secret_key) in [
+                ("valid-signature", credentials.secret_key),
+                ("bad-signature", wrong_secret.as_str()),
+            ] {
+                let signing_credentials = SignedRequestCredentials {
+                    secret_key,
+                    ..scoped_credentials
+                };
+                let label = format!("disabled-credential-s3-post-{token_case}-{scope}-{signature}");
+                let probe = S3PostScopeProbe {
+                    label: &label,
+                    credentials: signing_credentials,
+                    service,
+                    policy_token: security_token,
+                    form_tokens,
+                    header_token: None,
+                };
+                let result = send_s3_post_scope_probe(s3_endpoint, bucket, probe);
+                if scope == "wrong-region" {
+                    assert_s3_post_wrong_region_scope(
+                        &label,
+                        &result,
+                        signing_credentials,
+                        security_token.as_slice(),
+                        wrong_region,
+                        credentials.region,
+                    );
+                } else {
+                    assert_s3_post_wrong_service_scope(
+                        &label,
+                        &result,
+                        signing_credentials,
+                        security_token.as_slice(),
+                    );
+                }
+            }
+        }
+    }
+
+    for (token_case, security_token) in token_cases {
+        let tokens = security_token
+            .map(S3StreamingTokens::One)
+            .unwrap_or(S3StreamingTokens::Missing);
+        for (signature, signing_credentials) in [
+            ("valid-signature", credentials),
+            ("bad-signature", bad_signature_credentials),
+        ] {
+            let label = format!("disabled-credential-s3-streaming-{token_case}-{signature}");
+            let result = send_s3_streaming_request(
+                s3_endpoint,
+                bucket,
+                S3StreamingRequest {
+                    label: &label,
+                    credentials: signing_credentials,
+                    tokens,
+                    sign_token_header: true,
+                    bad_chunk_signature: false,
+                    service: "s3",
+                },
+            );
+            assert_s3_invalid_access_key(
+                &label,
+                &result.response,
+                credentials.access_key,
+                security_token.as_slice(),
+            );
+        }
+
+        for (scope, scoped_credentials, service) in [
+            (
+                "wrong-region",
+                SignedRequestCredentials {
+                    region: wrong_region,
+                    ..credentials
+                },
+                "s3",
+            ),
+            ("wrong-service", credentials, "sts"),
+        ] {
+            for (signature, secret_key) in [
+                ("valid-signature", credentials.secret_key),
+                ("bad-signature", wrong_secret.as_str()),
+            ] {
+                let signing_credentials = SignedRequestCredentials {
+                    secret_key,
+                    ..scoped_credentials
+                };
+                let label =
+                    format!("disabled-credential-s3-streaming-{token_case}-{scope}-{signature}");
+                let result = send_s3_streaming_request(
+                    s3_endpoint,
+                    bucket,
+                    S3StreamingRequest {
+                        label: &label,
+                        credentials: signing_credentials,
+                        tokens,
+                        sign_token_header: true,
+                        bad_chunk_signature: false,
+                        service,
+                    },
+                );
+                if scope == "wrong-region" {
+                    assert_s3_streaming_wrong_region_scope(
+                        &label,
+                        &result.response,
+                        wrong_region,
+                        credentials.region,
+                        credentials.access_key,
+                        security_token.as_slice(),
+                    );
+                } else {
+                    assert_s3_streaming_wrong_service_scope(
+                        &label,
+                        &result.response,
+                        credentials.access_key,
+                        security_token.as_slice(),
+                    );
+                }
+            }
+        }
+    }
+
+    for (label, send) in [
+        (
+            "disabled-credential-s3-presigned-unsigned-header",
+            "presigned",
+        ),
+        (
+            "disabled-credential-s3-streaming-unsigned-header",
+            "streaming",
+        ),
+    ] {
+        if send == "presigned" {
+            let presigned = build_s3_root_presigned_request_for_service(
+                s3_endpoint,
+                credentials,
+                &[],
+                &[],
+                "s3",
+            );
+            let response =
+                fetch_s3_presigned_request(s3_endpoint, &presigned, Some(live_security_token));
+            assert_s3_headers_not_signed(
+                label,
+                &response,
+                credentials.access_key,
+                &[live_security_token],
+            );
+        } else {
+            let result = send_s3_streaming_request(
+                s3_endpoint,
+                bucket,
+                S3StreamingRequest {
+                    label,
+                    credentials,
+                    tokens: S3StreamingTokens::One(live_security_token),
+                    sign_token_header: false,
+                    bad_chunk_signature: false,
+                    service: "s3",
+                },
+            );
+            assert_s3_headers_not_signed(
+                label,
+                &result.response,
+                credentials.access_key,
+                &[live_security_token],
+            );
+        }
+    }
+
+    let label = "disabled-credential-s3-post-http-token-header";
+    let probe = S3PostProbe {
+        label,
+        credentials,
+        policy_token: None,
+        form_tokens: S3PostFormTokens::Missing,
+        header_token: Some(live_security_token),
+        expected: S3PostAuthExpected::NoAccessKeyPresented,
+    };
+    let result = send_s3_post_probe(s3_endpoint, bucket, probe);
+    assert_s3_post_no_access_key_presented(probe, &result, &[live_security_token]);
 }
 
 fn run_expired_deleted_session_probes(
@@ -9806,6 +10735,49 @@ fn main() {
         region: &region,
         tls_ca_pem: None,
     };
+    if env::var("STS_TEST_DISABLED_CREDENTIAL_STAGE").as_deref() == Ok("active") {
+        let disabled_access_key = required_env("STS_TEST_DISABLED_ACCESS_KEY");
+        let disabled_secret_key = required_env("STS_TEST_DISABLED_SECRET_KEY");
+        let disabled_user_arn = required_env("STS_TEST_DISABLED_USER_ARN");
+        let bucket = required_env("STS_TEST_POST_BUCKET");
+        run_disabled_credential_active_controls(
+            &endpoint,
+            &format!("https://s3.{region}.amazonaws.com"),
+            &format!("https://{bucket}.s3.{region}.amazonaws.com/"),
+            &bucket,
+            SignedRequestCredentials {
+                access_key: &disabled_access_key,
+                secret_key: &disabled_secret_key,
+                region: &region,
+                tls_ca_pem: None,
+            },
+            &account_id,
+            &disabled_user_arn,
+        );
+        return;
+    }
+    if env::var("STS_TEST_DISABLED_CREDENTIAL_STAGE").as_deref() == Ok("inactive") {
+        let disabled_access_key = required_env("STS_TEST_DISABLED_ACCESS_KEY");
+        let disabled_secret_key = required_env("STS_TEST_DISABLED_SECRET_KEY");
+        let live_security_token = required_env("STS_TEST_OTHER_LIVE_SESSION_TOKEN");
+        let expired_security_token = required_env("STS_TEST_EXPIRED_DELETED_SESSION_TOKEN");
+        let bucket = required_env("STS_TEST_POST_BUCKET");
+        run_disabled_credential_probes(
+            &endpoint,
+            &format!("https://s3.{region}.amazonaws.com"),
+            &format!("https://{bucket}.s3.{region}.amazonaws.com/"),
+            &bucket,
+            SignedRequestCredentials {
+                access_key: &disabled_access_key,
+                secret_key: &disabled_secret_key,
+                region: &region,
+                tls_ca_pem: None,
+            },
+            &live_security_token,
+            &expired_security_token,
+        );
+        return;
+    }
     if let Ok(bucket) = env::var("STS_TEST_POST_BUCKET") {
         run_list_tags_for_resource_success_probe(
             &endpoint,
@@ -10309,6 +11281,23 @@ fn main() {
                 &expired_deleted_security_token,
                 &other_live_security_token,
             );
+            if let Ok(disabled_access_key) = env::var("STS_TEST_DISABLED_ACCESS_KEY") {
+                let disabled_secret_key = required_env("STS_TEST_DISABLED_SECRET_KEY");
+                run_disabled_credential_probes(
+                    &endpoint,
+                    &s3_endpoint,
+                    &s3_bucket_endpoint,
+                    &post_bucket,
+                    SignedRequestCredentials {
+                        access_key: &disabled_access_key,
+                        secret_key: &disabled_secret_key,
+                        region: &region,
+                        tls_ca_pem: None,
+                    },
+                    &other_live_security_token,
+                    &expired_deleted_security_token,
+                );
+            }
         }
     }
 }

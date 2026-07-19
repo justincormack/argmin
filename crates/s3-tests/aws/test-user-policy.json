@@ -127,6 +127,25 @@
             "Resource": "*"
         },
         {
+            "Sid": "AllowManageTemporaryStsOracleDisabledCredentialUsers",
+            "Effect": "Allow",
+            "Action": [
+                "iam:CreateUser",
+                "iam:DeleteUser",
+                "iam:CreateAccessKey",
+                "iam:DeleteAccessKey",
+                "iam:ListAccessKeys",
+                "iam:UpdateAccessKey"
+            ],
+            "Resource": "arn:aws:iam::*:user/argmin-sts-oracle/disabled-credential-*"
+        },
+        {
+            "Sid": "AllowListTemporaryStsOracleUsers",
+            "Effect": "Allow",
+            "Action": "iam:ListUsers",
+            "Resource": "*"
+        },
+        {
             "Sid": "AllowSimulateOwnStsOracleAuthorization",
             "Effect": "Allow",
             "Action": "iam:SimulatePrincipalPolicy",

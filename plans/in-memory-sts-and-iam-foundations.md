@@ -533,8 +533,11 @@ header, presigned, POST Object, and streaming authentication:
    its presence selects the non-POST authentication route, which rejects the
    request as `AccessDenied` with `No AWSAccessKey was presented.` before POST
    form-token, token decoding, issuer-liveness, or policy-signature validation
-6. if the access key ID resolves to a stored long-lived credential, use the
-   static path and preserve AWS's post-signature unexpected-token behavior
+6. if the access key ID resolves to a stored long-lived credential, reject an
+   inactive record after the mode's outer scope and signature-coverage/routing
+   checks but before HMAC comparison or opening/binding/expiring a selected
+   token. For an active static record, use the static path and preserve AWS's
+   post-signature unexpected-token behavior
 7. otherwise, require and AEAD-open the selected effective session token
 8. validate the embedded access key ID against the SigV4 credential in constant
    time and check credential-domain binding
@@ -1049,10 +1052,11 @@ The initial Query-protocol slice completed on 2026-07-13:
   `text/xml` response type, and request-ID agreement
 
 Before Phase 0 can satisfy the first-milestone exit condition, it still needs
-to explicitly disposition the remaining credential-precedence and architecture
-decisions listed below. The bounded Query-parser limits, temporary access-key
-namespace, generation shape, session-token envelope, credential-domain binding,
-and key-overlap semantics are now fixed by completed Phase 0 slices.
+to explicitly disposition the remaining architecture decisions listed below.
+The credential-precedence matrix, bounded Query-parser limits, temporary
+access-key namespace, generation shape, session-token envelope,
+credential-domain binding, and key-overlap semantics are now fixed by
+completed Phase 0 slices.
 Session policies, tags and transitive tags, MFA, and provided contexts are
 Phase 6 completeness work rather than blockers for beginning Phase 1. They
 remain unsupported compatibility gaps and must never be silently ignored.
@@ -1083,6 +1087,17 @@ prefix and applies stricter returned-path and role-name checks before deletion.
 Every role except the dedicated bounded mutation fixture remains
 permissionless. These temporary grants and the persistent boundary policy
 should be removed with the oracle after Phase 0.
+
+The disabled-credential fixture also uses the ordinary primary test user. Its
+IAM grants can create, inspect, deactivate, and delete only permissionless
+users named `/argmin-sts-oracle/disabled-credential-*` and their access keys;
+it has no user-policy, group, role, or policy-attachment permissions through
+that surface. Every run creates a unique user, registers it for trap cleanup
+before creating its one key, and deletes the key before the user. The periodic
+cleanup command lists only the `/argmin-sts-oracle/` path, rechecks the exact
+path/name prefix, applies the configured minimum age, deletes every key on a
+stale matching user, and then deletes the permissionless user. `ListUsers`
+requires the same narrowly handled `Resource: "*"` exception as `ListRoles`.
 
 `SimulatePrincipalPolicy` is temporary AWS-oracle fixture validation only. It
 must not appear in the endpoint-neutral `s3-tests` scenario and does not add
@@ -1202,7 +1217,10 @@ matrix establishes that:
 - supplementary characters are rejected by AWS's pattern validator even
   though the pattern rendered in the error appears to include
   `U+10000`-`U+10FFFF`; the implementation must reproduce the observed
-  behavior rather than interpreting the displayed pattern literally
+  behavior rather than interpreting the displayed pattern literally. For the
+  2,049-character supplementary input, repeated live runs returned its exact
+  pattern and maximum-length clauses in both orders, so the oracle accepts
+  only those two complete messages and does not infer precedence between them
 - `RoleSessionName` accepts the two- and 64-character boundaries and rejects
   values outside that range or outside `[\w+=,.@-]*`
 - absent `DurationSeconds` defaults to 3,600 seconds, 900 and 43,200 are the
@@ -1291,9 +1309,12 @@ The exact AWS-backed matrix establishes that:
   `PackedPolicySize` remains absent
 - empty, one-character, space-containing, and 1,225-character values receive
   the exact single-error `ValidationError` shapes for the violated constraint
-- when pattern and length both fail, AWS returns an exact two-error response
-  with the pattern failure first and the minimum- or maximum-length failure
-  second; this is pinned with one and 1,225 exclamation marks
+- when pattern and length both fail, AWS returns both exact applicable clauses.
+  Repeated live runs of the one-character invalid value returned the pattern
+  and minimum-length clauses in both orders, so only those two complete
+  messages are accepted. The 1,225-character invalid value has so far remained
+  pinned pattern-first followed by maximum length; no ordering is generalized
+  from one collision shape to the other
 - length is counted in decoded Unicode scalar values, not UTF-8 bytes or UTF-16
   units: 613 `é` characters occupy 1,226 bytes but receive only the pattern
   error, and 613 supplementary characters occupy 2,452 bytes and 1,226 UTF-16
@@ -1858,7 +1879,10 @@ the deletion rather than allowing `ExpiredToken` to mask a stale live-role
 view.
 The long-running fixture is explicitly selected with
 `./scripts/aws-sts-oracle --expiry`; ordinary `--assume-role` runs do not wait
-through the minimum session lifetime.
+through the minimum session lifetime. The specialized
+`--disabled-credential` option also waits for and consumes a real expired-token
+fixture for its inactive-key collisions, but does not run the ordinary expiry
+suite.
 
 Complete goldens establish that the expired-and-deleted session returns STS
 HTTP 403 `ExpiredToken` with exactly `The security token included in the
@@ -1945,6 +1969,50 @@ expired, independently live, or malformed, and when the expired uncovered
 header is present without any query token. Each case is pinned with correct and
 bad HMACs. The separately established scope matrix places presigned scope
 validation before this coverage error.
+
+The disabled long-lived credential slice completed on 2026-07-19. The fixture
+creates a unique permissionless IAM user and one access key rather than
+deactivating either persistent test credential. Before changing its status, it
+requires three consecutive positive authentication results independently
+through STS, S3 header auth, presigned query auth, POST Object, and aws-chunked
+streaming, then compares a following control response to that mode's complete
+success or authorization-denial golden. After `UpdateAccessKey` changes only
+the new key to `Inactive`, each of those five modes must converge to three
+consecutive credential errors before collision assertions begin. This
+prevents IAM or service-specific propagation delay from making a negative
+probe pass for the wrong reason. Header and presigned additionally require
+their active authorization-denial and inactive `InvalidAccessKeyId` controls
+to converge on the exact virtual-hosted bucket endpoint used by their
+wrong-scope requests, followed in each state by a complete exact golden on
+that endpoint. The virtual-hosted inactive golden includes
+`x-amz-bucket-region`; the regional-root inactive golden does not.
+
+With correct scope, STS returns the exact HTTP 403 `InvalidClientTokenId`
+golden for the inactive key with no session token, an independently live role
+session token, or a genuinely expired role session token. Each result is
+unchanged with a deliberately bad HMAC. S3 header, presigned-query, POST
+Object, and aws-chunked authentication instead return their exact HTTP 403
+`InvalidAccessKeyId` golden for the same missing/live/expired token and HMAC
+matrix. An inactive stored credential is therefore rejected before HMAC
+comparison and before an otherwise selected token is opened, bound to the
+access key, or checked for expiry. This does not change the separately pinned
+post-signature unexpected-token behavior of an active static credential.
+
+Every mode's established wrong-region and wrong-service error wins over the
+inactive status for all three token cases with both valid and bad HMACs. The
+virtual-hosted active/inactive controls establish that this is scope-versus-
+status precedence on the same header and presigned request path, not a
+credential propagation difference between regional-root and bucket endpoints.
+The outer mode-specific checks retain their earlier precedence too: a present
+but unsigned token header on presigned and streaming requests returns
+`HeadersNotSigned`, while any HTTP token header on POST Object selects the
+non-POST route and returns `No AWSAccessKey was presented.` These are coverage
+or route-selection failures, not successful selection of a session credential.
+The resulting implementation order is mode-specific outer routing/coverage
+and scope validation, inactive stored-credential rejection, HMAC comparison,
+then the active-static unexpected-token rule where applicable; temporary
+credentials continue through their separately pinned token/open/expiry/
+liveness pipeline.
 
 During this slice, one newly created role produced one successful STS
 assumption followed immediately by `AccessDenied` for the same request. The
@@ -2453,21 +2521,7 @@ body may appear in traces.
 
 1. Which existing identity/policy types can be generalized without making S3
    bucket-policy code less explicit?
-2. What is the exact AWS precedence among wrong token, missing token, wrong
-   region/service, disabled credential, and expired session? The core header,
-   presigned, POST Object, and streaming token/signature collisions are pinned;
-   STS, S3 header, S3 presigned-query, and S3 POST Object region/service
-   collisions are now pinned separately, as are streaming region/service
-   collisions. Expiry versus issuer deletion is pinned independently for STS
-   and every initial S3 mode. STS and all four initial S3 modes now pin expiry
-   collisions with missing, mismatched, and wrong-scope inputs; the four S3
-   modes additionally pin empty, malformed, identical-duplicate, and
-   conflicting-duplicate inputs in their primary token locations. Disabled-
-   credential collisions are not yet pinned. Presigned signed-header
-   authentication, scope, and expiry collisions are pinned; present unsigned
-   token headers are pinned as coverage failures rather than credential
-   locations.
-3. Should the first standalone UAT role be injected through a dedicated
+2. Should the first standalone UAT role be injected through a dedicated
    test-only constructor/config object or through explicitly UAT-only
    environment variables?
 

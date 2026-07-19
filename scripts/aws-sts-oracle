@@ -18,6 +18,10 @@ test user.
 Options:
   --assume-role     Include the self-cleaning same-account role probes
   --expiry          Include the 15-minute expiry/deleted-issuer probes
+  --disabled-credential
+                     Create and consume a real expired-token fixture for a
+                     self-cleaning, permissionless IAM-user access-key
+                     deactivation matrix; does not run the ordinary expiry suite
   --cross-account   Also include cross-account success and denial probes
   --region REGION   Override the STS signing region (default: TEST_S3_REGION or us-east-1)
   --endpoint URL    Override the regional STS endpoint
@@ -32,6 +36,7 @@ Examples:
   ./scripts/aws-sts-oracle
   ./scripts/aws-sts-oracle --assume-role
   ./scripts/aws-sts-oracle --expiry
+  ./scripts/aws-sts-oracle --disabled-credential
   ./scripts/aws-sts-oracle --cross-account
 EOF
 }
@@ -45,6 +50,7 @@ require_https_endpoint() {
 
 assume_role=false
 cross_account=false
+disabled_credential=false
 expiry_collision=false
 region=""
 endpoint=""
@@ -61,6 +67,12 @@ while (($#)); do
         --expiry)
             assume_role=true
             expiry_collision=true
+            shift
+            ;;
+        --disabled-credential)
+            assume_role=true
+            expiry_collision=true
+            disabled_credential=true
             shift
             ;;
         --cross-account)
@@ -558,6 +570,8 @@ wait_for_get_bucket_tagging_denied() {
 }
 
 declare -a created_role_names=()
+created_disabled_access_key=""
+created_disabled_user=""
 created_bucket=""
 tmpdir=""
 
@@ -566,6 +580,22 @@ cleanup_assume_role_fixture() {
     trap - EXIT
 
     local inline_policies_file policy_name role_name
+    if [[ -n "$created_disabled_access_key" && -n "$created_disabled_user" ]]; then
+        if ! aws_primary iam delete-access-key \
+            --user-name "$created_disabled_user" \
+            --access-key-id "$created_disabled_access_key"; then
+            echo "error: failed to delete temporary disabled-credential access key from $created_disabled_user" >&2
+            ((status != 0)) || status=1
+        fi
+        created_disabled_access_key=""
+    fi
+    if [[ -n "$created_disabled_user" ]]; then
+        if ! aws_primary iam delete-user --user-name "$created_disabled_user"; then
+            echo "error: failed to delete temporary disabled-credential user $created_disabled_user" >&2
+            ((status != 0)) || status=1
+        fi
+        created_disabled_user=""
+    fi
     for role_name in "${created_role_names[@]}"; do
         inline_policies_file="$tmpdir/cleanup-${role_name}-inline-policies.json"
         if aws_primary iam list-role-policies \
@@ -1858,12 +1888,59 @@ create_cross_account_role_fixtures() {
         "$STS_TEST_CROSS_TRUST_DENIED_ROLE_ARN"
 }
 
+create_disabled_credential_fixture() {
+    local access_key_fixture expected_user_arn primary_account role_suffix user_fixture
+    primary_account="$TEST_AWS_PRIMARY_ACCOUNT_ID"
+    role_suffix="${tmpdir##*/}"
+    role_suffix="${role_suffix#tmp.}"
+    role_suffix="${role_suffix,,}"
+    export STS_TEST_DISABLED_USER_NAME="disabled-credential-${role_suffix}"
+    expected_user_arn="arn:aws:iam::${primary_account}:user/argmin-sts-oracle/${STS_TEST_DISABLED_USER_NAME}"
+
+    user_fixture="$tmpdir/disabled-credential-user.json"
+    aws_primary iam create-user \
+        --user-name "$STS_TEST_DISABLED_USER_NAME" \
+        --path /argmin-sts-oracle/ \
+        --output json >"$user_fixture"
+    created_disabled_user="$STS_TEST_DISABLED_USER_NAME"
+    export STS_TEST_DISABLED_USER_ARN
+    STS_TEST_DISABLED_USER_ARN="$(jq -er '.User.Arn' "$user_fixture")"
+    [[ "$STS_TEST_DISABLED_USER_ARN" == "$expected_user_arn" ]] || \
+        external_s3_test_die "temporary disabled-credential user has an unexpected ARN"
+
+    access_key_fixture="$tmpdir/disabled-credential-access-key.json"
+    aws_primary iam create-access-key \
+        --user-name "$STS_TEST_DISABLED_USER_NAME" \
+        --output json >"$access_key_fixture"
+    export STS_TEST_DISABLED_ACCESS_KEY STS_TEST_DISABLED_SECRET_KEY
+    STS_TEST_DISABLED_ACCESS_KEY="$(jq -er '.AccessKey.AccessKeyId' "$access_key_fixture")"
+    STS_TEST_DISABLED_SECRET_KEY="$(jq -er '.AccessKey.SecretAccessKey' "$access_key_fixture")"
+    created_disabled_access_key="$STS_TEST_DISABLED_ACCESS_KEY"
+    [[ "$(jq -er '.AccessKey.Status' "$access_key_fixture")" == Active ]] || \
+        external_s3_test_die "temporary disabled-credential access key was not created active"
+    echo "disabled-credential-user-fixture: ok"
+
+    local -a active_cmd=(cargo run -p sts-tests --bin sts_oracle)
+    external_s3_test_print_command "AWS disabled-credential active controls" "${active_cmd[@]}"
+    STS_TEST_DISABLED_CREDENTIAL_STAGE=active "${active_cmd[@]}"
+
+    aws_primary iam update-access-key \
+        --user-name "$STS_TEST_DISABLED_USER_NAME" \
+        --access-key-id "$STS_TEST_DISABLED_ACCESS_KEY" \
+        --status Inactive
+    export STS_TEST_DISABLED_CREDENTIAL_STAGE=inactive
+    echo "disabled-credential-access-key-inactive: ok"
+}
+
 if [[ "$assume_role" == true ]]; then
     trap cleanup_assume_role_fixture EXIT
     create_assume_role_fixture
 fi
 if [[ "$cross_account" == true ]]; then
     create_cross_account_role_fixtures
+fi
+if [[ "$disabled_credential" == true ]]; then
+    create_disabled_credential_fixture
 fi
 
 cmd=(cargo run -p sts-tests --bin sts_oracle)

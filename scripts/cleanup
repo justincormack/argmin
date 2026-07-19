@@ -10,15 +10,15 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/cleanup [options]
 
-Delete leftover AWS-backed test buckets and stale STS oracle roles using the
-primary credentials from `.env` (`TEST_AWS_PRIMARY_ACCESS_KEY` /
-`TEST_AWS_PRIMARY_SECRET_KEY`).
+Delete leftover AWS-backed test buckets, stale STS oracle roles, and stale
+permissionless STS oracle users using the primary credentials from `.env`
+(`TEST_AWS_PRIMARY_ACCESS_KEY` / `TEST_AWS_PRIMARY_SECRET_KEY`).
 
 Options:
   --region REGION                 Override AWS region for API calls (default: TEST_S3_REGION or us-east-1)
   --endpoint URL                  Override the S3 endpoint URL (default: TEST_S3_ENDPOINT if set)
   --bucket-prefix PREFIX          Only clean buckets with this prefix (default: TEST_S3_BUCKET_PREFIX or claude-s3-)
-  --sts-role-min-age-seconds N    Only delete matching roles at least N seconds old (default: 3600)
+  --sts-role-min-age-seconds N    Only delete matching STS fixtures at least N seconds old (default: 3600)
   --dotenv PATH                   Read AWS variables from a different env file
   -h, --help                      Show this help
 
@@ -187,6 +187,76 @@ cleanup_stale_sts_oracle_roles() {
   done < "$roles_rows"
 }
 
+cleanup_stale_sts_oracle_users() {
+  local access_key_id access_keys_file age_seconds created_at created_epoch list_error now_epoch user user_count user_name user_path users_file users_rows
+
+  users_file="$tmpdir/sts-oracle-users.json"
+  users_rows="$tmpdir/sts-oracle-user-rows.txt"
+  list_error="$tmpdir/sts-oracle-list-users.err"
+  if ! aws iam list-users \
+    --path-prefix /argmin-sts-oracle/ \
+    --output json > "$users_file" 2> "$list_error"; then
+    echo "Failed to list stale STS oracle users; continuing role and bucket cleanup" >&2
+    cat "$list_error" >&2
+    failed=1
+    return
+  fi
+  jq -r \
+    '.Users[] | select(
+        .Path == "/argmin-sts-oracle/" and
+        (.UserName | startswith("disabled-credential-"))
+    ) | @base64' \
+    "$users_file" > "$users_rows"
+
+  user_count=$(grep -c . "$users_rows" 2>/dev/null || true)
+  echo "$user_count STS oracle users found..."
+  now_epoch=$(date +%s)
+
+  while IFS= read -r user; do
+    [[ -n "$user" ]] || continue
+    user=$(printf '%s' "$user" | base64 -d)
+    user_name=$(jq -er '.UserName' <<<"$user")
+    user_path=$(jq -er '.Path' <<<"$user")
+    created_at=$(jq -er '.CreateDate' <<<"$user")
+
+    case "$user_path:$user_name" in
+      /argmin-sts-oracle/:disabled-credential-*) ;;
+      *) continue ;;
+    esac
+    created_epoch=$(date -d "$created_at" +%s)
+    age_seconds=$((now_epoch - created_epoch))
+    if ((age_seconds < sts_role_min_age_seconds)); then
+      echo "Kept recent STS oracle user $user_name (${age_seconds}s old)"
+      continue
+    fi
+
+    access_keys_file="$tmpdir/sts-oracle-${user_name}-access-keys.json"
+    if ! aws iam list-access-keys \
+      --user-name "$user_name" \
+      --output json > "$access_keys_file"; then
+      echo "Failed to list access keys for stale STS oracle user $user_name" >&2
+      failed=1
+      continue
+    fi
+    while IFS= read -r access_key_id; do
+      [[ -n "$access_key_id" ]] || continue
+      if ! aws iam delete-access-key \
+        --user-name "$user_name" \
+        --access-key-id "$access_key_id"; then
+        echo "Failed to delete access key $access_key_id from stale STS oracle user $user_name" >&2
+        failed=1
+      fi
+    done < <(jq -r '.AccessKeyMetadata[].AccessKeyId' "$access_keys_file")
+
+    if aws iam delete-user --user-name "$user_name"; then
+      echo "Deleted stale STS oracle user $user_name"
+    else
+      echo "Failed to delete stale STS oracle user $user_name" >&2
+      failed=1
+    fi
+  done < "$users_rows"
+}
+
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
 
@@ -280,6 +350,7 @@ aws_s3api list-buckets --query 'Buckets[].Name' --output text \
 echo "$(grep -c . "$bucketlist" 2>/dev/null || true) buckets to go..."
 
 failed=0
+cleanup_stale_sts_oracle_users
 cleanup_stale_sts_oracle_roles
 
 for bucket in $(head -100 "$bucketlist")
