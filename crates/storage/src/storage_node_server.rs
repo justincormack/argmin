@@ -301,6 +301,7 @@ use crate::types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
 };
+use crate::BucketPgId;
 use crate::{
     BucketName, EcShape, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey,
     ShardLocation,
@@ -4755,7 +4756,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::release_metadata_command_bucket_write_reservation(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.proof,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
@@ -4817,7 +4818,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             DurableBucketWriteReservationAcquire {
                 name: &request.bucket,
                 reservation_id: &request.reservation_id,
@@ -4878,7 +4879,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.proof,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
@@ -4905,7 +4906,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.proof,
             request.lease_deadline,
         ) {
@@ -4942,7 +4943,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.record,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
@@ -4971,7 +4972,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
             &local_client,
-            request.bucket.pg_id,
+            self.validated_bucket_metadata_pg(request.bucket.pg_id),
             &request.bucket.bucket,
             &request.drain_id,
             &request.owner_token,
@@ -5022,7 +5023,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.record,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
@@ -5051,7 +5052,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
             &local_client,
-            request.bucket.pg_id,
+            self.validated_bucket_metadata_pg(request.bucket.pg_id),
             &request.bucket.bucket,
             request.now,
         ) {
@@ -5084,7 +5085,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_drain(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.record,
             request.lease_deadline,
         ) {
@@ -5121,7 +5122,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.bucket,
         ) {
             Ok(value) => {
@@ -5154,7 +5155,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::durable_bucket_write_drain(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.bucket,
         ) {
             Ok(record) => {
@@ -5186,7 +5187,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::record_bucket_delete_attempt_outcome(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.record,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
@@ -5213,7 +5214,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::bucket_delete_attempt_outcome(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.bucket,
         ) {
             Ok(record) => {
@@ -5245,7 +5246,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::durable_bucket_write_reservations(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.bucket,
         ) {
             Ok(records) => {
@@ -5275,7 +5276,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::get_bucket_delete_finalize_roots(
             &local_client,
-            request.route.pg_id,
+            self.validated_bucket_metadata_pg(request.route.pg_id),
             request.now,
             request.limit,
         ) {
@@ -5308,7 +5309,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
             &local_client,
-            request.route.pg_id,
+            self.validated_bucket_metadata_pg(request.route.pg_id),
             request.now,
             request.start_after_bucket.as_ref(),
             request.limit,
@@ -5344,7 +5345,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
             &local_client,
-            request.bucket.pg_id,
+            self.validated_bucket_metadata_pg(request.bucket.pg_id),
             &request.bucket.bucket,
             request.bucket_incarnation_generation,
             &request.claim_id,
@@ -5383,7 +5384,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::bucket_delete_finalize_claim(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.bucket,
         ) {
             Ok(record) => {
@@ -5417,7 +5418,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.record,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
@@ -5440,7 +5441,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::list_lifecycle_sweep_buckets(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
         ) {
             Ok(buckets) => {
                 let payload = encode_lifecycle_sweep_buckets_response(
@@ -5467,7 +5468,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::get_lifecycle_sweep_roots(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             request.now,
             request.limit,
         ) {
@@ -5502,7 +5503,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
             &local_client,
-            request.bucket.pg_id,
+            self.validated_bucket_metadata_pg(request.bucket.pg_id),
             &request.bucket.bucket,
             request.bucket_incarnation_generation,
             &request.claim_id,
@@ -5535,7 +5536,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
             &local_client,
-            request.record.pg_id,
+            self.validated_bucket_metadata_pg(request.record.pg_id),
             &request.record.claim,
             request.heartbeat_at,
             request.lease_deadline,
@@ -5562,7 +5563,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
             &local_client,
-            request.record.pg_id,
+            self.validated_bucket_metadata_pg(request.record.pg_id),
             &request.record.claim,
             &request.last_error,
         ) {
@@ -5588,7 +5589,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
             &local_client,
-            request.pg_id,
+            self.validated_bucket_metadata_pg(request.pg_id),
             &request.claim,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
@@ -11410,6 +11411,12 @@ impl StorageNodeConnectionHandler {
             });
         }
         Ok(())
+    }
+
+    fn validated_bucket_metadata_pg(&self, pg_id: PgId) -> BucketPgId {
+        self.node
+            .bucket_metadata_pg(pg_id)
+            .expect("validated bucket metadata PG must belong to the installed topology")
     }
 
     fn validate_primary_pg_for_bucket(

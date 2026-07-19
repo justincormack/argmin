@@ -159,37 +159,37 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
 pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
     fn durable_bucket_write_drain_exists(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError>;
 
     fn durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
 
     fn record_bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketDeleteAttemptOutcomeRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError>;
 
     fn acquire_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
     fn acquire_completion_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         self.acquire_durable_bucket_write_reservation(pg_id, acquire)
@@ -197,26 +197,26 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 
     fn validate_bucket_write_reservation_proof(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn release_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteReservationRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn release_metadata_command_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn begin_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         drain_id: &str,
         owner_token: &str,
@@ -227,47 +227,47 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 
     fn clear_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn clear_expired_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         now: u64,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
 
     fn heartbeat_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
         lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
 
     fn durable_bucket_write_reservations(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
 
     fn heartbeat_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
     fn get_bucket_delete_finalize_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError>;
 
     fn get_bucket_delete_begin_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         start_after_bucket: Option<&BucketName>,
         limit: usize,
@@ -276,7 +276,7 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn acquire_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -289,32 +289,32 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 
     fn release_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
 
     fn get_lifecycle_sweep_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError>;
 
     fn list_lifecycle_sweep_buckets(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
     ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -327,7 +327,7 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 
     fn heartbeat_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         heartbeat_at: u64,
         lease_deadline: Option<u64>,
@@ -335,14 +335,14 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 
     fn record_lifecycle_sweep_claim_error(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError>;
 
     fn release_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 }
@@ -1386,56 +1386,56 @@ pub(crate) trait StorageNodeClient:
 {
     fn durable_bucket_write_drain_exists(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError>;
 
     fn durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
 
     fn record_bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketDeleteAttemptOutcomeRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError>;
 
     fn acquire_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
     fn validate_bucket_write_reservation_proof(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &crate::BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn release_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteReservationRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn release_metadata_command_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &crate::BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn begin_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         drain_id: &str,
         owner_token: &str,
@@ -1446,33 +1446,33 @@ pub(crate) trait StorageNodeClient:
 
     fn clear_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn clear_expired_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         now: u64,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
 
     fn heartbeat_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
         lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
 
     fn durable_bucket_write_reservations(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError>;
 
     fn heartbeat_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &crate::BucketWriteReservationProof,
         lease_deadline: u64,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
@@ -1934,14 +1934,14 @@ pub(crate) trait StorageNodeClient:
 
     fn get_bucket_delete_finalize_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError>;
 
     fn get_bucket_delete_begin_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         start_after_bucket: Option<&BucketName>,
         limit: usize,
@@ -1950,7 +1950,7 @@ pub(crate) trait StorageNodeClient:
     #[allow(clippy::too_many_arguments)]
     fn acquire_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -1963,32 +1963,32 @@ pub(crate) trait StorageNodeClient:
 
     fn release_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
     fn bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
 
     fn get_lifecycle_sweep_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError>;
 
     fn list_lifecycle_sweep_buckets(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
     ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -2001,7 +2001,7 @@ pub(crate) trait StorageNodeClient:
 
     fn heartbeat_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         heartbeat_at: u64,
         lease_deadline: Option<u64>,
@@ -2009,14 +2009,14 @@ pub(crate) trait StorageNodeClient:
 
     fn record_lifecycle_sweep_claim_error(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError>;
 
     fn release_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 

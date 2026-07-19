@@ -786,7 +786,7 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
 impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
     fn durable_bucket_write_drain_exists(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::durable_bucket_write_drain_exists(self, pg_id, bucket)
@@ -794,7 +794,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::durable_bucket_write_drain(self, pg_id, bucket)
@@ -802,7 +802,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn record_bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketDeleteAttemptOutcomeRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::record_bucket_delete_attempt_outcome(self, pg_id, record)
@@ -810,7 +810,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::bucket_delete_attempt_outcome(self, pg_id, bucket)
@@ -818,7 +818,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn acquire_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::acquire_durable_bucket_write_reservation(self, pg_id, acquire)
@@ -826,7 +826,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn validate_bucket_write_reservation_proof(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::validate_bucket_write_reservation_proof(self, pg_id, proof)
@@ -834,7 +834,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn release_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteReservationRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::release_durable_bucket_write_reservation(self, pg_id, record)
@@ -842,7 +842,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn release_metadata_command_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::release_metadata_command_bucket_write_reservation(
@@ -852,7 +852,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn begin_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         drain_id: &str,
         owner_token: &str,
@@ -874,7 +874,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn clear_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::clear_durable_bucket_write_drain(self, pg_id, record)
@@ -882,7 +882,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn clear_expired_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         now: u64,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
@@ -893,7 +893,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn heartbeat_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
         lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
@@ -907,7 +907,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn durable_bucket_write_reservations(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::durable_bucket_write_reservations(self, pg_id, bucket)
@@ -915,7 +915,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn heartbeat_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
@@ -929,7 +929,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn get_bucket_delete_finalize_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError> {
@@ -938,7 +938,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn get_bucket_delete_begin_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         start_after_bucket: Option<&BucketName>,
         limit: usize,
@@ -954,7 +954,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn acquire_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -980,7 +980,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn release_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::release_bucket_delete_finalize_claim(self, pg_id, claim)
@@ -988,7 +988,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::bucket_delete_finalize_claim(self, pg_id, bucket)
@@ -996,7 +996,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn get_lifecycle_sweep_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError> {
@@ -1005,14 +1005,14 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn list_lifecycle_sweep_buckets(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
     ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::list_lifecycle_sweep_buckets(self, pg_id)
     }
 
     fn acquire_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -1038,7 +1038,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn heartbeat_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         heartbeat_at: u64,
         lease_deadline: Option<u64>,
@@ -1054,7 +1054,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn record_lifecycle_sweep_claim_error(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
@@ -1065,7 +1065,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 
     fn release_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::release_lifecycle_sweep_claim(self, pg_id, claim)
@@ -1688,7 +1688,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
     }
     fn durable_bucket_write_drain_exists(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1697,7 +1697,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1706,7 +1706,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn record_bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketDeleteAttemptOutcomeRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1717,7 +1717,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1728,7 +1728,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn acquire_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1739,7 +1739,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn validate_bucket_write_reservation_proof(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &crate::BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1781,7 +1781,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn release_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteReservationRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1792,7 +1792,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn release_metadata_command_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &crate::BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1813,7 +1813,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn begin_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         drain_id: &str,
         owner_token: &str,
@@ -1835,7 +1835,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn clear_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1852,7 +1852,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn clear_expired_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         now: u64,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
@@ -1864,7 +1864,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn heartbeat_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
         lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
@@ -1883,7 +1883,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn durable_bucket_write_reservations(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1894,7 +1894,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn heartbeat_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &crate::BucketWriteReservationProof,
         lease_deadline: u64,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
@@ -2033,7 +2033,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         }
         <Self as StorageNodeClient>::validate_bucket_write_reservation_proof(
             self,
-            pg_id.pg_id(),
+            pg_id,
             bucket_write_reservation,
         )?;
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -3797,7 +3797,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn get_bucket_delete_finalize_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError> {
@@ -3809,7 +3809,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn get_bucket_delete_begin_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         start_after_bucket: Option<&BucketName>,
         limit: usize,
@@ -3825,7 +3825,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn acquire_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -3851,7 +3851,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn release_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -3867,7 +3867,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         _bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -3876,7 +3876,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn get_lifecycle_sweep_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError> {
@@ -3888,7 +3888,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn list_lifecycle_sweep_buckets(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
     ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(LifecycleSweepBuckets {
@@ -3899,7 +3899,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn acquire_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -3925,7 +3925,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn heartbeat_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         heartbeat_at: u64,
         lease_deadline: Option<u64>,
@@ -3945,7 +3945,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn record_lifecycle_sweep_claim_error(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
@@ -3963,7 +3963,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn release_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;

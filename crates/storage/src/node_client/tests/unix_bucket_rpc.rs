@@ -1,5 +1,9 @@
 use super::*;
 
+fn bucket_pg_id_for_test(pg_id: u32) -> BucketPgId {
+    BucketPgId::new_for_test(PgId::new(pg_id))
+}
+
 #[test]
 fn unix_object_list_response_requires_truncated_marker_identity() {
     let client = test_unix_storage_node_client();
@@ -1044,7 +1048,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
     let lease_deadline = crate::clock::current_time_millis().saturating_add(60_000);
     let record = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
             name: &bucket,
             reservation_id: "reservation-remote-1",
@@ -1062,7 +1066,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
 
     BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &BucketWriteReservationProof::from(&record),
     )
     .unwrap();
@@ -1070,7 +1074,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
     conflicting_proof.owner_token = "wrong-owner-token".to_string();
     let conflict = BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &conflicting_proof,
     )
     .unwrap_err();
@@ -1083,7 +1087,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
     let renewed_deadline = lease_deadline.saturating_add(60_000);
     let renewed = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &BucketWriteReservationProof::from(&record),
         renewed_deadline,
     )
@@ -1091,7 +1095,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
     assert_eq!(renewed.lease_deadline, renewed_deadline);
     BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &renewed,
     )
     .unwrap();
@@ -1176,20 +1180,20 @@ fn unix_bucket_write_reservation_identity_uses_current_route_after_epoch_change(
     let proof = BucketWriteReservationProof::from(&record);
     BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &proof,
     )
     .unwrap();
     let renewed = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &proof,
         lease_deadline.saturating_add(60_000),
     )
     .unwrap();
     BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &renewed,
     )
     .unwrap();
@@ -1260,7 +1264,7 @@ fn unix_bucket_write_reservation_client_preserves_draining_signal() {
 
     let err = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
             name: &bucket,
             reservation_id: "reservation-remote-1",
@@ -1296,7 +1300,7 @@ fn unix_bucket_write_reservation_client_preserves_bucket_not_found() {
 
     let err = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
             name: &bucket,
             reservation_id: "reservation-remote-1",
@@ -1389,7 +1393,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
 
     let reservations = BucketWriteReservationNodeClient::durable_bucket_write_reservations(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &bucket,
     )
     .unwrap();
@@ -1398,7 +1402,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
 
     let drain = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &bucket,
         "drain-rpc-1",
         "drain-owner-rpc-1",
@@ -1412,7 +1416,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     assert!(
         BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
             &client,
-            PgId::new(0),
+            bucket_pg_id_for_test(0),
             &bucket,
         )
         .unwrap()
@@ -1420,7 +1424,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     assert_eq!(
         BucketWriteReservationNodeClient::durable_bucket_write_drain(
             &client,
-            PgId::new(0),
+            bucket_pg_id_for_test(0),
             &bucket,
         )
         .unwrap()
@@ -1430,14 +1434,14 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     );
     BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &drain,
     )
     .unwrap();
     assert!(
         !BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
             &client,
-            PgId::new(0),
+            bucket_pg_id_for_test(0),
             &bucket,
         )
         .unwrap()
@@ -1445,7 +1449,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     assert!(
         BucketWriteReservationNodeClient::durable_bucket_write_drain(
             &client,
-            PgId::new(0),
+            bucket_pg_id_for_test(0),
             &bucket,
         )
         .unwrap()
@@ -1454,7 +1458,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
 
     BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &bucket,
         "expired-drain-rpc-1",
         "expired-drain-owner-rpc-1",
@@ -1465,7 +1469,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     .unwrap();
     let expired = BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &bucket,
         60,
     )
@@ -1475,7 +1479,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
 
     let live_begin_drain = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &bucket,
         "active-begin-drain-rpc-1",
         "active-begin-drain-owner-rpc-1",
@@ -1486,7 +1490,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     .unwrap();
     let begin_roots = BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         90,
         None,
         16,
@@ -1495,14 +1499,14 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     assert!(begin_roots.is_empty());
     BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &live_begin_drain,
     )
     .unwrap();
 
     let expired_begin_drain = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &bucket,
         "expired-begin-drain-rpc-1",
         "expired-begin-drain-owner-rpc-1",
@@ -1513,7 +1517,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     .unwrap();
     let begin_roots = BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         90,
         None,
         16,
@@ -1523,14 +1527,14 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     assert_eq!(begin_roots[0].bucket, bucket);
     BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &expired_begin_drain,
     )
     .unwrap();
 
     let claim = BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &finalize_bucket,
         finalize_bucket_incarnation_generation,
         "finalize-claim-rpc-1",
@@ -1546,7 +1550,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     assert_eq!(claim.claim_id, "finalize-claim-rpc-1");
     let replacement_claim = BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &finalize_bucket,
         finalize_bucket_incarnation_generation,
         "finalize-claim-rpc-2",
@@ -1560,7 +1564,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     .expect("expired finalizer claim should be stealable");
     let observed_claim = BucketWriteReservationNodeClient::bucket_delete_finalize_claim(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &finalize_bucket,
     )
     .unwrap()
@@ -1573,7 +1577,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     );
     let stale_release = BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &claim,
     )
     .unwrap_err();
@@ -1583,14 +1587,14 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     ));
     BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &replacement_claim,
     )
     .unwrap();
     assert!(
         BucketWriteReservationNodeClient::bucket_delete_finalize_claim(
             &client,
-            PgId::new(0),
+            bucket_pg_id_for_test(0),
             &finalize_bucket,
         )
         .unwrap()
@@ -1599,7 +1603,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
 
     let roots = BucketWriteReservationNodeClient::get_bucket_delete_finalize_roots(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         90,
         16,
     )
@@ -1666,16 +1670,22 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
         config.socket_path.clone(),
     );
 
-    let buckets =
-        BucketWriteReservationNodeClient::list_lifecycle_sweep_buckets(&client, PgId::new(0))
-            .unwrap();
+    let buckets = BucketWriteReservationNodeClient::list_lifecycle_sweep_buckets(
+        &client,
+        bucket_pg_id_for_test(0),
+    )
+    .unwrap();
     assert_eq!(buckets.lifecycle_buckets.len(), 1);
     assert_eq!(buckets.lifecycle_buckets[0].name, bucket);
     assert!(buckets.aborting_buckets.is_empty());
 
-    let roots =
-        BucketWriteReservationNodeClient::get_lifecycle_sweep_roots(&client, PgId::new(0), 10, 16)
-            .unwrap();
+    let roots = BucketWriteReservationNodeClient::get_lifecycle_sweep_roots(
+        &client,
+        bucket_pg_id_for_test(0),
+        10,
+        16,
+    )
+    .unwrap();
     assert_eq!(roots.len(), 1);
     assert_eq!(roots[0].bucket, bucket);
     assert_eq!(
@@ -1685,7 +1695,7 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
 
     let claim = BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &bucket,
         bucket_incarnation_generation,
         "lifecycle-claim-rpc-1",
@@ -1702,7 +1712,7 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
 
     let heartbeat = BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &claim,
         30,
         Some(50),
@@ -1713,7 +1723,7 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
 
     let error_record = BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &heartbeat,
         "transient lifecycle error",
     )
@@ -1725,7 +1735,7 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
 
     BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
         &client,
-        PgId::new(0),
+        bucket_pg_id_for_test(0),
         &error_record,
     )
     .unwrap();
@@ -2192,7 +2202,7 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
 
     client
         .release_metadata_command_bucket_write_reservation(
-            PgId::new(0),
+            bucket_pg_id_for_test(0),
             &BucketWriteReservationProof::from(&reservation),
         )
         .unwrap();
@@ -2202,7 +2212,7 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
     let server_thread = thread::spawn(move || server.accept_one().unwrap());
     client
         .release_metadata_command_bucket_write_reservation(
-            PgId::new(0),
+            bucket_pg_id_for_test(0),
             &BucketWriteReservationProof::from(&reservation),
         )
         .unwrap();
@@ -2275,7 +2285,7 @@ fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
     let mut proof = BucketWriteReservationProof::from(&reservation);
     proof.owner_token = "wrong-owner-token".to_string();
     let err = client
-        .release_metadata_command_bucket_write_reservation(PgId::new(0), &proof)
+        .release_metadata_command_bucket_write_reservation(bucket_pg_id_for_test(0), &proof)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -2300,7 +2310,7 @@ fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
 }
 
 #[test]
-fn unix_bucket_metadata_client_rejects_wrong_bucket_pg_for_head_and_create_build() {
+fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);
     config.pg_ids = vec![0, 1];
@@ -2322,7 +2332,7 @@ fn unix_bucket_metadata_client_rejects_wrong_bucket_pg_for_head_and_create_build
     ];
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
-    let (bucket, wrong_pg_id) = {
+    let (bucket, correct_pg_id, wrong_pg_id) = {
         let node = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
             &config.pg_ids,
@@ -2341,12 +2351,16 @@ fn unix_bucket_metadata_client_rejects_wrong_bucket_pg_for_head_and_create_build
         PgMetadataStore::create_bucket(&*pg, &bucket, "owner", &owner, &acl_grants, false, false)
             .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
-        (bucket, if correct_pg_id == 0 { 1 } else { 0 })
+        (
+            bucket,
+            correct_pg_id,
+            if correct_pg_id == 0 { 1 } else { 0 },
+        )
     };
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..2)
+    let server_threads: Vec<_> = (0..3)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2397,8 +2411,49 @@ fn unix_bucket_metadata_client_rejects_wrong_bucket_pg_for_head_and_create_build
         BucketSnapshotLoadError::Store(StoreError::StorageRpc { .. })
     ));
 
+    let reservation_error =
+        BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
+            &client,
+            wrong_bucket_pg,
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "wrong-pg-reservation",
+                owner_token: "wrong-pg-owner",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key"),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        reservation_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc { .. })
+    ));
+
     for thread in server_threads {
         thread.join().unwrap();
+    }
+
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    for pg_id in [correct_pg_id, wrong_pg_id] {
+        let pg = node.get_pg(pg_id).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                "wrong-pg-reservation",
+            )
+            .unwrap()
+            .is_none(),
+            "wrong-PG reservation must not mutate PG {pg_id}"
+        );
     }
 }
 
@@ -2480,7 +2535,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
 
     let err = client
         .release_metadata_command_bucket_write_reservation(
-            PgId::new(wrong_pg_id),
+            bucket_pg_id_for_test(wrong_pg_id),
             &BucketWriteReservationProof::from(&reservation),
         )
         .unwrap_err();
@@ -2565,7 +2620,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_on_non_primary() {
 
     let err = client
         .release_metadata_command_bucket_write_reservation(
-            PgId::new(0),
+            bucket_pg_id_for_test(0),
             &BucketWriteReservationProof::from(&reservation),
         )
         .unwrap_err();

@@ -5569,7 +5569,10 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
         node.bucket_write_reservation_client()
-            .validate_bucket_write_reservation_proof(PgId::new(pg_id), proof)
+            .validate_bucket_write_reservation_proof(
+                self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                proof,
+            )
     }
 
     fn release_metadata_command_bucket_write_reservation(
@@ -5635,7 +5638,10 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node_at_retained_epoch(proof.cluster_epoch, PgId::new(pg_id))?;
         node.bucket_write_reservation_client()
-            .release_metadata_command_bucket_write_reservation(PgId::new(pg_id), proof)?;
+            .release_metadata_command_bucket_write_reservation(
+                self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                proof,
+            )?;
         Ok(())
     }
 

@@ -545,7 +545,9 @@ bucket or object PG, and recovery/transfer operates on a PG before a request
 bucket/object identity exists. Those calls require a route capability and
 command/operation binding rather than a falsely specific PG-role wrapper.
 
-Implementation update (2026-07-19, first Phase 3 slice):
+Implementation updates (2026-07-19):
+
+First Phase 3 slice:
 
 - `BucketPgId` and `ObjectMetadataPgId` now live inside the private
   `node_runtime` boundary with private fields and no raw public or
@@ -566,9 +568,6 @@ Implementation update (2026-07-19, first Phase 3 slice):
 - an adversarial Unix regression uses the test-only constructor to submit a
   configured but wrong bucket PG and requires both head and create-command
   build to fail before node access.
-- `DataPgId` construction, the remaining object/data client signatures,
-  bucket reservation typing, and request-scoped route capability values remain
-  open in Phase 3.
 - review correction: the initial implementation incorrectly exposed role
   constructors on public `PgTopology`, which allowed an arbitrary singleton
   topology to mint either role. Those constructors were removed; external
@@ -577,6 +576,30 @@ Implementation update (2026-07-19, first Phase 3 slice):
 - the corrected slice passed the boundary checker, formatting, workspace-wide
   strict Clippy, the PG-backfill UAT build, the focused wrong-bucket-PG Unix
   regression, and the full workspace suite (7,106 tests).
+
+Second Phase 3 slice:
+
+- `BucketWriteReservationNodeClient` and its duplicate methods on the
+  transitional `StorageNodeClient` aggregate now require `BucketPgId`.
+  Cluster callers obtain the role from their installed runtime map after
+  selecting the existing active or retained route. The Unix adapter erases
+  the role only into raw RPC route evidence, and the server reconstructs it
+  only after the applicable existing route, primary, and bucket-placement
+  checks pass.
+- this role conversion deliberately does not collapse active new-work
+  authority and retained cleanup/recovery authority. Acquire, heartbeat,
+  release, drain recovery, delete-finalizer, and lifecycle-sweep operations
+  preserve their previous route-validation modes; the later request-scoped
+  capability slice must make those modes distinct in the type system.
+- the adversarial Unix regression now also submits a test-forged, configured
+  but wrong bucket PG to reservation acquire, requires failure, and verifies
+  that neither the correct nor wrong PG gained a reservation. Existing
+  retained proof-release wrong-PG and non-primary regressions remain in place.
+- the second slice passed the focused active/retained Unix regressions, the
+  boundary checker, formatting, workspace-wide strict Clippy, and the full
+  workspace suite (7,126 tests).
+- `DataPgId` construction, the remaining object/data client signatures, and
+  request-scoped route capability values remain open in Phase 3.
 
 ### Phase 4 — type metadata-command publication
 

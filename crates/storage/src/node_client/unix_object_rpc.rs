@@ -246,14 +246,14 @@ pub(super) fn validate_list_multipart_uploads_response(
 
 fn unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
     client: &UnixStorageNodeClient,
-    pg_id: PgId,
+    pg_id: BucketPgId,
     acquire: DurableBucketWriteReservationAcquire<'_>,
     class: UnixStorageNodeRpcAdmissionClass,
 ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
     let request = StorageRpcBucketWriteReservationAcquireRequest {
         node_id: client.node_id,
         cluster_epoch: acquire.cluster_epoch,
-        pg_id,
+        pg_id: pg_id.pg_id(),
         bucket: acquire.name.clone(),
         reservation_id: acquire.reservation_id.to_string(),
         owner_token: acquire.owner_token.to_string(),
@@ -322,13 +322,13 @@ fn unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_cla
 impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     fn durable_bucket_write_drain_exists(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError> {
         let request = StorageRpcBucketRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             bucket: bucket.clone(),
         };
         let payload = encode_bucket_request(&request);
@@ -346,13 +346,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
         let request = StorageRpcBucketRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             bucket: bucket.clone(),
         };
         let payload = encode_bucket_request(&request);
@@ -381,13 +381,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn record_bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketDeleteAttemptOutcomeRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcBucketDeleteAttemptOutcomeRecordRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             record: record.clone(),
         };
         let payload =
@@ -407,13 +407,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn bucket_delete_attempt_outcome(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError> {
         let request = StorageRpcBucketRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             bucket: bucket.clone(),
         };
         let payload = encode_bucket_request(&request);
@@ -443,7 +443,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn acquire_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
@@ -456,7 +456,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn acquire_completion_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
@@ -468,13 +468,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     }
     fn validate_bucket_write_reservation_proof(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteReservationProofRequest {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             proof: proof.clone(),
         };
         let payload = encode_bucket_write_reservation_proof_request(&request).map_err(|error| {
@@ -495,14 +495,14 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn heartbeat_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
         lease_deadline: u64,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteReservationHeartbeatRequest {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             proof: proof.clone(),
             lease_deadline,
         };
@@ -551,13 +551,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn release_durable_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteReservationRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteReservationRecordRequest {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             record: record.clone(),
         };
         let payload =
@@ -579,13 +579,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn release_metadata_command_bucket_write_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcProofReleaseRequest {
             node_id: self.node_id,
             route_cluster_epoch: proof.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             proof: proof.clone(),
         };
         let payload = encode_proof_release_request(&request).map_err(|error| {
@@ -601,7 +601,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn begin_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         drain_id: &str,
         owner_token: &str,
@@ -613,7 +613,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             bucket: StorageRpcBucketRequest {
                 node_id: self.node_id,
                 cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
             },
             drain_id: drain_id.to_string(),
@@ -664,13 +664,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn clear_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteDrainRecordRequest {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             record: record.clone(),
         };
         let payload =
@@ -691,7 +691,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn clear_expired_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         now: u64,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
@@ -699,7 +699,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             bucket: StorageRpcBucketRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
             },
             now,
@@ -734,14 +734,14 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn heartbeat_durable_bucket_write_drain(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         record: &BucketWriteDrainRecord,
         lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteDrainHeartbeatRequest {
             node_id: self.node_id,
             route_cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             record: record.clone(),
             lease_deadline,
         };
@@ -807,13 +807,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn durable_bucket_write_reservations(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Vec<BucketWriteReservationRecord>, BucketSnapshotLoadError> {
         let request = StorageRpcBucketRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             bucket: bucket.clone(),
         };
         let payload = encode_bucket_request(&request);
@@ -844,7 +844,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn get_bucket_delete_finalize_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError> {
@@ -852,7 +852,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             route: StorageRpcBucketPgRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
             },
             now,
             limit,
@@ -884,7 +884,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn get_bucket_delete_begin_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         start_after_bucket: Option<&BucketName>,
         limit: usize,
@@ -893,7 +893,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             route: StorageRpcBucketPgRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
             },
             now,
             start_after_bucket: start_after_bucket.cloned(),
@@ -925,7 +925,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn acquire_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -939,7 +939,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             bucket: StorageRpcBucketRequest {
                 node_id: self.node_id,
                 cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
             },
             bucket_incarnation_generation,
@@ -988,13 +988,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn release_bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcBucketDeleteFinalizeClaimRecordRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             record: claim.clone(),
         };
         let payload =
@@ -1014,13 +1014,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn bucket_delete_finalize_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
         let request = StorageRpcBucketRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             bucket: bucket.clone(),
         };
         let payload = encode_bucket_request(&request);
@@ -1039,14 +1039,14 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn get_lifecycle_sweep_roots(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError> {
         let request = StorageRpcLifecycleSweepRootsRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             now,
             limit,
         };
@@ -1074,12 +1074,12 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn list_lifecycle_sweep_buckets(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
     ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
         let request = StorageRpcBucketPgRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
         };
         let payload = encode_bucket_pg_request(&request).map_err(|error| {
             BucketSnapshotLoadError::Store(
@@ -1101,7 +1101,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn acquire_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         claim_id: &str,
@@ -1115,7 +1115,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             bucket: StorageRpcBucketRequest {
                 node_id: self.node_id,
                 cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
             },
             bucket_incarnation_generation,
@@ -1163,7 +1163,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn heartbeat_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         heartbeat_at: u64,
         lease_deadline: Option<u64>,
@@ -1172,7 +1172,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             record: StorageRpcLifecycleSweepClaimRecordRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 claim: claim.clone(),
             },
             heartbeat_at,
@@ -1210,7 +1210,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn record_lifecycle_sweep_claim_error(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, BucketSnapshotLoadError> {
@@ -1218,7 +1218,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             record: StorageRpcLifecycleSweepClaimRecordRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 claim: claim.clone(),
             },
             last_error: last_error.to_string(),
@@ -1253,13 +1253,13 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 
     fn release_lifecycle_sweep_claim(
         &self,
-        pg_id: PgId,
+        pg_id: BucketPgId,
         claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcLifecycleSweepClaimRecordRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             claim: claim.clone(),
         };
         let payload = encode_lifecycle_sweep_claim_record_request(&request).map_err(|error| {

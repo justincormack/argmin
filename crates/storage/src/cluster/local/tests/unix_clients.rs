@@ -1847,7 +1847,7 @@ fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
         .node(node_id)
         .unwrap()
         .bucket_write_reservation_client()
-        .durable_bucket_write_reservations(PgId::new(0), &bucket)
+        .durable_bucket_write_reservations(crate::BucketPgId::new_for_test(PgId::new(0)), &bucket,)
         .unwrap()
         .is_empty());
     assert_eq!(
@@ -1951,7 +1951,7 @@ fn frontend_unix_delete_bucket_adopts_live_drain_from_older_epoch() {
         .node(node_id)
         .unwrap()
         .bucket_write_reservation_client()
-        .durable_bucket_write_drain(PgId::new(0), &bucket)
+        .durable_bucket_write_drain(crate::BucketPgId::new_for_test(PgId::new(0)), &bucket)
         .unwrap()
         .expect("successful delete begin should retain its terminal drain");
     assert_eq!(drain.cluster_epoch, drain_epoch);
@@ -2939,7 +2939,11 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
         .node(node_id)
         .unwrap()
         .bucket_write_reservation_client()
-        .heartbeat_durable_bucket_write_drain(PgId::new(drain.pg_id), &stale_drain, 200)
+        .heartbeat_durable_bucket_write_drain(
+            crate::BucketPgId::new_for_test(PgId::new(drain.pg_id)),
+            &stale_drain,
+            200,
+        )
         .unwrap_err();
     assert!(
             matches!(
