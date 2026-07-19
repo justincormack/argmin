@@ -401,19 +401,19 @@ pub(crate) trait DirectPutMetadataNodeClient: Send + Sync {
 pub(crate) trait ObjectListingMetadataNodeClient: Send + Sync {
     fn list_objects_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         req: &ListObjectsReq,
     ) -> Result<ListObjectsResp, BucketSnapshotLoadError>;
 
     fn list_object_versions_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError>;
 
     fn list_multipart_uploads_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError>;
 }

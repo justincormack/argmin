@@ -3,13 +3,13 @@ use super::*;
 impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
     fn list_objects_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         req: &ListObjectsReq,
     ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
         let request = StorageRpcListObjectsRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             request: ListObjectsReq {
                 bucket: req.bucket.clone(),
                 prefix: req.prefix.clone(),
@@ -41,13 +41,13 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
 
     fn list_object_versions_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
         let request = StorageRpcListObjectVersionsRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             request: ListObjectVersionsReq {
                 bucket: req.bucket.clone(),
                 prefix: req.prefix.clone(),
@@ -80,13 +80,13 @@ impl ObjectListingMetadataNodeClient for UnixStorageNodeClient {
 
     fn list_multipart_uploads_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
         let request = StorageRpcListMultipartUploadsRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             request: ListMultipartUploadsReq {
                 bucket: req.bucket.clone(),
                 prefix: req.prefix.clone(),

@@ -1655,7 +1655,7 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
 impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {
     fn list_objects_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         req: &ListObjectsReq,
     ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1664,7 +1664,7 @@ impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {
 
     fn list_object_versions_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1673,7 +1673,7 @@ impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {
 
     fn list_multipart_uploads_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;

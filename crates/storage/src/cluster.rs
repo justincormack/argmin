@@ -89,7 +89,7 @@ use crate::types::{
     PutLiveObjectReq,
 };
 use crate::ObjectEtag;
-use crate::{BucketPgId, ObjectMetadataPgId};
+use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 
 mod local;
@@ -5518,6 +5518,12 @@ impl StorageCluster {
 
     fn object_metadata_pg(&self, bucket: &BucketName, key: &ObjectKey) -> ObjectMetadataPgId {
         self.local_map.object_metadata_pg_for(bucket, key)
+    }
+
+    fn object_metadata_scan_pg(&self, pg_id: PgId) -> ObjectMetadataScanPgId {
+        self.local_map
+            .object_metadata_scan_pg(pg_id)
+            .expect("routed object metadata scan PG must belong to the installed topology")
     }
 
     fn metadata_command_bucket_write_reservation_proof(

@@ -1324,10 +1324,11 @@ impl super::StorageCluster {
         req: &ListObjectsReq,
     ) -> Result<ListObjectsResp, ObjectPgActionError> {
         let pg_id = PgId::new(pg_id);
+        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_listing_metadata_client()
-            .list_objects_page(pg_id, req)
+            .list_objects_page(scan_pg_id, req)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
@@ -1337,10 +1338,11 @@ impl super::StorageCluster {
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, ObjectPgActionError> {
         let pg_id = PgId::new(pg_id);
+        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_listing_metadata_client()
-            .list_object_versions_page(pg_id, req)
+            .list_object_versions_page(scan_pg_id, req)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
@@ -1350,10 +1352,11 @@ impl super::StorageCluster {
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, ObjectPgActionError> {
         let pg_id = PgId::new(pg_id);
+        let scan_pg_id = self.object_metadata_scan_pg(pg_id);
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_listing_metadata_client()
-            .list_multipart_uploads_page(pg_id, req)
+            .list_multipart_uploads_page(scan_pg_id, req)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
 
@@ -6472,10 +6475,11 @@ impl super::StorageCluster {
         for pg_id in self.metadata_pg_ids() {
             {
                 let pg_id = PgId::new(pg_id);
+                let scan_pg_id = self.object_metadata_scan_pg(pg_id);
                 let listing_client = self.metadata_pg_primary_object_listing_client(pg_id)?;
                 let versions = listing_client
                     .list_object_versions_page(
-                        pg_id,
+                        scan_pg_id,
                         &ListObjectVersionsReq {
                             bucket: bucket.clone(),
                             prefix: None,
@@ -6492,7 +6496,7 @@ impl super::StorageCluster {
 
                 let uploads = listing_client
                     .list_multipart_uploads_page(
-                        pg_id,
+                        scan_pg_id,
                         &ListMultipartUploadsReq {
                             bucket: bucket.clone(),
                             prefix: None,
@@ -13538,6 +13542,7 @@ impl super::StorageCluster {
         let mut payload_reclaim_claim_errors = Vec::new();
         for raw_pg_id in self.metadata_pg_ids() {
             let object_pg_id = PgId::new(raw_pg_id);
+            let scan_pg_id = self.object_metadata_scan_pg(object_pg_id);
             let node = match self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), object_pg_id)
@@ -13563,7 +13568,7 @@ impl super::StorageCluster {
             match node
                 .object_listing_metadata_client()
                 .list_object_versions_page(
-                    object_pg_id,
+                    scan_pg_id,
                     &ListObjectVersionsReq {
                         bucket: bucket.clone(),
                         prefix: None,

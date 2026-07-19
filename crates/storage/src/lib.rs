@@ -98,6 +98,7 @@ pub use node::{
 pub use node::{
     BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome, ReclaimWorkItem,
 };
+pub(crate) use node_runtime::role_facade::ObjectMetadataScanPgId;
 pub use node_runtime::role_facade::{BucketPgId, ObjectMetadataPgId};
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) use pg_store::PgStore;

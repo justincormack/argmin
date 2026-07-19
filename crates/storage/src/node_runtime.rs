@@ -68,6 +68,37 @@ impl From<ObjectMetadataPgId> for PgId {
     }
 }
 
+/// Installed object-metadata PG selected for a listing scan.
+///
+/// Unlike `ObjectMetadataPgId`, this role is not bound to one exact object
+/// key. Installed runtime topology may mint it for each configured metadata
+/// PG while fan-out listing code scans the complete object namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ObjectMetadataScanPgId(PgId);
+
+impl ObjectMetadataScanPgId {
+    #[cfg(test)]
+    pub(crate) const fn new_for_test(pg_id: PgId) -> Self {
+        Self(pg_id)
+    }
+
+    #[must_use]
+    pub const fn pg_id(self) -> PgId {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl From<ObjectMetadataScanPgId> for PgId {
+    fn from(value: ObjectMetadataScanPgId) -> Self {
+        value.pg_id()
+    }
+}
+
 #[allow(dead_code)]
 #[path = "node.rs"]
 mod engine;
@@ -115,7 +146,7 @@ pub(super) mod node_facade {
 }
 
 pub(super) mod role_facade {
-    pub use super::{BucketPgId, ObjectMetadataPgId};
+    pub use super::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 }
 
 pub(super) mod client_facade {

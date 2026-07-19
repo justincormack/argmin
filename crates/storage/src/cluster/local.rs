@@ -43,8 +43,9 @@ use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
 use crate::{
     BucketName, BucketPgId, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError,
-    ObjectKey, ObjectMetadataPgId, PgId, PgState, PlacedSegmentShardRepairWorkItem,
-    ReclaimWorkItem, RouteMapValidity, ShardIndex, ShardKey, WriteAck, WrittenShardAck,
+    ObjectKey, ObjectMetadataPgId, ObjectMetadataScanPgId, PgId, PgState,
+    PlacedSegmentShardRepairWorkItem, ReclaimWorkItem, RouteMapValidity, ShardIndex, ShardKey,
+    WriteAck, WrittenShardAck,
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
@@ -2115,6 +2116,12 @@ impl LocalClusterMap {
         self.metadata_primary()
             .runtime()
             .object_metadata_pg_for(bucket, key)
+    }
+
+    pub(crate) fn object_metadata_scan_pg(&self, pg_id: PgId) -> Option<ObjectMetadataScanPgId> {
+        self.metadata_primary()
+            .runtime()
+            .object_metadata_scan_pg(pg_id)
     }
 
     pub(crate) fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {

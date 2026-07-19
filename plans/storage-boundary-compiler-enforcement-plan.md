@@ -159,6 +159,7 @@ Replace role-specific bare `PgId` parameters with:
 
 - `BucketPgId`
 - `ObjectMetadataPgId`
+- `ObjectMetadataScanPgId`
 - `DataPgId`
 
 Generic administrative operations may continue to use `PgId` where the PG
@@ -175,6 +176,9 @@ role-specific type. Trusted construction is:
   request's validated bucket name
 - `ObjectMetadataPgId` from the configured object-placement function applied
   to the validated `(bucket, key)`
+- `ObjectMetadataScanPgId` from an object-metadata PG present in the installed
+  topology; unlike the exact-object role, listing fan-out must scan every such
+  PG and therefore cannot validate the PG against one `(bucket, key)`
 - `DataPgId` from the payload placement result for the validated segment or
   shard request
 
@@ -656,6 +660,30 @@ Fourth Phase 3 slice:
 - the fourth slice passed its focused direct-PUT and wrong-object-PG Unix
   regressions, the boundary checker, formatting, workspace-wide strict
   Clippy, and the full workspace suite (7,132 tests).
+
+Fifth Phase 3 slice:
+
+- `ObjectListingMetadataNodeClient` now requires the distinct
+  `ObjectMetadataScanPgId` role for object, object-version, and multipart
+  upload pages. Reusing `ObjectMetadataPgId` would be incorrect because these
+  calls deliberately fan out across every installed object-metadata PG rather
+  than routing one exact `(bucket, key)`.
+- production code cannot construct a scan role from an arbitrary raw `PgId`.
+  Cluster fan-out obtains it from the installed runtime map after enumerating
+  configured metadata PGs. The type remains crate-private because no external
+  production API needs to name a node-level listing scan.
+- local adapters erase the role only at the private raw-node boundary. Unix
+  adapters erase it into route evidence, and the Unix server reconstructs it
+  only after validating the route and PG primary against installed topology.
+- a Unix regression proves that all three listing interfaces accept an
+  installed scan PG even though it is not tied to a specific request key, and
+  that a test-forged unknown scan PG fails with `UnknownPg` before local node
+  dispatch.
+- object mutation/read and data-client signatures, `DataPgId` construction,
+  and request-scoped route capability values remain open in Phase 3.
+- the fifth slice passed its focused installed/unknown scan-PG Unix
+  regression, the boundary checker, formatting, workspace-wide strict Clippy,
+  and the full workspace suite (7,141 tests).
 
 ### Phase 4 — type metadata-command publication
 

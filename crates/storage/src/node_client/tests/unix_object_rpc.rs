@@ -1,6 +1,153 @@
 use super::*;
 
 #[test]
+fn unix_object_listing_client_accepts_installed_scan_pg_and_rejects_unknown_pg() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes.push(StorageNodePgRoute {
+        pg_id: 1,
+        cluster_epoch: ClusterEpoch::new(1).unwrap(),
+        state: crate::types::PgState::Active,
+        primary_node_id: NodeId::new(7),
+        acting_set: vec![NodeId::new(7)],
+    });
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..6)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        config.socket_path.clone(),
+    );
+    let bucket = crate::tests::bucket_name("object-listing-scan-pg-bucket");
+    let installed_scan_pg = ObjectMetadataScanPgId::new_for_test(PgId::new(1));
+    let unknown_scan_pg = ObjectMetadataScanPgId::new_for_test(PgId::new(2));
+
+    let objects = ObjectListingMetadataNodeClient::list_objects_page(
+        &client,
+        installed_scan_pg,
+        &ListObjectsReq {
+            bucket: bucket.clone(),
+            prefix: None,
+            start_after: None,
+            start_at: None,
+            max_keys: 10,
+        },
+    )
+    .unwrap();
+    assert!(objects.objects.is_empty());
+    assert!(!objects.is_truncated);
+    assert!(objects.next_start_after.is_none());
+
+    let versions = ObjectListingMetadataNodeClient::list_object_versions_page(
+        &client,
+        installed_scan_pg,
+        &ListObjectVersionsReq {
+            bucket: bucket.clone(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            start_at: None,
+            max_keys: 10,
+        },
+    )
+    .unwrap();
+    assert!(versions.versions.is_empty());
+    assert!(!versions.is_truncated);
+    assert!(versions.next_key_marker.is_none());
+    assert!(versions.next_version_id_marker.is_none());
+
+    let uploads = ObjectListingMetadataNodeClient::list_multipart_uploads_page(
+        &client,
+        installed_scan_pg,
+        &ListMultipartUploadsReq {
+            bucket: bucket.clone(),
+            prefix: None,
+            page_start: None,
+            max_uploads: 10,
+        },
+    )
+    .unwrap();
+    assert!(uploads.uploads.is_empty());
+    assert!(!uploads.is_truncated);
+    assert!(uploads.next_key_marker.is_none());
+    assert!(uploads.next_upload_id_marker.is_none());
+
+    let Err(object_error) = ObjectListingMetadataNodeClient::list_objects_page(
+        &client,
+        unknown_scan_pg,
+        &ListObjectsReq {
+            bucket: bucket.clone(),
+            prefix: None,
+            start_after: None,
+            start_at: None,
+            max_keys: 10,
+        },
+    ) else {
+        panic!("unknown scan PG must not reach object listing");
+    };
+    assert!(matches!(
+        object_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::UnknownPg,
+            ..
+        })
+    ));
+
+    let Err(version_error) = ObjectListingMetadataNodeClient::list_object_versions_page(
+        &client,
+        unknown_scan_pg,
+        &ListObjectVersionsReq {
+            bucket: bucket.clone(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            start_at: None,
+            max_keys: 10,
+        },
+    ) else {
+        panic!("unknown scan PG must not reach object-version listing");
+    };
+    assert!(matches!(
+        version_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::UnknownPg,
+            ..
+        })
+    ));
+
+    let Err(upload_error) = ObjectListingMetadataNodeClient::list_multipart_uploads_page(
+        &client,
+        unknown_scan_pg,
+        &ListMultipartUploadsReq {
+            bucket,
+            prefix: None,
+            page_start: None,
+            max_uploads: 10,
+        },
+    ) else {
+        panic!("unknown scan PG must not reach multipart-upload listing");
+    };
+    assert!(matches!(
+        upload_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::UnknownPg,
+            ..
+        })
+    ));
+
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
 fn unix_object_generation_metadata_client_routes_generation_reads() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

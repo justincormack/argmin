@@ -305,7 +305,7 @@ use crate::{
     BucketName, EcShape, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey,
     ShardLocation,
 };
-use crate::{BucketPgId, ObjectMetadataPgId};
+use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
 #[cfg(test)]
 type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
@@ -5612,7 +5612,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectListingMetadataNodeClient::list_objects_page(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_scan_pg(request.pg_id),
             &request.request,
         ) {
             Ok(response) => {
@@ -5639,7 +5639,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectListingMetadataNodeClient::list_object_versions_page(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_scan_pg(request.pg_id),
             &request.request,
         ) {
             Ok(response) => {
@@ -5670,7 +5670,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectListingMetadataNodeClient::list_multipart_uploads_page(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_scan_pg(request.pg_id),
             &request.request,
         ) {
             Ok(response) => {
@@ -11426,6 +11426,12 @@ impl StorageNodeConnectionHandler {
         key: &ObjectKey,
     ) -> ObjectMetadataPgId {
         self.node.object_metadata_pg_for(bucket, key)
+    }
+
+    fn validated_object_metadata_scan_pg(&self, pg_id: PgId) -> ObjectMetadataScanPgId {
+        self.node
+            .object_metadata_scan_pg(pg_id)
+            .expect("validated object metadata scan PG must belong to the installed topology")
     }
 
     fn validate_primary_pg_for_bucket(
