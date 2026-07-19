@@ -518,9 +518,13 @@ Path uniqueness is scoped by `(host_id, normalized_path)`: identical Unix,
 mount, state, or data paths on different hosts are valid. Every process parses
 and lexically validates every path, but only the selected process's host is
 checked against the local filesystem, canonical mount targets, ownership,
-permissions, and device identity. Remote-host paths must not be required to
-exist locally. One process hosts at most one authority and at most one storage
-node in version 1. Its `kind` must permit those roles.
+permissions, and device identity. A selected-host disk mount must be the exact
+root of a distinct mounted device: its device id must differ from its parent
+directory's device id. An ordinary leftover mountpoint directory and a
+same-filesystem bind mount are rejected, preventing state/data fallback onto
+the parent filesystem. Remote-host paths must not be required to exist locally.
+One process hosts at most one authority and at most one storage node in version
+1. Its `kind` must permit those roles.
 
 Version 1 has no `storage_nodes.pg_ids` or other static PG-ownership field.
 Every configured storage node is eligible for deterministic initial placement,
@@ -761,8 +765,19 @@ Progress as of 2026-07-19:
   topology/reference/role/global-host-path/endpoint/auth/deployment validation,
   per-PG production-placer validation retained in the model, snapshot transport
   capacity validation including metadata/auth overhead, production Raft
-  compatibility validation plus append identity/auth overhead, standalone and
-  complete three-host replicated fixtures, and the offline validation command.
+  compatibility validation plus append identity/auth overhead, selected-host
+  filesystem resolution, standalone and complete three-host replicated
+  fixtures, and the offline validation command. Selected-host disk mounts and
+  existing state/data components must be owned by the effective process user,
+  must not be group/other writable, must not traverse a symlink below the
+  declared mount, and must remain on that mount's device. The declared mount
+  itself must be an exact distinct-device boundary rather than an unmounted
+  directory or same-filesystem bind path. Missing final state/data leaves
+  remain valid initialization inputs. All manifest filesystem paths are
+  lexically canonical: dot components, parent components, repeated separators,
+  and trailing separators are rejected so validation and runtime consume the
+  same path. Remote-host paths remain lexical-only and are never probed on the
+  selected host.
 - Slice 2 is implemented: dedicated versioned canonical binary encoders produce
   a cluster topology digest, selected-process durable identity digest, and full
   unresolved-config fingerprint. Collections are identity-sorted, fields and
@@ -789,10 +804,8 @@ Progress as of 2026-07-19:
   Replicated, TCP, and secret-bearing manifests fail before runtime
   construction. Existing process-level Unix test fixtures still need to move
   to shared manifest builders as those process profiles are activated.
-- Selected-host filesystem/device checks remain with secret/filesystem
-  resolution rather than the structural parser. Durable identity binding,
-  secret resolution, production replicated mapping, and TCP transport remain
-  open.
+- Durable identity binding, secret resolution, production replicated mapping,
+  and TCP transport remain open.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;
@@ -847,6 +860,7 @@ The schema/parser release gate includes:
 - duplicate ids, paths, endpoints, credential identities, and references;
 - path uniqueness scoped by host, repeated remote-host paths, and selected-host
   filesystem validation without remote filesystem probing;
+- unmounted selected-host disk mountpoints and same-device mount paths;
 - authority state and storage data path collisions across roles on one host;
 - selected process missing or incompatible with its hosted role;
 - mixed file/env mode rejection;

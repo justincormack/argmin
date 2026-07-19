@@ -9,7 +9,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use storage::control_plane_raft::{
     ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
@@ -448,6 +448,24 @@ fn load_server_config_from_inputs<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
+    load_server_config_from_inputs_with_filesystem_validator(
+        config_path,
+        process_id,
+        get,
+        validate_selected_host_filesystem,
+    )
+}
+
+fn load_server_config_from_inputs_with_filesystem_validator<F, V>(
+    config_path: Option<&Path>,
+    process_id: Option<&str>,
+    get: F,
+    validate_filesystem: V,
+) -> Result<ServerConfig, String>
+where
+    F: Fn(&str) -> Option<String>,
+    V: FnOnce(&ValidatedStaticClusterManifest) -> Result<(), String>,
+{
     match (config_path, process_id) {
         (None, None) => ServerConfig::from_lookup(get),
         (Some(_), None) => {
@@ -464,8 +482,10 @@ where
                     ));
                 }
             }
-            let manifest = load_static_cluster_manifest(config_path, process_id)?;
-            manifest.standalone_legacy_server_config(get)
+            let manifest = load_static_cluster_manifest_structural(config_path, process_id)?;
+            let config = manifest.standalone_legacy_server_config(get)?;
+            validate_filesystem(&manifest)?;
+            Ok(config)
         }
     }
 }
@@ -1092,6 +1112,15 @@ pub(crate) fn load_static_cluster_manifest(
     path: &Path,
     process_id: &str,
 ) -> Result<ValidatedStaticClusterManifest, String> {
+    let manifest = load_static_cluster_manifest_structural(path, process_id)?;
+    validate_selected_host_filesystem(&manifest)?;
+    Ok(manifest)
+}
+
+fn load_static_cluster_manifest_structural(
+    path: &Path,
+    process_id: &str,
+) -> Result<ValidatedStaticClusterManifest, String> {
     if !path.is_absolute() {
         return Err("cluster manifest path must be absolute".to_string());
     }
@@ -1131,6 +1160,243 @@ pub(crate) fn load_static_cluster_manifest(
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| "cluster manifest must contain valid UTF-8".to_string())?;
     parse_static_cluster_manifest(text, process_id)
+}
+
+fn validate_selected_host_filesystem(
+    validated: &ValidatedStaticClusterManifest,
+) -> Result<(), String> {
+    validate_selected_host_filesystem_with_mount_validator(
+        validated,
+        validate_selected_host_mount_boundary,
+    )
+}
+
+fn validate_selected_host_filesystem_with_mount_validator<V>(
+    validated: &ValidatedStaticClusterManifest,
+    mut validate_mount: V,
+) -> Result<(), String>
+where
+    V: FnMut(&Path, &std::fs::Metadata, &str) -> Result<(), String>,
+{
+    let selected_process = &validated.manifest.processes[validated.selected_process_index];
+    let selected_host_id = selected_process.host_id.as_str();
+    let effective_uid = {
+        // SAFETY: geteuid has no preconditions and does not mutate memory.
+        unsafe { libc::geteuid() }
+    };
+    let local_disks: BTreeMap<&str, (PathBuf, PathBuf, u64)> = validated
+        .manifest
+        .disks
+        .iter()
+        .filter(|disk| disk.host_id == selected_host_id)
+        .map(|disk| {
+            let normalized_mount = normalize_absolute_path(&disk.mount_path, "disk mount path")?;
+            let metadata = std::fs::symlink_metadata(&normalized_mount).map_err(|error| {
+                format!(
+                    "selected-host disk {} mount path cannot be inspected: {error}",
+                    disk.id
+                )
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(format!(
+                    "selected-host disk {} mount path must be a non-symlink directory",
+                    disk.id
+                ));
+            }
+            validate_selected_host_path_permissions(
+                &metadata,
+                effective_uid,
+                &format!("selected-host disk {} mount path", disk.id),
+            )?;
+            validate_mount(
+                &normalized_mount,
+                &metadata,
+                &format!("selected-host disk {} mount path", disk.id),
+            )?;
+            let canonical_mount = normalized_mount.canonicalize().map_err(|error| {
+                format!(
+                    "selected-host disk {} mount path cannot be canonicalized: {error}",
+                    disk.id
+                )
+            })?;
+            Ok((
+                disk.id.as_str(),
+                (normalized_mount, canonical_mount, metadata.dev()),
+            ))
+        })
+        .collect::<Result<_, String>>()?;
+
+    for authority in &validated.manifest.authorities {
+        let process = validated
+            .manifest
+            .processes
+            .iter()
+            .find(|process| process.id == authority.process_id)
+            .expect("validated authority process must exist");
+        if process.host_id != selected_host_id {
+            continue;
+        }
+        let (mount_path, canonical_mount, mount_device) = local_disks
+            .get(authority.disk_id.as_str())
+            .expect("validated authority disk must exist");
+        validate_selected_host_durable_path(
+            &authority.state_path,
+            mount_path.as_path(),
+            canonical_mount,
+            *mount_device,
+            effective_uid,
+            SelectedHostDurablePathKind::StateFile,
+            &format!("authority {} state path", authority.id),
+        )?;
+    }
+
+    for storage_node in &validated.manifest.storage_nodes {
+        let process = validated
+            .manifest
+            .processes
+            .iter()
+            .find(|process| process.id == storage_node.process_id)
+            .expect("validated storage-node process must exist");
+        if process.host_id != selected_host_id {
+            continue;
+        }
+        let (mount_path, canonical_mount, mount_device) = local_disks
+            .get(storage_node.disk_id.as_str())
+            .expect("validated storage-node disk must exist");
+        validate_selected_host_durable_path(
+            &storage_node.data_dir,
+            mount_path.as_path(),
+            canonical_mount,
+            *mount_device,
+            effective_uid,
+            SelectedHostDurablePathKind::DataDirectory,
+            &format!("storage node {} data path", storage_node.node_id),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_selected_host_mount_boundary(
+    mount_path: &Path,
+    mount_metadata: &std::fs::Metadata,
+    label: &str,
+) -> Result<(), String> {
+    let parent = mount_path
+        .parent()
+        .ok_or_else(|| format!("{label} has no parent filesystem boundary"))?;
+    let parent_metadata = std::fs::symlink_metadata(parent)
+        .map_err(|error| format!("{label} parent cannot be inspected: {error}"))?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(format!("{label} parent must be a non-symlink directory"));
+    }
+    validate_distinct_mount_devices(mount_metadata.dev(), parent_metadata.dev(), label)
+}
+
+fn validate_distinct_mount_devices(
+    mount_device: u64,
+    parent_device: u64,
+    label: &str,
+) -> Result<(), String> {
+    if mount_device == parent_device {
+        return Err(format!(
+            "{label} must be an exact distinct-device mount boundary"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum SelectedHostDurablePathKind {
+    StateFile,
+    DataDirectory,
+}
+
+fn validate_selected_host_durable_path(
+    path: &Path,
+    mount_path: &Path,
+    canonical_mount: &Path,
+    mount_device: u64,
+    effective_uid: u32,
+    kind: SelectedHostDurablePathKind,
+    label: &str,
+) -> Result<(), String> {
+    let normalized_path = normalize_absolute_path(path, label)?;
+    let relative = normalized_path
+        .strip_prefix(mount_path)
+        .expect("validated durable path must be within its disk mount");
+    let mut current = mount_path.to_path_buf();
+    let mut deepest_existing = mount_path.to_path_buf();
+    let mut final_metadata = None;
+
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(format!(
+                        "{label} must not traverse a symlink below its disk mount"
+                    ));
+                }
+                if metadata.dev() != mount_device {
+                    return Err(format!(
+                        "{label} crosses away from its declared disk device"
+                    ));
+                }
+                validate_selected_host_path_permissions(&metadata, effective_uid, label)?;
+                deepest_existing = current.clone();
+                final_metadata = Some(metadata);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(format!("{label} cannot be inspected: {error}")),
+        }
+    }
+
+    let deepest_metadata = std::fs::symlink_metadata(&deepest_existing)
+        .map_err(|error| format!("{label} existing ancestor cannot be inspected: {error}"))?;
+    validate_selected_host_path_permissions(&deepest_metadata, effective_uid, label)?;
+    let canonical_existing = deepest_existing
+        .canonicalize()
+        .map_err(|error| format!("{label} existing ancestor cannot be canonicalized: {error}"))?;
+    if !canonical_existing.starts_with(canonical_mount) {
+        return Err(format!("{label} resolves outside its declared disk mount"));
+    }
+
+    if deepest_existing == normalized_path {
+        let metadata = final_metadata.expect("existing final path metadata must be retained");
+        match kind {
+            SelectedHostDurablePathKind::StateFile if !metadata.is_file() => {
+                return Err(format!("{label} must be a regular file when it exists"));
+            }
+            SelectedHostDurablePathKind::DataDirectory if !metadata.is_dir() => {
+                return Err(format!("{label} must be a directory when it exists"));
+            }
+            _ => {}
+        }
+    } else if !deepest_metadata.is_dir() {
+        return Err(format!(
+            "{label} existing parent component must be a directory"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_selected_host_path_permissions(
+    metadata: &std::fs::Metadata,
+    effective_uid: u32,
+    label: &str,
+) -> Result<(), String> {
+    if metadata.uid() != effective_uid {
+        return Err(format!(
+            "{label} must be owned by the effective process user"
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{label} must not be writable by group or other users"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_static_cluster_manifest(
@@ -2787,6 +3053,9 @@ fn normalize_absolute_path(path: &Path, field: &str) -> Result<PathBuf, String> 
             }
         }
     }
+    if result.as_os_str().as_encoded_bytes() != path.as_os_str().as_encoded_bytes() {
+        return Err(format!("{field} is not canonical"));
+    }
     if result == Path::new("/") {
         return Err(format!("{field} must not be filesystem root"));
     }
@@ -2848,6 +3117,7 @@ mod tests {
     use std::fmt::Write as _;
     use std::fs::File;
     use std::io::Write;
+    use std::os::unix::fs::symlink;
 
     fn standalone_runtime_environment() -> BTreeMap<&'static str, String> {
         BTreeMap::from([
@@ -2869,6 +3139,45 @@ mod tests {
         let path = dir.path().join("cluster.toml");
         std::fs::write(&path, contents).unwrap();
         (dir, path)
+    }
+
+    fn private_dir(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn validate_test_selected_host_filesystem(
+        validated: &ValidatedStaticClusterManifest,
+    ) -> Result<(), String> {
+        validate_selected_host_filesystem_with_mount_validator(
+            validated,
+            |_path, _metadata, _label| Ok(()),
+        )
+    }
+
+    fn standalone_manifest_on_mount(mount_path: &Path) -> String {
+        standalone_manifest()
+            .replace(
+                "mount_path = \"/srv/argmin\"",
+                &format!("mount_path = \"{}\"", mount_path.display()),
+            )
+            .replace(
+                "state_path = \"/srv/argmin/control.state\"",
+                &format!(
+                    "state_path = \"{}\"",
+                    mount_path.join("control.state").display()
+                ),
+            )
+            .replace(
+                "data_dir = \"/srv/argmin/data\"",
+                &format!("data_dir = \"{}\"", mount_path.join("data").display()),
+            )
+    }
+
+    fn replicated_manifest_with_host_one_mounts(control_mount: &Path, data_mount: &Path) -> String {
+        replicated_manifest()
+            .replace("/srv/argmin/control-1", control_mount.to_str().unwrap())
+            .replace("/srv/argmin/data-1", data_mount.to_str().unwrap())
     }
 
     fn standalone_manifest() -> String {
@@ -3300,6 +3609,58 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
     }
 
     #[test]
+    fn static_cluster_runtime_loader_validates_selected_host_filesystem() {
+        let dir = test_util::tempdir();
+        let mount_path = dir.path().join("disk");
+        private_dir(&mount_path);
+        let manifest = standalone_manifest_on_mount(&mount_path);
+        let manifest_path = dir.path().join("cluster.toml");
+        std::fs::write(&manifest_path, manifest).unwrap();
+        let environment = standalone_runtime_environment();
+
+        let config = load_server_config_from_inputs_with_filesystem_validator(
+            Some(&manifest_path),
+            Some("all-1"),
+            |key| environment.get(key).cloned(),
+            |_manifest| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.storage_node_data_dir.as_deref(),
+            Some(mount_path.join("data").to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn static_cluster_runtime_loader_rejects_unmounted_selected_host_disk() {
+        let dir = test_util::tempdir();
+        let mount_path = dir.path().join("unmounted-disk");
+        private_dir(&mount_path);
+        let manifest_path = dir.path().join("cluster.toml");
+        std::fs::write(&manifest_path, standalone_manifest_on_mount(&mount_path)).unwrap();
+        let environment = standalone_runtime_environment();
+
+        let error = load_server_config_from_inputs(Some(&manifest_path), Some("all-1"), |key| {
+            environment.get(key).cloned()
+        })
+        .unwrap_err();
+
+        assert!(
+            error.contains("must be an exact distinct-device mount boundary"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn static_cluster_mount_boundary_requires_distinct_device() {
+        validate_distinct_mount_devices(11, 10, "test mount").unwrap();
+        assert!(validate_distinct_mount_devices(10, 10, "test mount")
+            .unwrap_err()
+            .contains("exact distinct-device mount boundary"));
+    }
+
+    #[test]
     fn static_cluster_runtime_loader_rejects_profiles_not_yet_runtime_mapped() {
         let (_dir, replicated_path) = write_manifest(&replicated_manifest());
         let environment = standalone_runtime_environment();
@@ -3709,6 +4070,122 @@ transport_profile_id = "internal"
     }
 
     #[test]
+    fn static_cluster_filesystem_validation_probes_only_selected_host() {
+        let dir = test_util::tempdir();
+        let control_mount = dir.path().join("control");
+        let data_mount = dir.path().join("data");
+        private_dir(&control_mount);
+        private_dir(&data_mount);
+        let manifest = replicated_manifest_with_host_one_mounts(&control_mount, &data_mount);
+        let validated = parse_static_cluster_manifest(&manifest, "control-1").unwrap();
+
+        validate_test_selected_host_filesystem(&validated).unwrap();
+    }
+
+    #[test]
+    fn static_cluster_filesystem_validation_rejects_local_symlink_traversal() {
+        let dir = test_util::tempdir();
+        let mount_path = dir.path().join("disk");
+        let real_data = mount_path.join("real-data");
+        private_dir(&mount_path);
+        private_dir(&real_data);
+        symlink(&real_data, mount_path.join("linked-data")).unwrap();
+        let manifest = standalone_manifest_on_mount(&mount_path).replace(
+            &format!("data_dir = \"{}\"", mount_path.join("data").display()),
+            &format!(
+                "data_dir = \"{}\"",
+                mount_path.join("linked-data/node").display()
+            ),
+        );
+        let validated = parse_static_cluster_manifest(&manifest, "all-1").unwrap();
+
+        let error = validate_test_selected_host_filesystem(&validated).unwrap_err();
+
+        assert!(
+            error.contains("must not traverse a symlink"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_symlink_parent_component_escape() {
+        let dir = test_util::tempdir();
+        let mount_path = dir.path().join("disk");
+        let outside_child = dir.path().join("outside/child");
+        private_dir(&mount_path);
+        private_dir(&outside_child);
+        symlink(&outside_child, mount_path.join("jump")).unwrap();
+        let noncanonical_data_dir = mount_path.join("jump/../node");
+        let manifest = standalone_manifest_on_mount(&mount_path).replace(
+            &format!("data_dir = \"{}\"", mount_path.join("data").display()),
+            &format!("data_dir = \"{}\"", noncanonical_data_dir.display()),
+        );
+
+        let error = parse_static_cluster_manifest(&manifest, "all-1").unwrap_err();
+
+        assert!(
+            error.contains("storage data path is not canonical"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn static_cluster_filesystem_validation_rejects_missing_or_symlinked_mount() {
+        let dir = test_util::tempdir();
+        let missing_mount = dir.path().join("missing");
+        let missing =
+            parse_static_cluster_manifest(&standalone_manifest_on_mount(&missing_mount), "all-1")
+                .unwrap();
+        assert!(validate_test_selected_host_filesystem(&missing)
+            .unwrap_err()
+            .contains("mount path cannot be inspected"));
+
+        let real_mount = dir.path().join("real");
+        let linked_mount = dir.path().join("linked");
+        private_dir(&real_mount);
+        symlink(&real_mount, &linked_mount).unwrap();
+        let linked =
+            parse_static_cluster_manifest(&standalone_manifest_on_mount(&linked_mount), "all-1")
+                .unwrap();
+        assert!(validate_test_selected_host_filesystem(&linked)
+            .unwrap_err()
+            .contains("mount path must be a non-symlink directory"));
+    }
+
+    #[test]
+    fn static_cluster_filesystem_validation_rejects_insecure_local_path() {
+        let dir = test_util::tempdir();
+        let mount_path = dir.path().join("disk");
+        let data_path = mount_path.join("data");
+        private_dir(&mount_path);
+        private_dir(&data_path);
+        std::fs::set_permissions(&data_path, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let manifest = standalone_manifest_on_mount(&mount_path);
+        let validated = parse_static_cluster_manifest(&manifest, "all-1").unwrap();
+
+        let error = validate_test_selected_host_filesystem(&validated).unwrap_err();
+
+        assert!(error.contains("must not be writable by group or other users"));
+    }
+
+    #[test]
+    fn static_cluster_filesystem_validation_rejects_wrong_existing_path_type() {
+        let dir = test_util::tempdir();
+        let mount_path = dir.path().join("disk");
+        private_dir(&mount_path);
+        private_dir(&mount_path.join("control.state"));
+        let manifest = standalone_manifest_on_mount(&mount_path);
+        let validated = parse_static_cluster_manifest(&manifest, "all-1").unwrap();
+
+        let error = validate_test_selected_host_filesystem(&validated).unwrap_err();
+
+        assert!(
+            error.contains("state path must be a regular file"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn static_cluster_manifest_rejects_noncanonical_endpoint_uris() {
         let unix = standalone_manifest().replacen(
             "unix:///run/argmin/control.sock",
@@ -3717,7 +4194,7 @@ transport_profile_id = "internal"
         );
         assert!(parse_static_cluster_manifest(&unix, "all-1")
             .unwrap_err()
-            .contains("URI is not canonical"));
+            .contains("not canonical"));
 
         let tcp = replace_once(
             &replicated_manifest(),
@@ -3747,7 +4224,7 @@ transport_profile_id = "internal"
         );
         assert!(parse_static_cluster_manifest(&escaping, "all-1")
             .unwrap_err()
-            .contains("not contained"));
+            .contains("not canonical"));
     }
 
     #[test]
