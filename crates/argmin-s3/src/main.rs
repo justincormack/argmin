@@ -372,11 +372,14 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         ) {
             Ok(manifest) => {
                 println!(
-                    "valid cluster manifest cluster_id={} topology_generation={} process_id={} deployment_mode={}",
+                    "valid cluster manifest cluster_id={} topology_generation={} process_id={} deployment_mode={} topology_digest={} process_identity_digest={} full_config_fingerprint={}",
                     manifest.cluster_id(),
                     manifest.topology_generation(),
                     manifest.selected_process_id(),
-                    manifest.deployment_mode()
+                    manifest.deployment_mode(),
+                    manifest.topology_digest(),
+                    manifest.process_identity_digest(),
+                    manifest.full_config_fingerprint()
                 );
                 Some(0)
             }

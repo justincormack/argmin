@@ -29,6 +29,9 @@ const CLUSTER_MANIFEST_MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const CLUSTER_MANIFEST_RAFT_APPEND_FIXED_FRAME_OVERHEAD_BYTES: u64 = 64 * 1024;
 const CLUSTER_MANIFEST_RAFT_SNAPSHOT_FIXED_FRAME_OVERHEAD_BYTES: u64 = 64 * 1024;
 const INITIAL_PG_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin-initial-pg-placement-v1";
+const TOPOLOGY_IDENTITY_DOMAIN: &str = "argmin-static-cluster-topology-v1";
+const PROCESS_IDENTITY_DOMAIN: &str = "argmin-static-cluster-process-identity-v1";
+const FULL_CONFIG_FINGERPRINT_DOMAIN: &str = "argmin-static-cluster-full-config-v1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -263,6 +266,9 @@ pub(crate) struct ValidatedStaticClusterManifest {
     selected_process_index: usize,
     initial_pg_acting_sets: Vec<Vec<u32>>,
     canonical_raft_peer_endpoints: BTreeMap<u64, String>,
+    topology_digest: String,
+    process_identity_digest: String,
+    full_config_fingerprint: String,
 }
 
 impl ValidatedStaticClusterManifest {
@@ -283,6 +289,18 @@ impl ValidatedStaticClusterManifest {
             DeploymentMode::Standalone => "standalone",
             DeploymentMode::Replicated => "replicated",
         }
+    }
+
+    pub(crate) fn topology_digest(&self) -> &str {
+        &self.topology_digest
+    }
+
+    pub(crate) fn process_identity_digest(&self) -> &str {
+        &self.process_identity_digest
+    }
+
+    pub(crate) fn full_config_fingerprint(&self) -> &str {
+        &self.full_config_fingerprint
     }
 
     #[cfg(test)]
@@ -321,6 +339,9 @@ impl fmt::Debug for ValidatedStaticClusterManifest {
                 "canonical_raft_peer_endpoints",
                 &self.canonical_raft_peer_endpoints.len(),
             )
+            .field("topology_digest", &self.topology_digest)
+            .field("process_identity_digest", &self.process_identity_digest)
+            .field("full_config_fingerprint", &self.full_config_fingerprint)
             .finish()
     }
 }
@@ -348,6 +369,567 @@ struct CredentialIdentity {
 enum EndpointAddress {
     Unix(PathBuf),
     Tcp { host: String, port: u16 },
+}
+
+#[derive(Default)]
+struct CanonicalEncoder {
+    bytes: Vec<u8>,
+}
+
+impl CanonicalEncoder {
+    fn field(&mut self, tag: u16, value: &[u8]) {
+        self.bytes.extend_from_slice(&tag.to_be_bytes());
+        self.bytes.extend_from_slice(
+            &u64::try_from(value.len())
+                .expect("validated manifest field length fits u64")
+                .to_be_bytes(),
+        );
+        self.bytes.extend_from_slice(value);
+    }
+
+    fn string(&mut self, tag: u16, value: &str) {
+        self.field(tag, value.as_bytes());
+    }
+
+    fn optional_string(&mut self, tag: u16, value: Option<&str>) {
+        let mut encoded = Vec::new();
+        match value {
+            Some(value) => {
+                encoded.push(1);
+                encoded.extend_from_slice(
+                    &u64::try_from(value.len())
+                        .expect("validated manifest field length fits u64")
+                        .to_be_bytes(),
+                );
+                encoded.extend_from_slice(value.as_bytes());
+            }
+            None => encoded.push(0),
+        }
+        self.field(tag, &encoded);
+    }
+
+    fn path(&mut self, tag: u16, value: &Path) {
+        self.field(tag, value.as_os_str().as_encoded_bytes());
+    }
+
+    fn u8(&mut self, tag: u16, value: u8) {
+        self.field(tag, &[value]);
+    }
+
+    fn u32(&mut self, tag: u16, value: u32) {
+        self.field(tag, &value.to_be_bytes());
+    }
+
+    fn u64(&mut self, tag: u16, value: u64) {
+        self.field(tag, &value.to_be_bytes());
+    }
+
+    fn optional_u64(&mut self, tag: u16, value: Option<u64>) {
+        let mut encoded = Vec::with_capacity(9);
+        match value {
+            Some(value) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&value.to_be_bytes());
+            }
+            None => encoded.push(0),
+        }
+        self.field(tag, &encoded);
+    }
+
+    fn boolean(&mut self, tag: u16, value: bool) {
+        self.u8(tag, u8::from(value));
+    }
+
+    fn collection<I>(&mut self, tag: u16, values: I)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let values: Vec<Vec<u8>> = values.into_iter().collect();
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(
+            &u32::try_from(values.len())
+                .expect("validated manifest collection length fits u32")
+                .to_be_bytes(),
+        );
+        for value in values {
+            encoded.extend_from_slice(&1_u16.to_be_bytes());
+            encoded.extend_from_slice(
+                &u64::try_from(value.len())
+                    .expect("validated manifest item length fits u64")
+                    .to_be_bytes(),
+            );
+            encoded.extend_from_slice(&value);
+        }
+        self.field(tag, &encoded);
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+fn topology_digest(
+    manifest: &StaticClusterManifestInput,
+    initial_pg_acting_sets: &[Vec<u32>],
+    canonical_raft_peer_endpoints: &BTreeMap<u64, String>,
+) -> String {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, TOPOLOGY_IDENTITY_DOMAIN);
+    encoder.u32(2, manifest.schema_version);
+    encoder.string(3, &manifest.cluster.id);
+    encoder.u64(4, manifest.cluster.topology_generation);
+
+    encoder.field(5, &encode_deployment_topology(&manifest.deployment));
+    encoder.field(6, &encode_storage_topology(&manifest.storage));
+    encoder.field(7, &encode_raft_topology(&manifest.raft));
+    encoder.collection(
+        8,
+        manifest
+            .transport_profiles
+            .iter()
+            .map(encode_transport_profile_topology),
+    );
+    encoder.collection(9, manifest.hosts.iter().map(encode_host_topology));
+    encoder.collection(10, manifest.disks.iter().map(encode_disk_topology));
+    encoder.collection(11, manifest.processes.iter().map(encode_process_topology));
+    encoder.collection(
+        12,
+        manifest.authorities.iter().map(encode_authority_topology),
+    );
+    encoder.collection(
+        13,
+        manifest
+            .storage_nodes
+            .iter()
+            .map(encode_storage_node_topology),
+    );
+    encoder.collection(14, manifest.endpoints.iter().map(encode_endpoint_topology));
+    encoder.collection(
+        15,
+        required_principal_identities(manifest)
+            .iter()
+            .map(encode_principal_identity),
+    );
+    encoder.collection(
+        16,
+        initial_pg_acting_sets
+            .iter()
+            .enumerate()
+            .map(|(pg_id, acting_set)| encode_initial_pg_acting_set(pg_id, acting_set)),
+    );
+    encoder.collection(
+        17,
+        canonical_raft_peer_endpoints
+            .iter()
+            .map(|(node_id, endpoint)| encode_raft_peer_endpoint(*node_id, endpoint)),
+    );
+    auth::canonical::sha256_hex(&encoder.finish())
+}
+
+fn process_identity_digest(
+    manifest: &StaticClusterManifestInput,
+    selected_process_index: usize,
+    topology_digest: &str,
+) -> String {
+    let selected = &manifest.processes[selected_process_index];
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, PROCESS_IDENTITY_DOMAIN);
+    encoder.string(2, topology_digest);
+    encoder.string(3, &selected.id);
+    encoder.string(4, &selected.host_id);
+    encoder.u8(5, process_kind_tag(selected.kind));
+    encoder.collection(
+        6,
+        manifest
+            .authorities
+            .iter()
+            .filter(|authority| authority.process_id == selected.id)
+            .map(encode_authority_process_identity),
+    );
+    encoder.collection(
+        7,
+        manifest
+            .storage_nodes
+            .iter()
+            .filter(|storage_node| storage_node.process_id == selected.id)
+            .map(encode_storage_node_process_identity),
+    );
+    auth::canonical::sha256_hex(&encoder.finish())
+}
+
+fn full_config_fingerprint(manifest: &StaticClusterManifestInput) -> String {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, FULL_CONFIG_FINGERPRINT_DOMAIN);
+    encoder.u32(2, manifest.schema_version);
+    encoder.field(3, &encode_cluster_full(&manifest.cluster));
+    encoder.field(4, &encode_deployment_full(&manifest.deployment));
+    encoder.field(5, &encode_storage_topology(&manifest.storage));
+    encoder.field(6, &encode_raft_topology(&manifest.raft));
+    encoder.collection(
+        7,
+        manifest
+            .transport_profiles
+            .iter()
+            .map(encode_transport_profile_full),
+    );
+    encoder.collection(8, manifest.hosts.iter().map(encode_host_topology));
+    encoder.collection(9, manifest.disks.iter().map(encode_disk_full));
+    encoder.collection(10, manifest.processes.iter().map(encode_process_full));
+    encoder.collection(11, manifest.authorities.iter().map(encode_authority_full));
+    encoder.collection(
+        12,
+        manifest.storage_nodes.iter().map(encode_storage_node_full),
+    );
+    encoder.collection(13, manifest.endpoints.iter().map(encode_endpoint_full));
+    encoder.collection(
+        14,
+        manifest.tls_identities.iter().map(encode_tls_identity_full),
+    );
+    encoder.collection(
+        15,
+        manifest
+            .tls_trust_bundles
+            .iter()
+            .map(encode_tls_trust_bundle_full),
+    );
+    encoder.collection(
+        16,
+        manifest
+            .auth_credentials
+            .iter()
+            .map(encode_auth_credential_full),
+    );
+    auth::canonical::sha256_hex(&encoder.finish())
+}
+
+fn encode_deployment_topology(deployment: &DeploymentInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.u8(1, deployment_mode_tag(deployment.mode));
+    encoder.u8(2, failure_domain_tag(deployment.failure_domain));
+    encoder.u8(3, deployment.failure_tolerance);
+    encoder.u8(4, internal_auth_tag(deployment.internal_auth));
+    encoder.finish()
+}
+
+fn encode_deployment_full(deployment: &DeploymentInput) -> Vec<u8> {
+    encode_deployment_topology(deployment)
+}
+
+fn encode_cluster_full(cluster: &ClusterInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &cluster.id);
+    encoder.u64(2, cluster.topology_generation);
+    encoder.string(3, &cluster.region);
+    encoder.finish()
+}
+
+fn encode_storage_topology(storage: &StorageInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.u32(1, storage.pg_count);
+    encoder.u8(2, storage.ec_data_shards);
+    encoder.u8(3, storage.ec_parity_shards);
+    encoder.u64(4, storage.initial_cluster_epoch);
+    encoder.finish()
+}
+
+fn encode_raft_topology(raft: &RaftInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.u64(1, raft.max_append_entries);
+    encoder.u64(2, raft.max_append_bytes);
+    encoder.u64(3, raft.max_snapshot_bytes);
+    encoder.finish()
+}
+
+fn encode_transport_profile_topology(profile: &TransportProfileInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &profile.id);
+    encoder.u64(2, profile.max_frame_bytes);
+    encoder.finish()
+}
+
+fn encode_transport_profile_full(profile: &TransportProfileInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &profile.id);
+    encoder.u64(2, profile.max_frame_bytes);
+    encoder.u32(3, profile.max_connections);
+    encoder.u64(4, profile.connect_timeout_ms);
+    encoder.u64(5, profile.io_timeout_ms);
+    encoder.finish()
+}
+
+fn encode_host_topology(host: &HostInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &host.id);
+    encoder.string(2, &host.zone);
+    encoder.string(3, &host.rack);
+    encoder.finish()
+}
+
+fn encode_disk_topology(disk: &DiskInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &disk.id);
+    encoder.string(2, &disk.host_id);
+    encoder.finish()
+}
+
+fn encode_disk_full(disk: &DiskInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &disk.id);
+    encoder.string(2, &disk.host_id);
+    encoder.path(3, &disk.mount_path);
+    encoder.finish()
+}
+
+fn encode_process_topology(process: &ProcessInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &process.id);
+    encoder.string(2, &process.host_id);
+    encoder.u8(3, process_kind_tag(process.kind));
+    encoder.optional_string(4, process.frontend_instance_id.as_deref());
+    encoder.optional_string(5, process.admin_instance_id.as_deref());
+    encoder.optional_string(6, process.maintenance_instance_id.as_deref());
+    encoder.finish()
+}
+
+fn encode_process_full(process: &ProcessInput) -> Vec<u8> {
+    encode_process_topology(process)
+}
+
+fn encode_authority_topology(authority: &AuthorityInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &authority.id);
+    encoder.u8(2, authority_kind_tag(authority.kind));
+    encoder.optional_u64(3, authority.raft_node_id);
+    encoder.string(4, &authority.process_id);
+    encoder.string(5, &authority.disk_id);
+    encoder.finish()
+}
+
+fn encode_authority_process_identity(authority: &AuthorityInput) -> Vec<u8> {
+    encode_authority_topology(authority)
+}
+
+fn encode_authority_full(authority: &AuthorityInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &authority.id);
+    encoder.u8(2, authority_kind_tag(authority.kind));
+    encoder.optional_u64(3, authority.raft_node_id);
+    encoder.string(4, &authority.process_id);
+    encoder.string(5, &authority.disk_id);
+    encoder.path(6, &authority.state_path);
+    encoder.finish()
+}
+
+fn encode_storage_node_topology(storage_node: &StorageNodeInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.u32(1, storage_node.node_id);
+    encoder.string(2, &storage_node.process_id);
+    encoder.string(3, &storage_node.disk_id);
+    encoder.finish()
+}
+
+fn encode_storage_node_process_identity(storage_node: &StorageNodeInput) -> Vec<u8> {
+    encode_storage_node_topology(storage_node)
+}
+
+fn encode_storage_node_full(storage_node: &StorageNodeInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.u32(1, storage_node.node_id);
+    encoder.string(2, &storage_node.process_id);
+    encoder.string(3, &storage_node.disk_id);
+    encoder.path(4, &storage_node.data_dir);
+    encoder.finish()
+}
+
+fn encode_endpoint_topology(endpoint: &EndpointInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &endpoint.id);
+    encoder.string(2, &endpoint.owner_process_id);
+    encoder.u8(3, endpoint_protocol_tag(endpoint.protocol));
+    encoder.u32(4, endpoint.priority);
+    encoder.string(5, &endpoint.advertise);
+    encoder.string(6, &endpoint.transport_profile_id);
+    encoder.optional_string(7, endpoint.tls_identity_id.as_deref());
+    encoder.optional_string(8, endpoint.tls_trust_bundle_id.as_deref());
+    encoder.optional_string(9, endpoint.tls_server_name.as_deref());
+    encoder.finish()
+}
+
+fn encode_endpoint_full(endpoint: &EndpointInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &endpoint.id);
+    encoder.string(2, &endpoint.owner_process_id);
+    encoder.u8(3, endpoint_protocol_tag(endpoint.protocol));
+    encoder.u32(4, endpoint.priority);
+    encoder.string(5, &endpoint.listen);
+    encoder.string(6, &endpoint.advertise);
+    encoder.string(7, &endpoint.transport_profile_id);
+    encoder.optional_string(8, endpoint.tls_identity_id.as_deref());
+    encoder.optional_string(9, endpoint.tls_trust_bundle_id.as_deref());
+    encoder.optional_string(10, endpoint.tls_server_name.as_deref());
+    encoder.finish()
+}
+
+fn encode_tls_identity_full(identity: &TlsIdentityInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &identity.id);
+    encoder.string(2, &identity.certificate_ref);
+    encoder.string(3, &identity.private_key_ref);
+    encoder.finish()
+}
+
+fn encode_tls_trust_bundle_full(bundle: &TlsTrustBundleInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &bundle.id);
+    encoder.string(2, &bundle.ca_bundle_ref);
+    encoder.finish()
+}
+
+fn encode_auth_credential_full(credential: &AuthCredentialInput) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.u8(1, auth_principal_tag(credential.principal));
+    encoder.optional_u64(2, credential.node_id);
+    encoder.optional_string(3, credential.instance_id.as_deref());
+    encoder.string(4, &credential.credential_id);
+    encoder.u64(5, credential.credential_version);
+    encoder.boolean(6, credential.use_for_signing);
+    encoder.u64(7, credential.accept_from_ms);
+    encoder.optional_u64(8, credential.accept_until_ms);
+    encoder.string(9, &credential.secret_ref);
+    encoder.finish()
+}
+
+fn encode_principal_identity(principal: &CredentialPrincipalKey) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.u8(1, auth_principal_tag(principal.principal));
+    match &principal.id {
+        CredentialPrincipalId::Node(node_id) => {
+            encoder.u8(2, 1);
+            encoder.u64(3, *node_id);
+        }
+        CredentialPrincipalId::Instance(instance_id) => {
+            encoder.u8(2, 2);
+            encoder.string(3, instance_id);
+        }
+    }
+    encoder.finish()
+}
+
+fn encode_initial_pg_acting_set(pg_id: usize, acting_set: &[u32]) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.u64(
+        1,
+        u64::try_from(pg_id).expect("validated PG index fits in u64"),
+    );
+    encoder.collection(
+        2,
+        acting_set
+            .iter()
+            .map(|node_id| node_id.to_be_bytes().to_vec()),
+    );
+    encoder.finish()
+}
+
+fn encode_raft_peer_endpoint(node_id: u64, endpoint: &str) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.u64(1, node_id);
+    encoder.string(2, endpoint);
+    encoder.finish()
+}
+
+fn required_principal_identities(
+    manifest: &StaticClusterManifestInput,
+) -> BTreeSet<CredentialPrincipalKey> {
+    let raft_nodes = manifest
+        .authorities
+        .iter()
+        .filter_map(|authority| authority.raft_node_id)
+        .collect();
+    let storage_nodes = manifest
+        .storage_nodes
+        .iter()
+        .map(|storage_node| u64::from(storage_node.node_id))
+        .collect();
+    let frontend_ids = manifest
+        .processes
+        .iter()
+        .filter_map(|process| process.frontend_instance_id.as_deref())
+        .collect();
+    let admin_ids = manifest
+        .processes
+        .iter()
+        .filter_map(|process| process.admin_instance_id.as_deref())
+        .collect();
+    let maintenance_ids = manifest
+        .processes
+        .iter()
+        .filter_map(|process| process.maintenance_instance_id.as_deref())
+        .collect();
+    required_auth_principals(
+        &raft_nodes,
+        &storage_nodes,
+        &frontend_ids,
+        &admin_ids,
+        &maintenance_ids,
+    )
+}
+
+const fn deployment_mode_tag(value: DeploymentMode) -> u8 {
+    match value {
+        DeploymentMode::Standalone => 1,
+        DeploymentMode::Replicated => 2,
+    }
+}
+
+const fn failure_domain_tag(value: FailureDomain) -> u8 {
+    match value {
+        FailureDomain::None => 1,
+        FailureDomain::Disk => 2,
+        FailureDomain::Host => 3,
+    }
+}
+
+const fn internal_auth_tag(value: InternalAuth) -> u8 {
+    match value {
+        InternalAuth::Required => 1,
+        InternalAuth::Disabled => 2,
+    }
+}
+
+const fn process_kind_tag(value: ProcessKind) -> u8 {
+    match value {
+        ProcessKind::AllInOne => 1,
+        ProcessKind::Frontend => 2,
+        ProcessKind::StorageNode => 3,
+        ProcessKind::Combined => 4,
+        ProcessKind::ControlPlane => 5,
+    }
+}
+
+const fn authority_kind_tag(value: AuthorityKind) -> u8 {
+    match value {
+        AuthorityKind::Single => 1,
+        AuthorityKind::RaftVoter => 2,
+    }
+}
+
+const fn endpoint_protocol_tag(value: EndpointProtocol) -> u8 {
+    match value {
+        EndpointProtocol::RaftPeer => 1,
+        EndpointProtocol::ControlPlane => 2,
+        EndpointProtocol::AuthorityClockRecovery => 3,
+        EndpointProtocol::StorageRpc => 4,
+    }
+}
+
+const fn auth_principal_tag(value: AuthPrincipal) -> u8 {
+    match value {
+        AuthPrincipal::RaftPeer => 1,
+        AuthPrincipal::StorageNode => 2,
+        AuthPrincipal::Frontend => 3,
+        AuthPrincipal::Admin => 4,
+        AuthPrincipal::Maintenance => 5,
+    }
 }
 
 pub(crate) fn load_static_cluster_manifest(
@@ -550,12 +1132,23 @@ fn validate_static_cluster_manifest(
         &authorities,
         &canonical_raft_peer_endpoints,
     )?;
+    let topology_digest = topology_digest(
+        &manifest,
+        &initial_pg_acting_sets,
+        &canonical_raft_peer_endpoints,
+    );
+    let process_identity_digest =
+        process_identity_digest(&manifest, selected_process_index, &topology_digest);
+    let full_config_fingerprint = full_config_fingerprint(&manifest);
 
     Ok(ValidatedStaticClusterManifest {
         manifest,
         selected_process_index,
         initial_pg_acting_sets,
         canonical_raft_peer_endpoints,
+        topology_digest,
+        process_identity_digest,
+        full_config_fingerprint,
     })
 }
 
@@ -2371,6 +2964,36 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
         input.replacen(from, to, 1)
     }
 
+    fn assert_only_full_fingerprint_changes(
+        baseline: &ValidatedStaticClusterManifest,
+        changed: &ValidatedStaticClusterManifest,
+    ) {
+        assert_eq!(changed.topology_digest(), baseline.topology_digest());
+        assert_eq!(
+            changed.process_identity_digest(),
+            baseline.process_identity_digest()
+        );
+        assert_ne!(
+            changed.full_config_fingerprint(),
+            baseline.full_config_fingerprint()
+        );
+    }
+
+    fn assert_topology_identity_changes(
+        baseline: &ValidatedStaticClusterManifest,
+        changed: &ValidatedStaticClusterManifest,
+    ) {
+        assert_ne!(changed.topology_digest(), baseline.topology_digest());
+        assert_ne!(
+            changed.process_identity_digest(),
+            baseline.process_identity_digest()
+        );
+        assert_ne!(
+            changed.full_config_fingerprint(),
+            baseline.full_config_fingerprint()
+        );
+    }
+
     #[test]
     fn static_cluster_manifest_parses_valid_standalone_shape() {
         let manifest = parse_static_cluster_manifest(&standalone_manifest(), "all-1").unwrap();
@@ -2400,6 +3023,193 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
             acting_set.len() == 3
                 && acting_set.iter().copied().collect::<BTreeSet<_>>() == BTreeSet::from([1, 2, 3])
         }));
+    }
+
+    #[test]
+    fn static_cluster_manifest_identity_has_stable_vectors() {
+        let standalone = parse_static_cluster_manifest(&standalone_manifest(), "all-1").unwrap();
+        assert_eq!(
+            (
+                standalone.topology_digest(),
+                standalone.process_identity_digest(),
+                standalone.full_config_fingerprint(),
+            ),
+            (
+                "0cb10dea5a8fb3748ead9a20bcb94dc6ab6792c1aaca0df08f4d6198f2d0e7ad",
+                "2a416fa124fc47f744e82a8d0aced25db403b21e571b25e453709f82839ae294",
+                "b628d1d43b3570afad9796232132c4314bf867b2b0c1e77ee0d29cfafde959af",
+            )
+        );
+
+        let replicated =
+            parse_static_cluster_manifest(&replicated_manifest(), "control-2").unwrap();
+        assert_eq!(
+            (
+                replicated.topology_digest(),
+                replicated.process_identity_digest(),
+                replicated.full_config_fingerprint(),
+            ),
+            (
+                "7350e19d22bdd52da757cc449d8c68ae38ebdc3118b0141b6a570346a0a0f5fb",
+                "8d6b71bed787aeb1f206d54118c50e81d48f6bbc4176aae7bea7dedcc53f1a3d",
+                "14fefe4097e94d42485566c17243f57b175a84dd033905f4f5cd5ebbe09f0c42",
+            )
+        );
+    }
+
+    #[test]
+    fn static_cluster_manifest_identity_is_collection_order_independent() {
+        let input: StaticClusterManifestInput = toml::from_str(&replicated_manifest()).unwrap();
+        let canonical = validate_static_cluster_manifest(input.clone(), "control-2").unwrap();
+        let mut reversed = input;
+        reversed.transport_profiles.reverse();
+        reversed.hosts.reverse();
+        reversed.disks.reverse();
+        reversed.processes.reverse();
+        reversed.authorities.reverse();
+        reversed.storage_nodes.reverse();
+        reversed.endpoints.reverse();
+        reversed.tls_identities.reverse();
+        reversed.tls_trust_bundles.reverse();
+        reversed.auth_credentials.reverse();
+        let reversed = validate_static_cluster_manifest(reversed, "control-2").unwrap();
+
+        assert_eq!(reversed.topology_digest(), canonical.topology_digest());
+        assert_eq!(
+            reversed.process_identity_digest(),
+            canonical.process_identity_digest()
+        );
+        assert_eq!(
+            reversed.full_config_fingerprint(),
+            canonical.full_config_fingerprint()
+        );
+    }
+
+    #[test]
+    fn static_cluster_manifest_topology_identity_covers_compatibility_fields() {
+        let source = replicated_manifest();
+        let baseline = parse_static_cluster_manifest(&source, "control-1").unwrap();
+        for changed in [
+            replace_once(
+                &source,
+                "id = \"replicated-cluster\"",
+                "id = \"replicated-cluster-next\"",
+            ),
+            replace_once(
+                &source,
+                "topology_generation = 7",
+                "topology_generation = 8",
+            ),
+            replace_once(
+                &source,
+                "failure_domain = \"host\"",
+                "failure_domain = \"disk\"",
+            ),
+            replace_once(&source, "pg_count = 16", "pg_count = 17"),
+            replace_once(&source, "rack = \"rack-1\"", "rack = \"rack-next\""),
+            source.replace("node_id = 101", "node_id = 111"),
+            source.replace("control-1-admin", "control-1-admin-next"),
+            source.replace("7401", "7491"),
+            replace_once(
+                &source,
+                "max_snapshot_bytes = 15728640",
+                "max_snapshot_bytes = 15728639",
+            ),
+        ] {
+            let changed = parse_static_cluster_manifest(&changed, "control-1").unwrap();
+            assert_topology_identity_changes(&baseline, &changed);
+        }
+    }
+
+    #[test]
+    fn static_cluster_manifest_durable_identity_excludes_rotation_and_local_tuning() {
+        let source = replicated_manifest();
+        let baseline = parse_static_cluster_manifest(&source, "control-1").unwrap();
+        for changed in [
+            replace_once(
+                &source,
+                "credential_id = \"raft-1\"",
+                "credential_id = \"raft-1-rotated\"",
+            ),
+            replace_once(
+                &source,
+                "credential_id = \"raft-1\"\ncredential_version = 1",
+                "credential_id = \"raft-1\"\ncredential_version = 2",
+            ),
+            replace_once(
+                &source,
+                "credential_id = \"raft-1\"\ncredential_version = 1\nuse_for_signing = true\naccept_from_ms = 0",
+                "credential_id = \"raft-1\"\ncredential_version = 1\nuse_for_signing = true\naccept_from_ms = 1",
+            ),
+            replace_once(
+                &source,
+                "secret_ref = \"file:/run/argmin-secrets/raft-1.key\"",
+                "secret_ref = \"file:/run/argmin-secrets/raft-1-next.key\"",
+            ),
+            replace_once(
+                &source,
+                "certificate_ref = \"file:/run/argmin-secrets/host-1.crt\"",
+                "certificate_ref = \"file:/run/argmin-secrets/host-1-next.crt\"",
+            ),
+            replace_once(
+                &source,
+                "state_path = \"/srv/argmin/control-1/control.state\"",
+                "state_path = \"/srv/argmin/control-1/relocated.state\"",
+            ),
+            replace_once(
+                &source,
+                "listen = \"tcp://0.0.0.0:7401\"",
+                "listen = \"tcp://127.0.0.1:7401\"",
+            ),
+            replace_once(
+                &source,
+                "connect_timeout_ms = 1000",
+                "connect_timeout_ms = 2000",
+            ),
+            replace_once(&source, "region = \"us-east-1\"", "region = \"us-west-2\""),
+        ] {
+            let changed = parse_static_cluster_manifest(&changed, "control-1").unwrap();
+            assert_only_full_fingerprint_changes(&baseline, &changed);
+        }
+
+        let verify_only = format!(
+            "{}{}",
+            replace_once(&standalone_manifest(), "auth_credentials = []", ""),
+            r#"
+[[auth_credentials]]
+principal = "storage-node"
+node_id = 1
+credential_id = "storage-1"
+credential_version = 1
+use_for_signing = false
+accept_from_ms = 10
+accept_until_ms = 20
+secret_ref = "file:/run/argmin-secrets/storage-1.key"
+"#
+        );
+        let signing = replace_once(
+            &verify_only,
+            "use_for_signing = false",
+            "use_for_signing = true",
+        );
+        let verify_only = parse_static_cluster_manifest(&verify_only, "all-1").unwrap();
+        let signing = parse_static_cluster_manifest(&signing, "all-1").unwrap();
+        assert_only_full_fingerprint_changes(&verify_only, &signing);
+    }
+
+    #[test]
+    fn static_cluster_manifest_process_identity_is_selection_specific() {
+        let first = parse_static_cluster_manifest(&replicated_manifest(), "control-1").unwrap();
+        let second = parse_static_cluster_manifest(&replicated_manifest(), "control-2").unwrap();
+        assert_eq!(first.topology_digest(), second.topology_digest());
+        assert_eq!(
+            first.full_config_fingerprint(),
+            second.full_config_fingerprint()
+        );
+        assert_ne!(
+            first.process_identity_digest(),
+            second.process_identity_digest()
+        );
     }
 
     #[test]

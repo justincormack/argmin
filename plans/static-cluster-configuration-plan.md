@@ -763,11 +763,17 @@ Progress as of 2026-07-19:
   capacity validation including metadata/auth overhead, production Raft
   compatibility validation plus append identity/auth overhead, standalone and
   complete three-host replicated fixtures, and the offline validation command.
+- Slice 2 is implemented: dedicated versioned canonical binary encoders produce
+  a cluster topology digest, selected-process durable identity digest, and full
+  unresolved-config fingerprint. Collections are identity-sorted, fields and
+  collection elements are explicitly tagged and length-delimited, fixed digest
+  vectors pin the encoding, and mutation tests distinguish topology/process
+  identity from credential, TLS, path, bind-address, region, and timeout
+  changes. The validation command emits the three redacted SHA-256 identities.
 - Selected-host filesystem/device checks remain with secret/filesystem
-  resolution rather than the structural parser. Slices 2 onward remain open:
-  no canonical digest, startup `ServerConfig` mapping, env-mode exclusion,
-  durable identity binding, secret resolution, or TCP transport is introduced
-  by Slice 1.
+  resolution rather than the structural parser. Slices 3 onward remain open:
+  no startup `ServerConfig` mapping, env-mode exclusion, durable identity
+  binding, secret resolution, or TCP transport is introduced by Slices 1-2.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;
