@@ -52,6 +52,242 @@ const METADATA_COMMAND_RESERVE_OBJECT_VERSION: u16 = 22;
 const METADATA_COMMAND_MARK_BUCKET_DELETING: u16 = 23;
 const METADATA_COMMAND_DELETE_FINALIZED_BUCKET: u16 = 24;
 
+/// The retry/convergence contract owned by a metadata-command publisher.
+///
+/// This is the authoritative transitional classification registry. The typed
+/// publisher APIs planned in `storage-boundary-compiler-enforcement-plan.md`
+/// will eventually make these classes part of the callable API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum MetadataCommandPublisherClass {
+    SnapshotSensitive,
+    ApplyValidated,
+    AllocatorCleanup,
+    TerminalSessionRetry,
+    MatchingOutcomeRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataCommandPublisherDescriptor {
+    pub(crate) canonical_name: &'static str,
+    pub(crate) command_kind: &'static str,
+    pub(crate) class: MetadataCommandPublisherClass,
+}
+
+macro_rules! define_metadata_command_publishers {
+    (
+        $(
+            $id:ident => ($canonical_name:literal, $command_kind:literal, $class:ident)
+        ),+ $(,)?
+    ) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub(crate) enum MetadataCommandPublisherId {
+            $($id),+
+        }
+
+        impl MetadataCommandPublisherId {
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$id),+];
+
+            pub(crate) const fn descriptor(self) -> MetadataCommandPublisherDescriptor {
+                match self {
+                    $(
+                        Self::$id => MetadataCommandPublisherDescriptor {
+                            canonical_name: $canonical_name,
+                            command_kind: $command_kind,
+                            class: MetadataCommandPublisherClass::$class,
+                        },
+                    )+
+                }
+            }
+        }
+    };
+}
+
+define_metadata_command_publishers! {
+    CreateBucket => (
+        "create_bucket_with_config_and_load_info",
+        "CreateBucket",
+        ApplyValidated
+    ),
+    BeginBucketDelete => (
+        "begin_bucket_delete",
+        "MarkBucketDeleting",
+        SnapshotSensitive
+    ),
+    DeleteBucketFromActingSet => (
+        "delete_bucket_from_acting_set",
+        "DeleteFinalizedBucket",
+        SnapshotSensitive
+    ),
+    PutBucketVersioning => (
+        "put_bucket_versioning_and_load_info",
+        "PutBucketVersioning",
+        SnapshotSensitive
+    ),
+    PutBucketAcl => (
+        "put_bucket_acl_and_load_info",
+        "PutBucketAcl",
+        SnapshotSensitive
+    ),
+    PutBucketProperty => (
+        "put_bucket_property_command_and_load_info",
+        "PutBucketProperty",
+        SnapshotSensitive
+    ),
+    PutBucketSubresource => (
+        "put_bucket_subresource_command_and_load_info",
+        "PutBucketSubresource",
+        SnapshotSensitive
+    ),
+    ReservePutObjectGeneration => (
+        "reserve_put_object_generation",
+        "ReserveObjectGeneration",
+        AllocatorCleanup
+    ),
+    ReserveNextObjectVersion => (
+        "reserve_next_object_version",
+        "ReserveObjectVersion",
+        AllocatorCleanup
+    ),
+    ReleaseObjectGenerationReservationCommandRequired => (
+        "release_object_generation_reservation_command_required",
+        "ReleaseObjectGeneration",
+        AllocatorCleanup
+    ),
+    ReleaseObjectGenerationReservation => (
+        "release_object_generation_reservation",
+        "ReleaseObjectGeneration",
+        AllocatorCleanup
+    ),
+    CommitDirectPutObjectFromPayloadShards => (
+        "commit_direct_put_object_from_payload_shards",
+        "CommitDirectPutObject",
+        SnapshotSensitive
+    ),
+    CreatePutObjectStreamSessionRecordUnderReservation => (
+        "create_put_object_stream_session_record_under_reservation",
+        "CreateStreamUpload",
+        SnapshotSensitive
+    ),
+    CommitStreamSegmentAppend => (
+        "commit_stream_segment_append",
+        "AppendStreamSegment",
+        ApplyValidated
+    ),
+    AbortStreamUploadSession => (
+        "abort_stream_upload_session",
+        "AbortStreamUpload",
+        TerminalSessionRetry
+    ),
+    PutObjectMetadataIf => (
+        "put_object_metadata_if",
+        "PutObjectMetadata",
+        SnapshotSensitive
+    ),
+    DeleteSpecificObjectVersionIf => (
+        "delete_specific_object_version_if",
+        "DeleteObjectVersion",
+        SnapshotSensitive
+    ),
+    DeleteCurrentObjectIf => (
+        "delete_current_object_if",
+        "DeleteObjectVersion",
+        SnapshotSensitive
+    ),
+    InsertCurrentDeleteMarkerIf => (
+        "insert_current_delete_marker_if",
+        "InsertDeleteMarker",
+        SnapshotSensitive
+    ),
+    ExpireCurrentObjectIfDue => (
+        "expire_current_object_if_due",
+        "DeleteObjectVersion/InsertDeleteMarker",
+        SnapshotSensitive
+    ),
+    DeleteNoncurrentLiveVersionsIfDue => (
+        "delete_noncurrent_live_versions_if_due",
+        "DeleteObjectVersion",
+        SnapshotSensitive
+    ),
+    DeleteExpiredDeleteMarkerIfDue => (
+        "delete_expired_delete_marker_if_due",
+        "DeleteObjectVersion",
+        SnapshotSensitive
+    ),
+    ReclaimObjectPayloadIfUnleased => (
+        "reclaim_object_payload_if_unleased",
+        "DeleteObjectPayloadReclaim",
+        SnapshotSensitive
+    ),
+    CreatePutObjectStreamSession => (
+        "create_put_object_stream_session",
+        "CreateStreamUpload",
+        SnapshotSensitive
+    ),
+    FinalizePutObjectStream => (
+        "finalize_put_object_stream",
+        "CommitDirectPutObject",
+        TerminalSessionRetry
+    ),
+    CreateMultipartUpload => (
+        "create_multipart_upload",
+        "CreateMultipartUpload",
+        SnapshotSensitive
+    ),
+    BeginUploadPartStreamSession => (
+        "begin_upload_part_stream_session",
+        "CreateStreamUpload",
+        SnapshotSensitive
+    ),
+    CreateUploadPartStreamSession => (
+        "create_upload_part_stream_session",
+        "CreateStreamUpload",
+        SnapshotSensitive
+    ),
+    EstablishMultipartCompletionBarrier => (
+        "establish_multipart_completion_barrier",
+        "AdvanceMultipartCompletionBarrier",
+        AllocatorCleanup
+    ),
+    CompleteMultipartUploadCommitSerialized => (
+        "complete_multipart_upload_commit_serialized",
+        "CommitMultipartObject",
+        MatchingOutcomeRetry
+    ),
+    FinalizeUploadPartStream => (
+        "finalize_upload_part_stream",
+        "CommitStreamPart",
+        TerminalSessionRetry
+    ),
+    AbortMultipartUploadLocked => (
+        "abort_multipart_upload_locked",
+        "AbortMultipartUpload",
+        TerminalSessionRetry
+    ),
+    AbortAuthorizedMultipartUploadLocked => (
+        "abort_authorized_multipart_upload_locked",
+        "AbortMultipartUpload",
+        TerminalSessionRetry
+    ),
+}
+
+/// Mark a production entry point as the owner of one registered publisher ID.
+///
+/// The boundary check mechanically pairs these markers with discovered
+/// pending-slot installation calls and rejects unregistered or dead entries.
+macro_rules! metadata_command_publisher {
+    ($id:ident) => {
+        const _: (
+            &'static [crate::metadata_command::MetadataCommandPublisherId],
+            crate::metadata_command::MetadataCommandPublisherDescriptor,
+        ) = (
+            crate::metadata_command::MetadataCommandPublisherId::ALL,
+            crate::metadata_command::MetadataCommandPublisherId::$id.descriptor(),
+        );
+    };
+}
+
+pub(crate) use metadata_command_publisher;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
 
@@ -3984,6 +4220,8 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::types::{
         ChecksumAlgorithm, ChecksumType, EcShape, MultipartChecksumConfig,
@@ -3992,6 +4230,59 @@ mod tests {
         SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN,
         SSE_S3_WRAP_NONCE_LEN,
     };
+
+    #[test]
+    fn metadata_command_publisher_registry_matches_guide() {
+        let registered = MetadataCommandPublisherId::ALL
+            .iter()
+            .map(|id| {
+                let descriptor = id.descriptor();
+                (
+                    descriptor.canonical_name.to_string(),
+                    (
+                        descriptor.command_kind.to_string(),
+                        format!("{:?}", descriptor.class),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            registered.len(),
+            MetadataCommandPublisherId::ALL.len(),
+            "canonical publisher names must be unique"
+        );
+
+        let guide = include_str!("../../../guides/metadata-command-stream.md");
+        let table = guide
+            .split("Current production pending-command publishers:")
+            .nth(1)
+            .expect("publisher table heading")
+            .split("Adding a production call site")
+            .next()
+            .expect("publisher table terminator");
+        let documented = table
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .map(|line| {
+                let columns = line.split('|').map(str::trim).collect::<Vec<_>>();
+                assert!(columns.len() >= 5, "malformed publisher table row: {line}");
+                (
+                    columns[1].trim_matches('`').to_string(),
+                    (
+                        columns[2].replace('`', ""),
+                        columns[3].trim_matches('`').to_string(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            documented.len(),
+            table.lines().filter(|line| line.starts_with("| `")).count(),
+            "guide publisher names must be unique"
+        );
+        assert_eq!(documented, registered);
+    }
 
     fn test_bucket_record(name: &str, generation: u64) -> BucketRecord {
         let owner = CanonicalUserId::from_principal("owner");

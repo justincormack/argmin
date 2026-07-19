@@ -1386,6 +1386,7 @@ impl super::StorageCluster {
         &self,
         config: &CreateBucketConfig<'_>,
     ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
+        crate::metadata_command::metadata_command_publisher!(CreateBucket);
         let bucket = BucketName::try_from(config.name).map_err(|reason| {
             MetadataError::InvalidBucketName {
                 reason: reason.to_string(),
@@ -2497,6 +2498,7 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
+        crate::metadata_command::metadata_command_publisher!(DeleteBucketFromActingSet);
         let _ = observability::event(
             super::TRACE_TARGET,
             "bucket_finalize_delete_start",
@@ -4512,6 +4514,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         expected_bucket_identity: BucketIdentityGenerations,
     ) -> Result<(), BucketWriteDrainError> {
+        crate::metadata_command::metadata_command_publisher!(BeginBucketDelete);
         let started = std::time::Instant::now();
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let _ = observability::emit_flight_event(
@@ -6538,6 +6541,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         state: BucketVersioningState,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        crate::metadata_command::metadata_command_publisher!(PutBucketVersioning);
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let primary_store = self
             .local_map
@@ -6741,6 +6745,7 @@ impl super::StorageCluster {
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        crate::metadata_command::metadata_command_publisher!(PutBucketAcl);
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let primary_store = self
             .local_map
@@ -6859,6 +6864,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         mutation: BucketPropertyMutation,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        crate::metadata_command::metadata_command_publisher!(PutBucketProperty);
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let primary_store = self
             .local_map
@@ -6998,6 +7004,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         mutation: BucketSubresourceMutation,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        crate::metadata_command::metadata_command_publisher!(PutBucketSubresource);
         if let BucketSubresourceMutation::Put { kind, aux, .. } = &mutation {
             if !kind.supports_aux(*aux) {
                 return Err(MetadataError::Db {
@@ -8104,6 +8111,7 @@ impl super::StorageCluster {
         requested_version_id: Option<VersionId>,
         mut action: impl FnMut(&StoredObject) -> Result<(T, VersionId, PutObjectMetadataMutation), E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(PutObjectMetadataIf);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
@@ -8668,6 +8676,7 @@ impl super::StorageCluster {
         version_id: VersionId,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(DeleteSpecificObjectVersionIf);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
@@ -8816,6 +8825,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(DeleteCurrentObjectIf);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
@@ -8986,6 +8996,7 @@ impl super::StorageCluster {
         owner: OwnerIdentity,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(InsertCurrentDeleteMarkerIf);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
@@ -9169,6 +9180,7 @@ impl super::StorageCluster {
         expected_bucket_incarnation_generation: u64,
         mut should_expire: impl FnMut(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
     ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(ExpireCurrentObjectIfDue);
         let Some(lifecycle_context) =
             self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
         else {
@@ -9455,6 +9467,7 @@ impl super::StorageCluster {
         expected_bucket_incarnation_generation: u64,
         mut select_versions: impl FnMut(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
     ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(DeleteNoncurrentLiveVersionsIfDue);
         let Some(lifecycle_context) =
             self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
         else {
@@ -9638,6 +9651,7 @@ impl super::StorageCluster {
         expected_bucket_incarnation_generation: u64,
         mut should_delete: impl FnMut(Option<&str>, &[StoredObject]) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(DeleteExpiredDeleteMarkerIfDue);
         let Some(lifecycle_context) =
             self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
         else {
@@ -10115,6 +10129,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<super::ObjectPayloadReclaimAttempt, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(ReclaimObjectPayloadIfUnleased);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let emit_outcome = |outcome: &'static str| {
             let _ = observability::emit_object_payload_reclaim_event(
@@ -10807,6 +10822,7 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateStreamUploadReq), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        crate::metadata_command::metadata_command_publisher!(CreatePutObjectStreamSession);
         enum Attempt<T> {
             Complete(T),
             Retry,
@@ -11004,6 +11020,7 @@ impl super::StorageCluster {
         bucket_write_reservation: BucketWriteReservationProof,
         mut action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(FinalizePutObjectStream);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let effective_bucket_write_reservation = bucket_write_reservation;
         let mut bucket_write_proof_command_owned = false;
@@ -11287,6 +11304,7 @@ impl super::StorageCluster {
         )
             -> Result<(T, CreateMultipartUploadReq, Option<MultipartUploadIdKey>), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
+        crate::metadata_command::metadata_command_publisher!(CreateMultipartUpload);
         enum Attempt<T> {
             Complete(CreateMultipartUploadOutcome<T>),
             Retry,
@@ -11474,6 +11492,7 @@ impl super::StorageCluster {
             &MultipartUploadRecord,
         ) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        crate::metadata_command::metadata_command_publisher!(BeginUploadPartStreamSession);
         let BeginUploadPartStreamSessionReq {
             bucket,
             key,
@@ -11610,6 +11629,7 @@ impl super::StorageCluster {
         part_number: u32,
         session_id: &SessionId,
     ) -> Result<SessionId, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(CreateUploadPartStreamSession);
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
@@ -11854,6 +11874,7 @@ impl super::StorageCluster {
         bucket_write_reservation: &BucketWriteReservationProof,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<u64, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(EstablishMultipartCompletionBarrier);
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let bucket_metadata_client = self
             .local_map
@@ -12080,6 +12101,9 @@ impl super::StorageCluster {
         &self,
         mut req: CompleteMultipartCommitRequest,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(
+            CompleteMultipartUploadCommitSerialized
+        );
         let bucket = req.bucket.clone();
         let key = req.key.clone();
         let upload_id = req.upload_id.clone();
@@ -12332,6 +12356,7 @@ impl super::StorageCluster {
         part_number: u32,
         mut action: impl FnMut(StreamUploadPartSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(FinalizeUploadPartStream);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
@@ -12889,6 +12914,7 @@ impl super::StorageCluster {
         drain_mode: AbortMultipartUploadDrainMode,
         expected_bucket_incarnation_generation: Option<u64>,
     ) -> Result<bool, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(AbortMultipartUploadLocked);
         'retry_after_pending_conflict: loop {
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if metadata_command_is_matching_multipart_abort(&command, bucket, key, upload_id) {
@@ -13028,6 +13054,7 @@ impl super::StorageCluster {
         pg_id: PgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<bool, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(AbortAuthorizedMultipartUploadLocked);
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;

@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: proposed
+Status: active — Phase 0 complete
 
 ## Goal
 
@@ -327,6 +327,36 @@ Completion:
 - every production publisher has one authoritative classification
 - duplicate or missing publisher classifications fail a Rust test/check
 - the guide and canonicalized publisher inventory agree with the registry
+
+Implementation update (2026-07-19):
+
+- production scans now consistently exclude nested `tests/` directories and
+  `*_tests.rs`, and recognize `node_client/local.rs` as the sanctioned local
+  adapter
+- publisher discovery uses one shared Rust-literal/comment-aware balanced-scope scanner
+  for both helper calls and live markers; a fixture proves arbitrarily named
+  inline `cfg(test)` modules and sanctioned `test-hooks` items cannot affect
+  either inventory, even with unmatched braces in comments or literals, while
+  comma-terminated test-only fields and enum variants do not corrupt later
+  function attribution, and an `any(test, feature = "live-feature")` publisher
+  remains production-visible
+- top-level function attribution no longer lets nested helpers replace their
+  owning production method
+- the pending-publisher and conflict inventories canonicalize implementation
+  wrappers and generic signatures to semantic publisher names
+- `MetadataCommandPublisherId` is the authoritative, duplicate-rejecting Rust
+  registry; every live publisher entry point carries a marker, the boundary
+  check rejects missing/dead markers, and a Rust test mechanically compares
+  the registry with the guide table
+- the refreshed inventories separately identify temporary migration
+  prohibitions, public raw surfaces, and semantic checks not yet enforced by
+  Rust
+- the audit found and classified the previously omitted
+  `delete_bucket_from_acting_set` / `DeleteFinalizedBucket` publisher as
+  `SnapshotSensitive`
+- `scripts/ci` now runs `scripts/check-storage-cluster-boundaries`
+- validation passed the boundary check, strict workspace Clippy, the focused
+  registry/guide test, and all 7,091 workspace tests
 
 ### Phase 1 — reduce the public storage surface
 

@@ -6159,6 +6159,7 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(ReservePutObjectGeneration);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mut work_budget =
             RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
@@ -6430,6 +6431,7 @@ impl StorageCluster {
         key: &ObjectKey,
         completion_admission: bool,
     ) -> Result<VersionId, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(ReserveNextObjectVersion);
         let mut work_budget = RequestWorkBudget::new(OBJECT_VERSION_RESERVATION_RETRY_BUDGET, None)
             .for_operation("reserve_object_version")
             .for_pg(pg_id);
@@ -7059,6 +7061,9 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(
+            ReleaseObjectGenerationReservationCommandRequired
+        );
         let mut work_budget =
             RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
                 .for_operation("release_object_generation")
@@ -7673,6 +7678,7 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(ReleaseObjectGenerationReservation);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mut work_budget =
             RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
@@ -7836,6 +7842,9 @@ impl StorageCluster {
         written_shards: &[WrittenShardAck],
         mut action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(
+            CommitDirectPutObjectFromPayloadShards
+        );
         let pg_id = PgId::new(self.object_metadata_pg_id(&req.bucket, &req.key));
         let effective_bucket_write_reservation = req.bucket_write_reservation.clone();
         let mut bucket_write_proof_command_owned = false;
@@ -8789,6 +8798,9 @@ impl StorageCluster {
         bucket_write_reservation: BucketWriteReservationProof,
         work_budget: &mut RequestWorkBudget,
     ) -> Result<BucketWriteReservationDisposition, ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(
+            CreatePutObjectStreamSessionRecordUnderReservation
+        );
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let request = CreateStreamUploadReq {
             session_id: session_id.clone(),
@@ -8965,6 +8977,7 @@ impl StorageCluster {
         request: StreamAppendCommitRequest<'_>,
         mut work_budget: RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(CommitStreamSegmentAppend);
         let StreamAppendCommitRequest {
             bucket,
             key,
@@ -9637,6 +9650,7 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
+        crate::metadata_command::metadata_command_publisher!(AbortStreamUploadSession);
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let mut pending_completed_session =
