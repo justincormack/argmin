@@ -1315,7 +1315,7 @@ impl super::StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.storage_node().get_pg(pg_id)
+        node.test_node().get_pg(pg_id)
     }
 
     fn list_objects_page(
@@ -1365,7 +1365,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_node()
+            .test_node()
             .try_probe_bucket_pg_available(bucket)
     }
 
@@ -1378,7 +1378,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_node()
+            .test_node()
             .try_probe_object_pg_available(bucket, key)
     }
 
@@ -11777,7 +11777,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_node()
+            .test_node()
             .try_load_in_progress_multipart_upload(bucket, key, upload_id)
     }
 
@@ -13812,7 +13812,7 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
-            let pg = node.storage_node().get_pg(pg_id.get())?;
+            let pg = node.test_node().get_pg(pg_id.get())?;
             pg.put_object_segments_reclaim(reclaim)?;
             pg.refresh_metadata_command_state_digest()?;
         }
@@ -13831,7 +13831,7 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
-            let pg = node.storage_node().get_pg(pg_id.get())?;
+            let pg = node.test_node().get_pg(pg_id.get())?;
             pg.put_multipart_reclaim(reclaim)?;
             pg.refresh_metadata_command_state_digest()?;
         }
@@ -13869,7 +13869,7 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .storage_node()
+            .test_node()
             .test_force_became_noncurrent_at(bucket, key, version_id, became_noncurrent_at)
     }
 
@@ -13973,7 +13973,7 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
-            node.storage_node()
+            node.test_node()
                 .test_set_upload_state(bucket, key, upload_id, state)?;
         }
         Ok(())
@@ -14003,9 +14003,9 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
-            node.storage_node()
+            node.test_node()
                 .test_force_stream_upload_created_at(bucket, key, session_id, created_at)?;
-            let pg = node.storage_node().get_pg(pg_id.get())?;
+            let pg = node.test_node().get_pg(pg_id.get())?;
             pg.refresh_metadata_command_state_digest()?;
         }
         Ok(())

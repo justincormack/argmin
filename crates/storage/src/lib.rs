@@ -80,7 +80,6 @@ pub use error::{
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
 pub(crate) use node::LocalStorageNode;
-pub(crate) use node::SharedStorageNode;
 #[cfg(feature = "test-hooks")]
 pub use node::{
     install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,

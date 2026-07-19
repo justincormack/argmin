@@ -21,12 +21,16 @@ use crate::metadata_command::MetadataCommandLogIndex;
 use crate::metadata_command::{
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandReplicaState,
 };
-use crate::node::{ReclaimQueueInsert, OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG};
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::node::SharedStorageNode;
+use crate::node::{
+    LocalNodeRuntime, ReclaimQueueInsert, OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG,
+};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node_client::StorageNodeClient;
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
-    LocalStorageNodeClient, LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandNodeClient,
+    LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandNodeClient,
     ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
     ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectPayloadLeaseNodeLease,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
@@ -40,7 +44,7 @@ use crate::pg_topology::PgTopology;
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError, ObjectKey, PgId,
     PgState, PlacedSegmentShardRepairWorkItem, ReclaimWorkItem, RouteMapValidity, ShardIndex,
-    ShardKey, SharedStorageNode, WriteAck, WrittenShardAck,
+    ShardKey, WriteAck, WrittenShardAck,
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
@@ -432,7 +436,7 @@ impl LocalUnixObjectListingMetadataNodeClientConfig {
 pub struct LocalNodeStore {
     node_id: NodeId,
     data_dir: PathBuf,
-    storage_node: Arc<SharedStorageNode>,
+    runtime: LocalNodeRuntime,
     #[cfg(any(test, feature = "test-hooks"))]
     storage_client: Arc<dyn StorageNodeClient>,
     object_payload_lease_client: Arc<dyn ObjectPayloadLeaseNodeClient>,
@@ -454,56 +458,30 @@ pub struct LocalNodeStore {
 }
 
 impl LocalNodeStore {
-    fn new(node_id: NodeId, data_dir: PathBuf, storage_node: Arc<SharedStorageNode>) -> Self {
-        let local_client = Arc::new(LocalStorageNodeClient::new(
-            node_id,
-            Arc::clone(&storage_node),
-        ));
-        #[cfg(any(test, feature = "test-hooks"))]
-        let storage_client: Arc<dyn StorageNodeClient> = local_client.clone();
-        let object_payload_lease_client: Arc<dyn ObjectPayloadLeaseNodeClient> =
-            local_client.clone();
-        let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = local_client.clone();
-        let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =
-            local_client.clone();
-        let object_generation_metadata_client: Arc<dyn ObjectGenerationMetadataNodeClient> =
-            local_client.clone();
-        let object_version_metadata_client: Arc<dyn ObjectVersionMetadataNodeClient> =
-            local_client.clone();
-        let direct_put_metadata_client: Arc<dyn DirectPutMetadataNodeClient> = local_client.clone();
-        let object_listing_metadata_client: Arc<dyn ObjectListingMetadataNodeClient> =
-            local_client.clone();
-        let object_mutation_metadata_client: Arc<dyn ObjectMutationMetadataNodeClient> =
-            local_client.clone();
-        let object_read_metadata_client: Arc<dyn ObjectReadMetadataNodeClient> =
-            local_client.clone();
-        let metadata_command_client: Arc<dyn MetadataCommandNodeClient> = local_client.clone();
-        let shard_client: Arc<dyn PlacedShardNodeClient> = local_client.clone();
-        let shard_ack_client: Arc<dyn ShardAckNodeClient> = local_client.clone();
-        let shard_read_handle_client: Arc<dyn ShardReadHandleNodeClient> = local_client.clone();
-        let shard_scavenger_client: Arc<dyn ShardScavengerNodeClient> = local_client;
+    fn new(node_id: NodeId, data_dir: PathBuf, runtime: LocalNodeRuntime) -> Self {
+        let clients = runtime.clients();
         Self {
             node_id,
             data_dir,
-            storage_node,
+            runtime,
             #[cfg(any(test, feature = "test-hooks"))]
-            storage_client,
-            object_payload_lease_client,
-            bucket_metadata_client,
+            storage_client: clients.storage,
+            object_payload_lease_client: clients.object_payload_lease,
+            bucket_metadata_client: clients.bucket_metadata,
             bucket_metadata_unix_socket_path: None,
-            bucket_write_reservation_client,
+            bucket_write_reservation_client: clients.bucket_write_reservation,
             bucket_write_reservation_unix_socket_path: None,
-            object_generation_metadata_client,
-            object_version_metadata_client,
-            direct_put_metadata_client,
-            object_listing_metadata_client,
-            object_mutation_metadata_client,
-            object_read_metadata_client,
-            metadata_command_client,
-            shard_client,
-            shard_ack_client,
-            shard_read_handle_client,
-            shard_scavenger_client,
+            object_generation_metadata_client: clients.object_generation_metadata,
+            object_version_metadata_client: clients.object_version_metadata,
+            direct_put_metadata_client: clients.direct_put_metadata,
+            object_listing_metadata_client: clients.object_listing_metadata,
+            object_mutation_metadata_client: clients.object_mutation_metadata,
+            object_read_metadata_client: clients.object_read_metadata,
+            metadata_command_client: clients.metadata_command,
+            shard_client: clients.shard,
+            shard_ack_client: clients.shard_ack,
+            shard_read_handle_client: clients.shard_read_handle,
+            shard_scavenger_client: clients.shard_scavenger,
         }
     }
 
@@ -512,8 +490,8 @@ impl LocalNodeStore {
         pg_ids: &[u32],
         default_ec_shape: EcShape,
     ) -> Result<Self, StoreError> {
-        let storage_node = Arc::new(SharedStorageNode::topology_only(pg_ids, default_ec_shape)?);
-        Ok(Self::new(node_id, PathBuf::new(), storage_node))
+        let runtime = LocalNodeRuntime::topology_only(node_id, pg_ids, default_ec_shape)?;
+        Ok(Self::new(node_id, PathBuf::new(), runtime))
     }
 
     pub(crate) fn node_id(&self) -> NodeId {
@@ -525,8 +503,18 @@ impl LocalNodeStore {
         &self.data_dir
     }
 
-    pub(crate) fn storage_node(&self) -> &Arc<SharedStorageNode> {
-        &self.storage_node
+    fn runtime(&self) -> &LocalNodeRuntime {
+        &self.runtime
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_node(&self) -> &Arc<SharedStorageNode> {
+        self.runtime.test_node()
+    }
+
+    #[cfg(test)]
+    fn storage_node(&self) -> &Arc<SharedStorageNode> {
+        self.test_node()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1530,7 +1518,7 @@ impl LocalClusterMap {
                 RouteMapValidity::Forever,
             ),
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
-            process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
+            process_local_registry_key: metadata_primary.runtime().process_local_registry_key(),
             nodes,
         })
     }
@@ -1622,7 +1610,7 @@ impl LocalClusterMap {
                 route_map_validity,
             ),
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
-            process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
+            process_local_registry_key: metadata_primary.runtime().process_local_registry_key(),
             nodes,
         })
     }
@@ -1824,7 +1812,8 @@ impl LocalClusterMap {
 
         let mut nodes = BTreeMap::new();
         for (node_id, canonical_data_dir) in validated_configs {
-            let storage_node = SharedStorageNode::open_with_default_ec_shape(
+            let runtime = LocalNodeRuntime::open(
+                node_id,
                 &canonical_data_dir,
                 &storage_pg_ids,
                 default_ec_shape,
@@ -1835,7 +1824,7 @@ impl LocalClusterMap {
             })?;
             nodes.insert(
                 node_id,
-                LocalNodeStore::new(node_id, canonical_data_dir, Arc::new(storage_node)),
+                LocalNodeStore::new(node_id, canonical_data_dir, runtime),
             );
         }
         // Recovery phase A: clean epoch-mismatched orphan pending command slots
@@ -1848,8 +1837,8 @@ impl LocalClusterMap {
         if validate_local_metadata_command_replay {
             for (node_id, store) in &nodes {
                 store
-                    .storage_node()
-                    .prepare_pg_metadata_command_recovery(*node_id)
+                    .runtime()
+                    .prepare_metadata_command_recovery(*node_id)
                     .map_err(|source| ClusterBuildError::OpenLocalNode {
                         node_id: node_id.as_u32(),
                         source,
@@ -1867,8 +1856,8 @@ impl LocalClusterMap {
         if validate_local_metadata_command_replay {
             for (node_id, store) in &nodes {
                 store
-                    .storage_node()
-                    .recover_pg_metadata_command_state(*node_id)
+                    .runtime()
+                    .recover_metadata_command_state(*node_id)
                     .map_err(|source| ClusterBuildError::OpenLocalNode {
                         node_id: node_id.as_u32(),
                         source,
@@ -1894,7 +1883,7 @@ impl LocalClusterMap {
                 RouteMapValidity::Forever,
             ),
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
-            process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
+            process_local_registry_key: metadata_primary.runtime().process_local_registry_key(),
             nodes,
         })
     }
@@ -2913,7 +2902,7 @@ impl LocalClusterMap {
         F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, StoreError>,
     {
         self.metadata_primary()
-            .storage_node()
+            .runtime()
             .write_erasure_coded_segment_shards_with(
                 segment_okh,
                 segment_vid,
@@ -3147,7 +3136,7 @@ impl LocalClusterMap {
             .metadata_pg_primary_node(self.epoch, pg_id)
             .expect("test PG primary should be routable");
         let pg = primary
-            .storage_node()
+            .test_node()
             .get_pg(pg_id.get())
             .expect("test PG primary should have the PG");
         let max_log_index = pg
@@ -4270,7 +4259,7 @@ fn release_open_metadata_command_bucket_write_reservation(
         .values()
         .next()
         .expect("local cluster must contain at least one node")
-        .storage_node()
+        .runtime()
         .pg_topology();
     let bucket_pg_id = PgId::new(topology.bucket_pg_for(&proof.bucket));
     let primary_node_id = pg_routes
@@ -4360,7 +4349,7 @@ fn validate_open_metadata_command_bucket_write_reservation(
         .values()
         .next()
         .expect("local cluster must contain at least one node")
-        .storage_node()
+        .runtime()
         .pg_topology();
     let bucket_pg_id = PgId::new(topology.bucket_pg_for(&proof.bucket));
     let primary_node_id = pg_routes

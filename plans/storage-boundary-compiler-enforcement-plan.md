@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–1 complete
+Status: active — Phases 0–1 complete; Phase 2 in progress
 
 ## Goal
 
@@ -441,6 +441,34 @@ Completion:
 - cluster/request code cannot compile a raw shard-file or `PgStore` call
 - only the local adapter and storage-node server can reach raw node operations
 - direct shard-I/O and direct `PgMetadataStore` textual scans are retired
+
+Implementation update (2026-07-19):
+
+- `LocalNodeStore` no longer stores or constructs an
+  `Arc<SharedStorageNode>`. It owns an opaque `LocalNodeRuntime`, created by
+  the node implementation, plus only the same node-client trait objects used
+  by Unix-backed routes.
+- `LocalNodeRuntime` is the sole cluster-side production factory for the
+  concrete local adapter. It returns a bundle of trait objects, so cluster
+  construction cannot obtain or name `LocalStorageNodeClient`.
+- the remaining startup recovery, process-local identity, topology lookup,
+  and erasure-code encoding calls are explicit narrow runtime capabilities;
+  production cluster/request code has no raw-node accessor. Existing raw
+  inspection remains available only under `cfg(test)` or `test-hooks`.
+- direct raw-node calls in request operations were replaced by the test-only
+  accessor, preserving the internal fault-injection and durable-state tests
+  without exposing that path in production builds.
+- moving `node_client/local.rs` alone under `node` is not a sound boundary:
+  it currently depends on a large private snapshot/validation helper unit in
+  `node_client.rs`, while `storage_node_server.rs` also constructs the local
+  adapter. A file-only move would require widening raw `PgStore` helpers to
+  the crate or duplicating them. The next structural slice will instead move
+  the local adapter, its private local-store helpers, and the storage-node
+  server beneath one private node-runtime parent (leaving shared client
+  contracts and Unix codecs in `node_client`), then narrow
+  `SharedStorageNode` to that subtree.
+- the transitional boundary check, strict all-target/all-feature Clippy, and
+  the full 7,106-test nextest suite pass for this slice.
 
 ### Phase 3 — adopt role-specific PG IDs and route capabilities
 

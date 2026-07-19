@@ -4768,7 +4768,7 @@ impl StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     fn metadata_primary_bridge_node(&self) -> Result<&SharedStorageNode, StoreError> {
         self.require_current_metadata_primary_bridge_epoch()?;
-        Ok(self.local_map.metadata_primary().storage_node().as_ref())
+        Ok(self.local_map.metadata_primary().test_node().as_ref())
     }
 
     fn try_install_pending_metadata_command_for_bucket(

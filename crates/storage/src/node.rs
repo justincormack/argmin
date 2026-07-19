@@ -28,6 +28,15 @@ use crate::metadata_command::{
     CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
     MetadataCommandPayload,
 };
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::node_client::StorageNodeClient;
+use crate::node_client::{
+    BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
+    LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
+    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
+    ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
+    PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
+};
 use crate::pg_store::{
     PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReferences, PgStore,
     PgStoreRecoveryContext, ScavengerShardFileScan,
@@ -366,6 +375,132 @@ pub struct SharedStorageNode {
     object_payload_leases: Mutex<ObjectPayloadLeaseState>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
     ec_write_states: Mutex<HashMap<EcShape, Arc<StorageEcWriteState>>>,
+}
+
+/// Opaque process-local node runtime used by the cluster facade.
+///
+/// Cluster routing receives only the node-client adapter plus the small set of
+/// startup and encoding operations that cannot yet flow through a node-client
+/// trait. The raw [`SharedStorageNode`] never reaches cluster routing in
+/// production builds.
+#[derive(Clone)]
+pub(crate) struct LocalNodeRuntime {
+    node: Arc<SharedStorageNode>,
+    client: Arc<LocalStorageNodeClient>,
+}
+
+pub(crate) struct LocalNodeClients {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) storage: Arc<dyn StorageNodeClient>,
+    pub(crate) object_payload_lease: Arc<dyn ObjectPayloadLeaseNodeClient>,
+    pub(crate) bucket_metadata: Arc<dyn BucketMetadataNodeClient>,
+    pub(crate) bucket_write_reservation: Arc<dyn BucketWriteReservationNodeClient>,
+    pub(crate) object_generation_metadata: Arc<dyn ObjectGenerationMetadataNodeClient>,
+    pub(crate) object_version_metadata: Arc<dyn ObjectVersionMetadataNodeClient>,
+    pub(crate) direct_put_metadata: Arc<dyn DirectPutMetadataNodeClient>,
+    pub(crate) object_listing_metadata: Arc<dyn ObjectListingMetadataNodeClient>,
+    pub(crate) object_mutation_metadata: Arc<dyn ObjectMutationMetadataNodeClient>,
+    pub(crate) object_read_metadata: Arc<dyn ObjectReadMetadataNodeClient>,
+    pub(crate) metadata_command: Arc<dyn MetadataCommandNodeClient>,
+    pub(crate) shard: Arc<dyn PlacedShardNodeClient>,
+    pub(crate) shard_ack: Arc<dyn ShardAckNodeClient>,
+    pub(crate) shard_read_handle: Arc<dyn ShardReadHandleNodeClient>,
+    pub(crate) shard_scavenger: Arc<dyn ShardScavengerNodeClient>,
+}
+
+impl LocalNodeRuntime {
+    pub(crate) fn open(
+        node_id: NodeId,
+        data_dir: &Path,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+    ) -> Result<Self, StoreError> {
+        let node = Arc::new(SharedStorageNode::open_with_default_ec_shape(
+            data_dir,
+            pg_ids,
+            default_ec_shape,
+        )?);
+        Ok(Self::from_node(node_id, node))
+    }
+
+    pub(crate) fn topology_only(
+        node_id: NodeId,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+    ) -> Result<Self, StoreError> {
+        let node = Arc::new(SharedStorageNode::topology_only(pg_ids, default_ec_shape)?);
+        Ok(Self::from_node(node_id, node))
+    }
+
+    fn from_node(node_id: NodeId, node: Arc<SharedStorageNode>) -> Self {
+        let client = Arc::new(LocalStorageNodeClient::new(node_id, Arc::clone(&node)));
+        Self { node, client }
+    }
+
+    pub(crate) fn clients(&self) -> LocalNodeClients {
+        LocalNodeClients {
+            #[cfg(any(test, feature = "test-hooks"))]
+            storage: self.client.clone(),
+            object_payload_lease: self.client.clone(),
+            bucket_metadata: self.client.clone(),
+            bucket_write_reservation: self.client.clone(),
+            object_generation_metadata: self.client.clone(),
+            object_version_metadata: self.client.clone(),
+            direct_put_metadata: self.client.clone(),
+            object_listing_metadata: self.client.clone(),
+            object_mutation_metadata: self.client.clone(),
+            object_read_metadata: self.client.clone(),
+            metadata_command: self.client.clone(),
+            shard: self.client.clone(),
+            shard_ack: self.client.clone(),
+            shard_read_handle: self.client.clone(),
+            shard_scavenger: self.client.clone(),
+        }
+    }
+
+    pub(crate) fn process_local_registry_key(&self) -> usize {
+        Arc::as_ptr(&self.node) as usize
+    }
+
+    pub(crate) fn prepare_metadata_command_recovery(
+        &self,
+        node_id: NodeId,
+    ) -> Result<(), StoreError> {
+        self.node.prepare_pg_metadata_command_recovery(node_id)
+    }
+
+    pub(crate) fn recover_metadata_command_state(&self, node_id: NodeId) -> Result<(), StoreError> {
+        self.node.recover_pg_metadata_command_state(node_id)
+    }
+
+    pub(crate) fn pg_topology(&self) -> &PgTopology {
+        self.node.pg_topology()
+    }
+
+    pub(crate) fn write_erasure_coded_segment_shards_with<F>(
+        &self,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        data: &[u8],
+        ec: EcShape,
+        write_shards: F,
+    ) -> Result<Vec<crate::WrittenShardAck>, StoreError>
+    where
+        F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, StoreError>,
+    {
+        self.node.write_erasure_coded_segment_shards_with(
+            segment_okh,
+            segment_vid,
+            data,
+            ec,
+            write_shards,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_node(&self) -> &Arc<SharedStorageNode> {
+        &self.node
+    }
 }
 
 type ReclaimRoot = (BucketName, ObjectKey, GenerationId);
