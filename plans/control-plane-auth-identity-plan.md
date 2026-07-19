@@ -16,7 +16,10 @@ identity for trusted cluster components.
 Phase 12.3 added a Raft peer frame identity envelope that binds
 cluster/source/target fields to the configured peer map. That is necessary but
 not sufficient: any process with access to the peer socket can claim those
-fields. The same shape exists elsewhere in the control plane:
+fields. The static cluster-configuration/TCP slice further binds topology
+generation and digest into this authenticated frame identity so fresh peers
+with incompatible manifests fail before OpenRaft dispatch. The same shape
+exists elsewhere in the control plane:
 
 - a storage node reports heartbeat, endpoint, incarnation, history floor, and
   peering observations;
@@ -107,6 +110,17 @@ plane needs it. The envelope is still described in terms of credential
 id/version and MAC/signature coverage so a later asymmetric or mTLS-backed
 credential can replace the primitive without changing the identity model.
 
+These symmetric credentials authenticate and integrity-protect the canonical
+envelope; they do not encrypt its payload. Unix transport gets confidentiality
+from the local kernel/filesystem boundary. Non-local TCP transport additionally
+uses TLS for confidentiality and server endpoint authentication while retaining
+the symmetric envelope for Argmin principal, role, operation, and freshness
+authorization. The initial TCP configuration uses an explicit trust bundle,
+normally a private cluster CA but optionally an explicitly selected public-PKI
+bundle, rather than silently inheriting ambient roots. Certificate issuance,
+trust, and rotation are defined in
+[static-cluster-configuration-plan.md](static-cluster-configuration-plan.md).
+
 The usable signing/verifying material should be scoped by principal and role.
 This is a credential-capability boundary, not a requirement to split roles into
 separate OS processes: one Argmin process may legitimately host multiple
@@ -177,7 +191,9 @@ Env vars are adequate for the first experimental slices and focused tests, but
 the full TCP plus secret-distribution/rotation shape will outgrow flat env
 configuration. The TCP/configuration slice should introduce an optional
 configuration file, and production-shaped TCP mode may require one. That file
-should be able to describe:
+uses the versioned manifest and validation contract in
+[static-cluster-configuration-plan.md](static-cluster-configuration-plan.md)
+and should be able to describe:
 
 - cluster identity and transport listeners;
 - Raft peer, storage-node, frontend, admin, and local-maintenance principals;
@@ -189,9 +205,11 @@ should be able to describe:
 - peer endpoint identity and restart-artifact identity checks already required
   by the multihost/Raft plan.
 
-The existing env vars can remain as lightweight overrides/test fixtures, but
-they should not be the only production configuration surface once TCP and
-credential rotation are in scope.
+The existing env vars may remain only as a separate env-only standalone/test
+input mode and as inputs to test manifest-generation helpers. They are never
+overrides when `ARGMIN_CLUSTER_CONFIG_PATH` is active; mixed manifest/env
+cluster identity, endpoint, topology, or credential configuration fails
+startup before digest computation or listener construction.
 
 To make authenticated tests practical, add shared test helpers before broad
 test conversion. A helper such as `TestControlPlaneAuth::new(cluster_id)`
@@ -400,7 +418,8 @@ bounded/versioned frame boundary and are explicitly in Phase 12.4.
 Required:
 
 - bind auth to existing Raft peer frame identity: cluster, source node, target
-  node, and frame kind;
+  node, and frame kind, and extend configured-manifest mode with topology
+  generation/digest before TCP graduation;
 - cover append/vote/pre-vote/snapshot/transfer-leader payload bytes;
 - fail before OpenRaft dispatch on missing or bad auth;
 - expose peer-auth failure counts/reasons through replicated authority status

@@ -12204,6 +12204,11 @@ Supported deployment modes, replicated topologies, and gating:
 
 Post-12.4 sequencing for TCP transport and production-shaped config:
 
+- The initial versioned manifest schema, validation contract, canonical digest
+  boundaries, secret-reference model, and implementation slices are defined in
+  [static-cluster-configuration-plan.md](static-cluster-configuration-plan.md).
+  Treat that document as the normative config-file contract for the static
+  TCP/reference-workload work below.
 - Resolve the critical control-plane write-amplification and history-size
   blocker above before replicated-mode production cutover. TCP/auth/config work
   may proceed in parallel, but it must not cause the expensive
@@ -12251,8 +12256,11 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   storage transport listeners, Raft and storage-node endpoints, scoped
   role/principal credential ids/versions and secret references, rotation
   windows, auth requirement modes for standalone only, and the existing
-  restart-artifact/peer-policy identity checks. Env vars may remain as test
-  overrides and local shortcuts.
+  restart-artifact/peer-policy identity checks. Env vars may remain only as a
+  separate env-only standalone/test mode or as inputs to test manifest
+  generators. They never override any manifest field when
+  `ARGMIN_CLUSTER_CONFIG_PATH` is active; mixed input fails closed before
+  digest computation, state opening, or listener construction.
 - Add a **transport-independent storage RPC authentication and authorization
   slice before TCP**. Define a bounded/versioned envelope over the existing
   storage RPC payload and response frames, bind cluster/source/target identity,
