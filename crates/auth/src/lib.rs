@@ -19,6 +19,7 @@ pub mod canonical;
 pub mod credential;
 mod encoding;
 pub mod error;
+pub mod identity;
 pub mod post;
 pub mod request;
 pub mod sigv4;
@@ -64,6 +65,11 @@ pub use credential::{
     AuthorizationProfile, CredentialRecord, CredentialScope, CredentialStore, SecretKey,
 };
 pub use error::{AuthError, SignatureMismatchDiagnostics};
+pub use identity::{
+    AssumedRoleId, AssumedRoleSessionArn, AssumedRoleSessionIdentity, AuthenticatedIdentity,
+    AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleArn, IamRoleIdentity, IdentityError,
+    PrincipalIdentity, RoleName, RoleSessionName, SessionLifetime, SourceIdentity, StableRoleId,
+};
 pub use post::{
     authenticate_post_sigv4, prepare_post_policy, validate_post_policy,
     validate_prepared_post_policy_size, ExpectedCredentialScope, PostPolicyError, PostSigV4Request,
