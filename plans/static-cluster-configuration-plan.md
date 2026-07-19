@@ -1,6 +1,6 @@
 # Static Cluster Configuration Plan
 
-Status: schema definition for review
+Status: implementation in progress
 
 Related plans:
 
@@ -89,6 +89,17 @@ construct manifests directly or write temporary files; there is no production
 The file is read once at startup. Reload requires a process restart until an
 explicit dynamic configuration protocol exists.
 
+The schema/parser slice also exposes an offline structural validation command:
+
+```text
+argmin-s3 validate-cluster-config /etc/argmin/cluster.toml control-1
+```
+
+It performs the same bounded parse, reference, role, endpoint, authentication,
+and deployment-policy validation as startup will use, and emits only redacted
+cluster/process identity diagnostics. It does not resolve secret bytes, open
+mutable state, or start listeners.
+
 ## Version 1 TOML Shape
 
 The following example is a three-host replicated deployment with EC 2+1 and
@@ -119,7 +130,7 @@ initial_cluster_epoch = 1
 [raft]
 max_append_entries = 64
 max_append_bytes = 8388608
-max_snapshot_bytes = 16777216
+max_snapshot_bytes = 15728640
 
 [[transport_profiles]]
 id = "control-plane"
@@ -537,6 +548,14 @@ endpoint for remote clients. `priority` is nonzero and unique within
 out unusable transports first, then tries candidates by `(priority, endpoint
 id)`. Endpoint-list input order has no semantic effect.
 
+The canonical Raft membership peer map resolves one endpoint per voter that is
+reachable from every configured voter before applying priority. If any voter is
+on another host, that target's Unix candidates are ineligible and the preferred
+TCP candidate is selected even when a Unix candidate has a lower priority
+number. Production compatibility and encoded-membership capacity validation use
+this resolved map; the validated model retains it for startup and later digest
+construction.
+
 For a Unix endpoint, every configured client process must share the endpoint
 owner's host. Unix candidates are simply ineligible to clients on another host;
 the owner must have a TCP candidate for every required cross-host relationship.
@@ -548,10 +567,15 @@ Transport profiles are uniquely named and bounded by hard-coded protocol
 minimum compatibility requirements and allocation ceilings before allocation.
 Version 1 accepts only limits supported by the corresponding existing protocol
 implementation; a config value cannot silently raise a compile-time allocation
-ceiling. The Raft policy must support exactly the configured OpenRaft
-append-entry count and byte policy; a command accepted into the leader log must
-fit the configured single-entry share, and the peer frame must carry the
-complete configured batch.
+ceiling. The first implementation requires the live production replication
+values of 64 append entries, 8 MiB encoded append payload, and a 16 MiB peer
+frame, and invokes the storage authority's compatibility validator against the
+resolved peer map for every Raft endpoint profile. A command accepted into the
+leader log must fit the configured single-entry share, and the peer frame must
+carry the complete configured batch. Every Raft peer frame limit must also carry
+`max_snapshot_bytes` plus bounded snapshot metadata, voter endpoints,
+cluster/topology identity, and authentication-envelope overhead. Equality
+between the raw snapshot and frame limits is therefore invalid.
 
 Standalone mode requires:
 
@@ -564,6 +588,7 @@ Standalone mode requires:
 
 Replicated mode requires:
 
+- no `all-in-one` process; that topology is standalone-only;
 - `failure_domain` of `disk` or `host`;
 - `failure_tolerance >= 1`;
 - `ec_parity_shards >= failure_tolerance`;
@@ -584,7 +609,9 @@ also attest the intended disk/host mapping.
 
 The parser computes the deterministic initial placement using the same
 production placement implementation and validates every PG before any listener,
-state file, or data directory is opened.
+state file, or data directory is opened. The validated model retains the
+resulting acting sets so startup cannot substitute a different unverified
+placement.
 
 `cluster.id` is the stable cluster namespace, but it is not sufficient by
 itself to authorize peer traffic. It replaces separate config-file notions of
@@ -695,9 +722,12 @@ tuning remain in the full fingerprint instead.
 
 ## File And Parser Safety
 
-Before allocation, startup checks that the manifest is a regular file no larger
-than 4 MiB. UTF-8 is required. TOML unknown fields and duplicate keys are
-errors. The parser rejects:
+Before allocation, startup atomically opens the manifest with no symlink
+following and checks that the opened object is a regular file no larger than 4
+MiB. UTF-8 is required. TOML unknown fields and duplicate keys are errors.
+Parser diagnostics expose only a redacted category and byte location, never the
+raw parser message, unknown field name, enum value, or quoted source excerpt.
+The parser rejects:
 
 - unsupported schema versions;
 - missing required sections;
@@ -721,6 +751,23 @@ migration. An unsupported version is rejected rather than guessed or partially
 loaded.
 
 ## Implementation Slices
+
+Progress as of 2026-07-19:
+
+- Slice 1 is implemented: the manifest has strict version-1 TOML input types,
+  a 4 MiB bounded atomic no-follow regular-file loader, closed enums and
+  unknown-field rejection, canonical collection and endpoint ordering, an
+  immutable validated model, parser-message and debug redaction,
+  topology/reference/role/global-host-path/endpoint/auth/deployment validation,
+  per-PG production-placer validation retained in the model, snapshot transport
+  capacity validation including metadata/auth overhead, production Raft
+  compatibility validation plus append identity/auth overhead, standalone and
+  complete three-host replicated fixtures, and the offline validation command.
+- Selected-host filesystem/device checks remain with secret/filesystem
+  resolution rather than the structural parser. Slices 2 onward remain open:
+  no canonical digest, startup `ServerConfig` mapping, env-mode exclusion,
+  durable identity binding, secret resolution, or TCP transport is introduced
+  by Slice 1.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;
@@ -775,18 +822,27 @@ The schema/parser release gate includes:
 - duplicate ids, paths, endpoints, credential identities, and references;
 - path uniqueness scoped by host, repeated remote-host paths, and selected-host
   filesystem validation without remote filesystem probing;
+- authority state and storage data path collisions across roles on one host;
 - selected process missing or incompatible with its hosted role;
 - mixed file/env mode rejection;
 - oversized, non-UTF-8, truncated, and malformed TOML;
-- secret and debug redaction;
+- secret, unknown-field-name, unknown-enum-value, parser-message, and debug
+  redaction;
 - relative/escaping state and data paths;
+- symlinked manifest rejection at the open boundary;
+- noncanonical Unix and TCP endpoint URI rejection;
+- lower-priority-number local Unix Raft candidate plus globally reachable TCP
+  fallback resolves to TCP in a multihost peer map;
 - Unix endpoint referenced across hosts;
 - TCP without auth or TLS;
 - replicated auth disabled;
 - standalone EC other than 1+0;
 - replicated `m < f`, insufficient storage domains, and insufficient voters;
+- replicated all-in-one process rejection;
 - voter/storage placement sharing a prohibited failure domain;
+- deterministic production placement of every configured PG;
 - command/frame policy incompatibility;
+- snapshot/frame incompatibility after metadata and authentication overhead;
 - topology digest mutation for every topology/protocol/principal-identity
   field;
 - no topology or process-identity digest mutation for credential rotation,

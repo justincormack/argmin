@@ -443,6 +443,7 @@ impl ControlPlaneRaftPeerTransportLimits {
     pub const DEFAULT_MAX_APPEND_ENTRIES: usize = 256;
     pub const DEFAULT_MAX_APPEND_ENTRIES_BYTES: usize = 8 * 1024 * 1024;
     pub const DEFAULT_MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+    pub const REPLICATION_REQUIRED_APPEND_ENTRIES: usize = 64;
 }
 
 impl Default for ControlPlaneRaftPeerTransportLimits {
@@ -916,14 +917,14 @@ impl ControlPlaneRaftPeerTransportPolicy {
         )))
     }
 
-    fn validate_replication_compatibility(&self) -> Result<(), ControlPlaneError> {
+    pub fn validate_replication_compatibility(&self) -> Result<(), ControlPlaneError> {
         if self.limits.max_append_entries
-            < usize::try_from(CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES)
-                .expect("OpenRaft payload-entry limit fits usize")
+            < ControlPlaneRaftPeerTransportLimits::REPLICATION_REQUIRED_APPEND_ENTRIES
         {
             return Err(raft_artifact_protocol_error(format!(
                 "control-plane OpenRaft peer transport policy permits {} append entries, below the configured replication batch size {}",
-                self.limits.max_append_entries, CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES
+                self.limits.max_append_entries,
+                ControlPlaneRaftPeerTransportLimits::REPLICATION_REQUIRED_APPEND_ENTRIES
             )));
         }
         if self.limits.max_append_entries_bytes
@@ -3585,7 +3586,8 @@ enum ExperimentalRaftTimerMode {
     Automatic,
 }
 
-const CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES: u64 = 64;
+const CONTROL_PLANE_RAFT_MAX_PAYLOAD_ENTRIES: u64 =
+    ControlPlaneRaftPeerTransportLimits::REPLICATION_REQUIRED_APPEND_ENTRIES as u64;
 const CONTROL_PLANE_RAFT_APPEND_ENTRIES_COUNT_BYTES: usize = 4;
 const CONTROL_PLANE_RAFT_MAX_ENCODED_ENTRY_BYTES: usize =
     (ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_APPEND_ENTRIES_BYTES

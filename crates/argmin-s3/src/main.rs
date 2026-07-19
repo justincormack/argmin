@@ -1,4 +1,5 @@
 mod config;
+mod static_cluster_config;
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -339,6 +340,52 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
     let mut args = std::env::args_os();
     let _program = args.next();
     let command = args.next()?;
+    if command == "validate-cluster-config" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some(process_id) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        let Some(process_id) = process_id.to_str() else {
+            eprintln!("cluster manifest process id must contain valid UTF-8");
+            return Some(2);
+        };
+        return match static_cluster_config::load_static_cluster_manifest(
+            Path::new(&path),
+            process_id,
+        ) {
+            Ok(manifest) => {
+                println!(
+                    "valid cluster manifest cluster_id={} topology_generation={} process_id={} deployment_mode={}",
+                    manifest.cluster_id(),
+                    manifest.topology_generation(),
+                    manifest.selected_process_id(),
+                    manifest.deployment_mode()
+                );
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("cluster manifest validation failed: {error}");
+                Some(1)
+            }
+        };
+    }
     if command == "control-plane-runtime-map-ready" {
         let Some(path) = args.next() else {
             eprintln!(

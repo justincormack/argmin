@@ -21,13 +21,17 @@ deep-tracing = [
 [dependencies]
 auth = { path = "../auth" }
 ec = { path = "../ec", default-features = false }
+libc = "0.2"
 observability = { path = "../observability" }
+placement = { path = "../placement" }
 server-core = { path = "../server-core", default-features = false }
 server-http = { path = "../server-http", default-features = false }
 storage = { path = "../storage", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
 
 [dev-dependencies]
 openraft = { version = "=0.10.0-alpha.30", default-features = false }
