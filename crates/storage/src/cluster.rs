@@ -88,8 +88,8 @@ use crate::types::{
     MultipartReclaimRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
     PutLiveObjectReq,
 };
-use crate::BucketPgId;
 use crate::ObjectEtag;
+use crate::{BucketPgId, ObjectMetadataPgId};
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 
 mod local;
@@ -5516,6 +5516,10 @@ impl StorageCluster {
         self.local_map.object_pg_for(bucket, key)
     }
 
+    fn object_metadata_pg(&self, bucket: &BucketName, key: &ObjectKey) -> ObjectMetadataPgId {
+        self.local_map.object_metadata_pg_for(bucket, key)
+    }
+
     fn metadata_command_bucket_write_reservation_proof(
         command: &MetadataCommandEnvelope,
     ) -> Option<&BucketWriteReservationProof> {
@@ -6177,7 +6181,8 @@ impl StorageCluster {
         reservation_id: &SessionId,
     ) -> Result<GenerationId, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(ReservePutObjectGeneration);
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let mut work_budget =
             RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
                 .for_operation("reserve_object_generation")
@@ -6224,7 +6229,7 @@ impl StorageCluster {
 
             match self
                 .object_generation_metadata_primary_client(bucket, key)?
-                .object_generation_reservation(pg_id, bucket, key, reservation_id)
+                .object_generation_reservation(object_pg_id, bucket, key, reservation_id)
             {
                 Ok(generation_id) => return Ok(generation_id),
                 Err(ObjectPgActionError::Metadata(
@@ -6234,11 +6239,11 @@ impl StorageCluster {
             }
             let generation_id = self
                 .object_generation_metadata_primary_client(bucket, key)?
-                .next_object_generation_id(pg_id, bucket, key)?;
+                .next_object_generation_id(object_pg_id, bucket, key)?;
             self.maybe_run_before_object_generation_command_id_hook();
             if self
                 .object_generation_metadata_primary_client(bucket, key)?
-                .next_object_generation_id(pg_id, bucket, key)?
+                .next_object_generation_id(object_pg_id, bucket, key)?
                 != generation_id
             {
                 work_budget
@@ -6522,7 +6527,7 @@ impl StorageCluster {
             }
 
             let version_id = self.max_next_object_version_id_on_acting_set(
-                pg_id,
+                self.object_metadata_pg(bucket, key),
                 bucket,
                 key,
                 completion_admission,
@@ -6587,7 +6592,7 @@ impl StorageCluster {
 
     fn max_next_object_version_id_on_acting_set(
         &self,
-        pg_id: PgId,
+        object_pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         completion_admission: bool,
@@ -6595,13 +6600,17 @@ impl StorageCluster {
         let mut version_id = VersionId::from_u64(1);
         for node in self
             .local_map
-            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+            .metadata_pg_acting_nodes(self.operation_epoch(), object_pg_id.pg_id())?
         {
             let object_version_client = node.object_version_metadata_client();
             let candidate = if completion_admission {
-                object_version_client.next_completion_object_version_id(pg_id, bucket, key)?
+                object_version_client.next_completion_object_version_id(
+                    object_pg_id,
+                    bucket,
+                    key,
+                )?
             } else {
-                object_version_client.next_object_version_id(pg_id, bucket, key)?
+                object_version_client.next_object_version_id(object_pg_id, bucket, key)?
             };
             if candidate.to_u64() > version_id.to_u64() {
                 version_id = candidate;

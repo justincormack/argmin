@@ -46,6 +46,11 @@ impl From<BucketPgId> for PgId {
 pub struct ObjectMetadataPgId(PgId);
 
 impl ObjectMetadataPgId {
+    #[cfg(test)]
+    pub(crate) const fn new_for_test(pg_id: PgId) -> Self {
+        Self(pg_id)
+    }
+
     #[must_use]
     pub const fn pg_id(self) -> PgId {
         self.0

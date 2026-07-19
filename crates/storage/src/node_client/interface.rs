@@ -350,7 +350,7 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 pub(crate) trait ObjectGenerationMetadataNodeClient: Send + Sync {
     fn object_generation_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,
@@ -358,7 +358,7 @@ pub(crate) trait ObjectGenerationMetadataNodeClient: Send + Sync {
 
     fn next_object_generation_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<GenerationId, ObjectPgActionError>;
@@ -367,14 +367,14 @@ pub(crate) trait ObjectGenerationMetadataNodeClient: Send + Sync {
 pub(crate) trait ObjectVersionMetadataNodeClient: Send + Sync {
     fn next_object_version_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError>;
 
     fn next_completion_object_version_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError> {
@@ -1745,21 +1745,21 @@ pub(crate) trait StorageNodeClient:
 
     fn next_object_version_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<s3_types::VersionId, ObjectPgActionError>;
 
     fn next_object_generation_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<GenerationId, ObjectPgActionError>;
 
     fn object_generation_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,

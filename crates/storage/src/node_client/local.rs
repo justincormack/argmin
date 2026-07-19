@@ -1075,7 +1075,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
 impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
     fn object_generation_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,
@@ -1091,7 +1091,7 @@ impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
 
     fn next_object_generation_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<GenerationId, ObjectPgActionError> {
@@ -1102,7 +1102,7 @@ impl ObjectGenerationMetadataNodeClient for LocalStorageNodeClient {
 impl ObjectVersionMetadataNodeClient for LocalStorageNodeClient {
     fn next_object_version_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError> {
@@ -2785,7 +2785,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn next_object_version_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<s3_types::VersionId, ObjectPgActionError> {
@@ -2795,7 +2795,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn next_object_generation_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<GenerationId, ObjectPgActionError> {
@@ -2805,7 +2805,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn object_generation_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,

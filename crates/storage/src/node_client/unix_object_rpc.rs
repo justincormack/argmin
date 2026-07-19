@@ -1282,7 +1282,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
 impl ObjectGenerationMetadataNodeClient for UnixStorageNodeClient {
     fn object_generation_reservation(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         reservation_id: &SessionId,
@@ -1291,7 +1291,7 @@ impl ObjectGenerationMetadataNodeClient for UnixStorageNodeClient {
             object: StorageRpcObjectRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
                 key: key.clone(),
             },
@@ -1320,14 +1320,14 @@ impl ObjectGenerationMetadataNodeClient for UnixStorageNodeClient {
 
     fn next_object_generation_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<GenerationId, ObjectPgActionError> {
         let request = StorageRpcObjectRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             bucket: bucket.clone(),
             key: key.clone(),
         };
@@ -1348,7 +1348,7 @@ impl ObjectGenerationMetadataNodeClient for UnixStorageNodeClient {
 impl ObjectVersionMetadataNodeClient for UnixStorageNodeClient {
     fn next_object_version_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError> {
@@ -1362,7 +1362,7 @@ impl ObjectVersionMetadataNodeClient for UnixStorageNodeClient {
 
     fn next_completion_object_version_id(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<VersionId, ObjectPgActionError> {
@@ -1378,7 +1378,7 @@ impl ObjectVersionMetadataNodeClient for UnixStorageNodeClient {
 impl UnixStorageNodeClient {
     fn next_object_version_id_with_admission_class(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         class: UnixStorageNodeRpcAdmissionClass,
@@ -1386,7 +1386,7 @@ impl UnixStorageNodeClient {
         let request = StorageRpcObjectRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             bucket: bucket.clone(),
             key: key.clone(),
         };

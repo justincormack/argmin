@@ -37,13 +37,22 @@ fn unix_object_generation_metadata_client_routes_generation_reads() {
 
     assert_eq!(
         client
-            .object_generation_reservation(PgId::new(0), &bucket, &key, &reservation_id)
+            .object_generation_reservation(
+                ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                &bucket,
+                &key,
+                &reservation_id,
+            )
             .unwrap(),
         reserved_generation
     );
     assert_eq!(
         client
-            .next_object_generation_id(PgId::new(0), &bucket, &key)
+            .next_object_generation_id(
+                ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                &bucket,
+                &key,
+            )
             .unwrap(),
         GenerationId::new(reserved_generation.get() + 1).unwrap()
     );
@@ -70,7 +79,7 @@ fn unix_object_version_metadata_client_routes_version_reads() {
     assert_eq!(
         ObjectVersionMetadataNodeClient::next_object_version_id(
             &client,
-            PgId::new(0),
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
             &bucket,
             &key
         )
@@ -78,6 +87,116 @@ fn unix_object_version_metadata_client_routes_version_reads() {
         VersionId::from_u64(1)
     );
     server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes = vec![
+        StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: crate::types::PgState::Active,
+            primary_node_id: NodeId::new(7),
+            acting_set: vec![NodeId::new(7)],
+        },
+        StorageNodePgRoute {
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: crate::types::PgState::Active,
+            primary_node_id: NodeId::new(7),
+            acting_set: vec![NodeId::new(7)],
+        },
+    ];
+    let reservation_id = crate::tests::stream_session_id("obj-rpc-wrong-pg");
+    let (bucket, key, correct_pg_id, wrong_pg_id, reserved_generation) = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let (bucket, key, correct_pg_id) = (0..100)
+            .map(|index| {
+                let bucket =
+                    crate::tests::bucket_name(format!("object-rpc-wrong-pg-bucket-{index}"));
+                let key = crate::tests::object_key(format!("object-rpc-wrong-pg-key-{index}"));
+                let pg_id = node.pg_topology().object_pg_for(&bucket, &key);
+                (bucket, key, pg_id)
+            })
+            .find(|(_, _, pg_id)| *pg_id < 2)
+            .expect("two-PG topology must place a test object");
+        let pg = node.get_pg(correct_pg_id).unwrap();
+        let reserved_generation =
+            PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id)
+                .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        (
+            bucket,
+            key,
+            correct_pg_id,
+            if correct_pg_id == 0 { 1 } else { 0 },
+            reserved_generation,
+        )
+    };
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..3)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        config.socket_path.clone(),
+    );
+    let wrong_object_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
+
+    let reservation_error = ObjectGenerationMetadataNodeClient::object_generation_reservation(
+        &client,
+        wrong_object_pg,
+        &bucket,
+        &key,
+        &reservation_id,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        reservation_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc { .. })
+    ));
+
+    let version_error = ObjectVersionMetadataNodeClient::next_object_version_id(
+        &client,
+        wrong_object_pg,
+        &bucket,
+        &key,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        version_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc { .. })
+    ));
+
+    assert_eq!(
+        ObjectGenerationMetadataNodeClient::object_generation_reservation(
+            &client,
+            ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id)),
+            &bucket,
+            &key,
+            &reservation_id,
+        )
+        .unwrap(),
+        reserved_generation
+    );
+
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]

@@ -11,6 +11,7 @@ use s3_types::{AclGrants, BucketVersioningState};
 
 use super::engine::SharedStorageNode;
 use super::BucketPgId;
+use super::ObjectMetadataPgId;
 use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceMultipartCompletionBarrierCommand, BucketPropertyMutation,

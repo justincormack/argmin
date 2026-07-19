@@ -601,6 +601,32 @@ Second Phase 3 slice:
 - `DataPgId` construction, the remaining object/data client signatures, and
   request-scoped route capability values remain open in Phase 3.
 
+Third Phase 3 slice:
+
+- `ObjectGenerationMetadataNodeClient`,
+  `ObjectVersionMetadataNodeClient`, and their duplicate methods on the
+  transitional `StorageNodeClient` aggregate now require
+  `ObjectMetadataPgId`. Cluster callers derive the role for the exact
+  `(bucket, key)` from the installed runtime topology before selecting or
+  invoking a node client.
+- local adapters erase the role only at the private raw-node boundary. Unix
+  adapters erase it only into serialized route evidence; the Unix server
+  reconstructs its own role from the installed topology after the existing
+  route and object-placement checks succeed. Acting-set version allocation
+  now also derives both its selected PG and client argument from the same
+  typed role.
+- the test-only object-role constructor is confined to `cfg(test)`. An
+  adversarial Unix regression uses it to submit a configured but wrong object
+  PG, requires both generation-reservation lookup and version allocation to
+  fail at the server boundary, and verifies a reservation seeded on the
+  correct PG remains readable through a correctly routed canary.
+- direct PUT, object listing/mutation/read, and data-client signatures,
+  `DataPgId` construction, and request-scoped route capability values remain
+  open in Phase 3.
+- the third slice passed its focused local/Unix object-generation and
+  object-version tests, the boundary checker, formatting, workspace-wide
+  strict Clippy, and the full workspace suite (7,132 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

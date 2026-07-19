@@ -301,11 +301,11 @@ use crate::types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
 };
-use crate::BucketPgId;
 use crate::{
     BucketName, EcShape, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey,
     ShardLocation,
 };
+use crate::{BucketPgId, ObjectMetadataPgId};
 
 #[cfg(test)]
 type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
@@ -4784,7 +4784,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectGenerationMetadataNodeClient::next_object_generation_id(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_pg(&request.bucket, &request.key),
             &request.bucket,
             &request.key,
         ) {
@@ -5703,7 +5703,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectVersionMetadataNodeClient::next_object_version_id(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_pg(&request.bucket, &request.key),
             &request.bucket,
             &request.key,
         ) {
@@ -5738,7 +5738,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let outcome = match ObjectGenerationMetadataNodeClient::object_generation_reservation(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             &request.reservation_id,
@@ -11417,6 +11417,14 @@ impl StorageNodeConnectionHandler {
         self.node
             .bucket_metadata_pg(pg_id)
             .expect("validated bucket metadata PG must belong to the installed topology")
+    }
+
+    fn validated_object_metadata_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> ObjectMetadataPgId {
+        self.node.object_metadata_pg_for(bucket, key)
     }
 
     fn validate_primary_pg_for_bucket(
