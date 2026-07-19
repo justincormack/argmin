@@ -478,9 +478,10 @@ expiry is also behind the probed scope and binding checks. Wrong region wins
 when region and service are both wrong. Its matrix
 includes missing, empty, malformed, mismatched, identical-duplicate, and
 conflicting-duplicate query tokens in both conflicting orders, plus selected
-signed-header and present unsigned-header cases. Duplicate signed HTTP token
-headers were not sent, so their ordering remains unresolved. These results
-apply only to header and presigned SigV4 respectively.
+signed-header and present unsigned-header cases. Its signed-header matrix also
+covers identical duplicates and conflicting duplicates in both wire orders,
+with valid and bad HMACs. These results apply only to header and presigned
+SigV4 respectively.
 
 POST Object is independently pinned to parse the form
 `x-amz-credential` scope before the probed form-token structure, binding,
@@ -1332,9 +1333,14 @@ establishes that:
 - `azAZ09_+=,.@-` and the two- and 256-character boundaries succeed, pinning
   every rendered character class and the exact success XML; the response adds
   `SourceIdentity` after `Credentials`, while `PackedPolicySize` remains absent
-- empty, one-character, space-containing, and 257-character inputs receive the
-  exact single-error `ValidationError` shapes; simultaneous pattern/length
-  failures produce two errors ordered pattern first and length second
+- empty and one-character pattern-valid inputs receive the exact minimum-length
+  `ValidationError`, a space-containing value receives the exact pattern error,
+  and a 257-character pattern-valid value receives the exact maximum-length
+  error. The one-character pattern-invalid probe has consistently returned its
+  two exact clauses pattern-first and remains pinned in that order. Repeated
+  live observations of the 257-character pattern-invalid probe returned the
+  same two applicable clauses in both pattern-first and length-first order, so
+  only that overlong collision is accepted in either complete ordering
 - length is counted in decoded Unicode scalar values rather than UTF-8 bytes or
   UTF-16 units: 129 `é` characters and 129 supplementary characters receive
   only the pattern error despite occupying 258 UTF-8 bytes and, for the
@@ -1646,6 +1652,18 @@ signed header also returns `InvalidAccessKeyId` before the bad signature is
 considered. Presigned location selection, selected-token binding, and stable
 issuer liveness therefore precede signature comparison.
 
+Duplicate signed token headers are canonicalized as one comma-joined value in
+wire order. Two identical live values are accepted as one effective token:
+the correct HMAC reaches the ordinary authorization `AccessDenied`, while a bad
+HMAC reaches `SignatureDoesNotMatch`. Two different independently live token
+values return `InvalidAccessKeyId` in both wire orders, with correct and bad
+HMACs, so conflicting-value rejection precedes signature comparison rather
+than selecting the first or last value. Signed-header precedence over the query
+location still applies to duplicates: two identical live header values override
+an independently live mismatched query token, while conflicting header values
+return `InvalidAccessKeyId` and are not rescued by the matching query token.
+The oracle asserts the duplicate header wire order before sending every case.
+
 For presigned `SignatureDoesNotMatch`, the oracle validates the canonical query,
 canonical-request hash and byte list, string to sign and byte list, credential
 scope, and echoed signature. AWS XML-escapes the literal query separators to
@@ -1677,17 +1695,18 @@ golden. Complete response goldens then establish that:
   The query cases include missing, empty, malformed, independently valid but
   mismatched, identical duplicate, and conflicting duplicate tokens in both
   conflicting wire orders. Signed-header cases include valid, empty, malformed,
-  and mismatched-selected values, and the unsigned-header case combines a valid
-  query token with a present valid but uncovered header. The invalidated old
-  session and a live token signed with a bad secret also receive the scope
-  error. The presigner sorts a separate canonical query for SigV4 while
-  retaining the supplied base-query order in the emitted URI; the oracle parses
-  each URI to assert that order and asserts that the two conflicting-order URIs
-  differ
+  and mismatched-selected values, plus identical duplicates and conflicting
+  duplicates in both wire orders with valid and bad HMACs. The unsigned-header
+  case combines a valid query token with a present valid but uncovered header.
+  The invalidated old session and a live token signed with a bad secret also
+  receive the scope error. The presigner sorts a separate canonical query for
+  SigV4 while retaining the supplied base-query order in the emitted URI; the
+  oracle parses each URI to assert that order and asserts that the two
+  conflicting-order URIs differ. It also asserts the supplied signed-header
+  order before every request.
 
-This pins presigned-query scope ordering only for those cases. Duplicate signed
-HTTP token headers were not sent, and this matrix does not establish scope
-placement for POST Object or aws-chunked streaming.
+This pins presigned-query scope ordering only for those cases. The matrix does
+not establish scope placement for POST Object or aws-chunked streaming.
 
 The S3 POST Object session-authentication slice completed on 2026-07-14. The
 `--assume-role` fixture creates one unique `claude-s3-` bucket with the primary
@@ -2411,8 +2430,9 @@ body may appear in traces.
    collisions with missing, mismatched, and wrong-scope inputs; the four S3
    modes additionally pin empty, malformed, identical-duplicate, and
    conflicting-duplicate inputs in their primary token locations. Disabled-
-   credential collisions are not yet pinned. Alternate presigned HTTP-header
-   locations retain the explicit limitations documented above.
+   credential collisions are not yet pinned. Presigned signed-header
+   authentication and scope collisions are pinned, but expiry collisions for
+   that alternate token location remain unresolved.
 3. Should the first standalone UAT role be injected through a dedicated
    test-only constructor/config object or through explicitly UAT-only
    environment variables?

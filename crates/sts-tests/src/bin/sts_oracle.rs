@@ -1824,6 +1824,186 @@ struct S3PresignedProbe<'a> {
     expected: S3PresignedAuthExpected,
 }
 
+fn assert_s3_presigned_auth_expected(
+    label: &str,
+    response: &RawResponse,
+    presigned: &PresignedRequest,
+    assumed_role_arn: &str,
+    credentials: SignedRequestCredentials<'_>,
+    sensitive_tokens: &[&str],
+    expected: S3PresignedAuthExpected,
+) {
+    match expected {
+        S3PresignedAuthExpected::AccessDenied => {
+            assert_s3_list_buckets_access_denied(
+                label,
+                response,
+                assumed_role_arn,
+                credentials.access_key,
+                sensitive_tokens,
+            );
+        }
+        S3PresignedAuthExpected::HeadersNotSigned => {
+            assert_s3_headers_not_signed(label, response, credentials.access_key, sensitive_tokens);
+        }
+        S3PresignedAuthExpected::InvalidAccessKey => {
+            assert_s3_invalid_access_key(label, response, credentials.access_key, sensitive_tokens);
+        }
+        S3PresignedAuthExpected::SignatureMismatch => {
+            assert_s3_presigned_signature_mismatch(
+                label,
+                response,
+                presigned,
+                credentials,
+                sensitive_tokens,
+            );
+        }
+    }
+}
+
+fn assert_presigned_signed_header_wire_order(
+    label: &str,
+    presigned: &PresignedRequest,
+    expected_tokens: &[&str],
+) {
+    let wire_tokens = presigned
+        .headers()
+        .filter_map(|(name, value)| (name == "x-amz-security-token").then_some(value))
+        .collect::<Vec<_>>();
+    assert!(
+        wire_tokens.len() == expected_tokens.len()
+            && wire_tokens
+                .iter()
+                .zip(expected_tokens)
+                .all(|(wire, expected)| wire == expected),
+        "{label}: presigned request did not preserve signed token-header wire order"
+    );
+}
+
+fn run_s3_presigned_duplicate_signed_header_authentication_probes(
+    endpoint: &str,
+    account_id: &str,
+    fixture: S3PresignedSessionProbeSet<'_>,
+) {
+    let wrong_secret = "0".repeat(40);
+    let bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..fixture.live_credentials
+    };
+    let assumed_role_arn = format!(
+        "arn:aws:sts::{account_id}:assumed-role/{}/{}",
+        fixture.live_role_name, fixture.live_role_session_name
+    );
+    for (case, credentials, query_tokens, signed_header_tokens, expected) in [
+        (
+            "identical-valid-signature",
+            fixture.live_credentials,
+            vec![],
+            vec![fixture.live_security_token, fixture.live_security_token],
+            S3PresignedAuthExpected::AccessDenied,
+        ),
+        (
+            "identical-bad-signature",
+            bad_signature_credentials,
+            vec![],
+            vec![fixture.live_security_token, fixture.live_security_token],
+            S3PresignedAuthExpected::SignatureMismatch,
+        ),
+        (
+            "conflicting-valid-signature",
+            fixture.live_credentials,
+            vec![],
+            vec![
+                fixture.live_security_token,
+                fixture.other_live_security_token,
+            ],
+            S3PresignedAuthExpected::InvalidAccessKey,
+        ),
+        (
+            "conflicting-reversed-valid-signature",
+            fixture.live_credentials,
+            vec![],
+            vec![
+                fixture.other_live_security_token,
+                fixture.live_security_token,
+            ],
+            S3PresignedAuthExpected::InvalidAccessKey,
+        ),
+        (
+            "conflicting-bad-signature",
+            bad_signature_credentials,
+            vec![],
+            vec![
+                fixture.live_security_token,
+                fixture.other_live_security_token,
+            ],
+            S3PresignedAuthExpected::InvalidAccessKey,
+        ),
+        (
+            "conflicting-reversed-bad-signature",
+            bad_signature_credentials,
+            vec![],
+            vec![
+                fixture.other_live_security_token,
+                fixture.live_security_token,
+            ],
+            S3PresignedAuthExpected::InvalidAccessKey,
+        ),
+        (
+            "identical-overrides-mismatched-query",
+            fixture.live_credentials,
+            vec![fixture.other_live_security_token],
+            vec![fixture.live_security_token, fixture.live_security_token],
+            S3PresignedAuthExpected::AccessDenied,
+        ),
+        (
+            "conflicting-overrides-valid-query",
+            fixture.live_credentials,
+            vec![fixture.live_security_token],
+            vec![
+                fixture.live_security_token,
+                fixture.other_live_security_token,
+            ],
+            S3PresignedAuthExpected::InvalidAccessKey,
+        ),
+        (
+            "conflicting-reversed-overrides-valid-query",
+            fixture.live_credentials,
+            vec![fixture.live_security_token],
+            vec![
+                fixture.other_live_security_token,
+                fixture.live_security_token,
+            ],
+            S3PresignedAuthExpected::InvalidAccessKey,
+        ),
+    ] {
+        let label = format!("s3-presigned-auth-live-duplicate-signed-header-{case}");
+        let presigned = build_s3_root_presigned_request_for_service(
+            endpoint,
+            credentials,
+            &query_tokens,
+            &signed_header_tokens,
+            "s3",
+        );
+        assert_presigned_signed_header_wire_order(&label, &presigned, &signed_header_tokens);
+        let response = fetch_s3_presigned_request(endpoint, &presigned, None);
+        let sensitive_tokens = query_tokens
+            .iter()
+            .chain(&signed_header_tokens)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_s3_presigned_auth_expected(
+            &label,
+            &response,
+            &presigned,
+            &assumed_role_arn,
+            credentials,
+            &sensitive_tokens,
+            expected,
+        );
+    }
+}
+
 fn run_s3_presigned_session_authentication_probes(
     endpoint: &str,
     account_id: &str,
@@ -1838,6 +2018,10 @@ fn run_s3_presigned_session_authentication_probes(
         secret_key: &wrong_secret,
         ..fixture.old_credentials
     };
+    let assumed_role_arn = format!(
+        "arn:aws:sts::{account_id}:assumed-role/{}/{}",
+        fixture.live_role_name, fixture.live_role_session_name
+    );
     let probes = [
         S3PresignedProbe {
             label: "s3-presigned-auth-live-query-token-valid",
@@ -2036,43 +2220,17 @@ fn run_s3_presigned_session_authentication_probes(
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
-        match probe.expected {
-            S3PresignedAuthExpected::AccessDenied => {
-                let assumed_role_arn = format!(
-                    "arn:aws:sts::{account_id}:assumed-role/{}/{}",
-                    fixture.live_role_name, fixture.live_role_session_name
-                );
-                assert_s3_list_buckets_access_denied(
-                    probe.label,
-                    &response,
-                    &assumed_role_arn,
-                    probe.credentials.access_key,
-                    &sensitive_tokens,
-                );
-            }
-            S3PresignedAuthExpected::HeadersNotSigned => assert_s3_headers_not_signed(
-                probe.label,
-                &response,
-                probe.credentials.access_key,
-                &sensitive_tokens,
-            ),
-            S3PresignedAuthExpected::InvalidAccessKey => assert_s3_invalid_access_key(
-                probe.label,
-                &response,
-                probe.credentials.access_key,
-                &sensitive_tokens,
-            ),
-            S3PresignedAuthExpected::SignatureMismatch => {
-                assert_s3_presigned_signature_mismatch(
-                    probe.label,
-                    &response,
-                    &presigned,
-                    probe.credentials,
-                    &sensitive_tokens,
-                );
-            }
-        }
+        assert_s3_presigned_auth_expected(
+            probe.label,
+            &response,
+            &presigned,
+            &assumed_role_arn,
+            probe.credentials,
+            &sensitive_tokens,
+            probe.expected,
+        );
     }
+    run_s3_presigned_duplicate_signed_header_authentication_probes(endpoint, account_id, fixture);
 }
 
 fn assert_s3_presigned_wrong_region_scope(
@@ -2287,6 +2445,60 @@ fn run_s3_presigned_scope_probes(
                 None,
             ),
             (
+                "duplicate-identical-signed-header",
+                live_credentials,
+                vec![],
+                vec![fixture.live_security_token, fixture.live_security_token],
+                None,
+            ),
+            (
+                "duplicate-conflicting-signed-header",
+                live_credentials,
+                vec![],
+                vec![
+                    fixture.live_security_token,
+                    fixture.other_live_security_token,
+                ],
+                None,
+            ),
+            (
+                "duplicate-conflicting-signed-header-reversed",
+                live_credentials,
+                vec![],
+                vec![
+                    fixture.other_live_security_token,
+                    fixture.live_security_token,
+                ],
+                None,
+            ),
+            (
+                "duplicate-identical-signed-header-bad-signature",
+                bad_signature_credentials,
+                vec![],
+                vec![fixture.live_security_token, fixture.live_security_token],
+                None,
+            ),
+            (
+                "duplicate-conflicting-signed-header-bad-signature",
+                bad_signature_credentials,
+                vec![],
+                vec![
+                    fixture.live_security_token,
+                    fixture.other_live_security_token,
+                ],
+                None,
+            ),
+            (
+                "duplicate-conflicting-signed-header-reversed-bad-signature",
+                bad_signature_credentials,
+                vec![],
+                vec![
+                    fixture.other_live_security_token,
+                    fixture.live_security_token,
+                ],
+                None,
+            ),
+            (
                 "unsigned-header-valid-query",
                 live_credentials,
                 vec![fixture.live_security_token],
@@ -2329,6 +2541,7 @@ fn run_s3_presigned_scope_probes(
                     "{label}: reversed duplicate query produced the same wire URI"
                 );
             }
+            assert_presigned_signed_header_wire_order(&label, &presigned, &signed_header_tokens);
             let response = fetch_s3_presigned_request(endpoint, &presigned, unsigned_header_token);
             let sensitive_tokens = query_tokens
                 .iter()
@@ -5761,8 +5974,11 @@ fn run_source_identity_probes(
     let overlong_source_identity_message = format!(
         "1 validation error detected: Value '{overlong_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 256"
     );
-    let overlong_invalid_source_identity_message = format!(
+    let overlong_invalid_source_identity_pattern_first_message = format!(
         "2 validation errors detected: Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}; Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 256"
+    );
+    let overlong_invalid_source_identity_length_first_message = format!(
+        "2 validation errors detected: Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 256; Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}"
     );
     let multibyte_source_identity_message = format!(
         "1 validation error detected: Value '{multibyte_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}"
@@ -5807,11 +6023,6 @@ fn run_source_identity_probes(
             overlong_source_identity_message.as_str(),
         ),
         (
-            "assume-role-overlong-invalid-source-identity",
-            overlong_invalid_source_identity.as_str(),
-            overlong_invalid_source_identity_message.as_str(),
-        ),
-        (
             "assume-role-multibyte-source-identity-length-units",
             multibyte_source_identity.as_str(),
             multibyte_source_identity_message.as_str(),
@@ -5838,6 +6049,24 @@ fn run_source_identity_probes(
             Some(message),
         );
     }
+    assert_assume_role_error_with_observed_messages(
+        "assume-role-overlong-invalid-source-identity",
+        endpoint,
+        primary_credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", source_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("SourceIdentity", &overlong_invalid_source_identity),
+        ],
+        400,
+        "ValidationError",
+        &[
+            &overlong_invalid_source_identity_pattern_first_message,
+            &overlong_invalid_source_identity_length_first_message,
+        ],
+    );
 
     for (label, value) in [
         ("assume-role-min-source-identity", "ab"),
@@ -9779,7 +10008,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        assume_role_response_with_sanitized_credentials, matches_observed_get_boundary_fixture,
+        assume_role_response_with_sanitized_credentials,
+        build_s3_root_presigned_request_for_service, matches_observed_get_boundary_fixture,
         s3_post_response_with_sanitized_body, s3_response_with_sanitized_body,
         sign_s3_streaming_request, sign_s3_streaming_request_for_service, spaced_hex,
         validate_https_endpoint, S3StreamingTokens, OBSERVED_GET_BOUNDARY_ENDPOINT,
@@ -9937,6 +10167,40 @@ mod tests {
             "Credential=ARGMINSESSIONACCESSKEY/{date}/eu-central-1/sts/aws4_request"
         )));
         assert_eq!(wrong_service.signing_key, expected_signing_key.as_ref());
+    }
+
+    #[test]
+    fn presigner_preserves_duplicate_signed_token_header_wire_order() {
+        let credentials = SignedRequestCredentials {
+            access_key: "ARGMINSESSIONACCESSKEY",
+            secret_key: "secret",
+            region: "eu-central-1",
+            tls_ca_pem: None,
+        };
+        let presigned = build_s3_root_presigned_request_for_service(
+            "https://s3.eu-central-1.amazonaws.com",
+            credentials,
+            &[],
+            &["first-token", "second-token"],
+            "s3",
+        );
+
+        assert_eq!(
+            presigned
+                .headers()
+                .filter(|(name, _)| *name == "x-amz-security-token")
+                .collect::<Vec<_>>(),
+            vec![
+                ("x-amz-security-token", "first-token"),
+                ("x-amz-security-token", "second-token")
+            ]
+        );
+        assert!(
+            presigned
+                .uri()
+                .contains("X-Amz-SignedHeaders=host%3Bx-amz-security-token"),
+            "duplicate token headers must produce one signed-header name"
+        );
     }
 
     #[test]
