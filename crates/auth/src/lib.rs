@@ -62,7 +62,7 @@ pub use bucket_policy::{
 };
 pub use canonical::parse_amz_date;
 pub use credential::{
-    AuthorizationProfile, CredentialRecord, CredentialScope, CredentialStore, SecretKey,
+    AuthorizationProfile, CredentialScope, CredentialStore, SecretKey, StoredCredential,
 };
 pub use error::{AuthError, SignatureMismatchDiagnostics};
 pub use identity::{

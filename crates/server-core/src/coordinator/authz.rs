@@ -476,7 +476,7 @@ impl Coordinator {
     }
 
     pub(super) fn requester_can_bucket_admin(requester: &Requester, owner_principal: &str) -> bool {
-        requester.principal_opt() == Some(owner_principal)
+        requester.configured_principal() == Some(owner_principal)
     }
 
     pub(super) fn requester_can_bucket_owner_account_admin(
@@ -551,7 +551,7 @@ impl Coordinator {
             AclPermission::Read,
         );
 
-        requester.principal_opt() == Some(owner_principal) || acl_allows_read || public_read
+        requester.configured_principal() == Some(owner_principal) || acl_allows_read || public_read
     }
 
     pub(super) fn requester_can_read_object(
@@ -663,8 +663,11 @@ impl Coordinator {
             return owner.principal == OwnerIdentity::ANONYMOUS_UPLOAD_PRINCIPAL
                 && owner.canonical_id == CanonicalUserId::anonymous_upload();
         }
+        let Some(principal) = requester.configured_principal() else {
+            return false;
+        };
         requester.account().is_some_and(|account| {
-            account.principal() == owner.principal
+            principal == owner.principal
                 || (account.canonical_user_id() == &owner.canonical_id
                     && requester.authorization_profile()
                         == auth::AuthorizationProfile::OwnerAccountAdmin)
@@ -675,14 +678,17 @@ impl Coordinator {
         requester: &Requester,
         bucket: &BucketSummary,
     ) -> bool {
+        let Some(principal) = requester.configured_principal() else {
+            return false;
+        };
         let Some(account) = requester.account() else {
             return false;
         };
-        if account.principal() == bucket.owner_principal {
+        if principal == bucket.owner_principal {
             return true;
         }
 
-        let Some(requester_account_id) = aws_account_id_from_principal(account.principal()) else {
+        let Some(requester_account_id) = account.account_id() else {
             return false;
         };
         Self::bucket_owner_account_id(&bucket.owner_principal) == Some(requester_account_id)
@@ -703,7 +709,7 @@ impl Coordinator {
         let Some(account) = requester.account() else {
             return false;
         };
-        let Some(requester_account_id) = aws_account_id_from_principal(account.principal()) else {
+        let Some(requester_account_id) = account.account_id() else {
             return false;
         };
         let Some(bucket_owner_account_id) = Self::bucket_owner_account_id(&bucket.owner_principal)
@@ -714,7 +720,8 @@ impl Coordinator {
             return false;
         }
 
-        account.principal() == format!("arn:aws:iam::{requester_account_id}:root")
+        let root_arn = format!("arn:aws:iam::{requester_account_id}:root");
+        requester.configured_principal() == Some(root_arn.as_str())
     }
 
     pub(super) fn requester_can_discover_missing_object(
@@ -773,7 +780,7 @@ impl Coordinator {
         upload_id: &storage::UploadId,
     ) -> bool {
         Self::requester_can_bucket_owner_account_admin(requester, bucket)
-            || requester.principal_opt().is_some_and(|principal| {
+            || requester.configured_principal().is_some_and(|principal| {
                 bucket
                     .multipart_upload_id_key
                     .was_issued_for_principal(upload_id, principal)
@@ -2185,7 +2192,9 @@ impl Coordinator {
     }
 
     pub(super) fn requester_principal_required(requester: &Requester) -> Result<&str, ServerError> {
-        requester.principal_opt().ok_or(ServerError::AccessDenied)
+        requester
+            .configured_principal()
+            .ok_or(ServerError::AccessDenied)
     }
 
     pub(super) fn bucket_owner_identity(bucket: &BucketSummary) -> OwnerIdentity {
@@ -2265,12 +2274,12 @@ impl Coordinator {
         if requester.is_anonymous() {
             return Some(OwnerIdentity::anonymous_upload());
         }
-        requester.account().map(|account| {
-            OwnerIdentity::new(
-                account.principal().to_string(),
-                account.canonical_user_id().clone(),
-            )
-        })
+        let account = requester.account()?;
+        let principal = requester.configured_principal()?;
+        Some(OwnerIdentity::new(
+            principal.to_string(),
+            account.canonical_user_id().clone(),
+        ))
     }
 
     pub(super) fn effective_object_owner(

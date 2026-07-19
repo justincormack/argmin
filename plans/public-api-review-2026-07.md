@@ -678,7 +678,7 @@ steps it performs.
   case: an unexpected `x-amz-security-token` form field returns
   `InvalidToken`. Argmin does not implement STS or temporary session
   credentials, so stored session-token support was removed from
-  `CredentialRecord`; only credential-expiry checks remain as a local
+  `StoredCredential`; only credential-expiry checks remain as a local
   credential property.
 
 - [x] **A3. `now_epoch_secs == 0` is a sentinel that disables expiry checks,

@@ -424,7 +424,7 @@ pub(super) enum AuthorizedWriteTags<'a> {
 /// Authenticated requester context needed by core-side authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requester {
-    pub(super) account: Option<AccountIdentity>,
+    pub(super) identity: Option<auth::AuthenticatedIdentity>,
     pub(super) authorization_profile: auth::AuthorizationProfile,
     pub(super) source_ip: Option<std::net::IpAddr>,
     pub(super) request_epoch_seconds: Option<u64>,
@@ -1213,7 +1213,7 @@ impl Requester {
     #[must_use]
     pub fn from_auth(auth: &auth::AuthContext) -> Self {
         Self {
-            account: auth.account.clone(),
+            identity: auth.identity.clone(),
             authorization_profile: auth.authorization_profile,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1232,7 +1232,7 @@ impl Requester {
     #[cfg(any(test, feature = "test-utils"))]
     pub const fn anonymous() -> Self {
         Self {
-            account: None,
+            identity: None,
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1251,7 +1251,7 @@ impl Requester {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn authenticated(account: AccountIdentity) -> Self {
         Self {
-            account: Some(account),
+            identity: Some(Self::configured_identity_from_account(account)),
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1270,7 +1270,7 @@ impl Requester {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn from_account(account: Option<&AccountIdentity>) -> Self {
         Self {
-            account: account.cloned(),
+            identity: account.cloned().map(Self::configured_identity_from_account),
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1289,7 +1289,7 @@ impl Requester {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn authenticated_owner_account_admin(account: AccountIdentity) -> Self {
         Self {
-            account: Some(account),
+            identity: Some(Self::configured_identity_from_account(account)),
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1422,7 +1422,7 @@ impl Requester {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn from_account_owner_account_admin(account: Option<&AccountIdentity>) -> Self {
         Self {
-            account: account.cloned(),
+            identity: account.cloned().map(Self::configured_identity_from_account),
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1444,7 +1444,7 @@ impl Requester {
         authorization_profile: auth::AuthorizationProfile,
     ) -> Self {
         Self {
-            account: Some(account),
+            identity: Some(Self::configured_identity_from_account(account)),
             authorization_profile,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1466,7 +1466,7 @@ impl Requester {
         authorization_profile: auth::AuthorizationProfile,
     ) -> Self {
         Self {
-            account: account.cloned(),
+            identity: account.cloned().map(Self::configured_identity_from_account),
             authorization_profile,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1483,27 +1483,54 @@ impl Requester {
 
     #[must_use]
     pub fn account(&self) -> Option<&AccountIdentity> {
-        self.account.as_ref()
+        self.identity
+            .as_ref()
+            .map(auth::AuthenticatedIdentity::account)
     }
 
     #[must_use]
-    pub fn principal_opt(&self) -> Option<&str> {
-        self.account().map(AccountIdentity::principal)
+    pub fn configured_principal(&self) -> Option<&str> {
+        self.identity
+            .as_ref()?
+            .configured_principal()
+            .map(auth::ConfiguredPrincipalIdentity::principal)
+    }
+
+    #[must_use]
+    pub fn session_principal_arn(&self) -> Option<&auth::AssumedRoleSessionArn> {
+        self.identity.as_ref()?.session_principal_arn()
+    }
+
+    #[must_use]
+    pub fn role_principal_arn(&self) -> Option<&auth::IamRoleArn> {
+        self.identity.as_ref()?.role_principal_arn()
+    }
+
+    #[must_use]
+    pub fn aws_userid(&self) -> Option<&auth::AssumedRoleId> {
+        self.identity.as_ref()?.aws_userid()
     }
 
     #[must_use]
     pub fn canonical_user_id(&self) -> Option<&CanonicalUserId> {
+        self.configured_principal()?;
         self.account().map(AccountIdentity::canonical_user_id)
     }
 
     #[must_use]
     pub fn is_anonymous(&self) -> bool {
-        self.account.is_none()
+        self.identity.is_none()
     }
 
     #[must_use]
     pub const fn authorization_profile(&self) -> auth::AuthorizationProfile {
         self.authorization_profile
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn configured_identity_from_account(account: AccountIdentity) -> auth::AuthenticatedIdentity {
+        let principal = auth::ConfiguredPrincipalIdentity::new(account.principal());
+        auth::AuthenticatedIdentity::configured(account, principal)
     }
 }
 
@@ -1980,5 +2007,75 @@ impl<'a> CreateMultipartUploadRequest<'a> {
         } else {
             Ok(policy_context.with_request_object_tags_xml(self.tags))
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn assumed_role_requester_does_not_acquire_configured_principal_authorization() {
+        let account_id = "123456789012";
+        let account = AccountIdentity::new(
+            account_id,
+            CanonicalUserId::from_principal(account_id),
+            "Test account",
+        );
+        let role = auth::IamRoleIdentity::new(
+            auth::AwsAccountId::new(account_id).unwrap(),
+            auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap(),
+            auth::RoleName::new("test-role").unwrap(),
+            auth::IamPath::new("/team/").unwrap(),
+        );
+        let session = auth::AssumedRoleSessionIdentity::new(
+            role,
+            auth::RoleSessionName::new("test-session").unwrap(),
+            auth::SessionLifetime::new(1_700_000_000, 1_700_003_600).unwrap(),
+            None,
+        );
+        let identity = auth::AuthenticatedIdentity::assumed_role_session(account, session).unwrap();
+        let context = auth::AuthContext {
+            mode: auth::AuthMode::HeaderSigV4,
+            access_key_id: Some("ARGS0123456789ABCDEFGHIJ".to_string()),
+            identity: Some(identity),
+            authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
+            request_epoch_secs: Some(1_700_000_000),
+            signing_region: Some("us-east-1".to_string()),
+            streaming: None,
+        };
+
+        let requester = Requester::from_auth(&context);
+        assert!(!requester.is_anonymous());
+        assert!(requester.account().is_some());
+        assert!(requester.configured_principal().is_none());
+        assert!(requester.canonical_user_id().is_none());
+        assert_eq!(
+            requester.session_principal_arn().unwrap().as_str(),
+            "arn:aws:sts::123456789012:assumed-role/test-role/test-session"
+        );
+        assert_eq!(
+            requester.role_principal_arn().unwrap().as_str(),
+            "arn:aws:iam::123456789012:role/team/test-role"
+        );
+        assert_eq!(
+            requester.aws_userid().unwrap().as_str(),
+            "ARGR0123456789ABCDEFGHIJ:test-session"
+        );
+
+        let same_account_owner = storage::OwnerIdentity::new(
+            requester.session_principal_arn().unwrap().as_str(),
+            CanonicalUserId::from_principal(account_id),
+        );
+        assert!(
+            !crate::coordinator::Coordinator::requester_matches_owner_identity(
+                &requester,
+                &same_account_owner,
+            )
+        );
+        assert!(
+            crate::coordinator::Coordinator::requester_owner_identity(&requester).is_none(),
+            "an assumed-role session must not become a legacy S3 object owner before role authorization exists"
+        );
     }
 }

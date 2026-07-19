@@ -6,15 +6,16 @@ impl Coordinator {
         req: &CreateBucketRequest,
     ) -> Result<AuthorizedCreateBucket, ServerError> {
         let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
+        let owner_principal = req
+            .requester
+            .configured_principal()
+            .ok_or(ServerError::AccessDenied)?;
         let locked_to_account_region =
             self.validate_create_bucket_namespace(&req.name, req.namespace, owner_account)?;
         if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && req.acl.is_explicit() {
             return Err(ServerError::InvalidBucketAclWithObjectOwnership);
         }
-        let owner = OwnerIdentity::new(
-            owner_account.principal(),
-            owner_account.canonical_user_id().clone(),
-        );
+        let owner = OwnerIdentity::new(owner_principal, owner_account.canonical_user_id().clone());
         let acl_grants = match &req.acl {
             CreateBucketAcl::DefaultPrivate => Self::owner_full_control_grants(&owner),
             CreateBucketAcl::Canned(acl) => Self::bucket_acl_grants_from_canned(&owner, *acl)?,
@@ -981,6 +982,9 @@ impl Coordinator {
         &self,
         req: &ListBucketsRequest,
     ) -> Result<AuthorizedListBuckets, ServerError> {
+        req.requester
+            .configured_principal()
+            .ok_or(ServerError::AccessDenied)?;
         let requester = req.requester.account().ok_or(ServerError::AccessDenied)?;
         Ok(AuthorizedListBuckets {
             owner_canonical_id: requester.canonical_user_id().clone(),

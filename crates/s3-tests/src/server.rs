@@ -38,6 +38,29 @@ const TEST_MAX_CONNECTIONS: u32 = 512;
 const TEST_MAX_INFLIGHT_REQUESTS: u32 = 32;
 const SHARD_SCAVENGER_CLEAN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+fn configured_credential(
+    access_key_id: &str,
+    secret_key: &str,
+    account_id: &str,
+    principal: impl Into<String>,
+    display_name: &str,
+    authorization_profile: auth::AuthorizationProfile,
+) -> auth::StoredCredential {
+    auth::StoredCredential::configured(
+        access_key_id.to_string(),
+        auth::SecretKey::new(secret_key.to_string()),
+        AccountIdentity::new(
+            account_id,
+            CanonicalUserId::from_principal(account_id),
+            display_name,
+        ),
+        auth::ConfiguredPrincipalIdentity::new(principal),
+        authorization_profile,
+        None,
+        true,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestServerTransport {
     Http,
@@ -186,54 +209,38 @@ impl TestServer {
                     .expect("create coordinator");
 
                 let mut credentials = auth::CredentialStore::default();
-                credentials.add_record(auth::CredentialRecord {
-                    access_key_id: TEST_ACCESS_KEY.to_string(),
-                    secret_key: auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
-                    account: AccountIdentity::new(
-                        TEST_ACCOUNT_ID,
-                        CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
-                        "test-account",
-                    ),
-                    authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
-                    expires_at_epoch_secs: None,
-                    enabled: true,
-                });
-                credentials.add_record(auth::CredentialRecord {
-                    access_key_id: TEST_SECOND_ACCESS_KEY.to_string(),
-                    secret_key: auth::SecretKey::new(TEST_SECOND_SECRET_KEY.to_string()),
-                    account: AccountIdentity::new(
-                        format!("arn:aws:iam::{TEST_ACCOUNT_ID}:user/limited"),
-                        CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
-                        "test-account-limited",
-                    ),
-                    authorization_profile: auth::AuthorizationProfile::Standard,
-                    expires_at_epoch_secs: None,
-                    enabled: true,
-                });
-                credentials.add_record(auth::CredentialRecord {
-                    access_key_id: TEST_OWNER_ROOT_ACCESS_KEY.to_string(),
-                    secret_key: auth::SecretKey::new(TEST_OWNER_ROOT_SECRET_KEY.to_string()),
-                    account: AccountIdentity::new(
-                        format!("arn:aws:iam::{TEST_ACCOUNT_ID}:root"),
-                        CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
-                        "test-account-root",
-                    ),
-                    authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
-                    expires_at_epoch_secs: None,
-                    enabled: true,
-                });
-                credentials.add_record(auth::CredentialRecord {
-                    access_key_id: ALT_ACCESS_KEY.to_string(),
-                    secret_key: auth::SecretKey::new(ALT_SECRET_KEY.to_string()),
-                    account: AccountIdentity::new(
-                        ALT_ACCOUNT_ID,
-                        CanonicalUserId::from_principal(ALT_ACCOUNT_ID),
-                        "alt-account",
-                    ),
-                    authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
-                    expires_at_epoch_secs: None,
-                    enabled: true,
-                });
+                credentials.add_record(configured_credential(
+                    TEST_ACCESS_KEY,
+                    TEST_SECRET_KEY,
+                    TEST_ACCOUNT_ID,
+                    TEST_ACCOUNT_ID,
+                    "test-account",
+                    auth::AuthorizationProfile::OwnerAccountAdmin,
+                ));
+                credentials.add_record(configured_credential(
+                    TEST_SECOND_ACCESS_KEY,
+                    TEST_SECOND_SECRET_KEY,
+                    TEST_ACCOUNT_ID,
+                    format!("arn:aws:iam::{TEST_ACCOUNT_ID}:user/limited"),
+                    "test-account-limited",
+                    auth::AuthorizationProfile::Standard,
+                ));
+                credentials.add_record(configured_credential(
+                    TEST_OWNER_ROOT_ACCESS_KEY,
+                    TEST_OWNER_ROOT_SECRET_KEY,
+                    TEST_ACCOUNT_ID,
+                    format!("arn:aws:iam::{TEST_ACCOUNT_ID}:root"),
+                    "test-account-root",
+                    auth::AuthorizationProfile::OwnerAccountAdmin,
+                ));
+                credentials.add_record(configured_credential(
+                    ALT_ACCESS_KEY,
+                    ALT_SECRET_KEY,
+                    ALT_ACCOUNT_ID,
+                    ALT_ACCOUNT_ID,
+                    "alt-account",
+                    auth::AuthorizationProfile::OwnerAccountAdmin,
+                ));
 
                 server_http::http::HttpFrontend {
                     coordinator: Arc::new(coordinator),

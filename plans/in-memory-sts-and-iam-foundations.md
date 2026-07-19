@@ -97,45 +97,45 @@ open work. Supported actions must not ignore security-relevant input.
 
 ### Long-lived credential and role lookup is static and worker-local
 
-`auth::CredentialStore` is a plain `HashMap<String, CredentialRecord>`.
+`auth::CredentialStore` is a plain `HashMap<String, StoredCredential>`.
 `argmin-s3` builds a new copy for every `HttpFrontend` worker, and the embedded
 `s3-tests` server does the same. Stateless session issuance does not require
 mutating these maps, but dynamic in-memory IAM operations will still require a
 shared role/user/long-lived-credential provider. Every worker must also share
 the same token-sealing key ring.
 
-### Credential records cannot represent temporary credentials
+### Stored credentials are explicitly long-lived
 
-`CredentialRecord` currently contains:
+`StoredCredential` contains:
 
 - access key ID
 - secret key
-- account identity
+- composed account and configured-principal identity
 - coarse authorization profile
 - optional expiry
 - enabled state
 
-It has no way to obtain a temporary credential from a sealed token and no typed
-distinction between a stored long-lived credential and a decoded temporary
-credential. Auth currently checks an optional expiry on stored records but then
+Its constructor accepts only a configured principal, so an assumed-role session
+cannot be inserted into the long-lived store. The separate decoded temporary
+credential type and the authenticated long-lived/session credential enum do not
+exist yet. Auth currently checks an optional expiry on stored records but then
 calls `validate_static_credential_has_no_token` on header, presigned, and POST
 paths. An expiring stored record is therefore not a usable STS credential.
 
-### Identity is too coarse for roles and sessions
+### Structured identity exists but session authentication does not
 
-`AccountIdentity` carries one principal string, canonical user ID, and display
-name. A role session needs at least these distinct concepts:
+`AccountIdentity` remains the durable account/owner value. Authentication now
+composes it with a typed configured principal or assumed-role session identity,
+and exposes the IAM role ARN, STS session ARN, stable role ID, assumed-role ID,
+and `aws:userid` through distinct accessors. Current static credentials populate
+only the configured-principal variant, and existing S3 authorization paths
+explicitly require that variant rather than treating a role session as an
+existing configured user.
 
-- owning account
-- IAM role ARN and stable role ID
-- STS assumed-role ARN and assumed-role ID
-- role session name
-- source/caller identity
-- principal type and `aws:userid` value
-- optional session and principal tags
-
-Overloading the existing principal string would make policy matching and error
-rendering ambiguous.
+The remaining Phase 1 work must add the decoded session credential and shared
+provider/key-ring substrate before any request can authenticate as that session
+identity. Session and principal tags remain later versioned policy context as
+described below.
 
 ### S3 has resource policies but not IAM identity policies
 

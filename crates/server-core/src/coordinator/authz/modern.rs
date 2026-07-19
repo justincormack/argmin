@@ -891,14 +891,17 @@ fn requester_is_modern_bucket_owner_account(
     requester: &Requester,
     bucket: BoeBucketSummary<'_>,
 ) -> bool {
+    let Some(principal) = requester.configured_principal() else {
+        return false;
+    };
     let Some(account) = requester.account() else {
         return false;
     };
-    if account.principal() == bucket.owner_principal {
+    if principal == bucket.owner_principal {
         return true;
     }
 
-    let Some(requester_account_id) = aws_account_id_from_principal(account.principal()) else {
+    let Some(requester_account_id) = account.account_id() else {
         return false;
     };
     Coordinator::bucket_owner_account_id(&bucket.owner_principal) == Some(requester_account_id)
@@ -1176,7 +1179,7 @@ fn modern_read_object_default_allowed(
             requester_can_modern_bucket_owner_account_admin(requester, bucket)
         }
         ModernReadAction::AttributesCurrent | ModernReadAction::AttributesVersion => requester
-            .principal_opt()
+            .configured_principal()
             .is_some_and(|principal| principal == object.owner().principal.as_str()),
     }
 }

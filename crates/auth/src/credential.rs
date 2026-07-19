@@ -1,7 +1,7 @@
 /// Credential storage for SigV4 authentication.
 use std::collections::HashMap;
 
-use s3_types::AccountIdentity;
+use crate::{AuthenticatedIdentity, ConfiguredPrincipalIdentity};
 
 /// Coarse-grained authorization scope attached to an authenticated credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -36,25 +36,81 @@ impl std::fmt::Debug for SecretKey {
     }
 }
 
-/// Full credential record used by authentication.
-pub struct CredentialRecord {
-    pub access_key_id: String,
-    pub secret_key: SecretKey,
-    pub account: AccountIdentity,
-    pub authorization_profile: AuthorizationProfile,
-    pub expires_at_epoch_secs: Option<u64>,
-    pub enabled: bool,
+/// Configured long-lived credential stored by the identity provider.
+///
+/// Temporary session credentials are decoded from sealed tokens into a
+/// separate type and are never inserted into this store.
+pub struct StoredCredential {
+    access_key_id: String,
+    secret_key: SecretKey,
+    identity: AuthenticatedIdentity,
+    authorization_profile: AuthorizationProfile,
+    expires_at_epoch_secs: Option<u64>,
+    enabled: bool,
 }
 
-impl std::fmt::Debug for CredentialRecord {
+impl StoredCredential {
+    /// Construct a configured long-lived credential.
+    #[must_use]
+    pub fn configured(
+        access_key_id: String,
+        secret_key: SecretKey,
+        account: s3_types::AccountIdentity,
+        principal: ConfiguredPrincipalIdentity,
+        authorization_profile: AuthorizationProfile,
+        expires_at_epoch_secs: Option<u64>,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            access_key_id,
+            secret_key,
+            identity: AuthenticatedIdentity::configured(account, principal),
+            authorization_profile,
+            expires_at_epoch_secs,
+            enabled,
+        }
+    }
+
+    #[must_use]
+    pub fn access_key_id(&self) -> &str {
+        &self.access_key_id
+    }
+
+    #[must_use]
+    pub fn secret_key(&self) -> &SecretKey {
+        &self.secret_key
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &AuthenticatedIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub const fn authorization_profile(&self) -> AuthorizationProfile {
+        self.authorization_profile
+    }
+
+    #[must_use]
+    pub const fn expires_at_epoch_secs(&self) -> Option<u64> {
+        self.expires_at_epoch_secs
+    }
+
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl std::fmt::Debug for StoredCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CredentialRecord")
+        f.debug_struct("StoredCredential")
             .field(
                 "access_key_id",
                 &observability::escaped(&self.access_key_id),
             )
             .field("secret_key", &self.secret_key)
-            .field("account", &self.account)
+            .field("identity", &self.identity)
             .field("authorization_profile", &self.authorization_profile)
             .field("expires_at_epoch_secs", &self.expires_at_epoch_secs)
             .field("enabled", &self.enabled)
@@ -145,7 +201,7 @@ pub(crate) fn parse_credential_scope_ref(value: &str) -> Option<CredentialScopeR
 
 /// Static in-memory credential store. Maps access_key_id to credential record.
 pub struct CredentialStore {
-    keys: HashMap<String, CredentialRecord>,
+    keys: HashMap<String, StoredCredential>,
 }
 
 impl CredentialStore {
@@ -160,24 +216,26 @@ impl CredentialStore {
     ///
     /// Principal defaults to the access key ID, with no expiry.
     pub fn add(&mut self, access_key_id: String, secret_key: SecretKey) {
-        let account = AccountIdentity::from_principal(access_key_id.clone());
-        self.add_record(CredentialRecord {
+        let account = s3_types::AccountIdentity::from_principal(access_key_id.clone());
+        let principal = ConfiguredPrincipalIdentity::new(access_key_id.clone());
+        self.add_record(StoredCredential::configured(
             access_key_id,
             secret_key,
             account,
-            authorization_profile: AuthorizationProfile::Standard,
-            expires_at_epoch_secs: None,
-            enabled: true,
-        });
+            principal,
+            AuthorizationProfile::Standard,
+            None,
+            true,
+        ));
     }
 
     /// Add a full credential record.
-    pub fn add_record(&mut self, record: CredentialRecord) {
-        self.keys.insert(record.access_key_id.clone(), record);
+    pub fn add_record(&mut self, record: StoredCredential) {
+        self.keys.insert(record.access_key_id().to_string(), record);
     }
 
     /// Look up a full credential record by access key ID.
-    pub fn get_record(&self, access_key_id: &str) -> Option<&CredentialRecord> {
+    pub fn get_record(&self, access_key_id: &str) -> Option<&StoredCredential> {
         self.keys.get(access_key_id)
     }
 
@@ -185,11 +243,11 @@ impl CredentialStore {
     pub fn find_account_by_canonical_user_id(
         &self,
         canonical_user_id: &s3_types::CanonicalUserId,
-    ) -> Option<&AccountIdentity> {
+    ) -> Option<&s3_types::AccountIdentity> {
         self.keys
             .values()
-            .find(|record| record.account.canonical_user_id() == canonical_user_id)
-            .map(|record| &record.account)
+            .find(|record| record.identity().account().canonical_user_id() == canonical_user_id)
+            .map(|record| record.identity().account())
     }
 }
 
@@ -214,9 +272,16 @@ mod tests {
         let mut store = CredentialStore::new();
         store.add("AKID".into(), SecretKey::new("secret123".into()));
         let record = store.get_record("AKID").unwrap();
-        assert_eq!(record.secret_key.as_str(), "secret123");
-        assert_eq!(record.account.principal(), "AKID");
-        assert!(record.enabled);
+        assert_eq!(record.secret_key().as_str(), "secret123");
+        assert_eq!(
+            record
+                .identity()
+                .configured_principal()
+                .unwrap()
+                .principal(),
+            "AKID"
+        );
+        assert!(record.is_enabled());
     }
 
     #[test]
@@ -225,28 +290,59 @@ mod tests {
         store.add("AKID".into(), SecretKey::new("first".into()));
         store.add("AKID".into(), SecretKey::new("second".into()));
         let record = store.get_record("AKID").unwrap();
-        assert_eq!(record.secret_key.as_str(), "second");
+        assert_eq!(record.secret_key().as_str(), "second");
     }
 
     #[test]
     fn add_record_round_trip() {
         let mut store = CredentialStore::new();
-        store.add_record(CredentialRecord {
-            access_key_id: "AKID".into(),
-            secret_key: SecretKey::new("secret".into()),
-            account: AccountIdentity::new(
+        store.add_record(StoredCredential::configured(
+            "AKID".into(),
+            SecretKey::new("secret".into()),
+            s3_types::AccountIdentity::new(
                 "user-123",
                 s3_types::CanonicalUserId::from_principal("user-123"),
                 "User 123",
             ),
-            authorization_profile: AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(1234),
-            enabled: true,
-        });
+            ConfiguredPrincipalIdentity::new("user-123"),
+            AuthorizationProfile::Standard,
+            Some(1234),
+            true,
+        ));
         let record = store.get_record("AKID").unwrap();
-        assert_eq!(record.account.principal(), "user-123");
-        assert_eq!(record.account.display_name(), "User 123");
-        assert_eq!(record.expires_at_epoch_secs, Some(1234));
+        assert_eq!(record.identity().account().principal(), "user-123");
+        assert_eq!(record.identity().account().display_name(), "User 123");
+        assert_eq!(record.expires_at_epoch_secs(), Some(1234));
+    }
+
+    #[test]
+    fn configured_record_keeps_account_and_request_principal_separate() {
+        let account_id = "123456789012";
+        let record = StoredCredential::configured(
+            "AKID".into(),
+            SecretKey::new("secret".into()),
+            s3_types::AccountIdentity::new(
+                account_id,
+                s3_types::CanonicalUserId::from_principal(account_id),
+                "Test account",
+            ),
+            ConfiguredPrincipalIdentity::new("arn:aws:iam::123456789012:user/test"),
+            AuthorizationProfile::Standard,
+            None,
+            true,
+        );
+
+        assert_eq!(record.identity().account().principal(), account_id);
+        assert_eq!(
+            record
+                .identity()
+                .configured_principal()
+                .unwrap()
+                .principal(),
+            "arn:aws:iam::123456789012:user/test"
+        );
+        assert!(record.identity().session_principal_arn().is_none());
+        assert!(record.identity().role_principal_arn().is_none());
     }
 
     #[test]
@@ -305,14 +401,15 @@ mod tests {
         let secret = SecretKey::new("super-secret".into());
         assert_eq!(format!("{secret:?}"), "<redacted:secret_key>");
 
-        let record = CredentialRecord {
-            access_key_id: "AK\r\nID".into(),
-            secret_key: SecretKey::new("super-secret".into()),
-            account: AccountIdentity::from_principal("user-123"),
-            authorization_profile: AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(1234),
-            enabled: true,
-        };
+        let record = StoredCredential::configured(
+            "AK\r\nID".into(),
+            SecretKey::new("super-secret".into()),
+            s3_types::AccountIdentity::from_principal("user-123"),
+            ConfiguredPrincipalIdentity::new("user-123"),
+            AuthorizationProfile::Standard,
+            Some(1234),
+            true,
+        );
         let debug = format!("{record:?}");
         assert!(debug.contains(r#""AK\r\nID""#));
         assert!(debug.contains("<redacted:secret_key>"));

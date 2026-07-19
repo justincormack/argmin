@@ -737,7 +737,7 @@ mod tests {
             .load_bucket_pair(
                 (
                     &BucketName::try_from("bucket").unwrap(),
-                    Some(test_requester().principal_opt().unwrap()),
+                    Some(test_requester().configured_principal().unwrap()),
                     BucketHandleRequest::new(),
                 ),
                 (

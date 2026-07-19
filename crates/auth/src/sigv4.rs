@@ -6,7 +6,7 @@ use crate::canonical::{
     sha256_hex, string_to_sign,
 };
 use crate::credential::{
-    parse_credential_scope_ref, CredentialRecord, CredentialScope, CredentialStore, SecretKey,
+    parse_credential_scope_ref, CredentialScope, CredentialStore, SecretKey, StoredCredential,
 };
 use crate::encoding::hex_encode_lower;
 use crate::error::AuthError;
@@ -184,7 +184,7 @@ pub(crate) struct VerifyRequestRecordInput<'a, H: HeaderSource + ?Sized> {
 pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
     input: VerifyRequestRecordInput<'_, H>,
     store: &'a CredentialStore,
-) -> Result<(&'a CredentialRecord, String), AuthError> {
+) -> Result<(&'a StoredCredential, String), AuthError> {
     let VerifyRequestRecordInput {
         method,
         uri,
@@ -200,11 +200,11 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
     let record = store
         .get_record(&auth.credential.access_key_id)
         .ok_or(AuthError::UnknownAccessKey)?;
-    if !record.enabled {
+    if !record.is_enabled() {
         return Err(AuthError::UnknownAccessKey);
     }
     validate_static_record_expiry(record, now_epoch_secs)?;
-    let secret = &record.secret_key;
+    let secret = record.secret_key();
 
     // Extract signed headers — collect all values for each header name
     // to handle duplicate headers (values combined by canonical_headers).
@@ -695,14 +695,15 @@ mod tests {
     #[test]
     fn authenticate_header_disabled_key() {
         let mut store = CredentialStore::new();
-        store.add_record(crate::credential::CredentialRecord {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            account: s3_types::AccountIdentity::from_principal("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: None,
-            enabled: false,
-        });
+        store.add_record(crate::credential::StoredCredential::configured(
+            "AKIAIOSFODNN7EXAMPLE".to_string(),
+            SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            s3_types::AccountIdentity::from_principal("u1"),
+            crate::ConfiguredPrincipalIdentity::new("u1"),
+            crate::AuthorizationProfile::Standard,
+            None,
+            false,
+        ));
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-date, \

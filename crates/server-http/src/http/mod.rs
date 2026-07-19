@@ -1236,7 +1236,10 @@ impl HttpFrontend {
     fn authenticated_account(
         auth: &AuthContext,
     ) -> Result<&s3_types::AccountIdentity, ServerError> {
-        auth.account.as_ref().ok_or(ServerError::AccessDenied)
+        auth.identity
+            .as_ref()
+            .map(auth::AuthenticatedIdentity::account)
+            .ok_or(ServerError::AccessDenied)
     }
 }
 
@@ -1396,7 +1399,7 @@ impl HttpFrontend {
             req.method.as_str(),
             req.path(),
             operation,
-            auth.principal()
+            auth.configured_principal()
         );
         let expected_bucket_owner = expected_bucket_owner(req);
         // Dispatch to coordinator
@@ -6401,11 +6404,18 @@ mod tests {
         }
     }
 
+    fn configured_identity(account: auth::AccountIdentity) -> auth::AuthenticatedIdentity {
+        let principal = auth::ConfiguredPrincipalIdentity::new(account.principal());
+        auth::AuthenticatedIdentity::configured(account, principal)
+    }
+
     fn test_auth() -> auth::AuthContext {
         auth::AuthContext {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
-            account: Some(auth::AccountIdentity::from_principal("testuser")),
+            identity: Some(configured_identity(auth::AccountIdentity::from_principal(
+                "testuser",
+            ))),
             authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-east-1".to_string()),
@@ -6814,7 +6824,9 @@ mod tests {
         let auth = auth::AuthContext {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
-            account: Some(auth::AccountIdentity::from_principal("testuser")),
+            identity: Some(configured_identity(auth::AccountIdentity::from_principal(
+                "testuser",
+            ))),
             authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-west-2".to_string()),
@@ -6849,7 +6861,9 @@ mod tests {
         let auth = auth::AuthContext {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
-            account: Some(auth::AccountIdentity::from_principal("testuser")),
+            identity: Some(configured_identity(auth::AccountIdentity::from_principal(
+                "testuser",
+            ))),
             authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-west-2".to_string()),
@@ -6927,7 +6941,7 @@ mod tests {
         let auth = auth::AuthContext {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
-            account: Some(account),
+            identity: Some(configured_identity(account)),
             authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-east-1".to_string()),
@@ -11893,7 +11907,9 @@ mod tests {
         let auth = auth::AuthContext {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
-            account: Some(auth::AccountIdentity::from_principal("testuser")),
+            identity: Some(configured_identity(auth::AccountIdentity::from_principal(
+                "testuser",
+            ))),
             authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-east-1".to_string()),

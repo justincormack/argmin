@@ -138,7 +138,7 @@ pub(super) fn object_policy_request<'a>(
         input.action,
         input.bucket_name,
         input.key,
-        input.requester.principal_opt(),
+        input.requester.configured_principal(),
         input.requester.canonical_user_id(),
         input.existing_object_tags,
     )
@@ -235,7 +235,7 @@ fn bucket_policy_request<'a>(
     let mut request = auth::PolicyRequest::for_bucket(
         input.action,
         input.bucket_name,
-        input.requester.principal_opt(),
+        input.requester.configured_principal(),
         input.requester.canonical_user_id(),
         input.bucket_tags,
     )

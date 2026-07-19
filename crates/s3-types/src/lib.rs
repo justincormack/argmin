@@ -688,7 +688,10 @@ impl std::fmt::Display for CanonicalUserId {
     }
 }
 
-/// Durable authenticated account identity shared across auth and server layers.
+/// Durable S3 account/owner identity shared across auth and server layers.
+///
+/// Request-principal kinds such as IAM users and assumed-role sessions are
+/// modeled separately by the authentication layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AccountIdentity {
     principal: String,
@@ -723,7 +726,7 @@ impl AccountIdentity {
         }
     }
 
-    /// Stable principal name for authorization and XML owner display fields.
+    /// Stable account/owner principal retained by S3 metadata.
     #[must_use]
     pub fn principal(&self) -> &str {
         &self.principal

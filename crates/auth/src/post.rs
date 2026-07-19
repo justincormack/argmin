@@ -116,14 +116,14 @@ pub fn authenticate_post_sigv4(
     let record = store
         .get_record(credential.access_key_id)
         .ok_or(AuthError::UnknownAccessKey)?;
-    if !record.enabled {
+    if !record.is_enabled() {
         return Err(AuthError::UnknownAccessKey);
     }
     validate_static_record_expiry(record, now_epoch_secs)?;
 
     // Derive signing key and compute expected signature
     let signing_key = sigv4::derive_signing_key(
-        &record.secret_key,
+        record.secret_key(),
         credential.date,
         credential.region,
         credential.service,
@@ -147,8 +147,8 @@ pub fn authenticate_post_sigv4(
     Ok(AuthContext {
         mode: AuthMode::PostSigV4,
         access_key_id: Some(credential.access_key_id.to_string()),
-        account: Some(record.account.clone()),
-        authorization_profile: record.authorization_profile,
+        identity: Some(record.identity().clone()),
+        authorization_profile: record.authorization_profile(),
         request_epoch_secs: Some(request_epoch_secs),
         signing_region: Some(credential.region.to_string()),
         streaming: None,
@@ -499,6 +499,24 @@ mod tests {
         store
     }
 
+    fn configured_record(
+        access_key_id: &str,
+        secret_key: &str,
+        principal: &str,
+        expires_at_epoch_secs: Option<u64>,
+        enabled: bool,
+    ) -> crate::credential::StoredCredential {
+        crate::credential::StoredCredential::configured(
+            access_key_id.to_string(),
+            SecretKey::new(secret_key.to_string()),
+            AccountIdentity::from_principal(principal),
+            crate::ConfiguredPrincipalIdentity::new(principal),
+            crate::AuthorizationProfile::Standard,
+            expires_at_epoch_secs,
+            enabled,
+        )
+    }
+
     fn authenticate_post_sigv4(
         algorithm: &str,
         credential: &str,
@@ -640,14 +658,13 @@ mod tests {
     #[test]
     fn sigv4_post_expired_token() {
         let mut store = CredentialStore::new();
-        store.add_record(crate::credential::CredentialRecord {
-            access_key_id: "testAccessKey123".to_string(),
-            secret_key: SecretKey::new("testSecretKey456".to_string()),
-            account: AccountIdentity::from_principal("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(100),
-            enabled: true,
-        });
+        store.add_record(configured_record(
+            "testAccessKey123",
+            "testSecretKey456",
+            "u1",
+            Some(100),
+            true,
+        ));
         let (policy_b64, sig_hex) = signed_test_policy();
         let err = super::authenticate_post_sigv4(
             PostSigV4Request {
@@ -669,14 +686,13 @@ mod tests {
     #[test]
     fn sigv4_post_expired_token_with_bad_signature_reports_expired_token() {
         let mut store = CredentialStore::new();
-        store.add_record(crate::credential::CredentialRecord {
-            access_key_id: "testAccessKey123".to_string(),
-            secret_key: SecretKey::new("testSecretKey456".to_string()),
-            account: AccountIdentity::from_principal("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(100),
-            enabled: true,
-        });
+        store.add_record(configured_record(
+            "testAccessKey123",
+            "testSecretKey456",
+            "u1",
+            Some(100),
+            true,
+        ));
         let (policy_b64, _) = signed_test_policy();
         let err = super::authenticate_post_sigv4(
             PostSigV4Request {
@@ -1518,14 +1534,7 @@ mod tests {
     #[test]
     fn sigv4_post_disabled_key() {
         let mut store = CredentialStore::new();
-        store.add_record(crate::credential::CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("secret".to_string()),
-            account: AccountIdentity::from_principal("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: None,
-            enabled: false,
-        });
+        store.add_record(configured_record("AKID", "secret", "p", None, false));
         let err = authenticate_post_sigv4(
             "AWS4-HMAC-SHA256",
             "AKID/20250101/us-east-1/s3/aws4_request",

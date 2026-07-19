@@ -1,9 +1,6 @@
 /// High-level request authentication entrypoint.
 use std::borrow::Cow;
 
-use ring::hmac;
-use s3_types::AccountIdentity;
-
 use crate::canonical::{
     amz_date_matches_date_stamp, canonical_headers, canonical_query_string, canonical_request,
     parse_amz_date, sha256_hex, string_to_sign,
@@ -19,6 +16,7 @@ use crate::{
     MAX_AUTHORIZATION_HEADER_LEN, MAX_PRESIGNED_QUERY_LEN, MAX_SIGNED_HEADERS_LEN,
     MAX_SIGNED_HEADER_COUNT,
 };
+use ring::hmac;
 
 const TRACE_TARGET: &str = "auth";
 
@@ -96,7 +94,7 @@ impl std::fmt::Debug for StreamingSigningContext {
 pub struct AuthContext {
     pub mode: AuthMode,
     pub access_key_id: Option<String>,
-    pub account: Option<AccountIdentity>,
+    pub identity: Option<crate::AuthenticatedIdentity>,
     pub authorization_profile: crate::AuthorizationProfile,
     pub request_epoch_secs: Option<u64>,
     pub signing_region: Option<String>,
@@ -111,7 +109,7 @@ impl std::fmt::Debug for AuthContext {
         f.debug_struct("AuthContext")
             .field("mode", &self.mode)
             .field("access_key_id", &access_key_id)
-            .field("account", &self.account)
+            .field("identity", &self.identity)
             .field("authorization_profile", &self.authorization_profile)
             .field("request_epoch_secs", &self.request_epoch_secs)
             .field("signing_region", &signing_region)
@@ -126,7 +124,7 @@ impl AuthContext {
         Self {
             mode: AuthMode::Anonymous,
             access_key_id: None,
-            account: None,
+            identity: None,
             authorization_profile: crate::AuthorizationProfile::Standard,
             request_epoch_secs: None,
             signing_region: None,
@@ -135,8 +133,11 @@ impl AuthContext {
     }
 
     #[must_use]
-    pub fn principal(&self) -> Option<&str> {
-        self.account.as_ref().map(AccountIdentity::principal)
+    pub fn configured_principal(&self) -> Option<&str> {
+        self.identity
+            .as_ref()?
+            .configured_principal()
+            .map(crate::ConfiguredPrincipalIdentity::principal)
     }
 }
 
@@ -394,7 +395,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
             credential.date, credential.region, credential.service
         );
         let signing_key = derive_signing_key(
-            &record.secret_key,
+            record.secret_key(),
             &credential.date,
             &credential.region,
             &credential.service,
@@ -416,8 +417,8 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
     Ok(AuthContext {
         mode: AuthMode::HeaderSigV4,
         access_key_id: Some(credential.access_key_id),
-        account: Some(record.account.clone()),
-        authorization_profile: record.authorization_profile,
+        identity: Some(record.identity().clone()),
+        authorization_profile: record.authorization_profile(),
         request_epoch_secs,
         signing_region: Some(credential.region),
         streaming,
@@ -551,7 +552,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     let record = store
         .get_record(credential.access_key_id)
         .ok_or(AuthError::UnknownAccessKey)?;
-    if !record.enabled {
+    if !record.is_enabled() {
         return Err(AuthError::UnknownAccessKey);
     }
     validate_static_record_expiry(record, now_epoch_secs)?;
@@ -593,7 +594,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     );
     let sts = string_to_sign(request_date.as_ref(), &scope, &canonical_hash);
     let signing_key = derive_signing_key(
-        &record.secret_key,
+        record.secret_key(),
         credential.date,
         credential.region,
         credential.service,
@@ -619,8 +620,8 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     Ok(AuthContext {
         mode: AuthMode::PresignedSigV4,
         access_key_id: Some(credential.access_key_id.to_owned()),
-        account: Some(record.account.clone()),
-        authorization_profile: record.authorization_profile,
+        identity: Some(record.identity().clone()),
+        authorization_profile: record.authorization_profile(),
         request_epoch_secs: Some(request_epoch),
         signing_region: Some(credential.region.to_owned()),
         streaming: None,
@@ -658,10 +659,10 @@ where
 }
 
 pub(crate) fn validate_static_record_expiry(
-    record: &crate::credential::CredentialRecord,
+    record: &crate::credential::StoredCredential,
     now_epoch_secs: u64,
 ) -> Result<(), AuthError> {
-    if let Some(expiry) = record.expires_at_epoch_secs {
+    if let Some(expiry) = record.expires_at_epoch_secs() {
         if now_epoch_secs > expiry {
             return Err(AuthError::ExpiredToken);
         }
@@ -715,11 +716,30 @@ fn header_value<'a, H: HeaderSource + ?Sized>(headers: &'a H, name: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential::{CredentialRecord, SecretKey};
+    use crate::credential::{SecretKey, StoredCredential};
     use s3_types::AccountIdentity;
 
     fn account(principal: &str) -> AccountIdentity {
         AccountIdentity::from_principal(principal)
+    }
+
+    fn configured_record(
+        access_key_id: &str,
+        secret_key: &str,
+        account: AccountIdentity,
+        expires_at_epoch_secs: Option<u64>,
+        enabled: bool,
+    ) -> StoredCredential {
+        let principal = crate::ConfiguredPrincipalIdentity::new(account.principal());
+        StoredCredential::configured(
+            access_key_id.to_string(),
+            SecretKey::new(secret_key.to_string()),
+            account,
+            principal,
+            crate::AuthorizationProfile::Standard,
+            expires_at_epoch_secs,
+            enabled,
+        )
     }
 
     fn example_store() -> CredentialStore {
@@ -796,7 +816,7 @@ mod tests {
         .unwrap();
         assert_eq!(ctx.mode, AuthMode::HeaderSigV4);
         assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
-        assert_eq!(ctx.principal(), Some("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(ctx.configured_principal(), Some("AKIAIOSFODNN7EXAMPLE"));
         assert_eq!(ctx.request_epoch_secs, Some(1_369_353_600));
     }
 
@@ -1160,14 +1180,13 @@ mod tests {
     fn authenticate_header_unsigned_security_token_rejected() {
         // AWS requires x-amz-security-token to be signed; unsigned → UnsignedHeaders.
         let mut store = example_store();
-        store.add_record(CredentialRecord {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            account: account("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: None,
-            enabled: true,
-        });
+        store.add_record(configured_record(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            account("u1"),
+            None,
+            true,
+        ));
         let headers = [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
             ("host", "examplebucket.s3.amazonaws.com"),
@@ -1194,14 +1213,13 @@ mod tests {
     #[test]
     fn authenticate_header_expired_token() {
         let mut store = CredentialStore::new();
-        store.add_record(CredentialRecord {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            account: account("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(5),
-            enabled: true,
-        });
+        store.add_record(configured_record(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            account("u1"),
+            Some(5),
+            true,
+        ));
         let headers = [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
             ("host", "examplebucket.s3.amazonaws.com"),
@@ -1227,14 +1245,13 @@ mod tests {
     #[test]
     fn authenticate_header_expired_token_with_bad_signature_reports_expired_token() {
         let mut store = CredentialStore::new();
-        store.add_record(CredentialRecord {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            account: account("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(5),
-            enabled: true,
-        });
+        store.add_record(configured_record(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            account("u1"),
+            Some(5),
+            true,
+        ));
         let headers = [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"),
             ("host", "examplebucket.s3.amazonaws.com"),
@@ -1702,14 +1719,13 @@ mod tests {
     #[test]
     fn presigned_disabled_key() {
         let mut store = CredentialStore::new();
-        store.add_record(CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("secret".to_string()),
-            account: account("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: None,
-            enabled: false,
-        });
+        store.add_record(configured_record(
+            "AKID",
+            "secret",
+            account("p"),
+            None,
+            false,
+        ));
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(
@@ -1772,41 +1788,20 @@ mod tests {
 
     #[test]
     fn epoch_time_before_future_expiry_is_not_expired() {
-        let record = CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("s".to_string()),
-            account: account("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(5),
-            enabled: true,
-        };
+        let record = configured_record("AKID", "s", account("p"), Some(5), true);
         validate_static_record_expiry(&record, 0).unwrap();
     }
 
     #[test]
     fn no_token_no_expiry_ok() {
-        let record = CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("s".to_string()),
-            account: account("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: None,
-            enabled: true,
-        };
+        let record = configured_record("AKID", "s", account("p"), None, true);
         validate_static_record_expiry(&record, 100).unwrap();
         validate_static_credential_has_no_token(None).unwrap();
     }
 
     #[test]
     fn expiry_not_yet_expired_with_nonzero_now() {
-        let record = CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("s".to_string()),
-            account: account("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(100),
-            enabled: true,
-        };
+        let record = configured_record("AKID", "s", account("p"), Some(100), true);
         validate_static_record_expiry(&record, 100).unwrap();
     }
 
@@ -2046,14 +2041,13 @@ mod tests {
     #[test]
     fn presigned_security_token_in_query_with_bad_signature_rejects_signature_first() {
         let mut store = CredentialStore::new();
-        store.add_record(CredentialRecord {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            account: account("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: None,
-            enabled: true,
-        });
+        store.add_record(configured_record(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            account("u1"),
+            None,
+            true,
+        ));
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-Security-Token=wrong-token&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(
@@ -2096,14 +2090,13 @@ mod tests {
     #[test]
     fn presigned_expired_token() {
         let mut store = CredentialStore::new();
-        store.add_record(CredentialRecord {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            account: account("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(100),
-            enabled: true,
-        });
+        store.add_record(configured_record(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            account("u1"),
+            Some(100),
+            true,
+        ));
         let query = sign_test_presigned_query(
             "GET",
             "/",
@@ -2129,14 +2122,13 @@ mod tests {
     #[test]
     fn presigned_expired_token_with_bad_signature_reports_expired_token() {
         let mut store = CredentialStore::new();
-        store.add_record(CredentialRecord {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            account: account("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: Some(100),
-            enabled: true,
-        });
+        store.add_record(configured_record(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            account("u1"),
+            Some(100),
+            true,
+        ));
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(
@@ -2450,10 +2442,14 @@ mod tests {
 
     #[test]
     fn auth_context_debug_redacts_streaming_secrets_and_escapes_text() {
+        let account = AccountIdentity::from_principal("user-123");
         let ctx = AuthContext {
             mode: AuthMode::HeaderSigV4,
             access_key_id: Some("AK\r\nID".into()),
-            account: Some(AccountIdentity::from_principal("user-123")),
+            identity: Some(crate::AuthenticatedIdentity::configured(
+                account,
+                crate::ConfiguredPrincipalIdentity::new("user-123"),
+            )),
             authorization_profile: crate::AuthorizationProfile::Standard,
             request_epoch_secs: Some(1234),
             signing_region: Some("us-\neast-1".into()),

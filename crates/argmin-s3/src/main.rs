@@ -18,7 +18,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use auth::{AccountIdentity, CredentialRecord, CredentialStore};
+use auth::{AccountIdentity, ConfiguredPrincipalIdentity, CredentialStore, StoredCredential};
 use ec::EcConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -178,18 +178,20 @@ fn authorization_profile(profile: ConfiguredCredentialProfile) -> auth::Authoriz
 }
 
 fn add_configured_credential(credentials: &mut CredentialStore, credential: &ConfiguredCredential) {
-    credentials.add_record(CredentialRecord {
-        access_key_id: credential.access_key_id.clone(),
-        secret_key: credential.secret_access_key.clone(),
-        account: AccountIdentity::new(
-            credential.principal.clone(),
-            CanonicalUserId::from_principal(&credential.account_id),
-            credential.display_name.clone(),
-        ),
-        authorization_profile: authorization_profile(credential.authorization_profile),
-        expires_at_epoch_secs: None,
-        enabled: true,
-    });
+    let account = AccountIdentity::new(
+        credential.account_id.clone(),
+        CanonicalUserId::from_principal(&credential.account_id),
+        credential.display_name.clone(),
+    );
+    credentials.add_record(StoredCredential::configured(
+        credential.access_key_id.clone(),
+        credential.secret_access_key.clone(),
+        account,
+        ConfiguredPrincipalIdentity::new(credential.principal.clone()),
+        authorization_profile(credential.authorization_profile),
+        None,
+        true,
+    ));
 }
 
 fn build_credential_store(config: &ServerConfig) -> CredentialStore {
@@ -199,14 +201,15 @@ fn build_credential_store(config: &ServerConfig) -> CredentialStore {
         CanonicalUserId::from_principal(&config.account_id),
         config.account_id.clone(),
     );
-    credentials.add_record(CredentialRecord {
-        access_key_id: config.access_key_id.clone(),
-        secret_key: config.secret_access_key.clone(),
+    credentials.add_record(StoredCredential::configured(
+        config.access_key_id.clone(),
+        config.secret_access_key.clone(),
         account,
-        authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
-        expires_at_epoch_secs: None,
-        enabled: true,
-    });
+        ConfiguredPrincipalIdentity::new(config.account_id.clone()),
+        auth::AuthorizationProfile::OwnerAccountAdmin,
+        None,
+        true,
+    ));
     for credential in &config.uat_credentials {
         add_configured_credential(&mut credentials, credential);
     }
