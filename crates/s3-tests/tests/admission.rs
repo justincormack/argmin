@@ -45,6 +45,12 @@ async fn start_server(
     let storage_cluster = s3_tests::server::open_test_storage_cluster(&data_path, &pg_ids);
 
     let host_id = Arc::<str>::from(server_http::http::new_host_id());
+    let mut credentials = auth::CredentialStore::default();
+    credentials.add(
+        s3_tests::server::TEST_ACCESS_KEY.to_string(),
+        auth::SecretKey::new(s3_tests::server::TEST_SECRET_KEY.to_string()),
+    );
+    let identity_provider = auth::IdentityProvider::in_memory(credentials);
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
             let sse_s3_provider = ManagedWrappingKeyConfig::from_base64(
@@ -62,15 +68,9 @@ async fn start_server(
             )
             .expect("create coordinator");
 
-            let mut credentials = auth::CredentialStore::default();
-            credentials.add(
-                s3_tests::server::TEST_ACCESS_KEY.to_string(),
-                auth::SecretKey::new(s3_tests::server::TEST_SECRET_KEY.to_string()),
-            );
-
             server_http::http::HttpFrontend {
                 coordinator: Arc::new(coordinator),
-                credentials,
+                identity_provider: identity_provider.clone(),
                 host_id: Arc::clone(&host_id),
             }
         })

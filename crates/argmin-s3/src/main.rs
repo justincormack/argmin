@@ -6376,7 +6376,8 @@ async fn run_frontend_server(
         .as_ref()
         .map(storage::StorageClusterRuntimeMapRefreshLoop::status_handle);
 
-    // Build frontend pool sharing the same storage cluster handle.
+    // Build frontend pool sharing the same storage cluster and identity-provider handles.
+    let identity_provider = auth::IdentityProvider::in_memory(build_credential_store(&config));
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
         let coordinator =
@@ -6396,7 +6397,7 @@ async fn run_frontend_server(
         };
         frontends.push(HttpFrontend {
             coordinator: Arc::new(coordinator),
-            credentials: build_credential_store(&config),
+            identity_provider: identity_provider.clone(),
             host_id: Arc::<str>::from(host_id.clone()),
         });
     }

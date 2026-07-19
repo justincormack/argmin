@@ -57,6 +57,9 @@ pub enum ServerError {
     #[error("auth error: {0}")]
     Auth(#[from] auth::AuthError),
 
+    #[error("identity provider error: {0}")]
+    IdentityProvider(#[from] auth::IdentityProviderError),
+
     #[error("authorization header region {provided_region} is wrong; expecting {expected_region}")]
     WrongRegion {
         provided_region: String,
@@ -471,6 +474,8 @@ impl ServerError {
             Self::IntegrityError { .. } => "integrity_error",
             Self::SlowDown => "slow_down",
             Self::OperationAborted => "operation_aborted",
+            Self::IdentityProvider(_) => "identity_provider_unavailable",
+            Self::Auth(auth::AuthError::IdentityProviderFailure) => "identity_provider_unavailable",
             Self::Auth(_) => "auth_error",
             _ => self.s3_error_code(),
         }
@@ -535,6 +540,8 @@ impl ServerError {
                 | auth::AuthError::InvalidCredentialScopeService { .. },
             ) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
+            Self::IdentityProvider(_) => "InternalError",
+            Self::Auth(auth::AuthError::IdentityProviderFailure) => "InternalError",
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
             Self::Auth(auth::AuthError::MultipleAuthMechanisms { .. }) => "InvalidArgument",
             Self::Auth(auth::AuthError::SignatureMismatch { .. }) => "SignatureDoesNotMatch",
@@ -692,6 +699,8 @@ impl ServerError {
             Self::Auth(auth::AuthError::MultipleAuthMechanisms { .. }) => 400,
             Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => 400,
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => 501,
+            Self::IdentityProvider(_) => 500,
+            Self::Auth(auth::AuthError::IdentityProviderFailure) => 500,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidRequestHostId { .. }
@@ -1153,6 +1162,21 @@ mod tests {
     fn s3_error_code_auth_unknown_key() {
         let err = ServerError::Auth(auth::AuthError::UnknownAccessKey);
         assert_eq!(err.s3_error_code(), "InvalidAccessKeyId");
+    }
+
+    #[test]
+    fn identity_provider_failure_is_internal_error() {
+        for err in [
+            ServerError::Auth(auth::AuthError::IdentityProviderFailure),
+            ServerError::IdentityProvider(auth::IdentityProviderError::Unavailable),
+        ] {
+            assert_eq!(err.s3_error_code(), "InternalError");
+            assert_eq!(err.http_status(), 500);
+            assert_eq!(
+                err.diagnostic_cause_label(),
+                "identity_provider_unavailable"
+            );
+        }
     }
 
     #[test]

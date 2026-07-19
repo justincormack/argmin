@@ -5,7 +5,7 @@ use crate::canonical::{
     amz_date_matches_date_stamp, canonical_headers, canonical_query_string, canonical_request,
     parse_amz_date, sha256_hex, string_to_sign,
 };
-use crate::credential::{parse_credential_scope_ref, CredentialStore};
+use crate::credential::parse_credential_scope_ref;
 use crate::encoding::{hex_encode_lower, percent_decode_lossy};
 use crate::error::AuthError;
 use crate::sigv4::{
@@ -220,7 +220,7 @@ pub fn authenticate_request<H: HeaderSource + ?Sized>(
     query_string: &str,
     headers: &H,
     body: &[u8],
-    store: &CredentialStore,
+    provider: &crate::IdentityProvider,
     expected_region: ExpectedSigningRegion<'_>,
     expected_service: &str,
     now_epoch_secs: u64,
@@ -271,7 +271,7 @@ pub fn authenticate_request<H: HeaderSource + ?Sized>(
             query_string,
             headers,
             body,
-            store,
+            provider,
             expected_region,
             expected_service,
             now_epoch_secs,
@@ -291,7 +291,7 @@ pub fn authenticate_request<H: HeaderSource + ?Sized>(
             query_string,
             headers,
             body,
-            store,
+            provider,
             expected_region,
             expected_service,
             now_epoch_secs,
@@ -314,7 +314,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
     query_string: &str,
     headers: &H,
     body: &[u8],
-    store: &CredentialStore,
+    provider: &crate::IdentityProvider,
     expected_region: ExpectedSigningRegion<'_>,
     expected_service: &str,
     now_epoch_secs: u64,
@@ -373,7 +373,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
             timestamp: selected_timestamp,
             now_epoch_secs,
         },
-        store,
+        provider,
     )?;
 
     validate_static_credential_has_no_token(headers.first_value("x-amz-security-token"))?;
@@ -432,7 +432,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     query_string: &str,
     headers: &H,
     _body: &[u8],
-    store: &CredentialStore,
+    provider: &crate::IdentityProvider,
     expected_region: ExpectedSigningRegion<'_>,
     expected_service: &str,
     now_epoch_secs: u64,
@@ -549,13 +549,14 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         });
     }
 
-    let record = store
-        .get_record(credential.access_key_id)
+    let record = provider
+        .lookup_long_lived_credential(credential.access_key_id)
+        .map_err(|_| AuthError::IdentityProviderFailure)?
         .ok_or(AuthError::UnknownAccessKey)?;
     if !record.is_enabled() {
         return Err(AuthError::UnknownAccessKey);
     }
-    validate_static_record_expiry(record, now_epoch_secs)?;
+    validate_static_record_expiry(&record, now_epoch_secs)?;
     let token = query_param_lossy(query_string, "X-Amz-Security-Token");
     let signed_header_token = signed_headers
         .iter()
@@ -716,8 +717,27 @@ fn header_value<'a, H: HeaderSource + ?Sized>(headers: &'a H, name: &str) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential::{SecretKey, StoredCredential};
+    use crate::credential::{CredentialStore, SecretKey, StoredCredential};
     use s3_types::AccountIdentity;
+    use std::sync::Arc;
+
+    struct UnavailableIdentityProvider;
+
+    impl crate::IdentityProviderBackend for UnavailableIdentityProvider {
+        fn lookup_long_lived_credential(
+            &self,
+            _access_key_id: &str,
+        ) -> Result<Option<Arc<StoredCredential>>, crate::IdentityProviderError> {
+            Err(crate::IdentityProviderError::Unavailable)
+        }
+
+        fn find_account_by_canonical_user_id(
+            &self,
+            _canonical_user_id: &s3_types::CanonicalUserId,
+        ) -> Result<Option<AccountIdentity>, crate::IdentityProviderError> {
+            Err(crate::IdentityProviderError::Unavailable)
+        }
+    }
 
     fn account(principal: &str) -> AccountIdentity {
         AccountIdentity::from_principal(principal)
@@ -742,13 +762,13 @@ mod tests {
         )
     }
 
-    fn example_store() -> CredentialStore {
+    fn example_store() -> crate::IdentityProvider {
         let mut store = CredentialStore::new();
         store.add(
             "AKIAIOSFODNN7EXAMPLE".to_string(),
             SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
         );
-        store
+        crate::IdentityProvider::in_memory(store)
     }
 
     fn aws_example_time() -> u64 {
@@ -818,6 +838,25 @@ mod tests {
         assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
         assert_eq!(ctx.configured_principal(), Some("AKIAIOSFODNN7EXAMPLE"));
         assert_eq!(ctx.request_epoch_secs, Some(1_369_353_600));
+    }
+
+    #[test]
+    fn header_provider_failure_is_not_unknown_access_key() {
+        let provider = crate::IdentityProvider::new(UnavailableIdentityProvider);
+        let headers = aws_example_signed_headers();
+        let err = authenticate_request(
+            "GET",
+            "/test.txt",
+            "",
+            &headers,
+            &[],
+            &provider,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            aws_example_time(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::IdentityProviderFailure));
     }
 
     #[test]
@@ -982,6 +1021,26 @@ mod tests {
         .unwrap();
         assert_eq!(ctx.mode, AuthMode::PresignedSigV4);
         assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn presigned_provider_failure_is_not_unknown_access_key() {
+        let provider = crate::IdentityProvider::new(UnavailableIdentityProvider);
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000";
+        let headers = [("host", "examplebucket.s3.amazonaws.com")];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
+            &headers,
+            &[],
+            &provider,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            presigned_example_time(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::IdentityProviderFailure));
     }
 
     #[test]
@@ -1179,14 +1238,7 @@ mod tests {
     #[test]
     fn authenticate_header_unsigned_security_token_rejected() {
         // AWS requires x-amz-security-token to be signed; unsigned → UnsignedHeaders.
-        let mut store = example_store();
-        store.add_record(configured_record(
-            "AKIAIOSFODNN7EXAMPLE",
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            account("u1"),
-            None,
-            true,
-        ));
+        let store = example_store();
         let headers = [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
             ("host", "examplebucket.s3.amazonaws.com"),
@@ -1220,6 +1272,7 @@ mod tests {
             Some(5),
             true,
         ));
+        let store = crate::IdentityProvider::in_memory(store);
         let headers = [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
             ("host", "examplebucket.s3.amazonaws.com"),
@@ -1252,6 +1305,7 @@ mod tests {
             Some(5),
             true,
         ));
+        let store = crate::IdentityProvider::in_memory(store);
         let headers = [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"),
             ("host", "examplebucket.s3.amazonaws.com"),
@@ -1726,6 +1780,7 @@ mod tests {
             None,
             false,
         ));
+        let store = crate::IdentityProvider::in_memory(store);
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(
@@ -2048,6 +2103,7 @@ mod tests {
             None,
             true,
         ));
+        let store = crate::IdentityProvider::in_memory(store);
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-Security-Token=wrong-token&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(
@@ -2097,6 +2153,7 @@ mod tests {
             Some(100),
             true,
         ));
+        let store = crate::IdentityProvider::in_memory(store);
         let query = sign_test_presigned_query(
             "GET",
             "/",
@@ -2129,6 +2186,7 @@ mod tests {
             Some(100),
             true,
         ));
+        let store = crate::IdentityProvider::in_memory(store);
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(

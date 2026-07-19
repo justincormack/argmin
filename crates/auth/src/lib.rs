@@ -21,6 +21,7 @@ mod encoding;
 pub mod error;
 pub mod identity;
 pub mod post;
+pub mod provider;
 pub mod request;
 pub mod sigv4;
 
@@ -75,6 +76,7 @@ pub use post::{
     validate_prepared_post_policy_size, ExpectedCredentialScope, PostPolicyError, PostSigV4Request,
     PreparedPostPolicy,
 };
+pub use provider::{IdentityProvider, IdentityProviderBackend, IdentityProviderError};
 pub use request::{
     authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion, HeaderSource,
     StreamingSigningContext,

@@ -15,7 +15,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
+use auth::{authenticate_request, AuthContext, AuthMode, IdentityProvider};
 use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
 
@@ -650,7 +650,7 @@ fn reject_directory_bucket_only_object_features(req: &S3Request) -> Result<(), S
 /// The HTTP frontend that handles incoming requests.
 pub struct HttpFrontend {
     pub coordinator: Arc<Coordinator>,
-    pub credentials: CredentialStore,
+    pub identity_provider: IdentityProvider,
     pub host_id: Arc<str>,
 }
 
@@ -1295,15 +1295,35 @@ impl HttpFrontend {
             .with_content_sha256(req.header("x-amz-content-sha256").map(str::to_string))
     }
 
+    fn identity_provider_error() -> ServerError {
+        ServerError::IdentityProvider(auth::IdentityProviderError::Unavailable)
+    }
+
+    fn map_auth_error(error: auth::AuthError) -> ServerError {
+        match error {
+            auth::AuthError::IdentityProviderFailure => Self::identity_provider_error(),
+            error => ServerError::Auth(error),
+        }
+    }
+
+    fn find_account_by_canonical_user_id(
+        &self,
+        canonical_user_id: &s3_types::CanonicalUserId,
+    ) -> Result<Option<s3_types::AccountIdentity>, ServerError> {
+        self.identity_provider
+            .find_account_by_canonical_user_id(canonical_user_id)
+            .map_err(ServerError::IdentityProvider)
+    }
+
     fn acl_owner_display_name(
         &self,
         owner_principal: &str,
         owner_canonical_id: &s3_types::CanonicalUserId,
-    ) -> String {
-        self.credentials
-            .find_account_by_canonical_user_id(owner_canonical_id)
+    ) -> Result<String, ServerError> {
+        Ok(self
+            .find_account_by_canonical_user_id(owner_canonical_id)?
             .map(|account| account.display_name().to_string())
-            .unwrap_or_else(|| owner_principal.to_string())
+            .unwrap_or_else(|| owner_principal.to_string()))
     }
 
     fn render_acl_grants(
@@ -1311,8 +1331,9 @@ impl HttpFrontend {
         owner_principal: &str,
         owner_canonical_id: &s3_types::CanonicalUserId,
         acl_grants: &s3_types::AclGrants,
-    ) -> (String, Vec<xml::RenderedAclGrant>) {
-        let owner_display_name = self.acl_owner_display_name(owner_principal, owner_canonical_id);
+    ) -> Result<(String, Vec<xml::RenderedAclGrant>), ServerError> {
+        let owner_display_name =
+            self.acl_owner_display_name(owner_principal, owner_canonical_id)?;
         let grants = acl_grants
             .iter()
             .map(|grant| {
@@ -1321,27 +1342,26 @@ impl HttpFrontend {
                         Some(owner_display_name.clone())
                     }
                     s3_types::AclGrantee::CanonicalUser(id) => self
-                        .credentials
-                        .find_account_by_canonical_user_id(id)
+                        .find_account_by_canonical_user_id(id)?
                         .map(|account| account.display_name().to_string()),
                     s3_types::AclGrantee::AllUsers | s3_types::AclGrantee::AuthenticatedUsers => {
                         None
                     }
                 };
-                xml::RenderedAclGrant {
+                Ok(xml::RenderedAclGrant {
                     grantee: grant.grantee().clone(),
                     permission: grant.permission(),
                     display_name,
-                }
+                })
             })
-            .collect();
-        (owner_display_name, grants)
+            .collect::<Result<Vec<_>, ServerError>>()?;
+        Ok((owner_display_name, grants))
     }
 
     fn render_multipart_uploads(
         &self,
         result: crate::coordinator::ListMultipartUploadsResult,
-    ) -> xml::RenderedListMultipartUploadsResult {
+    ) -> Result<xml::RenderedListMultipartUploadsResult, ServerError> {
         let (next_key_marker, next_upload_id_marker) = match result.next_marker {
             Some(crate::coordinator::ListMultipartUploadsNextMarker::Upload { key, upload_id }) => {
                 (Some(key), Some(upload_id.to_string()))
@@ -1362,11 +1382,10 @@ impl HttpFrontend {
                 let initiator = xml::RenderedCanonicalUser {
                     canonical_id: upload.initiator.canonical_id.clone(),
                     display_name: self
-                        .credentials
-                        .find_account_by_canonical_user_id(&upload.initiator.canonical_id)
+                        .find_account_by_canonical_user_id(&upload.initiator.canonical_id)?
                         .map(|account| account.display_name().to_string()),
                 };
-                xml::RenderedMultipartUploadEntry {
+                Ok(xml::RenderedMultipartUploadEntry {
                     key: upload.key,
                     upload_id: upload.upload_id.to_string(),
                     initiated: upload.initiated,
@@ -1374,16 +1393,16 @@ impl HttpFrontend {
                     initiator,
                     checksum_algorithm: upload.checksum_algorithm,
                     checksum_type: upload.checksum_type,
-                }
+                })
             })
-            .collect();
-        xml::RenderedListMultipartUploadsResult {
+            .collect::<Result<Vec<_>, ServerError>>()?;
+        Ok(xml::RenderedListMultipartUploadsResult {
             uploads,
             common_prefixes: result.common_prefixes,
             is_truncated: result.is_truncated,
             next_key_marker,
             next_upload_id_marker,
-        }
+        })
     }
 
     fn dispatch_routed(
@@ -2568,7 +2587,7 @@ impl HttpFrontend {
                     &result.owner_principal,
                     &result.owner_canonical_id,
                     &result.acl_grants,
-                );
+                )?;
                 Ok(S3Response::get_object_acl(
                     &result,
                     &owner_display_name,
@@ -2770,7 +2789,7 @@ impl HttpFrontend {
                     &result.owner_principal,
                     &result.owner_canonical_id,
                     &result.acl_grants,
-                );
+                )?;
                 Ok(S3Response::get_bucket_acl(
                     &result,
                     &owner_display_name,
@@ -3170,7 +3189,7 @@ impl HttpFrontend {
                         max_uploads,
                     },
                 )?;
-                let rendered = self.render_multipart_uploads(result);
+                let rendered = self.render_multipart_uploads(result)?;
                 Ok(S3Response::list_multipart_uploads(
                     xml::RenderedListMultipartUploadsRequest {
                         bucket: bucket.as_str(),
@@ -3214,8 +3233,7 @@ impl HttpFrontend {
                 let initiator = xml::RenderedCanonicalUser {
                     canonical_id: result.initiator.canonical_id.clone(),
                     display_name: self
-                        .credentials
-                        .find_account_by_canonical_user_id(&result.initiator.canonical_id)
+                        .find_account_by_canonical_user_id(&result.initiator.canonical_id)?
                         .map(|account| account.display_name().to_string()),
                 };
                 Ok(S3Response::list_parts(
@@ -3317,7 +3335,7 @@ impl HttpFrontend {
             req.query_string(),
             &req.header_source(),
             &req.body,
-            &self.credentials,
+            &self.identity_provider,
             auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
             "s3",
             now,
@@ -3356,7 +3374,7 @@ impl HttpFrontend {
                     bucket_region_header,
                 });
             }
-            Err(err) => return Err(ServerError::Auth(err)),
+            Err(err) => return Err(Self::map_auth_error(err)),
         };
 
         // Verify payload integrity: if the client provided an actual content hash
@@ -3698,14 +3716,14 @@ impl HttpFrontend {
                     })?,
                     security_token: field("x-amz-security-token"),
                 },
-                &self.credentials,
+                &self.identity_provider,
                 auth::ExpectedCredentialScope::new(
                     auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
                     "s3",
                 ),
                 now,
             )
-            .map_err(ServerError::Auth)?
+            .map_err(Self::map_auth_error)?
         } else {
             AuthContext::anonymous()
         };
@@ -6331,6 +6349,24 @@ mod tests {
     const TEST_SIGV4_SECRET: &str = "secret";
     const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
+    struct UnavailableIdentityProvider;
+
+    impl auth::IdentityProviderBackend for UnavailableIdentityProvider {
+        fn lookup_long_lived_credential(
+            &self,
+            _access_key_id: &str,
+        ) -> Result<Option<Arc<auth::StoredCredential>>, auth::IdentityProviderError> {
+            Err(auth::IdentityProviderError::Unavailable)
+        }
+
+        fn find_account_by_canonical_user_id(
+            &self,
+            _canonical_user_id: &s3_types::CanonicalUserId,
+        ) -> Result<Option<auth::AccountIdentity>, auth::IdentityProviderError> {
+            Err(auth::IdentityProviderError::Unavailable)
+        }
+    }
+
     static EXPECTED_PANIC_ON_500_HOOK: std::sync::Once = std::sync::Once::new();
 
     struct SuppressExpectedPanicOn500Diagnostics {
@@ -6396,12 +6432,39 @@ mod tests {
             sse_s3_provider,
         )
         .unwrap();
-        let credentials = auth::CredentialStore::new();
+        let mut credentials = auth::CredentialStore::new();
+        credentials.add(
+            TEST_SIGV4_ACCESS_KEY.to_string(),
+            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+        );
         HttpFrontend {
             coordinator: Arc::new(coordinator),
-            credentials,
+            identity_provider: auth::IdentityProvider::in_memory(credentials),
             host_id: Arc::<str>::from("host-id"),
         }
+    }
+
+    #[test]
+    fn identity_provider_failure_fails_authentication_and_rendering_closed() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        frontend.identity_provider = auth::IdentityProvider::new(UnavailableIdentityProvider);
+
+        let request = signed_v4_put_req(b"", Vec::new());
+        assert!(matches!(
+            frontend.authenticate(&request, None),
+            Err(ServerError::IdentityProvider(
+                auth::IdentityProviderError::Unavailable
+            ))
+        ));
+
+        let canonical_id = s3_types::CanonicalUserId::from_principal("owner");
+        assert!(matches!(
+            frontend.acl_owner_display_name("owner", &canonical_id),
+            Err(ServerError::IdentityProvider(
+                auth::IdentityProviderError::Unavailable
+            ))
+        ));
     }
 
     fn configured_identity(account: auth::AccountIdentity) -> auth::AuthenticatedIdentity {
@@ -10063,11 +10126,7 @@ mod tests {
     #[test]
     fn prepare_streaming_post_object_denied_policy_does_not_create_session() {
         let tmp = test_util::tempdir();
-        let mut fe = setup_frontend(tmp.path());
-        fe.credentials.add(
-            TEST_SIGV4_ACCESS_KEY.to_string(),
-            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
-        );
+        let fe = setup_frontend(tmp.path());
         create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
 
         let req = new_req(
@@ -10108,11 +10167,7 @@ mod tests {
     #[test]
     fn prepare_streaming_post_object_does_not_set_object_creation_operation_policy_condition() {
         let tmp = test_util::tempdir();
-        let mut fe = setup_frontend(tmp.path());
-        fe.credentials.add(
-            TEST_SIGV4_ACCESS_KEY.to_string(),
-            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
-        );
+        let fe = setup_frontend(tmp.path());
         create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
         fe.coordinator
             .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
@@ -10153,11 +10208,7 @@ mod tests {
     #[test]
     fn prepare_streaming_post_object_passes_if_none_match_to_bucket_policy() {
         let tmp = test_util::tempdir();
-        let mut fe = setup_frontend(tmp.path());
-        fe.credentials.add(
-            TEST_SIGV4_ACCESS_KEY.to_string(),
-            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
-        );
+        let fe = setup_frontend(tmp.path());
         create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
         fe.coordinator
             .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
@@ -10215,11 +10266,7 @@ mod tests {
     #[test]
     fn prepare_streaming_post_object_wrong_region_returns_post_scope_error_before_policy_denial() {
         let tmp = test_util::tempdir();
-        let mut fe = setup_frontend(tmp.path());
-        fe.credentials.add(
-            TEST_SIGV4_ACCESS_KEY.to_string(),
-            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
-        );
+        let fe = setup_frontend(tmp.path());
         create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
 
         let req = new_req(
@@ -10263,11 +10310,7 @@ mod tests {
     #[test]
     fn prepare_streaming_put_with_object_lock_accepts_sdk_checksum_header() {
         let tmp = test_util::tempdir();
-        let mut fe = setup_frontend(tmp.path());
-        fe.credentials.add(
-            TEST_SIGV4_ACCESS_KEY.to_string(),
-            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
-        );
+        let fe = setup_frontend(tmp.path());
         create_sigv4_test_bucket(&fe.coordinator, "mybucket", true);
 
         let body = b"hello world".to_vec();
@@ -10292,11 +10335,7 @@ mod tests {
     #[test]
     fn start_streaming_put_session_uses_prepare_authorization_result() {
         let tmp = test_util::tempdir();
-        let mut fe = setup_frontend(tmp.path());
-        fe.credentials.add(
-            TEST_SIGV4_ACCESS_KEY.to_string(),
-            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
-        );
+        let fe = setup_frontend(tmp.path());
         create_sigv4_test_bucket(&fe.coordinator, "mybucket", false);
 
         let body = b"hello world".to_vec();

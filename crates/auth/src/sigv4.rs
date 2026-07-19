@@ -5,9 +5,7 @@ use crate::canonical::{
     amz_date_matches_date_stamp, canonical_headers, canonical_query_string, canonical_request,
     sha256_hex, string_to_sign,
 };
-use crate::credential::{
-    parse_credential_scope_ref, CredentialScope, CredentialStore, SecretKey, StoredCredential,
-};
+use crate::credential::{parse_credential_scope_ref, CredentialScope, SecretKey, StoredCredential};
 use crate::encoding::hex_encode_lower;
 use crate::error::AuthError;
 use crate::request::{validate_static_record_expiry, HeaderSource};
@@ -181,10 +179,10 @@ pub(crate) struct VerifyRequestRecordInput<'a, H: HeaderSource + ?Sized> {
     pub now_epoch_secs: u64,
 }
 
-pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
+pub(crate) fn verify_request_record<H: HeaderSource + ?Sized>(
     input: VerifyRequestRecordInput<'_, H>,
-    store: &'a CredentialStore,
-) -> Result<(&'a StoredCredential, String), AuthError> {
+    provider: &crate::IdentityProvider,
+) -> Result<(std::sync::Arc<StoredCredential>, String), AuthError> {
     let VerifyRequestRecordInput {
         method,
         uri,
@@ -197,13 +195,14 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
     } = input;
 
     // Look up the secret key
-    let record = store
-        .get_record(&auth.credential.access_key_id)
+    let record = provider
+        .lookup_long_lived_credential(&auth.credential.access_key_id)
+        .map_err(|_| AuthError::IdentityProviderFailure)?
         .ok_or(AuthError::UnknownAccessKey)?;
     if !record.is_enabled() {
         return Err(AuthError::UnknownAccessKey);
     }
-    validate_static_record_expiry(record, now_epoch_secs)?;
+    validate_static_record_expiry(&record, now_epoch_secs)?;
     let secret = record.secret_key();
 
     // Extract signed headers — collect all values for each header name
@@ -311,15 +310,16 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::canonical::parse_amz_date;
+    use crate::credential::CredentialStore;
     use crate::request::{authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion};
 
-    fn example_store() -> CredentialStore {
+    fn example_store() -> crate::IdentityProvider {
         let mut store = CredentialStore::new();
         store.add(
             "AKIAIOSFODNN7EXAMPLE".to_string(),
             SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
         );
-        store
+        crate::IdentityProvider::in_memory(store)
     }
 
     fn aws_example_time() -> u64 {
@@ -342,7 +342,7 @@ mod tests {
         query_string: &str,
         headers: &[(&str, &str)],
         body: &[u8],
-        store: &CredentialStore,
+        provider: &crate::IdentityProvider,
     ) -> Result<AuthContext, AuthError> {
         authenticate_request(
             method,
@@ -350,7 +350,7 @@ mod tests {
             query_string,
             headers,
             body,
-            store,
+            provider,
             ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
@@ -418,8 +418,14 @@ mod tests {
     #[test]
     fn credential_store_lookup() {
         let store = example_store();
-        assert!(store.get_record("AKIAIOSFODNN7EXAMPLE").is_some());
-        assert!(store.get_record("NONEXISTENT").is_none());
+        assert!(store
+            .lookup_long_lived_credential("AKIAIOSFODNN7EXAMPLE")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .lookup_long_lived_credential("NONEXISTENT")
+            .unwrap()
+            .is_none());
     }
 
     // AWS SigV4 test: GET object
@@ -704,6 +710,7 @@ mod tests {
             None,
             false,
         ));
+        let store = crate::IdentityProvider::in_memory(store);
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-date, \

@@ -3,8 +3,8 @@
 ## Status
 
 Phase 0 design, AWS-oracle, and fixture work is complete for the first usable
-`AssumeRole` milestone as of 2026-07-19. Implementation has not begun. The
-first implementation target is a test-enablement vertical slice, not a
+`AssumeRole` milestone as of 2026-07-19. Phase 1 implementation is in progress.
+The first implementation target is a test-enablement vertical slice, not a
 production identity service.
 
 The first public STS operation will be `AssumeRole`. It will be exposed on the
@@ -95,14 +95,21 @@ open work. Supported actions must not ignore security-relevant input.
 
 ## Current Repository State
 
-### Long-lived credential and role lookup is static and worker-local
+### Long-lived credential lookup is shared; role state and token keys remain
 
-`auth::CredentialStore` is a plain `HashMap<String, StoredCredential>`.
-`argmin-s3` builds a new copy for every `HttpFrontend` worker, and the embedded
-`s3-tests` server does the same. Stateless session issuance does not require
-mutating these maps, but dynamic in-memory IAM operations will still require a
-shared role/user/long-lived-credential provider. Every worker must also share
-the same token-sealing key ring.
+`auth::CredentialStore` is now a bootstrap collection consumed by an
+`IdentityProvider`. The initial provider owns that bounded in-memory state
+behind a private standard-library lock, and every `HttpFrontend` worker in both
+`argmin-s3` and the embedded test servers receives a clone of the same provider
+handle. Lookups return owned immutable records and distinguish absence from
+backend failure, releasing the provider lock before canonicalization, HMAC,
+storage, or response work. Existing configured-key authentication remains
+unchanged, and an unavailable provider fails closed as an internal service
+failure rather than `InvalidAccessKeyId`.
+
+The provider does not yet contain role identity/liveness records, and the
+process-local session-token sealing key ring does not exist. Phase 1 must add
+and share both before directly sealed sessions can be authenticated.
 
 ### Stored credentials are explicitly long-lived
 
@@ -132,10 +139,10 @@ only the configured-principal variant, and existing S3 authorization paths
 explicitly require that variant rather than treating a role session as an
 existing configured user.
 
-The remaining Phase 1 work must add the decoded session credential and shared
-provider/key-ring substrate before any request can authenticate as that session
-identity. Session and principal tags remain later versioned policy context as
-described below.
+The remaining Phase 1 work must add the decoded session credential, minimal
+stable role-liveness record, and shared key-ring substrate before any request
+can authenticate as that session identity. Session and principal tags remain
+later versioned policy context as described below.
 
 ### S3 has resource policies but not IAM identity policies
 
@@ -2366,6 +2373,15 @@ compatibility record.
 - add a versioned AEAD envelope, process-local sealing key ring, strict token
   size/codec limits, and secure generation interfaces
 - add redaction, tamper rejection, and provider/key-ring failure behavior
+
+Progress as of 2026-07-19: structured account, configured-principal, and
+assumed-role-session identities exist with surface-specific ARN accessors;
+stored credentials accept only configured principals; and one cloneable
+identity-provider handle now supplies owned long-lived credential/account
+lookups to every frontend worker. Unknown credentials remain distinct from
+provider failure. The remaining Phase 1 slice is the decoded-session credential
+type, minimal stable role identity/liveness state, shared sealing key ring, and
+versioned token codec.
 
 Exit condition: all current S3 suites remain green, every frontend worker can
 open a test-sealed credential using the shared key ring, and no issued-session

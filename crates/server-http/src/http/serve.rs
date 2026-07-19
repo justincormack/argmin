@@ -5099,7 +5099,7 @@ mod tests {
         );
         Arc::new(HttpFrontend {
             coordinator: Arc::new(coordinator),
-            credentials,
+            identity_provider: auth::IdentityProvider::in_memory(credentials),
             host_id: Arc::<str>::from("host-id"),
         })
     }

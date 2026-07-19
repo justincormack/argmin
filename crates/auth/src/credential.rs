@@ -1,5 +1,6 @@
 /// Credential storage for SigV4 authentication.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::{AuthenticatedIdentity, ConfiguredPrincipalIdentity};
 
@@ -199,9 +200,12 @@ pub(crate) fn parse_credential_scope_ref(value: &str) -> Option<CredentialScopeR
     })
 }
 
-/// Static in-memory credential store. Maps access_key_id to credential record.
+/// Bootstrap collection of long-lived credentials for an in-memory identity provider.
+///
+/// Runtime frontend workers share an [`crate::IdentityProvider`] rather than
+/// cloning this collection.
 pub struct CredentialStore {
-    keys: HashMap<String, StoredCredential>,
+    keys: HashMap<String, Arc<StoredCredential>>,
 }
 
 impl CredentialStore {
@@ -231,12 +235,17 @@ impl CredentialStore {
 
     /// Add a full credential record.
     pub fn add_record(&mut self, record: StoredCredential) {
-        self.keys.insert(record.access_key_id().to_string(), record);
+        self.keys
+            .insert(record.access_key_id().to_string(), Arc::new(record));
     }
 
     /// Look up a full credential record by access key ID.
     pub fn get_record(&self, access_key_id: &str) -> Option<&StoredCredential> {
-        self.keys.get(access_key_id)
+        self.keys.get(access_key_id).map(Arc::as_ref)
+    }
+
+    pub(crate) fn get_record_arc(&self, access_key_id: &str) -> Option<Arc<StoredCredential>> {
+        self.keys.get(access_key_id).cloned()
     }
 
     /// Look up an account by canonical user ID.

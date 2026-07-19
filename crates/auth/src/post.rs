@@ -2,7 +2,7 @@
 ///
 /// SigV4 uses form fields: `x-amz-algorithm`, `x-amz-credential`, `x-amz-date`,
 /// `policy`, `x-amz-signature`
-use crate::credential::{parse_credential_scope_ref, CredentialStore};
+use crate::credential::parse_credential_scope_ref;
 use crate::error::AuthError;
 use crate::request::{
     validate_static_credential_has_no_token, validate_static_record_expiry, AuthContext, AuthMode,
@@ -69,7 +69,7 @@ pub struct PostSigV4Request<'a> {
 /// Returns `Ok(AuthContext)` on success.
 pub fn authenticate_post_sigv4(
     request: PostSigV4Request<'_>,
-    store: &CredentialStore,
+    provider: &crate::IdentityProvider,
     expected_scope: ExpectedCredentialScope<'_>,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
@@ -113,13 +113,14 @@ pub fn authenticate_post_sigv4(
         crate::canonical::parse_amz_date(request.date).ok_or(AuthError::MalformedAuth)?;
 
     // Look up the secret key
-    let record = store
-        .get_record(credential.access_key_id)
+    let record = provider
+        .lookup_long_lived_credential(credential.access_key_id)
+        .map_err(|_| AuthError::IdentityProviderFailure)?
         .ok_or(AuthError::UnknownAccessKey)?;
     if !record.is_enabled() {
         return Err(AuthError::UnknownAccessKey);
     }
-    validate_static_record_expiry(record, now_epoch_secs)?;
+    validate_static_record_expiry(&record, now_epoch_secs)?;
 
     // Derive signing key and compute expected signature
     let signing_key = sigv4::derive_signing_key(
@@ -473,8 +474,27 @@ fn parse_iso8601(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credential::SecretKey;
+    use crate::credential::{CredentialStore, SecretKey, StoredCredential};
     use s3_types::AccountIdentity;
+    use std::sync::Arc;
+
+    struct UnavailableIdentityProvider;
+
+    impl crate::IdentityProviderBackend for UnavailableIdentityProvider {
+        fn lookup_long_lived_credential(
+            &self,
+            _access_key_id: &str,
+        ) -> Result<Option<Arc<StoredCredential>>, crate::IdentityProviderError> {
+            Err(crate::IdentityProviderError::Unavailable)
+        }
+
+        fn find_account_by_canonical_user_id(
+            &self,
+            _canonical_user_id: &s3_types::CanonicalUserId,
+        ) -> Result<Option<AccountIdentity>, crate::IdentityProviderError> {
+            Err(crate::IdentityProviderError::Unavailable)
+        }
+    }
 
     fn assert_split_validation_matches(
         policy_b64: &str,
@@ -490,13 +510,13 @@ mod tests {
         assert_eq!(wrapper, split, "wrapper and split validation diverged");
     }
 
-    fn test_store() -> CredentialStore {
+    fn test_store() -> crate::IdentityProvider {
         let mut store = CredentialStore::new();
         store.add(
             "testAccessKey123".to_string(),
             SecretKey::new("testSecretKey456".to_string()),
         );
-        store
+        crate::IdentityProvider::in_memory(store)
     }
 
     fn configured_record(
@@ -523,7 +543,7 @@ mod tests {
         date: &str,
         policy_b64: &str,
         signature_hex: &str,
-        store: &CredentialStore,
+        provider: &crate::IdentityProvider,
         expected_scope: ExpectedCredentialScope<'_>,
     ) -> Result<AuthContext, AuthError> {
         super::authenticate_post_sigv4(
@@ -535,7 +555,7 @@ mod tests {
                 signature_hex,
                 security_token: None,
             },
-            store,
+            provider,
             expected_scope,
             0,
         )
@@ -635,6 +655,26 @@ mod tests {
     }
 
     #[test]
+    fn sigv4_post_provider_failure_is_not_unknown_access_key() {
+        let provider = crate::IdentityProvider::new(UnavailableIdentityProvider);
+        let (policy_b64, sig_hex) = signed_test_policy();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+            "20250101T000000Z",
+            &policy_b64,
+            &sig_hex,
+            &provider,
+            ExpectedCredentialScope::new(
+                ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+                "s3",
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::IdentityProviderFailure));
+    }
+
+    #[test]
     fn sigv4_post_unexpected_security_token() {
         let store = test_store();
         let (policy_b64, sig_hex) = signed_test_policy();
@@ -665,6 +705,7 @@ mod tests {
             Some(100),
             true,
         ));
+        let store = crate::IdentityProvider::in_memory(store);
         let (policy_b64, sig_hex) = signed_test_policy();
         let err = super::authenticate_post_sigv4(
             PostSigV4Request {
@@ -693,6 +734,7 @@ mod tests {
             Some(100),
             true,
         ));
+        let store = crate::IdentityProvider::in_memory(store);
         let (policy_b64, _) = signed_test_policy();
         let err = super::authenticate_post_sigv4(
             PostSigV4Request {
@@ -1535,6 +1577,7 @@ mod tests {
     fn sigv4_post_disabled_key() {
         let mut store = CredentialStore::new();
         store.add_record(configured_record("AKID", "secret", "p", None, false));
+        let store = crate::IdentityProvider::in_memory(store);
         let err = authenticate_post_sigv4(
             "AWS4-HMAC-SHA256",
             "AKID/20250101/us-east-1/s3/aws4_request",
