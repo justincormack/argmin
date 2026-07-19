@@ -7569,7 +7569,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectReadMetadataNodeClient::load_object_read_auth_subject(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             request.version_id,
@@ -7616,7 +7616,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             request.version_id,
@@ -7663,7 +7663,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectReadMetadataNodeClient::get_object_tags_for_subject(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             request.version_id,

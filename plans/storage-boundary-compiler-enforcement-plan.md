@@ -685,6 +685,35 @@ Fifth Phase 3 slice:
   regression, the boundary checker, formatting, workspace-wide strict Clippy,
   and the full workspace suite (7,141 tests).
 
+Sixth Phase 3 slice:
+
+- `ObjectReadMetadataNodeClient` and its three duplicate methods on the
+  transitional `StorageNodeClient` aggregate now require
+  `ObjectMetadataPgId` for authorization-subject, coherent-snapshot, and
+  subject-bound tag reads.
+- cluster read paths derive one exact-object role for `(bucket, key)` from the
+  installed runtime topology. They retain its raw projection only for generic
+  route selection and retry-budget diagnostics, while every node-client call
+  receives the typed role.
+- local adapters erase the role only at the private raw-node boundary. Unix
+  adapters serialize its raw route evidence, and the Unix server reconstructs
+  the role only after route, primary, and exact object-placement validation.
+- the adversarial two-PG Unix regression seeds the same live object, identity,
+  and tags on both the correct and wrong PGs. A node call that bypassed
+  placement validation would therefore succeed; all three test-forged
+  wrong-role reads must instead fail with the exact `PayloadDecode` placement
+  error, while the correctly routed authorization-subject canary succeeds.
+- review correction: both raw inserts run under one fixed test clock, and the
+  fixture explicitly loads both PG-local authorization subjects and requires
+  their complete identities to be equal before exercising the Unix boundary.
+  This prevents timestamp drift from turning the snapshot/tag checks into
+  incidental stale-subject failures.
+- object mutation and data-client signatures, `DataPgId` construction, and
+  request-scoped route capability values remain open in Phase 3.
+- the sixth slice passed its focused correct/wrong object-read PG Unix
+  regressions, the boundary checker, formatting, workspace-wide strict Clippy,
+  and the full workspace suite (7,141 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

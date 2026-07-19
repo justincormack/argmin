@@ -7969,12 +7969,13 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let subject = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client()
-            .load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+            .load_object_read_auth_subject(object_pg_id, bucket, key, version_id)?;
         Ok(action(&subject.stored))
     }
 
@@ -7983,12 +7984,13 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         match self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client()
-            .load_object_read_auth_subject(pg_id, bucket, key, None)
+            .load_object_read_auth_subject(object_pg_id, bucket, key, None)
         {
             Ok(subject) => match subject.stored {
                 StoredObject::Live(_) => Ok(Some(subject.stored)),
@@ -8007,7 +8009,8 @@ impl super::StorageCluster {
         snapshot_mode: ObjectReadSnapshotMode,
         mut action: impl FnMut(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let object_read_client = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
@@ -8021,14 +8024,18 @@ impl super::StorageCluster {
             work_budget
                 .check("load object read snapshot stale retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
-            let subject =
-                object_read_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+            let subject = object_read_client.load_object_read_auth_subject(
+                object_pg_id,
+                bucket,
+                key,
+                version_id,
+            )?;
             let value = match action(&subject.stored) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
             };
             match object_read_client.load_object_read_snapshot_for_subject(
-                pg_id,
+                object_pg_id,
                 bucket,
                 key,
                 version_id,
@@ -8057,7 +8064,8 @@ impl super::StorageCluster {
         snapshot_mode: ObjectReadSnapshotMode,
         mut action: impl FnMut(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<super::LeasedObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let object_read_client = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
@@ -8071,8 +8079,12 @@ impl super::StorageCluster {
             work_budget
                 .check("load leased object read snapshot stale retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
-            let subject =
-                object_read_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+            let subject = object_read_client.load_object_read_auth_subject(
+                object_pg_id,
+                bucket,
+                key,
+                version_id,
+            )?;
             let value = match action(&subject.stored) {
                 Ok(value) => value,
                 Err(error) => return Ok(Err(error)),
@@ -8094,7 +8106,7 @@ impl super::StorageCluster {
                 None
             };
             match object_read_client.load_object_read_snapshot_for_subject(
-                pg_id,
+                object_pg_id,
                 bucket,
                 key,
                 version_id,
@@ -8141,7 +8153,8 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
     ) -> Result<Result<Option<String>, E>, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let object_read_client = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
@@ -8155,14 +8168,18 @@ impl super::StorageCluster {
             work_budget
                 .check("get object tags stale retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
-            let subject =
-                object_read_client.load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+            let subject = object_read_client.load_object_read_auth_subject(
+                object_pg_id,
+                bucket,
+                key,
+                version_id,
+            )?;
             let authorized_version_id = match action(&subject.stored) {
                 Ok(authorized_version_id) => authorized_version_id,
                 Err(error) => return Ok(Err(error)),
             };
             match object_read_client.get_object_tags_for_subject(
-                pg_id,
+                object_pg_id,
                 bucket,
                 key,
                 version_id,
@@ -8467,12 +8484,13 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<Option<LegalHoldStatus>, E>,
     ) -> Result<Result<Option<LegalHoldStatus>, E>, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let subject = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client()
-            .load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+            .load_object_read_auth_subject(object_pg_id, bucket, key, version_id)?;
         Ok(action(&subject.stored))
     }
 
@@ -8483,12 +8501,13 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         action: impl FnOnce(&StoredObject) -> Result<Option<ObjectRetention>, E>,
     ) -> Result<Result<Option<ObjectRetention>, E>, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let subject = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_read_metadata_client()
-            .load_object_read_auth_subject(pg_id, bucket, key, version_id)?;
+            .load_object_read_auth_subject(object_pg_id, bucket, key, version_id)?;
         Ok(action(&subject.stored))
     }
 

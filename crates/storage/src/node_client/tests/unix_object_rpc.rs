@@ -290,12 +290,56 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             wrong_pg_reserved_generation, reserved_generation,
             "equivalent wrong-PG state must make an unguarded direct-PUT lookup succeed"
         );
+        {
+            let _time = crate::clock::test_time_override_guard(1_000);
+            for object_pg in [&pg, &wrong_pg] {
+                PgMetadataStore::put_object_with_segments(
+                    &**object_pg,
+                    &PutLiveObjectReq {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        version_id: VersionId::Null,
+                        owner: OwnerIdentity::from_principal("owner"),
+                        acl_grants: AclGrants::default(),
+                        public_read: false,
+                        generation_id: GenerationId::new(9).unwrap(),
+                        size: 0,
+                        etag: ObjectEtag::single_part(99),
+                        ec: EcShape { k: 4, m: 2 },
+                        layout: ObjectLayout::Standard,
+                        tags: Some(SerializedTagSet::new(
+                            "<Tagging><TagSet><Tag><Key>route</Key><Value>canary</Value></Tag></TagSet></Tagging>"
+                                .to_string(),
+                        )),
+                        metadata_blob: None,
+                        system_metadata_blob: None,
+                        object_lock: ObjectLockState::default(),
+                        encryption: ObjectEncryption::None,
+                    },
+                    &[],
+                )
+                .unwrap();
+                object_pg.refresh_metadata_command_state_digest().unwrap();
+            }
+        }
+        let correct_subject = SharedStorageNode::load_object_read_auth_subject_from_object_pg(
+            &pg, &bucket, &key, None,
+        )
+        .unwrap();
+        let wrong_subject = SharedStorageNode::load_object_read_auth_subject_from_object_pg(
+            &wrong_pg, &bucket, &key, None,
+        )
+        .unwrap();
+        assert_eq!(
+            wrong_subject.identity, correct_subject.identity,
+            "equivalent wrong-PG state must make unguarded subject-bound reads succeed"
+        );
         (bucket, key, correct_pg_id, wrong_pg_id, reserved_generation)
     };
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..6)
+    let server_threads: Vec<_> = (0..10)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -351,6 +395,66 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         .unwrap(),
         reserved_generation
     );
+
+    let read_subject = ObjectReadMetadataNodeClient::load_object_read_auth_subject(
+        &client,
+        correct_object_pg,
+        &bucket,
+        &key,
+        None,
+    )
+    .unwrap();
+    let read_subject_error = ObjectReadMetadataNodeClient::load_object_read_auth_subject(
+        &client,
+        wrong_object_pg,
+        &bucket,
+        &key,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        read_subject_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let read_snapshot_error = ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
+        &client,
+        wrong_object_pg,
+        &bucket,
+        &key,
+        None,
+        &read_subject.identity,
+        ObjectReadSnapshotMode::StandardSegments,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        read_snapshot_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let read_tags_error = ObjectReadMetadataNodeClient::get_object_tags_for_subject(
+        &client,
+        wrong_object_pg,
+        &bucket,
+        &key,
+        None,
+        &read_subject.identity,
+        VersionId::Null,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        read_tags_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
 
     let snapshot_error = DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
         &client,
@@ -526,7 +630,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
 
     let subject = ObjectReadMetadataNodeClient::load_object_read_auth_subject(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         None,
@@ -537,7 +641,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
 
     let snapshot = ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         None,
@@ -552,7 +656,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
 
     let tags = ObjectReadMetadataNodeClient::get_object_tags_for_subject(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         None,

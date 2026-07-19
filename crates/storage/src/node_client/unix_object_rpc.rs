@@ -3276,7 +3276,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
     fn load_object_read_auth_subject(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -3285,7 +3285,7 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
             object: StorageRpcObjectRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
                 key: key.clone(),
             },
@@ -3314,7 +3314,7 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_object_read_snapshot_for_subject(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -3325,7 +3325,7 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
             object: StorageRpcObjectRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
                 key: key.clone(),
             },
@@ -3362,7 +3362,7 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
 
     fn get_object_tags_for_subject(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -3373,7 +3373,7 @@ impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
             object: StorageRpcObjectRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
                 key: key.clone(),
             },

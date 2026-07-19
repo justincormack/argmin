@@ -712,7 +712,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
     fn load_object_read_auth_subject(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -720,7 +720,7 @@ pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
 
     fn load_object_read_snapshot_for_subject(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -730,7 +730,7 @@ pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
 
     fn get_object_tags_for_subject(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -1638,7 +1638,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_object_read_auth_subject(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<s3_types::VersionId>,
@@ -1646,7 +1646,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_object_read_snapshot_for_subject(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<s3_types::VersionId>,
@@ -1656,7 +1656,7 @@ pub(crate) trait StorageNodeClient:
 
     fn get_object_tags_for_subject(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<s3_types::VersionId>,
