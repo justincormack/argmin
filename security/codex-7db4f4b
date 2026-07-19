@@ -22,7 +22,7 @@ Fix commit: [`811b808f`](https://github.com/justincormack/argmin/commit/811b808f
 (`tests: require TLS for STS oracle endpoints`).
 
 The Rust oracle now parses and requires HTTPS URLs for both
-`S3_TEST_STS_ENDPOINT` and `S3_TEST_S3_CONTROL_ENDPOINT` before reading the
+`STS_TEST_ENDPOINT` and `S3_CONTROL_TEST_ENDPOINT` before reading the
 credential variables into its signer. The shell wrapper independently rejects
 plain-HTTP overrides before exporting the oracle credential variables. Unit
 coverage rejects HTTP for each endpoint family, and direct wrapper checks prove
@@ -37,7 +37,7 @@ error was added as a shortcut.
 
 Verification:
 
-- `cargo nextest run -p s3-tests --bin sts_oracle --lib`
+- `cargo nextest run -p sts-tests --bin sts_oracle`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `shellcheck -x scripts/aws-sts-oracle`
 - read-only `./scripts/aws-sts-oracle`

@@ -2379,6 +2379,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sts-tests"
+version = "0.1.0"
+dependencies = [
+ "auth",
+ "aws-smithy-types",
+ "ring",
+ "s3-tests",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

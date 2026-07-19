@@ -139,10 +139,10 @@ async fn put_alt_object_read_policy(bucket: &str, actions: &[&str]) {
 
 async fn fresh_alt_client_for_policy_retry() -> aws_sdk_s3::Client {
     if std::env::var("S3_TEST_ENDPOINT").is_ok() {
-        let access_key = std::env::var("S3_TEST_ALT_ACCESS_KEY")
-            .expect("S3_TEST_ALT_ACCESS_KEY required for external policy retries");
-        let secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY")
-            .expect("S3_TEST_ALT_SECRET_KEY required for external policy retries");
+        let access_key = std::env::var("AWS_TEST_ALT_ACCESS_KEY")
+            .expect("AWS_TEST_ALT_ACCESS_KEY required for external policy retries");
+        let secret_key = std::env::var("AWS_TEST_ALT_SECRET_KEY")
+            .expect("AWS_TEST_ALT_SECRET_KEY required for external policy retries");
         s3_tests::build_client_with_ca(
             CTX.endpoint(),
             &access_key,

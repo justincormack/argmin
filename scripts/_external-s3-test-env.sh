@@ -52,29 +52,29 @@ external_s3_test_export_common_env() {
     external_s3_test_require_shell_var TEST_AWS_ALT_ACCOUNT_ID
 
     export S3_TEST_ENDPOINT="$endpoint"
-    export S3_TEST_S3_CONTROL_ENDPOINT="$s3_control_endpoint"
-    export S3_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY"
-    export S3_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
-    export S3_TEST_ACCOUNT_ID="$TEST_AWS_PRIMARY_ACCOUNT_ID"
-    export S3_TEST_ALT_ACCESS_KEY="$TEST_AWS_ALT_ACCESS_KEY"
-    export S3_TEST_ALT_SECRET_KEY="$TEST_AWS_ALT_SECRET_KEY"
-    export S3_TEST_ALT_ACCOUNT_ID="$TEST_AWS_ALT_ACCOUNT_ID"
-    export S3_TEST_REGION="$region"
+    export S3_CONTROL_TEST_ENDPOINT="$s3_control_endpoint"
+    export AWS_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY"
+    export AWS_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
+    export AWS_TEST_ACCOUNT_ID="$TEST_AWS_PRIMARY_ACCOUNT_ID"
+    export AWS_TEST_ALT_ACCESS_KEY="$TEST_AWS_ALT_ACCESS_KEY"
+    export AWS_TEST_ALT_SECRET_KEY="$TEST_AWS_ALT_SECRET_KEY"
+    export AWS_TEST_ALT_ACCOUNT_ID="$TEST_AWS_ALT_ACCOUNT_ID"
+    export AWS_TEST_REGION="$region"
     export S3_TEST_BUCKET_PREFIX="$bucket_prefix"
     export S3_TEST_TIMEOUT_SECS="$timeout_secs"
 
     if [[ -n "${TEST_AWS_SECOND_ACCESS_KEY:-}" || -n "${TEST_AWS_SECOND_SECRET_KEY:-}" ]]; then
         external_s3_test_require_shell_var TEST_AWS_SECOND_ACCESS_KEY
         external_s3_test_require_shell_var TEST_AWS_SECOND_SECRET_KEY
-        export S3_TEST_SECOND_ACCESS_KEY="$TEST_AWS_SECOND_ACCESS_KEY"
-        export S3_TEST_SECOND_SECRET_KEY="$TEST_AWS_SECOND_SECRET_KEY"
+        export AWS_TEST_SECOND_ACCESS_KEY="$TEST_AWS_SECOND_ACCESS_KEY"
+        export AWS_TEST_SECOND_SECRET_KEY="$TEST_AWS_SECOND_SECRET_KEY"
     fi
 
     if [[ -n "${TEST_AWS_OWNER_ROOT_ACCESS_KEY:-}" || -n "${TEST_AWS_OWNER_ROOT_SECRET_KEY:-}" ]]; then
         external_s3_test_require_shell_var TEST_AWS_OWNER_ROOT_ACCESS_KEY
         external_s3_test_require_shell_var TEST_AWS_OWNER_ROOT_SECRET_KEY
-        export S3_TEST_OWNER_ROOT_ACCESS_KEY="$TEST_AWS_OWNER_ROOT_ACCESS_KEY"
-        export S3_TEST_OWNER_ROOT_SECRET_KEY="$TEST_AWS_OWNER_ROOT_SECRET_KEY"
+        export AWS_TEST_OWNER_ROOT_ACCESS_KEY="$TEST_AWS_OWNER_ROOT_ACCESS_KEY"
+        export AWS_TEST_OWNER_ROOT_SECRET_KEY="$TEST_AWS_OWNER_ROOT_SECRET_KEY"
     fi
 }
 

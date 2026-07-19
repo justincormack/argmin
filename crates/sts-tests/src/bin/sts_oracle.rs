@@ -28,7 +28,7 @@ const QUERY_POST_MAX_BODY_BYTES: usize = 10_000_000;
 const OBSERVED_GET_BOUNDARY_ENDPOINT: &str = "https://sts.eu-central-1.amazonaws.com";
 const OBSERVED_GET_BOUNDARY_REGION: &str = "eu-central-1";
 const OBSERVED_GET_BOUNDARY_ACCESS_KEY_BYTES: usize = 20;
-const ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES: usize = 15_870;
+const ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES: usize = 15_844;
 const STS_XMLNS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
 const AWS_FAULT_XMLNS: &str = "http://webservices.amazon.com/AWSFault/2005-15-09";
 const STS_WRONG_REGION_SCOPE_MESSAGE: &str = "Credential should be scoped to a valid region. ";
@@ -411,24 +411,24 @@ fn run_query_limit_probes(
         query_body_with_ignored_value(ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES);
     let maximum_query_response = QueryRequest::Get(&maximum_query).send(endpoint, credentials);
     assert_get_caller_identity_success(
-        "query-get-maximum-15870-query-bytes",
+        "query-get-maximum-15844-query-bytes",
         &maximum_query_response,
         account_id,
     );
-    println!("query-get-maximum-15870-query-bytes: ok");
+    println!("query-get-maximum-15844-query-bytes: ok");
 
     let (overlong_query, _) =
         query_body_with_ignored_value(ORACLE_STANDARD_SIGNED_GET_MAX_QUERY_BYTES + 1);
     let overlong_query_response = QueryRequest::Get(&overlong_query).send(endpoint, credentials);
     assert_shape(
-        "query-get-overlong-15871-query-bytes",
+        "query-get-overlong-15845-query-bytes",
         &overlong_query_response,
         &shape()
             .status(400)
             .headers(std::iter::empty::<(&str, &str)>())
             .body_empty(),
     );
-    println!("query-get-overlong-15871-query-bytes: ok");
+    println!("query-get-overlong-15845-query-bytes: ok");
 
     let (smaller_query, _) = query_body_with_ignored_value(15_800);
     let smaller_query_with_header_response = send_signed_request_for_service_with_credentials(
@@ -455,14 +455,14 @@ fn run_query_limit_probes(
         credentials,
     );
     assert_shape(
-        "query-get-15870-query-bytes-with-signed-header",
+        "query-get-15844-query-bytes-with-signed-header",
         &maximum_query_with_header_response,
         &shape()
             .status(400)
             .headers(std::iter::empty::<(&str, &str)>())
             .body_empty(),
     );
-    println!("query-get-15870-query-bytes-with-signed-header: ok");
+    println!("query-get-15844-query-bytes-with-signed-header: ok");
 }
 
 fn assert_signing_scope_error(label: &str, response: &RawResponse, message: &str) {
@@ -4625,7 +4625,35 @@ fn assert_assume_role_error(
     message: Option<&str>,
 ) {
     let response = send_assume_role(endpoint, credentials, parameters);
+    let response = assume_role_response_with_sanitized_credentials(&response);
     assert_error_probe(label, &response, status, STS_XMLNS, code, message);
+    println!("{label}: ok");
+}
+
+fn assert_assume_role_error_with_observed_messages(
+    label: &str,
+    endpoint: &str,
+    credentials: SignedRequestCredentials<'_>,
+    parameters: &[(&str, &str)],
+    status: u16,
+    code: &str,
+    observed_messages: &[&str],
+) {
+    let response = send_assume_role(endpoint, credentials, parameters);
+    let response = assume_role_response_with_sanitized_credentials(&response);
+    let actual_message = required_xml_text(&response, "Message", label);
+    assert!(
+        observed_messages.contains(&actual_message.as_str()),
+        "{label}: unexpected error message"
+    );
+    assert_error_probe(
+        label,
+        &response,
+        status,
+        STS_XMLNS,
+        code,
+        Some(&actual_message),
+    );
     println!("{label}: ok");
 }
 
@@ -4645,6 +4673,7 @@ fn assert_assume_role_error_with_security_token(
 ) {
     let response =
         send_assume_role_with_security_token(endpoint, credentials, security_token, parameters);
+    let response = assume_role_response_with_sanitized_credentials(&response);
     assert_error_probe(
         label,
         &response,
@@ -4670,6 +4699,21 @@ fn replace_sensitive_xml_text(body: &mut String, tag: &str, value: &str, marker:
         "expected exactly one {tag} element while normalizing sensitive STS output"
     );
     *body = body.replacen(&needle, &format!("<{tag}>{marker}</{tag}>"), 1);
+}
+
+fn assume_role_response_with_sanitized_credentials(response: &RawResponse) -> RawResponse {
+    let mut sanitized = response.clone();
+    for (tag, marker) in [
+        ("AccessKeyId", "SESSION_ACCESS_KEY"),
+        ("SecretAccessKey", "SESSION_SECRET_KEY"),
+        ("SessionToken", "SESSION_TOKEN"),
+    ] {
+        if let Some(value) = xml_tag_text(&sanitized.body, tag).filter(|value| !value.is_empty()) {
+            let value = value.to_string();
+            replace_sensitive_xml_text(&mut sanitized.body, tag, &value, marker);
+        }
+    }
+    sanitized
 }
 
 fn assert_assume_role_success(
@@ -5001,7 +5045,7 @@ fn run_assume_role_probes(
         "ValidationError",
         Some("1 validation error detected: Value null at 'roleArn' failed to satisfy constraint: Member must not be null"),
     );
-    assert_assume_role_error(
+    assert_assume_role_error_with_observed_messages(
         "assume-role-empty-role-arn",
         endpoint,
         credentials,
@@ -5013,9 +5057,10 @@ fn run_assume_role_probes(
         ],
         400,
         "ValidationError",
-        Some(
+        &[
             r"2 validation errors detected: Value '' at 'roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: [\u0009\u000A\u000D\u0020-\u007E\u0085\u00A0-\uD7FF\uE000-\uFFFD\u10000-\u10FFFF]+; Value '' at 'roleArn' failed to satisfy constraint: Member must have length greater than or equal to 20",
-        ),
+            r"2 validation errors detected: Value '' at 'roleArn' failed to satisfy constraint: Member must have length greater than or equal to 20; Value '' at 'roleArn' failed to satisfy constraint: Member must satisfy regular expression pattern: [\u0009\u000A\u000D\u0020-\u007E\u0085\u00A0-\uD7FF\uE000-\uFFFD\u10000-\u10FFFF]+",
+        ],
     );
     assert_assume_role_error(
         "assume-role-short-role-arn",
@@ -5707,17 +5752,17 @@ fn run_source_identity_probes(
         target_session_name,
         no_set_target_role_arn,
     } = fixture;
-    let max_source_identity = "s".repeat(64);
-    let overlong_source_identity = "s".repeat(65);
-    let overlong_invalid_source_identity = "!".repeat(65);
-    let multibyte_source_identity = "é".repeat(33);
-    let supplementary_source_identity = "😀".repeat(33);
+    let max_source_identity = "s".repeat(256);
+    let overlong_source_identity = "s".repeat(257);
+    let overlong_invalid_source_identity = "!".repeat(257);
+    let multibyte_source_identity = "é".repeat(129);
+    let supplementary_source_identity = "😀".repeat(129);
     let source_identity_pattern = r"[\w+=,.@-]*";
     let overlong_source_identity_message = format!(
-        "1 validation error detected: Value '{overlong_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 64"
+        "1 validation error detected: Value '{overlong_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 256"
     );
     let overlong_invalid_source_identity_message = format!(
-        "2 validation errors detected: Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}; Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 64"
+        "2 validation errors detected: Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}; Value '{overlong_invalid_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 256"
     );
     let multibyte_source_identity_message = format!(
         "1 validation error detected: Value '{multibyte_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}"
@@ -5725,15 +5770,15 @@ fn run_source_identity_probes(
     let supplementary_source_identity_message = format!(
         "1 validation error detected: Value '{supplementary_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: {source_identity_pattern}"
     );
-    assert_eq!(max_source_identity.len(), 64);
-    assert_eq!(overlong_source_identity.len(), 65);
-    assert_eq!(overlong_invalid_source_identity.len(), 65);
-    assert_eq!(multibyte_source_identity.len(), 66);
-    assert_eq!(multibyte_source_identity.chars().count(), 33);
-    assert_eq!(multibyte_source_identity.encode_utf16().count(), 33);
-    assert_eq!(supplementary_source_identity.len(), 132);
-    assert_eq!(supplementary_source_identity.chars().count(), 33);
-    assert_eq!(supplementary_source_identity.encode_utf16().count(), 66);
+    assert_eq!(max_source_identity.len(), 256);
+    assert_eq!(overlong_source_identity.len(), 257);
+    assert_eq!(overlong_invalid_source_identity.len(), 257);
+    assert_eq!(multibyte_source_identity.len(), 258);
+    assert_eq!(multibyte_source_identity.chars().count(), 129);
+    assert_eq!(multibyte_source_identity.encode_utf16().count(), 129);
+    assert_eq!(supplementary_source_identity.len(), 516);
+    assert_eq!(supplementary_source_identity.chars().count(), 129);
+    assert_eq!(supplementary_source_identity.encode_utf16().count(), 258);
 
     for (label, value, message) in [
         (
@@ -9212,19 +9257,19 @@ fn run_list_tags_for_resource_success_probe(
 }
 
 fn main() {
-    let endpoint = required_https_endpoint("S3_TEST_STS_ENDPOINT");
-    let s3_control_endpoint = required_https_endpoint("S3_TEST_S3_CONTROL_ENDPOINT");
-    let access_key = required_env("S3_TEST_ACCESS_KEY");
-    let secret_key = required_env("S3_TEST_SECRET_KEY");
-    let account_id = required_env("S3_TEST_ACCOUNT_ID");
-    let region = required_env("S3_TEST_REGION");
+    let endpoint = required_https_endpoint("STS_TEST_ENDPOINT");
+    let s3_control_endpoint = required_https_endpoint("S3_CONTROL_TEST_ENDPOINT");
+    let access_key = required_env("AWS_TEST_ACCESS_KEY");
+    let secret_key = required_env("AWS_TEST_SECRET_KEY");
+    let account_id = required_env("AWS_TEST_ACCOUNT_ID");
+    let region = required_env("AWS_TEST_REGION");
     let credentials = SignedRequestCredentials {
         access_key: &access_key,
         secret_key: &secret_key,
         region: &region,
         tls_ca_pem: None,
     };
-    if let Ok(bucket) = env::var("S3_TEST_STS_POST_BUCKET") {
+    if let Ok(bucket) = env::var("STS_TEST_POST_BUCKET") {
         run_list_tags_for_resource_success_probe(
             &endpoint,
             &s3_control_endpoint,
@@ -9396,15 +9441,15 @@ fn main() {
     run_query_limit_probes(&endpoint, credentials, &account_id);
     run_signing_scope_probes(&endpoint, credentials, &account_id);
 
-    if let Ok(role_arn) = env::var("S3_TEST_STS_ROLE_ARN") {
-        let caller_arn = required_env("S3_TEST_STS_PRIMARY_ARN");
-        let role_name = required_env("S3_TEST_STS_ROLE_NAME");
-        let default_max_role_arn = required_env("S3_TEST_STS_DEFAULT_MAX_ROLE_ARN");
-        let default_max_role_name = required_env("S3_TEST_STS_DEFAULT_MAX_ROLE_NAME");
-        let external_id = required_env("S3_TEST_STS_EXTERNAL_ID");
-        let external_id_role_arn = required_env("S3_TEST_STS_EXTERNAL_ID_ROLE_ARN");
-        let external_id_role_name = required_env("S3_TEST_STS_EXTERNAL_ID_ROLE_NAME");
-        let role_session_name = required_env("S3_TEST_STS_ROLE_SESSION_NAME");
+    if let Ok(role_arn) = env::var("STS_TEST_ROLE_ARN") {
+        let caller_arn = required_env("STS_TEST_PRIMARY_ARN");
+        let role_name = required_env("STS_TEST_ROLE_NAME");
+        let default_max_role_arn = required_env("STS_TEST_DEFAULT_MAX_ROLE_ARN");
+        let default_max_role_name = required_env("STS_TEST_DEFAULT_MAX_ROLE_NAME");
+        let external_id = required_env("STS_TEST_EXTERNAL_ID");
+        let external_id_role_arn = required_env("STS_TEST_EXTERNAL_ID_ROLE_ARN");
+        let external_id_role_name = required_env("STS_TEST_EXTERNAL_ID_ROLE_NAME");
+        let role_session_name = required_env("STS_TEST_ROLE_SESSION_NAME");
         run_assume_role_probes(
             &endpoint,
             credentials,
@@ -9422,19 +9467,19 @@ fn main() {
             },
         );
 
-        let source_identity = required_env("S3_TEST_STS_SOURCE_IDENTITY");
-        let source_identity_role_arn = required_env("S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN");
-        let source_identity_role_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_ROLE_NAME");
-        let condition_role_arn = required_env("S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN");
-        let condition_role_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_NAME");
-        let source_access_key = required_env("S3_TEST_STS_SOURCE_IDENTITY_ACCESS_KEY");
-        let source_secret_key = required_env("S3_TEST_STS_SOURCE_IDENTITY_SECRET_KEY");
-        let source_session_token = required_env("S3_TEST_STS_SOURCE_IDENTITY_SESSION_TOKEN");
-        let source_session_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_SESSION_NAME");
-        let target_role_arn = required_env("S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_ARN");
-        let target_role_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_NAME");
-        let target_session_name = required_env("S3_TEST_STS_SOURCE_IDENTITY_TARGET_SESSION_NAME");
-        let no_set_target_role_arn = required_env("S3_TEST_STS_CHAIN_TARGET_ROLE_ARN");
+        let source_identity = required_env("STS_TEST_SOURCE_IDENTITY");
+        let source_identity_role_arn = required_env("STS_TEST_SOURCE_IDENTITY_ROLE_ARN");
+        let source_identity_role_name = required_env("STS_TEST_SOURCE_IDENTITY_ROLE_NAME");
+        let condition_role_arn = required_env("STS_TEST_SOURCE_IDENTITY_CONDITION_ROLE_ARN");
+        let condition_role_name = required_env("STS_TEST_SOURCE_IDENTITY_CONDITION_ROLE_NAME");
+        let source_access_key = required_env("STS_TEST_SOURCE_IDENTITY_ACCESS_KEY");
+        let source_secret_key = required_env("STS_TEST_SOURCE_IDENTITY_SECRET_KEY");
+        let source_session_token = required_env("STS_TEST_SOURCE_IDENTITY_SESSION_TOKEN");
+        let source_session_name = required_env("STS_TEST_SOURCE_IDENTITY_SESSION_NAME");
+        let target_role_arn = required_env("STS_TEST_SOURCE_IDENTITY_TARGET_ROLE_ARN");
+        let target_role_name = required_env("STS_TEST_SOURCE_IDENTITY_TARGET_ROLE_NAME");
+        let target_session_name = required_env("STS_TEST_SOURCE_IDENTITY_TARGET_SESSION_NAME");
+        let no_set_target_role_arn = required_env("STS_TEST_CHAIN_TARGET_ROLE_ARN");
         let source_credentials = SignedRequestCredentials {
             access_key: &source_access_key,
             secret_key: &source_secret_key,
@@ -9465,20 +9510,20 @@ fn main() {
         );
     }
 
-    if let Ok(success_role_arn) = env::var("S3_TEST_STS_CROSS_SUCCESS_ROLE_ARN") {
-        let alt_access_key = required_env("S3_TEST_STS_ALT_ACCESS_KEY");
-        let alt_secret_key = required_env("S3_TEST_STS_ALT_SECRET_KEY");
+    if let Ok(success_role_arn) = env::var("STS_TEST_CROSS_SUCCESS_ROLE_ARN") {
+        let alt_access_key = required_env("STS_TEST_ALT_ACCESS_KEY");
+        let alt_secret_key = required_env("STS_TEST_ALT_SECRET_KEY");
         let alt_credentials = SignedRequestCredentials {
             access_key: &alt_access_key,
             secret_key: &alt_secret_key,
             region: &region,
             tls_ca_pem: None,
         };
-        let caller_arn = required_env("S3_TEST_STS_ALT_ARN");
-        let role_session_name = required_env("S3_TEST_STS_CROSS_SESSION_NAME");
-        let success_role_name = required_env("S3_TEST_STS_CROSS_SUCCESS_ROLE_NAME");
-        let trust_denied_role_arn = required_env("S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_ARN");
-        let caller_denied_role_arn = required_env("S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_ARN");
+        let caller_arn = required_env("STS_TEST_ALT_ARN");
+        let role_session_name = required_env("STS_TEST_CROSS_SESSION_NAME");
+        let success_role_name = required_env("STS_TEST_CROSS_SUCCESS_ROLE_NAME");
+        let trust_denied_role_arn = required_env("STS_TEST_CROSS_TRUST_DENIED_ROLE_ARN");
+        let caller_denied_role_arn = required_env("STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN");
         run_cross_account_probes(
             &endpoint,
             alt_credentials,
@@ -9494,16 +9539,16 @@ fn main() {
         );
     }
 
-    if let Ok(target_role_arn) = env::var("S3_TEST_STS_CHAIN_TARGET_ROLE_ARN") {
-        let chain_access_key = required_env("S3_TEST_STS_CHAIN_ACCESS_KEY");
-        let chain_secret_key = required_env("S3_TEST_STS_CHAIN_SECRET_KEY");
-        let chain_security_token = required_env("S3_TEST_STS_CHAIN_SESSION_TOKEN");
-        let other_live_security_token = required_env("S3_TEST_STS_OTHER_LIVE_SESSION_TOKEN");
-        let chain_role_name = required_env("S3_TEST_STS_ROLE_NAME");
-        let chain_role_session_name = required_env("S3_TEST_STS_CHAIN_SOURCE_SESSION_NAME");
-        let target_role_name = required_env("S3_TEST_STS_CHAIN_TARGET_ROLE_NAME");
-        let target_session_name = required_env("S3_TEST_STS_CHAIN_TARGET_SESSION_NAME");
-        let low_max_target_role_arn = required_env("S3_TEST_STS_DEFAULT_MAX_ROLE_ARN");
+    if let Ok(target_role_arn) = env::var("STS_TEST_CHAIN_TARGET_ROLE_ARN") {
+        let chain_access_key = required_env("STS_TEST_CHAIN_ACCESS_KEY");
+        let chain_secret_key = required_env("STS_TEST_CHAIN_SECRET_KEY");
+        let chain_security_token = required_env("STS_TEST_CHAIN_SESSION_TOKEN");
+        let other_live_security_token = required_env("STS_TEST_OTHER_LIVE_SESSION_TOKEN");
+        let chain_role_name = required_env("STS_TEST_ROLE_NAME");
+        let chain_role_session_name = required_env("STS_TEST_CHAIN_SOURCE_SESSION_NAME");
+        let target_role_name = required_env("STS_TEST_CHAIN_TARGET_ROLE_NAME");
+        let target_session_name = required_env("STS_TEST_CHAIN_TARGET_SESSION_NAME");
+        let low_max_target_role_arn = required_env("STS_TEST_DEFAULT_MAX_ROLE_ARN");
         let chain_credentials = SignedRequestCredentials {
             access_key: &chain_access_key,
             secret_key: &chain_secret_key,
@@ -9523,28 +9568,28 @@ fn main() {
             },
         );
 
-        let deleted_access_key = required_env("S3_TEST_STS_DELETED_ROLE_ACCESS_KEY");
-        let deleted_secret_key = required_env("S3_TEST_STS_DELETED_ROLE_SECRET_KEY");
-        let deleted_security_token = required_env("S3_TEST_STS_DELETED_ROLE_SESSION_TOKEN");
+        let deleted_access_key = required_env("STS_TEST_DELETED_ROLE_ACCESS_KEY");
+        let deleted_secret_key = required_env("STS_TEST_DELETED_ROLE_SECRET_KEY");
+        let deleted_security_token = required_env("STS_TEST_DELETED_ROLE_SESSION_TOKEN");
         let deleted_credentials = SignedRequestCredentials {
             access_key: &deleted_access_key,
             secret_key: &deleted_secret_key,
             region: &region,
             tls_ca_pem: None,
         };
-        let recreated_access_key = required_env("S3_TEST_STS_RECREATED_ROLE_ACCESS_KEY");
-        let recreated_secret_key = required_env("S3_TEST_STS_RECREATED_ROLE_SECRET_KEY");
-        let recreated_security_token = required_env("S3_TEST_STS_RECREATED_ROLE_SESSION_TOKEN");
-        let recreated_role_name = required_env("S3_TEST_STS_DELETED_ROLE_NAME");
-        let recreated_role_session_name = required_env("S3_TEST_STS_RECREATED_ROLE_SESSION_NAME");
-        let recreated_role_id = required_env("S3_TEST_STS_RECREATED_ROLE_ID");
+        let recreated_access_key = required_env("STS_TEST_RECREATED_ROLE_ACCESS_KEY");
+        let recreated_secret_key = required_env("STS_TEST_RECREATED_ROLE_SECRET_KEY");
+        let recreated_security_token = required_env("STS_TEST_RECREATED_ROLE_SESSION_TOKEN");
+        let recreated_role_name = required_env("STS_TEST_DELETED_ROLE_NAME");
+        let recreated_role_session_name = required_env("STS_TEST_RECREATED_ROLE_SESSION_NAME");
+        let recreated_role_id = required_env("STS_TEST_RECREATED_ROLE_ID");
         let recreated_credentials = SignedRequestCredentials {
             access_key: &recreated_access_key,
             secret_key: &recreated_secret_key,
             region: &region,
             tls_ca_pem: None,
         };
-        let post_bucket = required_env("S3_TEST_STS_POST_BUCKET");
+        let post_bucket = required_env("STS_TEST_POST_BUCKET");
         run_s3_header_session_authentication_probes(
             &format!("https://s3.{region}.amazonaws.com/"),
             &account_id,
@@ -9592,7 +9637,7 @@ fn main() {
             &post_bucket,
             presigned_fixture,
         );
-        let recreated_session_arn = required_env("S3_TEST_STS_RECREATED_SESSION_ARN");
+        let recreated_session_arn = required_env("STS_TEST_RECREATED_SESSION_ARN");
         run_s3_session_context_probes(
             &format!("https://{post_bucket}.s3.{region}.amazonaws.com"),
             &post_bucket,
@@ -9602,18 +9647,16 @@ fn main() {
                 assumed_role_arn: &recreated_session_arn,
             },
         );
-        let policy_pre_access_key = required_env("S3_TEST_STS_POLICY_MUTATION_PRE_ACCESS_KEY");
-        let policy_pre_secret_key = required_env("S3_TEST_STS_POLICY_MUTATION_PRE_SECRET_KEY");
-        let policy_pre_security_token =
-            required_env("S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_TOKEN");
-        let policy_pre_assumed_role_arn =
-            required_env("S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_ARN");
-        let policy_post_access_key = required_env("S3_TEST_STS_POLICY_MUTATION_POST_ACCESS_KEY");
-        let policy_post_secret_key = required_env("S3_TEST_STS_POLICY_MUTATION_POST_SECRET_KEY");
+        let policy_pre_access_key = required_env("STS_TEST_POLICY_MUTATION_PRE_ACCESS_KEY");
+        let policy_pre_secret_key = required_env("STS_TEST_POLICY_MUTATION_PRE_SECRET_KEY");
+        let policy_pre_security_token = required_env("STS_TEST_POLICY_MUTATION_PRE_SESSION_TOKEN");
+        let policy_pre_assumed_role_arn = required_env("STS_TEST_POLICY_MUTATION_PRE_SESSION_ARN");
+        let policy_post_access_key = required_env("STS_TEST_POLICY_MUTATION_POST_ACCESS_KEY");
+        let policy_post_secret_key = required_env("STS_TEST_POLICY_MUTATION_POST_SECRET_KEY");
         let policy_post_security_token =
-            required_env("S3_TEST_STS_POLICY_MUTATION_POST_SESSION_TOKEN");
+            required_env("STS_TEST_POLICY_MUTATION_POST_SESSION_TOKEN");
         let policy_post_assumed_role_arn =
-            required_env("S3_TEST_STS_POLICY_MUTATION_POST_SESSION_ARN");
+            required_env("STS_TEST_POLICY_MUTATION_POST_SESSION_ARN");
         run_s3_role_policy_mutation_probes(
             &format!("https://{post_bucket}.s3.{region}.amazonaws.com"),
             &post_bucket,
@@ -9692,20 +9735,20 @@ fn main() {
             },
         );
 
-        if let Ok(expired_deleted_access_key) = env::var("S3_TEST_STS_EXPIRED_DELETED_ACCESS_KEY") {
-            let expiry_liveness_access_key = required_env("S3_TEST_STS_EXPIRY_LIVENESS_ACCESS_KEY");
-            let expiry_liveness_secret_key = required_env("S3_TEST_STS_EXPIRY_LIVENESS_SECRET_KEY");
+        if let Ok(expired_deleted_access_key) = env::var("STS_TEST_EXPIRED_DELETED_ACCESS_KEY") {
+            let expiry_liveness_access_key = required_env("STS_TEST_EXPIRY_LIVENESS_ACCESS_KEY");
+            let expiry_liveness_secret_key = required_env("STS_TEST_EXPIRY_LIVENESS_SECRET_KEY");
             let expiry_liveness_security_token =
-                required_env("S3_TEST_STS_EXPIRY_LIVENESS_SESSION_TOKEN");
+                required_env("STS_TEST_EXPIRY_LIVENESS_SESSION_TOKEN");
             let expiry_liveness_credentials = SignedRequestCredentials {
                 access_key: &expiry_liveness_access_key,
                 secret_key: &expiry_liveness_secret_key,
                 region: &region,
                 tls_ca_pem: None,
             };
-            let expired_deleted_secret_key = required_env("S3_TEST_STS_EXPIRED_DELETED_SECRET_KEY");
+            let expired_deleted_secret_key = required_env("STS_TEST_EXPIRED_DELETED_SECRET_KEY");
             let expired_deleted_security_token =
-                required_env("S3_TEST_STS_EXPIRED_DELETED_SESSION_TOKEN");
+                required_env("STS_TEST_EXPIRED_DELETED_SESSION_TOKEN");
             let expired_deleted_credentials = SignedRequestCredentials {
                 access_key: &expired_deleted_access_key,
                 secret_key: &expired_deleted_secret_key,
@@ -9736,35 +9779,35 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        matches_observed_get_boundary_fixture, s3_post_response_with_sanitized_body,
-        s3_response_with_sanitized_body, sign_s3_streaming_request,
-        sign_s3_streaming_request_for_service, spaced_hex, validate_https_endpoint,
-        S3StreamingTokens, OBSERVED_GET_BOUNDARY_ENDPOINT,
+        assume_role_response_with_sanitized_credentials, matches_observed_get_boundary_fixture,
+        s3_post_response_with_sanitized_body, s3_response_with_sanitized_body,
+        sign_s3_streaming_request, sign_s3_streaming_request_for_service, spaced_hex,
+        validate_https_endpoint, S3StreamingTokens, OBSERVED_GET_BOUNDARY_ENDPOINT,
     };
     use s3_tests::{RawResponse, SignedRequestCredentials};
 
     #[test]
     fn aws_oracle_endpoints_require_valid_https_urls() {
         assert!(validate_https_endpoint(
-            "S3_TEST_STS_ENDPOINT",
+            "STS_TEST_ENDPOINT",
             "https://sts.us-east-1.amazonaws.com"
         )
         .is_ok());
         assert!(validate_https_endpoint(
-            "S3_TEST_S3_CONTROL_ENDPOINT",
+            "S3_CONTROL_TEST_ENDPOINT",
             "https://111122223333.s3-control.us-east-1.amazonaws.com"
         )
         .is_ok());
 
         for (name, endpoint) in [
-            ("S3_TEST_STS_ENDPOINT", "http://sts.us-east-1.amazonaws.com"),
+            ("STS_TEST_ENDPOINT", "http://sts.us-east-1.amazonaws.com"),
             (
-                "S3_TEST_S3_CONTROL_ENDPOINT",
+                "S3_CONTROL_TEST_ENDPOINT",
                 "http://111122223333.s3-control.us-east-1.amazonaws.com",
             ),
-            ("S3_TEST_STS_ENDPOINT", "ftp://sts.us-east-1.amazonaws.com"),
-            ("S3_TEST_STS_ENDPOINT", "https://"),
-            ("S3_TEST_STS_ENDPOINT", "not-a-url"),
+            ("STS_TEST_ENDPOINT", "ftp://sts.us-east-1.amazonaws.com"),
+            ("STS_TEST_ENDPOINT", "https://"),
+            ("STS_TEST_ENDPOINT", "not-a-url"),
         ] {
             assert!(
                 validate_https_endpoint(name, endpoint).is_err(),
@@ -9803,6 +9846,35 @@ mod tests {
                 ..credentials
             }
         ));
+    }
+
+    #[test]
+    fn assume_role_error_response_sanitization_removes_issued_credentials() {
+        let response = RawResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: "<Credentials>\
+                   <AccessKeyId>SESSIONACCESSKEY</AccessKeyId>\
+                   <SecretAccessKey>session-secret</SecretAccessKey>\
+                   <SessionToken>session-token</SessionToken>\
+                   </Credentials>"
+                .to_string(),
+            body_read_error: None,
+        };
+
+        let sanitized = assume_role_response_with_sanitized_credentials(&response);
+        for sensitive in ["SESSIONACCESSKEY", "session-secret", "session-token"] {
+            assert!(
+                !sanitized.body.contains(sensitive),
+                "sanitized AssumeRole response retained sensitive credential material"
+            );
+        }
+        for marker in ["SESSION_ACCESS_KEY", "SESSION_SECRET_KEY", "SESSION_TOKEN"] {
+            assert!(
+                sanitized.body.contains(marker),
+                "sanitized AssumeRole response omitted its replacement marker"
+            );
+        }
     }
 
     #[test]

@@ -65,7 +65,7 @@ region="${region:-${TEST_S3_REGION:-us-east-1}}"
 policy_document="$ROOT/crates/s3-tests/aws/test-user-policy.json"
 policy_path="/argmin-s3-tests/"
 policy_name="test-user-policy"
-boundary_document="$ROOT/crates/s3-tests/aws/sts-oracle-role-boundary.json"
+boundary_document="$ROOT/crates/sts-tests/aws/sts-oracle-role-boundary.json"
 boundary_name="sts-oracle-role-boundary"
 
 jq empty "$policy_document"

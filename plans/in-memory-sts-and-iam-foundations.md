@@ -1183,6 +1183,13 @@ matrix establishes that:
   values receive the observed STS validation shapes, while a syntactically
   valid nonexistent role produces the same HTTP 403 `AccessDenied` shape as an
   authorization failure
+- an empty `RoleArn` always reports the same pattern and minimum-length
+  validation failures, but AWS does not give their order stable precedence:
+  20 identical requests to the `eu-central-1` regional endpoint on 2026-07-19
+  returned pattern-first 17 times and minimum-length-first three times; the
+  oracle therefore accepts exactly those two complete golden messages while
+  continuing to pin the rest of the response shape, and the implementation
+  must not infer precedence between those two validation failures
 - `RoleArn` length is counted in decoded Unicode scalar values, not UTF-8 bytes
   or UTF-16 code units: 2,048 multibyte BMP characters pass the length check,
   while 2,049 fail; 2,048 supplementary characters receive only the pattern
@@ -1249,14 +1256,14 @@ fixed Query-string scalar limit. The boundary golden is deliberately restricted
 to the exact fixture on which it was observed: the
 `https://sts.eu-central-1.amazonaws.com` authority, `eu-central-1` signing
 region, and an ordinary 20-byte IAM access key. With that fixed signing shape,
-a 15,870-byte query executes successfully while 15,871 bytes returns HTTP `400`
+a 15,844-byte query executes successfully while 15,845 bytes returns HTTP `400`
 with an empty body and no semantic response headers. Adding an empty signed
-`x-test-padding` header makes the otherwise accepted 15,870-byte query return
+`x-test-padding` header makes the otherwise accepted 15,844-byte query return
 that same `400`; a 15,800-byte query with a one-byte value for the same signed
 header still succeeds. The oracle skips only these aggregate-head rows when an
 advertised `--region` or `--endpoint` override, or a differently sized access
 key, changes the wire-head arithmetic; the portable POST-limit rows continue
-to run. Do not encode 15,870 as a universal Query-string constant: the shared
+to run. Do not encode 15,844 as a universal Query-string constant: the shared
 HTTP frontend must bound the complete request head and the local oracle must
 reproduce these accepted/rejected fixed-fixture signed shapes before Query
 decoding.
@@ -1312,24 +1319,26 @@ that selected value in typed request context and evaluate it as
 would fail the oracle.
 
 The `SourceIdentity` validation, trust-policy, and chaining slice completed on
-2026-07-14. It uses three unique permissionless role shapes: an unconditioned
-source role granting both `sts:AssumeRole` and `sts:SetSourceIdentity`, a role
-with an exact `sts:SourceIdentity` trust condition, and a chaining target that
-trusts the source IAM role with the same condition. The exact AWS-backed matrix
+2026-07-14 and its length boundary was re-observed on 2026-07-19 after the live
+oracle became part of the ordinary AWS wrapper. It uses three unique
+permissionless role shapes: an unconditioned source role granting both
+`sts:AssumeRole` and `sts:SetSourceIdentity`, a role with an exact
+`sts:SourceIdentity` trust condition, and a chaining target that trusts the
+source IAM role with the same condition. The exact AWS-backed matrix
 establishes that:
 
-- omission is schema-valid; a present value must contain 2 through 64
+- omission is schema-valid; a present value must contain 2 through 256
   characters and match `[\w+=,.@-]*`
-- `azAZ09_+=,.@-` and the two- and 64-character boundaries succeed, pinning
+- `azAZ09_+=,.@-` and the two- and 256-character boundaries succeed, pinning
   every rendered character class and the exact success XML; the response adds
   `SourceIdentity` after `Credentials`, while `PackedPolicySize` remains absent
-- empty, one-character, space-containing, and 65-character inputs receive the
+- empty, one-character, space-containing, and 257-character inputs receive the
   exact single-error `ValidationError` shapes; simultaneous pattern/length
   failures produce two errors ordered pattern first and length second
 - length is counted in decoded Unicode scalar values rather than UTF-8 bytes or
-  UTF-16 units: 33 `é` characters and 33 supplementary characters receive only
-  the pattern error despite occupying 66 UTF-8 bytes and, for the supplementary
-  case, 66 UTF-16 units
+  UTF-16 units: 129 `é` characters and 129 supplementary characters receive
+  only the pattern error despite occupying 258 UTF-8 bytes and, for the
+  supplementary case, 258 UTF-16 units
 - both `aws:reserved` and `AWS:reserved` receive the ordinary exact pattern
   error because the colon is outside the admitted pattern; AWS exposes no
   separate reserved-prefix error for these inputs
@@ -2219,7 +2228,8 @@ permissions.
 
 ### Phase 5: End-to-end conformance and standalone UAT
 
-- add a dedicated `s3-tests` STS/temporary-credentials binary
+- extend the dedicated `sts-tests` crate from its Phase 0 AWS oracle into the
+  endpoint-neutral STS/temporary-credentials conformance suite
 - run it against AWS and the embedded local server
 - add standalone `argmin-s3` UAT coverage with multiple workers
 - cover issuance/use races, simultaneous sessions, expiry, restart loss,
@@ -2346,7 +2356,7 @@ Use the repository's normal gates, scaled during development and complete
 before committing:
 
 - focused `auth`, `server-http`, `server-core`, and new STS/IAM tests
-- targeted `s3-tests` temporary-credential suite locally and against AWS
+- targeted `sts-tests` temporary-credential suite locally and against AWS
 - standalone UAT targeted suite
 - `cargo fmt`
 - `cargo clippy --all-targets --all-features -- -D warnings`

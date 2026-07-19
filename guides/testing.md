@@ -38,8 +38,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 # Local-only S3 behavior tests.
 cargo test -p s3-local-tests
 
-# AWS-backed compatibility tests.
+# AWS-backed S3 tests and live STS compatibility oracle.
 ./scripts/aws-tests
+
+# Run one AWS protocol surface in isolation.
+./scripts/aws-tests --s3-only
+./scripts/aws-tests --sts-only
 
 # Standalone binary UAT acceptance run.
 ./scripts/uat-s3-tests --test bucket_crud
@@ -127,10 +131,14 @@ For external AWS-backed workflows, prefer the wrapper scripts under
 `./scripts/` rather than reconstructing long `cargo test` commands by hand.
 
 - `./scripts/aws-tests`
-  - runs the external `s3-tests` suite
+  - runs the external `s3-tests` package and live STS oracle by default
+  - accepts `--s3-only` or `--sts-only` to select one protocol surface
   - loads AWS credentials from `.env`
-  - sets the required `S3_TEST_*` variables
-  - forwards extra arguments to `cargo test -p s3-tests`
+  - sets the required service endpoint and shared `AWS_TEST_*` variables
+  - runs the self-cleaning same-account `AssumeRole` fixture for STS coverage
+  - forwards extra arguments to the S3 `cargo test` command; `--sts-only`
+    rejects Cargo test selectors because the live probes execute from the
+    oracle binary's `main`
 - `./scripts/uat-s3-tests`
   - starts the standalone `argmin-s3` binary over HTTPS
   - configures UAT-only primary, alternate, same-account constrained, and
@@ -142,10 +150,10 @@ For external AWS-backed workflows, prefer the wrapper scripts under
   - loads the primary AWS credentials from `.env`
   - uses the same AWS user as `./scripts/aws-tests`
 
-The AWS-backed scripts accept `--region`, and `aws-tests` also accepts
-additional `cargo test` selectors and `-- --nocapture` style test-binary
-arguments. `uat-s3-tests` accepts additional `cargo nextest run` selectors and
-options.
+The AWS-backed scripts accept `--region`. `aws-tests` also accepts `--s3-only`
+and `--sts-only`; additional `cargo test` selectors and `-- --nocapture` style
+test-binary arguments apply to its S3 run. `uat-s3-tests` accepts additional
+`cargo nextest run` selectors and options.
 
 ## Standalone `argmin-s3` UAT `s3-tests`
 
@@ -339,17 +347,31 @@ ARGMIN_TRACE_FILE=/tmp/argmin.trace \
 cargo run -p argmin-s3 --features deep-tracing --release
 ```
 
-## AWS-backed `s3-tests`
+## AWS-backed S3 and STS tests
 
-This repo uses `crates/s3-tests` for AWS compatibility checks. External runs
-now fail fast if the AWS-specific environment is incomplete, rather than
-silently skipping coverage.
+This repo keeps the protocol surfaces independently selectable:
+
+- `crates/s3-tests` owns S3 API compatibility tests and the reusable raw
+  signing, HTTP, and golden-shape test support
+- `crates/sts-tests` owns STS Query, AssumeRole, and temporary-credential
+  conformance probes; it reuses the public S3 test support where those probes
+  exercise temporary credentials through S3
+
+`./scripts/aws-tests` runs both surfaces by default so the ordinary AWS
+compatibility command retains the complete protocol surface. Its STS leg runs
+the live oracle with a self-cleaning same-account `AssumeRole` fixture; it does
+not use Cargo's test harness, which would execute only the oracle binary's local
+unit tests. Use `--s3-only` or `--sts-only` for focused work.
+
+External runs fail fast if the AWS-specific environment is incomplete, rather
+than silently skipping coverage.
 
 ### Required environment variables
 
 The wrapper scripts above load `.env` directly. If you need to construct a
 manual command, use the `TEST_AWS_*` and `TEST_S3_*` names from `.env` as the
-source values that you map into `S3_TEST_*`.
+source values. The runtime test contract uses service-specific endpoint names
+and shared `AWS_TEST_*` identity names.
 
 The external `s3-tests` harness hard-fails if any of these are missing:
 
@@ -357,19 +379,19 @@ The external `s3-tests` harness hard-fails if any of these are missing:
   - Prefer `https://...` for full coverage.
   - `http://...` is allowed for partial runs, but tests that explicitly require
     HTTPS will fail.
-- `S3_TEST_S3_CONTROL_ENDPOINT`
+- `S3_CONTROL_TEST_ENDPOINT`
   - Endpoint used for the narrow S3 Control test surface. The harness does not
     infer it from the ordinary S3 endpoint or identify AWS by hostname.
   - `./scripts/aws-tests` derives the AWS account-prefixed endpoint by default;
     `./scripts/uat-s3-tests` uses the standalone local server endpoint.
   - Embedded local `cargo test` runs set it to the embedded server endpoint
     automatically.
-- `S3_TEST_ACCESS_KEY`
-- `S3_TEST_SECRET_KEY`
-- `S3_TEST_ACCOUNT_ID`
-- `S3_TEST_ALT_ACCESS_KEY`
-- `S3_TEST_ALT_SECRET_KEY`
-- `S3_TEST_ALT_ACCOUNT_ID`
+- `AWS_TEST_ACCESS_KEY`
+- `AWS_TEST_SECRET_KEY`
+- `AWS_TEST_ACCOUNT_ID`
+- `AWS_TEST_ALT_ACCESS_KEY`
+- `AWS_TEST_ALT_SECRET_KEY`
+- `AWS_TEST_ALT_ACCOUNT_ID`
 - `S3_TEST_BUCKET_PREFIX`
   - Required for external runs. The committed IAM policy below assumes
     `claude-s3-`.
@@ -379,7 +401,7 @@ Optional external endpoint support:
 - `S3_TEST_TLS_CA_CERT_PATH`
   - PEM CA certificate path for local HTTPS endpoints such as
     `./scripts/uat-s3-tests`.
-- `S3_TEST_SECOND_PRINCIPAL`
+- `AWS_TEST_SECOND_PRINCIPAL`
   - Exact IAM-style principal ARN for the same-account constrained test
     credential.
   - This is normally only needed for non-AWS external endpoints, where tests
@@ -389,11 +411,11 @@ Optional external endpoint support:
 The dedicated privileged root-principal suite in
 `crates/s3-tests/tests/bucket_policy_root.rs` requires:
 
-- `S3_TEST_OWNER_ROOT_ACCESS_KEY`
-- `S3_TEST_OWNER_ROOT_SECRET_KEY`
+- `AWS_TEST_OWNER_ROOT_ACCESS_KEY`
+- `AWS_TEST_OWNER_ROOT_SECRET_KEY`
 
 Those root credentials must belong to the same AWS account as
-`S3_TEST_ACCESS_KEY` / `S3_TEST_SECRET_KEY`. A full
+`AWS_TEST_ACCESS_KEY` / `AWS_TEST_SECRET_KEY`. A full
 `cargo test -p s3-tests --no-fail-fast` run includes the `bucket_policy_root`
 binary, so it will fail fast with a focused setup error if they are absent.
 Targeted non-root test binaries can still be run without them.
@@ -404,23 +426,30 @@ Recommended command:
 ./scripts/aws-tests
 ```
 
+Focused protocol surfaces:
+
+```bash
+./scripts/aws-tests --s3-only
+./scripts/aws-tests --sts-only
+```
+
 Privileged bucket-policy root-principal coverage:
 
 ```bash
-./scripts/aws-tests --test bucket_policy_root -- --nocapture
+./scripts/aws-tests --s3-only --test bucket_policy_root -- --nocapture
 ```
 
 You can override the region or forward any normal `cargo test` selectors:
 
 ```bash
-./scripts/aws-tests --region us-west-2 --test versioning -- --nocapture
-./scripts/aws-tests object_lock
+./scripts/aws-tests --s3-only --region us-west-2 --test versioning -- --nocapture
+./scripts/aws-tests --s3-only object_lock
 ```
 
-The `s3-tests` client defaults to a 30 second operation-attempt timeout. The
-AWS wrapper defaults `S3_TEST_TIMEOUT_SECS` to 120 seconds; use
-`--timeout-secs` to override it. AWS and local clients otherwise use the same
-AWS SDK stalled-stream protection.
+The shared S3/STS HTTP support defaults to a 30 second operation-attempt
+timeout. The AWS wrappers default `S3_TEST_TIMEOUT_SECS` to 120 seconds; use
+`--timeout-secs` to override it for either or both selected protocol surfaces.
+AWS and local clients otherwise use the same AWS SDK stalled-stream protection.
 
 ### AWS convergence and retries
 
@@ -505,10 +534,10 @@ Recommended command:
 ```bash
 eval "$(grep = .env)" && \
 S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
-S3_TEST_S3_CONTROL_ENDPOINT=https://111122223333.s3-control.us-east-1.amazonaws.com \
-S3_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY" \
-S3_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY" \
-S3_TEST_REGION="${TEST_S3_REGION:-us-east-1}" \
+S3_CONTROL_TEST_ENDPOINT=https://111122223333.s3-control.us-east-1.amazonaws.com \
+AWS_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY" \
+AWS_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY" \
+AWS_TEST_REGION="${TEST_S3_REGION:-us-east-1}" \
 S3_TEST_BUCKET_PREFIX="${TEST_S3_BUCKET_PREFIX:-claude-s3-}" \
 S3_TEST_TIMEOUT_SECS="${TEST_S3_TIMEOUT_SECS:-120}" \
 cargo test -p s3-http-tests --no-fail-fast
@@ -574,11 +603,11 @@ The working pattern, in order:
    [aws-compatibility.md](aws-compatibility.md), with a comment pointing at
    the guide entry.
 7. **Validate against AWS before trusting it.** Run the touched binaries via
-   `./scripts/aws-tests --test <binary> -- <test names>`. One AWS data point
-   covers one request shape — probe adjacent shapes (bucket vs object scope,
-   existing vs missing resource, with vs without an optional header) before
-   concluding anything about drift. If AWS disagrees with the template,
-   treat it as a server bug first (see aws-compatibility.md).
+   `./scripts/aws-tests --s3-only --test <binary> -- <test names>`. One AWS
+   data point covers one request shape — probe adjacent shapes (bucket vs
+   object scope, existing vs missing resource, with vs without an optional
+   header) before concluding anything about drift. If AWS disagrees with the
+   template, treat it as a server bug first (see aws-compatibility.md).
 8. **Upgrade in place.** When an existing test already covers the behaviour
    with weaker assertions, strengthen that test rather than adding a
    parallel one.

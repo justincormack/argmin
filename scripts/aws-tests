@@ -8,30 +8,37 @@ source "$ROOT/scripts/_external-s3-test-env.sh"
 
 usage() {
     cat <<'EOF'
-Usage: ./scripts/aws-tests [options] [cargo test args...]
+Usage: ./scripts/aws-tests [options] [S3 cargo test args...]
 
-Run the external AWS-backed `s3-tests` suite using credentials from `.env`.
-Extra arguments are passed directly to `cargo test -p s3-tests`.
+Run the external AWS-backed S3 suite and live STS oracle using credentials from
+`.env`. Extra arguments are passed to the S3 `cargo test` command and therefore
+cannot be used with `--sts-only`.
 
 Options:
-  --region REGION         Override `S3_TEST_REGION` (default: TEST_S3_REGION or us-east-1)
+  --s3-only               Run only the `s3-tests` package
+  --sts-only              Run only the live STS and AssumeRole oracle
+  --region REGION         Override the S3/STS test region (default: TEST_S3_REGION or us-east-1)
   --endpoint URL          Override `S3_TEST_ENDPOINT` (default: TEST_S3_ENDPOINT or derived from region)
+  --sts-endpoint URL      Override `STS_TEST_ENDPOINT` (default: TEST_STS_ENDPOINT or derived from region)
   --s3-control-endpoint URL
-                          Override `S3_TEST_S3_CONTROL_ENDPOINT` (default: TEST_S3_CONTROL_ENDPOINT or derived from account and region)
+                          Override `S3_CONTROL_TEST_ENDPOINT` (default: TEST_S3_CONTROL_ENDPOINT or derived from account and region)
   --bucket-prefix PREFIX  Override `S3_TEST_BUCKET_PREFIX` (default: TEST_S3_BUCKET_PREFIX or claude-s3-)
-  --timeout-secs SECS     Override `S3_TEST_TIMEOUT_SECS` (default: TEST_S3_TIMEOUT_SECS or 120)
+  --timeout-secs SECS     Override the shared S3/STS HTTP timeout (default: TEST_S3_TIMEOUT_SECS or 120)
   --dotenv PATH           Read AWS variables from a different env file
   -h, --help              Show this help
 
 Examples:
   ./scripts/aws-tests
-  ./scripts/aws-tests --test versioning -- --nocapture
-  ./scripts/aws-tests --region us-west-2 --test object_lock
+  ./scripts/aws-tests --s3-only --test versioning -- --nocapture
+  ./scripts/aws-tests --sts-only
+  ./scripts/aws-tests --s3-only --region us-west-2 --test object_lock
 EOF
 }
 
+suite="all"
 region=""
 endpoint=""
+sts_endpoint=""
 s3_control_endpoint=""
 bucket_prefix=""
 timeout_secs=""
@@ -40,6 +47,18 @@ cargo_args=()
 
 while (($#)); do
     case "$1" in
+        --s3-only)
+            [[ "$suite" != "sts" ]] || \
+                external_s3_test_die "--s3-only and --sts-only are mutually exclusive"
+            suite="s3"
+            shift
+            ;;
+        --sts-only)
+            [[ "$suite" != "s3" ]] || \
+                external_s3_test_die "--s3-only and --sts-only are mutually exclusive"
+            suite="sts"
+            shift
+            ;;
         --region)
             [[ $# -ge 2 ]] || external_s3_test_die "--region requires a value"
             region="$2"
@@ -48,6 +67,11 @@ while (($#)); do
         --endpoint)
             [[ $# -ge 2 ]] || external_s3_test_die "--endpoint requires a value"
             endpoint="$2"
+            shift 2
+            ;;
+        --sts-endpoint)
+            [[ $# -ge 2 ]] || external_s3_test_die "--sts-endpoint requires a value"
+            sts_endpoint="$2"
             shift 2
             ;;
         --s3-control-endpoint)
@@ -85,24 +109,64 @@ while (($#)); do
     esac
 done
 
+if [[ "$suite" == sts && ${#cargo_args[@]} -ne 0 ]]; then
+    external_s3_test_die \
+        "cargo test arguments cannot be used with --sts-only"
+fi
+
 cd "$ROOT"
 external_s3_test_load_dotenv "$dotenv_path"
 region="${region:-${TEST_S3_REGION:-us-east-1}}"
-bucket_prefix="${bucket_prefix:-${TEST_S3_BUCKET_PREFIX:-claude-s3-}}"
-timeout_secs="${timeout_secs:-${TEST_S3_TIMEOUT_SECS:-120}}"
-endpoint="${endpoint:-${TEST_S3_ENDPOINT:-}}"
-endpoint="${endpoint:-$(external_s3_test_default_endpoint "$region")}"
+sts_endpoint="${sts_endpoint:-${TEST_STS_ENDPOINT:-}}"
+sts_endpoint="${sts_endpoint:-https://sts.${region}.amazonaws.com}"
+external_s3_test_require_shell_var TEST_AWS_PRIMARY_ACCOUNT_ID
 s3_control_endpoint="${s3_control_endpoint:-${TEST_S3_CONTROL_ENDPOINT:-}}"
 s3_control_endpoint="${s3_control_endpoint:-$(external_s3_test_default_s3_control_endpoint "$TEST_AWS_PRIMARY_ACCOUNT_ID" "$region")}"
-external_s3_test_export_common_env \
-    "$region" \
-    "$endpoint" \
-    "$bucket_prefix" \
-    "$timeout_secs" \
-    "$s3_control_endpoint"
+timeout_secs="${timeout_secs:-${TEST_S3_TIMEOUT_SECS:-120}}"
 
-cmd=(cargo test -p s3-tests --no-fail-fast)
-cmd+=("${cargo_args[@]}")
+sts_cmd=(
+    "$ROOT/scripts/aws-sts-oracle"
+    --assume-role
+    --region "$region"
+    --endpoint "$sts_endpoint"
+    --s3-control-endpoint "$s3_control_endpoint"
+    --timeout-secs "$timeout_secs"
+    --dotenv "$dotenv_path"
+)
 
-external_s3_test_print_command "external s3-tests" "${cmd[@]}"
-exec "${cmd[@]}"
+if [[ "$suite" != sts ]]; then
+    bucket_prefix="${bucket_prefix:-${TEST_S3_BUCKET_PREFIX:-claude-s3-}}"
+    endpoint="${endpoint:-${TEST_S3_ENDPOINT:-}}"
+    endpoint="${endpoint:-$(external_s3_test_default_endpoint "$region")}"
+    external_s3_test_export_common_env \
+        "$region" \
+        "$endpoint" \
+        "$bucket_prefix" \
+        "$timeout_secs" \
+        "$s3_control_endpoint"
+    s3_cmd=(cargo test -p s3-tests --no-fail-fast)
+    s3_cmd+=("${cargo_args[@]}")
+fi
+
+case "$suite" in
+    s3)
+        external_s3_test_print_command "external s3-tests" "${s3_cmd[@]}"
+        exec "${s3_cmd[@]}"
+        ;;
+    sts)
+        external_s3_test_print_command "external STS oracle" "${sts_cmd[@]}"
+        exec "${sts_cmd[@]}"
+        ;;
+    all)
+        failed=0
+        external_s3_test_print_command "external s3-tests" "${s3_cmd[@]}"
+        if ! "${s3_cmd[@]}"; then
+            failed=1
+        fi
+        external_s3_test_print_command "external STS oracle" "${sts_cmd[@]}"
+        if ! "${sts_cmd[@]}"; then
+            failed=1
+        fi
+        exit "$failed"
+        ;;
+esac

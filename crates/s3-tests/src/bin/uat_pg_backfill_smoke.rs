@@ -51,9 +51,9 @@ where
 
 fn client_from_env() -> s3_tests::aws_sdk_s3::Client {
     let endpoint = std::env::var("S3_TEST_ENDPOINT").expect("S3_TEST_ENDPOINT is required");
-    let access_key = std::env::var("S3_TEST_ACCESS_KEY").expect("S3_TEST_ACCESS_KEY is required");
-    let secret_key = std::env::var("S3_TEST_SECRET_KEY").expect("S3_TEST_SECRET_KEY is required");
-    let region = std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let access_key = std::env::var("AWS_TEST_ACCESS_KEY").expect("AWS_TEST_ACCESS_KEY is required");
+    let secret_key = std::env::var("AWS_TEST_SECRET_KEY").expect("AWS_TEST_SECRET_KEY is required");
+    let region = std::env::var("AWS_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let tls_ca_pem = std::env::var("S3_TEST_TLS_CA_CERT_PATH").ok().map(|path| {
         std::fs::read(&path).unwrap_or_else(|error| {
             panic!("read S3_TEST_TLS_CA_CERT_PATH {path}: {error}");

@@ -108,21 +108,21 @@ impl TestContext {
     /// server or connect to an external endpoint:
     ///
     /// - `S3_TEST_ENDPOINT`: external endpoint URL
-    /// - `S3_TEST_S3_CONTROL_ENDPOINT`: external S3 Control endpoint URL
-    /// - `S3_TEST_ACCESS_KEY`: primary access key
-    /// - `S3_TEST_SECRET_KEY`: primary secret key
-    /// - `S3_TEST_ACCOUNT_ID`: primary AWS account ID
-    /// - `S3_TEST_ALT_ACCESS_KEY`: alternate access key from a different AWS account
-    /// - `S3_TEST_ALT_SECRET_KEY`: alternate secret key from a different AWS account
-    /// - `S3_TEST_ALT_ACCOUNT_ID`: alternate AWS account ID
-    /// - `S3_TEST_SECOND_ACCESS_KEY`: optional same-account constrained access key
-    /// - `S3_TEST_SECOND_SECRET_KEY`: optional same-account constrained secret key
-    /// - `S3_TEST_SECOND_PRINCIPAL`: optional exact principal ARN for non-AWS external endpoints
-    /// - `S3_TEST_OWNER_ROOT_ACCESS_KEY`: optional owner-account root access key
-    /// - `S3_TEST_OWNER_ROOT_SECRET_KEY`: optional owner-account root secret key
+    /// - `S3_CONTROL_TEST_ENDPOINT`: external S3 Control endpoint URL
+    /// - `AWS_TEST_ACCESS_KEY`: primary access key
+    /// - `AWS_TEST_SECRET_KEY`: primary secret key
+    /// - `AWS_TEST_ACCOUNT_ID`: primary AWS account ID
+    /// - `AWS_TEST_ALT_ACCESS_KEY`: alternate access key from a different AWS account
+    /// - `AWS_TEST_ALT_SECRET_KEY`: alternate secret key from a different AWS account
+    /// - `AWS_TEST_ALT_ACCOUNT_ID`: alternate AWS account ID
+    /// - `AWS_TEST_SECOND_ACCESS_KEY`: optional same-account constrained access key
+    /// - `AWS_TEST_SECOND_SECRET_KEY`: optional same-account constrained secret key
+    /// - `AWS_TEST_SECOND_PRINCIPAL`: optional exact principal ARN for non-AWS external endpoints
+    /// - `AWS_TEST_OWNER_ROOT_ACCESS_KEY`: optional owner-account root access key
+    /// - `AWS_TEST_OWNER_ROOT_SECRET_KEY`: optional owner-account root secret key
     /// - `S3_TEST_TLS_CA_CERT_PATH`: optional PEM CA bundle for local HTTPS endpoints
     /// - `S3_TEST_BUCKET_PREFIX`: required prefix for external test buckets
-    /// - `S3_TEST_REGION`: region (defaults to "us-east-1")
+    /// - `AWS_TEST_REGION`: region (defaults to "us-east-1")
     ///
     /// Local embedded-server tracing helpers:
     ///
@@ -139,32 +139,32 @@ impl TestContext {
                 endpoint.starts_with("https://") || endpoint.starts_with("http://"),
                 "S3_TEST_ENDPOINT must use http:// or https://; https:// is recommended for full external s3-tests coverage; got {endpoint}"
             );
-            let s3_control_endpoint = std::env::var("S3_TEST_S3_CONTROL_ENDPOINT").expect(
-                "S3_TEST_S3_CONTROL_ENDPOINT required with S3_TEST_ENDPOINT; set it to the S3 Control endpoint used by this test target",
+            let s3_control_endpoint = std::env::var("S3_CONTROL_TEST_ENDPOINT").expect(
+                "S3_CONTROL_TEST_ENDPOINT required with S3_TEST_ENDPOINT; set it to the S3 Control endpoint used by this test target",
             );
             assert!(
                 s3_control_endpoint.starts_with("https://")
                     || s3_control_endpoint.starts_with("http://"),
-                "S3_TEST_S3_CONTROL_ENDPOINT must use http:// or https://; got {s3_control_endpoint}"
+                "S3_CONTROL_TEST_ENDPOINT must use http:// or https://; got {s3_control_endpoint}"
             );
-            let access_key = std::env::var("S3_TEST_ACCESS_KEY")
-                .expect("S3_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
-            let secret_key = std::env::var("S3_TEST_SECRET_KEY")
-                .expect("S3_TEST_SECRET_KEY required with S3_TEST_ENDPOINT");
-            let account_id = std::env::var("S3_TEST_ACCOUNT_ID").expect(
-                "S3_TEST_ACCOUNT_ID required with S3_TEST_ENDPOINT; full external s3-tests runs need the primary AWS account ID",
+            let access_key = std::env::var("AWS_TEST_ACCESS_KEY")
+                .expect("AWS_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
+            let secret_key = std::env::var("AWS_TEST_SECRET_KEY")
+                .expect("AWS_TEST_SECRET_KEY required with S3_TEST_ENDPOINT");
+            let account_id = std::env::var("AWS_TEST_ACCOUNT_ID").expect(
+                "AWS_TEST_ACCOUNT_ID required with S3_TEST_ENDPOINT; full external s3-tests runs need the primary AWS account ID",
             );
-            let alt_access_key = std::env::var("S3_TEST_ALT_ACCESS_KEY").expect(
-                "S3_TEST_ALT_ACCESS_KEY required with S3_TEST_ENDPOINT; full external s3-tests runs need alternate credentials from a different AWS account",
+            let alt_access_key = std::env::var("AWS_TEST_ALT_ACCESS_KEY").expect(
+                "AWS_TEST_ALT_ACCESS_KEY required with S3_TEST_ENDPOINT; full external s3-tests runs need alternate credentials from a different AWS account",
             );
-            let alt_secret_key = std::env::var("S3_TEST_ALT_SECRET_KEY").expect(
-                "S3_TEST_ALT_SECRET_KEY required with S3_TEST_ENDPOINT; full external s3-tests runs need alternate credentials from a different AWS account",
+            let alt_secret_key = std::env::var("AWS_TEST_ALT_SECRET_KEY").expect(
+                "AWS_TEST_ALT_SECRET_KEY required with S3_TEST_ENDPOINT; full external s3-tests runs need alternate credentials from a different AWS account",
             );
-            let alt_account_id = std::env::var("S3_TEST_ALT_ACCOUNT_ID").expect(
-                "S3_TEST_ALT_ACCOUNT_ID required with S3_TEST_ENDPOINT; full external s3-tests runs need the alternate AWS account ID",
+            let alt_account_id = std::env::var("AWS_TEST_ALT_ACCOUNT_ID").expect(
+                "AWS_TEST_ALT_ACCOUNT_ID required with S3_TEST_ENDPOINT; full external s3-tests runs need the alternate AWS account ID",
             );
             let region =
-                std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+                std::env::var("AWS_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
             let tls_ca_pem = match std::env::var("S3_TEST_TLS_CA_CERT_PATH") {
                 Ok(path) => Some(std::fs::read(&path).unwrap_or_else(|err| {
                     panic!("read S3_TEST_TLS_CA_CERT_PATH {path}: {err}");
@@ -173,8 +173,8 @@ impl TestContext {
                 Err(err) => panic!("read S3_TEST_TLS_CA_CERT_PATH: {err}"),
             };
             let second_client = match (
-                std::env::var("S3_TEST_SECOND_ACCESS_KEY"),
-                std::env::var("S3_TEST_SECOND_SECRET_KEY"),
+                std::env::var("AWS_TEST_SECOND_ACCESS_KEY"),
+                std::env::var("AWS_TEST_SECOND_SECRET_KEY"),
             ) {
                 (Ok(second_access_key), Ok(second_secret_key)) => Some(build_client(
                     &endpoint,
@@ -185,18 +185,18 @@ impl TestContext {
                 )),
                 (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
                 (Err(std::env::VarError::NotPresent), Ok(_)) => {
-                    panic!("S3_TEST_SECOND_ACCESS_KEY required with S3_TEST_SECOND_SECRET_KEY");
+                    panic!("AWS_TEST_SECOND_ACCESS_KEY required with AWS_TEST_SECOND_SECRET_KEY");
                 }
                 (Ok(_), Err(std::env::VarError::NotPresent)) => {
-                    panic!("S3_TEST_SECOND_SECRET_KEY required with S3_TEST_SECOND_ACCESS_KEY");
+                    panic!("AWS_TEST_SECOND_SECRET_KEY required with AWS_TEST_SECOND_ACCESS_KEY");
                 }
                 (Err(err), _) | (_, Err(err)) => {
                     panic!("read second same-account AWS test credentials: {err}");
                 }
             };
             let owner_root_client = match (
-                std::env::var("S3_TEST_OWNER_ROOT_ACCESS_KEY"),
-                std::env::var("S3_TEST_OWNER_ROOT_SECRET_KEY"),
+                std::env::var("AWS_TEST_OWNER_ROOT_ACCESS_KEY"),
+                std::env::var("AWS_TEST_OWNER_ROOT_SECRET_KEY"),
             ) {
                 (Ok(owner_root_access_key), Ok(owner_root_secret_key)) => Some(build_client(
                     &endpoint,
@@ -208,12 +208,12 @@ impl TestContext {
                 (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
                 (Err(std::env::VarError::NotPresent), Ok(_)) => {
                     panic!(
-                        "S3_TEST_OWNER_ROOT_ACCESS_KEY required with S3_TEST_OWNER_ROOT_SECRET_KEY"
+                        "AWS_TEST_OWNER_ROOT_ACCESS_KEY required with AWS_TEST_OWNER_ROOT_SECRET_KEY"
                     );
                 }
                 (Ok(_), Err(std::env::VarError::NotPresent)) => {
                     panic!(
-                        "S3_TEST_OWNER_ROOT_SECRET_KEY required with S3_TEST_OWNER_ROOT_ACCESS_KEY"
+                        "AWS_TEST_OWNER_ROOT_SECRET_KEY required with AWS_TEST_OWNER_ROOT_ACCESS_KEY"
                     );
                 }
                 (Err(err), _) | (_, Err(err)) => {
@@ -331,7 +331,7 @@ impl TestContext {
     pub fn require_second_client(&self) -> &Client {
         self.second_client.as_ref().unwrap_or_else(|| {
             panic!(
-                "S3_TEST_SECOND_ACCESS_KEY/S3_TEST_SECOND_SECRET_KEY required for constrained same-account AWS tests"
+                "AWS_TEST_SECOND_ACCESS_KEY/AWS_TEST_SECOND_SECRET_KEY required for constrained same-account AWS tests"
             )
         })
     }
@@ -345,7 +345,7 @@ impl TestContext {
     pub fn require_owner_root_client(&self) -> &Client {
         self.owner_root_client.as_ref().unwrap_or_else(|| {
             panic!(
-                "S3_TEST_OWNER_ROOT_ACCESS_KEY/S3_TEST_OWNER_ROOT_SECRET_KEY required for privileged owner-root AWS tests"
+                "AWS_TEST_OWNER_ROOT_ACCESS_KEY/AWS_TEST_OWNER_ROOT_SECRET_KEY required for privileged owner-root AWS tests"
             )
         })
     }
@@ -468,7 +468,7 @@ async fn assert_distinct_external_s3_owners(
 ) {
     assert_ne!(
         account_id, alt_account_id,
-        "S3_TEST_ALT_ACCESS_KEY/S3_TEST_ALT_SECRET_KEY must belong to a different AWS account than S3_TEST_ACCESS_KEY/S3_TEST_SECRET_KEY"
+        "AWS_TEST_ALT_ACCESS_KEY/AWS_TEST_ALT_SECRET_KEY must belong to a different AWS account than AWS_TEST_ACCESS_KEY/AWS_TEST_SECRET_KEY"
     );
 
     let primary_bucket = unique_bucket();
@@ -531,7 +531,7 @@ async fn assert_distinct_external_s3_owners(
 
         assert_eq!(
             owner_root_id, primary_owner_id,
-            "S3_TEST_OWNER_ROOT_ACCESS_KEY/S3_TEST_OWNER_ROOT_SECRET_KEY must resolve to the same S3 canonical owner ID as the primary credentials"
+            "AWS_TEST_OWNER_ROOT_ACCESS_KEY/AWS_TEST_OWNER_ROOT_SECRET_KEY must resolve to the same S3 canonical owner ID as the primary credentials"
         );
     }
     let alt_owner_id = alt_client
@@ -551,7 +551,7 @@ async fn assert_distinct_external_s3_owners(
 
     assert_ne!(
         primary_owner_id, alt_owner_id,
-        "S3_TEST_ALT_ACCESS_KEY/S3_TEST_ALT_SECRET_KEY resolve to the same S3 canonical owner ID as the primary credentials; use alternate credentials from a different AWS account"
+        "AWS_TEST_ALT_ACCESS_KEY/AWS_TEST_ALT_SECRET_KEY resolve to the same S3 canonical owner ID as the primary credentials; use alternate credentials from a different AWS account"
     );
 }
 

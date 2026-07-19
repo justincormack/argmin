@@ -119,10 +119,10 @@ async fn same_account_exact_principal(root_client: &aws_sdk_s3::Client) -> Strin
     if std::env::var_os("S3_TEST_ENDPOINT").is_none() {
         return format!("arn:aws:iam::{}:user/limited", CTX.account_id());
     }
-    if let Ok(principal) = std::env::var("S3_TEST_SECOND_PRINCIPAL") {
+    if let Ok(principal) = std::env::var("AWS_TEST_SECOND_PRINCIPAL") {
         assert!(
             principal.starts_with("arn:aws:iam::"),
-            "S3_TEST_SECOND_PRINCIPAL must be an IAM ARN"
+            "AWS_TEST_SECOND_PRINCIPAL must be an IAM ARN"
         );
         return principal;
     }

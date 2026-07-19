@@ -1,0 +1,13 @@
+[package]
+name = "sts-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+s3-tests = { path = "../s3-tests" }
+auth = { path = "../auth" }
+aws-smithy-types = "1"
+ring = "0.17"
+serde_json = "1"
+url = "2.5.8"

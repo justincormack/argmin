@@ -45,7 +45,8 @@ non-confidential deployment mode.
   storage node heartbeat is treated as a statement from a trusted node process
   about its locally verified durable PG state, not as an arbitrary public
   network input.
-- **Developer boundary:** Test utilities (`crates/s3-tests`, `test-util`) and build scripts are not part of production runtime.
+- **Developer boundary:** Test utilities (`crates/s3-tests`, `crates/sts-tests`,
+  `test-util`) and build scripts are not part of production runtime.
 
 ### Assumptions
 - Host OS and filesystem permissions are trusted; unprivileged local users cannot modify `ARGMIN_DATA_DIR` contents.

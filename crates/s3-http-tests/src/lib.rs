@@ -34,12 +34,12 @@ pub struct HttpTestContext {
 impl HttpTestContext {
     async fn setup() -> Self {
         if let Some(endpoint) = external_http_endpoint() {
-            let access_key = std::env::var("S3_TEST_ACCESS_KEY")
-                .expect("S3_TEST_ACCESS_KEY required for external s3-http-tests runs");
-            let secret_key = std::env::var("S3_TEST_SECRET_KEY")
-                .expect("S3_TEST_SECRET_KEY required for external s3-http-tests runs");
+            let access_key = std::env::var("AWS_TEST_ACCESS_KEY")
+                .expect("AWS_TEST_ACCESS_KEY required for external s3-http-tests runs");
+            let secret_key = std::env::var("AWS_TEST_SECRET_KEY")
+                .expect("AWS_TEST_SECRET_KEY required for external s3-http-tests runs");
             let region =
-                std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+                std::env::var("AWS_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
             let client = build_client_with_ca(&endpoint, &access_key, &secret_key, &region, None);
             Self {
                 client,

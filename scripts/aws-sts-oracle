@@ -23,6 +23,8 @@ Options:
   --endpoint URL    Override the regional STS endpoint
   --s3-control-endpoint URL
                      Override the regional S3 Control endpoint
+  --timeout-secs SECS
+                     Override the shared HTTP timeout (default: TEST_S3_TIMEOUT_SECS or 120)
   --dotenv PATH     Read AWS variables from a different env file
   -h, --help        Show this help
 
@@ -47,6 +49,7 @@ expiry_collision=false
 region=""
 endpoint=""
 s3_control_endpoint=""
+timeout_secs=""
 dotenv_path="$ROOT/.env"
 
 while (($#)); do
@@ -83,6 +86,11 @@ while (($#)); do
             require_https_endpoint "S3 Control" "$s3_control_endpoint"
             shift 2
             ;;
+        --timeout-secs)
+            [[ $# -ge 2 ]] || external_s3_test_die "--timeout-secs requires a value"
+            timeout_secs="$2"
+            shift 2
+            ;;
         --dotenv)
             [[ $# -ge 2 ]] || external_s3_test_die "--dotenv requires a value"
             dotenv_path="$2"
@@ -110,20 +118,21 @@ if [[ "$cross_account" == true ]]; then
 fi
 
 region="${region:-${TEST_S3_REGION:-us-east-1}}"
+timeout_secs="${timeout_secs:-${TEST_S3_TIMEOUT_SECS:-120}}"
 endpoint="${endpoint:-https://sts.${region}.amazonaws.com}"
 endpoint="${endpoint%/}"
-s3_control_endpoint="${s3_control_endpoint:-${TEST_AWS_S3_CONTROL_ENDPOINT:-https://${TEST_AWS_PRIMARY_ACCOUNT_ID}.s3-control.${region}.amazonaws.com}}"
+s3_control_endpoint="${s3_control_endpoint:-${TEST_S3_CONTROL_ENDPOINT:-https://${TEST_AWS_PRIMARY_ACCOUNT_ID}.s3-control.${region}.amazonaws.com}}"
 s3_control_endpoint="${s3_control_endpoint%/}"
 require_https_endpoint STS "$endpoint"
 require_https_endpoint "S3 Control" "$s3_control_endpoint"
 
-export S3_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY"
-export S3_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
-export S3_TEST_ACCOUNT_ID="$TEST_AWS_PRIMARY_ACCOUNT_ID"
-export S3_TEST_REGION="$region"
-export S3_TEST_STS_ENDPOINT="$endpoint"
-export S3_TEST_S3_CONTROL_ENDPOINT="$s3_control_endpoint"
-export S3_TEST_TIMEOUT_SECS="${TEST_S3_TIMEOUT_SECS:-120}"
+export AWS_TEST_ACCESS_KEY="$TEST_AWS_PRIMARY_ACCESS_KEY"
+export AWS_TEST_SECRET_KEY="$TEST_AWS_PRIMARY_SECRET_KEY"
+export AWS_TEST_ACCOUNT_ID="$TEST_AWS_PRIMARY_ACCOUNT_ID"
+export AWS_TEST_REGION="$region"
+export STS_TEST_ENDPOINT="$endpoint"
+export S3_CONTROL_TEST_ENDPOINT="$s3_control_endpoint"
+export S3_TEST_TIMEOUT_SECS="$timeout_secs"
 
 aws_with_optional_session_credentials() {
     local access_key="$1"
@@ -178,25 +187,25 @@ aws_with_session_credentials() {
 
 aws_chaining_source() {
     aws_with_session_credentials \
-        "$S3_TEST_STS_CHAIN_ACCESS_KEY" \
-        "$S3_TEST_STS_CHAIN_SECRET_KEY" \
-        "$S3_TEST_STS_CHAIN_SESSION_TOKEN" \
+        "$STS_TEST_CHAIN_ACCESS_KEY" \
+        "$STS_TEST_CHAIN_SECRET_KEY" \
+        "$STS_TEST_CHAIN_SESSION_TOKEN" \
         "$@"
 }
 
 aws_source_identity_session() {
     aws_with_session_credentials \
-        "$S3_TEST_STS_SOURCE_IDENTITY_ACCESS_KEY" \
-        "$S3_TEST_STS_SOURCE_IDENTITY_SECRET_KEY" \
-        "$S3_TEST_STS_SOURCE_IDENTITY_SESSION_TOKEN" \
+        "$STS_TEST_SOURCE_IDENTITY_ACCESS_KEY" \
+        "$STS_TEST_SOURCE_IDENTITY_SECRET_KEY" \
+        "$STS_TEST_SOURCE_IDENTITY_SESSION_TOKEN" \
         "$@"
 }
 
 aws_deleted_role_session() {
     aws_with_session_credentials \
-        "$S3_TEST_STS_DELETED_ROLE_ACCESS_KEY" \
-        "$S3_TEST_STS_DELETED_ROLE_SECRET_KEY" \
-        "$S3_TEST_STS_DELETED_ROLE_SESSION_TOKEN" \
+        "$STS_TEST_DELETED_ROLE_ACCESS_KEY" \
+        "$STS_TEST_DELETED_ROLE_SECRET_KEY" \
+        "$STS_TEST_DELETED_ROLE_SESSION_TOKEN" \
         "$@"
 }
 
@@ -410,11 +419,11 @@ wait_for_streaming_bucket_policy_success() {
     : >"$empty_body"
     for ((attempt = 1; attempt <= 15; attempt++)); do
         if aws_with_session_credentials \
-            "$S3_TEST_STS_RECREATED_ROLE_ACCESS_KEY" \
-            "$S3_TEST_STS_RECREATED_ROLE_SECRET_KEY" \
-            "$S3_TEST_STS_RECREATED_ROLE_SESSION_TOKEN" \
+            "$STS_TEST_RECREATED_ROLE_ACCESS_KEY" \
+            "$STS_TEST_RECREATED_ROLE_SECRET_KEY" \
+            "$STS_TEST_RECREATED_ROLE_SESSION_TOKEN" \
             s3api put-object \
-            --bucket "$S3_TEST_STS_POST_BUCKET" \
+            --bucket "$STS_TEST_POST_BUCKET" \
             --key streaming-policy-convergence \
             --body "$empty_body" >/dev/null 2>"$error_file"; then
             ready=true
@@ -448,11 +457,11 @@ wait_for_session_context_bucket_policy_success() {
         local all_succeeded=true
         for key in "${keys[@]}"; do
             if ! aws_with_session_credentials \
-                "$S3_TEST_STS_RECREATED_ROLE_ACCESS_KEY" \
-                "$S3_TEST_STS_RECREATED_ROLE_SECRET_KEY" \
-                "$S3_TEST_STS_RECREATED_ROLE_SESSION_TOKEN" \
+                "$STS_TEST_RECREATED_ROLE_ACCESS_KEY" \
+                "$STS_TEST_RECREATED_ROLE_SECRET_KEY" \
+                "$STS_TEST_RECREATED_ROLE_SESSION_TOKEN" \
                 s3api put-object \
-                --bucket "$S3_TEST_STS_POST_BUCKET" \
+                --bucket "$STS_TEST_POST_BUCKET" \
                 --key "$key" \
                 --body "$empty_body" >/dev/null 2>"$error_file"; then
                 all_succeeded=false
@@ -683,7 +692,7 @@ wait_for_role_policy_session_s3_result() {
             "$secret_key" \
             "$session_token" \
             s3api put-object \
-            --bucket "$S3_TEST_STS_POST_BUCKET" \
+            --bucket "$STS_TEST_POST_BUCKET" \
             --key "$key" \
             --body "$empty_body" >/dev/null 2>"$error_file"; then
             if [[ "$expected" == success ]]; then
@@ -740,7 +749,7 @@ issue_converged_role_policy_session() {
             "$secret_key" \
             "$session_token" \
             s3api put-object \
-            --bucket "$S3_TEST_STS_POST_BUCKET" \
+            --bucket "$STS_TEST_POST_BUCKET" \
             --key "$key" \
             --body "$empty_body" >/dev/null 2>"$error_file"; then
             if [[ "$expected" == success ]]; then
@@ -806,43 +815,43 @@ create_role_policy_mutation_fixture() {
     local trust_policy="$4"
     local allow_policy boundary_delete_error deny_policy forbidden_policy_error observed_policy post_session pre_session
 
-    export S3_TEST_STS_POLICY_MUTATION_ROLE_NAME="policy-mutation-${role_suffix}"
-    export S3_TEST_STS_POLICY_MUTATION_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_POLICY_MUTATION_ROLE_NAME}"
-    export S3_TEST_STS_POLICY_MUTATION_POLICY_NAME="put-object-mutation"
-    export S3_TEST_STS_POLICY_MUTATION_BOUNDARY_ARN="arn:aws:iam::${primary_account}:policy/argmin-s3-tests/sts-oracle-role-boundary"
-    export S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_NAME="policy-before-mutation"
-    export S3_TEST_STS_POLICY_MUTATION_POST_SESSION_NAME="policy-after-mutation"
+    export STS_TEST_POLICY_MUTATION_ROLE_NAME="policy-mutation-${role_suffix}"
+    export STS_TEST_POLICY_MUTATION_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_POLICY_MUTATION_ROLE_NAME}"
+    export STS_TEST_POLICY_MUTATION_POLICY_NAME="put-object-mutation"
+    export STS_TEST_POLICY_MUTATION_BOUNDARY_ARN="arn:aws:iam::${primary_account}:policy/argmin-s3-tests/sts-oracle-role-boundary"
+    export STS_TEST_POLICY_MUTATION_PRE_SESSION_NAME="policy-before-mutation"
+    export STS_TEST_POLICY_MUTATION_POST_SESSION_NAME="policy-after-mutation"
 
     assert_identity_decision \
         same-account-policy-mutation \
         aws_primary \
         "$primary_arn" \
-        "$S3_TEST_STS_POLICY_MUTATION_ROLE_ARN" \
+        "$STS_TEST_POLICY_MUTATION_ROLE_ARN" \
         implicitDeny
     create_scoped_role \
-        "$S3_TEST_STS_POLICY_MUTATION_ROLE_NAME" \
+        "$STS_TEST_POLICY_MUTATION_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_policy" \
-        "$S3_TEST_STS_POLICY_MUTATION_ROLE_ARN" \
+        "$STS_TEST_POLICY_MUTATION_ROLE_ARN" \
         "" \
         false \
-        "$S3_TEST_STS_POLICY_MUTATION_BOUNDARY_ARN"
+        "$STS_TEST_POLICY_MUTATION_BOUNDARY_ARN"
     [[ "$(aws_primary iam get-role \
-        --role-name "$S3_TEST_STS_POLICY_MUTATION_ROLE_NAME" \
+        --role-name "$STS_TEST_POLICY_MUTATION_ROLE_NAME" \
         --query 'Role.PermissionsBoundary.PermissionsBoundaryArn' \
-        --output text)" == "$S3_TEST_STS_POLICY_MUTATION_BOUNDARY_ARN" ]] || \
+        --output text)" == "$STS_TEST_POLICY_MUTATION_BOUNDARY_ARN" ]] || \
         external_s3_test_die "policy-mutation role does not have the required permissions boundary"
 
     allow_policy="$tmpdir/role-policy-mutation-allow.json"
     deny_policy="$tmpdir/role-policy-mutation-deny.json"
     jq -n \
-        --arg resource "arn:aws:s3:::${S3_TEST_STS_POST_BUCKET}/role-policy-mutation-*" \
+        --arg resource "arn:aws:s3:::${STS_TEST_POST_BUCKET}/role-policy-mutation-*" \
         '{
             Version: "2012-10-17",
             Statement: [{Effect: "Allow", Action: "s3:PutObject", Resource: $resource}]
         }' >"$allow_policy"
     jq -n \
-        --arg resource "arn:aws:s3:::${S3_TEST_STS_POST_BUCKET}/role-policy-mutation-*" \
+        --arg resource "arn:aws:s3:::${STS_TEST_POST_BUCKET}/role-policy-mutation-*" \
         '{
             Version: "2012-10-17",
             Statement: [{Effect: "Deny", Action: "s3:PutObject", Resource: $resource}]
@@ -850,7 +859,7 @@ create_role_policy_mutation_fixture() {
 
     forbidden_policy_error="$tmpdir/role-policy-mutation-forbidden-target.err"
     if aws_primary iam put-role-policy \
-        --role-name "$S3_TEST_STS_ROLE_NAME" \
+        --role-name "$STS_TEST_ROLE_NAME" \
         --policy-name forbidden-mutation \
         --policy-document "file://${deny_policy}" \
         >/dev/null 2>"$forbidden_policy_error"; then
@@ -868,7 +877,7 @@ create_role_policy_mutation_fixture() {
 
     boundary_delete_error="$tmpdir/role-policy-mutation-delete-boundary.err"
     if aws_primary iam delete-role-permissions-boundary \
-        --role-name "$S3_TEST_STS_POLICY_MUTATION_ROLE_NAME" \
+        --role-name "$STS_TEST_POLICY_MUTATION_ROLE_NAME" \
         >/dev/null 2>"$boundary_delete_error"; then
         external_s3_test_die \
             "test user unexpectedly removed the mutation role permissions boundary"
@@ -883,13 +892,13 @@ create_role_policy_mutation_fixture() {
     echo "same-account-policy-mutation-boundary-delete-access-denied: ok"
 
     aws_primary iam put-role-policy \
-        --role-name "$S3_TEST_STS_POLICY_MUTATION_ROLE_NAME" \
-        --policy-name "$S3_TEST_STS_POLICY_MUTATION_POLICY_NAME" \
+        --role-name "$STS_TEST_POLICY_MUTATION_ROLE_NAME" \
+        --policy-name "$STS_TEST_POLICY_MUTATION_POLICY_NAME" \
         --policy-document "file://${allow_policy}"
     observed_policy="$tmpdir/role-policy-mutation-observed.json"
     aws_primary iam get-role-policy \
-        --role-name "$S3_TEST_STS_POLICY_MUTATION_ROLE_NAME" \
-        --policy-name "$S3_TEST_STS_POLICY_MUTATION_POLICY_NAME" \
+        --role-name "$STS_TEST_POLICY_MUTATION_ROLE_NAME" \
+        --policy-name "$STS_TEST_POLICY_MUTATION_POLICY_NAME" \
         --query PolicyDocument \
         --output json >"$observed_policy"
     [[ "$(jq -S -c . "$observed_policy")" == "$(jq -S -c . "$allow_policy")" ]] || \
@@ -898,40 +907,40 @@ create_role_policy_mutation_fixture() {
     wait_for_assume_role_success \
         same-account-policy-mutation-role \
         aws_primary \
-        "$S3_TEST_STS_POLICY_MUTATION_ROLE_ARN"
+        "$STS_TEST_POLICY_MUTATION_ROLE_ARN"
     issue_converged_role_policy_session \
         same-account-policy-mutation-before \
-        "$S3_TEST_STS_POLICY_MUTATION_ROLE_ARN" \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_NAME" \
+        "$STS_TEST_POLICY_MUTATION_ROLE_ARN" \
+        "$STS_TEST_POLICY_MUTATION_PRE_SESSION_NAME" \
         role-policy-mutation-before-control \
         success
     pre_session="$converged_role_policy_session"
-    export S3_TEST_STS_POLICY_MUTATION_PRE_ACCESS_KEY
-    export S3_TEST_STS_POLICY_MUTATION_PRE_SECRET_KEY
-    export S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_TOKEN
-    export S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_ARN
-    S3_TEST_STS_POLICY_MUTATION_PRE_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$pre_session")"
-    S3_TEST_STS_POLICY_MUTATION_PRE_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$pre_session")"
-    S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$pre_session")"
-    S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_ARN="$(jq -er '.AssumedRoleUser.Arn' <<<"$pre_session")"
-    [[ "$S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_ARN" == \
-        "arn:aws:sts::${primary_account}:assumed-role/${S3_TEST_STS_POLICY_MUTATION_ROLE_NAME}/${S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_NAME}" ]] || \
+    export STS_TEST_POLICY_MUTATION_PRE_ACCESS_KEY
+    export STS_TEST_POLICY_MUTATION_PRE_SECRET_KEY
+    export STS_TEST_POLICY_MUTATION_PRE_SESSION_TOKEN
+    export STS_TEST_POLICY_MUTATION_PRE_SESSION_ARN
+    STS_TEST_POLICY_MUTATION_PRE_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$pre_session")"
+    STS_TEST_POLICY_MUTATION_PRE_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$pre_session")"
+    STS_TEST_POLICY_MUTATION_PRE_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$pre_session")"
+    STS_TEST_POLICY_MUTATION_PRE_SESSION_ARN="$(jq -er '.AssumedRoleUser.Arn' <<<"$pre_session")"
+    [[ "$STS_TEST_POLICY_MUTATION_PRE_SESSION_ARN" == \
+        "arn:aws:sts::${primary_account}:assumed-role/${STS_TEST_POLICY_MUTATION_ROLE_NAME}/${STS_TEST_POLICY_MUTATION_PRE_SESSION_NAME}" ]] || \
         external_s3_test_die "pre-mutation role session has an unexpected ARN"
     wait_for_role_policy_session_s3_result \
         same-account-policy-mutation-before-session \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_ACCESS_KEY" \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_SECRET_KEY" \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_TOKEN" \
+        "$STS_TEST_POLICY_MUTATION_PRE_ACCESS_KEY" \
+        "$STS_TEST_POLICY_MUTATION_PRE_SECRET_KEY" \
+        "$STS_TEST_POLICY_MUTATION_PRE_SESSION_TOKEN" \
         role-policy-mutation-before-session-control \
         success
 
     aws_primary iam put-role-policy \
-        --role-name "$S3_TEST_STS_POLICY_MUTATION_ROLE_NAME" \
-        --policy-name "$S3_TEST_STS_POLICY_MUTATION_POLICY_NAME" \
+        --role-name "$STS_TEST_POLICY_MUTATION_ROLE_NAME" \
+        --policy-name "$STS_TEST_POLICY_MUTATION_POLICY_NAME" \
         --policy-document "file://${deny_policy}"
     aws_primary iam get-role-policy \
-        --role-name "$S3_TEST_STS_POLICY_MUTATION_ROLE_NAME" \
-        --policy-name "$S3_TEST_STS_POLICY_MUTATION_POLICY_NAME" \
+        --role-name "$STS_TEST_POLICY_MUTATION_ROLE_NAME" \
+        --policy-name "$STS_TEST_POLICY_MUTATION_POLICY_NAME" \
         --query PolicyDocument \
         --output json >"$observed_policy"
     [[ "$(jq -S -c . "$observed_policy")" == "$(jq -S -c . "$deny_policy")" ]] || \
@@ -939,40 +948,40 @@ create_role_policy_mutation_fixture() {
 
     issue_converged_role_policy_session \
         same-account-policy-mutation-after \
-        "$S3_TEST_STS_POLICY_MUTATION_ROLE_ARN" \
-        "$S3_TEST_STS_POLICY_MUTATION_POST_SESSION_NAME" \
+        "$STS_TEST_POLICY_MUTATION_ROLE_ARN" \
+        "$STS_TEST_POLICY_MUTATION_POST_SESSION_NAME" \
         role-policy-mutation-after-control \
         explicit-deny
     post_session="$converged_role_policy_session"
-    export S3_TEST_STS_POLICY_MUTATION_POST_ACCESS_KEY
-    export S3_TEST_STS_POLICY_MUTATION_POST_SECRET_KEY
-    export S3_TEST_STS_POLICY_MUTATION_POST_SESSION_TOKEN
-    export S3_TEST_STS_POLICY_MUTATION_POST_SESSION_ARN
-    S3_TEST_STS_POLICY_MUTATION_POST_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$post_session")"
-    S3_TEST_STS_POLICY_MUTATION_POST_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$post_session")"
-    S3_TEST_STS_POLICY_MUTATION_POST_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$post_session")"
-    S3_TEST_STS_POLICY_MUTATION_POST_SESSION_ARN="$(jq -er '.AssumedRoleUser.Arn' <<<"$post_session")"
-    [[ "$S3_TEST_STS_POLICY_MUTATION_POST_SESSION_ARN" == \
-        "arn:aws:sts::${primary_account}:assumed-role/${S3_TEST_STS_POLICY_MUTATION_ROLE_NAME}/${S3_TEST_STS_POLICY_MUTATION_POST_SESSION_NAME}" ]] || \
+    export STS_TEST_POLICY_MUTATION_POST_ACCESS_KEY
+    export STS_TEST_POLICY_MUTATION_POST_SECRET_KEY
+    export STS_TEST_POLICY_MUTATION_POST_SESSION_TOKEN
+    export STS_TEST_POLICY_MUTATION_POST_SESSION_ARN
+    STS_TEST_POLICY_MUTATION_POST_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$post_session")"
+    STS_TEST_POLICY_MUTATION_POST_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$post_session")"
+    STS_TEST_POLICY_MUTATION_POST_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$post_session")"
+    STS_TEST_POLICY_MUTATION_POST_SESSION_ARN="$(jq -er '.AssumedRoleUser.Arn' <<<"$post_session")"
+    [[ "$STS_TEST_POLICY_MUTATION_POST_SESSION_ARN" == \
+        "arn:aws:sts::${primary_account}:assumed-role/${STS_TEST_POLICY_MUTATION_ROLE_NAME}/${STS_TEST_POLICY_MUTATION_POST_SESSION_NAME}" ]] || \
         external_s3_test_die "post-mutation role session has an unexpected ARN"
 
     wait_for_role_policy_session_s3_result \
         same-account-policy-mutation-after-session \
-        "$S3_TEST_STS_POLICY_MUTATION_POST_ACCESS_KEY" \
-        "$S3_TEST_STS_POLICY_MUTATION_POST_SECRET_KEY" \
-        "$S3_TEST_STS_POLICY_MUTATION_POST_SESSION_TOKEN" \
+        "$STS_TEST_POLICY_MUTATION_POST_ACCESS_KEY" \
+        "$STS_TEST_POLICY_MUTATION_POST_SECRET_KEY" \
+        "$STS_TEST_POLICY_MUTATION_POST_SESSION_TOKEN" \
         role-policy-mutation-after-session-control \
         explicit-deny
     wait_for_role_policy_session_sts_success \
         same-account-policy-mutation-before-session-after-update \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_ACCESS_KEY" \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_SECRET_KEY" \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_TOKEN"
+        "$STS_TEST_POLICY_MUTATION_PRE_ACCESS_KEY" \
+        "$STS_TEST_POLICY_MUTATION_PRE_SECRET_KEY" \
+        "$STS_TEST_POLICY_MUTATION_PRE_SESSION_TOKEN"
     wait_for_role_policy_session_s3_result \
         same-account-policy-mutation-before-session-after-update \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_ACCESS_KEY" \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_SECRET_KEY" \
-        "$S3_TEST_STS_POLICY_MUTATION_PRE_SESSION_TOKEN" \
+        "$STS_TEST_POLICY_MUTATION_PRE_ACCESS_KEY" \
+        "$STS_TEST_POLICY_MUTATION_PRE_SECRET_KEY" \
+        "$STS_TEST_POLICY_MUTATION_PRE_SESSION_TOKEN" \
         role-policy-mutation-before-session-after-update-control \
         explicit-deny
 }
@@ -995,16 +1004,16 @@ create_assume_role_fixture() {
             "primary credential account $primary_account does not match TEST_AWS_PRIMARY_ACCOUNT_ID"
     [[ "$primary_arn" == "arn:aws:iam::${primary_account}:user/"* ]] || \
         external_s3_test_die "primary credentials do not identify an IAM user"
-    export S3_TEST_STS_PRIMARY_ARN="$primary_arn"
+    export STS_TEST_PRIMARY_ARN="$primary_arn"
 
     tmpdir="$(mktemp -d)"
     role_suffix="${tmpdir##*/}"
     role_suffix="${role_suffix#tmp.}"
     role_suffix="${role_suffix,,}"
-    export S3_TEST_STS_POST_BUCKET="claude-s3-sts-oracle-${role_suffix}"
+    export STS_TEST_POST_BUCKET="claude-s3-sts-oracle-${role_suffix}"
     local -a create_bucket_args=(
         s3api create-bucket
-        --bucket "$S3_TEST_STS_POST_BUCKET"
+        --bucket "$STS_TEST_POST_BUCKET"
     )
     if [[ "$region" != us-east-1 ]]; then
         create_bucket_args+=(
@@ -1012,7 +1021,7 @@ create_assume_role_fixture() {
         )
     fi
     aws_primary "${create_bucket_args[@]}" >/dev/null
-    created_bucket="$S3_TEST_STS_POST_BUCKET"
+    created_bucket="$STS_TEST_POST_BUCKET"
     aws_primary s3api wait bucket-exists --bucket "$created_bucket"
     echo "post-object-bucket-fixture: ok"
     aws_primary s3control tag-resource \
@@ -1023,35 +1032,35 @@ create_assume_role_fixture() {
         initial-tag-fixture \
         "$primary_account" \
         "arn:aws:s3:::${created_bucket}"
-    export S3_TEST_STS_ROLE_NAME="path-shape-${role_suffix}"
-    export S3_TEST_STS_ROLE_SESSION_NAME="path-shape-session"
-    export S3_TEST_STS_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_ROLE_NAME}"
-    export S3_TEST_STS_DEFAULT_MAX_ROLE_NAME="default-max-${role_suffix}"
-    export S3_TEST_STS_DEFAULT_MAX_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_DEFAULT_MAX_ROLE_NAME}"
-    export S3_TEST_STS_EXTERNAL_ID="argmin-sts-oracle-external-id"
-    export S3_TEST_STS_EXTERNAL_ID_ROLE_NAME="external-id-${role_suffix}"
-    export S3_TEST_STS_EXTERNAL_ID_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_EXTERNAL_ID_ROLE_NAME}"
-    export S3_TEST_STS_SOURCE_IDENTITY="argmin-sts-oracle-source"
-    export S3_TEST_STS_SOURCE_IDENTITY_ROLE_NAME="source-identity-${role_suffix}"
-    export S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_SOURCE_IDENTITY_ROLE_NAME}"
-    export S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_NAME="source-identity-condition-${role_suffix}"
-    export S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_NAME}"
-    export S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_NAME="source-identity-target-${role_suffix}"
-    export S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_NAME}"
-    export S3_TEST_STS_SOURCE_IDENTITY_SESSION_NAME="source-identity-source"
-    export S3_TEST_STS_SOURCE_IDENTITY_TARGET_SESSION_NAME="source-identity-target"
-    export S3_TEST_STS_CHAIN_SOURCE_SESSION_NAME="chaining-source"
-    export S3_TEST_STS_CHAIN_TARGET_SESSION_NAME="chaining-target"
-    export S3_TEST_STS_CHAIN_TARGET_ROLE_NAME="chain-target-${role_suffix}"
-    export S3_TEST_STS_CHAIN_TARGET_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_CHAIN_TARGET_ROLE_NAME}"
-    export S3_TEST_STS_DELETED_ROLE_NAME="deleted-role-${role_suffix}"
-    export S3_TEST_STS_DELETED_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_DELETED_ROLE_NAME}"
-    export S3_TEST_STS_DELETED_ROLE_SESSION_NAME="deleted-role-session"
-    export S3_TEST_STS_RECREATED_ROLE_SESSION_NAME="recreated-role-session"
+    export STS_TEST_ROLE_NAME="path-shape-${role_suffix}"
+    export STS_TEST_ROLE_SESSION_NAME="path-shape-session"
+    export STS_TEST_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_ROLE_NAME}"
+    export STS_TEST_DEFAULT_MAX_ROLE_NAME="default-max-${role_suffix}"
+    export STS_TEST_DEFAULT_MAX_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_DEFAULT_MAX_ROLE_NAME}"
+    export STS_TEST_EXTERNAL_ID="argmin-sts-oracle-external-id"
+    export STS_TEST_EXTERNAL_ID_ROLE_NAME="external-id-${role_suffix}"
+    export STS_TEST_EXTERNAL_ID_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_EXTERNAL_ID_ROLE_NAME}"
+    export STS_TEST_SOURCE_IDENTITY="argmin-sts-oracle-source"
+    export STS_TEST_SOURCE_IDENTITY_ROLE_NAME="source-identity-${role_suffix}"
+    export STS_TEST_SOURCE_IDENTITY_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_SOURCE_IDENTITY_ROLE_NAME}"
+    export STS_TEST_SOURCE_IDENTITY_CONDITION_ROLE_NAME="source-identity-condition-${role_suffix}"
+    export STS_TEST_SOURCE_IDENTITY_CONDITION_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_SOURCE_IDENTITY_CONDITION_ROLE_NAME}"
+    export STS_TEST_SOURCE_IDENTITY_TARGET_ROLE_NAME="source-identity-target-${role_suffix}"
+    export STS_TEST_SOURCE_IDENTITY_TARGET_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_SOURCE_IDENTITY_TARGET_ROLE_NAME}"
+    export STS_TEST_SOURCE_IDENTITY_SESSION_NAME="source-identity-source"
+    export STS_TEST_SOURCE_IDENTITY_TARGET_SESSION_NAME="source-identity-target"
+    export STS_TEST_CHAIN_SOURCE_SESSION_NAME="chaining-source"
+    export STS_TEST_CHAIN_TARGET_SESSION_NAME="chaining-target"
+    export STS_TEST_CHAIN_TARGET_ROLE_NAME="chain-target-${role_suffix}"
+    export STS_TEST_CHAIN_TARGET_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_CHAIN_TARGET_ROLE_NAME}"
+    export STS_TEST_DELETED_ROLE_NAME="deleted-role-${role_suffix}"
+    export STS_TEST_DELETED_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_DELETED_ROLE_NAME}"
+    export STS_TEST_DELETED_ROLE_SESSION_NAME="deleted-role-session"
+    export STS_TEST_RECREATED_ROLE_SESSION_NAME="recreated-role-session"
     if [[ "$expiry_collision" == true ]]; then
-        export S3_TEST_STS_EXPIRY_ROLE_NAME="expiry-role-${role_suffix}"
-        export S3_TEST_STS_EXPIRY_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${S3_TEST_STS_EXPIRY_ROLE_NAME}"
-        export S3_TEST_STS_EXPIRED_DELETED_ROLE_SESSION_NAME="expired-deleted-role-session"
+        export STS_TEST_EXPIRY_ROLE_NAME="expiry-role-${role_suffix}"
+        export STS_TEST_EXPIRY_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_EXPIRY_ROLE_NAME}"
+        export STS_TEST_EXPIRED_DELETED_ROLE_SESSION_NAME="expired-deleted-role-session"
     fi
 
     trust_policy="$tmpdir/trust-policy.json"
@@ -1068,13 +1077,13 @@ create_assume_role_fixture() {
     aws_primary iam simulate-principal-policy \
         --policy-source-arn "$primary_arn" \
         --action-names sts:AssumeRole \
-        --resource-arns "$S3_TEST_STS_ROLE_ARN" \
+        --resource-arns "$STS_TEST_ROLE_ARN" \
         --output json >"$identity_simulation"
     [[ "$(jq -er '.EvaluationResults | length' "$identity_simulation")" == 1 ]] || \
         external_s3_test_die "same-account identity-policy simulation returned an unexpected result count"
     [[ "$(jq -er '.EvaluationResults[0].EvalActionName' "$identity_simulation")" == "sts:AssumeRole" ]] || \
         external_s3_test_die "same-account identity-policy simulation returned an unexpected action"
-    [[ "$(jq -er '.EvaluationResults[0].EvalResourceName' "$identity_simulation")" == "$S3_TEST_STS_ROLE_ARN" ]] || \
+    [[ "$(jq -er '.EvaluationResults[0].EvalResourceName' "$identity_simulation")" == "$STS_TEST_ROLE_ARN" ]] || \
         external_s3_test_die "same-account identity-policy simulation returned an unexpected resource"
     identity_decision="$(jq -er '.EvaluationResults[0].EvalDecision' "$identity_simulation")"
     [[ "$identity_decision" == "implicitDeny" ]] || \
@@ -1084,7 +1093,7 @@ create_assume_role_fixture() {
 
     missing_role_error="$tmpdir/get-missing-role.err"
     if aws_primary iam get-role \
-        --role-name "$S3_TEST_STS_ROLE_NAME" \
+        --role-name "$STS_TEST_ROLE_NAME" \
         --query 'Role.Arn' \
         --output text >/dev/null 2>"$missing_role_error"; then
         external_s3_test_die \
@@ -1100,22 +1109,22 @@ create_assume_role_fixture() {
     echo "missing-path-role-get-access-denied: ok"
 
     create_scoped_role \
-        "$S3_TEST_STS_ROLE_NAME" \
+        "$STS_TEST_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_policy" \
-        "$S3_TEST_STS_ROLE_ARN" \
+        "$STS_TEST_ROLE_ARN" \
         43200
 
     assert_identity_decision \
         same-account-default-max \
         aws_primary \
         "$primary_arn" \
-        "$S3_TEST_STS_DEFAULT_MAX_ROLE_ARN" \
+        "$STS_TEST_DEFAULT_MAX_ROLE_ARN" \
         implicitDeny
     trust_default_max="$tmpdir/trust-default-max.json"
     jq -n \
         --arg primary_principal "$primary_arn" \
-        --arg source_role_principal "$S3_TEST_STS_ROLE_ARN" \
+        --arg source_role_principal "$STS_TEST_ROLE_ARN" \
         '{
             Version: "2012-10-17",
             Statement: [{
@@ -1125,14 +1134,14 @@ create_assume_role_fixture() {
             }]
         }' >"$trust_default_max"
     create_scoped_role \
-        "$S3_TEST_STS_DEFAULT_MAX_ROLE_NAME" \
+        "$STS_TEST_DEFAULT_MAX_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_default_max" \
-        "$S3_TEST_STS_DEFAULT_MAX_ROLE_ARN" \
+        "$STS_TEST_DEFAULT_MAX_ROLE_ARN" \
         "" \
         true
     default_max_duration="$(aws_primary iam get-role \
-        --role-name "$S3_TEST_STS_DEFAULT_MAX_ROLE_NAME" \
+        --role-name "$STS_TEST_DEFAULT_MAX_ROLE_NAME" \
         --query 'Role.MaxSessionDuration' \
         --output text)"
     [[ "$default_max_duration" == 3600 ]] || \
@@ -1144,12 +1153,12 @@ create_assume_role_fixture() {
         same-account-external-id \
         aws_primary \
         "$primary_arn" \
-        "$S3_TEST_STS_EXTERNAL_ID_ROLE_ARN" \
+        "$STS_TEST_EXTERNAL_ID_ROLE_ARN" \
         implicitDeny
     trust_external_id="$tmpdir/trust-external-id.json"
     jq -n \
         --arg principal "$primary_arn" \
-        --arg external_id "$S3_TEST_STS_EXTERNAL_ID" \
+        --arg external_id "$STS_TEST_EXTERNAL_ID" \
         '{
             Version: "2012-10-17",
             Statement: [{
@@ -1160,16 +1169,16 @@ create_assume_role_fixture() {
             }]
         }' >"$trust_external_id"
     create_scoped_role \
-        "$S3_TEST_STS_EXTERNAL_ID_ROLE_NAME" \
+        "$STS_TEST_EXTERNAL_ID_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_external_id" \
-        "$S3_TEST_STS_EXTERNAL_ID_ROLE_ARN"
+        "$STS_TEST_EXTERNAL_ID_ROLE_ARN"
 
     assert_identity_decision \
         same-account-source-identity \
         aws_primary \
         "$primary_arn" \
-        "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
+        "$STS_TEST_SOURCE_IDENTITY_ROLE_ARN" \
         implicitDeny
     trust_source_identity="$tmpdir/trust-source-identity.json"
     jq -n --arg principal "$primary_arn" '{
@@ -1181,21 +1190,21 @@ create_assume_role_fixture() {
         }]
     }' >"$trust_source_identity"
     create_scoped_role \
-        "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_NAME" \
+        "$STS_TEST_SOURCE_IDENTITY_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_source_identity" \
-        "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN"
+        "$STS_TEST_SOURCE_IDENTITY_ROLE_ARN"
 
     assert_identity_decision \
         same-account-source-identity-condition \
         aws_primary \
         "$primary_arn" \
-        "$S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN" \
+        "$STS_TEST_SOURCE_IDENTITY_CONDITION_ROLE_ARN" \
         implicitDeny
     trust_source_identity_condition="$tmpdir/trust-source-identity-condition.json"
     jq -n \
         --arg principal "$primary_arn" \
-        --arg source_identity "$S3_TEST_STS_SOURCE_IDENTITY" \
+        --arg source_identity "$STS_TEST_SOURCE_IDENTITY" \
         '{
             Version: "2012-10-17",
             Statement: [{
@@ -1206,15 +1215,15 @@ create_assume_role_fixture() {
             }]
         }' >"$trust_source_identity_condition"
     create_scoped_role \
-        "$S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_NAME" \
+        "$STS_TEST_SOURCE_IDENTITY_CONDITION_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_source_identity_condition" \
-        "$S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN"
+        "$STS_TEST_SOURCE_IDENTITY_CONDITION_ROLE_ARN"
 
     trust_source_identity_target="$tmpdir/trust-source-identity-target.json"
     jq -n \
-        --arg principal "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
-        --arg source_identity "$S3_TEST_STS_SOURCE_IDENTITY" \
+        --arg principal "$STS_TEST_SOURCE_IDENTITY_ROLE_ARN" \
+        --arg source_identity "$STS_TEST_SOURCE_IDENTITY" \
         '{
             Version: "2012-10-17",
             Statement: [{
@@ -1225,18 +1234,18 @@ create_assume_role_fixture() {
             }]
         }' >"$trust_source_identity_target"
     create_scoped_role \
-        "$S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_NAME" \
+        "$STS_TEST_SOURCE_IDENTITY_TARGET_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_source_identity_target" \
-        "$S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_ARN" \
+        "$STS_TEST_SOURCE_IDENTITY_TARGET_ROLE_ARN" \
         "" \
         true
 
     trust_chain_source="$tmpdir/trust-chain-source.json"
     trust_chain_source_with_set="$tmpdir/trust-chain-source-with-set.json"
     jq -n \
-        --arg principal "$S3_TEST_STS_ROLE_ARN" \
-        --arg source_identity_principal "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
+        --arg principal "$STS_TEST_ROLE_ARN" \
+        --arg source_identity_principal "$STS_TEST_SOURCE_IDENTITY_ROLE_ARN" \
         '{
         Version: "2012-10-17",
         Statement: [{
@@ -1246,8 +1255,8 @@ create_assume_role_fixture() {
         }]
     }' >"$trust_chain_source"
     jq -n \
-        --arg principal "$S3_TEST_STS_ROLE_ARN" \
-        --arg source_identity_principal "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
+        --arg principal "$STS_TEST_ROLE_ARN" \
+        --arg source_identity_principal "$STS_TEST_SOURCE_IDENTITY_ROLE_ARN" \
         '{
         Version: "2012-10-17",
         Statement: [{
@@ -1260,16 +1269,16 @@ create_assume_role_fixture() {
         same-account-chain-target \
         aws_primary \
         "$primary_arn" \
-        "$S3_TEST_STS_CHAIN_TARGET_ROLE_ARN" \
+        "$STS_TEST_CHAIN_TARGET_ROLE_ARN" \
         implicitDeny
     create_scoped_role \
-        "$S3_TEST_STS_CHAIN_TARGET_ROLE_NAME" \
+        "$STS_TEST_CHAIN_TARGET_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_chain_source_with_set" \
-        "$S3_TEST_STS_CHAIN_TARGET_ROLE_ARN" \
+        "$STS_TEST_CHAIN_TARGET_ROLE_ARN" \
         43200
     chain_target_max_duration="$(aws_primary iam get-role \
-        --role-name "$S3_TEST_STS_CHAIN_TARGET_ROLE_NAME" \
+        --role-name "$STS_TEST_CHAIN_TARGET_ROLE_NAME" \
         --query 'Role.MaxSessionDuration' \
         --output text)"
     [[ "$chain_target_max_duration" == 43200 ]] || \
@@ -1281,15 +1290,15 @@ create_assume_role_fixture() {
         same-account-deleted-role \
         aws_primary \
         "$primary_arn" \
-        "$S3_TEST_STS_DELETED_ROLE_ARN" \
+        "$STS_TEST_DELETED_ROLE_ARN" \
         implicitDeny
     create_scoped_role \
-        "$S3_TEST_STS_DELETED_ROLE_NAME" \
+        "$STS_TEST_DELETED_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_policy" \
-        "$S3_TEST_STS_DELETED_ROLE_ARN"
+        "$STS_TEST_DELETED_ROLE_ARN"
     deleted_role_stable_id="$(aws_primary iam get-role \
-        --role-name "$S3_TEST_STS_DELETED_ROLE_NAME" \
+        --role-name "$STS_TEST_DELETED_ROLE_NAME" \
         --query 'Role.RoleId' \
         --output text)"
 
@@ -1298,82 +1307,82 @@ create_assume_role_fixture() {
             same-account-expiry-role \
             aws_primary \
             "$primary_arn" \
-            "$S3_TEST_STS_EXPIRY_ROLE_ARN" \
+            "$STS_TEST_EXPIRY_ROLE_ARN" \
             implicitDeny
         create_scoped_role \
-            "$S3_TEST_STS_EXPIRY_ROLE_NAME" \
+            "$STS_TEST_EXPIRY_ROLE_NAME" \
             /argmin-sts-oracle/same-account/ \
             "$trust_policy" \
-            "$S3_TEST_STS_EXPIRY_ROLE_ARN"
+            "$STS_TEST_EXPIRY_ROLE_ARN"
         wait_for_assume_role_success \
             same-account-expiry-role \
             aws_primary \
-            "$S3_TEST_STS_EXPIRY_ROLE_ARN"
+            "$STS_TEST_EXPIRY_ROLE_ARN"
 
         expired_role_session="$(aws_primary sts assume-role \
-            --role-arn "$S3_TEST_STS_EXPIRY_ROLE_ARN" \
-            --role-session-name "$S3_TEST_STS_EXPIRED_DELETED_ROLE_SESSION_NAME" \
+            --role-arn "$STS_TEST_EXPIRY_ROLE_ARN" \
+            --role-session-name "$STS_TEST_EXPIRED_DELETED_ROLE_SESSION_NAME" \
             --duration-seconds 900 \
             --output json)"
-        export S3_TEST_STS_EXPIRED_DELETED_ACCESS_KEY
-        export S3_TEST_STS_EXPIRED_DELETED_SECRET_KEY
-        export S3_TEST_STS_EXPIRED_DELETED_SESSION_TOKEN
-        S3_TEST_STS_EXPIRED_DELETED_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$expired_role_session")"
-        S3_TEST_STS_EXPIRED_DELETED_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$expired_role_session")"
-        S3_TEST_STS_EXPIRED_DELETED_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$expired_role_session")"
+        export STS_TEST_EXPIRED_DELETED_ACCESS_KEY
+        export STS_TEST_EXPIRED_DELETED_SECRET_KEY
+        export STS_TEST_EXPIRED_DELETED_SESSION_TOKEN
+        STS_TEST_EXPIRED_DELETED_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$expired_role_session")"
+        STS_TEST_EXPIRED_DELETED_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$expired_role_session")"
+        STS_TEST_EXPIRED_DELETED_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$expired_role_session")"
 
         expiry_liveness_session="$(aws_primary sts assume-role \
-            --role-arn "$S3_TEST_STS_EXPIRY_ROLE_ARN" \
+            --role-arn "$STS_TEST_EXPIRY_ROLE_ARN" \
             --role-session-name expiry-liveness-control \
             --duration-seconds 3600 \
             --output json)"
-        export S3_TEST_STS_EXPIRY_LIVENESS_ACCESS_KEY
-        export S3_TEST_STS_EXPIRY_LIVENESS_SECRET_KEY
-        export S3_TEST_STS_EXPIRY_LIVENESS_SESSION_TOKEN
-        S3_TEST_STS_EXPIRY_LIVENESS_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$expiry_liveness_session")"
-        S3_TEST_STS_EXPIRY_LIVENESS_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$expiry_liveness_session")"
-        S3_TEST_STS_EXPIRY_LIVENESS_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$expiry_liveness_session")"
-        expiry_liveness_access_key="$S3_TEST_STS_EXPIRY_LIVENESS_ACCESS_KEY"
-        expiry_liveness_secret_key="$S3_TEST_STS_EXPIRY_LIVENESS_SECRET_KEY"
-        expiry_liveness_session_token="$S3_TEST_STS_EXPIRY_LIVENESS_SESSION_TOKEN"
+        export STS_TEST_EXPIRY_LIVENESS_ACCESS_KEY
+        export STS_TEST_EXPIRY_LIVENESS_SECRET_KEY
+        export STS_TEST_EXPIRY_LIVENESS_SESSION_TOKEN
+        STS_TEST_EXPIRY_LIVENESS_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$expiry_liveness_session")"
+        STS_TEST_EXPIRY_LIVENESS_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$expiry_liveness_session")"
+        STS_TEST_EXPIRY_LIVENESS_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$expiry_liveness_session")"
+        expiry_liveness_access_key="$STS_TEST_EXPIRY_LIVENESS_ACCESS_KEY"
+        expiry_liveness_secret_key="$STS_TEST_EXPIRY_LIVENESS_SECRET_KEY"
+        expiry_liveness_session_token="$STS_TEST_EXPIRY_LIVENESS_SESSION_TOKEN"
         echo "same-account-expiry-sessions-issued: ok"
     fi
 
     wait_for_assume_role_success \
         same-account-role \
         aws_primary \
-        "$S3_TEST_STS_ROLE_ARN"
+        "$STS_TEST_ROLE_ARN"
     wait_for_assume_role_success \
         same-account-default-max-role \
         aws_primary \
-        "$S3_TEST_STS_DEFAULT_MAX_ROLE_ARN"
+        "$STS_TEST_DEFAULT_MAX_ROLE_ARN"
     wait_for_external_id_assume_role_success \
         same-account-external-id-role \
-        "$S3_TEST_STS_EXTERNAL_ID_ROLE_ARN" \
-        "$S3_TEST_STS_EXTERNAL_ID"
+        "$STS_TEST_EXTERNAL_ID_ROLE_ARN" \
+        "$STS_TEST_EXTERNAL_ID"
     wait_for_source_identity_assume_role_success \
         same-account-source-identity-role \
-        "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
-        "$S3_TEST_STS_SOURCE_IDENTITY"
+        "$STS_TEST_SOURCE_IDENTITY_ROLE_ARN" \
+        "$STS_TEST_SOURCE_IDENTITY"
     wait_for_source_identity_assume_role_success \
         same-account-source-identity-condition-role \
-        "$S3_TEST_STS_SOURCE_IDENTITY_CONDITION_ROLE_ARN" \
-        "$S3_TEST_STS_SOURCE_IDENTITY"
+        "$STS_TEST_SOURCE_IDENTITY_CONDITION_ROLE_ARN" \
+        "$STS_TEST_SOURCE_IDENTITY"
 
     source_identity_session="$(aws_primary sts assume-role \
-        --role-arn "$S3_TEST_STS_SOURCE_IDENTITY_ROLE_ARN" \
-        --role-session-name "$S3_TEST_STS_SOURCE_IDENTITY_SESSION_NAME" \
-        --source-identity "$S3_TEST_STS_SOURCE_IDENTITY" \
+        --role-arn "$STS_TEST_SOURCE_IDENTITY_ROLE_ARN" \
+        --role-session-name "$STS_TEST_SOURCE_IDENTITY_SESSION_NAME" \
+        --source-identity "$STS_TEST_SOURCE_IDENTITY" \
         --duration-seconds 3600 \
         --output json)"
-    export S3_TEST_STS_SOURCE_IDENTITY_ACCESS_KEY
-    export S3_TEST_STS_SOURCE_IDENTITY_SECRET_KEY
-    export S3_TEST_STS_SOURCE_IDENTITY_SESSION_TOKEN
-    S3_TEST_STS_SOURCE_IDENTITY_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$source_identity_session")"
-    S3_TEST_STS_SOURCE_IDENTITY_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$source_identity_session")"
-    S3_TEST_STS_SOURCE_IDENTITY_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$source_identity_session")"
+    export STS_TEST_SOURCE_IDENTITY_ACCESS_KEY
+    export STS_TEST_SOURCE_IDENTITY_SECRET_KEY
+    export STS_TEST_SOURCE_IDENTITY_SESSION_TOKEN
+    STS_TEST_SOURCE_IDENTITY_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$source_identity_session")"
+    STS_TEST_SOURCE_IDENTITY_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$source_identity_session")"
+    STS_TEST_SOURCE_IDENTITY_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$source_identity_session")"
     [[ "$(jq -er '.SourceIdentity' <<<"$source_identity_session")" == \
-        "$S3_TEST_STS_SOURCE_IDENTITY" ]] || \
+        "$STS_TEST_SOURCE_IDENTITY" ]] || \
         external_s3_test_die \
             "temporary source-identity session did not preserve its source identity"
     echo "same-account-source-identity-session: ok"
@@ -1381,44 +1390,44 @@ create_assume_role_fixture() {
     wait_for_assume_role_success \
         same-account-source-identity-target \
         aws_source_identity_session \
-        "$S3_TEST_STS_SOURCE_IDENTITY_TARGET_ROLE_ARN"
+        "$STS_TEST_SOURCE_IDENTITY_TARGET_ROLE_ARN"
     wait_for_assume_role_success \
         same-account-source-identity-no-set-positive-control \
         aws_source_identity_session \
-        "$S3_TEST_STS_CHAIN_TARGET_ROLE_ARN"
+        "$STS_TEST_CHAIN_TARGET_ROLE_ARN"
     aws_primary iam update-assume-role-policy \
-        --role-name "$S3_TEST_STS_CHAIN_TARGET_ROLE_NAME" \
+        --role-name "$STS_TEST_CHAIN_TARGET_ROLE_NAME" \
         --policy-document "file://${trust_chain_source}"
     wait_for_assume_role_denied \
         same-account-source-identity-no-set \
         aws_source_identity_session \
-        "$S3_TEST_STS_CHAIN_TARGET_ROLE_ARN"
+        "$STS_TEST_CHAIN_TARGET_ROLE_ARN"
 
     chain_source_session="$(aws_primary sts assume-role \
-        --role-arn "$S3_TEST_STS_ROLE_ARN" \
-        --role-session-name "$S3_TEST_STS_CHAIN_SOURCE_SESSION_NAME" \
+        --role-arn "$STS_TEST_ROLE_ARN" \
+        --role-session-name "$STS_TEST_CHAIN_SOURCE_SESSION_NAME" \
         --duration-seconds 3600 \
         --output json)"
-    export S3_TEST_STS_CHAIN_ACCESS_KEY
-    export S3_TEST_STS_CHAIN_SECRET_KEY
-    export S3_TEST_STS_CHAIN_SESSION_TOKEN
-    S3_TEST_STS_CHAIN_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$chain_source_session")"
-    S3_TEST_STS_CHAIN_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$chain_source_session")"
-    S3_TEST_STS_CHAIN_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$chain_source_session")"
+    export STS_TEST_CHAIN_ACCESS_KEY
+    export STS_TEST_CHAIN_SECRET_KEY
+    export STS_TEST_CHAIN_SESSION_TOKEN
+    STS_TEST_CHAIN_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$chain_source_session")"
+    STS_TEST_CHAIN_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$chain_source_session")"
+    STS_TEST_CHAIN_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$chain_source_session")"
     chain_source_identity="$(aws_chaining_source sts get-caller-identity --output json)"
     [[ "$(jq -er '.Arn' <<<"$chain_source_identity")" == \
-        "arn:aws:sts::${primary_account}:assumed-role/${S3_TEST_STS_ROLE_NAME}/${S3_TEST_STS_CHAIN_SOURCE_SESSION_NAME}" ]] || \
+        "arn:aws:sts::${primary_account}:assumed-role/${STS_TEST_ROLE_NAME}/${STS_TEST_CHAIN_SOURCE_SESSION_NAME}" ]] || \
         external_s3_test_die "temporary STS chaining source has an unexpected caller ARN"
     echo "same-account-chain-source-identity: ok"
     other_live_session="$(aws_primary sts assume-role \
-        --role-arn "$S3_TEST_STS_ROLE_ARN" \
+        --role-arn "$STS_TEST_ROLE_ARN" \
         --role-session-name token-binding-control \
         --duration-seconds 3600 \
         --output json)"
     other_live_access_key="$(jq -er '.Credentials.AccessKeyId' <<<"$other_live_session")"
     other_live_secret_key="$(jq -er '.Credentials.SecretAccessKey' <<<"$other_live_session")"
     other_live_session_token="$(jq -er '.Credentials.SessionToken' <<<"$other_live_session")"
-    export S3_TEST_STS_OTHER_LIVE_SESSION_TOKEN="$other_live_session_token"
+    export STS_TEST_OTHER_LIVE_SESSION_TOKEN="$other_live_session_token"
     other_live_identity="$(aws_with_session_credentials \
         "$other_live_access_key" \
         "$other_live_secret_key" \
@@ -1426,110 +1435,110 @@ create_assume_role_fixture() {
         sts get-caller-identity \
         --output json)"
     [[ "$(jq -er '.Arn' <<<"$other_live_identity")" == \
-        "arn:aws:sts::${primary_account}:assumed-role/${S3_TEST_STS_ROLE_NAME}/token-binding-control" ]] || \
+        "arn:aws:sts::${primary_account}:assumed-role/${STS_TEST_ROLE_NAME}/token-binding-control" ]] || \
         external_s3_test_die "temporary token-binding control has an unexpected caller ARN"
     echo "same-account-other-live-session-identity: ok"
     wait_for_assume_role_success \
         same-account-chain-target \
         aws_chaining_source \
-        "$S3_TEST_STS_CHAIN_TARGET_ROLE_ARN"
+        "$STS_TEST_CHAIN_TARGET_ROLE_ARN"
     wait_for_assume_role_success \
         same-account-chain-default-max-target \
         aws_chaining_source \
-        "$S3_TEST_STS_DEFAULT_MAX_ROLE_ARN"
+        "$STS_TEST_DEFAULT_MAX_ROLE_ARN"
     wait_for_assume_role_success \
         same-account-deleted-role \
         aws_primary \
-        "$S3_TEST_STS_DELETED_ROLE_ARN"
+        "$STS_TEST_DELETED_ROLE_ARN"
 
     deleted_role_session="$(aws_primary sts assume-role \
-        --role-arn "$S3_TEST_STS_DELETED_ROLE_ARN" \
-        --role-session-name "$S3_TEST_STS_DELETED_ROLE_SESSION_NAME" \
+        --role-arn "$STS_TEST_DELETED_ROLE_ARN" \
+        --role-session-name "$STS_TEST_DELETED_ROLE_SESSION_NAME" \
         --duration-seconds 3600 \
         --output json)"
-    export S3_TEST_STS_DELETED_ROLE_ACCESS_KEY
-    export S3_TEST_STS_DELETED_ROLE_SECRET_KEY
-    export S3_TEST_STS_DELETED_ROLE_SESSION_TOKEN
-    S3_TEST_STS_DELETED_ROLE_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$deleted_role_session")"
-    S3_TEST_STS_DELETED_ROLE_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$deleted_role_session")"
-    S3_TEST_STS_DELETED_ROLE_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$deleted_role_session")"
+    export STS_TEST_DELETED_ROLE_ACCESS_KEY
+    export STS_TEST_DELETED_ROLE_SECRET_KEY
+    export STS_TEST_DELETED_ROLE_SESSION_TOKEN
+    STS_TEST_DELETED_ROLE_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$deleted_role_session")"
+    STS_TEST_DELETED_ROLE_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$deleted_role_session")"
+    STS_TEST_DELETED_ROLE_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$deleted_role_session")"
     old_assumed_role_id="$(jq -er '.AssumedRoleUser.AssumedRoleId' <<<"$deleted_role_session")"
     [[ "$old_assumed_role_id" == \
-        "${deleted_role_stable_id}:${S3_TEST_STS_DELETED_ROLE_SESSION_NAME}" ]] || \
+        "${deleted_role_stable_id}:${STS_TEST_DELETED_ROLE_SESSION_NAME}" ]] || \
         external_s3_test_die "temporary deleted-role session has an unexpected stable role ID"
     deleted_role_identity="$(aws_deleted_role_session sts get-caller-identity --output json)"
     [[ "$(jq -er '.Arn' <<<"$deleted_role_identity")" == \
-        "arn:aws:sts::${primary_account}:assumed-role/${S3_TEST_STS_DELETED_ROLE_NAME}/${S3_TEST_STS_DELETED_ROLE_SESSION_NAME}" ]] || \
+        "arn:aws:sts::${primary_account}:assumed-role/${STS_TEST_DELETED_ROLE_NAME}/${STS_TEST_DELETED_ROLE_SESSION_NAME}" ]] || \
         external_s3_test_die "temporary deleted-role session has an unexpected caller ARN"
     echo "same-account-deleted-role-session-before-delete: ok"
-    aws_primary iam delete-role --role-name "$S3_TEST_STS_DELETED_ROLE_NAME"
-    unregister_created_role "$S3_TEST_STS_DELETED_ROLE_NAME"
+    aws_primary iam delete-role --role-name "$STS_TEST_DELETED_ROLE_NAME"
+    unregister_created_role "$STS_TEST_DELETED_ROLE_NAME"
     wait_for_deleted_role_session_invalid same-account-deleted-role-session-after-delete
 
     create_scoped_role \
-        "$S3_TEST_STS_DELETED_ROLE_NAME" \
+        "$STS_TEST_DELETED_ROLE_NAME" \
         /argmin-sts-oracle/same-account/ \
         "$trust_policy" \
-        "$S3_TEST_STS_DELETED_ROLE_ARN"
+        "$STS_TEST_DELETED_ROLE_ARN"
     recreated_role_stable_id="$(aws_primary iam get-role \
-        --role-name "$S3_TEST_STS_DELETED_ROLE_NAME" \
+        --role-name "$STS_TEST_DELETED_ROLE_NAME" \
         --query 'Role.RoleId' \
         --output text)"
     [[ "$recreated_role_stable_id" != "$deleted_role_stable_id" ]] || \
         external_s3_test_die "recreated STS oracle role reused the deleted role's stable ID"
-    export S3_TEST_STS_RECREATED_ROLE_ID="$recreated_role_stable_id"
+    export STS_TEST_RECREATED_ROLE_ID="$recreated_role_stable_id"
     wait_for_assume_role_success \
         same-account-recreated-role \
         aws_primary \
-        "$S3_TEST_STS_DELETED_ROLE_ARN"
+        "$STS_TEST_DELETED_ROLE_ARN"
     recreated_role_session="$(aws_primary sts assume-role \
-        --role-arn "$S3_TEST_STS_DELETED_ROLE_ARN" \
-        --role-session-name "$S3_TEST_STS_RECREATED_ROLE_SESSION_NAME" \
+        --role-arn "$STS_TEST_DELETED_ROLE_ARN" \
+        --role-session-name "$STS_TEST_RECREATED_ROLE_SESSION_NAME" \
         --duration-seconds 3600 \
         --output json)"
-    export S3_TEST_STS_RECREATED_ROLE_ACCESS_KEY
-    export S3_TEST_STS_RECREATED_ROLE_SECRET_KEY
-    export S3_TEST_STS_RECREATED_ROLE_SESSION_TOKEN
-    S3_TEST_STS_RECREATED_ROLE_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$recreated_role_session")"
-    S3_TEST_STS_RECREATED_ROLE_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$recreated_role_session")"
-    S3_TEST_STS_RECREATED_ROLE_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$recreated_role_session")"
+    export STS_TEST_RECREATED_ROLE_ACCESS_KEY
+    export STS_TEST_RECREATED_ROLE_SECRET_KEY
+    export STS_TEST_RECREATED_ROLE_SESSION_TOKEN
+    STS_TEST_RECREATED_ROLE_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$recreated_role_session")"
+    STS_TEST_RECREATED_ROLE_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$recreated_role_session")"
+    STS_TEST_RECREATED_ROLE_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$recreated_role_session")"
     [[ "$(jq -er '.AssumedRoleUser.AssumedRoleId' <<<"$recreated_role_session")" == \
-        "${recreated_role_stable_id}:${S3_TEST_STS_RECREATED_ROLE_SESSION_NAME}" ]] || \
+        "${recreated_role_stable_id}:${STS_TEST_RECREATED_ROLE_SESSION_NAME}" ]] || \
         external_s3_test_die "recreated-role session has an unexpected stable role ID"
     recreated_role_identity="$(aws_with_session_credentials \
-        "$S3_TEST_STS_RECREATED_ROLE_ACCESS_KEY" \
-        "$S3_TEST_STS_RECREATED_ROLE_SECRET_KEY" \
-        "$S3_TEST_STS_RECREATED_ROLE_SESSION_TOKEN" \
+        "$STS_TEST_RECREATED_ROLE_ACCESS_KEY" \
+        "$STS_TEST_RECREATED_ROLE_SECRET_KEY" \
+        "$STS_TEST_RECREATED_ROLE_SESSION_TOKEN" \
         sts get-caller-identity \
         --output json)"
     [[ "$(jq -er '.Arn' <<<"$recreated_role_identity")" == \
-        "arn:aws:sts::${primary_account}:assumed-role/${S3_TEST_STS_DELETED_ROLE_NAME}/${S3_TEST_STS_RECREATED_ROLE_SESSION_NAME}" ]] || \
+        "arn:aws:sts::${primary_account}:assumed-role/${STS_TEST_DELETED_ROLE_NAME}/${STS_TEST_RECREATED_ROLE_SESSION_NAME}" ]] || \
         external_s3_test_die "recreated-role session has an unexpected caller ARN"
-    export S3_TEST_STS_RECREATED_ROLE_ARN="$S3_TEST_STS_DELETED_ROLE_ARN"
-    export S3_TEST_STS_RECREATED_SESSION_ARN
-    S3_TEST_STS_RECREATED_SESSION_ARN="arn:aws:sts::${primary_account}:assumed-role/${S3_TEST_STS_DELETED_ROLE_NAME}/${S3_TEST_STS_RECREATED_ROLE_SESSION_NAME}"
-    export S3_TEST_STS_RECREATED_USER_ID="${recreated_role_stable_id}:${S3_TEST_STS_RECREATED_ROLE_SESSION_NAME}"
+    export STS_TEST_RECREATED_ROLE_ARN="$STS_TEST_DELETED_ROLE_ARN"
+    export STS_TEST_RECREATED_SESSION_ARN
+    STS_TEST_RECREATED_SESSION_ARN="arn:aws:sts::${primary_account}:assumed-role/${STS_TEST_DELETED_ROLE_NAME}/${STS_TEST_RECREATED_ROLE_SESSION_NAME}"
+    export STS_TEST_RECREATED_USER_ID="${recreated_role_stable_id}:${STS_TEST_RECREATED_ROLE_SESSION_NAME}"
     echo "same-account-recreated-role-session: ok"
     wait_for_deleted_role_session_invalid same-account-old-session-after-role-recreation
 
-    export S3_TEST_STS_TOKEN_ISSUE_LOWER_BOUND
-    export S3_TEST_STS_TOKEN_ISSUE_UPPER_BOUND
+    export STS_TEST_TOKEN_ISSUE_LOWER_BOUND
+    export STS_TEST_TOKEN_ISSUE_UPPER_BOUND
     recreated_expiration="$(jq -er '.Credentials.Expiration' <<<"$recreated_role_session")"
     recreated_expiration_epoch="$(date -u -d "$recreated_expiration" '+%s')"
     recreated_issue_epoch=$((recreated_expiration_epoch - 3600))
-    S3_TEST_STS_TOKEN_ISSUE_LOWER_BOUND="$(date -u \
+    STS_TEST_TOKEN_ISSUE_LOWER_BOUND="$(date -u \
         -d "@$((recreated_issue_epoch - 1))" '+%Y-%m-%dT%H:%M:%SZ')"
-    S3_TEST_STS_TOKEN_ISSUE_UPPER_BOUND="$(date -u \
+    STS_TEST_TOKEN_ISSUE_UPPER_BOUND="$(date -u \
         -d "@$((recreated_issue_epoch + 1))" '+%Y-%m-%dT%H:%M:%SZ')"
 
     streaming_bucket_policy="$tmpdir/streaming-bucket-policy.json"
     jq -n \
-        --arg role_principal "$S3_TEST_STS_RECREATED_ROLE_ARN" \
-        --arg session_principal "$S3_TEST_STS_RECREATED_SESSION_ARN" \
-        --arg user_id "$S3_TEST_STS_RECREATED_USER_ID" \
-        --arg lower_bound "$S3_TEST_STS_TOKEN_ISSUE_LOWER_BOUND" \
-        --arg upper_bound "$S3_TEST_STS_TOKEN_ISSUE_UPPER_BOUND" \
-        --arg bucket_arn "arn:aws:s3:::${S3_TEST_STS_POST_BUCKET}" \
+        --arg role_principal "$STS_TEST_RECREATED_ROLE_ARN" \
+        --arg session_principal "$STS_TEST_RECREATED_SESSION_ARN" \
+        --arg user_id "$STS_TEST_RECREATED_USER_ID" \
+        --arg lower_bound "$STS_TEST_TOKEN_ISSUE_LOWER_BOUND" \
+        --arg upper_bound "$STS_TEST_TOKEN_ISSUE_UPPER_BOUND" \
+        --arg bucket_arn "arn:aws:s3:::${STS_TEST_POST_BUCKET}" \
         --arg primary_principal "$primary_arn" \
         '{
             Version: "2012-10-17",
@@ -1659,17 +1668,17 @@ create_assume_role_fixture() {
             ]
         }' >"$streaming_bucket_policy"
     aws_primary s3api put-bucket-policy \
-        --bucket "$S3_TEST_STS_POST_BUCKET" \
+        --bucket "$STS_TEST_POST_BUCKET" \
         --policy "file://${streaming_bucket_policy}"
     wait_for_streaming_bucket_policy_success
     wait_for_session_context_bucket_policy_success
     wait_for_get_bucket_tagging_denied \
         list-tags-distinct-action \
-        "$S3_TEST_STS_POST_BUCKET"
+        "$STS_TEST_POST_BUCKET"
     wait_for_list_tags_for_resource_success \
         list-tags-distinct-action \
         "$primary_account" \
-        "arn:aws:s3:::${S3_TEST_STS_POST_BUCKET}"
+        "arn:aws:s3:::${STS_TEST_POST_BUCKET}"
 
     trust_recreated_role_revoked="$tmpdir/trust-recreated-role-revoked.json"
     jq -n --arg principal "$primary_arn" '{
@@ -1682,12 +1691,12 @@ create_assume_role_fixture() {
         }]
     }' >"$trust_recreated_role_revoked"
     aws_primary iam update-assume-role-policy \
-        --role-name "$S3_TEST_STS_DELETED_ROLE_NAME" \
+        --role-name "$STS_TEST_DELETED_ROLE_NAME" \
         --policy-document "file://${trust_recreated_role_revoked}"
     wait_for_assume_role_denied \
         same-account-recreated-role-trust-revoked \
         aws_primary \
-        "$S3_TEST_STS_RECREATED_ROLE_ARN"
+        "$STS_TEST_RECREATED_ROLE_ARN"
     wait_for_session_context_bucket_policy_success
 
     create_role_policy_mutation_fixture \
@@ -1699,11 +1708,11 @@ create_assume_role_fixture() {
     if [[ "$expiry_collision" == true ]]; then
         wait_for_session_expired \
             same-account-expiry-role-session \
-            "$S3_TEST_STS_EXPIRED_DELETED_ACCESS_KEY" \
-            "$S3_TEST_STS_EXPIRED_DELETED_SECRET_KEY" \
-            "$S3_TEST_STS_EXPIRED_DELETED_SESSION_TOKEN"
-        aws_primary iam delete-role --role-name "$S3_TEST_STS_EXPIRY_ROLE_NAME"
-        unregister_created_role "$S3_TEST_STS_EXPIRY_ROLE_NAME"
+            "$STS_TEST_EXPIRED_DELETED_ACCESS_KEY" \
+            "$STS_TEST_EXPIRED_DELETED_SECRET_KEY" \
+            "$STS_TEST_EXPIRED_DELETED_SESSION_TOKEN"
+        aws_primary iam delete-role --role-name "$STS_TEST_EXPIRY_ROLE_NAME"
+        unregister_created_role "$STS_TEST_EXPIRY_ROLE_NAME"
         wait_for_session_invalid \
             same-account-expiry-role-liveness-control-after-delete \
             "$expiry_liveness_access_key" \
@@ -1755,40 +1764,40 @@ create_cross_account_role_fixtures() {
 
     role_suffix="${tmpdir##*/}"
     role_suffix="${role_suffix#tmp.}"
-    export S3_TEST_STS_ALT_ACCESS_KEY="$TEST_AWS_ALT_ACCESS_KEY"
-    export S3_TEST_STS_ALT_SECRET_KEY="$TEST_AWS_ALT_SECRET_KEY"
-    export S3_TEST_STS_ALT_ARN="$alt_arn"
-    export S3_TEST_STS_CROSS_SESSION_NAME="cross-account-session"
-    export S3_TEST_STS_CROSS_SUCCESS_ROLE_NAME="cross-success-${role_suffix}"
-    export S3_TEST_STS_CROSS_SUCCESS_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/cross-account/${S3_TEST_STS_CROSS_SUCCESS_ROLE_NAME}"
-    export S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_NAME="cross-trust-denied-${role_suffix}"
-    export S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/cross-account/${S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_NAME}"
-    export S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_NAME="cross-caller-denied-${role_suffix}"
-    export S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/caller-denied/${S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_NAME}"
+    export STS_TEST_ALT_ACCESS_KEY="$TEST_AWS_ALT_ACCESS_KEY"
+    export STS_TEST_ALT_SECRET_KEY="$TEST_AWS_ALT_SECRET_KEY"
+    export STS_TEST_ALT_ARN="$alt_arn"
+    export STS_TEST_CROSS_SESSION_NAME="cross-account-session"
+    export STS_TEST_CROSS_SUCCESS_ROLE_NAME="cross-success-${role_suffix}"
+    export STS_TEST_CROSS_SUCCESS_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/cross-account/${STS_TEST_CROSS_SUCCESS_ROLE_NAME}"
+    export STS_TEST_CROSS_TRUST_DENIED_ROLE_NAME="cross-trust-denied-${role_suffix}"
+    export STS_TEST_CROSS_TRUST_DENIED_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/cross-account/${STS_TEST_CROSS_TRUST_DENIED_ROLE_NAME}"
+    export STS_TEST_CROSS_CALLER_DENIED_ROLE_NAME="cross-caller-denied-${role_suffix}"
+    export STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/caller-denied/${STS_TEST_CROSS_CALLER_DENIED_ROLE_NAME}"
 
     assert_identity_decision \
         cross-success \
         aws_alt \
         "$alt_arn" \
-        "$S3_TEST_STS_CROSS_SUCCESS_ROLE_ARN" \
+        "$STS_TEST_CROSS_SUCCESS_ROLE_ARN" \
         allowed
     assert_identity_decision \
         cross-trust-denied \
         aws_alt \
         "$alt_arn" \
-        "$S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_ARN" \
+        "$STS_TEST_CROSS_TRUST_DENIED_ROLE_ARN" \
         allowed
     assert_identity_decision \
         cross-caller-denied \
         aws_alt \
         "$alt_arn" \
-        "$S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_ARN" \
+        "$STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN" \
         implicitDeny
     assert_identity_decision \
         cross-caller-denied-primary-control \
         aws_primary \
         "$primary_arn" \
-        "$S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_ARN" \
+        "$STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN" \
         implicitDeny
 
     trust_alt="$tmpdir/cross-trust-alt.json"
@@ -1812,41 +1821,41 @@ create_cross_account_role_fixtures() {
     }' >"$trust_alt_and_primary"
 
     create_scoped_role \
-        "$S3_TEST_STS_CROSS_SUCCESS_ROLE_NAME" \
+        "$STS_TEST_CROSS_SUCCESS_ROLE_NAME" \
         /argmin-sts-oracle/cross-account/ \
         "$trust_alt" \
-        "$S3_TEST_STS_CROSS_SUCCESS_ROLE_ARN"
+        "$STS_TEST_CROSS_SUCCESS_ROLE_ARN"
     create_scoped_role \
-        "$S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_NAME" \
+        "$STS_TEST_CROSS_TRUST_DENIED_ROLE_NAME" \
         /argmin-sts-oracle/cross-account/ \
         "$trust_alt" \
-        "$S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_ARN"
+        "$STS_TEST_CROSS_TRUST_DENIED_ROLE_ARN"
     create_scoped_role \
-        "$S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_NAME" \
+        "$STS_TEST_CROSS_CALLER_DENIED_ROLE_NAME" \
         /argmin-sts-oracle/caller-denied/ \
         "$trust_alt_and_primary" \
-        "$S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_ARN"
+        "$STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN"
 
     wait_for_assume_role_success \
         cross-account-success-role \
         aws_alt \
-        "$S3_TEST_STS_CROSS_SUCCESS_ROLE_ARN"
+        "$STS_TEST_CROSS_SUCCESS_ROLE_ARN"
     wait_for_assume_role_success \
         cross-account-trust-denied-positive-control \
         aws_alt \
-        "$S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_ARN"
+        "$STS_TEST_CROSS_TRUST_DENIED_ROLE_ARN"
     wait_for_assume_role_success \
         cross-account-caller-denied-positive-control \
         aws_primary \
-        "$S3_TEST_STS_CROSS_CALLER_DENIED_ROLE_ARN"
+        "$STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN"
 
     aws_primary iam update-assume-role-policy \
-        --role-name "$S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_NAME" \
+        --role-name "$STS_TEST_CROSS_TRUST_DENIED_ROLE_NAME" \
         --policy-document "file://${trust_primary}"
     wait_for_assume_role_denied \
         cross-account-trust-denied-role \
         aws_alt \
-        "$S3_TEST_STS_CROSS_TRUST_DENIED_ROLE_ARN"
+        "$STS_TEST_CROSS_TRUST_DENIED_ROLE_ARN"
 }
 
 if [[ "$assume_role" == true ]]; then
@@ -1857,6 +1866,6 @@ if [[ "$cross_account" == true ]]; then
     create_cross_account_role_fixtures
 fi
 
-cmd=(cargo run -p s3-tests --bin sts_oracle)
+cmd=(cargo run -p sts-tests --bin sts_oracle)
 external_s3_test_print_command "AWS STS oracle" "${cmd[@]}"
 "${cmd[@]}"

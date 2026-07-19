@@ -7,6 +7,7 @@ It complements rather than replaces:
 
 - `./scripts/coverage` for local integration coverage movement
 - AWS-backed compatibility suites and golden shape assertions in `s3-tests`
+  and `sts-tests`
 - parser fuzzing under `fuzz/`
 
 The default local entry point is:
