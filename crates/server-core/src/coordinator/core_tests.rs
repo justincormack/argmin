@@ -22,8 +22,8 @@ use storage::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, ClusterEpoch, LocalClusterMap,
     LocalNodeStoreConfig, LocalPgRoute, LocalUnixStorageNodeClientConfig,
     MetadataCommandApplyTestKind, NodeId, PgId, PgState, PlacedSegmentShardBackfillWorkItem,
-    RouteMapValidity, SegmentStoredBytesRequest, ShardScavengerObservationReason,
-    SharedStorageNode, StorageCluster, StorageClusterRuntimeMapHandle,
+    RouteMapValidity, SegmentStoredBytesRequest, ShardScavengerObservationReason, StorageCluster,
+    StorageClusterRuntimeMapHandle,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -320,7 +320,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
         NodeId::new(5),
         NodeId::new(6),
     ];
-    let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+    let ec_shape = EcShape { k: 4, m: 2 };
     let pg_id = PgId::new(0);
     let mut authority = storage::control_plane::SingleAuthorityControlPlane::open(
         storage::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),

@@ -1966,8 +1966,9 @@ fail_with_matches \
     "Legacy bucket-row write-drain counter helper reintroduced" \
     "$legacy_bucket_counter_matches"
 
-# Public-surface inventory: these raw PgMetadataStore methods remain necessary
-# for the local adapter/storage-node boundary until module visibility narrows.
+# Temporary migration prohibition: the raw trait is no longer externally
+# nameable, but crate siblings can still reach it until Phase 2 moves the local
+# adapter under the private node runtime and narrows its methods.
 production_metadata_methods=$(
     awk '
     function is_allowed_production_method(name) {

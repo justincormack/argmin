@@ -21,10 +21,10 @@
 
 /// Storage layer for argmin2.
 ///
-/// Provides per-PG shard I/O with CRC64-NVME integrity checksums,
-/// and per-PG object/bucket metadata in SQLite.
-///
-/// All IO is synchronous. Single-node, single-process for v1-minimal.
+/// Request-serving code enters storage through [`StorageCluster`]. Storage
+/// processes are assembled through the bootstrap and server types in
+/// [`storage_node_server`]. Raw node, PG-store, and shard-store
+/// implementations are private engine details.
 pub mod clock;
 pub mod cluster;
 pub mod control_plane;
@@ -36,28 +36,34 @@ pub(crate) mod data_dir;
 pub(crate) mod durable_journal;
 pub mod error;
 pub(crate) mod metadata_command;
-pub mod node;
+// Phase 1 makes the legacy raw engine private before Phase 2 removes or
+// relocates methods retained only by its internal tests and migration work.
+// Keep that transitional dead-code debt explicit and confined to these raw
+// implementation modules.
+#[allow(dead_code)]
+mod node;
 pub(crate) mod node_client;
 pub(crate) mod peering;
-pub mod pg_store;
+#[allow(dead_code)]
+mod pg_store;
 pub mod pg_topology;
 pub mod schema;
 pub mod shard_key_hash;
 pub mod storage_node_server;
 #[allow(dead_code)]
 pub(crate) mod storage_rpc;
-pub mod traits;
+#[allow(dead_code)]
+mod traits;
 pub mod types;
 
 pub use cluster::{
     BucketWriteSnapshotAction, DurableReclaimScanOutcome, LeasedObjectReadSnapshotOutcome,
-    LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
-    LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
-    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
-    ObjectPayloadLease, PgMetadataTransferArtifact, PlacedSegmentShardBackfillCopyTarget,
-    PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth, PlacedSegmentShardSetHealth,
-    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, ReleasedObjectPayloadLease,
-    ShardLocation, StorageCluster, StorageClusterRuntimeMapHandle,
+    LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
+    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
+    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
+    PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,
+    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
+    ReleasedObjectPayloadLease, ShardLocation, StorageCluster, StorageClusterRuntimeMapHandle,
     StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
     StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
     StorageClusterRuntimeMapRefreshLoopSuccess,
@@ -72,20 +78,23 @@ pub use error::{
     ObjectPgActionError, PgMetadataTransferError, ShardIoError, StoreError,
 };
 pub use metadata_command::BucketWriteReservationProof;
+#[cfg(test)]
+pub(crate) use node::LocalStorageNode;
+pub(crate) use node::SharedStorageNode;
 #[cfg(feature = "test-hooks")]
 pub use node::{
     install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,
 };
 pub use node::{
-    BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome,
-    LocalStorageNode, ReclaimWorkItem, SharedStorageNode,
+    BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome, ReclaimWorkItem,
 };
+pub(crate) use pg_store::PgStore;
 pub use pg_store::{
     MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
     MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandCheckpointValidationError,
     MetadataCommandLogCompactionStatus, MetadataCommandLogStats,
     PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
-    PgClusterMapHistoryRouteReferenceKind, PgClusterMapHistoryRouteReferences, PgStore,
+    PgClusterMapHistoryRouteReferenceKind, PgClusterMapHistoryRouteReferences,
     MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
 };
 pub use pg_topology::PgTopology;
@@ -97,7 +106,6 @@ pub use shard_key_hash::{
 pub use storage_rpc::StorageRpcErrorCode;
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;
-pub use traits::{ShardStore, StorageNode};
 pub use types::{
     key_prefix_upper_bound, object_key_common_prefix, object_key_prefix_upper_bound,
     AbortMultipartUploadCleanup, AclGrants, AuthorizedMultipartUploadRecord,

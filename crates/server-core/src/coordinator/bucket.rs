@@ -266,58 +266,56 @@ impl Coordinator {
                 })
                 .map_err(Self::map_bucket_snapshot_load_error)?
             {
-                storage::node::BucketCreateAttemptOutcome::Created(info) => {
+                storage::BucketCreateAttemptOutcome::Created(info) => {
                     self.clear_bucket_fast_path(&info);
                     return Ok(BucketCreateOutcome::Created);
                 }
-                storage::node::BucketCreateAttemptOutcome::Exists(existing) => {
-                    match existing.state {
-                        BucketState::Active
-                            if existing.owner_principal == owner.principal
-                                && existing.owner_canonical_id == owner.canonical_id =>
-                        {
-                            return Ok(BucketCreateOutcome::AlreadyOwned);
-                        }
-                        BucketState::Active => return Err(ServerError::BucketAlreadyExists),
-                        BucketState::Deleting => {
-                            let _ = observability::event(
-                                TRACE_TARGET,
-                                "bucket_create_finalize_deleting_start",
-                                Some(format_args!("bucket={:?}", name)),
-                            );
-                            match storage_node.try_finalize_bucket_delete(name) {
-                                Ok(
-                                    storage::BucketDeleteFinalizeOutcome::Finalized
-                                    | storage::BucketDeleteFinalizeOutcome::NotFound,
-                                ) => {
-                                    let _ = observability::event(
-                                        TRACE_TARGET,
-                                        "bucket_create_finalize_deleting_done",
-                                        Some(format_args!("bucket={:?}", name)),
-                                    );
-                                    continue;
-                                }
-                                Ok(storage::BucketDeleteFinalizeOutcome::NotDeleting) => {
-                                    let _ = observability::event(
-                                        TRACE_TARGET,
-                                        "bucket_create_finalize_deleting_changed",
-                                        Some(format_args!("bucket={:?}", name)),
-                                    );
-                                    continue;
-                                }
-                                Ok(storage::BucketDeleteFinalizeOutcome::Pending) => {
-                                    let _ = observability::event(
-                                        TRACE_TARGET,
-                                        "bucket_create_finalize_deleting_pending",
-                                        Some(format_args!("bucket={:?}", name)),
-                                    );
-                                    return Err(ServerError::BucketAlreadyExists);
-                                }
-                                Err(err) => return Err(Self::map_bucket_write_drain_error(err)),
+                storage::BucketCreateAttemptOutcome::Exists(existing) => match existing.state {
+                    BucketState::Active
+                        if existing.owner_principal == owner.principal
+                            && existing.owner_canonical_id == owner.canonical_id =>
+                    {
+                        return Ok(BucketCreateOutcome::AlreadyOwned);
+                    }
+                    BucketState::Active => return Err(ServerError::BucketAlreadyExists),
+                    BucketState::Deleting => {
+                        let _ = observability::event(
+                            TRACE_TARGET,
+                            "bucket_create_finalize_deleting_start",
+                            Some(format_args!("bucket={:?}", name)),
+                        );
+                        match storage_node.try_finalize_bucket_delete(name) {
+                            Ok(
+                                storage::BucketDeleteFinalizeOutcome::Finalized
+                                | storage::BucketDeleteFinalizeOutcome::NotFound,
+                            ) => {
+                                let _ = observability::event(
+                                    TRACE_TARGET,
+                                    "bucket_create_finalize_deleting_done",
+                                    Some(format_args!("bucket={:?}", name)),
+                                );
+                                continue;
                             }
+                            Ok(storage::BucketDeleteFinalizeOutcome::NotDeleting) => {
+                                let _ = observability::event(
+                                    TRACE_TARGET,
+                                    "bucket_create_finalize_deleting_changed",
+                                    Some(format_args!("bucket={:?}", name)),
+                                );
+                                continue;
+                            }
+                            Ok(storage::BucketDeleteFinalizeOutcome::Pending) => {
+                                let _ = observability::event(
+                                    TRACE_TARGET,
+                                    "bucket_create_finalize_deleting_pending",
+                                    Some(format_args!("bucket={:?}", name)),
+                                );
+                                return Err(ServerError::BucketAlreadyExists);
+                            }
+                            Err(err) => return Err(Self::map_bucket_write_drain_error(err)),
                         }
                     }
-                }
+                },
             }
         }
     }

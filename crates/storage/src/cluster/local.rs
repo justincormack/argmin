@@ -516,15 +516,16 @@ impl LocalNodeStore {
         Ok(Self::new(node_id, PathBuf::new(), storage_node))
     }
 
-    pub fn node_id(&self) -> NodeId {
+    pub(crate) fn node_id(&self) -> NodeId {
         self.node_id
     }
 
-    pub fn data_dir(&self) -> &Path {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
-    pub fn storage_node(&self) -> &Arc<SharedStorageNode> {
+    pub(crate) fn storage_node(&self) -> &Arc<SharedStorageNode> {
         &self.storage_node
     }
 
@@ -2085,7 +2086,7 @@ impl LocalClusterMap {
         self.metadata_primary_node_id
     }
 
-    pub fn metadata_primary(&self) -> &LocalNodeStore {
+    pub(crate) fn metadata_primary(&self) -> &LocalNodeStore {
         self.nodes
             .get(&self.metadata_primary_node_id)
             .expect("local cluster map metadata primary must exist")
@@ -2107,7 +2108,7 @@ impl LocalClusterMap {
         &self.pg_topology
     }
 
-    pub fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {
+    pub(crate) fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {
         self.nodes.get(&node_id)
     }
 

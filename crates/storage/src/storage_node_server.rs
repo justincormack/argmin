@@ -323,7 +323,7 @@ extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageNodeProcessConfig {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -451,7 +451,7 @@ impl StorageNodeProcessConfig {
         &self.historical_pg_routes
     }
 
-    pub fn from_runtime_map(
+    pub(crate) fn from_runtime_map(
         node_id: NodeId,
         data_dir: impl Into<PathBuf>,
         default_ec_shape: EcShape,
@@ -510,7 +510,7 @@ impl StorageNodeProcessConfig {
         })
     }
 
-    pub fn from_runtime_map_refresh(
+    pub(crate) fn from_runtime_map_refresh(
         current: &StorageNodeProcessConfig,
         runtime_map: &ClusterRuntimeMapSnapshot,
         history_reference_summary: crate::PgClusterMapHistoryReferenceSummary,
@@ -621,7 +621,7 @@ impl StorageNodeProcessConfig {
         Ok(())
     }
 
-    pub fn load_control_plane_runtime_config(
+    pub(crate) fn load_control_plane_runtime_config(
         data_dir: impl AsRef<Path>,
         node_id: NodeId,
         default_ec_shape: EcShape,
@@ -664,7 +664,9 @@ impl StorageNodeProcessConfig {
         Ok(Some(config))
     }
 
-    pub fn persist_control_plane_runtime_config(&self) -> Result<(), StorageNodeServerError> {
+    pub(crate) fn persist_control_plane_runtime_config(
+        &self,
+    ) -> Result<(), StorageNodeServerError> {
         self.stage_control_plane_runtime_config()?.publish()
     }
 
@@ -704,7 +706,7 @@ impl StorageNodeProcessConfig {
         })
     }
 
-    pub fn control_plane_heartbeat(
+    pub(crate) fn control_plane_heartbeat(
         &self,
         node: &SharedStorageNode,
         node_incarnation: u64,
@@ -857,6 +859,26 @@ fn metadata_transfer_source_route_keys_for_refresh(
 
 fn control_plane_runtime_config_path(data_dir: &Path) -> PathBuf {
     data_dir.join(StorageNodeProcessConfig::CONTROL_PLANE_RUNTIME_CONFIG_FILE)
+}
+
+fn validate_process_config_matches_persisted_runtime_config(
+    config: &StorageNodeProcessConfig,
+) -> Result<(), StorageNodeServerError> {
+    let persisted = StorageNodeProcessConfig::load_control_plane_runtime_config(
+        &config.data_dir,
+        config.node_id,
+        config.default_ec_shape,
+        &config.socket_path,
+    )?;
+    if persisted
+        .as_ref()
+        .is_some_and(|persisted| persisted != config)
+    {
+        return Err(StorageNodeServerError::PersistedRuntimeConfigMismatch {
+            path: control_plane_runtime_config_path(&config.data_dir),
+        });
+    }
+    Ok(())
 }
 
 fn encode_control_plane_runtime_config(config: &StorageNodeProcessConfig) -> String {
@@ -1500,6 +1522,14 @@ pub enum StorageNodeServerError {
         candidate: PathBuf,
     },
     #[error(
+        "configured storage-node socket path {configured:?} does not match control-plane endpoint {runtime_map:?} for node {node_id}"
+    )]
+    BootstrapSocketPathMismatch {
+        configured: PathBuf,
+        runtime_map: PathBuf,
+        node_id: u32,
+    },
+    #[error(
         "storage-node runtime refresh changed opened PG set from {current:?} to {candidate:?}"
     )]
     RuntimeRefreshPgSetChanged {
@@ -1537,6 +1567,10 @@ pub enum StorageNodeServerError {
     },
     #[error("invalid storage-node control-plane runtime config {path:?}: {message}")]
     RuntimeConfigInvalid { path: PathBuf, message: String },
+    #[error(
+        "storage-node process configuration does not match persisted control-plane runtime config {path:?}"
+    )]
+    PersistedRuntimeConfigMismatch { path: PathBuf },
     #[error("spawn storage-node control-plane refresh loop")]
     ControlPlaneRefreshLoopSpawn {
         #[source]
@@ -1697,13 +1731,13 @@ pub struct StorageNodeServer {
 type RuntimeConfigStageTestHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Debug)]
-pub struct StorageNodeDataDirGuard {
+pub(crate) struct StorageNodeDataDirGuard {
     data_dir: PathBuf,
     lock: StorageNodeDataDirLock,
 }
 
 impl StorageNodeDataDirGuard {
-    pub fn acquire(data_dir: &Path) -> Result<Self, StorageNodeServerError> {
+    pub(crate) fn acquire(data_dir: &Path) -> Result<Self, StorageNodeServerError> {
         let lock = StorageNodeDataDirLock::acquire(data_dir)?;
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
@@ -1722,6 +1756,172 @@ impl StorageNodeDataDirGuard {
             });
         }
         Ok(self.lock)
+    }
+}
+
+/// Opaque startup boundary for a control-plane-managed storage-node process.
+///
+/// This keeps raw node opening, metadata-command recovery, and startup
+/// heartbeat inspection inside the storage-node implementation. Application
+/// code can inspect startup heartbeats, then consumes the bootstrap to obtain
+/// the one-shot [`PreparedStorageNodeServer`] needed to bind.
+pub struct StorageNodeBootstrap {
+    node: SharedStorageNode,
+    node_id: NodeId,
+    node_incarnation: u64,
+    data_dir: PathBuf,
+    default_ec_shape: EcShape,
+    configured_socket_path: PathBuf,
+    startup_runtime_config: Option<StorageNodeProcessConfig>,
+    data_dir_guard: StorageNodeDataDirGuard,
+}
+
+impl StorageNodeBootstrap {
+    pub fn open_control_plane_managed(
+        node_id: NodeId,
+        data_dir: impl Into<PathBuf>,
+        pg_ids: &[u32],
+        default_ec_shape: EcShape,
+        configured_socket_path: impl Into<PathBuf>,
+    ) -> Result<Self, StorageNodeServerError> {
+        let data_dir = data_dir.into();
+        let configured_socket_path = configured_socket_path.into();
+        let data_dir_guard = StorageNodeDataDirGuard::acquire(&data_dir)?;
+        let node_incarnation = advance_storage_node_incarnation(&data_dir)?;
+        let node =
+            SharedStorageNode::open_with_default_ec_shape(&data_dir, pg_ids, default_ec_shape)?;
+        node.recover_pg_metadata_command_state(node_id)?;
+        let startup_runtime_config = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &data_dir,
+            node_id,
+            default_ec_shape,
+            &configured_socket_path,
+        )?;
+        Ok(Self {
+            node,
+            node_id,
+            node_incarnation,
+            data_dir,
+            default_ec_shape,
+            configured_socket_path,
+            startup_runtime_config,
+            data_dir_guard,
+        })
+    }
+
+    #[must_use]
+    pub fn node_incarnation(&self) -> u64 {
+        self.node_incarnation
+    }
+
+    pub fn control_plane_heartbeat(
+        &self,
+        requested_lease_duration_ms: u64,
+    ) -> Result<NodeHeartbeat, StorageNodeServerError> {
+        match self.startup_runtime_config.as_ref() {
+            Some(runtime_config) => runtime_config.control_plane_heartbeat(
+                &self.node,
+                self.node_incarnation,
+                requested_lease_duration_ms,
+            ),
+            None => {
+                let endpoint = self.configured_socket_path.to_str().ok_or_else(|| {
+                    StorageNodeServerError::SocketPathNotUtf8 {
+                        path: self.configured_socket_path.clone(),
+                    }
+                })?;
+                self.node
+                    .control_plane_heartbeat(
+                        self.node_id,
+                        self.node_incarnation,
+                        endpoint,
+                        ClusterEpoch::INITIAL,
+                        requested_lease_duration_ms,
+                        std::iter::empty(),
+                    )
+                    .map_err(StorageNodeServerError::from)
+            }
+        }
+    }
+
+    pub fn prepare(
+        self,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<PreparedStorageNodeServer, StorageNodeServerError> {
+        let config = match self.startup_runtime_config.as_ref() {
+            Some(runtime_config) => {
+                let history_reference_summary =
+                    self.node.cluster_map_history_reference_summary()?;
+                StorageNodeProcessConfig::from_runtime_map_refresh(
+                    runtime_config,
+                    runtime_map,
+                    history_reference_summary,
+                )
+            }
+            None => StorageNodeProcessConfig::from_runtime_map(
+                self.node_id,
+                self.data_dir.clone(),
+                self.default_ec_shape,
+                runtime_map,
+            ),
+        }?;
+        if config.socket_path() != self.configured_socket_path {
+            return Err(StorageNodeServerError::BootstrapSocketPathMismatch {
+                configured: self.configured_socket_path.clone(),
+                runtime_map: config.socket_path().to_path_buf(),
+                node_id: self.node_id.as_u32(),
+            });
+        }
+        config.persist_control_plane_runtime_config()?;
+        Ok(PreparedStorageNodeServer::with_data_dir_guard(
+            config,
+            self.data_dir_guard,
+        ))
+    }
+}
+
+/// One-shot storage-node bind input.
+///
+/// A control-plane bootstrap returns this only after durably persisting the
+/// exact contained configuration. Its private data-directory guard prevents a
+/// second bootstrap from replacing that configuration before [`Self::bind`]
+/// consumes both values together.
+pub struct PreparedStorageNodeServer {
+    config: StorageNodeProcessConfig,
+    data_dir_guard: Option<StorageNodeDataDirGuard>,
+}
+
+impl PreparedStorageNodeServer {
+    #[must_use]
+    pub fn new(config: StorageNodeProcessConfig) -> Self {
+        Self {
+            config,
+            data_dir_guard: None,
+        }
+    }
+
+    fn with_data_dir_guard(
+        config: StorageNodeProcessConfig,
+        data_dir_guard: StorageNodeDataDirGuard,
+    ) -> Self {
+        Self {
+            config,
+            data_dir_guard: Some(data_dir_guard),
+        }
+    }
+
+    #[must_use]
+    pub fn config(&self) -> &StorageNodeProcessConfig {
+        &self.config
+    }
+
+    pub fn bind(self) -> Result<StorageNodeServer, StorageNodeServerError> {
+        match self.data_dir_guard {
+            Some(data_dir_guard) => {
+                StorageNodeServer::bind_with_data_dir_guard(self.config, data_dir_guard)
+            }
+            None => StorageNodeServer::bind(self.config),
+        }
     }
 }
 
@@ -1877,13 +2077,14 @@ impl StorageNodeServer {
         Self::bind_with_data_dir_guard(config, data_dir_guard)
     }
 
-    pub fn bind_with_data_dir_guard(
+    fn bind_with_data_dir_guard(
         config: StorageNodeProcessConfig,
         data_dir_guard: StorageNodeDataDirGuard,
     ) -> Result<Self, StorageNodeServerError> {
         validate_process_config_route_table(&config)?;
-        validate_socket_directory(&config.socket_path)?;
         let data_dir_lock = data_dir_guard.into_lock_for(&config.data_dir)?;
+        validate_process_config_matches_persisted_runtime_config(&config)?;
+        validate_socket_directory(&config.socket_path)?;
         cleanup_stale_socket_path(&config.socket_path)?;
         let node = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
@@ -11972,7 +12173,9 @@ impl Drop for StorageNodeServer {
     }
 }
 
-pub fn advance_storage_node_incarnation(data_dir: &Path) -> Result<u64, StorageNodeServerError> {
+pub(crate) fn advance_storage_node_incarnation(
+    data_dir: &Path,
+) -> Result<u64, StorageNodeServerError> {
     fs::create_dir_all(data_dir).map_err(|source| StorageNodeServerError::Io {
         context: "create storage-node data directory for incarnation",
         path: data_dir.to_path_buf(),
@@ -12707,6 +12910,136 @@ mod tests {
             "2\n"
         );
         assert!(!data_dir.join(STORAGE_NODE_INCARNATION_TMP_FILE).exists());
+    }
+
+    #[test]
+    fn storage_node_bootstrap_owns_raw_startup_and_persists_runtime_config() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let data_dir = tmp.path().join("node");
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let default_ec_shape = EcShape { k: 1, m: 0 };
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+        let now_ms = crate::clock::current_time_millis();
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 1,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 10_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                now_ms,
+            )
+            .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 1,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 10_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                now_ms.saturating_add(1),
+            )
+            .unwrap();
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+        let runtime_map = authority
+            .snapshot()
+            .runtime_map(now_ms.saturating_add(2))
+            .unwrap();
+
+        let bootstrap = StorageNodeBootstrap::open_control_plane_managed(
+            node_id,
+            &data_dir,
+            &[pg_id.get()],
+            default_ec_shape,
+            &socket_path,
+        )
+        .unwrap();
+        assert_eq!(bootstrap.node_incarnation(), 1);
+        let initial_heartbeat = bootstrap.control_plane_heartbeat(10_000).unwrap();
+        assert_eq!(initial_heartbeat.node_id, node_id);
+        assert_eq!(initial_heartbeat.node_incarnation, 1);
+        assert_eq!(initial_heartbeat.observed_epoch, ClusterEpoch::INITIAL);
+        assert_eq!(initial_heartbeat.endpoint, socket_path.to_str().unwrap());
+        assert!(initial_heartbeat.pg_observations.is_empty());
+
+        let prepared = bootstrap.prepare(&runtime_map).unwrap();
+        let config = prepared.config();
+        assert_eq!(config.node_id(), node_id);
+        assert_eq!(config.cluster_epoch(), runtime_map.cluster_epoch());
+        assert_eq!(config.socket_path(), socket_path);
+        let loaded = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &data_dir,
+            node_id,
+            default_ec_shape,
+            &socket_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_storage_node_process_config_eq(&loaded, config);
+        let server = prepared.bind().unwrap();
+        let served_heartbeat = server.control_plane_heartbeat(1, 10_000).unwrap();
+        assert_eq!(served_heartbeat.observed_epoch, runtime_map.cluster_epoch());
+        assert_eq!(served_heartbeat.pg_observations.len(), 1);
+        drop(server);
+
+        let restarted = StorageNodeBootstrap::open_control_plane_managed(
+            node_id,
+            &data_dir,
+            &[pg_id.get()],
+            default_ec_shape,
+            &socket_path,
+        )
+        .unwrap();
+        assert_eq!(restarted.node_incarnation(), 2);
+        let restart_heartbeat = restarted.control_plane_heartbeat(10_000).unwrap();
+        assert_eq!(
+            restart_heartbeat.observed_epoch,
+            runtime_map.cluster_epoch()
+        );
+        assert_eq!(restart_heartbeat.endpoint, socket_path.to_str().unwrap());
+        assert_eq!(restart_heartbeat.pg_observations.len(), 1);
+        assert_eq!(restart_heartbeat.pg_observations[0].pg_id, pg_id);
+        let restarted_server = restarted.prepare(&runtime_map).unwrap().bind().unwrap();
+        let served_restart_heartbeat = restarted_server.control_plane_heartbeat(2, 10_000).unwrap();
+        assert_eq!(
+            served_restart_heartbeat.observed_epoch,
+            runtime_map.cluster_epoch()
+        );
+        drop(restarted_server);
+    }
+
+    #[test]
+    fn storage_node_bind_rejects_config_older_than_persisted_runtime_config() {
+        let tmp = test_util::tempdir();
+        let mut persisted = test_config(&tmp);
+        private_socket_dir(persisted.socket_path.parent().unwrap());
+        let stale = persisted.clone();
+        persisted.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        persisted.pg_routes[0].cluster_epoch = persisted.cluster_epoch;
+        persisted.persist_control_plane_runtime_config().unwrap();
+
+        assert!(matches!(
+            StorageNodeServer::bind(stale),
+            Err(StorageNodeServerError::PersistedRuntimeConfigMismatch { path })
+                if path == control_plane_runtime_config_path(&persisted.data_dir)
+        ));
     }
 
     #[test]

@@ -89,11 +89,14 @@ cluster startup paths must run recovery before serving PG state.
 
 `PgStore::open` bootstraps the schema, digest triggers, and replica-state row.
 It does not reconcile crash leftovers by itself because recovery needs the
-owning `NodeId`. `StorageNodeServer::bind`, the control-plane-managed pre-bind
-startup heartbeat path, and the local-cluster builder all call
-`SharedStorageNode::recover_pg_metadata_command_state(node_id)` before serving
-PG state. The pre-bind startup path holds the storage-node data-dir lock before
-opening and recovering the node, then transfers that guard into bind.
+owning `NodeId`. `StorageNodeServer::bind`, `StorageNodeBootstrap`, and the
+local-cluster builder all run raw-node metadata-command recovery before serving
+PG state. The bootstrap path holds the storage-node data-dir lock before
+opening and recovering the node, then consumes itself to produce a one-shot
+prepared server that couples the exact persisted runtime configuration to that
+guard until bind. Bind also rejects any process configuration that differs from
+an existing persisted control-plane runtime configuration. Raw `PgStore` and
+shared-node construction are private storage-engine details.
 
 Recovery is a distinct pass that runs after `PgStore::open`. The recovery epoch
 is the store's own `metadata_command_replica_state.cluster_epoch`, read

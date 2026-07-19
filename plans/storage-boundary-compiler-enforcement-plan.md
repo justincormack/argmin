@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phase 0 complete
+Status: active — Phases 0–1 complete
 
 ## Goal
 
@@ -380,6 +380,49 @@ Completion:
 - public documentation exposes the cluster facade rather than storage-engine
   internals
 - boundary-script public-API inventories covering these exports are removed
+
+Implementation update (2026-07-19):
+
+- the external-user inventory found one production raw-node consumer: the
+  control-plane-managed startup heartbeat path in `argmin-s3`; server-core and
+  the other workspace crates did not consume raw node, PG-store, or shard-store
+  types
+- `StorageNodeBootstrap` now owns the pre-bind data-directory lock,
+  incarnation advance, raw-node open and recovery, startup heartbeat
+  construction, refreshed process-config construction, and durable runtime-map
+  persistence; consuming finalization returns a one-shot prepared server that
+  keeps the exact persisted process config coupled to the data-directory guard
+  until bind, while `argmin-s3` receives only the heartbeat, prepared server,
+  and incarnation
+- the raw `node`, `pg_store`, and `traits` modules are private, and
+  `SharedStorageNode`, `LocalStorageNode`, `PgStore`, `ShardStore`, and
+  `StorageNode` are no longer publicly re-exported
+- the local-cluster raw-node accessors are crate-private and `LocalNodeStore`
+  is no longer publicly exported, so external request code cannot recover a
+  raw node through the public cluster facade
+- crate documentation and the recovery guide now present `StorageCluster`,
+  `StorageNodeBootstrap`, and `StorageNodeServer` as the production boundary
+- methods used only by raw-engine tests or awaiting Phase 2 migration remain
+  explicitly dead-code-tolerant inside the three private implementation
+  modules; this avoids reopening the public surface while preserving the
+  staged internal-boundary work
+- the metadata-method checker inventory was reclassified from a public-surface
+  inventory to a temporary internal migration prohibition: module privacy now
+  enforces the external boundary, while the scan still prevents sibling-module
+  bypasses until Phase 2 changes the internal layout
+- focused bootstrap coverage proves the initial heartbeat is built without
+  exposing the node, the control-plane runtime map is converted and persisted,
+  the prepared server actually binds the exact persisted configuration, and a
+  restart advances incarnation while using and binding the persisted epoch and
+  PG observation; a separate regression rejects binding an older config after
+  a newer runtime configuration has been persisted
+- initial validation passed the storage boundary check, strict workspace
+  Clippy, and all 7,104 workspace tests
+- after the one-shot prepared-bind review correction, the focused storage and
+  application bootstrap/bind regressions, boundary check, and strict workspace
+  Clippy passed; a full 7,105-test run reached 3,313 passes before two untouched
+  authorization-model matrix tests failed under unusually high machine load,
+  and both failures passed together on an isolated rerun
 
 ### Phase 2 — enforce the internal node boundary
 
