@@ -1210,7 +1210,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn matching_stream_upload_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateStreamUploadReq,
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError> {
@@ -1224,7 +1224,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn matching_multipart_upload_initiated_at(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateMultipartUploadReq,
         expected_command: Option<&CreateMultipartUploadCommand>,
     ) -> Result<Option<u64>, ObjectPgActionError> {
@@ -2834,7 +2834,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn matching_stream_upload_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateStreamUploadReq,
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError> {
@@ -2858,7 +2858,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn matching_multipart_upload_initiated_at(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateMultipartUploadReq,
         expected_command: Option<&CreateMultipartUploadCommand>,
     ) -> Result<Option<u64>, ObjectPgActionError> {
@@ -2963,7 +2963,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             Err(error) => return Err(error.into()),
         }
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;
@@ -3009,7 +3009,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             &request.request.key,
         )?;
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;

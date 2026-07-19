@@ -774,6 +774,35 @@ Eighth Phase 3 slice:
   regressions, the boundary checker, formatting, workspace-wide strict Clippy,
   and the full workspace suite (7,150 tests).
 
+Ninth Phase 3 slice:
+
+- upload initiation now requires `ObjectMetadataPgId` for PutObject/UploadPart
+  stream-session match detection, multipart-upload match detection, and both
+  create-command request values. The duplicate match methods on the
+  transitional `StorageNodeClient` aggregate carry the same exact-object role.
+- PutObject stream creation, multipart initiation, UploadPart session
+  creation, and the reservation-preserving internal stream-create path derive
+  one exact-object role for `(bucket, key)`. Raw `PgId` remains only for the
+  still-generic pending-command, reservation, installation, and application
+  helpers used around those typed node-client calls.
+- local adapters erase the role only at the private raw-node boundary. Unix
+  adapters serialize its raw route evidence and validate command responses
+  against its raw projection. The Unix server reconstructs the role only
+  after route, primary, exact object-placement, and, for command builders,
+  bucket-write-reservation validation.
+- the two-PG adversarial Unix regression uses the existing identical
+  fixed-clock object state. Correctly routed absent stream and multipart match
+  checks are positive canaries; test-forged wrong-role match checks and both
+  command builders must fail with the exact `PayloadDecode` placement error.
+  Without server-side placement validation, the wrong PG has sufficient
+  coherent state to return an absent match or build the command.
+- stream-session lookup/finalization, multipart read/management/completion,
+  reclaim/scan, and data-client signatures, `DataPgId` construction, and
+  request-scoped route capability values remain open in Phase 3.
+- the ninth slice passed its focused correct/wrong upload-initiation PG Unix
+  regressions, the boundary checker, formatting, workspace-wide strict Clippy,
+  and the full workspace suite (7,150 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

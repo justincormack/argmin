@@ -339,7 +339,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..21)
+    let server_threads: Vec<_> = (0..27)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -578,6 +578,121 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         .unwrap_err();
     assert!(matches!(
         lifecycle_list_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let stream_request = CreateStreamUploadReq {
+        session_id: crate::tests::stream_session_id("wrong-pg-stream"),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        target: StreamUploadTarget::PutObject,
+        encryption: ObjectEncryption::None,
+    };
+    assert!(
+        !ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
+            &client,
+            correct_object_pg,
+            &stream_request,
+            None,
+        )
+        .unwrap(),
+        "correctly routed absent stream session must be a positive request canary"
+    );
+    let stream_match_error = ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
+        &client,
+        wrong_object_pg,
+        &stream_request,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        stream_match_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    let stream_command_error =
+        ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
+            &client,
+            BuildCreateStreamUploadCommandReq {
+                pg_id: wrong_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                request: &stream_request,
+                precondition: CreateStreamUploadPrecondition::PutObject {
+                    expected_current: current_delete_snapshot.stored.as_ref(),
+                    require_generation_reservation: false,
+                },
+                bucket_write_reservation: &metadata_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        stream_command_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let multipart_request = CreateMultipartUploadReq {
+        upload_id: crate::tests::multipart_upload_id("wrong-object-pg-multipart"),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: SerializedMetadataBlob::default(),
+        system_metadata_blob: SerializedSystemMetadataBlob::default(),
+        initiator: OwnerIdentity::from_principal("owner"),
+        owner: OwnerIdentity::from_principal("owner"),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        object_lock: ObjectLockState::default(),
+        checksum: None,
+        encryption: ObjectEncryption::None,
+    };
+    assert_eq!(
+        ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
+            &client,
+            correct_object_pg,
+            &multipart_request,
+            None,
+        )
+        .unwrap(),
+        None,
+        "correctly routed absent multipart upload must be a positive request canary"
+    );
+    let multipart_match_error =
+        ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
+            &client,
+            wrong_object_pg,
+            &multipart_request,
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        multipart_match_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    let multipart_command_error =
+        ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
+            &client,
+            BuildCreateMultipartUploadCommandReq {
+                pg_id: wrong_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                request: &multipart_request,
+                expected_current: current_delete_snapshot.stored.as_ref(),
+                bucket_write_reservation: &metadata_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        multipart_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
             code: StorageRpcErrorCode::PayloadDecode,
             ..
@@ -1186,7 +1301,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     assert!(
         !ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
             &client,
-            PgId::new(0),
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
             &stream_request,
             None,
         )
@@ -1195,7 +1310,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let stream_command = ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
         &client,
         BuildCreateStreamUploadCommandReq {
-            pg_id: PgId::new(0),
+            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             request: &stream_request,
             precondition: CreateStreamUploadPrecondition::PutObject {
@@ -1237,7 +1352,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         .validate_create_stream_upload_command_response(
             &bad_stream_command,
             &BuildCreateStreamUploadCommandReq {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &stream_request,
                 precondition: CreateStreamUploadPrecondition::PutObject {
@@ -1276,7 +1391,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let err = ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
         &client,
         BuildCreateStreamUploadCommandReq {
-            pg_id: PgId::new(0),
+            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             request: &missing_upload_part_stream_request,
             precondition: CreateStreamUploadPrecondition::UploadPart {
@@ -1310,7 +1425,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     assert_eq!(
         ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
             &client,
-            PgId::new(0),
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
             &multipart_request,
             None,
         )
@@ -1321,7 +1436,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
             &client,
             BuildCreateMultipartUploadCommandReq {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &multipart_request,
                 expected_current: Some(&stored),
@@ -1380,7 +1495,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         .validate_create_multipart_upload_command_response(
             &bad_multipart_command,
             &BuildCreateMultipartUploadCommandReq {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &multipart_request,
                 expected_current: Some(&stored),
@@ -1433,7 +1548,7 @@ fn unix_object_mutation_client_rejects_stale_upload_part_stream_command_epoch() 
     let err = ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
         &client,
         BuildCreateStreamUploadCommandReq {
-            pg_id: PgId::new(0),
+            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
             cluster_epoch: stale_epoch,
             request: &request,
             precondition: CreateStreamUploadPrecondition::UploadPart {

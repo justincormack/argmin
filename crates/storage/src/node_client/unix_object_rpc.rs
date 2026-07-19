@@ -1516,12 +1516,12 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
 impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     fn matching_stream_upload_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateStreamUploadReq,
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError> {
         let request = StorageRpcStreamUploadMatchRequest {
-            object: self.object_request(pg_id, &create.bucket, &create.key),
+            object: self.object_request(pg_id.pg_id(), &create.bucket, &create.key),
             request: create.clone(),
             expected_command: expected_command.cloned(),
         };
@@ -1544,12 +1544,12 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn matching_multipart_upload_initiated_at(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateMultipartUploadReq,
         expected_command: Option<&CreateMultipartUploadCommand>,
     ) -> Result<Option<u64>, ObjectPgActionError> {
         let request = StorageRpcMultipartUploadMatchRequest {
-            object: self.object_request(pg_id, &create.bucket, &create.key),
+            object: self.object_request(pg_id.pg_id(), &create.bucket, &create.key),
             request: create.clone(),
             expected_command: expected_command.cloned(),
         };
@@ -2032,7 +2032,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         };
         let rpc_request = StorageRpcCreateStreamUploadCommandBuildRequest {
             object: self.object_request(
-                request.pg_id,
+                request.pg_id.pg_id(),
                 &request.request.bucket,
                 &request.request.key,
             ),
@@ -2049,7 +2049,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             })?;
         match self.object_metadata_command_build_request(
             StorageRpcMessageKind::ObjectStreamUploadCommandBuild,
-            request.pg_id,
+            request.pg_id.pg_id(),
             payload,
             "decode stream upload command build response",
             ObjectPgActionError::StaleObjectReadSubject,
@@ -2087,7 +2087,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         let rpc_request = StorageRpcCreateMultipartUploadCommandBuildRequest {
             object: self.object_request(
-                request.pg_id,
+                request.pg_id.pg_id(),
                 &request.request.bucket,
                 &request.request.key,
             ),
@@ -2105,7 +2105,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         )?;
         match self.object_metadata_command_build_request(
             StorageRpcMessageKind::ObjectMultipartUploadCommandBuild,
-            request.pg_id,
+            request.pg_id.pg_id(),
             payload,
             "decode multipart upload command build response",
             ObjectPgActionError::StaleObjectReadSubject,

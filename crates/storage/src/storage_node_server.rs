@@ -6250,7 +6250,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let exists = match ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.request,
             request.expected_command.as_ref(),
         ) {
@@ -6775,7 +6775,7 @@ impl StorageNodeConnectionHandler {
         let initiated_at =
             match ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
                 &local_client,
-                request.object.pg_id,
+                self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 &request.request,
                 request.expected_command.as_ref(),
             ) {
@@ -7100,7 +7100,8 @@ impl StorageNodeConnectionHandler {
         let response = match ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
             &local_client,
             BuildCreateStreamUploadCommandReq {
-                pg_id: request.object.pg_id,
+                pg_id: self
+                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 cluster_epoch: request.object.cluster_epoch,
                 request: &request.request,
                 precondition,
@@ -7143,7 +7144,8 @@ impl StorageNodeConnectionHandler {
         let response = match ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
             &local_client,
             BuildCreateMultipartUploadCommandReq {
-                pg_id: request.object.pg_id,
+                pg_id: self
+                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 cluster_epoch: request.object.cluster_epoch,
                 request: &request.request,
                 expected_current: request.expected_current.as_ref(),

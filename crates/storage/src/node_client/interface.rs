@@ -471,14 +471,14 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn matching_stream_upload_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateStreamUploadReq,
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError>;
 
     fn matching_multipart_upload_initiated_at(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateMultipartUploadReq,
         expected_command: Option<&CreateMultipartUploadCommand>,
     ) -> Result<Option<u64>, ObjectPgActionError>;
@@ -774,7 +774,7 @@ pub(crate) enum CreateStreamUploadPrecondition<'a> {
 }
 
 pub(crate) struct BuildCreateStreamUploadCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CreateStreamUploadReq,
     pub(crate) precondition: CreateStreamUploadPrecondition<'a>,
@@ -782,7 +782,7 @@ pub(crate) struct BuildCreateStreamUploadCommandReq<'a> {
 }
 
 pub(crate) struct BuildCreateMultipartUploadCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CreateMultipartUploadReq,
     pub(crate) expected_current: Option<&'a StoredObject>,
@@ -1775,14 +1775,14 @@ pub(crate) trait StorageNodeClient:
 
     fn matching_stream_upload_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateStreamUploadReq,
         expected_command: Option<&CreateStreamUploadCommand>,
     ) -> Result<bool, ObjectPgActionError>;
 
     fn matching_multipart_upload_initiated_at(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         create: &CreateMultipartUploadReq,
         expected_command: Option<&CreateMultipartUploadCommand>,
     ) -> Result<Option<u64>, ObjectPgActionError>;

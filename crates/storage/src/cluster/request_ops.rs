@@ -11035,7 +11035,7 @@ impl super::StorageCluster {
                 };
                 if mutation_client
                     .matching_stream_upload_exists(
-                        pg_id,
+                        object_pg_id,
                         &create,
                         super::applied_stream_create_command(&applied_commands, &create),
                     )
@@ -11052,7 +11052,7 @@ impl super::StorageCluster {
                 );
                 let command = match mutation_client.build_create_stream_upload_command(
                     BuildCreateStreamUploadCommandReq {
-                        pg_id,
+                        pg_id: object_pg_id,
                         cluster_epoch: self.operation_epoch(),
                         request: &create,
                         precondition: CreateStreamUploadPrecondition::PutObject {
@@ -11522,7 +11522,7 @@ impl super::StorageCluster {
                 let applied_create =
                     super::applied_multipart_create_command(&applied_commands, &create);
                 if let Some(initiated_at) = mutation_client
-                    .matching_multipart_upload_initiated_at(pg_id, &create, applied_create)
+                    .matching_multipart_upload_initiated_at(object_pg_id, &create, applied_create)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                 {
                     return Ok(Ok(Attempt::Complete(CreateMultipartUploadOutcome {
@@ -11537,7 +11537,7 @@ impl super::StorageCluster {
 
                 let mut command = match mutation_client.build_create_multipart_upload_command(
                     BuildCreateMultipartUploadCommandReq {
-                        pg_id,
+                        pg_id: object_pg_id,
                         cluster_epoch: self.operation_epoch(),
                         request: &create,
                         expected_current: current_object.stored.as_ref(),
@@ -11671,7 +11671,8 @@ impl super::StorageCluster {
             session_id,
             bucket_write_reservation,
         } = req;
-        let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
+        let object_pg_id = self.object_metadata_pg(&bucket, &key);
+        let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
         macro_rules! release_caller_bucket_write_proof {
             () => {{
@@ -11727,7 +11728,7 @@ impl super::StorageCluster {
                 encryption: upload.encryption.clone(),
             };
             match mutation_client.matching_stream_upload_exists(
-                pg_id,
+                object_pg_id,
                 &create,
                 super::applied_stream_create_command(&applied_commands, &create),
             ) {
@@ -11745,7 +11746,7 @@ impl super::StorageCluster {
             }
             let command = match mutation_client.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
-                    pg_id,
+                    pg_id: object_pg_id,
                     cluster_epoch: self.operation_epoch(),
                     request: &create,
                     precondition: CreateStreamUploadPrecondition::UploadPart {
@@ -11803,7 +11804,8 @@ impl super::StorageCluster {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         loop {
             let reservation = match self.acquire_durable_bucket_write_reservation(
@@ -11866,7 +11868,7 @@ impl super::StorageCluster {
                 encryption: upload.encryption.clone(),
             };
             match mutation_client.matching_stream_upload_exists(
-                pg_id,
+                object_pg_id,
                 &create,
                 super::applied_stream_create_command(&applied_commands, &create),
             ) {
@@ -11882,7 +11884,7 @@ impl super::StorageCluster {
             }
             let command = match mutation_client.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
-                    pg_id,
+                    pg_id: object_pg_id,
                     cluster_epoch: self.operation_epoch(),
                     request: &create,
                     precondition: CreateStreamUploadPrecondition::UploadPart {

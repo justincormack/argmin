@@ -8834,7 +8834,8 @@ impl StorageCluster {
         crate::metadata_command::metadata_command_publisher!(
             CreatePutObjectStreamSessionRecordUnderReservation
         );
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let request = CreateStreamUploadReq {
             session_id: session_id.clone(),
             bucket: bucket.clone(),
@@ -8850,13 +8851,17 @@ impl StorageCluster {
                 self.drain_pending_object_metadata_commands_for_bucket_collect(pg_id, bucket)?;
             let expected_command = applied_stream_create_command(&applied_commands, &request);
             let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-            if mutation_client.matching_stream_upload_exists(pg_id, &request, expected_command)? {
+            if mutation_client.matching_stream_upload_exists(
+                object_pg_id,
+                &request,
+                expected_command,
+            )? {
                 return Ok(BucketWriteReservationDisposition::ReleaseByCaller);
             }
             self.reserve_put_object_generation(bucket, key, session_id)?;
             let command = match mutation_client.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
-                    pg_id,
+                    pg_id: object_pg_id,
                     cluster_epoch: self.operation_epoch(),
                     request: &request,
                     precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {

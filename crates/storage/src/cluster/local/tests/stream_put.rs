@@ -1249,7 +1249,11 @@ fn stream_put_heartbeat_updates_persisted_bucket_write_proof() {
         cluster
             .object_mutation_metadata_primary_client(&bucket, &key)
             .unwrap()
-            .matching_stream_upload_exists(PgId::new(2), &create, Some(&original_command),)
+            .matching_stream_upload_exists(
+                cluster.object_metadata_pg(&bucket, &key),
+                &create,
+                Some(&original_command),
+            )
             .unwrap(),
         "stream create idempotency should ignore the mutable proof lease deadline"
     );
