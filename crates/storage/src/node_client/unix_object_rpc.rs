@@ -3132,12 +3132,12 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_current_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
         self.load_object_delete_snapshot(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             key,
             None,
@@ -3147,13 +3147,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_specific_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
         self.load_object_delete_snapshot(
-            pg_id,
+            pg_id.pg_id(),
             bucket,
             key,
             Some(version_id),
@@ -3163,11 +3163,11 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn list_object_versions_for_lifecycle(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
-        self.load_object_lifecycle_version_list(pg_id, bucket, key)
+        self.load_object_lifecycle_version_list(pg_id.pg_id(), bucket, key)
     }
 
     fn build_delete_specific_object_version_command(
@@ -3175,7 +3175,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         request: BuildDeleteSpecificObjectVersionCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
         let rpc_request = StorageRpcDeleteSpecificObjectCommandBuildRequest {
-            object: self.object_request(request.pg_id, request.bucket, request.key),
+            object: self.object_request(request.pg_id.pg_id(), request.bucket, request.key),
             version_id: request.version_id,
             expected_stored: request.expected_stored.cloned(),
             expected_target: request.expected_target.cloned(),
@@ -3191,7 +3191,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             })?;
         self.object_metadata_command_build_request(
             StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild,
-            request.pg_id,
+            request.pg_id.pg_id(),
             payload,
             "decode delete-specific object command build response",
             ObjectPgActionError::StaleObjectReadSubject,
@@ -3204,7 +3204,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         request: BuildDeleteCurrentObjectCommandReq<'_>,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
         let rpc_request = StorageRpcDeleteCurrentObjectCommandBuildRequest {
-            object: self.object_request(request.pg_id, request.bucket, request.key),
+            object: self.object_request(request.pg_id.pg_id(), request.bucket, request.key),
             expected_current: request.expected_current.cloned(),
             expected_target: request.expected_target.cloned(),
             bucket_write_reservation: request.bucket_write_reservation.clone(),
@@ -3218,7 +3218,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             })?;
         self.object_metadata_command_build_request(
             StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild,
-            request.pg_id,
+            request.pg_id.pg_id(),
             payload,
             "decode delete-current object command build response",
             ObjectPgActionError::StaleObjectReadSubject,
@@ -3241,7 +3241,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             }
         };
         let rpc_request = StorageRpcInsertDeleteMarkerCommandBuildRequest {
-            object: self.object_request(request.pg_id, request.bucket, request.key),
+            object: self.object_request(request.pg_id.pg_id(), request.bucket, request.key),
             expected_current: request.expected_current.cloned(),
             expected_stale_payload_source: request.expected_stale_payload_source.cloned(),
             version_id: request.version_id,
@@ -3258,7 +3258,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             })?;
         match self.object_metadata_command_build_request(
             StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild,
-            request.pg_id,
+            request.pg_id.pg_id(),
             payload,
             "decode insert-delete-marker command build response",
             ObjectPgActionError::StaleObjectReadSubject,

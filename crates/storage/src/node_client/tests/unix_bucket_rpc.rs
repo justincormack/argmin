@@ -893,7 +893,7 @@ fn unix_delete_specific_command_response_rejects_wrong_reclaim_target() {
         .validate_delete_specific_object_command_response(
             &command,
             &BuildDeleteSpecificObjectVersionCommandReq {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 bucket: &bucket,
                 key: &key,
@@ -959,7 +959,7 @@ fn unix_insert_delete_marker_response_rejects_wrong_snapshot_stale_payload() {
         .validate_insert_delete_marker_command_response(
             &command,
             &BuildInsertDeleteMarkerCommandReq {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 bucket: &bucket,
                 key: &key,

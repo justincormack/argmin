@@ -434,14 +434,14 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_current_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
 
     fn load_specific_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
@@ -449,7 +449,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn list_object_versions_for_lifecycle(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError>;
@@ -853,7 +853,7 @@ pub(crate) struct BuildPutObjectMetadataCommandReq<'a> {
 }
 
 pub(crate) struct BuildDeleteSpecificObjectVersionCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
@@ -865,7 +865,7 @@ pub(crate) struct BuildDeleteSpecificObjectVersionCommandReq<'a> {
 }
 
 pub(crate) struct BuildDeleteCurrentObjectCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
@@ -881,7 +881,7 @@ pub(crate) struct ObjectDeleteStorageSnapshot {
 }
 
 pub(crate) struct BuildInsertDeleteMarkerCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
@@ -1601,14 +1601,14 @@ pub(crate) trait StorageNodeClient:
 
     fn load_current_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError>;
 
     fn load_specific_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
@@ -1616,7 +1616,7 @@ pub(crate) trait StorageNodeClient:
 
     fn list_object_versions_for_lifecycle(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError>;

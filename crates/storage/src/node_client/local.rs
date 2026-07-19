@@ -1159,7 +1159,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_current_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
@@ -1168,7 +1168,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_specific_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
@@ -1180,7 +1180,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn list_object_versions_for_lifecycle(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
@@ -2299,7 +2299,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_current_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<ObjectDeleteStorageSnapshot, ObjectPgActionError> {
@@ -2312,7 +2312,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_specific_object_delete_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
@@ -2326,7 +2326,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn list_object_versions_for_lifecycle(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
@@ -2379,7 +2379,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             return Err(ObjectPgActionError::StaleObjectReadSubject);
         }
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;
@@ -2412,7 +2412,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             return Err(ObjectPgActionError::StaleObjectReadSubject);
         }
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;
@@ -2455,7 +2455,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         let write_sequence =
             pg.next_object_write_sequence(request.bucket.as_str(), request.key.as_str())?;
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;

@@ -742,6 +742,38 @@ Seventh Phase 3 slice:
   regressions, the boundary checker, formatting, workspace-wide strict Clippy,
   and the full workspace suite (7,150 tests).
 
+Eighth Phase 3 slice:
+
+- exact-object deletion now requires `ObjectMetadataPgId` for current and
+  specific-version snapshots, lifecycle's per-key version list, and the
+  delete-specific, delete-current, and insert-delete-marker command builders.
+  The duplicate snapshot/list methods on the transitional
+  `StorageNodeClient` aggregate and all three command request values carry the
+  same role.
+- cluster delete and lifecycle paths derive one exact-object role for
+  `(bucket, key)`. They retain its raw projection only for generic
+  pending-command routing, reservation, installation, and application helpers;
+  every object-specific node-client call receives the typed role. PutObject
+  stream-session and multipart-upload initiation use the role for their shared
+  current-object snapshot while retaining raw routing for their still-open
+  stream/multipart interfaces.
+- local adapters erase the role only at the private raw-node boundary. Unix
+  request and response validation erase it at the RPC boundary, and the Unix
+  server reconstructs it only after route, primary, exact object-placement,
+  and, for command builders, bucket-write-reservation validation.
+- the two-PG adversarial Unix regression uses identical fixed-clock live
+  object state on the correct and wrong PGs. Correctly routed current and
+  specific snapshot loads are positive canaries; wrong-role current/specific
+  snapshots, lifecycle listing, and all three command builders must fail with
+  the exact `PayloadDecode` placement error. An unguarded call would otherwise
+  find a coherent object and build a valid command on the wrong PG.
+- multipart/stream mutation, reclaim/scan, and data-client signatures,
+  `DataPgId` construction, and request-scoped route capability values remain
+  open in Phase 3.
+- the eighth slice passed its focused correct/wrong deletion-PG Unix
+  regressions, the boundary checker, formatting, workspace-wide strict Clippy,
+  and the full workspace suite (7,150 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

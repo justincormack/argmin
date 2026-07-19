@@ -6000,7 +6000,7 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectDeleteCurrentSnapshotLoad => {
                 ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
                     &local_client,
-                    request.object.pg_id,
+                    self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                     &request.object.bucket,
                     &request.object.key,
                 )
@@ -6014,7 +6014,7 @@ impl StorageNodeConnectionHandler {
                 };
                 ObjectMutationMetadataNodeClient::load_specific_object_delete_snapshot(
                     &local_client,
-                    request.object.pg_id,
+                    self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                     &request.object.bucket,
                     &request.object.key,
                     version_id,
@@ -6064,7 +6064,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let versions = match ObjectMutationMetadataNodeClient::list_object_versions_for_lifecycle(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
         ) {
@@ -6095,7 +6095,8 @@ impl StorageNodeConnectionHandler {
             match ObjectMutationMetadataNodeClient::build_delete_specific_object_version_command(
                 &local_client,
                 BuildDeleteSpecificObjectVersionCommandReq {
-                    pg_id: request.object.pg_id,
+                    pg_id: self
+                        .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                     cluster_epoch: request.object.cluster_epoch,
                     bucket: &request.object.bucket,
                     key: &request.object.key,
@@ -6142,7 +6143,8 @@ impl StorageNodeConnectionHandler {
         let response = match ObjectMutationMetadataNodeClient::build_delete_current_object_command(
             &local_client,
             BuildDeleteCurrentObjectCommandReq {
-                pg_id: request.object.pg_id,
+                pg_id: self
+                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 cluster_epoch: request.object.cluster_epoch,
                 bucket: &request.object.bucket,
                 key: &request.object.key,
@@ -6195,7 +6197,8 @@ impl StorageNodeConnectionHandler {
         let response = match ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
             &local_client,
             BuildInsertDeleteMarkerCommandReq {
-                pg_id: request.object.pg_id,
+                pg_id: self
+                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 cluster_epoch: request.object.cluster_epoch,
                 bucket: &request.object.bucket,
                 key: &request.object.key,

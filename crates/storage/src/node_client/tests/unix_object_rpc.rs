@@ -339,7 +339,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..13)
+    let server_threads: Vec<_> = (0..21)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -492,6 +492,170 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         lease_deadline: 20,
         target_context: Some(key.as_str().to_string()),
     };
+    let current_delete_snapshot =
+        ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
+            &client,
+            correct_object_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap();
+    assert_eq!(
+        current_delete_snapshot.stored.as_ref(),
+        Some(&metadata_stored)
+    );
+    let current_delete_error =
+        ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
+            &client,
+            wrong_object_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        current_delete_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let specific_delete_snapshot =
+        ObjectMutationMetadataNodeClient::load_specific_object_delete_snapshot(
+            &client,
+            correct_object_pg,
+            &bucket,
+            &key,
+            VersionId::Null,
+        )
+        .unwrap();
+    assert_eq!(
+        specific_delete_snapshot.stored,
+        current_delete_snapshot.stored
+    );
+    assert!(matches!(
+        (
+            specific_delete_snapshot.target.as_ref(),
+            current_delete_snapshot.target.as_ref(),
+        ),
+        (
+            Some(DeleteObjectVersionTarget::Live {
+                generation_id: specific_generation,
+                layout: specific_layout,
+                ..
+            }),
+            Some(DeleteObjectVersionTarget::Live {
+                generation_id: current_generation,
+                layout: current_layout,
+                ..
+            }),
+        ) if specific_generation == current_generation && specific_layout == current_layout
+    ));
+    let specific_delete_error =
+        ObjectMutationMetadataNodeClient::load_specific_object_delete_snapshot(
+            &client,
+            wrong_object_pg,
+            &bucket,
+            &key,
+            VersionId::Null,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        specific_delete_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let lifecycle_list_error =
+        ObjectMutationMetadataNodeClient::list_object_versions_for_lifecycle(
+            &client,
+            wrong_object_pg,
+            &bucket,
+            &key,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        lifecycle_list_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let delete_current_command_error =
+        ObjectMutationMetadataNodeClient::build_delete_current_object_command(
+            &client,
+            BuildDeleteCurrentObjectCommandReq {
+                pg_id: wrong_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                expected_current: current_delete_snapshot.stored.as_ref(),
+                expected_target: current_delete_snapshot.target.as_ref(),
+                bucket_write_reservation: &metadata_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        delete_current_command_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let delete_specific_command_error =
+        ObjectMutationMetadataNodeClient::build_delete_specific_object_version_command(
+            &client,
+            BuildDeleteSpecificObjectVersionCommandReq {
+                pg_id: wrong_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                version_id: VersionId::Null,
+                expected_stored: specific_delete_snapshot.stored.as_ref(),
+                expected_target: specific_delete_snapshot.target.as_ref(),
+                expected_version_list: None,
+                bucket_write_reservation: &metadata_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        delete_specific_command_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let owner = OwnerIdentity::from_principal("owner");
+    let insert_delete_marker_command_error =
+        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
+            &client,
+            BuildInsertDeleteMarkerCommandReq {
+                pg_id: wrong_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                expected_current: current_delete_snapshot.stored.as_ref(),
+                version_id: VersionId::from_u64(2),
+                owner: &owner,
+                stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
+                expected_stale_payload_source: None,
+                bucket_write_reservation: &metadata_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        insert_delete_marker_command_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
     let metadata_command_error =
         ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
             &client,
@@ -884,7 +1048,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
 
     let current = ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
     )
@@ -995,7 +1159,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let delete_command = ObjectMutationMetadataNodeClient::build_delete_current_object_command(
         &client,
         BuildDeleteCurrentObjectCommandReq {
-            pg_id: PgId::new(0),
+            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             bucket: &bucket,
             key: &key,
