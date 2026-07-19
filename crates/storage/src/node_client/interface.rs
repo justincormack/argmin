@@ -421,7 +421,7 @@ pub(crate) trait ObjectListingMetadataNodeClient: Send + Sync {
 pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
     fn load_put_object_metadata_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -841,7 +841,7 @@ pub(crate) struct BuildAuthorizedAbortMultipartUploadCommandReq<'a> {
 }
 
 pub(crate) struct BuildPutObjectMetadataCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
@@ -1588,7 +1588,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_put_object_metadata_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,

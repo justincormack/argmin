@@ -5911,7 +5911,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let outcome = match ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             request.version_id,
@@ -5945,7 +5945,8 @@ impl StorageNodeConnectionHandler {
         let response = match ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
             &local_client,
             BuildPutObjectMetadataCommandReq {
-                pg_id: request.object.pg_id,
+                pg_id: self
+                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 cluster_epoch: request.object.cluster_epoch,
                 bucket: &request.object.bucket,
                 key: &request.object.key,

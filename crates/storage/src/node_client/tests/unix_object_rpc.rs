@@ -339,7 +339,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..10)
+    let server_threads: Vec<_> = (0..13)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -450,6 +450,66 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
     .unwrap_err();
     assert!(matches!(
         read_tags_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let metadata_stored = ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
+        &client,
+        correct_object_pg,
+        &bucket,
+        &key,
+        None,
+    )
+    .unwrap();
+    let metadata_snapshot_error =
+        ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
+            &client,
+            wrong_object_pg,
+            &bucket,
+            &key,
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        metadata_snapshot_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    let metadata_proof = BucketWriteReservationProof {
+        bucket: bucket.clone(),
+        reservation_id: "wrong-object-pg-metadata-proof".to_string(),
+        owner_token: "wrong-object-pg-metadata-owner".to_string(),
+        cluster_epoch: ClusterEpoch::new(1).unwrap(),
+        bucket_execution_generation: 1,
+        bucket_incarnation_generation: 1,
+        operation_kind: "put-object-metadata".to_string(),
+        created_at: 10,
+        lease_deadline: 20,
+        target_context: Some(key.as_str().to_string()),
+    };
+    let metadata_command_error =
+        ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
+            &client,
+            BuildPutObjectMetadataCommandReq {
+                pg_id: wrong_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                requested_version_id: None,
+                expected_stored: &metadata_stored,
+                version_id: VersionId::Null,
+                mutation: PutObjectMetadataMutation::PutTags("<Tagging/>".to_string()),
+                bucket_write_reservation: &metadata_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        metadata_command_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
             code: StorageRpcErrorCode::PayloadDecode,
             ..
@@ -792,7 +852,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
 
     let stored = ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         None,
@@ -804,7 +864,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     let put_command = ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
         &client,
         BuildPutObjectMetadataCommandReq {
-            pg_id: PgId::new(0),
+            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             bucket: &bucket,
             key: &key,

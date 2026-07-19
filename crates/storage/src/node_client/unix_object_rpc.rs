@@ -3028,13 +3028,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_put_object_metadata_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
     ) -> Result<StoredObject, ObjectPgActionError> {
         let request = StorageRpcPutObjectMetadataSnapshotRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             version_id,
         };
         let payload = encode_put_object_metadata_snapshot_request(&request);
@@ -3073,7 +3073,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         request: BuildPutObjectMetadataCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         let rpc_request = StorageRpcPutObjectMetadataCommandBuildRequest {
-            object: self.object_request(request.pg_id, request.bucket, request.key),
+            object: self.object_request(request.pg_id.pg_id(), request.bucket, request.key),
             requested_version_id: request.requested_version_id,
             expected_stored: request.expected_stored.clone(),
             version_id: request.version_id,
@@ -3120,7 +3120,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 cluster_epoch,
                 log_index,
             } => Err(self.metadata_command_log_conflict_error(
-                request.pg_id,
+                request.pg_id.pg_id(),
                 "decode object metadata PUT command build response",
                 node_id,
                 conflict_pg_id,

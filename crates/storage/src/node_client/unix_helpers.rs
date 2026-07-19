@@ -623,7 +623,7 @@ impl UnixStorageNodeClient {
         let context = "validate object metadata PUT command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             context,
         )?;

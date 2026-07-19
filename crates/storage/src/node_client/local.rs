@@ -1140,7 +1140,7 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
 impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
     fn load_put_object_metadata_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -2233,7 +2233,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_put_object_metadata_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -2281,7 +2281,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             .as_live()
             .ok_or(MetadataError::MethodNotAllowedOnDeleteMarker)?;
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;

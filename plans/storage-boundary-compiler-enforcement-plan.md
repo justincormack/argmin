@@ -714,6 +714,34 @@ Sixth Phase 3 slice:
   regressions, the boundary checker, formatting, workspace-wide strict Clippy,
   and the full workspace suite (7,141 tests).
 
+Seventh Phase 3 slice:
+
+- the object metadata-property update path now requires
+  `ObjectMetadataPgId` for both
+  `ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot` and
+  `BuildPutObjectMetadataCommandReq`, including the duplicate snapshot method
+  on the transitional `StorageNodeClient` aggregate. This covers tag, ACL,
+  retention, and legal-hold mutations that share the snapshot-sensitive
+  publisher.
+- cluster mutation code derives one exact-object role for `(bucket, key)` and
+  uses its raw projection only for generic pending-command routing. Local
+  command-ID allocation erases the role at the private store boundary; Unix
+  request encoding and command-response route validation erase it only at the
+  RPC boundary.
+- the Unix server reconstructs the object role after the existing route,
+  primary, exact object-placement, and bucket-write-reservation binding checks.
+- the two-PG adversarial regression now requires both metadata snapshot loading
+  and command construction to fail with the exact `PayloadDecode` placement
+  error for a test-forged wrong role. Identical fixed-clock object state exists
+  on both PGs, while a correctly routed metadata snapshot is the positive
+  canary, so an unguarded wrong-PG call would otherwise succeed.
+- object deletion, multipart/stream mutation, reclaim/scan, and data-client
+  signatures, `DataPgId` construction, and request-scoped route capability
+  values remain open in Phase 3.
+- the seventh slice passed its focused correct/wrong object-metadata PG Unix
+  regressions, the boundary checker, formatting, workspace-wide strict Clippy,
+  and the full workspace suite (7,150 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

@@ -8231,7 +8231,8 @@ impl super::StorageCluster {
         mut action: impl FnMut(&StoredObject) -> Result<(T, VersionId, PutObjectMetadataMutation), E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(PutObjectMetadataIf);
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let storage_client = self.object_mutation_metadata_primary_client(bucket, key)?;
 
         loop {
@@ -8249,7 +8250,7 @@ impl super::StorageCluster {
                             None => None,
                         };
                         let stored = storage_client.load_put_object_metadata_snapshot(
-                            pg_id,
+                            object_pg_id,
                             bucket,
                             key,
                             snapshot_version_id,
@@ -8319,7 +8320,7 @@ impl super::StorageCluster {
             }
 
             let stored = match storage_client.load_put_object_metadata_snapshot(
-                pg_id,
+                object_pg_id,
                 bucket,
                 key,
                 requested_version_id,
@@ -8339,7 +8340,7 @@ impl super::StorageCluster {
             };
             let command = match storage_client.build_put_object_metadata_command(
                 BuildPutObjectMetadataCommandReq {
-                    pg_id,
+                    pg_id: object_pg_id,
                     cluster_epoch: self.operation_epoch(),
                     bucket,
                     key,
