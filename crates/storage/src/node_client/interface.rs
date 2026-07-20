@@ -493,7 +493,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -501,7 +501,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_in_progress_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -509,7 +509,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_in_progress_multipart_upload_for_listing(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -517,20 +517,20 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_multipart_completion_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError>;
 
     fn load_multipart_completion_preflight(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError>;
 
     fn list_multipart_parts_for_authorized_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number_marker: Option<u32>,
         max_parts: u32,
@@ -538,7 +538,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn lookup_multipart_upload_management(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -680,7 +680,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_multipart_completion_stale_payload_source(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError>;
@@ -692,7 +692,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn load_abort_multipart_upload_cleanup(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -804,7 +804,7 @@ pub(crate) struct BuildStreamPartCommitCommandReq<'a> {
 }
 
 pub(crate) struct BuildCompleteMultipartObjectCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CompleteMultipartCommitRequest,
     pub(crate) version_id: VersionId,
@@ -813,7 +813,7 @@ pub(crate) struct BuildCompleteMultipartObjectCommandReq<'a> {
 }
 
 pub(crate) struct AbortMultipartCommandValidation<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
@@ -823,7 +823,7 @@ pub(crate) struct AbortMultipartCommandValidation<'a> {
 }
 
 pub(crate) struct BuildAbortMultipartUploadCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) bucket: &'a BucketName,
     pub(crate) key: &'a ObjectKey,
@@ -833,7 +833,7 @@ pub(crate) struct BuildAbortMultipartUploadCommandReq<'a> {
 }
 
 pub(crate) struct BuildAuthorizedAbortMultipartUploadCommandReq<'a> {
-    pub(crate) pg_id: PgId,
+    pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) authorized_upload: &'a AuthorizedMultipartUploadRecord,
     pub(crate) expected_cleanup: Option<&'a AbortMultipartUploadCleanup>,
@@ -1666,7 +1666,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -1674,7 +1674,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_in_progress_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -1682,7 +1682,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_in_progress_multipart_upload_for_listing(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -1690,20 +1690,20 @@ pub(crate) trait StorageNodeClient:
 
     fn load_multipart_completion_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError>;
 
     fn load_multipart_completion_preflight(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError>;
 
     fn list_multipart_parts_for_authorized_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number_marker: Option<u32>,
         max_parts: u32,
@@ -1711,7 +1711,7 @@ pub(crate) trait StorageNodeClient:
 
     fn lookup_multipart_upload_management(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -1719,7 +1719,7 @@ pub(crate) trait StorageNodeClient:
 
     fn load_abort_multipart_upload_cleanup(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,

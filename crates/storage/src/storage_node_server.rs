@@ -6816,7 +6816,10 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectMultipartUploadLoad => {
                 match ObjectMutationMetadataNodeClient::load_multipart_upload(
                     &local_client,
-                    request.object.pg_id,
+                    self.validated_object_metadata_pg(
+                        &request.object.bucket,
+                        &request.object.key,
+                    ),
                     &request.object.bucket,
                     &request.object.key,
                     &request.upload_id,
@@ -6837,7 +6840,10 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectMultipartInProgressUploadLoad => {
                 match ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
                     &local_client,
-                    request.object.pg_id,
+                    self.validated_object_metadata_pg(
+                        &request.object.bucket,
+                        &request.object.key,
+                    ),
                     &request.object.bucket,
                     &request.object.key,
                     &request.upload_id,
@@ -6858,7 +6864,10 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad => {
                 match ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
                     &local_client,
-                    request.object.pg_id,
+                    self.validated_object_metadata_pg(
+                        &request.object.bucket,
+                        &request.object.key,
+                    ),
                     &request.object.bucket,
                     &request.object.key,
                     &request.upload_id,
@@ -6910,7 +6919,7 @@ impl StorageNodeConnectionHandler {
         );
         let outcome = match ObjectMutationMetadataNodeClient::load_multipart_completion_snapshot(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &authorized_upload,
             &request.requested_part_numbers,
         ) {
@@ -6963,7 +6972,7 @@ impl StorageNodeConnectionHandler {
         );
         let outcome = match ObjectMutationMetadataNodeClient::load_multipart_completion_preflight(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &authorized_upload,
         ) {
             Ok(preflight) => StorageRpcMultipartCompletionPreflightOutcome::Loaded(preflight),
@@ -7008,7 +7017,7 @@ impl StorageNodeConnectionHandler {
         let outcome =
             match ObjectMutationMetadataNodeClient::list_multipart_parts_for_authorized_upload(
                 &local_client,
-                request.object.pg_id,
+                self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 &authorized_upload,
                 request.part_number_marker,
                 request.max_parts,
@@ -7052,7 +7061,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let lookup = match ObjectMutationMetadataNodeClient::lookup_multipart_upload_management(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             &request.upload_id,
@@ -7360,7 +7369,8 @@ impl StorageNodeConnectionHandler {
             match ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
                 &local_client,
                 BuildCompleteMultipartObjectCommandReq {
-                    pg_id: request.object.pg_id,
+                    pg_id: self
+                        .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                     cluster_epoch: request.object.cluster_epoch,
                     request: &request.request,
                     version_id: request.version_id,
@@ -7409,7 +7419,7 @@ impl StorageNodeConnectionHandler {
         let source =
             match ObjectMutationMetadataNodeClient::load_multipart_completion_stale_payload_source(
                 &local_client,
-                request.pg_id,
+                self.validated_object_metadata_pg(&request.bucket, &request.key),
                 &request.bucket,
                 &request.key,
             ) {
@@ -7439,7 +7449,8 @@ impl StorageNodeConnectionHandler {
         let response = match ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
             &local_client,
             BuildAbortMultipartUploadCommandReq {
-                pg_id: request.object.pg_id,
+                pg_id: self
+                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                 cluster_epoch: request.object.cluster_epoch,
                 bucket: &request.object.bucket,
                 key: &request.object.key,
@@ -7491,7 +7502,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let cleanup = match ObjectMutationMetadataNodeClient::load_abort_multipart_upload_cleanup(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             &request.upload_id,
@@ -7527,7 +7538,8 @@ impl StorageNodeConnectionHandler {
             match ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
                 &local_client,
                 BuildAuthorizedAbortMultipartUploadCommandReq {
-                    pg_id: request.object.pg_id,
+                    pg_id: self
+                        .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
                     cluster_epoch: request.object.cluster_epoch,
                     authorized_upload: &authorized_upload,
                     expected_cleanup: request.expected_cleanup.as_ref(),

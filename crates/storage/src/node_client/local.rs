@@ -1250,7 +1250,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -1260,7 +1260,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_in_progress_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -1272,7 +1272,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_in_progress_multipart_upload_for_listing(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -1284,7 +1284,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_multipart_completion_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
@@ -1298,7 +1298,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_multipart_completion_preflight(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
         <Self as StorageNodeClient>::load_multipart_completion_preflight(
@@ -1310,7 +1310,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn list_multipart_parts_for_authorized_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number_marker: Option<u32>,
         max_parts: u32,
@@ -1326,7 +1326,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn lookup_multipart_upload_management(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -1554,7 +1554,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_multipart_completion_stale_payload_source(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
@@ -1573,7 +1573,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn load_abort_multipart_upload_cleanup(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -2529,7 +2529,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -2540,7 +2540,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_in_progress_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -2553,7 +2553,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_in_progress_multipart_upload_for_listing(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -2565,7 +2565,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_multipart_completion_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
@@ -2616,7 +2616,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_multipart_completion_preflight(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
@@ -2640,7 +2640,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn list_multipart_parts_for_authorized_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number_marker: Option<u32>,
         max_parts: u32,
@@ -2666,7 +2666,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn lookup_multipart_upload_management(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -2695,7 +2695,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn load_abort_multipart_upload_cleanup(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -2721,7 +2721,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             return Ok(None);
         };
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;
@@ -2751,7 +2751,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             return Ok(None);
         };
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;
@@ -3653,7 +3653,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             None
         };
         let command_id = self.next_metadata_command_id_from_locked_pg(
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             &pg,
         )?;

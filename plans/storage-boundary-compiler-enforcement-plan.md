@@ -835,6 +835,36 @@ Tenth Phase 3 slice:
   regressions, the boundary checker, formatting, workspace-wide strict Clippy,
   and the full workspace suite (7,151 tests).
 
+Eleventh Phase 3 slice:
+
+- exact-object multipart state now requires `ObjectMetadataPgId` for upload
+  lookup, in-progress and listing lookup, completion snapshot and preflight,
+  authorized part listing, management lookup, null-version stale-payload
+  lookup, abort cleanup, and complete/abort command request values. The
+  duplicate methods on the transitional `StorageNodeClient` aggregate carry
+  the same role.
+- cluster multipart initiation follow-up, UploadPart stream creation,
+  completion, management, lifecycle, and abort paths derive one exact-object
+  role for `(bucket, key)`. Its raw projection remains only around generic
+  pending-command routing, command installation, application, version
+  reservation, and recovery helpers.
+- local adapters erase the role only at the private raw-node boundary. Unix
+  adapters serialize its raw route evidence and validate command responses
+  against the raw projection. The Unix server reconstructs the role only
+  after route, primary, and exact object-placement validation.
+- a dedicated two-PG Unix regression installs the same multipart upload and
+  part on the correct and wrong PG under a fixed clock. Every exact multipart
+  read and command builder has a correctly routed positive canary; test-forged
+  wrong roles must fail with the exact `PayloadDecode` placement error.
+  Equivalent wrong-PG state ensures a missing/conflicting record cannot mask a
+  placement-validation gap.
+- bucket-wide stream scans, reclaim/scan and data-client signatures,
+  `DataPgId` construction, and request-scoped route capability values remain
+  open in Phase 3.
+- the eleventh slice passed its focused correct/wrong multipart-metadata PG
+  Unix regressions, the boundary checker, formatting, workspace-wide strict
+  Clippy, and the full workspace suite (7,196 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

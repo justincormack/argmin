@@ -1128,7 +1128,7 @@ impl UnixStorageNodeClient {
         let context = "validate complete multipart command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             context,
         )?;
@@ -1332,7 +1332,7 @@ impl UnixStorageNodeClient {
         let context = "validate abort multipart command build response";
         self.validate_object_metadata_command_route(
             command,
-            request.pg_id,
+            request.pg_id.pg_id(),
             request.cluster_epoch,
             context,
         )?;

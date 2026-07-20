@@ -1288,6 +1288,376 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
 }
 
 #[test]
+fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
+    macro_rules! assert_object_payload_decode {
+        ($result:expr) => {
+            assert!(matches!(
+                $result.unwrap_err(),
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                })
+            ));
+        };
+    }
+    macro_rules! assert_bucket_payload_decode {
+        ($result:expr) => {
+            assert!(matches!(
+                $result.unwrap_err(),
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                })
+            ));
+        };
+    }
+
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes = vec![
+        StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: crate::types::PgState::Active,
+            primary_node_id: NodeId::new(7),
+            acting_set: vec![NodeId::new(7)],
+        },
+        StorageNodePgRoute {
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: crate::types::PgState::Active,
+            primary_node_id: NodeId::new(7),
+            acting_set: vec![NodeId::new(7)],
+        },
+    ];
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let (bucket, key, correct_pg_id) = (0..100)
+        .map(|index| {
+            let bucket =
+                crate::tests::bucket_name(format!("multipart-rpc-wrong-pg-bucket-{index}"));
+            let key = crate::tests::object_key(format!("multipart-rpc-wrong-pg-key-{index}"));
+            let pg_id = node.pg_topology().object_pg_for(&bucket, &key);
+            (bucket, key, pg_id)
+        })
+        .find(|(_, _, pg_id)| *pg_id < 2)
+        .expect("two-PG topology must place a test object");
+    let wrong_pg_id = if correct_pg_id == 0 { 1 } else { 0 };
+    let upload_id = crate::tests::multipart_upload_id("wrong-pg-multipart");
+    let owner = OwnerIdentity::from_principal("owner");
+    let create = CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: SerializedMetadataBlob::default(),
+        system_metadata_blob: SerializedSystemMetadataBlob::default(),
+        initiator: owner.clone(),
+        owner: owner.clone(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        object_lock: ObjectLockState::default(),
+        checksum: None,
+        encryption: ObjectEncryption::None,
+    };
+    let part = test_multipart_part_record(upload_id.clone(), 1);
+    let _time = crate::clock::test_time_override_guard(1_000);
+    let mut expected_upload = None;
+    for pg_id in [correct_pg_id, wrong_pg_id] {
+        let pg = node.get_pg(pg_id).unwrap();
+        PgMetadataStore::create_multipart_upload(&*pg, &create).unwrap();
+        PgMetadataStore::upsert_multipart_part(&*pg, &part).unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        let upload = PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+        if let Some(expected) = &expected_upload {
+            assert_eq!(
+                &upload, expected,
+                "equivalent wrong-PG state must make unguarded multipart operations succeed"
+            );
+        } else {
+            expected_upload = Some(upload);
+        }
+    }
+    drop(_time);
+    let topology = node.pg_topology().clone();
+    drop(node);
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..24)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        config.socket_path.clone(),
+    );
+    let correct_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id));
+    let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
+
+    let upload = ObjectMutationMetadataNodeClient::load_multipart_upload(
+        &client, correct_pg, &bucket, &key, &upload_id,
+    )
+    .unwrap();
+    assert_eq!(upload, expected_upload.unwrap());
+    assert_bucket_payload_decode!(ObjectMutationMetadataNodeClient::load_multipart_upload(
+        &client, wrong_pg, &bucket, &key, &upload_id,
+    ));
+
+    assert_eq!(
+        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
+            &client, correct_pg, &bucket, &key, &upload_id,
+        )
+        .unwrap(),
+        upload
+    );
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
+            &client, wrong_pg, &bucket, &key, &upload_id,
+        )
+    );
+
+    assert_eq!(
+        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
+            &client, correct_pg, &bucket, &key, &upload_id,
+        )
+        .unwrap(),
+        upload
+    );
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
+            &client, wrong_pg, &bucket, &key, &upload_id,
+        )
+    );
+
+    let authorized_upload = AuthorizedMultipartUploadRecord::assume_authorized(upload.clone());
+    let snapshot = ObjectMutationMetadataNodeClient::load_multipart_completion_snapshot(
+        &client,
+        correct_pg,
+        &authorized_upload,
+        &[1],
+    )
+    .unwrap();
+    assert_eq!(snapshot.part_records, vec![part.clone()]);
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::load_multipart_completion_snapshot(
+            &client,
+            wrong_pg,
+            &authorized_upload,
+            &[1],
+        )
+    );
+
+    ObjectMutationMetadataNodeClient::load_multipart_completion_preflight(
+        &client,
+        correct_pg,
+        &authorized_upload,
+    )
+    .unwrap();
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::load_multipart_completion_preflight(
+            &client,
+            wrong_pg,
+            &authorized_upload,
+        )
+    );
+
+    let listed = ObjectMutationMetadataNodeClient::list_multipart_parts_for_authorized_upload(
+        &client,
+        correct_pg,
+        &authorized_upload,
+        None,
+        10,
+    )
+    .unwrap();
+    assert_eq!(listed.response.parts, vec![part.clone()]);
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::list_multipart_parts_for_authorized_upload(
+            &client,
+            wrong_pg,
+            &authorized_upload,
+            None,
+            10,
+        )
+    );
+
+    assert!(matches!(
+        ObjectMutationMetadataNodeClient::lookup_multipart_upload_management(
+            &client,
+            correct_pg,
+            &bucket,
+            &key,
+            &upload_id,
+        )
+        .unwrap(),
+        MultipartUploadManagementLookup::InProgress(current) if *current == upload
+    ));
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::lookup_multipart_upload_management(
+            &client, wrong_pg, &bucket, &key, &upload_id,
+        )
+    );
+
+    assert!(
+        ObjectMutationMetadataNodeClient::load_multipart_completion_stale_payload_source(
+            &client, correct_pg, &bucket, &key,
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::load_multipart_completion_stale_payload_source(
+            &client, wrong_pg, &bucket, &key,
+        )
+    );
+
+    let cleanup = ObjectMutationMetadataNodeClient::load_abort_multipart_upload_cleanup(
+        &client, correct_pg, &bucket, &key, &upload_id,
+    )
+    .unwrap()
+    .expect("in-progress upload has abort cleanup");
+    assert_eq!(cleanup.upload, upload);
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::load_abort_multipart_upload_cleanup(
+            &client, wrong_pg, &bucket, &key, &upload_id,
+        )
+    );
+
+    let complete_request = CompleteMultipartCommitRequest {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        upload_id: upload_id.clone(),
+        completion_fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0x61; 32]),
+        versioning: BucketVersioningState::Disabled,
+        owner,
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        generation_id: upload.object_generation_id,
+        size: part.size,
+        etag_crc64: [9; 8],
+        tags: None,
+        metadata_blob: Some(SerializedMetadataBlob::default()),
+        system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+        object_lock: ObjectLockState::default(),
+        encryption: ObjectEncryption::None,
+        expected_stale_payload_source: snapshot.stale_payload_source.clone(),
+        expected_current_object_identity: snapshot.current_object_identity,
+        conditional_completion: false,
+        part_records: snapshot.part_records,
+        selected_streaming_segments: snapshot.selected_streaming_segments,
+        expected_cleanup: snapshot.cleanup,
+    };
+    let expected_object_parts = crate::node_client::complete_multipart_expected_object_parts(
+        &complete_request,
+        VersionId::Null,
+        &topology,
+    );
+    let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    let complete_command =
+        ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
+            &client,
+            BuildCompleteMultipartObjectCommandReq {
+                pg_id: correct_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                request: &complete_request,
+                version_id: VersionId::Null,
+                expected_object_parts: &expected_object_parts,
+                bucket_write_reservation: &proof,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        complete_command.payload(),
+        MetadataCommandPayload::CommitMultipartObject(commit)
+            if commit.upload_id == upload_id
+    ));
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
+            &client,
+            BuildCompleteMultipartObjectCommandReq {
+                pg_id: wrong_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                request: &complete_request,
+                version_id: VersionId::Null,
+                expected_object_parts: &expected_object_parts,
+                bucket_write_reservation: &proof,
+            },
+        )
+    );
+
+    let abort_command = ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
+        &client,
+        BuildAbortMultipartUploadCommandReq {
+            pg_id: correct_pg,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket: &bucket,
+            key: &key,
+            upload_id: &upload_id,
+            expected_cleanup: Some(&cleanup),
+            bucket_write_reservation: proof.clone(),
+        },
+    )
+    .unwrap()
+    .expect("in-progress upload produces abort command");
+    assert!(matches!(
+        abort_command.payload(),
+        MetadataCommandPayload::AbortMultipartUpload(abort)
+            if abort.upload_id == upload_id
+    ));
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
+            &client,
+            BuildAbortMultipartUploadCommandReq {
+                pg_id: wrong_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                upload_id: &upload_id,
+                expected_cleanup: Some(&cleanup),
+                bucket_write_reservation: proof.clone(),
+            },
+        )
+    );
+
+    ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
+        &client,
+        BuildAuthorizedAbortMultipartUploadCommandReq {
+            pg_id: correct_pg,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            authorized_upload: &authorized_upload,
+            expected_cleanup: Some(&cleanup),
+            bucket_write_reservation: proof.clone(),
+        },
+    )
+    .unwrap()
+    .expect("authorized in-progress upload produces abort command");
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
+            &client,
+            BuildAuthorizedAbortMultipartUploadCommandReq {
+                pg_id: wrong_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                authorized_upload: &authorized_upload,
+                expected_cleanup: Some(&cleanup),
+                bucket_write_reservation: proof,
+            },
+        )
+    );
+
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
 fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
@@ -2534,7 +2904,7 @@ fn unix_object_mutation_client_loads_multipart_upload_over_rpc() {
 
     let upload = ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         &upload_id,
@@ -3504,7 +3874,7 @@ fn unix_complete_multipart_uses_durable_initiation_identity() {
     let error = ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
         &client,
         BuildCompleteMultipartObjectCommandReq {
-            pg_id: PgId::new(0),
+            pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             request: &request,
             version_id: VersionId::Null,
@@ -3637,7 +4007,7 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         })),
     );
     let build = BuildCompleteMultipartObjectCommandReq {
-        pg_id: PgId::new(0),
+        pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
         cluster_epoch: ClusterEpoch::new(1).unwrap(),
         request: &request,
         version_id,
@@ -3700,7 +4070,7 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         checksum: None,
     }];
     let missing_cleanup_build = BuildCompleteMultipartObjectCommandReq {
-        pg_id: PgId::new(0),
+        pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
         cluster_epoch: ClusterEpoch::new(1).unwrap(),
         request: &missing_cleanup_request,
         version_id,
@@ -3750,7 +4120,7 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
         part.version_id = VersionId::Null;
     }
     let null_build = BuildCompleteMultipartObjectCommandReq {
-        pg_id: PgId::new(0),
+        pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
         cluster_epoch: ClusterEpoch::new(1).unwrap(),
         request: &null_request,
         version_id: VersionId::Null,
@@ -3839,7 +4209,7 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
         .validate_abort_multipart_command_response(
             &command,
             &AbortMultipartCommandValidation {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 bucket: &bucket,
                 key: &key,
@@ -3860,7 +4230,7 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
         .validate_abort_multipart_command_response(
             &bad_command,
             &AbortMultipartCommandValidation {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 bucket: &bucket,
                 key: &key,
@@ -3903,7 +4273,7 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
         .validate_abort_multipart_command_response(
             &bad_cleanup_command,
             &AbortMultipartCommandValidation {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 bucket: &bucket,
                 key: &key,
@@ -3942,7 +4312,7 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
         .validate_abort_multipart_command_response(
             &command,
             &AbortMultipartCommandValidation {
-                pg_id: PgId::new(0),
+                pg_id: ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 bucket: &bucket,
                 key: &key,

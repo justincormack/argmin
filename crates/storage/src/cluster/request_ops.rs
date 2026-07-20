@@ -11654,7 +11654,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let pg_id = self.object_metadata_pg(bucket, key);
         self.object_mutation_metadata_primary_client(bucket, key)?
             .load_multipart_upload(pg_id, bucket, key, upload_id)
     }
@@ -11695,9 +11695,12 @@ impl super::StorageCluster {
                     ));
                 }
             };
-            let upload = match mutation_client
-                .load_in_progress_multipart_upload(pg_id, &bucket, &key, &upload_id)
-            {
+            let upload = match mutation_client.load_in_progress_multipart_upload(
+                object_pg_id,
+                &bucket,
+                &key,
+                &upload_id,
+            ) {
                 Ok(upload) => upload,
                 Err(error) => {
                     release_caller_bucket_write_proof!()?;
@@ -11845,9 +11848,12 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let upload = match mutation_client
-                .load_in_progress_multipart_upload(pg_id, bucket, key, upload_id)
-            {
+            let upload = match mutation_client.load_in_progress_multipart_upload(
+                object_pg_id,
+                bucket,
+                key,
+                upload_id,
+            ) {
                 Ok(upload) => upload,
                 Err(error) => {
                     release_caller_bucket_write_proof!()?;
@@ -11938,7 +11944,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let pg_id = self.object_metadata_pg(bucket, key);
         self.object_mutation_metadata_primary_client(bucket, key)?
             .load_in_progress_multipart_upload(pg_id, bucket, key, upload_id)
     }
@@ -11963,7 +11969,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let pg_id = self.object_metadata_pg(bucket, key);
         self.object_mutation_metadata_primary_client(bucket, key)?
             .load_in_progress_multipart_upload_for_listing(pg_id, bucket, key, upload_id)
     }
@@ -11975,7 +11981,7 @@ impl super::StorageCluster {
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let pg_id = self.object_metadata_pg(bucket, key);
         self.object_mutation_metadata_primary_client(bucket, key)?
             .load_multipart_completion_snapshot(pg_id, authorized_upload, requested_part_numbers)
     }
@@ -11986,7 +11992,7 @@ impl super::StorageCluster {
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let pg_id = self.object_metadata_pg(bucket, key);
         self.object_mutation_metadata_primary_client(bucket, key)?
             .load_multipart_completion_preflight(pg_id, authorized_upload)
     }
@@ -12284,7 +12290,8 @@ impl super::StorageCluster {
         let key = req.key.clone();
         let upload_id = req.upload_id.clone();
         let generation_id = req.generation_id;
-        let pg_id = PgId::new(self.object_metadata_pg_id(&bucket, &key));
+        let object_pg_id = self.object_metadata_pg(&bucket, &key);
+        let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(&bucket, &key)?;
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
@@ -12352,9 +12359,12 @@ impl super::StorageCluster {
             }
 
             if req.conditional_completion {
-                let upload = match mutation_client
-                    .load_in_progress_multipart_upload(pg_id, &bucket, &key, &upload_id)
-                {
+                let upload = match mutation_client.load_in_progress_multipart_upload(
+                    object_pg_id,
+                    &bucket,
+                    &key,
+                    &upload_id,
+                ) {
                     Ok(upload) => upload,
                     Err(error) => {
                         release_bucket_write_proof!()?;
@@ -12368,9 +12378,11 @@ impl super::StorageCluster {
             }
 
             if req.versioning != BucketVersioningState::Enabled {
-                match mutation_client
-                    .load_multipart_completion_stale_payload_source(pg_id, &bucket, &key)
-                {
+                match mutation_client.load_multipart_completion_stale_payload_source(
+                    object_pg_id,
+                    &bucket,
+                    &key,
+                ) {
                     Ok(current_stale_payload_source) => {
                         req.expected_stale_payload_source = current_stale_payload_source;
                     }
@@ -12410,7 +12422,7 @@ impl super::StorageCluster {
             );
             let command = match mutation_client.build_complete_multipart_object_command(
                 BuildCompleteMultipartObjectCommandReq {
-                    pg_id,
+                    pg_id: object_pg_id,
                     cluster_epoch: self.operation_epoch(),
                     request: &req,
                     version_id,
@@ -12435,7 +12447,7 @@ impl super::StorageCluster {
                     if version_id.is_null() =>
                 {
                     let current_stale_payload_source = match mutation_client
-                        .load_multipart_completion_stale_payload_source(pg_id, &bucket, &key)
+                        .load_multipart_completion_stale_payload_source(object_pg_id, &bucket, &key)
                     {
                         Ok(source) => source,
                         Err(error) => {
@@ -13021,7 +13033,7 @@ impl super::StorageCluster {
     ) -> Result<ListedMultipartParts, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let pg_id = self.object_metadata_pg(bucket, key);
         self.object_mutation_metadata_primary_client(bucket, key)?
             .list_multipart_parts_for_authorized_upload(
                 pg_id,
@@ -13037,14 +13049,15 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         // A concurrent terminal command may have removed the active upload on
         // part of the acting set before its object-scoped completion replay is
         // visible everywhere. Finish the durable command before classifying
         // the upload for CompleteMultipartUpload or AbortMultipartUpload.
         self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
         self.object_mutation_metadata_primary_client(bucket, key)?
-            .lookup_multipart_upload_management(pg_id, bucket, key, upload_id)
+            .lookup_multipart_upload_management(object_pg_id, bucket, key, upload_id)
     }
 
     pub fn abort_multipart_upload(
@@ -13053,7 +13066,7 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<bool, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let pg_id = self.object_metadata_pg(bucket, key);
         self.abort_multipart_upload_locked(
             pg_id,
             bucket,
@@ -13071,7 +13084,7 @@ impl super::StorageCluster {
         upload_id: &UploadId,
         expected_bucket_incarnation_generation: u64,
     ) -> Result<bool, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let pg_id = self.object_metadata_pg(bucket, key);
         self.abort_multipart_upload_locked(
             pg_id,
             bucket,
@@ -13084,7 +13097,7 @@ impl super::StorageCluster {
 
     fn abort_multipart_upload_locked(
         &self,
-        pg_id: PgId,
+        object_pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -13092,6 +13105,7 @@ impl super::StorageCluster {
         expected_bucket_incarnation_generation: Option<u64>,
     ) -> Result<bool, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(AbortMultipartUploadLocked);
+        let pg_id = object_pg_id.pg_id();
         'retry_after_pending_conflict: loop {
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 if metadata_command_is_matching_multipart_abort(&command, bucket, key, upload_id) {
@@ -13131,7 +13145,7 @@ impl super::StorageCluster {
                 None => return Ok(false),
             };
             let command = match self.prepare_abort_multipart_upload_command(
-                pg_id,
+                object_pg_id,
                 bucket,
                 key,
                 upload_id,
@@ -13222,16 +13236,17 @@ impl super::StorageCluster {
     ) -> Result<bool, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let pg_id = self.object_metadata_pg(bucket, key);
         self.abort_authorized_multipart_upload_locked(pg_id, authorized_upload)
     }
 
     fn abort_authorized_multipart_upload_locked(
         &self,
-        pg_id: PgId,
+        object_pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<bool, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(AbortAuthorizedMultipartUploadLocked);
+        let pg_id = object_pg_id.pg_id();
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
@@ -13257,7 +13272,7 @@ impl super::StorageCluster {
                 None => continue 'retry_after_pending_conflict,
             };
             let command = match self.prepare_authorized_abort_multipart_upload_command(
-                pg_id,
+                object_pg_id,
                 authorized_upload,
                 proof.clone(),
             ) {
@@ -13337,7 +13352,7 @@ impl super::StorageCluster {
 
     fn prepare_abort_multipart_upload_command(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
@@ -13361,7 +13376,7 @@ impl super::StorageCluster {
 
     fn prepare_authorized_abort_multipart_upload_command(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
@@ -13411,7 +13426,8 @@ impl super::StorageCluster {
             ..
         } = lifecycle_context;
 
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             let matching_abort = matches!(
                 command.payload(),
@@ -13438,7 +13454,7 @@ impl super::StorageCluster {
 
         let upload = match self
             .object_mutation_metadata_primary_client(bucket, key)?
-            .load_multipart_upload(pg_id, bucket, key, upload_id)
+            .load_multipart_upload(object_pg_id, bucket, key, upload_id)
         {
             Ok(upload) => upload,
             Err(BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload { .. })) => {
@@ -13454,7 +13470,7 @@ impl super::StorageCluster {
         if upload.state == UploadState::Aborting {
             return self
                 .abort_multipart_upload_locked(
-                    pg_id,
+                    object_pg_id,
                     bucket,
                     key,
                     upload_id,
@@ -13476,7 +13492,7 @@ impl super::StorageCluster {
         }
 
         self.abort_multipart_upload_locked(
-            pg_id,
+            object_pg_id,
             bucket,
             key,
             upload_id,

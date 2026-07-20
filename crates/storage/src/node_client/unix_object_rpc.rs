@@ -1623,13 +1623,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
         let request = StorageRpcMultipartUploadLoadRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             upload_id: upload_id.clone(),
         };
         let payload = encode_multipart_upload_load_request(&request);
@@ -1683,13 +1683,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_in_progress_multipart_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
         let request = StorageRpcMultipartUploadLoadRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             upload_id: upload_id.clone(),
         };
         let payload = encode_multipart_upload_load_request(&request);
@@ -1736,13 +1736,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_in_progress_multipart_upload_for_listing(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
         let request = StorageRpcMultipartUploadLoadRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             upload_id: upload_id.clone(),
         };
         let payload = encode_multipart_upload_load_request(&request);
@@ -1789,7 +1789,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_multipart_completion_snapshot(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
@@ -1797,7 +1797,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
         let request = StorageRpcMultipartCompletionSnapshotRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             authorized_upload: authorized_upload.record().clone(),
             requested_part_numbers: requested_part_numbers.to_vec(),
         };
@@ -1870,14 +1870,14 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_multipart_completion_preflight(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
         let request = StorageRpcMultipartCompletionPreflightRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             authorized_upload: authorized_upload.record().clone(),
         };
         let payload = encode_multipart_completion_preflight_request(&request).map_err(|error| {
@@ -1920,7 +1920,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn list_multipart_parts_for_authorized_upload(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number_marker: Option<u32>,
         max_parts: u32,
@@ -1929,7 +1929,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
         let request = StorageRpcMultipartPartsListRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             authorized_upload: authorized_upload.record().clone(),
             part_number_marker,
             max_parts,
@@ -1976,13 +1976,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn lookup_multipart_upload_management(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
         let request = StorageRpcMultipartUploadLoadRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             upload_id: upload_id.clone(),
         };
         let payload = encode_multipart_upload_load_request(&request);
@@ -2838,11 +2838,11 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_multipart_completion_stale_payload_source(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
-        let request = self.object_request(pg_id, bucket, key);
+        let request = self.object_request(pg_id.pg_id(), bucket, key);
         let payload = encode_object_request(&request);
         let response = self
             .rpc_request(
@@ -2878,7 +2878,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         let rpc_request = StorageRpcCompleteMultipartCommandBuildRequest {
             object: self.object_request(
-                request.pg_id,
+                request.pg_id.pg_id(),
                 &request.request.bucket,
                 &request.request.key,
             ),
@@ -2895,7 +2895,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             })?;
         match self.object_metadata_command_build_request(
             StorageRpcMessageKind::ObjectMultipartCompleteCommandBuild,
-            request.pg_id,
+            request.pg_id.pg_id(),
             payload,
             "decode complete multipart command build response",
             ObjectPgActionError::StaleMultipartCompletionSnapshot,
@@ -2917,7 +2917,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         let key = request.key;
         let upload_id = request.upload_id;
         let rpc_request = StorageRpcAbortMultipartCommandBuildRequest {
-            object: self.object_request(request.pg_id, bucket, key),
+            object: self.object_request(request.pg_id.pg_id(), bucket, key),
             upload_id: upload_id.clone(),
             expected_cleanup: request.expected_cleanup.cloned(),
             bucket_write_reservation: request.bucket_write_reservation.clone(),
@@ -2931,7 +2931,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             })?;
         self.object_metadata_command_build_request(
             StorageRpcMessageKind::ObjectMultipartAbortCommandBuild,
-            request.pg_id,
+            request.pg_id.pg_id(),
             payload,
             "decode abort multipart command build response",
             ObjectPgActionError::StaleObjectReadSubject,
@@ -2960,7 +2960,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         let key = &request.authorized_upload.record().key;
         let upload_id = &request.authorized_upload.record().upload_id;
         let rpc_request = StorageRpcAuthorizedAbortMultipartCommandBuildRequest {
-            object: self.object_request(request.pg_id, bucket, key),
+            object: self.object_request(request.pg_id.pg_id(), bucket, key),
             authorized_upload: request.authorized_upload.record().clone(),
             expected_cleanup: request.expected_cleanup.cloned(),
             bucket_write_reservation: request.bucket_write_reservation.clone(),
@@ -2974,7 +2974,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             })?;
         self.object_metadata_command_build_request(
             StorageRpcMessageKind::ObjectMultipartAuthorizedAbortCommandBuild,
-            request.pg_id,
+            request.pg_id.pg_id(),
             payload,
             "decode authorized abort multipart command build response",
             ObjectPgActionError::StaleObjectReadSubject,
@@ -2997,13 +2997,13 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn load_abort_multipart_upload_cleanup(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<Option<AbortMultipartUploadCleanup>, ObjectPgActionError> {
         let request = StorageRpcAbortMultipartCleanupRequest {
-            object: self.object_request(pg_id, bucket, key),
+            object: self.object_request(pg_id.pg_id(), bucket, key),
             upload_id: upload_id.clone(),
         };
         let payload = encode_abort_multipart_cleanup_request(&request);
