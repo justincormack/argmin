@@ -75,7 +75,9 @@ use crate::storage_rpc::{
     decode_metadata_command_log_hash_range_request,
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
     decode_metadata_command_pending_slot_replace_request,
-    decode_metadata_command_pending_slot_request, decode_metadata_command_request,
+    decode_metadata_command_pending_slot_request,
+    decode_metadata_command_recovery_pending_slot_replace_request,
+    decode_metadata_command_recovery_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_metadata_command_transfer_adopt_request,
     decode_metadata_command_transfer_checkpoint_base_request,
     decode_metadata_command_transfer_empty_state_request,
@@ -230,7 +232,9 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
     StorageRpcMetadataCommandPendingSlotReplaceRequest,
-    StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
+    StorageRpcMetadataCommandPendingSlotRequest,
+    StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest,
+    StorageRpcMetadataCommandRecoveryRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateOutcomeResponse,
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
     StorageRpcMetadataCommandTransferAdoptRequest,
@@ -4260,6 +4264,17 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace => {
+                match decode_metadata_command_recovery_pending_slot_replace_request(&frame.payload)
+                {
+                    Ok(request) => self
+                        .metadata_command_recovery_pending_slot_replace_response(session, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::MetadataCommandMaxLogIndex => {
                 match decode_metadata_command_state_request(&frame.payload) {
                     Ok(request) => self.metadata_command_max_log_index_response(session, request),
@@ -4467,6 +4482,17 @@ impl StorageNodeConnectionHandler {
                 match decode_metadata_command_request(&frame.payload) {
                     Ok(request) => {
                         self.metadata_command_apply_and_record_response(session, request)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord => {
+                match decode_metadata_command_recovery_request(&frame.payload) {
+                    Ok(request) => {
+                        self.metadata_command_recovery_apply_and_record_response(session, request)
                     }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -9359,11 +9385,21 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_metadata_transfer_inspection(
-            request.node_id,
-            request.cluster_epoch,
-            request.pg_id,
-        ) {
+        let route_validation = if request.cluster_epoch < self.config.cluster_epoch {
+            self.validate_metadata_command_recovery_read(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+                false,
+            )
+        } else {
+            self.validate_pg_route_for_metadata_transfer_inspection(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+            )
+        };
+        if let Err(error) = route_validation {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -9593,11 +9629,21 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_metadata_log_read(
-            request.node_id,
-            request.cluster_epoch,
-            request.pg_id,
-        ) {
+        let route_validation = if request.cluster_epoch < self.config.cluster_epoch {
+            self.validate_metadata_command_recovery_read(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+                true,
+            )
+        } else {
+            self.validate_pg_route_for_metadata_log_read(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+            )
+        };
+        if let Err(error) = route_validation {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -10195,6 +10241,33 @@ impl StorageNodeConnectionHandler {
         )
     }
 
+    fn metadata_command_recovery_apply_and_record_response(
+        &self,
+        session: &StorageNodeSession,
+        request: StorageRpcMetadataCommandRecoveryRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let mutation_fence = match self.validate_reissued_metadata_command_recovery(
+            request.node_id,
+            request.pg_id,
+            &request.authorized_source,
+            request.abandoned_source.as_ref(),
+            &request.command,
+        ) {
+            Ok(fence) => fence,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        self.metadata_command_apply_and_record_response_with_mutation_fence(
+            session,
+            StorageRpcMetadataCommandRequest {
+                node_id: request.node_id,
+                cluster_epoch: request.cluster_epoch,
+                pg_id: request.pg_id,
+                command: request.command,
+            },
+            mutation_fence,
+        )
+    }
+
     fn metadata_command_peering_replay_apply_and_record_response(
         &self,
         session: &StorageNodeSession,
@@ -10236,6 +10309,19 @@ impl StorageNodeConnectionHandler {
             }
             MetadataMutationRouteFence::current(&self.config, self.current_route_map_lease())
         };
+        self.metadata_command_apply_and_record_response_with_mutation_fence(
+            session,
+            request,
+            mutation_fence,
+        )
+    }
+
+    fn metadata_command_apply_and_record_response_with_mutation_fence(
+        &self,
+        session: &StorageNodeSession,
+        request: StorageRpcMetadataCommandRequest,
+        mutation_fence: MetadataMutationRouteFence,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         if let Err(error) = mutation_fence.validate_rpc_at(
             crate::clock::current_time_millis(),
@@ -10814,6 +10900,140 @@ impl StorageNodeConnectionHandler {
         Ok(response)
     }
 
+    fn metadata_command_recovery_pending_slot_replace_response(
+        &self,
+        session: &StorageNodeSession,
+        request: StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let mutation_fence = match self.validate_reissued_metadata_command_recovery(
+            request.node_id,
+            request.pg_id,
+            &request.authorized_source,
+            request.abandoned_source.as_ref(),
+            &request.replacement,
+        ) {
+            Ok(fence) => fence,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let cleanup_chain_matches = match request.abandoned_source.as_ref() {
+            None => true,
+            Some(abandoned_source)
+                if request.previous.payload() == request.authorized_source.payload() =>
+            {
+                request.previous == *abandoned_source
+            }
+            Some(abandoned_source) => {
+                request.previous.payload() == request.replacement.payload()
+                    && request.previous.id().log_index() > abandoned_source.id().log_index()
+            }
+        };
+        if request.previous.id().cluster_epoch() != request.cluster_epoch
+            || request.previous.id().pg_id() != request.pg_id
+            || !request
+                .previous
+                .payload()
+                .is_authorized_recovery_derivative_of(request.authorized_source.payload())
+            || request.previous.id().log_index() < request.authorized_source.id().log_index()
+            || request.replacement.id().log_index() <= request.previous.id().log_index()
+            || !cleanup_chain_matches
+        {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "metadata command recovery replacement is not derived from its authorized source"
+                    .to_string(),
+            });
+        }
+        let reporting_node_is_local = self.config.pending_metadata_command_recoveries.iter().any(
+            |(authorized_pg_id, recovery)| {
+                *authorized_pg_id == request.pg_id
+                    && recovery.reporting_node_id() == self.config.node_id
+                    && recovery.pending()
+                        == PendingMetadataCommandObservation::new(
+                            request.cluster_epoch,
+                            std::num::NonZeroU64::new(
+                                request.authorized_source.id().log_index().get(),
+                            )
+                            .expect("typed metadata command log index must be nonzero"),
+                            request.authorized_source.checksum_crc64(),
+                        )
+            },
+        );
+        if !reporting_node_is_local {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: "metadata command recovery replacement is not executing on the authorized historical primary"
+                    .to_string(),
+            });
+        }
+        if let Some(scope_bucket) = request.scope_bucket.as_ref() {
+            if scope_bucket != request.replacement.bucket_name() {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message:
+                        "metadata command replacement scope bucket does not match command bucket"
+                            .to_string(),
+                });
+            }
+        }
+        let canonical_scope_bucket = request
+            .scope_bucket
+            .as_ref()
+            .map(|_| request.replacement.bucket_name().clone());
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
+        metadata_mutation_route_guard_or_return!(self);
+        if let Err(error) = mutation_fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let pg = match self.node.get_pg(request.pg_id.get()) {
+            Ok(pg) => pg,
+            Err(error) => return encode_storage_rpc_error_response(&store_error_response(error)),
+        };
+        let durable_log_tip =
+            match pg.max_metadata_command_log_index(request.previous.id().cluster_epoch()) {
+                Ok(durable_log_tip) => durable_log_tip,
+                Err(error) => {
+                    return encode_storage_rpc_error_response(&store_error_response(error));
+                }
+            };
+        let Some(expected_replacement_index) = durable_log_tip
+            .max(request.previous.id().log_index().get())
+            .checked_add(1)
+        else {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "metadata command recovery replacement index overflows".to_string(),
+            });
+        };
+        if request.replacement.id().log_index().get() != expected_replacement_index {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "metadata command recovery replacement index {} is not the next primary log index {}",
+                    request.replacement.id().log_index().get(),
+                    expected_replacement_index
+                ),
+            });
+        }
+        let response = match pg.replace_pending_metadata_command_slot_for_reissue(
+            self.config.node_id.as_u32(),
+            &request.previous,
+            &request.replacement,
+            canonical_scope_bucket.as_ref(),
+        ) {
+            Ok(removed) => {
+                let payload = encode_metadata_command_pending_slot_remove_response(
+                    &StorageRpcMetadataCommandPendingSlotRemoveResponse { removed },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
     fn metadata_command_pg_lock_acquire_response(
         &self,
         session: &mut StorageNodeSession,
@@ -10867,6 +11087,37 @@ impl StorageNodeConnectionHandler {
             code: StorageRpcErrorCode::StaleShardLocation,
             message: format!(
                 "historical metadata command critical section for PG {} at epoch {} is not authorized for primary node {} by the current runtime map",
+                pg_id.get(),
+                cluster_epoch.get(),
+                self.config.node_id.as_u32()
+            ),
+        })
+    }
+
+    fn validate_metadata_command_recovery_read(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        require_reporting_node: bool,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route_for_metadata_command_recovery(node_id, cluster_epoch, pg_id)?;
+        self.require_current_route_map_valid_rpc()?;
+        let authorized = self.config.pending_metadata_command_recoveries.iter().any(
+            |(authorized_pg_id, recovery)| {
+                *authorized_pg_id == pg_id
+                    && recovery.pending().cluster_epoch() == cluster_epoch
+                    && (!require_reporting_node
+                        || recovery.reporting_node_id() == self.config.node_id)
+            },
+        );
+        if authorized {
+            return Ok(());
+        }
+        Err(StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::StaleShardLocation,
+            message: format!(
+                "historical metadata command read for PG {} at epoch {} is not authorized for node {} by the current runtime map",
                 pg_id.get(),
                 cluster_epoch.get(),
                 self.config.node_id.as_u32()
@@ -11019,66 +11270,156 @@ impl StorageNodeConnectionHandler {
                 self.current_route_map_lease(),
             )),
             Err(_) if cluster_epoch < self.config.cluster_epoch => {
-                self.validate_pg_route_for_metadata_command_recovery(
-                    node_id,
-                    cluster_epoch,
-                    pg_id,
-                )?;
-                let expected = PendingMetadataCommandObservation::new(
-                    cluster_epoch,
-                    std::num::NonZeroU64::new(command.id().log_index().get())
-                        .expect("typed metadata command log index must be nonzero"),
-                    command.checksum_crc64(),
-                );
-                let authorized = self.config.pending_metadata_command_recoveries.iter().any(
-                    |(authorized_pg_id, recovery)| {
-                        *authorized_pg_id == pg_id && recovery.pending() == expected
-                    },
-                );
-                if !authorized {
-                    return Err(StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::StaleShardLocation,
-                        message: format!(
-                            "historical metadata command recovery for PG {} at epoch {} is not authorized by the current runtime map",
-                            pg_id.get(),
-                            cluster_epoch.get()
-                        ),
-                    });
-                }
-                let valid_until_ms = self.config.route_map_valid_until_ms().ok_or_else(|| {
-                    StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::StaleShardLocation,
-                        message: format!(
-                            "historical metadata command recovery for PG {} at epoch {} has no bounded runtime-map validity",
-                            pg_id.get(),
-                            cluster_epoch.get()
-                        ),
-                    }
-                })?;
-                let local_valid_until_monotonic_ms = self
-                    .current_route_map_lease()
-                    .map(BoundRouteMapLease::local_valid_until_monotonic_ms)
-                    .ok_or_else(|| StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::StaleShardLocation,
-                        message: format!(
-                            "historical metadata command recovery for PG {} at epoch {} has no process-bound runtime-map lease",
-                            pg_id.get(),
-                            cluster_epoch.get()
-                        ),
-                    })?;
-                let fence = MetadataMutationRouteFence::historical(
-                    cluster_epoch,
-                    valid_until_ms,
-                    local_valid_until_monotonic_ms,
-                );
-                fence.validate_rpc_at(
-                    crate::clock::current_time_millis(),
-                    crate::clock::monotonic_time_millis(),
-                )?;
-                Ok(fence)
+                self.validate_authorized_metadata_command_recovery_source(node_id, pg_id, command)
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn validate_reissued_metadata_command_recovery(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataMutationRouteFence, StorageRpcErrorResponse> {
+        if command != authorized_source
+            && (command.id().cluster_epoch() != authorized_source.id().cluster_epoch()
+                || command.id().pg_id() != authorized_source.id().pg_id()
+                || !command
+                    .payload()
+                    .is_authorized_recovery_derivative_of(authorized_source.payload())
+                || command.id().log_index() <= authorized_source.id().log_index())
+        {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message:
+                    "metadata command recovery command is not derived from its authorized source"
+                        .to_string(),
+            });
+        }
+        let fence = self.validate_authorized_metadata_command_recovery_source(
+            node_id,
+            pg_id,
+            authorized_source,
+        )?;
+        if command.payload() == authorized_source.payload() {
+            if abandoned_source.is_some() {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message:
+                        "same-payload metadata command recovery cannot carry an abandoned source"
+                            .to_string(),
+                });
+            }
+        } else {
+            let Some(abandoned_source) = abandoned_source else {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "metadata command recovery follow-up requires its abandoned source"
+                        .to_string(),
+                });
+            };
+            if abandoned_source.id().cluster_epoch() != authorized_source.id().cluster_epoch()
+                || abandoned_source.id().pg_id() != authorized_source.id().pg_id()
+                || abandoned_source.payload() != authorized_source.payload()
+                || abandoned_source.id().log_index() < authorized_source.id().log_index()
+                || command.id().log_index() <= abandoned_source.id().log_index()
+            {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message:
+                        "metadata command recovery follow-up is not bound to its abandoned reissue"
+                            .to_string(),
+                });
+            }
+            let pg = self
+                .node
+                .get_pg(pg_id.get())
+                .map_err(store_error_response)?;
+            let source_abandoned = pg
+                .metadata_command_abandoned(self.config.node_id.as_u32(), abandoned_source)
+                .map_err(store_error_response)?;
+            if !source_abandoned {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message:
+                        "metadata command recovery follow-up requires a durable source tombstone"
+                            .to_string(),
+                });
+            }
+        }
+        Ok(fence)
+    }
+
+    fn validate_authorized_metadata_command_recovery_source(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+    ) -> Result<MetadataMutationRouteFence, StorageRpcErrorResponse> {
+        if authorized_source.id().pg_id() != pg_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "metadata command recovery source does not match the request PG"
+                    .to_string(),
+            });
+        }
+        let cluster_epoch = authorized_source.id().cluster_epoch();
+        self.validate_pg_route_for_metadata_command_recovery(node_id, cluster_epoch, pg_id)?;
+        let expected = PendingMetadataCommandObservation::new(
+            cluster_epoch,
+            std::num::NonZeroU64::new(authorized_source.id().log_index().get())
+                .expect("typed metadata command log index must be nonzero"),
+            authorized_source.checksum_crc64(),
+        );
+        let authorized = self.config.pending_metadata_command_recoveries.iter().any(
+            |(authorized_pg_id, recovery)| {
+                *authorized_pg_id == pg_id && recovery.pending() == expected
+            },
+        );
+        if !authorized {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "historical metadata command recovery for PG {} at epoch {} is not authorized by the current runtime map",
+                    pg_id.get(),
+                    cluster_epoch.get()
+                ),
+            });
+        }
+        let valid_until_ms = self.config.route_map_valid_until_ms().ok_or_else(|| {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "historical metadata command recovery for PG {} at epoch {} has no bounded runtime-map validity",
+                    pg_id.get(),
+                    cluster_epoch.get()
+                ),
+            }
+        })?;
+        let local_valid_until_monotonic_ms = self
+            .current_route_map_lease()
+            .map(BoundRouteMapLease::local_valid_until_monotonic_ms)
+            .ok_or_else(|| StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "historical metadata command recovery for PG {} at epoch {} has no process-bound runtime-map lease",
+                    pg_id.get(),
+                    cluster_epoch.get()
+                ),
+            })?;
+        let fence = MetadataMutationRouteFence::historical(
+            cluster_epoch,
+            valid_until_ms,
+            local_valid_until_monotonic_ms,
+        );
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        Ok(fence)
     }
 
     fn validate_pg_route_for_peering_inspection(
@@ -12843,10 +13184,10 @@ mod tests {
     };
     use crate::metadata_command::{
         BucketWriteReservationProof, CommitDirectPutObjectCommand, CreateBucketCommand,
-        DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
-        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-        MetadataCommandPayload, MetadataTransferCommand, PutBucketAclCommand,
-        ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+        CreateStreamUploadCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
+        InsertDeleteMarkerCommand, MetadataCommandEnvelope, MetadataCommandId,
+        MetadataCommandLogIndex, MetadataCommandPayload, MetadataTransferCommand,
+        PutBucketAclCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
     };
     use crate::node_runtime::traits::{PgMetadataStore, ShardStore};
     use crate::storage_rpc::{
@@ -19100,6 +19441,464 @@ mod tests {
         decode_storage_rpc_response_payload(&release_response.payload)
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn storage_node_server_reissues_certified_historical_recovery_over_unix_rpc() {
+        let tmp = test_util::tempdir();
+        let source_route_epoch = ClusterEpoch::new(1).unwrap();
+        let current_epoch = ClusterEpoch::new(2).unwrap();
+        let config = bounded_runtime_refresh_config(test_config(&tmp));
+        let source = test_metadata_command(0, 1);
+        let conflicting = MetadataCommandEnvelope::new(
+            source.id(),
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                crate::tests::bucket_name("metadata-rpc-bucket"),
+                crate::tests::object_key("other-object"),
+                crate::tests::stream_session_id("rpc-conflict"),
+                GenerationId::new(1).unwrap(),
+                123,
+            )),
+        );
+        let replacement = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                source_route_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            source.payload().clone(),
+        );
+        let gap_replacement = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                source_route_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            source.payload().clone(),
+        );
+        let invalid_replacement =
+            MetadataCommandEnvelope::new(replacement.id(), conflicting.payload().clone());
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let source_route = config.pg_routes[0].clone();
+        let local_node_id = config.node_id;
+        let socket_path = config.socket_path.clone();
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                config.node_id.as_u32(),
+                &source,
+                Some(source.bucket_name()),
+            )
+            .unwrap();
+            pg.apply_metadata_command_and_record(config.node_id.as_u32(), &conflicting)
+                .unwrap();
+        }
+        let mut next_config = bounded_runtime_refresh_config(config);
+        next_config.cluster_epoch = current_epoch;
+        next_config.pg_routes[0].cluster_epoch = current_epoch;
+        next_config.pg_routes[0].state = PgState::Peering;
+        next_config.historical_pg_routes.push(source_route);
+        next_config.pending_metadata_command_recoveries.push((
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                NodeId::new(7),
+                PendingMetadataCommandObservation::new(
+                    source_route_epoch,
+                    std::num::NonZeroU64::MIN,
+                    source.checksum_crc64(),
+                ),
+            ),
+        ));
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
+        let serving = Arc::clone(&server);
+        let join = thread::spawn(move || serving.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let lock_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        let invalid_apply_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+            crate::storage_rpc::encode_metadata_command_recovery_request(
+                &StorageRpcMetadataCommandRecoveryRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    authorized_source: source.clone(),
+                    abandoned_source: None,
+                    command: invalid_replacement,
+                },
+            )
+            .unwrap(),
+        );
+        let gap_replace_response = send_frame(
+            &mut client,
+            3,
+            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
+            crate::storage_rpc::encode_metadata_command_recovery_pending_slot_replace_request(
+                &StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    authorized_source: source.clone(),
+                    abandoned_source: None,
+                    previous: source.clone(),
+                    replacement: gap_replacement,
+                    scope_bucket: Some(source.bucket_name().clone()),
+                },
+            )
+            .unwrap(),
+        );
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                pg.pending_metadata_command_envelope(local_node_id.as_u32(), source_route_epoch,)
+                    .unwrap(),
+                Some(source.clone()),
+                "an invalid recovery index jump must leave the pending slot unchanged"
+            );
+        }
+        let replace_response = send_frame(
+            &mut client,
+            4,
+            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
+            crate::storage_rpc::encode_metadata_command_recovery_pending_slot_replace_request(
+                &StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    authorized_source: source.clone(),
+                    abandoned_source: None,
+                    previous: source.clone(),
+                    replacement: replacement.clone(),
+                    scope_bucket: Some(source.bucket_name().clone()),
+                },
+            )
+            .unwrap(),
+        );
+        let apply_response = send_frame(
+            &mut client,
+            5,
+            StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+            crate::storage_rpc::encode_metadata_command_recovery_request(
+                &StorageRpcMetadataCommandRecoveryRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    authorized_source: source,
+                    abandoned_source: None,
+                    command: replacement,
+                },
+            )
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        decode_storage_rpc_response_payload(&lock_response.payload)
+            .unwrap()
+            .unwrap();
+        let invalid_apply_error =
+            decode_storage_rpc_response_payload(&invalid_apply_response.payload)
+                .unwrap()
+                .unwrap_err();
+        assert_eq!(invalid_apply_error.code, StorageRpcErrorCode::PayloadDecode);
+        let gap_replace_error = decode_storage_rpc_response_payload(&gap_replace_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(gap_replace_error.code, StorageRpcErrorCode::PayloadDecode);
+        decode_storage_rpc_response_payload(&replace_response.payload)
+            .unwrap()
+            .unwrap();
+        let payload = decode_storage_rpc_response_payload(&apply_response.payload)
+            .unwrap()
+            .unwrap();
+        let applied = decode_metadata_command_state_outcome_response(&payload).unwrap();
+        assert!(matches!(
+            applied.outcome,
+            StorageRpcMetadataCommandStateOutcome::State(
+                crate::metadata_command::MetadataCommandReplicaState {
+                    cluster_epoch,
+                    applied_log_index: 2,
+                    ..
+                }
+            ) if cluster_epoch == source_route_epoch
+        ));
+    }
+
+    #[test]
+    fn storage_node_server_applies_certified_reissued_abandonment_cleanup_over_unix_rpc() {
+        let tmp = test_util::tempdir();
+        let source_route_epoch = ClusterEpoch::new(1).unwrap();
+        let current_epoch = ClusterEpoch::new(2).unwrap();
+        let config = bounded_runtime_refresh_config(test_config(&tmp));
+        let bucket = crate::tests::bucket_name("metadata-recovery-cleanup");
+        let key = crate::tests::object_key("object");
+        let session_id = crate::tests::stream_session_id("recovery");
+        let source = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                source_route_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                    crate::CreateStreamUploadReq {
+                        session_id: session_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: crate::StreamUploadTarget::PutObject,
+                        encryption: crate::ObjectEncryption::None,
+                    },
+                    123,
+                    test_bucket_write_reservation_proof(bucket.clone(), &key),
+                ),
+            )),
+        );
+        let reissued = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                source_route_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            source.payload().clone(),
+        );
+        let cleanup = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                source_route_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            source
+                .payload()
+                .abandoned_recovery_follow_up()
+                .expect("PutObject stream creation requires generation cleanup"),
+        );
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let source_route = config.pg_routes[0].clone();
+        let local_node_id = config.node_id;
+        let socket_path = config.socket_path.clone();
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &session_id).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            let conflict = MetadataCommandEnvelope::new(
+                source.id(),
+                MetadataCommandPayload::ReserveObjectGeneration(
+                    ReserveObjectGenerationCommand::new(
+                        bucket.clone(),
+                        crate::tests::object_key("other-object"),
+                        crate::tests::stream_session_id("other-recovery"),
+                        GenerationId::MIN,
+                        122,
+                    ),
+                ),
+            );
+            pg.try_insert_pending_metadata_command_slot(
+                local_node_id.as_u32(),
+                &source,
+                Some(&bucket),
+            )
+            .unwrap();
+            pg.apply_metadata_command_and_record(local_node_id.as_u32(), &conflict)
+                .unwrap();
+        }
+        let mut next_config = bounded_runtime_refresh_config(config);
+        next_config.cluster_epoch = current_epoch;
+        next_config.pg_routes[0].cluster_epoch = current_epoch;
+        next_config.pg_routes[0].state = PgState::Peering;
+        next_config.historical_pg_routes.push(source_route);
+        next_config.pending_metadata_command_recoveries.push((
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                NodeId::new(7),
+                PendingMetadataCommandObservation::new(
+                    source_route_epoch,
+                    std::num::NonZeroU64::MIN,
+                    source.checksum_crc64(),
+                ),
+            ),
+        ));
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
+        let serving = Arc::clone(&server);
+        let join = thread::spawn(move || serving.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let lock_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        let reissue_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
+            crate::storage_rpc::encode_metadata_command_recovery_pending_slot_replace_request(
+                &StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    authorized_source: source.clone(),
+                    abandoned_source: None,
+                    previous: source.clone(),
+                    replacement: reissued.clone(),
+                    scope_bucket: Some(bucket.clone()),
+                },
+            )
+            .unwrap(),
+        );
+        let cleanup_before_tombstone_response = send_frame(
+            &mut client,
+            3,
+            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
+            crate::storage_rpc::encode_metadata_command_recovery_pending_slot_replace_request(
+                &StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    authorized_source: source.clone(),
+                    abandoned_source: Some(reissued.clone()),
+                    previous: reissued.clone(),
+                    replacement: cleanup.clone(),
+                    scope_bucket: Some(bucket.clone()),
+                },
+            )
+            .unwrap(),
+        );
+        let abandoned_response = send_frame(
+            &mut client,
+            4,
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+                command: reissued.clone(),
+            })
+            .unwrap(),
+        );
+        let replace_response = send_frame(
+            &mut client,
+            5,
+            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
+            crate::storage_rpc::encode_metadata_command_recovery_pending_slot_replace_request(
+                &StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    authorized_source: source.clone(),
+                    abandoned_source: Some(reissued.clone()),
+                    previous: reissued.clone(),
+                    replacement: cleanup.clone(),
+                    scope_bucket: Some(bucket.clone()),
+                },
+            )
+            .unwrap(),
+        );
+        let cleanup_response = send_frame(
+            &mut client,
+            6,
+            StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+            crate::storage_rpc::encode_metadata_command_recovery_request(
+                &StorageRpcMetadataCommandRecoveryRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    authorized_source: source.clone(),
+                    abandoned_source: Some(reissued),
+                    command: cleanup.clone(),
+                },
+            )
+            .unwrap(),
+        );
+        let remove_response = send_frame(
+            &mut client,
+            7,
+            StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+                command: cleanup,
+            })
+            .unwrap(),
+        );
+        let release_response = send_frame(
+            &mut client,
+            8,
+            StorageRpcMessageKind::MetadataCommandPgLockRelease,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let reissue_payload = decode_storage_rpc_response_payload(&reissue_response.payload)
+            .unwrap()
+            .unwrap();
+        let reissue =
+            decode_metadata_command_pending_slot_remove_response(&reissue_payload).unwrap();
+        assert!(reissue.removed);
+        let cleanup_before_tombstone_error =
+            decode_storage_rpc_response_payload(&cleanup_before_tombstone_response.payload)
+                .unwrap()
+                .unwrap_err();
+        assert_eq!(
+            cleanup_before_tombstone_error.code,
+            StorageRpcErrorCode::PayloadDecode
+        );
+        for response in [
+            &lock_response,
+            &abandoned_response,
+            &replace_response,
+            &cleanup_response,
+            &remove_response,
+            &release_response,
+        ] {
+            decode_storage_rpc_response_payload(&response.payload)
+                .unwrap()
+                .unwrap();
+        }
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(matches!(
+            PgMetadataStore::get_object_generation_reservation(&*pg, &bucket, &key, &session_id,),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            3
+        );
+        assert_eq!(
+            pg.pending_metadata_command_envelope(local_node_id.as_u32(), source_route_epoch)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

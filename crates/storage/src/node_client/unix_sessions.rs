@@ -465,6 +465,23 @@ impl UnixStorageNodeMetadataCommandSession {
         let payload = self
             .encode_metadata_command_request(pg_id, command)
             .map_err(BucketSnapshotLoadError::Store)?;
+        self.metadata_command_apply_and_record_with_payload(
+            pg_id,
+            command,
+            kind,
+            payload,
+            decode_context,
+        )
+    }
+
+    fn metadata_command_apply_and_record_with_payload(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        decode_context: &'static str,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
         let response = self
             .rpc_request(kind, payload)
             .map_err(BucketSnapshotLoadError::Store)?;
@@ -884,6 +901,46 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             .map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command pending slot replace response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    fn replace_pending_metadata_command_slot_for_recovery(
+        &self,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            authorized_source: authorized_source.clone(),
+            abandoned_source: abandoned_source.cloned(),
+            previous: previous.clone(),
+            replacement: replacement.clone(),
+            scope_bucket: bucket.cloned(),
+        };
+        let payload = encode_metadata_command_recovery_pending_slot_replace_request(&request)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "encode metadata command recovery pending slot replace request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
+            payload,
+        )?;
+        decode_metadata_command_pending_slot_remove_response(&response)
+            .map(|response| response.removed)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command recovery pending slot replace response",
                     error.to_string(),
                 )
             })
@@ -1487,6 +1544,38 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             command,
             StorageRpcMessageKind::MetadataCommandApplyAndRecord,
             "decode metadata command apply and record response",
+        )
+    }
+
+    fn apply_metadata_command_and_record_for_recovery(
+        &self,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let request = StorageRpcMetadataCommandRecoveryRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            authorized_source: authorized_source.clone(),
+            abandoned_source: abandoned_source.cloned(),
+            command: command.clone(),
+        };
+        let payload = encode_metadata_command_recovery_request(&request)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "encode metadata command recovery apply and record request",
+                    error.to_string(),
+                )
+            })
+            .map_err(BucketSnapshotLoadError::Store)?;
+        self.metadata_command_apply_and_record_with_payload(
+            pg_id,
+            command,
+            StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+            payload,
+            "decode metadata command recovery apply and record response",
         )
     }
 

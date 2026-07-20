@@ -604,8 +604,10 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandAbandoned
         | StorageRpcMessageKind::MetadataCommandRecordAbandoned
         | StorageRpcMessageKind::MetadataCommandPendingSlotReplace
+        | StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace
         | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert
         | StorageRpcMessageKind::MetadataCommandApplyAndRecord
+        | StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
         | StorageRpcMessageKind::MetadataCommandPgLockAcquire
         | StorageRpcMessageKind::MetadataCommandPgLockRelease

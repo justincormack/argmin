@@ -4091,6 +4091,18 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn replace_pending_metadata_command_slot_for_recovery(
+        &self,
+        pg_id: PgId,
+        _authorized_source: &MetadataCommandEnvelope,
+        _abandoned_source: Option<&MetadataCommandEnvelope>,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError> {
+        self.replace_pending_metadata_command_slot_for_reissue(pg_id, previous, replacement, bucket)
+    }
+
     fn metadata_command_replica_state(
         &self,
         pg_id: PgId,
@@ -4316,6 +4328,16 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.apply_metadata_command_and_record(self.node_id.as_u32(), command)
+    }
+
+    fn apply_metadata_command_and_record_for_recovery(
+        &self,
+        pg_id: PgId,
+        _authorized_source: &MetadataCommandEnvelope,
+        _abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.apply_metadata_command_and_record(pg_id, command)
     }
 
     fn replay_metadata_command_for_peering(

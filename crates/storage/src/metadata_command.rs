@@ -612,6 +612,31 @@ impl MetadataCommandPayload {
             Self::AdvanceMultipartCompletionBarrier(advance) => &advance.bucket,
         }
     }
+
+    pub(crate) fn abandoned_recovery_follow_up(&self) -> Option<Self> {
+        let release = match self {
+            Self::CommitDirectPutObject(commit) => ReleaseObjectGenerationCommand::new(
+                commit.object.bucket.clone(),
+                commit.object.key.clone(),
+                commit.generation_reservation_id.clone(),
+            ),
+            Self::CreateStreamUpload(create)
+                if create.session.target == StreamUploadTarget::PutObject =>
+            {
+                ReleaseObjectGenerationCommand::new(
+                    create.session.bucket.clone(),
+                    create.session.key.clone(),
+                    create.session.session_id.clone(),
+                )
+            }
+            _ => return None,
+        };
+        Some(Self::ReleaseObjectGeneration(release))
+    }
+
+    pub(crate) fn is_authorized_recovery_derivative_of(&self, source: &Self) -> bool {
+        self == source || source.abandoned_recovery_follow_up().as_ref() == Some(self)
+    }
 }
 
 fn metadata_command_payload_kind_name(kind_id: u16) -> Option<&'static str> {

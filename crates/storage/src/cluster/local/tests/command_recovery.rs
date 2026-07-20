@@ -245,6 +245,570 @@ fn route_independent_listing_recovers_later_real_authority_task_after_earlier_fa
     }
 }
 
+#[test]
+fn refresh_recovery_applies_direct_put_from_historical_active_route() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let base_map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap());
+    let bucket = BucketName::new("historical-direct-put-recovery").unwrap();
+    let key = crate::ObjectKey::new("object").unwrap();
+    let object_pg = 1;
+    let pg_id = PgId::new(1);
+
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            node_ids
+                .into_iter()
+                .map(|node_id| {
+                    (
+                        node_id,
+                        format!("/tmp/direct-put-recovery-node-{}.sock", node_id.as_u32()),
+                    )
+                })
+                .collect(),
+            vec![pg_id],
+        )
+        .unwrap();
+    let mut heartbeat_now_ms = crate::clock::current_time_millis();
+    for _ in 0..2 {
+        for node_id in node_ids {
+            heartbeat_authority_with_pending(
+                &mut authority,
+                &base_map,
+                node_id,
+                pg_id,
+                None,
+                heartbeat_now_ms,
+            );
+            heartbeat_now_ms += 1;
+        }
+    }
+    let primary_incarnation = authority
+        .snapshot()
+        .node(NodeId::new(0))
+        .unwrap()
+        .node_incarnation();
+    authority
+        .complete_pg_peering(pg_id, NodeId::new(0), primary_incarnation, heartbeat_now_ms)
+        .unwrap();
+    heartbeat_now_ms += 1;
+    for _ in 0..2 {
+        for node_id in node_ids {
+            heartbeat_authority_with_pending(
+                &mut authority,
+                &base_map,
+                node_id,
+                pg_id,
+                None,
+                heartbeat_now_ms,
+            );
+            heartbeat_now_ms += 1;
+        }
+    }
+    let active_epoch = authority.snapshot().cluster_epoch();
+    let runtime_map = authority.runtime_map_snapshot(heartbeat_now_ms).unwrap();
+    let active_map = Arc::new(
+        LocalClusterMap::open_runtime_map_with_existing_local_nodes(&base_map, &runtime_map)
+            .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&active_map)).unwrap();
+    let handle = StorageClusterRuntimeMapHandle::new(cluster.clone());
+    cluster.require_route_map_valid_now().unwrap();
+
+    create_test_bucket(&cluster, &bucket);
+    let reservation_id = crate::SessionId::try_from("73".repeat(16)).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"historical direct put recovery";
+    let segment_okh = [0x73; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+    let primary = active_map
+        .metadata_pg_primary_node(active_epoch, pg_id)
+        .unwrap();
+    let object_pg_store = primary.storage_node().get_pg(object_pg).unwrap();
+    let command = cluster
+        .prepare_commit_direct_put_object_command(
+            pg_id,
+            &object_pg_store,
+            &commit_req,
+            crate::VersionId::Null,
+            commit_req.bucket_write_reservation.clone(),
+        )
+        .unwrap();
+    object_pg_store
+        .try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            &command,
+            Some(&bucket),
+        )
+        .unwrap();
+    object_pg_store
+        .apply_metadata_command_and_record(primary.node_id().as_u32(), &command)
+        .unwrap();
+    drop(object_pg_store);
+
+    let pending = PendingMetadataCommandObservation::new(
+        active_epoch,
+        std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
+        command.checksum_crc64(),
+    );
+    authority.set_pg_state(pg_id, PgState::Peering).unwrap();
+    for node_id in node_ids {
+        heartbeat_now_ms += 1;
+        heartbeat_authority_with_pending(
+            &mut authority,
+            &active_map,
+            node_id,
+            pg_id,
+            (node_id == NodeId::new(0)).then_some(pending),
+            heartbeat_now_ms,
+        );
+    }
+    cluster.require_route_map_valid_now().unwrap();
+
+    assert_eq!(
+        handle
+            .recover_reported_pending_metadata_command(
+                &authority,
+                heartbeat_now_ms + 1,
+                None,
+                pg_id,
+                NodeId::new(0),
+                pending,
+            )
+            .unwrap(),
+        1
+    );
+    for node_id in node_ids {
+        let pg = active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        assert_eq!(stored.as_live().unwrap().generation_id, generation_id);
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            command.id().log_index().get()
+        );
+    }
+}
+
+struct HistoricalRouteRecoveryFixture {
+    node_ids: [NodeId; 3],
+    pg_id: PgId,
+    authority: crate::control_plane::SingleAuthorityControlPlane<
+        crate::control_plane::FileControlPlaneStore,
+    >,
+    active_epoch: ClusterEpoch,
+    active_map: Arc<LocalClusterMap>,
+    cluster: Arc<crate::StorageCluster>,
+    handle: StorageClusterRuntimeMapHandle,
+    now_ms: u64,
+}
+
+impl HistoricalRouteRecoveryFixture {
+    fn open(path: &std::path::Path, endpoint_prefix: &str) -> Self {
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let pg_id = PgId::new(1);
+        let base_map = Arc::new(
+            LocalClusterMap::open(path, &node_ids, &[pg_id.get()], EcShape { k: 2, m: 1 }).unwrap(),
+        );
+        let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+            crate::control_plane::FileControlPlaneStore::new(
+                path.join("historical-route-control-plane.state"),
+            ),
+        )
+        .unwrap();
+        authority
+            .bootstrap_initial_cluster_map(
+                node_ids
+                    .into_iter()
+                    .map(|node_id| {
+                        (
+                            node_id,
+                            format!("/tmp/{endpoint_prefix}-node-{}.sock", node_id.as_u32()),
+                        )
+                    })
+                    .collect(),
+                vec![pg_id],
+            )
+            .unwrap();
+
+        let mut now_ms = crate::clock::current_time_millis();
+        for _ in 0..2 {
+            for node_id in node_ids {
+                heartbeat_authority_with_pending(
+                    &mut authority,
+                    &base_map,
+                    node_id,
+                    pg_id,
+                    None,
+                    now_ms,
+                );
+                now_ms += 1;
+            }
+        }
+        let primary_incarnation = authority
+            .snapshot()
+            .node(NodeId::new(0))
+            .unwrap()
+            .node_incarnation();
+        authority
+            .complete_pg_peering(pg_id, NodeId::new(0), primary_incarnation, now_ms)
+            .unwrap();
+        now_ms += 1;
+        for _ in 0..2 {
+            for node_id in node_ids {
+                heartbeat_authority_with_pending(
+                    &mut authority,
+                    &base_map,
+                    node_id,
+                    pg_id,
+                    None,
+                    now_ms,
+                );
+                now_ms += 1;
+            }
+        }
+
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let runtime_map = authority.runtime_map_snapshot(now_ms).unwrap();
+        let active_map = Arc::new(
+            LocalClusterMap::open_runtime_map_with_existing_local_nodes(&base_map, &runtime_map)
+                .unwrap(),
+        );
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&active_map)).unwrap();
+        let handle = StorageClusterRuntimeMapHandle::new(cluster.clone());
+        cluster.require_route_map_valid_now().unwrap();
+        Self {
+            node_ids,
+            pg_id,
+            authority,
+            active_epoch,
+            active_map,
+            cluster,
+            handle,
+            now_ms,
+        }
+    }
+
+    fn authorize_pending_recovery(
+        &mut self,
+        command: &MetadataCommandEnvelope,
+    ) -> PendingMetadataCommandObservation {
+        let pending = PendingMetadataCommandObservation::new(
+            self.active_epoch,
+            std::num::NonZeroU64::new(command.id().log_index().get()).unwrap(),
+            command.checksum_crc64(),
+        );
+        self.authority
+            .set_pg_state(self.pg_id, PgState::Peering)
+            .unwrap();
+        for node_id in self.node_ids {
+            self.now_ms += 1;
+            heartbeat_authority_with_pending(
+                &mut self.authority,
+                &self.active_map,
+                node_id,
+                self.pg_id,
+                (node_id == NodeId::new(0)).then_some(pending),
+                self.now_ms,
+            );
+        }
+        pending
+    }
+
+    fn recover(&self, pending: PendingMetadataCommandObservation) -> usize {
+        self.handle
+            .recover_reported_pending_metadata_command(
+                &self.authority,
+                self.now_ms + 1,
+                None,
+                self.pg_id,
+                NodeId::new(0),
+                pending,
+            )
+            .unwrap()
+    }
+}
+
+#[test]
+fn refresh_recovery_reissues_zero_apply_bucket_command_from_historical_active_route() {
+    let tmp = test_util::tempdir();
+    let mut fixture = HistoricalRouteRecoveryFixture::open(tmp.path(), "historical-bucket-reissue");
+    let first_bucket = BucketName::new("historical-reissue-first").unwrap();
+    let reissued_bucket = BucketName::new("historical-reissue-second").unwrap();
+    let applied = create_bucket_metadata_command_at_epoch(
+        fixture.active_epoch,
+        fixture.pg_id,
+        1,
+        first_bucket.clone(),
+    );
+    fixture
+        .cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &applied)
+        .unwrap();
+
+    let stale = create_bucket_metadata_command_at_epoch(
+        fixture.active_epoch,
+        fixture.pg_id,
+        1,
+        reissued_bucket.clone(),
+    );
+    force_insert_pending_metadata_command_for_node_for_test(
+        &fixture.active_map,
+        NodeId::new(0),
+        fixture.pg_id,
+        &reissued_bucket,
+        &stale,
+    );
+    let pending = fixture.authorize_pending_recovery(&stale);
+
+    assert_eq!(fixture.recover(pending), 1);
+    for node_id in fixture.node_ids {
+        let pg = fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &reissued_bucket).unwrap();
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            2
+        );
+    }
+}
+
+#[test]
+fn refresh_recovery_abandons_stale_reservation_from_historical_active_route() {
+    let tmp = test_util::tempdir();
+    let mut fixture =
+        HistoricalRouteRecoveryFixture::open(tmp.path(), "historical-stale-reservation");
+    let bucket = BucketName::new("historical-stale-reservation").unwrap();
+    let key = crate::ObjectKey::new("object").unwrap();
+    create_test_bucket(&fixture.cluster, &bucket);
+
+    let first_reservation_id = crate::SessionId::try_from("74".repeat(16)).unwrap();
+    let stale_reservation_id = crate::SessionId::try_from("75".repeat(16)).unwrap();
+    let generation_id = crate::GenerationId::MIN;
+    let first = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            fixture.active_epoch,
+            fixture.pg_id,
+            fixture
+                .active_map
+                .test_next_metadata_command_log_index(fixture.pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            first_reservation_id.clone(),
+            generation_id,
+            fixture.now_ms,
+        )),
+    );
+    fixture
+        .cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &first)
+        .unwrap();
+    let stale = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            fixture.active_epoch,
+            fixture.pg_id,
+            fixture
+                .active_map
+                .test_next_metadata_command_log_index(fixture.pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            stale_reservation_id.clone(),
+            generation_id,
+            fixture.now_ms + 1,
+        )),
+    );
+    let primary = fixture
+        .active_map
+        .metadata_pg_primary_node(fixture.active_epoch, fixture.pg_id)
+        .unwrap();
+    primary
+        .storage_node()
+        .get_pg(fixture.pg_id.get())
+        .unwrap()
+        .try_insert_pending_metadata_command_slot(primary.node_id().as_u32(), &stale, Some(&bucket))
+        .unwrap();
+    let pending = fixture.authorize_pending_recovery(&stale);
+
+    assert_eq!(fixture.recover(pending), 1);
+    for node_id in fixture.node_ids {
+        let pg = fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &first_reservation_id,
+            )
+            .unwrap(),
+            generation_id
+        );
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &stale_reservation_id,
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            stale.id().log_index().get()
+        );
+    }
+}
+
+#[test]
+fn refresh_recovery_abandons_stream_create_with_certified_generation_cleanup() {
+    let tmp = test_util::tempdir();
+    let mut fixture = HistoricalRouteRecoveryFixture::open(tmp.path(), "historical-stream-abandon");
+    let bucket = BucketName::new("historical-stream-abandon").unwrap();
+    let key = crate::ObjectKey::new("object").unwrap();
+    let session_id = crate::SessionId::try_from("77".repeat(16)).unwrap();
+    create_test_bucket(&fixture.cluster, &bucket);
+    let generation_id = fixture
+        .cluster
+        .reserve_put_object_generation(&bucket, &key, &session_id)
+        .unwrap();
+    let bucket_write_reservation = fixture
+        .cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "historical-stream-abandon",
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let bucket_write_proof = crate::metadata_command::BucketWriteReservationProof::from(
+        &bucket_write_reservation.record,
+    );
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            fixture.active_epoch,
+            fixture.pg_id,
+            fixture
+                .active_map
+                .test_next_metadata_command_log_index(fixture.pg_id),
+        ),
+        MetadataCommandPayload::CreateStreamUpload(Box::new(
+            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::ObjectEncryption::None,
+                },
+                fixture.now_ms,
+                bucket_write_proof,
+            ),
+        )),
+    );
+    let primary = fixture
+        .active_map
+        .metadata_pg_primary_node(fixture.active_epoch, fixture.pg_id)
+        .unwrap();
+    primary
+        .storage_node()
+        .get_pg(fixture.pg_id.get())
+        .unwrap()
+        .try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            &command,
+            Some(&bucket),
+        )
+        .unwrap();
+    fixture
+        .cluster
+        .release_durable_bucket_write_reservation(bucket_write_reservation)
+        .unwrap();
+    let pending = fixture.authorize_pending_recovery(&command);
+
+    assert_eq!(fixture.recover(pending), 1);
+    for node_id in fixture.node_ids {
+        let pg = fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &session_id,
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        assert!(matches!(
+            crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+            Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ));
+        assert_eq!(
+            pg.metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            command.id().log_index().get() + 1
+        );
+    }
+    assert_eq!(generation_id, crate::GenerationId::MIN);
+}
+
 fn heartbeat_authority_with_pending<S: crate::control_plane::ControlPlaneStore>(
     authority: &mut crate::control_plane::SingleAuthorityControlPlane<S>,
     map: &Arc<LocalClusterMap>,
@@ -253,6 +817,11 @@ fn heartbeat_authority_with_pending<S: crate::control_plane::ControlPlaneStore>(
     pending_metadata_command: Option<PendingMetadataCommandObservation>,
     now_ms: u64,
 ) {
+    let snapshot = authority.snapshot();
+    let node_incarnation = snapshot.node(node_id).unwrap().node_incarnation().max(1);
+    let endpoint = snapshot.node(node_id).unwrap().endpoint().to_owned();
+    let observed_epoch = snapshot.cluster_epoch();
+    let pg_state = snapshot.pg(pg_id).unwrap().state();
     let state = map
         .node(node_id)
         .unwrap()
@@ -261,19 +830,18 @@ fn heartbeat_authority_with_pending<S: crate::control_plane::ControlPlaneStore>(
         .unwrap()
         .metadata_command_replica_state()
         .unwrap();
-    let record = authority.snapshot().node(node_id).unwrap();
     authority
         .heartbeat(
             crate::control_plane::NodeHeartbeat {
                 node_id,
-                node_incarnation: record.node_incarnation().max(1),
-                endpoint: record.endpoint().to_owned(),
-                observed_epoch: authority.snapshot().cluster_epoch(),
+                node_incarnation,
+                endpoint,
+                observed_epoch,
                 requested_lease_duration_ms: 10_000,
                 cluster_map_history_route_references: Default::default(),
                 pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
                     pg_id,
-                    state: PgState::Peering,
+                    state: pg_state,
                     metadata_proof: crate::control_plane::PgMetadataProof {
                         applied_log_index: state.applied_log_index,
                         applied_log_hash: state.applied_log_hash,

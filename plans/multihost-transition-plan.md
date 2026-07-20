@@ -12595,6 +12595,29 @@ Phase 12.4 progress:
   commands; and unrelated global epoch gaps before recovery. This complements
   the control-plane heartbeat lifecycle model with executable coverage of the
   storage-node admission boundary that soak had been reaching slowly.
+  Follow-up review closed two mutation-boundary gaps in historical recovery.
+  Zero-apply reissue now uses an explicit recovery replacement RPC bound to the
+  original control-plane certificate; the historical source, previous pending
+  command, replacement, target PG, and bucket scope are carried together.
+  Storage-node admission permits only the original payload or the one
+  deterministic `ReleaseObjectGeneration` follow-up implied by an abandoned
+  direct PUT or PutObject stream-create command. Cleanup carries both the
+  original control-plane certificate and the exact abandoned reissue; admission
+  requires that reissue's tombstone to be durable locally before accepting the
+  follow-up. This preserves the original recovery authority without requiring
+  the conflicted source index to contain an impossible tombstone. The follow-up
+  remains a normal replicated metadata-log entry rather than an out-of-band
+  state edit, so
+  recovery can release the durable generation reservation while the current PG
+  is Peering and ordinary commands are fenced. Before changing the pending
+  slot, both the RPC boundary and PG store require the replacement index to be
+  exactly one greater than the maximum of the durable primary log tip and the
+  previous pending index. Invalid gaps fail without mutation. Local
+  orchestration and real Unix server regressions cover certified cleanup. The
+  composed Unix regression covers conflict, same-payload reissue, stale
+  reservation rejection, exact reissue tombstoning, and certified generation
+  cleanup; the lower-level replacement regression proves an arbitrary index
+  jump leaves the source slot unchanged before a valid replacement succeeds.
   A later soak exposed a cross-PG epoch interleaving outside the first model:
   an unrelated PG transition bumped the global epoch and correctly cleared all
   node PG observations between an admin preflight and an overlapping Active PG

@@ -254,6 +254,13 @@ const STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN:
         + 1
         + 4
         + STORAGE_RPC_MAX_BUCKET_NAME_LEN;
+const STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + 1
+        + 3 * STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN;
+const STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN: usize = 1
+    + 2 * STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN
+    + STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_METADATA_COMMAND_MATCHING_APPLIED_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_BUCKET_NAME_LEN: usize = 63;
@@ -628,6 +635,8 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandPendingSlotReplace = 29,
     MetadataCommandBucketControlPendingSlotInsert = 30,
     MetadataCommandApplyAndRecord = 31,
+    MetadataCommandRecoveryApplyAndRecord = 162,
+    MetadataCommandRecoveryPendingSlotReplace = 163,
     BucketHeadRaw = 32,
     BucketHeadInfo = 33,
     BucketCreateCommandBuild = 34,
@@ -884,6 +893,12 @@ impl StorageRpcMessageKind {
                 "metadata command bucket-control pending slot insert"
             }
             Self::MetadataCommandApplyAndRecord => "metadata command apply and record",
+            Self::MetadataCommandRecoveryApplyAndRecord => {
+                "metadata command recovery apply and record"
+            }
+            Self::MetadataCommandRecoveryPendingSlotReplace => {
+                "metadata command recovery pending slot replace"
+            }
             Self::MetadataCommandPeeringReplayApplyAndRecord => {
                 "metadata command peering replay apply and record"
             }
@@ -1067,6 +1082,8 @@ impl StorageRpcMessageKind {
             29 => Ok(Self::MetadataCommandPendingSlotReplace),
             30 => Ok(Self::MetadataCommandBucketControlPendingSlotInsert),
             31 => Ok(Self::MetadataCommandApplyAndRecord),
+            162 => Ok(Self::MetadataCommandRecoveryApplyAndRecord),
+            163 => Ok(Self::MetadataCommandRecoveryPendingSlotReplace),
             32 => Ok(Self::BucketHeadRaw),
             33 => Ok(Self::BucketHeadInfo),
             34 => Ok(Self::BucketCreateCommandBuild),
@@ -1304,6 +1321,16 @@ pub(crate) struct StorageRpcMetadataCommandRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
+    pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandRecoveryRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) authorized_source: crate::metadata_command::MetadataCommandEnvelope,
+    pub(crate) abandoned_source: Option<crate::metadata_command::MetadataCommandEnvelope>,
     pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
 }
 
@@ -2686,6 +2713,18 @@ pub(crate) struct StorageRpcMetadataCommandPendingSlotReplaceRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) authorized_source: crate::metadata_command::MetadataCommandEnvelope,
+    pub(crate) abandoned_source: Option<crate::metadata_command::MetadataCommandEnvelope>,
+    pub(crate) previous: crate::metadata_command::MetadataCommandEnvelope,
+    pub(crate) replacement: crate::metadata_command::MetadataCommandEnvelope,
+    pub(crate) scope_bucket: Option<BucketName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StorageRpcMetadataCommandPendingSlotInsertOutcome {
     Inserted,
     PendingConflict {
@@ -3584,12 +3623,18 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord => {
             STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::MetadataCommandPendingSlotInsert
         | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert => {
             STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandPendingSlotReplace => {
             STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
             STORAGE_RPC_MAX_METADATA_COMMAND_MATCHING_APPLIED_REQUEST_PAYLOAD_LEN
@@ -4009,6 +4054,85 @@ pub(crate) fn decode_metadata_command_request(
         node_id,
         cluster_epoch,
         pg_id,
+        command,
+    })
+}
+
+pub(crate) fn encode_metadata_command_recovery_request(
+    request: &StorageRpcMetadataCommandRecoveryRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_metadata_command_route(
+        request.cluster_epoch,
+        request.pg_id,
+        request.authorized_source.id(),
+    )?;
+    if let Some(abandoned_source) = request.abandoned_source.as_ref() {
+        validate_metadata_command_route(
+            request.cluster_epoch,
+            request.pg_id,
+            abandoned_source.id(),
+        )?;
+    }
+    validate_metadata_command_route(request.cluster_epoch, request.pg_id, request.command.id())?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    let source = StorageRpcMetadataCommandItem {
+        command_checksum: request.authorized_source.checksum_crc64(),
+        command_bytes: request.authorized_source.command_bytes(),
+    };
+    out.extend_from_slice(&encode_metadata_command_item(&source)?);
+    match request.abandoned_source.as_ref() {
+        None => put_u8(&mut out, 0),
+        Some(abandoned_source) => {
+            put_u8(&mut out, 1);
+            let item = StorageRpcMetadataCommandItem {
+                command_checksum: abandoned_source.checksum_crc64(),
+                command_bytes: abandoned_source.command_bytes(),
+            };
+            out.extend_from_slice(&encode_metadata_command_item(&item)?);
+        }
+    }
+    let command = StorageRpcMetadataCommandItem {
+        command_checksum: request.command.checksum_crc64(),
+        command_bytes: request.command.command_bytes(),
+    };
+    out.extend_from_slice(&encode_metadata_command_item(&command)?);
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_recovery_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandRecoveryRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let authorized_source =
+        metadata_command_envelope_from_item(&decoder.read_metadata_command_item()?)?;
+    let abandoned_source = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(metadata_command_envelope_from_item(
+            &decoder.read_metadata_command_item()?,
+        )?),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidMetadataCommandEnvelope);
+        }
+    };
+    let command = metadata_command_envelope_from_item(&decoder.read_metadata_command_item()?)?;
+    decoder.finish()?;
+    validate_metadata_command_route(cluster_epoch, pg_id, authorized_source.id())?;
+    if let Some(abandoned_source) = abandoned_source.as_ref() {
+        validate_metadata_command_route(cluster_epoch, pg_id, abandoned_source.id())?;
+    }
+    validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
+    Ok(StorageRpcMetadataCommandRecoveryRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        authorized_source,
+        abandoned_source,
         command,
     })
 }
@@ -8057,6 +8181,97 @@ pub(crate) fn decode_metadata_command_pending_slot_replace_request(
         previous,
         replacement,
         scope_bucket,
+    })
+}
+
+pub(crate) fn encode_metadata_command_recovery_pending_slot_replace_request(
+    request: &StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_metadata_command_route(
+        request.cluster_epoch,
+        request.pg_id,
+        request.authorized_source.id(),
+    )?;
+    if let Some(abandoned_source) = request.abandoned_source.as_ref() {
+        validate_metadata_command_route(
+            request.cluster_epoch,
+            request.pg_id,
+            abandoned_source.id(),
+        )?;
+    }
+    let ordinary = StorageRpcMetadataCommandPendingSlotReplaceRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+        previous: request.previous.clone(),
+        replacement: request.replacement.clone(),
+        scope_bucket: request.scope_bucket.clone(),
+    };
+    let mut out = Vec::new();
+    let source = StorageRpcMetadataCommandItem {
+        command_checksum: request.authorized_source.checksum_crc64(),
+        command_bytes: request.authorized_source.command_bytes(),
+    };
+    out.extend_from_slice(&encode_metadata_command_item(&source)?);
+    match request.abandoned_source.as_ref() {
+        None => put_u8(&mut out, 0),
+        Some(abandoned_source) => {
+            put_u8(&mut out, 1);
+            let item = StorageRpcMetadataCommandItem {
+                command_checksum: abandoned_source.checksum_crc64(),
+                command_bytes: abandoned_source.command_bytes(),
+            };
+            out.extend_from_slice(&encode_metadata_command_item(&item)?);
+        }
+    }
+    out.extend_from_slice(&encode_metadata_command_pending_slot_replace_request(
+        &ordinary,
+    )?);
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_recovery_pending_slot_replace_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let authorized_source =
+        metadata_command_envelope_from_item(&decoder.read_metadata_command_item()?)?;
+    let abandoned_source = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(metadata_command_envelope_from_item(
+            &decoder.read_metadata_command_item()?,
+        )?),
+        _ => {
+            return Err(
+                StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(
+                    "invalid optional abandoned recovery source tag",
+                ),
+            );
+        }
+    };
+    let ordinary_offset = bytes.len() - decoder.remaining_len();
+    let ordinary = decode_metadata_command_pending_slot_replace_request(&bytes[ordinary_offset..])?;
+    validate_metadata_command_route(
+        ordinary.cluster_epoch,
+        ordinary.pg_id,
+        authorized_source.id(),
+    )?;
+    if let Some(abandoned_source) = abandoned_source.as_ref() {
+        validate_metadata_command_route(
+            ordinary.cluster_epoch,
+            ordinary.pg_id,
+            abandoned_source.id(),
+        )?;
+    }
+    Ok(StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+        node_id: ordinary.node_id,
+        cluster_epoch: ordinary.cluster_epoch,
+        pg_id: ordinary.pg_id,
+        authorized_source,
+        abandoned_source,
+        previous: ordinary.previous,
+        replacement: ordinary.replacement,
+        scope_bucket: ordinary.scope_bucket,
     })
 }
 
@@ -17396,6 +17611,49 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_recovery_request_round_trips_authorized_source_and_reissue() {
+        let authorized_source = test_metadata_command();
+        let abandoned_source = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                authorized_source.id().cluster_epoch(),
+                authorized_source.id().pg_id(),
+                MetadataCommandLogIndex::new(authorized_source.id().log_index().get() + 1).unwrap(),
+            ),
+            authorized_source.payload().clone(),
+        );
+        let command = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                authorized_source.id().cluster_epoch(),
+                authorized_source.id().pg_id(),
+                MetadataCommandLogIndex::new(authorized_source.id().log_index().get() + 2).unwrap(),
+            ),
+            authorized_source.payload().clone(),
+        );
+        let request = StorageRpcMetadataCommandRecoveryRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: authorized_source.id().cluster_epoch(),
+            pg_id: authorized_source.id().pg_id(),
+            authorized_source: authorized_source.clone(),
+            abandoned_source: Some(abandoned_source.clone()),
+            command: command.clone(),
+        };
+
+        let bytes = encode_metadata_command_recovery_request(&request).unwrap();
+        let decoded = decode_metadata_command_recovery_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+        assert_eq!(
+            decoded.authorized_source.command_bytes(),
+            authorized_source.command_bytes()
+        );
+        assert_eq!(
+            decoded.abandoned_source.unwrap().command_bytes(),
+            abandoned_source.command_bytes()
+        );
+        assert_eq!(decoded.command.command_bytes(), command.command_bytes());
+    }
+
+    #[test]
     fn metadata_command_pending_slot_request_carries_scope_bucket() {
         let command = test_metadata_command();
         let request = StorageRpcMetadataCommandPendingSlotRequest {
@@ -17442,6 +17700,126 @@ mod tests {
             decoded.replacement.command_bytes(),
             replacement.command_bytes()
         );
+    }
+
+    #[test]
+    fn metadata_command_recovery_pending_slot_replace_request_round_trips() {
+        let authorized_source = test_metadata_command();
+        let abandoned_source = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                authorized_source.id().cluster_epoch(),
+                authorized_source.id().pg_id(),
+                MetadataCommandLogIndex::new(authorized_source.id().log_index().get() + 1).unwrap(),
+            ),
+            authorized_source.payload().clone(),
+        );
+        let replacement = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                authorized_source.id().cluster_epoch(),
+                authorized_source.id().pg_id(),
+                MetadataCommandLogIndex::new(authorized_source.id().log_index().get() + 2).unwrap(),
+            ),
+            authorized_source.payload().clone(),
+        );
+        let request = StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: authorized_source.id().cluster_epoch(),
+            pg_id: authorized_source.id().pg_id(),
+            authorized_source: authorized_source.clone(),
+            abandoned_source: Some(abandoned_source.clone()),
+            previous: abandoned_source,
+            replacement,
+            scope_bucket: Some(BucketName::try_from("pending-scope").unwrap()),
+        };
+
+        let bytes =
+            encode_metadata_command_recovery_pending_slot_replace_request(&request).unwrap();
+        let decoded =
+            decode_metadata_command_recovery_pending_slot_replace_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn metadata_command_recovery_frames_with_abandoned_source_fit_declared_caps() {
+        assert_eq!(
+            STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN,
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+                + 1
+                + 3 * STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN
+        );
+        assert_eq!(
+            STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN,
+            STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN
+                + 1
+                + 2 * STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN
+        );
+
+        let authorized_source = test_metadata_command();
+        let abandoned_source = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                authorized_source.id().cluster_epoch(),
+                authorized_source.id().pg_id(),
+                MetadataCommandLogIndex::new(authorized_source.id().log_index().get() + 1).unwrap(),
+            ),
+            authorized_source.payload().clone(),
+        );
+        let replacement = MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                authorized_source.id().cluster_epoch(),
+                authorized_source.id().pg_id(),
+                MetadataCommandLogIndex::new(authorized_source.id().log_index().get() + 2).unwrap(),
+            ),
+            authorized_source.payload().clone(),
+        );
+        let apply_payload =
+            encode_metadata_command_recovery_request(&StorageRpcMetadataCommandRecoveryRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: authorized_source.id().cluster_epoch(),
+                pg_id: authorized_source.id().pg_id(),
+                authorized_source: authorized_source.clone(),
+                abandoned_source: Some(abandoned_source.clone()),
+                command: replacement.clone(),
+            })
+            .unwrap();
+        let replace_payload = encode_metadata_command_recovery_pending_slot_replace_request(
+            &StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: authorized_source.id().cluster_epoch(),
+                pg_id: authorized_source.id().pg_id(),
+                authorized_source,
+                abandoned_source: Some(abandoned_source.clone()),
+                previous: abandoned_source,
+                replacement,
+                scope_bucket: Some(BucketName::try_from("pending-scope").unwrap()),
+            },
+        )
+        .unwrap();
+
+        for (kind, payload, limit) in [
+            (
+                StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+                apply_payload,
+                STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
+                replace_payload,
+                STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN,
+            ),
+        ] {
+            assert!(payload.len() <= limit);
+            let frame = encode_storage_rpc_frame(7, kind, &payload).unwrap();
+            let decoded = read_storage_rpc_request_frame_from(&mut Cursor::new(frame)).unwrap();
+            assert_eq!(decoded.payload, payload);
+
+            let mut boundary_payload = payload;
+            boundary_payload.resize(limit, 0);
+            let boundary_frame = encode_storage_rpc_frame(8, kind, &boundary_payload).unwrap();
+            let decoded =
+                read_storage_rpc_request_frame_from(&mut Cursor::new(boundary_frame)).unwrap();
+            assert_eq!(decoded.payload.len(), limit);
+        }
     }
 
     #[test]
@@ -19384,6 +19762,17 @@ mod tests {
                 StorageRpcMessageKind::MetadataCommandApplyAndRecord,
                 STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+                STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
+                STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN
+                    + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_PENDING_SLOT_REPLACE_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::ObjectGenerationNext,

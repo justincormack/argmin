@@ -8,7 +8,7 @@ use std::sync::{Mutex, OnceLock};
 
 use placement::NodeId;
 
-use super::LocalClusterRuntimeState;
+use super::{LocalClusterRuntimeState, MetadataCommandExecutionRoute, MetadataCommandRouteMode};
 #[cfg(any(test, feature = "test-hooks"))]
 use super::{
     MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
@@ -137,12 +137,6 @@ const LIFECYCLE_SWEEP_CLAIM_LEASE_MILLIS: u64 = 60_000;
 enum AbortMultipartUploadDrainMode {
     Wait,
     Stop,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetadataCommandRouteMode {
-    Normal,
-    Recovery,
 }
 
 #[derive(Clone, Copy)]
@@ -1484,7 +1478,7 @@ impl super::StorageCluster {
                 }
             };
             let outcome = self
-                .finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget(
+                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
                     pg_id,
                     &command,
                     clear_pending_on_zero_apply,
@@ -1515,6 +1509,8 @@ impl super::StorageCluster {
             command,
             MetadataCommandRouteMode::Normal,
             self,
+            None,
+            None,
         )
     }
 
@@ -1527,17 +1523,38 @@ impl super::StorageCluster {
             command,
             MetadataCommandRouteMode::Normal,
             reservation_authority,
+            None,
+            None,
         )
     }
 
-    fn apply_metadata_command_to_acting_set_for_recovery(
+    pub(super) fn apply_reissued_metadata_command_to_acting_set_for_recovery(
         &self,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
         command: &MetadataCommandEnvelope,
+        reservation_authority: &StorageCluster,
     ) -> Result<(), MetadataCommandApplyFailure> {
         self.apply_metadata_command_to_acting_set_with_route_mode(
             command,
             MetadataCommandRouteMode::Recovery,
-            self,
+            reservation_authority,
+            Some(authorized_source),
+            abandoned_source,
+        )
+    }
+
+    pub(super) fn apply_metadata_command_to_acting_set_for_recovery(
+        &self,
+        command: &MetadataCommandEnvelope,
+        reservation_authority: &StorageCluster,
+    ) -> Result<(), MetadataCommandApplyFailure> {
+        self.apply_metadata_command_to_acting_set_with_route_mode(
+            command,
+            MetadataCommandRouteMode::Recovery,
+            reservation_authority,
+            None,
+            None,
         )
     }
 
@@ -1546,6 +1563,8 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
         reservation_authority: &StorageCluster,
+        authorized_source: Option<&MetadataCommandEnvelope>,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
     ) -> Result<(), MetadataCommandApplyFailure> {
         let pg_id = command.id().pg_id();
         let primary_node_id = match route_mode {
@@ -1569,6 +1588,8 @@ impl super::StorageCluster {
             command,
             route_mode,
             reservation_authority,
+            authorized_source,
+            abandoned_source,
         )
     }
 
@@ -1578,6 +1599,8 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
         reservation_authority: &StorageCluster,
+        authorized_source: Option<&MetadataCommandEnvelope>,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
     ) -> Result<(), MetadataCommandApplyFailure> {
         let pg_id = command.id().pg_id();
         let pg_lock = self
@@ -1651,12 +1674,20 @@ impl super::StorageCluster {
                         source: BucketSnapshotLoadError::Store(source),
                     })?;
                 if acceptance == MetadataCommandAcceptance::AlreadyApplied {
-                    metadata_client
-                        .apply_metadata_command_and_record(pg_id, command)
-                        .map_err(|source| MetadataCommandApplyFailure {
-                            applied_nodes,
-                            source,
-                        })?;
+                    let apply = match authorized_source {
+                        Some(source) => metadata_client
+                            .apply_metadata_command_and_record_for_recovery(
+                                pg_id,
+                                source,
+                                abandoned_source,
+                                command,
+                            ),
+                        None => metadata_client.apply_metadata_command_and_record(pg_id, command),
+                    };
+                    apply.map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source,
+                    })?;
                     admission_witnessed = true;
                     continue;
                 }
@@ -1677,12 +1708,19 @@ impl super::StorageCluster {
                     applied_nodes,
                     source: source.into(),
                 })?;
-                metadata_client
-                    .apply_metadata_command_and_record(pg_id, command)
-                    .map_err(|source| MetadataCommandApplyFailure {
-                        applied_nodes,
+                let apply = match authorized_source {
+                    Some(source) => metadata_client.apply_metadata_command_and_record_for_recovery(
+                        pg_id,
                         source,
-                    })?;
+                        abandoned_source,
+                        command,
+                    ),
+                    None => metadata_client.apply_metadata_command_and_record(pg_id, command),
+                };
+                apply.map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source,
+                })?;
                 admission_witnessed = true;
                 continue;
             }
@@ -1715,12 +1753,19 @@ impl super::StorageCluster {
                 source: source.into(),
             })?;
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
-                metadata_client
-                    .apply_metadata_command_and_record(pg_id, command)
-                    .map_err(|source| MetadataCommandApplyFailure {
-                        applied_nodes,
+                let apply = match authorized_source {
+                    Some(source) => metadata_client.apply_metadata_command_and_record_for_recovery(
+                        pg_id,
                         source,
-                    })?;
+                        abandoned_source,
+                        command,
+                    ),
+                    None => metadata_client.apply_metadata_command_and_record(pg_id, command),
+                };
+                apply.map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source,
+                })?;
                 continue;
             }
             maybe_run_before_metadata_command_apply_hook(
@@ -1732,12 +1777,19 @@ impl super::StorageCluster {
                 applied_nodes,
                 source: source.into(),
             })?;
-            metadata_client
-                .apply_metadata_command_and_record(pg_id, command)
-                .map_err(|source| MetadataCommandApplyFailure {
-                    applied_nodes,
+            let apply = match authorized_source {
+                Some(source) => metadata_client.apply_metadata_command_and_record_for_recovery(
+                    pg_id,
                     source,
-                })?;
+                    abandoned_source,
+                    command,
+                ),
+                None => metadata_client.apply_metadata_command_and_record(pg_id, command),
+            };
+            apply.map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes,
+                source,
+            })?;
         }
         Ok(())
     }
@@ -1752,7 +1804,7 @@ impl super::StorageCluster {
         )
     }
 
-    fn record_abandoned_metadata_command_to_acting_set_for_recovery(
+    pub(super) fn record_abandoned_metadata_command_to_acting_set_for_recovery(
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), MetadataCommandApplyFailure> {
@@ -1868,7 +1920,7 @@ impl super::StorageCluster {
         )
     }
 
-    fn metadata_command_has_abandoned_log_on_acting_set_for_recovery(
+    pub(super) fn metadata_command_has_abandoned_log_on_acting_set_for_recovery(
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, MetadataCommandApplyFailure> {
@@ -1925,6 +1977,8 @@ impl super::StorageCluster {
             command,
             MetadataCommandRouteMode::Normal,
             self,
+            None,
+            None,
         )
         .map_err(|error| error.source)
     }
@@ -1963,7 +2017,7 @@ impl super::StorageCluster {
             command,
             clear_pending_on_zero_apply,
             false,
-            MetadataCommandRouteMode::Normal,
+            MetadataCommandExecutionRoute::normal(),
             work_budget,
         )? {
             FinishPendingMetadataCommandResult::Applied => {
@@ -1990,7 +2044,7 @@ impl super::StorageCluster {
             command,
             clear_pending_on_zero_apply,
             true,
-            MetadataCommandRouteMode::Normal,
+            MetadataCommandExecutionRoute::normal(),
             work_budget,
         )
     }
@@ -2000,6 +2054,7 @@ impl super::StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
+        recovery_authorized_source: Option<&MetadataCommandEnvelope>,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
         self.finish_pending_metadata_command_to_acting_set_inner(
@@ -2007,7 +2062,7 @@ impl super::StorageCluster {
             command,
             clear_pending_on_zero_apply,
             true,
-            MetadataCommandRouteMode::Recovery,
+            MetadataCommandExecutionRoute::recovery(recovery_authorized_source, None),
             work_budget,
         )
     }
@@ -2018,9 +2073,11 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
         retry_partial_exact_conflict: bool,
-        route_mode: MetadataCommandRouteMode,
+        execution_route: MetadataCommandExecutionRoute<'_>,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
+        let route_mode = execution_route.mode;
+        let recovery_authorized_source = execution_route.recovery_authorized_source.cloned();
         let mut command = command.clone();
         loop {
             work_budget.check("metadata command apply retry budget exhausted")?;
@@ -2065,9 +2122,16 @@ impl super::StorageCluster {
                 MetadataCommandRouteMode::Normal => {
                     self.apply_metadata_command_to_acting_set(&command)
                 }
-                MetadataCommandRouteMode::Recovery => {
-                    self.apply_metadata_command_to_acting_set_for_recovery(&command)
-                }
+                MetadataCommandRouteMode::Recovery => match recovery_authorized_source.as_ref() {
+                    Some(authorized_source) => self
+                        .apply_reissued_metadata_command_to_acting_set_for_recovery(
+                            authorized_source,
+                            None,
+                            &command,
+                            self,
+                        ),
+                    None => self.apply_metadata_command_to_acting_set_for_recovery(&command, self),
+                },
             };
             match apply_result {
                 Ok(()) => {
@@ -2094,15 +2158,18 @@ impl super::StorageCluster {
                         source,
                     } = error;
                     if retry_partial_exact_conflict
+                        && applied_nodes > 0
                         && super::StorageCluster::metadata_command_log_conflict_matches(
                             &command, &source,
                         )
-                        && self.partial_exact_metadata_command_conflict_is_retryable(
-                            pg_id,
-                            &command,
-                            applied_nodes,
-                            &source,
-                        )?
+                        && self
+                            .partial_exact_metadata_command_conflict_is_retryable_with_route_mode(
+                                pg_id,
+                                &command,
+                                applied_nodes,
+                                &source,
+                                route_mode,
+                            )?
                     {
                         return Ok(FinishPendingMetadataCommandResult::RetryPartialExactConflict);
                     }
@@ -2111,8 +2178,15 @@ impl super::StorageCluster {
                             &command, &source,
                         )
                     {
-                        let Some(reissued) =
-                            self.reissue_pending_metadata_command(pg_id, &command)?
+                        let Some(reissued) = self
+                            .reissue_pending_metadata_command_with_route_mode(
+                                pg_id,
+                                &command,
+                                route_mode,
+                                recovery_authorized_source.as_ref(),
+                                None,
+                                command.payload(),
+                            )?
                         else {
                             return Ok(FinishPendingMetadataCommandResult::Abandoned);
                         };

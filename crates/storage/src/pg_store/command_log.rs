@@ -2367,6 +2367,26 @@ impl PgStore {
                 cluster_epoch: replacement.id().cluster_epoch(),
             });
         }
+        let durable_log_tip = self.max_metadata_command_log_index(expected.id().cluster_epoch())?;
+        let expected_replacement_index = durable_log_tip
+            .max(expected.id().log_index().get())
+            .checked_add(1)
+            .ok_or(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: expected.id().cluster_epoch(),
+                log_index: u64::MAX,
+            })?;
+        if replacement.id().cluster_epoch() != expected.id().cluster_epoch()
+            || replacement.id().log_index().get() != expected_replacement_index
+        {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: expected.id().cluster_epoch(),
+                log_index: replacement.id().log_index().get(),
+            });
+        }
         let Some(slot) =
             self.pending_metadata_command_slot(node_id, expected.id().cluster_epoch())?
         else {

@@ -1246,6 +1246,16 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         bucket: Option<&BucketName>,
     ) -> Result<bool, StoreError>;
 
+    fn replace_pending_metadata_command_slot_for_recovery(
+        &self,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+    ) -> Result<bool, StoreError>;
+
     fn metadata_command_replica_state(
         &self,
         pg_id: PgId,
@@ -1373,6 +1383,14 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
     fn apply_metadata_command_and_record(
         &self,
         pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+
+    fn apply_metadata_command_and_record_for_recovery(
+        &self,
+        pg_id: PgId,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 

@@ -132,6 +132,20 @@ fn spawn_storage_node_server(server: StorageNodeServer) -> StorageNodeServerGuar
     }
 }
 
+fn spawn_shared_storage_node_server(server: Arc<StorageNodeServer>) -> StorageNodeServerGuard {
+    let socket_path = server.socket_path_for_test();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = thread::spawn(move || {
+        server.serve_until_stop_for_test(&thread_stop).unwrap();
+    });
+    StorageNodeServerGuard {
+        stop,
+        socket_path,
+        thread: Some(thread),
+    }
+}
+
 static UNIX_CLIENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn unix_client_tempdir() -> (std::sync::MutexGuard<'static, ()>, test_util::TempDir) {
@@ -596,6 +610,283 @@ fn unix_historical_recovery_clears_fully_applied_pending_command() {
 #[test]
 fn unix_historical_recovery_converges_partial_pending_command() {
     assert_historical_pending_command_recovery_over_unix(1, 1, false);
+}
+
+#[test]
+fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(0);
+    let node_ids = [node_id];
+    let pg_ids = [0, 1];
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let command_epoch = ClusterEpoch::INITIAL;
+    let current_epoch = ClusterEpoch::new(command_epoch.get() + 1).unwrap();
+    let placement_map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        node_id,
+        node_ids,
+        &pg_ids,
+        ec_shape,
+        command_epoch,
+    )
+    .unwrap();
+    let (bucket, key, pg_id, bucket_pg_id) = (0..1_000)
+        .find_map(|index| {
+            let bucket = BucketName::new(format!("unix-reissued-stream-cleanup-{index}")).unwrap();
+            let key = ObjectKey::new("object").unwrap();
+            let bucket_pg_id = PgId::new(placement_map.bucket_pg_for(&bucket));
+            let pg_id = PgId::new(placement_map.object_pg_for(&bucket, &key));
+            (bucket_pg_id != pg_id).then_some((bucket, key, pg_id, bucket_pg_id))
+        })
+        .expect("two-PG topology must place one test object separately from its bucket metadata");
+    drop(placement_map);
+    let session_id =
+        crate::SessionId::try_from("78787878787878787878787878787878".to_string()).unwrap();
+    let now_ms = crate::clock::current_time_millis();
+    let source = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            command_epoch,
+            pg_id,
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::CreateStreamUpload(Box::new(
+            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::ObjectEncryption::None,
+                },
+                now_ms,
+                crate::BucketWriteReservationProof {
+                    bucket: bucket.clone(),
+                    reservation_id: "missing-recovery-reservation".to_string(),
+                    owner_token: "recovery-owner".to_string(),
+                    cluster_epoch: command_epoch,
+                    bucket_execution_generation: 1,
+                    bucket_incarnation_generation: 1,
+                    operation_kind: "historical-recovery".to_string(),
+                    created_at: now_ms,
+                    lease_deadline: now_ms.saturating_add(60_000),
+                    target_context: Some(key.as_str().to_string()),
+                },
+            ),
+        )),
+    );
+    let reissued = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            command_epoch,
+            pg_id,
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        source.payload().clone(),
+    );
+    let cleanup = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            command_epoch,
+            pg_id,
+            MetadataCommandLogIndex::new(3).unwrap(),
+        ),
+        source
+            .payload()
+            .abandoned_recovery_follow_up()
+            .expect("PutObject stream creation requires generation cleanup"),
+    );
+    let pending = crate::control_plane::PendingMetadataCommandObservation::new(
+        command_epoch,
+        std::num::NonZeroU64::MIN,
+        source.checksum_crc64(),
+    );
+    let recovery = crate::control_plane::PendingMetadataCommandRecovery::new(node_id, pending);
+    let historical_routes = pg_ids.map(|raw_pg_id| StorageNodePgRoute {
+        pg_id: raw_pg_id,
+        cluster_epoch: command_epoch,
+        state: PgState::Active,
+        primary_node_id: node_id,
+        acting_set: node_ids.to_vec(),
+    });
+    let current_routes = pg_ids.map(|raw_pg_id| StorageNodePgRoute {
+        pg_id: raw_pg_id,
+        cluster_epoch: current_epoch,
+        state: if raw_pg_id == pg_id.get() {
+            PgState::Peering
+        } else {
+            PgState::Active
+        },
+        primary_node_id: node_id,
+        acting_set: node_ids.to_vec(),
+    });
+    let data_dir = tmp.path().join("reissued-stream-cleanup-node");
+    let socket_path = tmp
+        .path()
+        .join("sockets")
+        .join("reissued-stream-cleanup.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    {
+        let node =
+            SharedStorageNode::open_with_default_ec_shape(&data_dir, &pg_ids, ec_shape).unwrap();
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let acl_grants = crate::AclGrants::default();
+        let create_bucket = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        for raw_pg_id in pg_ids {
+            let pg = node.get_pg(raw_pg_id).unwrap();
+            pg.create_bucket_with_config(&create_bucket).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        let pg = node.get_pg(pg_id.get()).unwrap();
+        crate::PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &session_id)
+            .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        pg.try_insert_pending_metadata_command_slot(node_id.as_u32(), &source, Some(&bucket))
+            .unwrap();
+    }
+    let route_map_validity = RouteMapValidity::until_ms_saturating(now_ms.saturating_add(60_000));
+    let initial_server_config = StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: command_epoch,
+        route_map_validity,
+        data_dir: data_dir.clone(),
+        default_ec_shape: ec_shape,
+        pg_ids: pg_ids.to_vec(),
+        socket_path: socket_path.clone(),
+        pg_routes: historical_routes.to_vec(),
+        historical_pg_routes: Vec::new(),
+        pending_metadata_command_recoveries: Vec::new(),
+    };
+    let server = Arc::new(StorageNodeServer::bind(initial_server_config).unwrap());
+    let server_guard = spawn_shared_storage_node_server(Arc::clone(&server));
+    let client_config = LocalUnixStorageNodeClientConfig::new(node_id, socket_path);
+
+    let historical_snapshots: Vec<_> = pg_ids
+        .map(|raw_pg_id| {
+            PgRouteSnapshot::reconstructed(
+                command_epoch,
+                PgId::new(raw_pg_id),
+                node_id,
+                node_ids.to_vec(),
+                PgState::Active,
+            )
+        })
+        .into();
+    let mut historical_map = LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+        node_id,
+        node_ids,
+        &pg_ids,
+        ec_shape,
+        command_epoch,
+        historical_snapshots.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    historical_map
+        .install_unix_storage_node_clients([client_config.clone()])
+        .unwrap();
+    let historical_cluster = StorageCluster::from_local_map(Arc::new(historical_map)).unwrap();
+    let conflict = MetadataCommandEnvelope::new(
+        source.id(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            ObjectKey::new("conflicting-object").unwrap(),
+            crate::SessionId::try_from("79797979797979797979797979797979".to_string()).unwrap(),
+            GenerationId::MIN,
+            now_ms,
+        )),
+    );
+    historical_cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(node_id, &conflict)
+        .unwrap();
+
+    server
+        .install_control_plane_runtime_config(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: current_epoch,
+            route_map_validity,
+            data_dir: data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.to_vec(),
+            socket_path: server_guard.socket_path.clone(),
+            pg_routes: current_routes.to_vec(),
+            historical_pg_routes: historical_routes.to_vec(),
+            pending_metadata_command_recoveries: vec![(pg_id, recovery)],
+        })
+        .unwrap();
+
+    let current_snapshots: Vec<_> = pg_ids
+        .map(|raw_pg_id| {
+            PgRouteSnapshot::reconstructed(
+                current_epoch,
+                PgId::new(raw_pg_id),
+                node_id,
+                node_ids.to_vec(),
+                if raw_pg_id == pg_id.get() {
+                    PgState::Peering
+                } else {
+                    PgState::Active
+                },
+            )
+        })
+        .into();
+    let mut current_map = LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+        node_id,
+        node_ids,
+        &pg_ids,
+        ec_shape,
+        current_epoch,
+        current_snapshots.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    current_map.test_install_historical_pg_routes(historical_snapshots);
+    current_map
+        .install_unix_storage_node_clients([client_config])
+        .unwrap();
+    let current_cluster = StorageCluster::from_local_map(Arc::new(current_map)).unwrap();
+
+    assert_eq!(
+        historical_cluster
+            .drain_pending_metadata_command_with_authorized_recovery_route(
+                pg_id,
+                &source,
+                &current_cluster,
+            )
+            .unwrap(),
+        PendingMetadataCommandOutcome::Abandoned
+    );
+    drop(historical_cluster);
+    drop(current_cluster);
+    drop(server_guard);
+
+    let node = SharedStorageNode::open_with_default_ec_shape(&data_dir, &pg_ids, ec_shape).unwrap();
+    let pg = node.get_pg(pg_id.get()).unwrap();
+    assert!(pg
+        .metadata_command_abandoned(node_id.as_u32(), &reissued)
+        .unwrap());
+    assert_eq!(
+        pg.metadata_command_replica_state()
+            .unwrap()
+            .applied_log_index,
+        cleanup.id().log_index().get()
+    );
+    assert_eq!(
+        pg.pending_metadata_command_envelope(node_id.as_u32(), command_epoch)
+            .unwrap(),
+        None
+    );
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_generation_reservation(&*pg, &bucket, &key, &session_id,),
+        Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+    ));
+    assert_ne!(pg_id, bucket_pg_id);
 }
 
 proptest! {
