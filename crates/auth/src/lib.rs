@@ -85,7 +85,7 @@ pub use post::{
 };
 pub use provider::{
     IdentityProvider, IdentityProviderBackend, IdentityProviderError, ResolvedRoleIdentity,
-    RoleIdentityStore, RoleIdentityStoreError,
+    RoleIdentityStore, RoleIdentityStoreError, SessionCredentialAuthenticationError,
 };
 pub use request::{
     authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion, HeaderSource,

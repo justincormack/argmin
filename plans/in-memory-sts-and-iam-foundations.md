@@ -155,10 +155,12 @@ Long-lived store insertion and server configuration reject the reserved
 long-lived and validates access-key binding on every custom-backend result, so
 a future backend cannot bypass the reservation.
 
-Auth can seal and strictly open the version-1 envelope through the shared
-provider, but request authentication does not yet select that path or produce
-the session variant. It continues to check an optional expiry on stored records
-and then calls
+The shared provider can now authenticate one already-selected temporary
+credential into the session variant. That boundary strictly opens the
+version-1 envelope, binds its access key in constant time, checks expiry, and
+only then resolves the stable issuer incarnation. Request authentication does
+not yet select or call that path. It continues to check an optional expiry on
+stored records and then calls
 `validate_static_credential_has_no_token` on header, presigned, and POST paths.
 An expiring stored record is therefore still not a usable STS credential.
 
@@ -2445,9 +2447,8 @@ data, a random per-key nonce prefix plus atomic counter, strict defensive decode
 bounds, strict typed payload reconstruction, and a derived 742-byte issuance
 ceiling. The codec rejects unknown keys/versions, non-canonical encoding,
 truncation, tampering, invalid fields, impossible lifetimes, and trailing data
-without exposing bearer material. Opening then resolves the stable role
-incarnation and authoritative account before constructing a session
-credential.
+without exposing bearer material. Stable role incarnation and authoritative
+account resolution are deliberately outside the cryptographic codec.
 
 Temporary access/secret generation uses the Argmin-owned `ARGS` namespace,
 unbiased rejection sampling for the 20-character suffix, and 30 random bytes
@@ -2486,6 +2487,22 @@ record exists.
   credential or deleted issuer and requiring the internal fail-closed response
 - exercise each SigV4 mode at the authentication boundary without claiming that
   a role session yet has usable S3 permissions
+
+Progress as of 2026-07-20: the shared provider authentication decision accepts
+only an access key, one mode-selected optional token, and an injected current
+time. Missing/empty tokens, malformed tokens, access-key mismatch, exact
+expiry, deleted stable issuers, key-ring failure, and identity-provider failure
+remain typed and contain no bearer input. The implemented order is token open,
+constant-time access-key binding, expiry, then authoritative stable-issuer
+liveness. Deterministic tests pin the exact expiration instant, binding before
+expiry and liveness-provider failure, expiry before deletion and provider
+failure, token opening before binding, authentication-path key-ring failure,
+cross-provider key/domain rejection, and redacted diagnostics. A live-role
+record whose immutable account or role name disagrees with its authenticated
+sealed payload is a typed invalid provider record, not a client credential
+error. Header, presigned, POST, and streaming adapters still need to perform
+their mode-specific selection/coverage checks and call this boundary before
+signature verification.
 
 Exit condition: directly sealed session credentials authenticate with
 AWS-pinned token/signature/expiry precedence on every SigV4 mode and produce a

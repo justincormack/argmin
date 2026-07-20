@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::{
-    is_reserved_session_access_key_id, CredentialStore, DecodedSessionCredential,
-    GeneratedSessionCredentialMaterial, LiveRoleIdentity, RoleSessionName, SessionLifetime,
-    SessionTokenKeyRingInitError, SessionTokenKeyRingStatus, SessionTokenOpenError,
-    SessionTokenSealError, SourceIdentity, StableRoleId, StoredCredential,
+    is_reserved_session_access_key_id, AuthenticatedCredential, CredentialStore,
+    DecodedSessionCredential, GeneratedSessionCredentialMaterial, LiveRoleIdentity,
+    RoleSessionName, SessionLifetime, SessionTokenKeyRingInitError, SessionTokenKeyRingStatus,
+    SessionTokenOpenError, SessionTokenSealError, SourceIdentity, StableRoleId, StoredCredential,
 };
 
 /// Conflicting live-role identity in process-local bootstrap state.
@@ -85,6 +85,26 @@ impl IdentityProviderError {
             Self::InvalidRecord => "identity_provider_invalid_record",
         }
     }
+}
+
+/// Failure while authenticating an Argmin-issued temporary credential.
+///
+/// This shared result deliberately does not contain the presented access key
+/// or session token. Protocol adapters retain the inputs they need for
+/// AWS-compatible error rendering and map these typed decisions at their own
+/// service boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SessionCredentialAuthenticationError {
+    #[error("invalid session credential")]
+    InvalidCredential,
+    #[error("invalid session token")]
+    InvalidToken,
+    #[error("session credential expired")]
+    ExpiredToken,
+    #[error("session-token key ring unavailable")]
+    KeyRingUnavailable,
+    #[error(transparent)]
+    IdentityProvider(#[from] IdentityProviderError),
 }
 
 /// Live role/account record whose lookup key was verified by the shared
@@ -240,23 +260,51 @@ impl IdentityProvider {
         crate::session_token::seal_v1(&self.session_token_key_ring, &credential)
     }
 
-    /// Open a versioned token, resolve its stable issuer incarnation, and
-    /// construct a typed session credential from the authoritative role and
-    /// account record.
-    pub fn open_session_token(
+    /// Authenticate one temporary credential after a protocol adapter has
+    /// selected and structurally collapsed its mode-specific token input.
+    ///
+    /// Token opening and constant-time access-key binding precede expiry.
+    /// Expiry precedes the authoritative stable-role liveness lookup, matching
+    /// the AWS ordering pinned independently for each initial SigV4 mode.
+    pub fn authenticate_session_credential(
         &self,
-        token: &str,
-    ) -> Result<DecodedSessionCredential, SessionTokenOpenError> {
-        let opened = crate::session_token::open_v1(&self.session_token_key_ring, token)?;
+        access_key_id: &str,
+        token: Option<&str>,
+        now_epoch_secs: u64,
+    ) -> Result<AuthenticatedCredential, SessionCredentialAuthenticationError> {
+        let token = token
+            .filter(|token| !token.is_empty())
+            .ok_or(SessionCredentialAuthenticationError::InvalidCredential)?;
+        let opened = crate::session_token::open_v1(&self.session_token_key_ring, token).map_err(
+            |error| match error {
+                SessionTokenOpenError::InvalidToken => {
+                    SessionCredentialAuthenticationError::InvalidToken
+                }
+                SessionTokenOpenError::KeyRingUnavailable => {
+                    SessionCredentialAuthenticationError::KeyRingUnavailable
+                }
+            },
+        )?;
+        if !crate::constant_time_eq(
+            access_key_id.as_bytes(),
+            crate::session_token::opened_access_key_id(&opened).as_bytes(),
+        ) {
+            return Err(SessionCredentialAuthenticationError::InvalidCredential);
+        }
+        let lifetime = crate::session_token::opened_lifetime(&opened);
+        if i64::try_from(now_epoch_secs).map_or(true, |now| now >= lifetime.expires_at_epoch_secs())
+        {
+            return Err(SessionCredentialAuthenticationError::ExpiredToken);
+        }
         let issuer = self
             .lookup_live_role_identity(crate::session_token::opened_stable_role_id(&opened))?
-            .ok_or(SessionTokenOpenError::IssuerNotFound)?;
+            .ok_or(SessionCredentialAuthenticationError::InvalidCredential)?;
         if issuer.role().account_id() != crate::session_token::opened_account_id(&opened)
             || issuer.role().name() != crate::session_token::opened_role_name(&opened)
         {
-            return Err(SessionTokenOpenError::InvalidToken);
+            return Err(IdentityProviderError::InvalidRecord.into());
         }
-        DecodedSessionCredential::version1(
+        let credential = DecodedSessionCredential::version1(
             crate::session_token::opened_access_key_id(&opened).to_string(),
             crate::session_token::opened_secret_key(&opened).clone(),
             &issuer,
@@ -264,7 +312,8 @@ impl IdentityProvider {
             crate::session_token::opened_lifetime(&opened),
             crate::session_token::opened_source_identity(&opened).cloned(),
         )
-        .map_err(|_| SessionTokenOpenError::InvalidToken)
+        .map_err(|_| IdentityProviderError::InvalidRecord)?;
+        Ok(AuthenticatedCredential::Session(Arc::new(credential)))
     }
 
     /// Return non-secret status for the shared session-token key ring.
@@ -656,8 +705,31 @@ mod tests {
     }
 
     #[test]
-    fn poisoned_session_token_key_ring_is_typed_unavailability() {
-        let provider = IdentityProvider::in_memory(CredentialStore::new()).unwrap();
+    fn poisoned_session_token_key_ring_is_typed_unavailability_during_authentication() {
+        let stable_role_id = StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
+        let mut roles = RoleIdentityStore::new();
+        roles
+            .add(role(stable_role_id.as_str(), "test-role"))
+            .unwrap();
+        let provider =
+            IdentityProvider::in_memory_with_roles(CredentialStore::new(), roles).unwrap();
+        let issuer = provider
+            .lookup_live_role_identity(&stable_role_id)
+            .unwrap()
+            .unwrap();
+        let access_key_id = "ARGS0123456789ABCDEFGHIJ";
+        let token = provider
+            .seal_session_credential_v1(
+                GeneratedSessionCredentialMaterial::from_parts_for_test(
+                    access_key_id.to_string(),
+                    SecretKey::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".to_string()),
+                ),
+                &issuer,
+                RoleSessionName::new("test-session").unwrap(),
+                SessionLifetime::new(1_700_000_000, 1_700_003_600).unwrap(),
+                None,
+            )
+            .unwrap();
         let poison_target = Arc::clone(&provider.session_token_key_ring);
         let _ = std::thread::spawn(move || {
             let _panic_guard = SuppressExpectedPanicOutput::new();
@@ -669,5 +741,9 @@ mod tests {
             provider.session_token_key_ring_status(),
             Err(SessionTokenSealError::KeyRingUnavailable)
         );
+        assert!(matches!(
+            provider.authenticate_session_credential(access_key_id, Some(&token), 1_700_003_599,),
+            Err(SessionCredentialAuthenticationError::KeyRingUnavailable)
+        ));
     }
 }

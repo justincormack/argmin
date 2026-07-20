@@ -6541,9 +6541,12 @@ mod tests {
         for frontend in [&first, &second] {
             let opened = frontend
                 .identity_provider
-                .open_session_token(&token)
+                .authenticate_session_credential(&access_key_id, Some(&token), 1_700_003_599)
                 .unwrap();
-            assert_eq!(opened.session().role().stable_id(), &stable_role_id);
+            assert_eq!(
+                opened.session().unwrap().session().role().stable_id(),
+                &stable_role_id
+            );
         }
 
         let payload_hash = "0".repeat(64);

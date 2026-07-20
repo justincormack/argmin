@@ -94,17 +94,13 @@ pub enum SessionTokenSealError {
     IssuanceInvariant,
 }
 
-/// Failure while opening and resolving a session credential.
+/// Failure while opening a sealed session token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SessionTokenOpenError {
     #[error("invalid session token")]
     InvalidToken,
-    #[error("session-token issuer no longer exists")]
-    IssuerNotFound,
     #[error("session-token key ring unavailable")]
     KeyRingUnavailable,
-    #[error(transparent)]
-    IdentityProvider(#[from] crate::IdentityProviderError),
 }
 
 /// Public, non-secret status for the bounded process-local key ring.
@@ -709,7 +705,8 @@ mod tests {
     use crate::{
         AwsAccountId, CredentialStore, GeneratedSessionCredentialMaterial, IamPath,
         IamRoleIdentity, IdentityProvider, IdentityProviderBackend, IdentityProviderError,
-        LiveRoleIdentity, ResolvedRoleIdentity, RoleIdentityStore, StoredCredential,
+        LiveRoleIdentity, ResolvedRoleIdentity, RoleIdentityStore,
+        SessionCredentialAuthenticationError, StoredCredential,
     };
 
     const DOMAIN: CredentialDomain = [0x11; CREDENTIAL_DOMAIN_LEN];
@@ -769,8 +766,14 @@ mod tests {
         (provider, role)
     }
 
+    enum MutableRoleState {
+        Present(Arc<LiveRoleIdentity>),
+        Missing,
+        Failure(IdentityProviderError),
+    }
+
     struct MutableRoleProvider {
-        role: Arc<RwLock<Option<Arc<LiveRoleIdentity>>>>,
+        role: Arc<RwLock<MutableRoleState>>,
     }
 
     impl IdentityProviderBackend for MutableRoleProvider {
@@ -789,10 +792,13 @@ mod tests {
                 .role
                 .read()
                 .map_err(|_| IdentityProviderError::Unavailable)?;
-            Ok(role
-                .as_ref()
-                .filter(|role| role.role().stable_id() == stable_role_id)
-                .cloned())
+            match &*role {
+                MutableRoleState::Present(role) if role.role().stable_id() == stable_role_id => {
+                    Ok(Some(Arc::clone(role)))
+                }
+                MutableRoleState::Present(_) | MutableRoleState::Missing => Ok(None),
+                MutableRoleState::Failure(error) => Err(*error),
+            }
         }
 
         fn find_account_by_canonical_user_id(
@@ -887,7 +893,14 @@ mod tests {
             )
             .unwrap();
 
-        let opened = clone.open_session_token(&token).unwrap();
+        let opened = clone
+            .authenticate_session_credential(
+                "ARGS0123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_599,
+            )
+            .unwrap();
+        let opened = opened.session().unwrap();
         assert_eq!(opened.access_key_id(), "ARGS0123456789ABCDEFGHIJ");
         assert_eq!(
             opened.identity().account().account_id(),
@@ -904,12 +917,18 @@ mod tests {
         );
 
         let (other_provider, _) = resolved_role("test-role");
-        assert_invalid_provider(other_provider.open_session_token(&token));
+        assert_invalid_provider(other_provider.authenticate_session_credential(
+            "ARGS0123456789ABCDEFGHIJ",
+            Some(&token),
+            1_700_003_599,
+        ));
     }
 
     #[test]
-    fn provider_open_requires_the_stable_issuer_incarnation_to_remain_live() {
-        let role_state = Arc::new(RwLock::new(Some(Arc::new(live_role("test-role")))));
+    fn provider_authentication_enforces_binding_expiry_and_stable_issuer_liveness_in_order() {
+        let role_state = Arc::new(RwLock::new(MutableRoleState::Present(Arc::new(live_role(
+            "test-role",
+        )))));
         let provider = IdentityProvider::new(MutableRoleProvider {
             role: Arc::clone(&role_state),
         })
@@ -929,15 +948,134 @@ mod tests {
             )
             .unwrap();
 
-        *role_state.write().unwrap() = None;
+        let valid = provider
+            .authenticate_session_credential(
+                "ARGS0123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_599,
+            )
+            .unwrap();
+        assert_eq!(
+            valid.session().unwrap().session().role().stable_id(),
+            &stable_role_id
+        );
+
         assert!(matches!(
-            provider.open_session_token(&token),
-            Err(SessionTokenOpenError::IssuerNotFound)
+            provider.authenticate_session_credential(
+                "ARGS1123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_600,
+            ),
+            Err(SessionCredentialAuthenticationError::InvalidCredential)
+        ));
+        assert!(matches!(
+            provider.authenticate_session_credential(
+                "ARGS0123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_600,
+            ),
+            Err(SessionCredentialAuthenticationError::ExpiredToken)
+        ));
+
+        *role_state.write().unwrap() = MutableRoleState::Missing;
+        assert!(matches!(
+            provider.authenticate_session_credential(
+                "ARGS0123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_599,
+            ),
+            Err(SessionCredentialAuthenticationError::InvalidCredential)
+        ));
+        assert!(matches!(
+            provider.authenticate_session_credential(
+                "ARGS0123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_600,
+            ),
+            Err(SessionCredentialAuthenticationError::ExpiredToken)
+        ));
+
+        *role_state.write().unwrap() =
+            MutableRoleState::Failure(IdentityProviderError::Unavailable);
+        assert!(matches!(
+            provider.authenticate_session_credential(
+                "ARGS1123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_599,
+            ),
+            Err(SessionCredentialAuthenticationError::InvalidCredential)
+        ));
+        assert!(matches!(
+            provider.authenticate_session_credential(
+                "ARGS0123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_599,
+            ),
+            Err(SessionCredentialAuthenticationError::IdentityProvider(
+                IdentityProviderError::Unavailable
+            ))
+        ));
+        assert!(matches!(
+            provider.authenticate_session_credential(
+                "ARGS0123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_600,
+            ),
+            Err(SessionCredentialAuthenticationError::ExpiredToken)
+        ));
+
+        *role_state.write().unwrap() =
+            MutableRoleState::Present(Arc::new(live_role("replacement-role")));
+        assert!(matches!(
+            provider.authenticate_session_credential(
+                "ARGS0123456789ABCDEFGHIJ",
+                Some(&token),
+                1_700_003_599,
+            ),
+            Err(SessionCredentialAuthenticationError::IdentityProvider(
+                IdentityProviderError::InvalidRecord
+            ))
         ));
     }
 
-    fn assert_invalid_provider(result: Result<DecodedSessionCredential, SessionTokenOpenError>) {
-        assert!(matches!(result, Err(SessionTokenOpenError::InvalidToken)));
+    fn assert_invalid_provider(
+        result: Result<crate::AuthenticatedCredential, SessionCredentialAuthenticationError>,
+    ) {
+        assert!(matches!(
+            result,
+            Err(SessionCredentialAuthenticationError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn provider_authentication_classifies_missing_empty_and_malformed_tokens_without_leaking_input()
+    {
+        let (provider, _) = resolved_role("test-role");
+        let access_key_id = "ARGS0123456789ABCDEFGHIJ";
+
+        for token in [None, Some("")] {
+            assert!(matches!(
+                provider.authenticate_session_credential(access_key_id, token, 1_700_000_000),
+                Err(SessionCredentialAuthenticationError::InvalidCredential)
+            ));
+        }
+
+        let malformed = "ARGST1.not-a-canonical-token";
+        let error = provider
+            .authenticate_session_credential(access_key_id, Some(malformed), 1_700_000_000)
+            .unwrap_err();
+        assert_eq!(error, SessionCredentialAuthenticationError::InvalidToken);
+        assert!(matches!(
+            provider.authenticate_session_credential(
+                "ARGS1123456789ABCDEFGHIJ",
+                Some(malformed),
+                1_700_000_000,
+            ),
+            Err(SessionCredentialAuthenticationError::InvalidToken)
+        ));
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(access_key_id));
+        assert!(!rendered.contains(malformed));
     }
 
     #[test]
