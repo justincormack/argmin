@@ -28983,6 +28983,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let server_socket_path = socket_path.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
         authority
@@ -28993,6 +28994,13 @@ mod tests {
             .unwrap();
         let heartbeat_epoch = authority.snapshot().cluster_epoch();
         let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            drop(stream);
+            drop(listener);
+            std::fs::remove_file(&server_socket_path).unwrap();
+
             std::thread::sleep(Duration::from_millis(75));
             let listener = std::os::unix::net::UnixListener::bind(server_socket_path).unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -29029,9 +29037,10 @@ mod tests {
 
         assert!(!accepted_retry_after_deadline);
         let error = refresh.unwrap_err();
-        assert!(matches!(error, ControlPlaneError::Io { source, .. }
-            if source.kind() == ErrorKind::ConnectionRefused
-                || source.kind() == ErrorKind::NotFound));
+        assert!(
+            error.is_retryable_control_plane_rpc_transport_error(),
+            "heartbeat retry should return its terminal retryable transport error: {error}"
+        );
     }
 
     #[test]
