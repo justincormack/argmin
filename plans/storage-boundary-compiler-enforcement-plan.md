@@ -865,6 +865,30 @@ Eleventh Phase 3 slice:
   Unix regressions, the boundary checker, formatting, workspace-wide strict
   Clippy, and the full workspace suite (7,196 tests).
 
+Twelfth Phase 3 slice:
+
+- bucket-scoped and all-PG stream-upload scans now require
+  `ObjectMetadataScanPgId`. The duplicate methods on the transitional
+  `StorageNodeClient` aggregate carry the same role.
+- cluster bucket-deletion visibility and cleanup paths, together with the
+  best-effort abandoned-session scan, derive scan roles only from object
+  metadata PGs in the installed topology. Raw PG IDs remain only for routing
+  and returned-row placement validation.
+- local adapters erase the role only at the private raw-node boundary. Unix
+  adapters serialize its raw route evidence, and the Unix server reconstructs
+  the role only after route and primary validation. Both Unix scan endpoints
+  validate every returned stream-upload row against the scanned PG before
+  responding.
+- expanded Unix regressions prove that both scan endpoints accept an
+  installed object-metadata scan PG, reject an unknown PG with `UnknownPg`,
+  require the routed primary, and reject equivalent durable rows deliberately
+  stored on the wrong PG.
+- reclaim/scan and data-client signatures, `DataPgId` construction, and
+  request-scoped route capability values remain open in Phase 3.
+- the twelfth slice passed its focused stream-upload scan Unix regressions,
+  the boundary checker, formatting, workspace-wide strict Clippy, and the full
+  workspace suite (7,196 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

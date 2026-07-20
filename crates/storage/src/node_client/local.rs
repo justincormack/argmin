@@ -1364,7 +1364,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn list_stream_uploads_for_bucket_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         bucket: &BucketName,
         session_id_marker: Option<&SessionId>,
         limit: u32,
@@ -1380,7 +1380,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn list_all_stream_uploads_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         session_id_marker: Option<&SessionId>,
         limit: u32,
     ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
@@ -3045,7 +3045,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn list_all_stream_uploads_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         session_id_marker: Option<&SessionId>,
         limit: u32,
     ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
@@ -3055,7 +3055,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn list_stream_uploads_for_bucket_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         bucket: &BucketName,
         session_id_marker: Option<&SessionId>,
         limit: u32,

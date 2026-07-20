@@ -9787,6 +9787,7 @@ impl StorageCluster {
         let mut sessions = Vec::new();
         for &pg_id in self.local_map.pg_ids() {
             let pg_id = PgId::new(pg_id);
+            let scan_pg_id = self.object_metadata_scan_pg(pg_id);
             let Ok(node) = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), pg_id)
@@ -9798,7 +9799,7 @@ impl StorageCluster {
                 let Ok(page) = node
                     .object_mutation_metadata_client()
                     .list_all_stream_uploads_page(
-                        pg_id,
+                        scan_pg_id,
                         marker.as_ref(),
                         STREAM_UPLOAD_SESSION_BEST_EFFORT_PAGE_LIMIT,
                     )

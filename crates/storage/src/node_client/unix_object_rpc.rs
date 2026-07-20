@@ -2170,7 +2170,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn list_stream_uploads_for_bucket_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         bucket: &BucketName,
         session_id_marker: Option<&SessionId>,
         limit: u32,
@@ -2179,7 +2179,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             bucket: StorageRpcBucketRequest {
                 node_id: self.node_id,
                 cluster_epoch: self.cluster_epoch,
-                pg_id,
+                pg_id: pg_id.pg_id(),
                 bucket: bucket.clone(),
             },
             session_id_marker: session_id_marker.cloned(),
@@ -2250,14 +2250,14 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn list_all_stream_uploads_page(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         session_id_marker: Option<&SessionId>,
         limit: u32,
     ) -> Result<StreamUploadRecordPage, ObjectPgActionError> {
         let request = StorageRpcStreamUploadsPgListRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: pg_id.pg_id(),
             session_id_marker: session_id_marker.cloned(),
             limit,
         };

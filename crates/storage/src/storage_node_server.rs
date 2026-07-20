@@ -6405,7 +6405,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let page = match ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
             &local_client,
-            request.bucket.pg_id,
+            self.validated_object_metadata_scan_pg(request.bucket.pg_id),
             &request.bucket.bucket,
             request.session_id_marker.as_ref(),
             request.limit,
@@ -6448,7 +6448,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let page = match ObjectMutationMetadataNodeClient::list_all_stream_uploads_page(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_scan_pg(request.pg_id),
             request.session_id_marker.as_ref(),
             request.limit,
         ) {
@@ -6457,6 +6457,16 @@ impl StorageNodeConnectionHandler {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
             }
         };
+        for upload in &page.uploads {
+            if let Err(error) = self.validate_pg_for_object(
+                request.pg_id,
+                &upload.bucket,
+                &upload.key,
+                "object stream uploads PG list",
+            ) {
+                return encode_storage_rpc_error_response(&error);
+            }
+        }
         let payload = encode_stream_uploads_list_response(&StorageRpcStreamUploadsListResponse {
             uploads: page.uploads,
             next_session_id_marker: page.next_session_id_marker,

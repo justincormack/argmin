@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn unix_object_listing_client_accepts_installed_scan_pg_and_rejects_unknown_pg() {
+fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);
     config.pg_ids = vec![0, 1];
@@ -14,7 +14,7 @@ fn unix_object_listing_client_accepts_installed_scan_pg_and_rejects_unknown_pg()
     });
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..6)
+    let server_threads: Vec<_> = (0..10)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -126,7 +126,7 @@ fn unix_object_listing_client_accepts_installed_scan_pg_and_rejects_unknown_pg()
         &client,
         unknown_scan_pg,
         &ListMultipartUploadsReq {
-            bucket,
+            bucket: bucket.clone(),
             prefix: None,
             page_start: None,
             max_uploads: 10,
@@ -137,6 +137,59 @@ fn unix_object_listing_client_accepts_installed_scan_pg_and_rejects_unknown_pg()
     assert!(matches!(
         upload_error,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::UnknownPg,
+            ..
+        })
+    ));
+
+    let bucket_streams = ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
+        &client,
+        installed_scan_pg,
+        &bucket,
+        None,
+        10,
+    )
+    .unwrap();
+    assert!(bucket_streams.uploads.is_empty());
+    assert!(bucket_streams.next_session_id_marker.is_none());
+
+    let all_streams = ObjectMutationMetadataNodeClient::list_all_stream_uploads_page(
+        &client,
+        installed_scan_pg,
+        None,
+        10,
+    )
+    .unwrap();
+    assert!(all_streams.uploads.is_empty());
+    assert!(all_streams.next_session_id_marker.is_none());
+
+    let bucket_stream_error =
+        ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
+            &client,
+            unknown_scan_pg,
+            &bucket,
+            None,
+            10,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        bucket_stream_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::UnknownPg,
+            ..
+        })
+    ));
+
+    let all_stream_error = ObjectMutationMetadataNodeClient::list_all_stream_uploads_page(
+        &client,
+        unknown_scan_pg,
+        None,
+        10,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        all_stream_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
             code: StorageRpcErrorCode::UnknownPg,
             ..
         })
@@ -1943,7 +1996,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     assert_eq!(current.stored.as_ref(), Some(&stored));
     let stream_uploads = ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
         &client,
-        PgId::new(0),
+        ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
         &bucket,
         None,
         10,
@@ -2354,8 +2407,13 @@ fn unix_stream_uploads_list_requires_pg_primary() {
     config.pg_routes[0].primary_node_id = NodeId::new(8);
     config.pg_routes[0].acting_set = vec![NodeId::new(7), NodeId::new(8)];
     private_socket_dir(config.socket_path.parent().unwrap());
-    let server = StorageNodeServer::bind(config.clone()).unwrap();
-    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..2)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
     let client = UnixStorageNodeClient::new(
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
@@ -2365,7 +2423,7 @@ fn unix_stream_uploads_list_requires_pg_primary() {
     let bucket = crate::tests::bucket_name("stream-upload-list-primary");
     let err = ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
         &client,
-        PgId::new(0),
+        ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
         &bucket,
         None,
         1,
@@ -2379,7 +2437,23 @@ fn unix_stream_uploads_list_requires_pg_primary() {
             ..
         })
     ));
-    server_thread.join().unwrap();
+    let err = ObjectMutationMetadataNodeClient::list_all_stream_uploads_page(
+        &client,
+        ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        None,
+        1,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            operation: "object stream uploads PG list",
+            ..
+        })
+    ));
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]
@@ -2434,8 +2508,13 @@ fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
         (bucket, wrong_pg_id)
     };
     private_socket_dir(config.socket_path.parent().unwrap());
-    let server = StorageNodeServer::bind(config.clone()).unwrap();
-    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..2)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
     let client = UnixStorageNodeClient::new(
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
@@ -2444,7 +2523,7 @@ fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
 
     let err = ObjectMutationMetadataNodeClient::list_stream_uploads_for_bucket_page(
         &client,
-        PgId::new(wrong_pg_id),
+        ObjectMetadataScanPgId::new_for_test(PgId::new(wrong_pg_id)),
         &bucket,
         None,
         10,
@@ -2457,7 +2536,23 @@ fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
             ..
         })
     ));
-    server_thread.join().unwrap();
+    let err = ObjectMutationMetadataNodeClient::list_all_stream_uploads_page(
+        &client,
+        ObjectMetadataScanPgId::new_for_test(PgId::new(wrong_pg_id)),
+        None,
+        10,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            operation: "object stream uploads PG list",
+            ..
+        })
+    ));
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]

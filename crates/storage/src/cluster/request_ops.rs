@@ -3973,6 +3973,7 @@ impl super::StorageCluster {
 
         for raw_pg_id in self.metadata_pg_ids() {
             let pg_id = PgId::new(raw_pg_id);
+            let scan_pg_id = self.object_metadata_scan_pg(pg_id);
             let mut marker = None;
             loop {
                 let node = self
@@ -3981,7 +3982,7 @@ impl super::StorageCluster {
                 let page = node
                     .object_mutation_metadata_client()
                     .list_stream_uploads_for_bucket_page(
-                        pg_id,
+                        scan_pg_id,
                         bucket,
                         marker.as_ref(),
                         STREAM_UPLOAD_SCAN_PAGE_LIMIT,
@@ -6132,6 +6133,7 @@ impl super::StorageCluster {
         let mut aborted_count = 0usize;
         for raw_pg_id in self.metadata_pg_ids() {
             let pg_id = PgId::new(raw_pg_id);
+            let scan_pg_id = self.object_metadata_scan_pg(pg_id);
             let mut marker = None;
             loop {
                 let node = self
@@ -6140,7 +6142,7 @@ impl super::StorageCluster {
                 let page = node
                     .object_mutation_metadata_client()
                     .list_stream_uploads_for_bucket_page(
-                        pg_id,
+                        scan_pg_id,
                         bucket,
                         marker.as_ref(),
                         STREAM_UPLOAD_DELETE_PAGE_LIMIT,
@@ -6512,12 +6514,13 @@ impl super::StorageCluster {
 
             if include_stream_uploads {
                 let pg_id = PgId::new(pg_id);
+                let scan_pg_id = self.object_metadata_scan_pg(pg_id);
                 let node = self
                     .local_map
                     .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
                 let page = match node
                     .object_mutation_metadata_client()
-                    .list_stream_uploads_for_bucket_page(pg_id, bucket, None, 1)
+                    .list_stream_uploads_for_bucket_page(scan_pg_id, bucket, None, 1)
                 {
                     Ok(page) => page,
                     Err(error) => {
