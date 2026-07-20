@@ -54,6 +54,7 @@ async fn start_server(
         .unwrap();
     let identity_provider =
         auth::IdentityProvider::in_memory(credentials).expect("initialize session-token key ring");
+    let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
             let sse_s3_provider = ManagedWrappingKeyConfig::from_base64(
@@ -62,14 +63,14 @@ async fn start_server(
             )
             .map(StaticManagedKeyProvider::single)
             .expect("valid test SSE-S3 wrapping key");
-            let coordinator =
-                server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster(
-                Arc::clone(&storage_cluster),
-                "us-east-1".to_string(),
-                None,
-                sse_s3_provider,
-            )
-            .expect("create coordinator");
+            let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+                    storage_handle.clone(),
+                    "us-east-1".to_string(),
+                    None,
+                    sse_s3_provider,
+                    server_core::coordinator::BackgroundWorkerMode::all(),
+                )
+                .expect("create coordinator");
 
             server_http::http::HttpFrontend {
                 coordinator: Arc::new(coordinator),

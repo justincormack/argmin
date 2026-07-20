@@ -1074,6 +1074,54 @@ Eighteenth Phase 3 slice:
   doctest, workspace-wide checks and strict Clippy, and the full workspace
   suite (7,275 tests).
 
+Nineteenth Phase 3 slice:
+
+- buffered HTTP operations now acquire a `StorageClusterRouteAdmission` after
+  their bounded body has been collected, routed, and authenticated, but before
+  region enforcement or coordinator dispatch. Routing and AWS-facing
+  authentication errors therefore retain precedence over an expired route
+  map; optional bucket-region enrichment is attempted only under a valid
+  admission and route expiry merely suppresses that header. Actual-response
+  CORS enrichment follows the same best-effort rule, so an authentication
+  error with `Origin` cannot perform an unadmitted metadata lookup. OPTIONS
+  acquires admission after successful routing and before its unauthenticated
+  CORS metadata lookup.
+  Streaming PUT, POST, and UploadPart acquire it after request authentication
+  but before their first storage lookup, and store the non-cloneable guard in
+  the streaming context through request-body ingestion, finalization, or abort
+  cleanup. Unauthenticated transport parsing and slow pre-auth bodies
+  therefore cannot delay runtime-map publication.
+- the guard is deliberately released once the response has been constructed.
+  Client response backpressure is not active route authority; streaming reads
+  retain their existing payload/read handles. Route capability checks at those
+  lower read boundaries remain part of the later active/retained capability
+  work.
+- a multi-worker HTTP pool must now share one runtime-map admission domain.
+  Handle clones have an explicit identity check, server startup rejects
+  independently constructed domains, and both the primary S3 test server and
+  the admission integration server now construct their worker coordinators
+  from one shared `StorageClusterRuntimeMapHandle`.
+- a deterministic serve regression starts an authenticated streaming PUT,
+  sends a partial signed body, waits until its context is admitted, begins
+  replacement publication, and proves the old map remains current until the
+  client disconnects and abort cleanup releases the context. A storage-level
+  regression separately proves that only handle clones share an admission
+  domain. A socket-level buffered-request regression expires the route map,
+  sends a bad SigV4 signature with `Origin`, and requires
+  `SignatureDoesNotMatch` rather than the internal `OperationAborted`
+  admission error while also proving expired admission suppresses CORS
+  metadata enrichment. A per-frontend test-only counter at the CORS metadata
+  load boundary requires zero lookup attempts, so the regression does not
+  infer the guard solely from absent response headers.
+- this slice threads the frontend publication guard through real request
+  entry, but it does not yet expose the guarded cluster API. Operation- and
+  subject-bound active, retained-cleanup, and recovery capabilities, captured
+  deadline validation at each effect, and Unix server-local capability
+  construction remain open.
+- validation passed formatting, the storage boundary checker, all 774
+  server-HTTP tests, the focused S3 admission integration test,
+  workspace-wide strict Clippy, and the full workspace suite (7,278 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

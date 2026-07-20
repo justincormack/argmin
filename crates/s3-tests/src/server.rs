@@ -229,6 +229,8 @@ impl TestServer {
             .unwrap();
         let identity_provider = auth::IdentityProvider::in_memory(credentials)
             .expect("initialize session-token key ring");
+        let frontend_storage_handle =
+            storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
         let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
                 let sse_c_validator = server_core::sse::SseCustomerValidatorConfig::from_base64(
@@ -242,12 +244,12 @@ impl TestServer {
                 )
                 .map(server_core::sse::StaticManagedKeyProvider::single)
                 .expect("valid test SSE-S3 wrapping key");
-                let coordinator =
-                    server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster(
-                        Arc::clone(&storage_cluster),
+                let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+                        frontend_storage_handle.clone(),
                         region.to_string(),
                         Some(sse_c_validator),
                         sse_s3_provider,
+                        server_core::coordinator::BackgroundWorkerMode::all(),
                     )
                     .expect("create coordinator");
 

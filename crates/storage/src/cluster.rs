@@ -1316,6 +1316,8 @@ impl StorageClusterRouteAdmissionGate {
             .active_requests
             .checked_add(1)
             .expect("route admission permit count must not overflow");
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.inner.changed.notify_all();
         StorageClusterRouteAdmissionPermit { gate: self.clone() }
     }
 
@@ -1345,7 +1347,23 @@ impl StorageClusterRouteAdmissionGate {
         StorageClusterRoutePublicationGuard { gate: self.clone() }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn wait_until_request_is_admitted(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.active_requests == 0 {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     fn wait_until_publication_is_pending(&self) {
         let mut state = self
             .inner
@@ -1533,6 +1551,25 @@ impl StorageClusterRuntimeMapHandle {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Return whether both handles participate in the same frontend
+    /// route-publication admission domain.
+    ///
+    /// A frontend pool must share this domain so one request admission
+    /// prevents every worker from switching to a replacement runtime map.
+    pub fn shares_route_admission_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.route_admission.inner, &other.route_admission.inner)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_wait_until_route_request_is_admitted(&self) {
+        self.route_admission.wait_until_request_is_admitted();
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_wait_until_route_publication_is_pending(&self) {
+        self.route_admission.wait_until_publication_is_pending();
     }
 
     pub fn admit_current_route(&self) -> Result<StorageClusterRouteAdmission, StoreError> {
@@ -2265,6 +2302,17 @@ mod runtime_map_refresh_invalidation_tests {
         installed_rx.recv().unwrap();
         installer.join().unwrap();
         assert!(Arc::ptr_eq(&handle.current(), &candidate));
+    }
+
+    #[test]
+    fn frontend_route_admission_domain_is_shared_only_by_handle_clones() {
+        let cluster = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
+        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+        let clone = handle.clone();
+        let independent = StorageClusterRuntimeMapHandle::new(cluster);
+
+        assert!(handle.shares_route_admission_with(&clone));
+        assert!(!handle.shares_route_admission_with(&independent));
     }
 
     #[test]

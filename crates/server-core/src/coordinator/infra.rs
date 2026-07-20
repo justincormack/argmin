@@ -14,14 +14,16 @@ use super::runtime::{
 };
 #[cfg(test)]
 use super::trusted_bucket_name;
-use super::{shared_caches_for_storage_cluster, Coordinator, CoordinatorSharedCaches};
+use super::{
+    map_store_error, shared_caches_for_storage_cluster, Coordinator, CoordinatorSharedCaches,
+};
 use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
 use storage::PgTopology;
 use storage::{
     BucketFastPathInfo, BucketInfo, BucketName, BucketState, SessionId, StorageCluster,
-    StorageClusterRuntimeMapHandle,
+    StorageClusterRouteAdmission, StorageClusterRuntimeMapHandle,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -592,6 +594,19 @@ impl Coordinator {
 
     pub fn storage_node_for_request(&self) -> Arc<StorageCluster> {
         self.storage_node()
+    }
+
+    pub fn admit_storage_route_for_request(
+        &self,
+    ) -> Result<StorageClusterRouteAdmission, ServerError> {
+        self.storage_node
+            .admit_current_route()
+            .map_err(map_store_error)
+    }
+
+    pub fn shares_storage_route_admission_with(&self, other: &Self) -> bool {
+        self.storage_node
+            .shares_route_admission_with(&other.storage_node)
     }
 
     #[cfg(test)]

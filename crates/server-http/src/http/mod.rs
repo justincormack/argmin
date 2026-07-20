@@ -652,6 +652,8 @@ pub struct HttpFrontend {
     pub coordinator: Arc<Coordinator>,
     pub identity_provider: IdentityProvider,
     pub host_id: Arc<str>,
+    #[cfg(test)]
+    actual_cors_metadata_lookup_count: std::sync::atomic::AtomicUsize,
 }
 
 enum S3HyperBodyState {
@@ -993,6 +995,13 @@ impl HttpFrontend {
 
         // OPTIONS (preflight CORS) bypasses authentication.
         if let S3Operation::OptionsRequest { ref bucket, .. } = operation {
+            let _storage_route_admission = match self.coordinator.admit_storage_route_for_request()
+            {
+                Ok(admission) => admission,
+                Err(err) => {
+                    return S3Response::error_with_ids(&err, s3req.path(), wire_ids);
+                }
+            };
             return self.handle_options_request(s3req, bucket, wire_ids);
         }
 
@@ -1029,41 +1038,53 @@ impl HttpFrontend {
             );
             self.authenticate(s3req, auth_bucket)
         };
-        let result = match auth {
-            Ok(auth) => {
-                if auth_bucket.is_some() {
-                    if let Err(err) = self.enforce_bucket_region_for_operation(&operation, &auth) {
-                        Err(err)
+        let (result, mut storage_route_admission) = match auth {
+            Ok(auth) => match self.coordinator.admit_storage_route_for_request() {
+                Ok(admission) => {
+                    let result = if auth_bucket.is_some() {
+                        if let Err(err) =
+                            self.enforce_bucket_region_for_operation(&operation, &auth)
+                        {
+                            Err(err)
+                        } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
+                            Err(err)
+                        } else {
+                            self.dispatch_routed(s3req, &auth, operation)
+                        }
                     } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                         Err(err)
                     } else {
                         self.dispatch_routed(s3req, &auth, operation)
-                    }
-                } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
-                    Err(err)
-                } else {
-                    self.dispatch_routed(s3req, &auth, operation)
+                    };
+                    (result, Some(admission))
                 }
-            }
-            Err(err) => Err(err),
+                Err(err) => (Err(err), None),
+            },
+            Err(err) => (Err(err), None),
         };
+        let auth_error_needs_bucket_region_lookup = matches!(
+            &result,
+            Err(ServerError::Auth(
+                auth::AuthError::UnexpectedSecurityToken { .. }
+                    | auth::AuthError::UnknownAccessKey { .. }
+                    | auth::AuthError::InvalidHeaderCredentialService { .. }
+                    | auth::AuthError::InvalidQueryCredentialRegion { .. }
+                    | auth::AuthError::InvalidQueryCredentialService { .. }
+            ))
+        );
+        if auth_error_needs_bucket_region_lookup && storage_route_admission.is_none() {
+            // The region header is optional enrichment of an already selected
+            // authentication error. Route expiry must suppress that lookup,
+            // never replace the AWS-facing authentication response.
+            storage_route_admission = self.coordinator.admit_storage_route_for_request().ok();
+        }
         let add_bucket_region_for_auth_error = auth_error_bucket_region_bucket
             .as_ref()
-            .filter(|_| {
-                matches!(
-                    &result,
-                    Err(ServerError::Auth(
-                        auth::AuthError::UnexpectedSecurityToken { .. }
-                            | auth::AuthError::UnknownAccessKey { .. }
-                            | auth::AuthError::InvalidHeaderCredentialService { .. }
-                            | auth::AuthError::InvalidQueryCredentialRegion { .. }
-                            | auth::AuthError::InvalidQueryCredentialService { .. }
-                    ))
-                )
-            })
-            // A metadata lookup failure only suppresses the optional header;
-            // the auth error response itself must still be returned.
-            .is_some_and(|bucket| self.coordinator.bucket_exists(bucket).unwrap_or(false));
+            .filter(|_| auth_error_needs_bucket_region_lookup)
+            .is_some_and(|bucket| {
+                storage_route_admission.is_some()
+                    && self.coordinator.bucket_exists(bucket).unwrap_or(false)
+            });
         let add_bucket_region_for_denied_discovery = denied_bucket_region_bucket
             .as_ref()
             .filter(|_| {
@@ -1072,7 +1093,10 @@ impl HttpFrontend {
                     Err(err) if err.http_status() == 403 && err.s3_error_code() == "AccessDenied"
                 )
             })
-            .is_some_and(|bucket| self.coordinator.bucket_exists(bucket).unwrap_or(false));
+            .is_some_and(|bucket| {
+                storage_route_admission.is_some()
+                    && self.coordinator.bucket_exists(bucket).unwrap_or(false)
+            });
         let mut resp = {
             observability::trace_scope!(
                 TRACE_TARGET,
@@ -1130,15 +1154,25 @@ impl HttpFrontend {
         // CORS response headers on actual (non-preflight) requests.
         if let Some(origin) = s3req.header("origin") {
             if let Some(bucket) = actual_cors_bucket {
-                observability::trace_scope!(
-                    TRACE_TARGET,
-                    "HttpFrontend::apply_actual_cors",
-                    "method={} path={:?} bucket={:?}",
-                    s3req.method.as_str(),
-                    s3req.path(),
-                    bucket
-                );
-                self.apply_cors_headers(&mut resp, &bucket, origin, s3req.method.as_str());
+                if storage_route_admission.is_none() {
+                    // CORS is optional enrichment of the response selected
+                    // above. In particular, route expiry must not replace an
+                    // authentication error or permit an unadmitted metadata
+                    // lookup while rendering it.
+                    storage_route_admission =
+                        self.coordinator.admit_storage_route_for_request().ok();
+                }
+                if storage_route_admission.is_some() {
+                    observability::trace_scope!(
+                        TRACE_TARGET,
+                        "HttpFrontend::apply_actual_cors",
+                        "method={} path={:?} bucket={:?}",
+                        s3req.method.as_str(),
+                        s3req.path(),
+                        bucket
+                    );
+                    self.apply_cors_headers(&mut resp, &bucket, origin, s3req.method.as_str());
+                }
             }
         }
 
@@ -1212,6 +1246,9 @@ impl HttpFrontend {
         origin: &str,
         method: &str,
     ) -> Vec<(String, String)> {
+        #[cfg(test)]
+        self.actual_cors_metadata_lookup_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
             Ok(Some(xml)) => xml,
             _ => return Vec::new(),
@@ -1226,6 +1263,12 @@ impl HttpFrontend {
         } else {
             Vec::new()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_actual_cors_metadata_lookup_count(&self) -> usize {
+        self.actual_cors_metadata_lookup_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn apply_cors_headers(
@@ -3746,6 +3789,7 @@ impl HttpFrontend {
         } else {
             &post_auth
         };
+        let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
         self.enforce_bucket_region_raw(bucket, effective_auth)?;
 
         let post_policy = if let Some(policy_b64) = field("policy") {
@@ -3865,6 +3909,7 @@ impl HttpFrontend {
 
         Ok(StreamingPostContext {
             trace: current_trace_context(),
+            _storage_route_admission: storage_route_admission,
             session_id: prepared_put.session_id,
             storage_node: prepared_put.storage_node,
             metadata_blob,
@@ -4096,6 +4141,7 @@ impl HttpFrontend {
         );
         Self::require_content_sha256_for_sigv4_header_auth(req)?;
         let auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
+        let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
         self.enforce_bucket_region_raw(bucket, &auth)?;
         reject_directory_bucket_only_object_features(req)?;
 
@@ -4227,6 +4273,7 @@ impl HttpFrontend {
 
         Ok(StreamingPutContext {
             trace: current_trace_context(),
+            _storage_route_admission: storage_route_admission,
             storage_node,
             bucket: bucket_name,
             key: object_key,
@@ -4448,6 +4495,7 @@ impl HttpFrontend {
         );
         Self::require_content_sha256_for_sigv4_header_auth(req)?;
         let auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
+        let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
         self.enforce_bucket_region_raw(bucket, &auth)?;
 
         let requester = self.requester_from_auth(&auth, req);
@@ -4497,6 +4545,7 @@ impl HttpFrontend {
 
         Ok(StreamingPartContext {
             trace: current_trace_context(),
+            _storage_route_admission: storage_route_admission,
             storage_node,
             binding: StreamPartBinding::new(
                 StreamObjectBinding::new(begin.session_id, binding_bucket, binding_key),
@@ -4730,6 +4779,7 @@ struct StreamingPartChecksumContract {
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
 struct StreamingPutContext {
     trace: observability::TraceContext,
+    _storage_route_admission: storage::StorageClusterRouteAdmission,
     storage_node: Arc<StorageCluster>,
     bucket: BucketName,
     key: ObjectKey,
@@ -4746,6 +4796,7 @@ struct StreamingPutContext {
 /// Context for an in-progress streaming `PostObject`.
 struct StreamingPostContext {
     trace: observability::TraceContext,
+    _storage_route_admission: storage::StorageClusterRouteAdmission,
     session_id: SessionId,
     storage_node: Arc<StorageCluster>,
     metadata_blob: crate::metadata_blob::MetadataBlob,
@@ -4764,6 +4815,7 @@ struct StreamingPostContext {
 /// Created by `prepare_streaming_part`, used across async/blocking boundaries.
 struct StreamingPartContext {
     trace: observability::TraceContext,
+    _storage_route_admission: storage::StorageClusterRouteAdmission,
     storage_node: Arc<StorageCluster>,
     binding: StreamPartBinding,
     requester: crate::coordinator::Requester,
@@ -6454,6 +6506,7 @@ mod tests {
             identity_provider: auth::IdentityProvider::in_memory(credentials)
                 .expect("initialize session-token key ring"),
             host_id: Arc::<str>::from("host-id"),
+            actual_cors_metadata_lookup_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 

@@ -561,6 +561,16 @@ async fn serve_plain_or_tls(
         frontends.iter().all(|frontend| frontend.host_id == host_id),
         "all frontends must share the same host id"
     );
+    let first_coordinator = &frontends
+        .first()
+        .expect("frontends is non-empty")
+        .coordinator;
+    assert!(
+        frontends.iter().all(|frontend| frontend
+            .coordinator
+            .shares_storage_route_admission_with(first_coordinator)),
+        "all frontends must share one storage route-admission domain"
+    );
 
     let header_read_timeout = config.header_read_timeout;
     let state = Arc::new(ServerState {
@@ -1883,6 +1893,10 @@ async fn append_actual_cors_headers(
     let method = method.to_string();
     let headers = spawn_blocking_with_trace(trace.clone(), move || {
         let frontend = acquire_frontend(&st);
+        let Ok(_storage_route_admission) = frontend.coordinator.admit_storage_route_for_request()
+        else {
+            return Vec::new();
+        };
         frontend.actual_cors_headers(&bucket, &origin, &method)
     })
     .await
@@ -5081,17 +5095,25 @@ mod tests {
     fn setup_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
         let pg_ids: Vec<u32> = (0..1).collect();
         let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+        let storage_handle =
+            storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+        setup_frontend_with_storage_handle(storage_handle)
+    }
+
+    fn setup_frontend_with_storage_handle(
+        storage_handle: storage::StorageClusterRuntimeMapHandle,
+    ) -> Arc<HttpFrontend> {
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
-        let coordinator =
-            server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster(
-            storage_cluster,
-            "us-east-1".to_string(),
-            None,
-            sse_s3_provider,
-        )
-        .unwrap();
+        let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+                storage_handle,
+                "us-east-1".to_string(),
+                None,
+                sse_s3_provider,
+                server_core::coordinator::BackgroundWorkerMode::none(),
+            )
+            .unwrap();
         let mut credentials = auth::CredentialStore::new();
         credentials
             .add(
@@ -5104,6 +5126,7 @@ mod tests {
             identity_provider: auth::IdentityProvider::in_memory(credentials)
                 .expect("initialize session-token key ring"),
             host_id: Arc::<str>::from("host-id"),
+            actual_cors_metadata_lookup_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -5366,6 +5389,159 @@ mod tests {
             "request should use admission timestamp captured before clock advance: {response}"
         );
         assert!(response.ends_with("time-body"), "{response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn buffered_invalid_signature_precedes_expired_route_admission() {
+        let tmp = test_util::tempdir();
+        let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+        let storage_handle =
+            storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster));
+        let frontend = setup_frontend_with_storage_handle(storage_handle);
+        create_test_bucket(&frontend, "mybucket");
+        frontend
+            .coordinator
+            .put_bucket_cors(&crate::coordinator::PutBucketConfigRequest {
+                bucket: bucket_request("mybucket"),
+                config: "<CORSConfiguration><CORSRule><AllowedOrigin>https://example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>",
+            })
+            .unwrap();
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+        storage_cluster.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(storage::clock::current_time_millis()).unwrap(),
+        );
+        assert!(matches!(
+            frontend.coordinator.admit_storage_route_for_request(),
+            Err(ServerError::OperationAborted)
+        ));
+
+        let signed = sign_headers("GET", "/mybucket/key", &addr, b"", &[]);
+        let mut invalid_authorization = signed.authorization;
+        let replacement = if invalid_authorization.ends_with('0') {
+            "1"
+        } else {
+            "0"
+        };
+        invalid_authorization.replace_range(invalid_authorization.len() - 1.., replacement);
+        let request = format!(
+            "GET /mybucket/key HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {invalid_authorization}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Origin: https://example.com\r\n\
+Connection: close\r\n\r\n",
+            signed.amz_date, signed.amz_content_sha256
+        );
+        let response = send_raw_http_request(&addr, &request, b"");
+
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "expected SignatureDoesNotMatch rather than route admission failure: {response}"
+        );
+        assert!(
+            response.contains("<Code>SignatureDoesNotMatch</Code>"),
+            "{response}"
+        );
+        assert!(
+            !response.contains("<Code>OperationAborted</Code>"),
+            "{response}"
+        );
+        assert!(
+            !response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "expired route admission must suppress CORS enrichment: {response}"
+        );
+        assert_eq!(
+            frontend.test_actual_cors_metadata_lookup_count(),
+            0,
+            "expired route admission must prevent the CORS metadata lookup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_flight_streaming_put_blocks_runtime_map_publication_until_cleanup_finishes() {
+        use tokio::io::AsyncWriteExt;
+
+        let tmp = test_util::tempdir();
+        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
+        create_test_bucket(&frontend, "route-admission-bucket");
+        let config = ServeConfig {
+            body_idle_timeout: Duration::from_secs(60),
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 1).await;
+
+        let payload = b"route-admission-body";
+        let signed = sign_streaming_headers(
+            "PUT",
+            "/route-admission-bucket/key",
+            &addr,
+            payload.len(),
+            &[],
+        );
+        let wire = build_signed_chunked_body(&signed, payload);
+        let request = format!(
+            "PUT /route-admission-bucket/key HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+content-encoding: aws-chunked\r\n\
+x-amz-decoded-content-length: {}\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n",
+            signed.authorization,
+            signed.amz_date,
+            signed.amz_content_sha256,
+            payload.len(),
+            wire.len()
+        );
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.write_all(&wire[..1]).await.unwrap();
+        client.flush().await.unwrap();
+
+        let admitted_handle = storage_handle.clone();
+        tokio::task::spawn_blocking(move || {
+            admitted_handle.test_wait_until_route_request_is_admitted();
+        })
+        .await
+        .unwrap();
+
+        let candidate = open_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
+        candidate.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(
+                storage::clock::current_time_millis().saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+        let install_handle = storage_handle.clone();
+        let installed_candidate = Arc::clone(&candidate);
+        let installer = std::thread::spawn(move || {
+            install_handle.install(installed_candidate).unwrap();
+        });
+
+        let pending_handle = storage_handle.clone();
+        tokio::task::spawn_blocking(move || {
+            pending_handle.test_wait_until_route_publication_is_pending();
+        })
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&storage_handle.current(), &initial));
+
+        drop(client);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || installer.join().unwrap()),
+        )
+        .await
+        .expect("runtime-map publication should finish after the request disconnects")
+        .unwrap();
+        assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
     }
 
     #[tokio::test(flavor = "multi_thread")]
