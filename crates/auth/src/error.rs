@@ -258,7 +258,7 @@ impl std::fmt::Debug for AuthError {
 
 #[cfg(test)]
 mod tests {
-    use super::AuthError;
+    use super::{AuthError, SignatureMismatchDiagnostics};
 
     #[test]
     fn unexpected_security_token_debug_is_redacted() {
@@ -318,12 +318,32 @@ mod tests {
         assert!(debug.contains(r#""x-amz-meta-\nname""#));
         assert!(!debug.contains("x-amz-meta-\nname"));
     }
+
+    #[test]
+    fn signature_mismatch_diagnostics_debug_redacts_protocol_values() {
+        let diagnostics = SignatureMismatchDiagnostics {
+            access_key_id: "ARGS0123456789ABCDEFGHIJ".to_string(),
+            string_to_sign: "policy-containing-secret-token".to_string(),
+            signature_provided: "client-signature".to_string(),
+            canonical_request: Some("canonical-request-containing-secret-token".to_string()),
+        };
+        let debug = format!("{diagnostics:?}");
+
+        assert!(debug.contains("<redacted:sigv4_string_to_sign>"));
+        assert!(debug.contains("<redacted:sigv4_signature>"));
+        assert!(debug.contains("<redacted:sigv4_canonical_request>"));
+        assert!(!debug.contains("secret-token"));
+        assert!(!debug.contains("client-signature"));
+    }
 }
 
 /// The SigV4 verification inputs AWS echoes in a `SignatureDoesNotMatch`
-/// error body. None of these values are secret: they are the request's own
-/// canonical form and the (wrong) signature the client sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// error body.
+///
+/// The raw values are retained only for the protocol renderer. A canonical
+/// request or POST string-to-sign can contain a bearer session token, so this
+/// type's diagnostic representation must remain redacted.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SignatureMismatchDiagnostics {
     pub access_key_id: String,
     pub string_to_sign: String,
@@ -331,4 +351,36 @@ pub struct SignatureMismatchDiagnostics {
     /// Absent for POST policy signatures, which have no canonical request;
     /// chunk signatures echo the seed request's canonical form.
     pub canonical_request: Option<String>,
+}
+
+impl std::fmt::Debug for SignatureMismatchDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignatureMismatchDiagnostics")
+            .field(
+                "access_key_id",
+                &observability::escaped(&self.access_key_id),
+            )
+            .field(
+                "string_to_sign",
+                &observability::redacted("sigv4_string_to_sign"),
+            )
+            .field("string_to_sign_len", &self.string_to_sign.len())
+            .field(
+                "signature_provided",
+                &observability::redacted("sigv4_signature"),
+            )
+            .field("signature_provided_len", &self.signature_provided.len())
+            .field(
+                "canonical_request",
+                &self
+                    .canonical_request
+                    .as_ref()
+                    .map(|_| observability::redacted("sigv4_canonical_request")),
+            )
+            .field(
+                "canonical_request_len",
+                &self.canonical_request.as_ref().map(String::len),
+            )
+            .finish()
+    }
 }

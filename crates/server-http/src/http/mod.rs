@@ -6960,6 +6960,158 @@ mod tests {
         }
     }
 
+    fn signed_streaming_session_req(
+        session: &InstalledPostSession,
+        tokens: &[&str],
+        cover_token: bool,
+        valid_seed_signature: bool,
+        payload_hash: &str,
+        checksum_trailer: bool,
+        body: Vec<u8>,
+    ) -> S3Request {
+        let (date, amz_date) = current_sigv4_timestamp();
+        let mut headers = vec![
+            (
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            ),
+            ("content-encoding".to_string(), "aws-chunked".to_string()),
+            ("x-amz-decoded-content-length".to_string(), "5".to_string()),
+            ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
+            ("x-amz-date".to_string(), amz_date.clone()),
+        ];
+        if checksum_trailer {
+            headers.push((
+                "x-amz-trailer".to_string(),
+                "x-amz-checksum-crc32".to_string(),
+            ));
+        }
+        headers.extend(
+            tokens
+                .iter()
+                .map(|token| ("x-amz-security-token".to_string(), (*token).to_string())),
+        );
+        let mut signed_header_names = vec![
+            "content-encoding",
+            "host",
+            "x-amz-content-sha256",
+            "x-amz-date",
+            "x-amz-decoded-content-length",
+        ];
+        if cover_token {
+            signed_header_names.push("x-amz-security-token");
+        }
+        if checksum_trailer {
+            signed_header_names.push("x-amz-trailer");
+        }
+        let signed_headers = signed_header_names.join(";");
+        let canonical_input = headers
+            .iter()
+            .filter(|(name, _)| {
+                name == "content-encoding"
+                    || name == "host"
+                    || name == "x-amz-content-sha256"
+                    || name == "x-amz-date"
+                    || name == "x-amz-decoded-content-length"
+                    || (checksum_trailer && name == "x-amz-trailer")
+                    || (cover_token && name == "x-amz-security-token")
+            })
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let canonical_req = canonical_request(
+            "PUT",
+            "/",
+            "",
+            &canonical_headers(&canonical_input),
+            &signed_headers,
+            payload_hash,
+        );
+        let scope = format!("{date}/us-east-1/s3/aws4_request");
+        let sts = string_to_sign(&amz_date, &scope, &sha256_hex(canonical_req.as_bytes()));
+        let signature = if valid_seed_signature {
+            let signing_key =
+                auth::sigv4::derive_signing_key(&session.secret_key, &date, "us-east-1", "s3");
+            hex_lower(
+                hmac::sign(
+                    &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
+                    sts.as_bytes(),
+                )
+                .as_ref(),
+            )
+        } else {
+            "0".repeat(64)
+        };
+        headers.push((
+            "authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+                session.access_key_id
+            ),
+        ));
+        new_req(http::Method::PUT, "/", "", headers, body)
+    }
+
+    fn streaming_chunk_signature(
+        context: &auth::StreamingSigningContext,
+        previous_signature: &str,
+        data: &[u8],
+    ) -> String {
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
+            context.timestamp,
+            context.scope,
+            previous_signature,
+            sha256_hex(b""),
+            sha256_hex(data),
+        );
+        hex_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, &context.signing_key),
+                string_to_sign.as_bytes(),
+            )
+            .as_ref(),
+        )
+    }
+
+    fn signed_streaming_trailer_body(
+        context: &auth::StreamingSigningContext,
+        bad_trailer_signature: bool,
+    ) -> Vec<u8> {
+        let data = b"hello";
+        let chunk_signature = streaming_chunk_signature(context, &context.seed_signature, data);
+        let terminal_signature = streaming_chunk_signature(context, &chunk_signature, b"");
+        let canonical_trailers = "x-amz-checksum-crc32:NhCmhg==\n";
+        let trailer_string_to_sign = format!(
+            "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
+            context.timestamp,
+            context.scope,
+            terminal_signature,
+            sha256_hex(canonical_trailers.as_bytes()),
+        );
+        let trailer_signature = if bad_trailer_signature {
+            "0".repeat(64)
+        } else {
+            hex_lower(
+                hmac::sign(
+                    &hmac::Key::new(hmac::HMAC_SHA256, &context.signing_key),
+                    trailer_string_to_sign.as_bytes(),
+                )
+                .as_ref(),
+            )
+        };
+        format!(
+            "5;chunk-signature={chunk_signature}\r\nhello\r\n\
+             0;chunk-signature={terminal_signature}\r\n\
+             x-amz-checksum-crc32:NhCmhg==\r\n\
+             x-amz-trailer-signature:{trailer_signature}\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn unsigned_streaming_trailer_body() -> Vec<u8> {
+        b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n".to_vec()
+    }
+
     fn signed_v4_put_req(body: &[u8], extra_headers: Vec<(String, String)>) -> S3Request {
         let (date, amz_date) = current_sigv4_timestamp();
         let body_hash = sha256_hex(body);
@@ -12754,6 +12906,224 @@ mod tests {
     }
 
     // ── aws-chunked decode edge cases ──────────────────────────────────
+
+    #[test]
+    fn streaming_session_authentication_precedes_chunk_signature_verification() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        let session = install_maximum_live_post_session(&mut frontend);
+        let bad_chunk_signature = "0".repeat(64);
+        let body = format!(
+            "5;chunk-signature={bad_chunk_signature}\r\nhello\r\n\
+             0;chunk-signature={bad_chunk_signature}\r\n\r\n"
+        )
+        .into_bytes();
+        let request = signed_streaming_session_req(
+            &session,
+            &[&session.token],
+            true,
+            true,
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            false,
+            body.clone(),
+        );
+
+        let context = frontend
+            .authenticate_with_payload_check(&request, false, None)
+            .unwrap();
+        assert!(context.identity.as_ref().unwrap().role_session().is_some());
+        assert!(context.streaming.is_some());
+        let error = match frontend.maybe_decode_chunked(&request, &context) {
+            Err(error) => error,
+            Ok(_) => panic!("expected chunk SignatureMismatch"),
+        };
+        let ServerError::Auth(auth::AuthError::SignatureMismatch {
+            diagnostics: Some(diagnostics),
+        }) = &error
+        else {
+            panic!("expected chunk SignatureMismatch, got {error:?}");
+        };
+        assert!(diagnostics
+            .canonical_request
+            .as_ref()
+            .unwrap()
+            .contains(&session.token));
+        assert!(!format!("{error:?}").contains(&session.token));
+
+        for tokens in [Vec::new(), vec![""], vec!["ARGST1.not-a-canonical-token"]] {
+            let request = signed_streaming_session_req(
+                &session,
+                &tokens,
+                !tokens.is_empty(),
+                false,
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                false,
+                body.clone(),
+            );
+            let error = frontend
+                .authenticate_with_payload_check(&request, false, None)
+                .unwrap_err();
+            assert!(matches!(
+                (tokens.as_slice(), error),
+                (
+                    [] | [""],
+                    ServerError::Auth(auth::AuthError::UnknownAccessKey { .. })
+                ) | (
+                    ["ARGST1.not-a-canonical-token"],
+                    ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { .. })
+                )
+            ));
+        }
+    }
+
+    #[test]
+    fn streaming_session_adjacent_trailer_modes_match_authentication_boundaries() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        let session = install_maximum_live_post_session(&mut frontend);
+
+        let mut signed_trailer_request = signed_streaming_session_req(
+            &session,
+            &[&session.token],
+            true,
+            true,
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            true,
+            Vec::new(),
+        );
+        let signed_trailer_auth = frontend
+            .authenticate_with_payload_check(&signed_trailer_request, false, None)
+            .unwrap();
+        assert!(signed_trailer_auth
+            .identity
+            .as_ref()
+            .unwrap()
+            .role_session()
+            .is_some());
+        let signing_context = signed_trailer_auth.streaming.as_ref().unwrap();
+        signed_trailer_request.body = signed_streaming_trailer_body(signing_context, false);
+        let decoded = frontend
+            .maybe_decode_chunked(&signed_trailer_request, &signed_trailer_auth)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.body, b"hello");
+
+        signed_trailer_request.body = signed_streaming_trailer_body(signing_context, true);
+        assert!(matches!(
+            frontend.maybe_decode_chunked(&signed_trailer_request, &signed_trailer_auth),
+            Err(ServerError::Auth(auth::AuthError::SignatureMismatch { .. }))
+        ));
+
+        for (tokens, valid_seed_signature, expected) in [
+            (Vec::new(), true, "missing temporary token must be rejected"),
+            (
+                vec!["ARGST1.not-a-canonical-token"],
+                true,
+                "malformed temporary token must be rejected",
+            ),
+            (
+                vec![session.token.as_str()],
+                false,
+                "bad seed signature must be rejected",
+            ),
+        ] {
+            let request = signed_streaming_session_req(
+                &session,
+                &tokens,
+                !tokens.is_empty(),
+                valid_seed_signature,
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                true,
+                Vec::new(),
+            );
+            let error = frontend
+                .authenticate_with_payload_check(&request, false, None)
+                .expect_err(expected);
+            assert!(match tokens.as_slice() {
+                [] => matches!(
+                    error,
+                    ServerError::Auth(auth::AuthError::UnknownAccessKey { .. })
+                ),
+                ["ARGST1.not-a-canonical-token"] => matches!(
+                    error,
+                    ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { .. })
+                ),
+                [_] => matches!(
+                    error,
+                    ServerError::Auth(auth::AuthError::SignatureMismatch { .. })
+                ),
+                _ => false,
+            });
+        }
+
+        let mut unsigned_trailer_request = signed_streaming_session_req(
+            &session,
+            &[&session.token],
+            true,
+            true,
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            true,
+            Vec::new(),
+        );
+        let unsigned_trailer_auth = frontend
+            .authenticate_with_payload_check(&unsigned_trailer_request, false, None)
+            .unwrap();
+        assert!(unsigned_trailer_auth
+            .identity
+            .as_ref()
+            .unwrap()
+            .role_session()
+            .is_some());
+        assert!(unsigned_trailer_auth.streaming.is_none());
+        unsigned_trailer_request.body = unsigned_streaming_trailer_body();
+        let decoded = frontend
+            .maybe_decode_chunked(&unsigned_trailer_request, &unsigned_trailer_auth)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.body, b"hello");
+
+        for (tokens, valid_seed_signature, expected) in [
+            (Vec::new(), true, "missing temporary token must be rejected"),
+            (
+                vec!["ARGST1.not-a-canonical-token"],
+                true,
+                "malformed temporary token must be rejected",
+            ),
+            (
+                vec![session.token.as_str()],
+                false,
+                "bad seed signature must be rejected",
+            ),
+        ] {
+            let request = signed_streaming_session_req(
+                &session,
+                &tokens,
+                !tokens.is_empty(),
+                valid_seed_signature,
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                true,
+                Vec::new(),
+            );
+            let error = frontend
+                .authenticate_with_payload_check(&request, false, None)
+                .expect_err(expected);
+            assert!(match tokens.as_slice() {
+                [] => matches!(
+                    error,
+                    ServerError::Auth(auth::AuthError::UnknownAccessKey { .. })
+                ),
+                ["ARGST1.not-a-canonical-token"] => matches!(
+                    error,
+                    ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { .. })
+                ),
+                [_] => matches!(
+                    error,
+                    ServerError::Auth(auth::AuthError::SignatureMismatch { .. })
+                ),
+                _ => false,
+            });
+        }
+    }
 
     #[test]
     fn signed_streaming_without_context_returns_signature_mismatch() {

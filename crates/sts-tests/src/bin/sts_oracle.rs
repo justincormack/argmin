@@ -3799,6 +3799,10 @@ fn run_s3_post_scope_probes(endpoint: &str, bucket: &str, fixture: S3PostSession
 }
 
 const STREAMING_PAYLOAD_HASH: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+const STREAMING_SIGNED_TRAILER_PAYLOAD_HASH: &str = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER";
+const STREAMING_UNSIGNED_TRAILER_PAYLOAD_HASH: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
+const STREAMING_CHECKSUM_TRAILER_NAME: &str = "x-amz-checksum-crc32";
+const STREAMING_CHECKSUM_TRAILER_VALUE: &str = "M2QmfA==";
 const STREAMING_DATA: &[u8] = b"STS streaming oracle";
 
 #[derive(Clone, Copy)]
@@ -3952,6 +3956,31 @@ fn sign_s3_streaming_request_for_service(
     sign_token_header: bool,
     service: &str,
 ) -> S3StreamingSignature {
+    sign_s3_streaming_request_for_mode(
+        endpoint,
+        path,
+        decoded_length,
+        credentials,
+        tokens,
+        sign_token_header,
+        service,
+        STREAMING_PAYLOAD_HASH,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_s3_streaming_request_for_mode(
+    endpoint: &str,
+    path: &str,
+    decoded_length: usize,
+    credentials: SignedRequestCredentials<'_>,
+    tokens: S3StreamingTokens<'_>,
+    sign_token_header: bool,
+    service: &str,
+    payload_hash: &str,
+    checksum_trailer: bool,
+) -> S3StreamingSignature {
     let parsed_endpoint = url::Url::parse(endpoint)
         .unwrap_or_else(|error| panic!("invalid S3 streaming endpoint: {error}"));
     let host = parsed_endpoint
@@ -3967,10 +3996,13 @@ fn sign_s3_streaming_request_for_service(
     let mut headers = vec![
         ("content-encoding", "aws-chunked".to_string()),
         ("host", host),
-        ("x-amz-content-sha256", STREAMING_PAYLOAD_HASH.to_string()),
+        ("x-amz-content-sha256", payload_hash.to_string()),
         ("x-amz-date", amz_date.clone()),
         ("x-amz-decoded-content-length", decoded_length),
     ];
+    if checksum_trailer {
+        headers.push(("x-amz-trailer", STREAMING_CHECKSUM_TRAILER_NAME.to_string()));
+    }
     if sign_token_header {
         if let Some(value) = tokens.canonical_value() {
             headers.push(("x-amz-security-token", value));
@@ -3993,7 +4025,7 @@ fn sign_s3_streaming_request_for_service(
         "",
         &canonical_headers,
         &signed_headers,
-        STREAMING_PAYLOAD_HASH,
+        payload_hash,
     );
     let scope = format!("{date}/{}/{service}/aws4_request", credentials.region);
     let string_to_sign = format!(
@@ -4059,6 +4091,168 @@ fn build_s3_streaming_body(
     body.extend_from_slice(b"\r\n");
     body.extend_from_slice(format!("0;chunk-signature={terminal_signature}\r\n\r\n").as_bytes());
     (body, presented_chunk_signature)
+}
+
+#[derive(Clone, Copy)]
+enum S3AdjacentStreamingMode {
+    SignedTrailer { bad_trailer_signature: bool },
+    UnsignedTrailer,
+}
+
+impl S3AdjacentStreamingMode {
+    fn payload_hash(self) -> &'static str {
+        match self {
+            Self::SignedTrailer { .. } => STREAMING_SIGNED_TRAILER_PAYLOAD_HASH,
+            Self::UnsignedTrailer => STREAMING_UNSIGNED_TRAILER_PAYLOAD_HASH,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum S3AdjacentStreamingExpected {
+    Success,
+    InvalidAccessKey,
+    InvalidToken,
+    SeedSignatureMismatch,
+    TrailerSignatureMismatch,
+}
+
+#[derive(Clone, Copy)]
+struct S3AdjacentStreamingProbe<'a> {
+    label: &'a str,
+    credentials: SignedRequestCredentials<'a>,
+    tokens: S3StreamingTokens<'a>,
+    sign_token_header: bool,
+    mode: S3AdjacentStreamingMode,
+    expected: S3AdjacentStreamingExpected,
+}
+
+struct S3AdjacentStreamingResult {
+    response: RawResponse,
+    signature: S3StreamingSignature,
+    trailer_string_to_sign: Option<String>,
+    trailer_signature: Option<String>,
+}
+
+fn build_s3_signed_trailer_body(
+    signature: &S3StreamingSignature,
+    data: &[u8],
+    bad_trailer_signature: bool,
+) -> (Vec<u8>, String, String) {
+    let chunk_signature = s3_streaming_chunk_signature(signature, &signature.seed_signature, data);
+    let terminal_signature = s3_streaming_chunk_signature(signature, &chunk_signature, b"");
+    let canonical_trailers =
+        format!("{STREAMING_CHECKSUM_TRAILER_NAME}:{STREAMING_CHECKSUM_TRAILER_VALUE}\n");
+    let trailer_string_to_sign = format!(
+        "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
+        signature.amz_date,
+        signature.scope,
+        terminal_signature,
+        auth::canonical::sha256_hex(canonical_trailers.as_bytes())
+    );
+    let valid_trailer_signature = streaming_hmac(&signature.signing_key, &trailer_string_to_sign);
+    let presented_trailer_signature = if bad_trailer_signature {
+        "0".repeat(64)
+    } else {
+        valid_trailer_signature
+    };
+    let body = format!(
+        "{:x};chunk-signature={chunk_signature}\r\n{}\r\n\
+         0;chunk-signature={terminal_signature}\r\n\
+         {STREAMING_CHECKSUM_TRAILER_NAME}:{STREAMING_CHECKSUM_TRAILER_VALUE}\r\n\
+         x-amz-trailer-signature:{presented_trailer_signature}\r\n\r\n",
+        data.len(),
+        String::from_utf8_lossy(data),
+    )
+    .into_bytes();
+    (body, trailer_string_to_sign, presented_trailer_signature)
+}
+
+fn build_s3_unsigned_trailer_body(data: &[u8]) -> Vec<u8> {
+    format!(
+        "{:x}\r\n{}\r\n0\r\n\
+         {STREAMING_CHECKSUM_TRAILER_NAME}:{STREAMING_CHECKSUM_TRAILER_VALUE}\r\n\r\n",
+        data.len(),
+        String::from_utf8_lossy(data),
+    )
+    .into_bytes()
+}
+
+fn send_s3_adjacent_streaming_probe(
+    endpoint: &str,
+    bucket: &str,
+    probe: S3AdjacentStreamingProbe<'_>,
+) -> S3AdjacentStreamingResult {
+    let path = format!("/{bucket}/{}", probe.label);
+    let signature = sign_s3_streaming_request_for_mode(
+        endpoint,
+        &path,
+        STREAMING_DATA.len(),
+        probe.credentials,
+        probe.tokens,
+        probe.sign_token_header,
+        "s3",
+        probe.mode.payload_hash(),
+        true,
+    );
+    let (body, trailer_string_to_sign, trailer_signature) = match probe.mode {
+        S3AdjacentStreamingMode::SignedTrailer {
+            bad_trailer_signature,
+        } => {
+            let (body, string_to_sign, signature_value) =
+                build_s3_signed_trailer_body(&signature, STREAMING_DATA, bad_trailer_signature);
+            (body, Some(string_to_sign), Some(signature_value))
+        }
+        S3AdjacentStreamingMode::UnsignedTrailer => {
+            (build_s3_unsigned_trailer_body(STREAMING_DATA), None, None)
+        }
+    };
+    let url = format!("{endpoint}{path}");
+    let mut wire_request = build_test_agent(endpoint, None, Duration::from_secs(120))
+        .put(&url)
+        .header("authorization", &signature.authorization)
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-content-sha256", probe.mode.payload_hash())
+        .header("x-amz-date", &signature.amz_date)
+        .header(
+            "x-amz-decoded-content-length",
+            STREAMING_DATA.len().to_string(),
+        )
+        .header("x-amz-trailer", STREAMING_CHECKSUM_TRAILER_NAME);
+    for token in probe.tokens.values().into_iter().flatten() {
+        wire_request = wire_request.header("x-amz-security-token", token);
+    }
+    let mut response = wire_request
+        .send(&body)
+        .expect("adjacent streaming AWS transport error");
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("adjacent streaming AWS response header is valid UTF-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let (body, body_read_error) = match response.body_mut().read_to_string() {
+        Ok(body) => (body, None),
+        Err(error) => (String::new(), Some(error.to_string())),
+    };
+    S3AdjacentStreamingResult {
+        response: RawResponse {
+            status: response.status().as_u16(),
+            headers,
+            body,
+            body_read_error,
+        },
+        signature,
+        trailer_string_to_sign,
+        trailer_signature,
+    }
 }
 
 fn send_s3_streaming_probe(
@@ -4297,6 +4491,276 @@ fn assert_s3_streaming_chunk_signature_mismatch(
             ),
     );
     println!("{}: ok", probe.label);
+}
+
+fn assert_s3_adjacent_streaming_success(
+    probe: S3AdjacentStreamingProbe<'_>,
+    result: &S3AdjacentStreamingResult,
+) {
+    assert_shape(
+        probe.label,
+        &result.response,
+        &shape()
+            .status(200)
+            .header("x-amz-id-2", "{host_id}")
+            .header("x-amz-request-id", "{request_id}")
+            .header("x-amz-server-side-encryption", "AES256")
+            .header("etag", "{etag}")
+            .header(
+                STREAMING_CHECKSUM_TRAILER_NAME,
+                STREAMING_CHECKSUM_TRAILER_VALUE,
+            )
+            .header("x-amz-checksum-type", "FULL_OBJECT")
+            .body_empty(),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn assert_s3_adjacent_streaming_trailer_signature_mismatch(
+    probe: S3AdjacentStreamingProbe<'_>,
+    result: &S3AdjacentStreamingResult,
+    security_tokens: &[&str],
+) {
+    let string_to_sign = result
+        .trailer_string_to_sign
+        .as_ref()
+        .expect("signed-trailer result has a trailer string to sign");
+    let signature_provided = result
+        .trailer_signature
+        .as_ref()
+        .expect("signed-trailer result has a presented trailer signature");
+    assert_eq!(
+        required_xml_text(&result.response, "AWSAccessKeyId", probe.label),
+        probe.credentials.access_key,
+        "{}: S3 did not echo the session access key",
+        probe.label,
+    );
+    assert_eq!(
+        required_xml_text(&result.response, "StringToSign", probe.label),
+        string_to_sign.as_str(),
+        "{}: S3 did not echo the trailer string to sign",
+        probe.label,
+    );
+    assert_eq!(
+        required_xml_text(&result.response, "StringToSignBytes", probe.label),
+        spaced_hex(string_to_sign),
+        "{}: StringToSignBytes does not encode the trailer string to sign",
+        probe.label,
+    );
+    assert_eq!(
+        required_xml_text(&result.response, "SignatureProvided", probe.label),
+        signature_provided.as_str(),
+        "{}: S3 did not echo the bad trailer signature",
+        probe.label,
+    );
+    assert_eq!(
+        required_xml_text(&result.response, "CanonicalRequest", probe.label),
+        result.signature.canonical_request,
+        "{}: S3 did not echo the seed canonical request",
+        probe.label,
+    );
+    assert_eq!(
+        required_xml_text(&result.response, "CanonicalRequestBytes", probe.label),
+        spaced_hex(&result.signature.canonical_request),
+        "{}: CanonicalRequestBytes does not encode the seed canonical request",
+        probe.label,
+    );
+
+    let response = s3_response_with_sanitized_body(
+        &result.response,
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    let sanitized_string_to_sign = sanitize_s3_text(
+        string_to_sign,
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    let sanitized_string_to_sign_bytes = sanitize_s3_text(
+        &spaced_hex(string_to_sign),
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    let sanitized_canonical_request = sanitize_s3_text(
+        &result.signature.canonical_request,
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    let sanitized_canonical_request_bytes = sanitize_s3_text(
+        &spaced_hex(&result.signature.canonical_request),
+        probe.credentials.access_key,
+        security_tokens,
+    );
+    assert_shape(
+        probe.label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("string_to_sign", sanitized_string_to_sign)
+            .sub("signature", signature_provided)
+            .sub("string_to_sign_bytes", sanitized_string_to_sign_bytes)
+            .sub("canonical_request", sanitized_canonical_request)
+            .sub(
+                "canonical_request_bytes",
+                sanitized_canonical_request_bytes,
+            )
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>SignatureDoesNotMatch</Code>\
+                 <Message>The request signature we calculated does not match the signature you provided. Check your key and signing method.</Message>\
+                 <AWSAccessKeyId>SESSION_ACCESS_KEY</AWSAccessKeyId>\
+                 <StringToSign>{string_to_sign}</StringToSign>\
+                 <SignatureProvided>{signature}</SignatureProvided>\
+                 <StringToSignBytes>{string_to_sign_bytes}</StringToSignBytes>\
+                 <CanonicalRequest>{canonical_request}</CanonicalRequest>\
+                 <CanonicalRequestBytes>{canonical_request_bytes}</CanonicalRequestBytes>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{}: ok", probe.label);
+}
+
+fn run_s3_adjacent_streaming_session_authentication_probes(
+    endpoint: &str,
+    bucket: &str,
+    fixture: S3StreamingSessionProbeSet<'_>,
+) {
+    let wrong_secret = "0".repeat(40);
+    let malformed_security_token = "malformed-session-token";
+    let bad_signature_credentials = SignedRequestCredentials {
+        secret_key: &wrong_secret,
+        ..fixture.live_credentials
+    };
+    let signed_trailer = S3AdjacentStreamingMode::SignedTrailer {
+        bad_trailer_signature: false,
+    };
+    let bad_signed_trailer = S3AdjacentStreamingMode::SignedTrailer {
+        bad_trailer_signature: true,
+    };
+    let probes = [
+        S3AdjacentStreamingProbe {
+            label: "streaming-signed-trailer-live-valid",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: true,
+            mode: signed_trailer,
+            expected: S3AdjacentStreamingExpected::Success,
+        },
+        S3AdjacentStreamingProbe {
+            label: "streaming-signed-trailer-bad-trailer-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: true,
+            mode: bad_signed_trailer,
+            expected: S3AdjacentStreamingExpected::TrailerSignatureMismatch,
+        },
+        S3AdjacentStreamingProbe {
+            label: "streaming-signed-trailer-missing-token-bad-trailer-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::Missing,
+            sign_token_header: true,
+            mode: bad_signed_trailer,
+            expected: S3AdjacentStreamingExpected::InvalidAccessKey,
+        },
+        S3AdjacentStreamingProbe {
+            label: "streaming-signed-trailer-malformed-token-bad-trailer-signature",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(malformed_security_token),
+            sign_token_header: true,
+            mode: bad_signed_trailer,
+            expected: S3AdjacentStreamingExpected::InvalidToken,
+        },
+        S3AdjacentStreamingProbe {
+            label: "streaming-signed-trailer-valid-token-bad-seed-signature",
+            credentials: bad_signature_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: true,
+            mode: signed_trailer,
+            expected: S3AdjacentStreamingExpected::SeedSignatureMismatch,
+        },
+        S3AdjacentStreamingProbe {
+            label: "streaming-unsigned-trailer-live-valid",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: true,
+            mode: S3AdjacentStreamingMode::UnsignedTrailer,
+            expected: S3AdjacentStreamingExpected::Success,
+        },
+        S3AdjacentStreamingProbe {
+            label: "streaming-unsigned-trailer-missing-token",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::Missing,
+            sign_token_header: true,
+            mode: S3AdjacentStreamingMode::UnsignedTrailer,
+            expected: S3AdjacentStreamingExpected::InvalidAccessKey,
+        },
+        S3AdjacentStreamingProbe {
+            label: "streaming-unsigned-trailer-malformed-token",
+            credentials: fixture.live_credentials,
+            tokens: S3StreamingTokens::One(malformed_security_token),
+            sign_token_header: true,
+            mode: S3AdjacentStreamingMode::UnsignedTrailer,
+            expected: S3AdjacentStreamingExpected::InvalidToken,
+        },
+        S3AdjacentStreamingProbe {
+            label: "streaming-unsigned-trailer-valid-token-bad-seed-signature",
+            credentials: bad_signature_credentials,
+            tokens: S3StreamingTokens::One(fixture.live_security_token),
+            sign_token_header: true,
+            mode: S3AdjacentStreamingMode::UnsignedTrailer,
+            expected: S3AdjacentStreamingExpected::SeedSignatureMismatch,
+        },
+    ];
+
+    for probe in probes {
+        let result = send_s3_adjacent_streaming_probe(endpoint, bucket, probe);
+        let sensitive_tokens = probe
+            .tokens
+            .values()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        match probe.expected {
+            S3AdjacentStreamingExpected::Success => {
+                assert_s3_adjacent_streaming_success(probe, &result);
+            }
+            S3AdjacentStreamingExpected::InvalidAccessKey => assert_s3_invalid_access_key(
+                probe.label,
+                &result.response,
+                probe.credentials.access_key,
+                &sensitive_tokens,
+            ),
+            S3AdjacentStreamingExpected::InvalidToken => {
+                let rejected_token = required_xml_text(&result.response, "Token-0", probe.label);
+                assert_s3_invalid_token(
+                    probe.label,
+                    &result.response,
+                    probe.credentials.access_key,
+                    &sensitive_tokens,
+                    &rejected_token,
+                );
+            }
+            S3AdjacentStreamingExpected::SeedSignatureMismatch => {
+                assert_s3_signature_mismatch(
+                    probe.label,
+                    &result.response,
+                    probe.credentials,
+                    &sensitive_tokens,
+                    Some(&result.signature.amz_date),
+                    Some(&result.signature.seed_signature),
+                    |_| result.signature.canonical_request.clone(),
+                );
+            }
+            S3AdjacentStreamingExpected::TrailerSignatureMismatch => {
+                assert_s3_adjacent_streaming_trailer_signature_mismatch(
+                    probe,
+                    &result,
+                    &sensitive_tokens,
+                );
+            }
+        }
+    }
 }
 
 fn run_s3_streaming_session_authentication_probes(
@@ -11220,6 +11684,11 @@ fn main() {
             &post_bucket,
             streaming_fixture,
         );
+        run_s3_adjacent_streaming_session_authentication_probes(
+            &format!("https://s3.{region}.amazonaws.com"),
+            &post_bucket,
+            streaming_fixture,
+        );
         run_s3_streaming_scope_probes(
             &format!("https://s3.{region}.amazonaws.com"),
             &post_bucket,
@@ -11306,10 +11775,13 @@ fn main() {
 mod tests {
     use super::{
         assume_role_response_with_sanitized_credentials,
-        build_s3_root_presigned_request_for_service, matches_observed_get_boundary_fixture,
+        build_s3_root_presigned_request_for_service, build_s3_signed_trailer_body,
+        build_s3_unsigned_trailer_body, matches_observed_get_boundary_fixture,
         s3_post_response_with_sanitized_body, s3_response_with_sanitized_body,
-        sign_s3_streaming_request, sign_s3_streaming_request_for_service, spaced_hex,
-        validate_https_endpoint, S3StreamingTokens, OBSERVED_GET_BOUNDARY_ENDPOINT,
+        sign_s3_streaming_request, sign_s3_streaming_request_for_mode,
+        sign_s3_streaming_request_for_service, spaced_hex, validate_https_endpoint,
+        S3StreamingTokens, OBSERVED_GET_BOUNDARY_ENDPOINT, STREAMING_DATA,
+        STREAMING_SIGNED_TRAILER_PAYLOAD_HASH,
     };
     use s3_tests::{RawResponse, SignedRequestCredentials};
 
@@ -11464,6 +11936,51 @@ mod tests {
             "Credential=ARGMINSESSIONACCESSKEY/{date}/eu-central-1/sts/aws4_request"
         )));
         assert_eq!(wrong_service.signing_key, expected_signing_key.as_ref());
+    }
+
+    #[test]
+    fn adjacent_streaming_signer_and_bodies_preserve_trailer_modes() {
+        let credentials = SignedRequestCredentials {
+            access_key: "ARGMINSESSIONACCESSKEY",
+            secret_key: "secret",
+            region: "eu-central-1",
+            tls_ca_pem: None,
+        };
+        let signed = sign_s3_streaming_request_for_mode(
+            "https://s3.eu-central-1.amazonaws.com",
+            "/bucket/key",
+            STREAMING_DATA.len(),
+            credentials,
+            S3StreamingTokens::One("session-token"),
+            true,
+            "s3",
+            STREAMING_SIGNED_TRAILER_PAYLOAD_HASH,
+            true,
+        );
+        assert!(signed
+            .canonical_request
+            .ends_with(STREAMING_SIGNED_TRAILER_PAYLOAD_HASH));
+        assert!(signed
+            .canonical_request
+            .contains("x-amz-trailer:x-amz-checksum-crc32\n"));
+        assert!(signed
+            .authorization
+            .contains("x-amz-decoded-content-length;x-amz-security-token;x-amz-trailer"));
+
+        let (signed_body, trailer_string_to_sign, trailer_signature) =
+            build_s3_signed_trailer_body(&signed, STREAMING_DATA, false);
+        let signed_body = String::from_utf8(signed_body).unwrap();
+        assert!(signed_body.contains(";chunk-signature="));
+        assert!(signed_body.contains(&format!("x-amz-trailer-signature:{trailer_signature}\r\n")));
+        assert!(trailer_string_to_sign.starts_with("AWS4-HMAC-SHA256-TRAILER\n"));
+
+        assert_eq!(
+            String::from_utf8(build_s3_unsigned_trailer_body(STREAMING_DATA)).unwrap(),
+            concat!(
+                "14\r\nSTS streaming oracle\r\n0\r\n",
+                "x-amz-checksum-crc32:M2QmfA==\r\n\r\n"
+            )
+        );
     }
 
     #[test]

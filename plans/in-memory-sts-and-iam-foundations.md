@@ -3,9 +3,10 @@
 ## Status
 
 Phase 0 design, AWS-oracle, and fixture work is complete for the first usable
-`AssumeRole` milestone as of 2026-07-19. Phase 1 implementation is in progress.
-The first implementation target is a test-enablement vertical slice, not a
-production identity service.
+`AssumeRole` milestone as of 2026-07-19. Phase 1 identity-provider and stateless
+credential foundations and Phase 2 temporary-credential authentication
+plumbing are complete as of 2026-07-20. The first implementation target is a
+test-enablement vertical slice, not a production identity service.
 
 The first public STS operation will be `AssumeRole`. It will be exposed on the
 existing HTTP listener and backed by process-local, in-memory role state. Issued
@@ -163,8 +164,8 @@ Authorization-header authentication now selects and calls that path for the
 reserved `ARGS` namespace. Presigned-query authentication now does the same
 through its own query-versus-signed-header selector. POST Object now selects
 ordered multipart form-token inputs and calls the same shared session
-authentication path. Aws-chunked streaming authentication still uses only the
-long-lived path.
+authentication path. Aws-chunked streaming now uses that same selected-token
+path before constructing its seed/chunk signing context.
 Active static credentials retain their post-signature unexpected-token check,
 and expiring stored records remain static rather than becoming STS
 credentials.
@@ -177,10 +178,8 @@ and exposes the IAM role ARN, STS session ARN, stable role ID, assumed-role ID,
 and `aws:userid` through distinct accessors. The first ordinary header-auth
 slice can now populate the assumed-role-session variant. Existing S3
 authorization paths explicitly refuse to reinterpret it as a configured user;
-role permission evaluation remains Phase 3.
-
-The remaining request-authentication plumbing belongs to Phase 2. Session and
-principal tags remain later versioned policy context as described below.
+role permission evaluation remains Phase 3. Session and principal tags remain
+later versioned policy context as described below.
 
 ### S3 has resource policies but not IAM identity policies
 
@@ -2578,8 +2577,32 @@ failure, scope precedence, typed assumed-role identity, exact response shapes,
 and successful authentication of the derived 742-byte maximum issued token
 through the server's parsed POST adapter path.
 
-The aws-chunked streaming adapter still needs its mode-specific
-selection/coverage wiring.
+The aws-chunked streaming adapter is now implemented as a separate
+mode-specific consumer of the shared Authorization-header selector. Region and
+service scope remain ahead of token coverage and structure. A present token
+must be covered by `SignedHeaders`; identical signed duplicates collapse for
+credential selection while retaining their presentation for expiry rendering,
+and conflicting duplicates in either order fail before the seed signature.
+Missing, empty, malformed, mismatched, expired, deleted-issuer,
+liveness-provider-failure, and key-ring decisions use the shared mappings and
+all occur before seed-signature comparison. Successful authentication returns
+the typed assumed-role identity plus a streaming signing context for
+`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and
+`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`; the adjacent
+`STREAMING-UNSIGNED-PAYLOAD-TRAILER` mode returns the same identity without
+chunk-signing state. First-chunk or signed-trailer verification occurs only
+after that boundary. Adapter tests prove a valid maximum-size issued credential
+reaches bad first-chunk and bad trailer `SignatureDoesNotMatch`, while token
+failures stop before body decoding. The complete signed aws-chunked
+request-header shape containing the 742-byte maximum issued token remains below
+the 8,192-byte transport ceiling. Because the seed canonical request
+necessarily contains the bearer token for AWS's client-visible chunk-signature
+error body, its diagnostic `Debug` form is explicitly redacted.
+
+The AWS oracle separately confirms temporary credentials for signed payload
+trailers and unsigned payload trailers: success, missing and malformed tokens,
+and bad seed signatures for both, plus the exact signed-trailer
+signature-failure golden and token-before-bad-trailer ordering.
 
 Exit condition: directly sealed session credentials authenticate with
 AWS-pinned token/signature/expiry precedence on every SigV4 mode and produce a

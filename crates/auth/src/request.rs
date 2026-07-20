@@ -83,7 +83,11 @@ impl std::fmt::Debug for StreamingSigningContext {
             )
             .field(
                 "seed_canonical_request",
-                &observability::escaped(&self.seed_canonical_request),
+                &observability::redacted("sigv4_seed_canonical_request"),
+            )
+            .field(
+                "seed_canonical_request_len",
+                &self.seed_canonical_request.len(),
             )
             .finish()
     }
@@ -365,13 +369,6 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         Some(hash) => Cow::Borrowed(hash),
         None => Cow::Owned(sha256_hex(body)),
     };
-    if crate::is_reserved_session_access_key_id(&parsed.credential.access_key_id)
-        && body_hash.starts_with("STREAMING-")
-    {
-        // The aws-chunked adapter has additional token/seed/chunk precedence
-        // that will be wired and tested as its own Phase 2 slice.
-        return Err(unknown_access_key(&parsed.credential.access_key_id));
-    }
     let credential = resolve_header_credential(&parsed, headers, provider, now_epoch_secs)?;
     let seed_canonical_request = verify_request_credential(
         VerifyRequestCredentialInput {
@@ -1198,6 +1195,83 @@ mod tests {
         headers
     }
 
+    fn signed_streaming_session_request(
+        access_key_id: &str,
+        signing_secret: &SecretKey,
+        tokens: &[&str],
+        cover_token: bool,
+        region: &str,
+        service: &str,
+        valid_seed_signature: bool,
+    ) -> Vec<(String, String)> {
+        let body_hash = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+        let mut headers = vec![
+            ("content-encoding".to_string(), "aws-chunked".to_string()),
+            (
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            ),
+            ("x-amz-content-sha256".to_string(), body_hash.to_string()),
+            ("x-amz-date".to_string(), "20260720T120000Z".to_string()),
+            ("x-amz-decoded-content-length".to_string(), "5".to_string()),
+        ];
+        headers.extend(
+            tokens
+                .iter()
+                .map(|token| ("x-amz-security-token".to_string(), (*token).to_string())),
+        );
+        let signed_headers = if cover_token {
+            "content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-security-token"
+        } else {
+            "content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length"
+        };
+        let canonical_pairs: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| {
+                name == "content-encoding"
+                    || name == "host"
+                    || name == "x-amz-content-sha256"
+                    || name == "x-amz-date"
+                    || name == "x-amz-decoded-content-length"
+                    || (cover_token && name == "x-amz-security-token")
+            })
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let canonical_request = canonical_request(
+            "PUT",
+            "/streaming",
+            "",
+            &canonical_headers(&canonical_pairs),
+            signed_headers,
+            body_hash,
+        );
+        let scope = format!("20260720/{region}/{service}/aws4_request");
+        let string_to_sign = string_to_sign(
+            "20260720T120000Z",
+            &scope,
+            &sha256_hex(canonical_request.as_bytes()),
+        );
+        let signature = if valid_seed_signature {
+            let signing_key = derive_signing_key(signing_secret, "20260720", region, service);
+            hex_encode_lower(
+                hmac::sign(
+                    &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
+                    string_to_sign.as_bytes(),
+                )
+                .as_ref(),
+            )
+        } else {
+            "0".repeat(64)
+        };
+        headers.push((
+            "authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260720/{region}/{service}/aws4_request, SignedHeaders={signed_headers}, Signature={signature}"
+            ),
+        ));
+        headers
+    }
+
     fn signed_presigned_session_request(
         access_key_id: &str,
         signing_secret: &SecretKey,
@@ -1391,6 +1465,23 @@ mod tests {
         authenticate_request(
             "GET",
             "/",
+            "",
+            headers,
+            b"",
+            &fixture.provider,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            fixture.now_epoch_secs,
+        )
+    }
+
+    fn authenticate_streaming_session(
+        fixture: &HeaderSessionFixture,
+        headers: &[(String, String)],
+    ) -> Result<AuthContext, AuthError> {
+        authenticate_request(
+            "PUT",
+            "/streaming",
             "",
             headers,
             b"",
@@ -1661,6 +1752,332 @@ mod tests {
         );
         assert!(matches!(
             authenticate_header_session(&unavailable, &headers),
+            Err(AuthError::IdentityProviderFailure(
+                crate::IdentityProviderError::Unavailable
+            ))
+        ));
+    }
+
+    #[test]
+    fn streaming_authenticates_maximum_issued_session_token_without_debug_leakage() {
+        let role_name = "r".repeat(crate::identity::ROLE_NAME_MAX_LEN);
+        let session_name = "s".repeat(crate::identity::ROLE_SESSION_NAME_MAX_LEN);
+        let source_identity = "i".repeat(crate::identity::SOURCE_IDENTITY_MAX_LEN);
+        let fixture =
+            session_fixture_with_identity(3_600, &role_name, &session_name, Some(&source_identity));
+        assert_eq!(
+            fixture.token.len(),
+            crate::session_token::MAX_ISSUED_V1_TOKEN_LEN
+        );
+        let headers = signed_streaming_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token],
+            true,
+            "us-east-1",
+            "s3",
+            true,
+        );
+        let request_head_len = "PUT /streaming HTTP/1.1\r\n".len()
+            + headers
+                .iter()
+                .map(|(name, value)| name.len() + 2 + value.len() + 2)
+                .sum::<usize>()
+            + 2;
+        assert!(request_head_len <= 8_192);
+
+        let context = authenticate_streaming_session(&fixture, &headers).unwrap();
+        assert_eq!(context.mode, AuthMode::HeaderSigV4);
+        assert_eq!(
+            context.access_key_id.as_deref(),
+            Some(fixture.access_key_id.as_str())
+        );
+        assert_eq!(
+            context
+                .identity
+                .as_ref()
+                .unwrap()
+                .role_session()
+                .unwrap()
+                .session_name()
+                .as_str(),
+            session_name
+        );
+        assert_eq!(
+            context.authorization_profile,
+            crate::AuthorizationProfile::Standard
+        );
+        let streaming = context.streaming.as_ref().unwrap();
+        assert_eq!(streaming.timestamp, "20260720T120000Z");
+        assert_eq!(streaming.scope, "20260720/us-east-1/s3/aws4_request");
+        assert!(streaming.seed_canonical_request.contains(&fixture.token));
+
+        let debug = format!("{context:?}");
+        assert!(debug.contains("<redacted:sigv4_seed_canonical_request>"));
+        assert!(!debug.contains(&fixture.token));
+        assert!(!debug.contains(fixture.secret_key.as_str()));
+    }
+
+    #[test]
+    fn streaming_token_selection_and_coverage_precede_seed_signature() {
+        let fixture = header_session_fixture(3_600);
+        let other_token = issue_header_session_token(
+            &fixture,
+            "ARGS1123456789ABCDEFGHIJ",
+            SecretKey::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn".to_string()),
+        );
+
+        for tokens in [Vec::new(), vec![""], vec![other_token.as_str()]] {
+            let headers = signed_streaming_session_request(
+                &fixture.access_key_id,
+                &fixture.secret_key,
+                &tokens,
+                !tokens.is_empty(),
+                "us-east-1",
+                "s3",
+                false,
+            );
+            assert!(matches!(
+                authenticate_streaming_session(&fixture, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        let malformed = "ARGST1.not-a-canonical-token";
+        let headers = signed_streaming_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[malformed],
+            true,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_streaming_session(&fixture, &headers),
+            Err(AuthError::UnexpectedSecurityToken { token }) if token == malformed
+        ));
+
+        for tokens in [
+            vec![fixture.token.as_str(), other_token.as_str()],
+            vec![other_token.as_str(), fixture.token.as_str()],
+        ] {
+            for valid_seed_signature in [true, false] {
+                let headers = signed_streaming_session_request(
+                    &fixture.access_key_id,
+                    &fixture.secret_key,
+                    &tokens,
+                    true,
+                    "us-east-1",
+                    "s3",
+                    valid_seed_signature,
+                );
+                assert!(matches!(
+                    authenticate_streaming_session(&fixture, &headers),
+                    Err(AuthError::UnknownAccessKey { .. })
+                ));
+            }
+        }
+
+        let identical = [fixture.token.as_str(), fixture.token.as_str()];
+        let headers = signed_streaming_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &identical,
+            true,
+            "us-east-1",
+            "s3",
+            true,
+        );
+        authenticate_streaming_session(&fixture, &headers).unwrap();
+        let headers = signed_streaming_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &identical,
+            true,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_streaming_session(&fixture, &headers),
+            Err(AuthError::SignatureMismatch { .. })
+        ));
+
+        *fixture.role_state.write().unwrap() = SessionRoleState::Missing;
+        let headers = signed_streaming_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[malformed],
+            false,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_streaming_session(&fixture, &headers),
+            Err(AuthError::UnsignedHeaders { headers })
+                if headers == ["x-amz-security-token"]
+        ));
+    }
+
+    #[test]
+    fn streaming_scope_precedes_token_coverage_structure_and_seed_signature() {
+        let fixture = header_session_fixture(3_600);
+        let malformed = "ARGST1.not-a-canonical-token";
+
+        for (tokens, cover_token) in [
+            (Vec::new(), false),
+            (vec![""], true),
+            (vec![malformed], true),
+            (vec![fixture.token.as_str()], false),
+            (vec![fixture.token.as_str(), malformed], true),
+        ] {
+            let wrong_region = signed_streaming_session_request(
+                &fixture.access_key_id,
+                &fixture.secret_key,
+                &tokens,
+                cover_token,
+                "us-west-2",
+                "sts",
+                false,
+            );
+            assert!(matches!(
+                authenticate_streaming_session(&fixture, &wrong_region),
+                Err(AuthError::InvalidHeaderCredentialRegion {
+                    provided_region,
+                    expected_region,
+                }) if provided_region == "us-west-2" && expected_region == "us-east-1"
+            ));
+
+            let wrong_service = signed_streaming_session_request(
+                &fixture.access_key_id,
+                &fixture.secret_key,
+                &tokens,
+                cover_token,
+                "us-east-1",
+                "sts",
+                false,
+            );
+            assert!(matches!(
+                authenticate_streaming_session(&fixture, &wrong_service),
+                Err(AuthError::InvalidHeaderCredentialService {
+                    provided_service,
+                    expected_service,
+                }) if provided_service == "sts" && expected_service == "s3"
+            ));
+        }
+    }
+
+    #[test]
+    fn streaming_token_opening_expiry_and_liveness_precede_seed_signature() {
+        let expired = header_session_fixture(0);
+        let other_token = issue_header_session_token(
+            &expired,
+            "ARGS1123456789ABCDEFGHIJ",
+            SecretKey::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn".to_string()),
+        );
+        let malformed = "ARGST1.not-a-canonical-token";
+
+        for tokens in [Vec::new(), vec![""], vec![other_token.as_str()]] {
+            let headers = signed_streaming_session_request(
+                &expired.access_key_id,
+                &expired.secret_key,
+                &tokens,
+                !tokens.is_empty(),
+                "us-east-1",
+                "s3",
+                false,
+            );
+            assert!(matches!(
+                authenticate_streaming_session(&expired, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+        let headers = signed_streaming_session_request(
+            &expired.access_key_id,
+            &expired.secret_key,
+            &[malformed],
+            true,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_streaming_session(&expired, &headers),
+            Err(AuthError::UnexpectedSecurityToken { token }) if token == malformed
+        ));
+        for tokens in [
+            vec![expired.token.as_str(), other_token.as_str()],
+            vec![other_token.as_str(), expired.token.as_str()],
+        ] {
+            let headers = signed_streaming_session_request(
+                &expired.access_key_id,
+                &expired.secret_key,
+                &tokens,
+                true,
+                "us-east-1",
+                "s3",
+                false,
+            );
+            assert!(matches!(
+                authenticate_streaming_session(&expired, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        for tokens in [
+            vec![expired.token.as_str()],
+            vec![expired.token.as_str(), expired.token.as_str()],
+        ] {
+            for valid_seed_signature in [true, false] {
+                let headers = signed_streaming_session_request(
+                    &expired.access_key_id,
+                    &expired.secret_key,
+                    &tokens,
+                    true,
+                    "us-east-1",
+                    "s3",
+                    valid_seed_signature,
+                );
+                assert!(matches!(
+                    authenticate_streaming_session(&expired, &headers),
+                    Err(AuthError::ExpiredSessionToken { tokens: presented })
+                        if presented == tokens
+                ));
+            }
+        }
+
+        let missing = header_session_fixture(3_600);
+        *missing.role_state.write().unwrap() = SessionRoleState::Missing;
+        let headers = signed_streaming_session_request(
+            &missing.access_key_id,
+            &missing.secret_key,
+            &[&missing.token],
+            true,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_streaming_session(&missing, &headers),
+            Err(AuthError::UnknownAccessKey { .. })
+        ));
+
+        let unavailable = header_session_fixture(3_600);
+        *unavailable.role_state.write().unwrap() =
+            SessionRoleState::Failure(crate::IdentityProviderError::Unavailable);
+        let headers = signed_streaming_session_request(
+            &unavailable.access_key_id,
+            &unavailable.secret_key,
+            &[&unavailable.token],
+            true,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_streaming_session(&unavailable, &headers),
             Err(AuthError::IdentityProviderFailure(
                 crate::IdentityProviderError::Unavailable
             ))
