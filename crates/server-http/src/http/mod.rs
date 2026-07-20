@@ -997,10 +997,13 @@ impl HttpFrontend {
         }
 
         let actual_cors_bucket = operation.bucket_name().cloned();
-        // AWS reveals the bucket region on security-token auth errors only
-        // for bucket-scoped requests to existing buckets; object-scoped
-        // requests and unknown buckets omit the header.
-        let token_error_bucket_region_bucket = if operation.object_key().is_none() {
+        // AWS reveals the bucket region on the pinned header/presigned
+        // credential errors only for bucket-scoped requests to existing
+        // buckets. Object-scoped requests, POST/streaming writes, and unknown
+        // buckets omit the header.
+        let auth_error_bucket_region_bucket = if operation.object_key().is_none()
+            && !matches!(&operation, S3Operation::PostObject { .. })
+        {
             actual_cors_bucket.clone()
         } else {
             None
@@ -1044,13 +1047,17 @@ impl HttpFrontend {
             }
             Err(err) => Err(err),
         };
-        let add_bucket_region_for_token_error = token_error_bucket_region_bucket
+        let add_bucket_region_for_auth_error = auth_error_bucket_region_bucket
             .as_ref()
             .filter(|_| {
                 matches!(
                     &result,
                     Err(ServerError::Auth(
                         auth::AuthError::UnexpectedSecurityToken { .. }
+                            | auth::AuthError::UnknownAccessKey { .. }
+                            | auth::AuthError::InvalidHeaderCredentialService { .. }
+                            | auth::AuthError::InvalidQueryCredentialRegion { .. }
+                            | auth::AuthError::InvalidQueryCredentialService { .. }
                     ))
                 )
             })
@@ -1108,7 +1115,7 @@ impl HttpFrontend {
                 }
             }
         };
-        if (add_bucket_region_for_token_error || add_bucket_region_for_denied_discovery)
+        if (add_bucket_region_for_auth_error || add_bucket_region_for_denied_discovery)
             && !resp
                 .headers
                 .iter()
@@ -6674,6 +6681,118 @@ mod tests {
         (date, amz_date)
     }
 
+    fn header_auth_request(
+        method: http::Method,
+        path: &str,
+        access_key_id: &str,
+        service: &str,
+        security_tokens: &[&str],
+    ) -> S3Request {
+        let (date, amz_date) = current_sigv4_timestamp();
+        let mut headers = vec![
+            (
+                "host".to_string(),
+                "mybucket.s3.us-east-1.amazonaws.com".to_string(),
+            ),
+            ("x-amz-date".to_string(), amz_date),
+        ];
+        headers.extend(
+            security_tokens
+                .iter()
+                .map(|token| ("x-amz-security-token".to_string(), (*token).to_string())),
+        );
+        let signed_headers = if security_tokens.is_empty() {
+            "host;x-amz-date"
+        } else {
+            "host;x-amz-date;x-amz-security-token"
+        };
+        headers.push((
+            "authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/{date}/us-east-1/{service}/aws4_request, SignedHeaders={signed_headers}, Signature={}",
+                "0".repeat(64)
+            ),
+        ));
+        new_req(method, path, "", headers, Vec::new())
+    }
+
+    fn presigned_auth_request(
+        path: &str,
+        access_key_id: &str,
+        region: &str,
+        service: &str,
+    ) -> S3Request {
+        let (date, amz_date) = current_sigv4_timestamp();
+        let query = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&\
+             X-Amz-Credential={access_key_id}%2F{date}%2F{region}%2F{service}%2Faws4_request&\
+             X-Amz-Date={amz_date}&\
+             X-Amz-Expires=900&\
+             X-Amz-SignedHeaders=host&\
+             X-Amz-Signature={}",
+            "0".repeat(64)
+        );
+        new_req(
+            http::Method::GET,
+            path,
+            &query,
+            vec![(
+                "host".to_string(),
+                "mybucket.s3.us-east-1.amazonaws.com".to_string(),
+            )],
+            Vec::new(),
+        )
+    }
+
+    fn install_expired_session_provider(frontend: &mut HttpFrontend) -> (String, String) {
+        let stable_role_id = auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
+        let role = auth::IamRoleIdentity::new(
+            auth::AwsAccountId::new("123456789012").unwrap(),
+            stable_role_id.clone(),
+            auth::RoleName::new("expired-session-role").unwrap(),
+            auth::IamPath::new("/test/").unwrap(),
+        );
+        let live_role = auth::LiveRoleIdentity::new(
+            s3_types::AccountIdentity::new(
+                "123456789012",
+                s3_types::CanonicalUserId::from_principal("123456789012"),
+                "test account",
+            ),
+            role,
+        )
+        .unwrap();
+        let mut roles = auth::RoleIdentityStore::new();
+        roles.add(live_role).unwrap();
+        frontend.identity_provider =
+            auth::IdentityProvider::in_memory_with_roles(auth::CredentialStore::new(), roles)
+                .unwrap();
+        let issuer = frontend
+            .identity_provider
+            .lookup_live_role_identity(&stable_role_id)
+            .unwrap()
+            .unwrap();
+        let material = auth::generate_session_credential_material().unwrap();
+        let access_key_id = material.access_key_id().to_string();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let token = frontend
+            .identity_provider
+            .seal_session_credential_v1(
+                material,
+                &issuer,
+                auth::RoleSessionName::new("expired-session").unwrap(),
+                auth::SessionLifetime::new(now - 3_600, now - 1).unwrap(),
+                None,
+            )
+            .unwrap();
+        (access_key_id, token)
+    }
+
     fn signed_v4_put_req(body: &[u8], extra_headers: Vec<(String, String)>) -> S3Request {
         let (date, amz_date) = current_sigv4_timestamp();
         let body_hash = sha256_hex(body);
@@ -6990,6 +7109,134 @@ mod tests {
         assert!(
             HttpFrontend::unsupported_sigv2_error(Some("AWS AKIA:signature"), "us-west-2")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn duplicate_expired_header_session_tokens_render_exact_aws_response_end_to_end() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        let (access_key_id, token) = install_expired_session_provider(&mut frontend);
+        let request = header_auth_request(
+            http::Method::GET,
+            "/",
+            &access_key_id,
+            "s3",
+            &[&token, &token],
+        );
+        let wire_ids = WireResponseIds::new("request-id", "host-id");
+
+        let response = frontend.handle_s3_request(&request, &wire_ids);
+        assert_eq!(response.status_code, 400);
+        let body = String::from_utf8(response.into_test_body_bytes().unwrap()).unwrap();
+        let sanitized = body.replace(&token, "SESSION_TOKEN");
+        assert_eq!(
+            sanitized,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error>\
+             <Code>ExpiredToken</Code>\
+             <Message>The provided token has expired.</Message>\
+             <Token-0>SESSION_TOKEN</Token-0>\
+             <Token-1>SESSION_TOKEN</Token-1>\
+             <RequestId>request-id</RequestId>\
+             <HostId>host-id</HostId>\
+             </Error>"
+        );
+    }
+
+    #[test]
+    fn bucket_scoped_auth_errors_add_region_only_for_existing_non_post_bucket() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend.coordinator, "mybucket");
+        let wire_ids = WireResponseIds::new("request-id", "host-id");
+
+        let existing_bucket = header_auth_request(
+            http::Method::GET,
+            "/mybucket",
+            "UNKNOWNKEY123456",
+            "s3",
+            &[],
+        );
+        let response = frontend.handle_s3_request(&existing_bucket, &wire_ids);
+        assert_eq!(response.status_code, 403);
+        assert_eq!(
+            find_header(&response, "x-amz-bucket-region"),
+            Some("us-east-1")
+        );
+        let body = String::from_utf8(response.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>InvalidAccessKeyId</Code>"));
+
+        for (method, path) in [
+            (http::Method::GET, "/mybucket/key"),
+            (http::Method::GET, "/missing"),
+            (http::Method::POST, "/mybucket"),
+        ] {
+            let request = header_auth_request(method, path, "UNKNOWNKEY123456", "s3", &[]);
+            let response = frontend.handle_s3_request(&request, &wire_ids);
+            assert_eq!(response.status_code, 403);
+            assert_eq!(find_header(&response, "x-amz-bucket-region"), None);
+        }
+    }
+
+    #[test]
+    fn existing_bucket_header_service_error_adds_bucket_region_end_to_end() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend.coordinator, "mybucket");
+        let request = header_auth_request(
+            http::Method::GET,
+            "/mybucket",
+            TEST_SIGV4_ACCESS_KEY,
+            "sts",
+            &[],
+        );
+        let wire_ids = WireResponseIds::new("request-id", "host-id");
+
+        let response = frontend.handle_s3_request(&request, &wire_ids);
+        assert_eq!(response.status_code, 400);
+        assert_eq!(
+            find_header(&response, "x-amz-bucket-region"),
+            Some("us-east-1")
+        );
+        let body = String::from_utf8(response.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error>\
+             <Code>AuthorizationHeaderMalformed</Code>\
+             <Message>The authorization header is malformed; incorrect service \"sts\". This endpoint belongs to \"s3\".</Message>\
+             <RequestId>request-id</RequestId>\
+             <HostId>host-id</HostId>\
+             </Error>"
+        );
+    }
+
+    #[test]
+    fn existing_bucket_presigned_region_error_adds_bucket_region_end_to_end() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend.coordinator, "mybucket");
+        let request = presigned_auth_request("/mybucket", TEST_SIGV4_ACCESS_KEY, "us-west-2", "s3");
+        let wire_ids = WireResponseIds::new("request-id", "host-id");
+
+        let response = frontend.handle_s3_request(&request, &wire_ids);
+        assert_eq!(response.status_code, 400);
+        assert_eq!(
+            find_header(&response, "x-amz-bucket-region"),
+            Some("us-east-1")
+        );
+        let body = String::from_utf8(response.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error>\
+             <Code>AuthorizationQueryParametersError</Code>\
+             <Message>Error parsing the X-Amz-Credential parameter; the region 'us-west-2' is wrong; expecting 'us-east-1'</Message>\
+             <Region>us-east-1</Region>\
+             <RequestId>request-id</RequestId>\
+             <HostId>host-id</HostId>\
+             </Error>"
         );
     }
 

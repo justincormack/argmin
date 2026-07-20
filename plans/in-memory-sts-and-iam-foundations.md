@@ -158,21 +158,22 @@ a future backend cannot bypass the reservation.
 The shared provider can now authenticate one already-selected temporary
 credential into the session variant. That boundary strictly opens the
 version-1 envelope, binds its access key in constant time, checks expiry, and
-only then resolves the stable issuer incarnation. Request authentication does
-not yet select or call that path. It continues to check an optional expiry on
-stored records and then calls
-`validate_static_credential_has_no_token` on header, presigned, and POST paths.
-An expiring stored record is therefore still not a usable STS credential.
+only then resolves the stable issuer incarnation. Ordinary non-streaming S3
+Authorization-header authentication now selects and calls that path for the
+reserved `ARGS` namespace. Presigned, POST Object, and aws-chunked streaming
+authentication still use only the long-lived path. Active static credentials
+retain their post-signature unexpected-token check, and expiring stored records
+remain static rather than becoming STS credentials.
 
-### Structured identity exists but session authentication does not
+### Structured session authentication exists but role authorization does not
 
 `AccountIdentity` remains the durable account/owner value. Authentication now
 composes it with a typed configured principal or assumed-role session identity,
 and exposes the IAM role ARN, STS session ARN, stable role ID, assumed-role ID,
-and `aws:userid` through distinct accessors. Current static credentials populate
-only the configured-principal variant, and existing S3 authorization paths
-explicitly require that variant rather than treating a role session as an
-existing configured user.
+and `aws:userid` through distinct accessors. The first ordinary header-auth
+slice can now populate the assumed-role-session variant. Existing S3
+authorization paths explicitly refuse to reinterpret it as a configured user;
+role permission evaluation remains Phase 3.
 
 The remaining request-authentication plumbing belongs to Phase 2. Session and
 principal tags remain later versioned policy context as described below.
@@ -2500,9 +2501,26 @@ failure, token opening before binding, authentication-path key-ring failure,
 cross-provider key/domain rejection, and redacted diagnostics. A live-role
 record whose immutable account or role name disagrees with its authenticated
 sealed payload is a typed invalid provider record, not a client credential
-error. Header, presigned, POST, and streaming adapters still need to perform
-their mode-specific selection/coverage checks and call this boundary before
-signature verification.
+error.
+
+The ordinary non-streaming S3 Authorization-header adapter is also complete.
+After its already-pinned region and service scope checks, it requires a signed
+session-token header, collapses identical duplicate values, rejects conflicting
+duplicates as `InvalidAccessKeyId`, and maps missing/empty, malformed,
+mismatched, expired, deleted-issuer, provider-failure, and key-ring-failure
+decisions at the S3 boundary before HMAC comparison. A correct credential
+returns a typed assumed-role session; a bad HMAC then reaches
+`SignatureDoesNotMatch`. The header wrong-service path now has its pinned
+`AuthorizationHeaderMalformed` message and response shape rather than the
+previous generic malformed-header response. Expired sessions retain every
+presented identical token header and render the exact HTTP 400 `ExpiredToken`
+body with ordered `Token-N` elements. Bucket-scoped `InvalidAccessKeyId` and
+wrong-service responses on an existing bucket receive
+`x-amz-bucket-region`, as do the previously pinned presigned wrong-region and
+wrong-service responses; object-scoped requests, missing buckets, and POST
+Object retain their pinned exclusions. Active and inactive static credential
+ordering is unchanged. Presigned, POST, and streaming adapters still need
+their mode-specific selection/coverage wiring.
 
 Exit condition: directly sealed session credentials authenticate with
 AWS-pinned token/signature/expiry precedence on every SigV4 mode and produce a

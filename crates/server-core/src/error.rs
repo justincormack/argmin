@@ -478,6 +478,9 @@ impl ServerError {
             | Self::Auth(auth::AuthError::IdentityProviderFailure(error)) => {
                 error.diagnostic_cause_label()
             }
+            Self::Auth(auth::AuthError::SessionTokenKeyRingUnavailable) => {
+                "session_token_key_ring_unavailable"
+            }
             Self::Auth(_) => "auth_error",
             _ => self.s3_error_code(),
         }
@@ -532,7 +535,8 @@ impl ServerError {
                 auth::AuthError::MalformedAuth
                 | auth::AuthError::MalformedAuthComponents
                 | auth::AuthError::MalformedSignedHeaders
-                | auth::AuthError::InvalidHeaderCredentialRegion { .. },
+                | auth::AuthError::InvalidHeaderCredentialRegion { .. }
+                | auth::AuthError::InvalidHeaderCredentialService { .. },
             )
             | Self::WrongRegion { .. } => "AuthorizationHeaderMalformed",
             Self::Auth(
@@ -541,15 +545,18 @@ impl ServerError {
                 | auth::AuthError::InvalidCredentialScopeRegion { .. }
                 | auth::AuthError::InvalidCredentialScopeService { .. },
             ) => "InvalidArgument",
-            Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
+            Self::Auth(auth::AuthError::UnknownAccessKey { .. }) => "InvalidAccessKeyId",
             Self::IdentityProvider(_) => "InternalError",
             Self::Auth(auth::AuthError::IdentityProviderFailure(_)) => "InternalError",
+            Self::Auth(auth::AuthError::SessionTokenKeyRingUnavailable) => "InternalError",
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
             Self::Auth(auth::AuthError::MultipleAuthMechanisms { .. }) => "InvalidArgument",
             Self::Auth(auth::AuthError::SignatureMismatch { .. }) => "SignatureDoesNotMatch",
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
             Self::Auth(auth::AuthError::PresignedRequestExpired { .. }) => "AccessDenied",
-            Self::Auth(auth::AuthError::ExpiredToken) => "ExpiredToken",
+            Self::Auth(
+                auth::AuthError::ExpiredToken | auth::AuthError::ExpiredSessionToken { .. },
+            ) => "ExpiredToken",
             Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => "InvalidToken",
             Self::Auth(auth::AuthError::InvalidQueryParam { .. }) => {
                 "AuthorizationQueryParametersError"
@@ -689,6 +696,7 @@ impl ServerError {
                 | auth::AuthError::MalformedAuthComponents
                 | auth::AuthError::MalformedSignedHeaders
                 | auth::AuthError::InvalidHeaderCredentialRegion { .. }
+                | auth::AuthError::InvalidHeaderCredentialService { .. }
                 | auth::AuthError::UnsupportedAuthType
                 | auth::AuthError::InvalidCredentialScope { .. }
                 | auth::AuthError::InvalidCredentialScopeRegion { .. }
@@ -699,10 +707,14 @@ impl ServerError {
                 | auth::AuthError::MissingQueryParam { .. },
             ) => 400,
             Self::Auth(auth::AuthError::MultipleAuthMechanisms { .. }) => 400,
-            Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => 400,
+            Self::Auth(
+                auth::AuthError::UnexpectedSecurityToken { .. }
+                | auth::AuthError::ExpiredSessionToken { .. },
+            ) => 400,
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => 501,
             Self::IdentityProvider(_) => 500,
             Self::Auth(auth::AuthError::IdentityProviderFailure(_)) => 500,
+            Self::Auth(auth::AuthError::SessionTokenKeyRingUnavailable) => 500,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidRequestHostId { .. }
@@ -1163,7 +1175,9 @@ mod tests {
 
     #[test]
     fn s3_error_code_auth_unknown_key() {
-        let err = ServerError::Auth(auth::AuthError::UnknownAccessKey);
+        let err = ServerError::Auth(auth::AuthError::UnknownAccessKey {
+            access_key_id: "unknown".to_string(),
+        });
         assert_eq!(err.s3_error_code(), "InvalidAccessKeyId");
     }
 
@@ -1217,6 +1231,31 @@ mod tests {
         });
         assert_eq!(err.s3_error_code(), "AuthorizationHeaderMalformed");
         assert_eq!(err.http_status(), 400);
+    }
+
+    #[test]
+    fn auth_header_service_mismatch_is_authorization_header_malformed_400() {
+        let err = ServerError::Auth(auth::AuthError::InvalidHeaderCredentialService {
+            provided_service: "sts".to_string(),
+            expected_service: "s3".to_string(),
+        });
+        assert_eq!(err.s3_error_code(), "AuthorizationHeaderMalformed");
+        assert_eq!(err.http_status(), 400);
+    }
+
+    #[test]
+    fn session_token_key_ring_failure_is_distinct_internal_error() {
+        let err = ServerError::Auth(auth::AuthError::SessionTokenKeyRingUnavailable);
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+        assert_eq!(
+            err.diagnostic_cause_label(),
+            "session_token_key_ring_unavailable"
+        );
+        assert_eq!(
+            err.diagnostic_cause_chain(),
+            "server_error>session_token_key_ring_unavailable"
+        );
     }
 
     #[test]
@@ -1287,6 +1326,15 @@ mod tests {
     fn s3_error_code_auth_expired_token() {
         let err = ServerError::Auth(auth::AuthError::ExpiredToken);
         assert_eq!(err.s3_error_code(), "ExpiredToken");
+    }
+
+    #[test]
+    fn expired_session_token_is_expired_token_400() {
+        let err = ServerError::Auth(auth::AuthError::ExpiredSessionToken {
+            tokens: vec!["expired".to_string()],
+        });
+        assert_eq!(err.s3_error_code(), "ExpiredToken");
+        assert_eq!(err.http_status(), 400);
     }
 
     #[test]

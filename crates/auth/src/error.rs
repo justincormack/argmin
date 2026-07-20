@@ -32,6 +32,11 @@ pub enum AuthError {
         provided_region: String,
         expected_region: String,
     },
+    #[error("invalid Authorization credential service")]
+    InvalidHeaderCredentialService {
+        provided_service: String,
+        expected_service: String,
+    },
     #[error("invalid credential scope: {param}")]
     InvalidCredentialScope { param: &'static str },
     #[error("invalid credential scope region: {param}")]
@@ -49,9 +54,11 @@ pub enum AuthError {
         expected_service: String,
     },
     #[error("unknown access key id")]
-    UnknownAccessKey,
+    UnknownAccessKey { access_key_id: String },
     #[error("identity provider failure")]
     IdentityProviderFailure(crate::IdentityProviderError),
+    #[error("session-token key ring unavailable")]
+    SessionTokenKeyRingUnavailable,
     #[error("duplicate Authorization header")]
     DuplicateAuthorizationHeader,
     #[error("multiple authentication mechanisms supplied")]
@@ -68,6 +75,8 @@ pub enum AuthError {
     UnexpectedSecurityToken { token: String },
     #[error("token expired")]
     ExpiredToken,
+    #[error("session token expired")]
+    ExpiredSessionToken { tokens: Vec<String> },
     #[error("missing required signed header: {header}")]
     MissingSignedHeader { header: String },
     #[error("request timestamp is too far from server time")]
@@ -144,6 +153,20 @@ impl std::fmt::Debug for AuthError {
                 .field("provided_region", &observability::escaped(provided_region))
                 .field("expected_region", &observability::escaped(expected_region))
                 .finish(),
+            Self::InvalidHeaderCredentialService {
+                provided_service,
+                expected_service,
+            } => f
+                .debug_struct("InvalidHeaderCredentialService")
+                .field(
+                    "provided_service",
+                    &observability::escaped(provided_service),
+                )
+                .field(
+                    "expected_service",
+                    &observability::escaped(expected_service),
+                )
+                .finish(),
             Self::InvalidCredentialScope { param } => f
                 .debug_struct("InvalidCredentialScope")
                 .field("param", &param)
@@ -180,11 +203,15 @@ impl std::fmt::Debug for AuthError {
                     &observability::escaped(expected_service),
                 )
                 .finish(),
-            Self::UnknownAccessKey => f.write_str("UnknownAccessKey"),
+            Self::UnknownAccessKey { access_key_id } => f
+                .debug_struct("UnknownAccessKey")
+                .field("access_key_id", &observability::escaped(access_key_id))
+                .finish(),
             Self::IdentityProviderFailure(error) => f
                 .debug_tuple("IdentityProviderFailure")
                 .field(error)
                 .finish(),
+            Self::SessionTokenKeyRingUnavailable => f.write_str("SessionTokenKeyRingUnavailable"),
             Self::DuplicateAuthorizationHeader => f.write_str("DuplicateAuthorizationHeader"),
             Self::MultipleAuthMechanisms { authorization } => f
                 .debug_struct("MultipleAuthMechanisms")
@@ -201,6 +228,14 @@ impl std::fmt::Debug for AuthError {
                 .field("token", &observability::redacted("security_token"))
                 .finish(),
             Self::ExpiredToken => f.write_str("ExpiredToken"),
+            Self::ExpiredSessionToken { tokens } => f
+                .debug_struct("ExpiredSessionToken")
+                .field(
+                    "tokens",
+                    &observability::redacted("presented_session_tokens"),
+                )
+                .field("token_count", &tokens.len())
+                .finish(),
             Self::MissingSignedHeader { header } => f
                 .debug_struct("MissingSignedHeader")
                 .field("header", &observability::escaped(header))
@@ -243,6 +278,25 @@ mod tests {
         let display = err.to_string();
         assert_eq!(display, "unexpected security token");
         assert!(!display.contains("tok\nen"));
+    }
+
+    #[test]
+    fn expired_session_token_debug_and_display_are_redacted() {
+        let err = AuthError::ExpiredSessionToken {
+            tokens: vec![
+                "first-secret-token".to_string(),
+                "second-secret-token".to_string(),
+            ],
+        };
+        let debug = format!("{err:?}");
+        assert!(debug.contains("<redacted:presented_session_tokens>"));
+        assert!(debug.contains("token_count"));
+        assert!(!debug.contains("first-secret-token"));
+        assert!(!debug.contains("second-secret-token"));
+
+        let display = err.to_string();
+        assert_eq!(display, "session token expired");
+        assert!(!display.contains("secret-token"));
     }
 
     #[test]

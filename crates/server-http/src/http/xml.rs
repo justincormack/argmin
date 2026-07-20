@@ -212,6 +212,28 @@ pub fn invalid_encryption_algorithm_error_xml(
     )
 }
 
+/// Format an S3 `InvalidAccessKeyId` response echoing the rejected access key.
+#[must_use]
+pub fn invalid_access_key_error_xml(
+    access_key_id: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>InvalidAccessKeyId</Code>\
+         <Message>The AWS Access Key Id you provided does not exist in our records.</Message>\
+         <AWSAccessKeyId>{}</AWSAccessKeyId>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(access_key_id),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an S3 `InvalidToken` error response echoing the rejected token.
 #[must_use]
 pub fn invalid_token_error_xml(
@@ -231,6 +253,28 @@ pub fn invalid_token_error_xml(
          </Error>",
         xml_escape_text(message),
         xml_escape(token),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an S3 `ExpiredToken` response preserving every presented token.
+#[must_use]
+pub fn expired_token_error_xml(tokens: &[String], request_id: &str, host_id: &str) -> String {
+    let token_elements = tokens
+        .iter()
+        .enumerate()
+        .map(|(index, token)| format!("<Token-{index}>{}</Token-{index}>", xml_escape(token)))
+        .collect::<String>();
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>ExpiredToken</Code>\
+         <Message>The provided token has expired.</Message>\
+         {token_elements}\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
         xml_escape(request_id),
         xml_escape(host_id),
     )

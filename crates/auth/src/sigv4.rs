@@ -5,10 +5,10 @@ use crate::canonical::{
     amz_date_matches_date_stamp, canonical_headers, canonical_query_string, canonical_request,
     sha256_hex, string_to_sign,
 };
-use crate::credential::{parse_credential_scope_ref, CredentialScope, SecretKey, StoredCredential};
+use crate::credential::{parse_credential_scope_ref, CredentialScope, SecretKey};
 use crate::encoding::hex_encode_lower;
 use crate::error::AuthError;
-use crate::request::{validate_static_record_expiry, HeaderSource};
+use crate::request::HeaderSource;
 use crate::{is_lower_hex, MAX_SIGNED_HEADERS_LEN, MAX_SIGNED_HEADER_COUNT, SIGNATURE_HEX_LEN};
 
 /// Parsed AWS SigV4 Authorization header.
@@ -168,7 +168,7 @@ pub(crate) struct HeaderSigningTimestamp<'a> {
     pub value: &'a str,
 }
 
-pub(crate) struct VerifyRequestRecordInput<'a, H: HeaderSource + ?Sized> {
+pub(crate) struct VerifyRequestCredentialInput<'a, H: HeaderSource + ?Sized> {
     pub method: &'a str,
     pub uri: &'a str,
     pub query_string: &'a str,
@@ -176,14 +176,13 @@ pub(crate) struct VerifyRequestRecordInput<'a, H: HeaderSource + ?Sized> {
     pub body_hash: &'a str,
     pub auth: &'a SigV4Auth,
     pub timestamp: Option<HeaderSigningTimestamp<'a>>,
-    pub now_epoch_secs: u64,
 }
 
-pub(crate) fn verify_request_record<H: HeaderSource + ?Sized>(
-    input: VerifyRequestRecordInput<'_, H>,
-    provider: &crate::IdentityProvider,
-) -> Result<(std::sync::Arc<StoredCredential>, String), AuthError> {
-    let VerifyRequestRecordInput {
+pub(crate) fn verify_request_credential<H: HeaderSource + ?Sized>(
+    input: VerifyRequestCredentialInput<'_, H>,
+    credential: &crate::AuthenticatedCredential,
+) -> Result<String, AuthError> {
+    let VerifyRequestCredentialInput {
         method,
         uri,
         query_string,
@@ -191,19 +190,10 @@ pub(crate) fn verify_request_record<H: HeaderSource + ?Sized>(
         body_hash,
         auth,
         timestamp,
-        now_epoch_secs,
     } = input;
 
-    // Look up the secret key
-    let record = provider
-        .lookup_long_lived_credential(&auth.credential.access_key_id)
-        .map_err(AuthError::IdentityProviderFailure)?
-        .ok_or(AuthError::UnknownAccessKey)?;
-    if !record.is_enabled() {
-        return Err(AuthError::UnknownAccessKey);
-    }
-    validate_static_record_expiry(&record, now_epoch_secs)?;
-    let secret = record.secret_key();
+    debug_assert_eq!(credential.access_key_id(), auth.credential.access_key_id);
+    let secret = credential.secret_key();
 
     // Extract signed headers — collect all values for each header name
     // to handle duplicate headers (values combined by canonical_headers).
@@ -294,7 +284,7 @@ pub(crate) fn verify_request_record<H: HeaderSource + ?Sized>(
         });
     }
 
-    Ok((record, creq))
+    Ok(creq)
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
@@ -723,7 +713,11 @@ mod tests {
         let headers = with_auth_header(auth_header, &headers);
         let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         let err = result.unwrap_err();
-        assert_eq!(err.to_string(), AuthError::UnknownAccessKey.to_string());
+        assert!(matches!(
+            err,
+            AuthError::UnknownAccessKey { access_key_id }
+                if access_key_id == "AKIAIOSFODNN7EXAMPLE"
+        ));
     }
 
     #[test]
@@ -810,7 +804,11 @@ mod tests {
         let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];
         let headers = with_auth_header(auth_header, &headers);
         let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
-        assert!(matches!(result, Err(AuthError::UnknownAccessKey)));
+        assert!(matches!(
+            result,
+            Err(AuthError::UnknownAccessKey { access_key_id })
+                if access_key_id == "UNKNOWNKEY123456"
+        ));
     }
 
     #[test]

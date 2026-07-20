@@ -116,9 +116,13 @@ pub fn authenticate_post_sigv4(
     let record = provider
         .lookup_long_lived_credential(credential.access_key_id)
         .map_err(AuthError::IdentityProviderFailure)?
-        .ok_or(AuthError::UnknownAccessKey)?;
+        .ok_or_else(|| AuthError::UnknownAccessKey {
+            access_key_id: credential.access_key_id.to_string(),
+        })?;
     if !record.is_enabled() {
-        return Err(AuthError::UnknownAccessKey);
+        return Err(AuthError::UnknownAccessKey {
+            access_key_id: credential.access_key_id.to_string(),
+        });
     }
     validate_static_record_expiry(&record, now_epoch_secs)?;
 
@@ -859,7 +863,7 @@ mod tests {
             ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::UnknownAccessKey));
+        assert!(matches!(err, AuthError::UnknownAccessKey { .. }));
     }
 
     #[test]
@@ -1635,7 +1639,7 @@ mod tests {
             ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::UnknownAccessKey));
+        assert!(matches!(err, AuthError::UnknownAccessKey { .. }));
     }
 
     // ── parse_iso8601 edge cases ──────────────────────────────────────

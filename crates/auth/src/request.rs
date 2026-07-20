@@ -9,8 +9,8 @@ use crate::credential::parse_credential_scope_ref;
 use crate::encoding::{hex_encode_lower, percent_decode_lossy};
 use crate::error::AuthError;
 use crate::sigv4::{
-    derive_signing_key, parse_auth_header, unsigned_required_headers, verify_request_record,
-    HeaderSigningTimestamp, VerifyRequestRecordInput,
+    derive_signing_key, parse_auth_header, unsigned_required_headers, verify_request_credential,
+    HeaderSigningTimestamp, VerifyRequestCredentialInput,
 };
 use crate::{
     MAX_AUTHORIZATION_HEADER_LEN, MAX_PRESIGNED_QUERY_LEN, MAX_SIGNED_HEADERS_LEN,
@@ -355,15 +355,26 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         }
     }
     if parsed.credential.service != expected_service {
-        return Err(AuthError::MalformedAuth);
+        return Err(AuthError::InvalidHeaderCredentialService {
+            provided_service: parsed.credential.service.to_string(),
+            expected_service: expected_service.to_string(),
+        });
     }
     let body_hash = match headers.first_value("x-amz-content-sha256") {
         Some("UNSIGNED-PAYLOAD") => Cow::Borrowed("UNSIGNED-PAYLOAD"),
         Some(hash) => Cow::Borrowed(hash),
         None => Cow::Owned(sha256_hex(body)),
     };
-    let (record, seed_canonical_request) = verify_request_record(
-        VerifyRequestRecordInput {
+    if crate::is_reserved_session_access_key_id(&parsed.credential.access_key_id)
+        && body_hash.starts_with("STREAMING-")
+    {
+        // The aws-chunked adapter has additional token/seed/chunk precedence
+        // that will be wired and tested as its own Phase 2 slice.
+        return Err(unknown_access_key(&parsed.credential.access_key_id));
+    }
+    let credential = resolve_header_credential(&parsed, headers, provider, now_epoch_secs)?;
+    let seed_canonical_request = verify_request_credential(
+        VerifyRequestCredentialInput {
             method,
             uri: path,
             query_string,
@@ -371,15 +382,16 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
             body_hash: body_hash.as_ref(),
             auth: &parsed,
             timestamp: selected_timestamp,
-            now_epoch_secs,
         },
-        provider,
+        &credential,
     )?;
 
-    validate_static_credential_has_no_token(headers.first_value("x-amz-security-token"))?;
+    if credential.long_lived().is_some() {
+        validate_static_credential_has_no_token(headers.first_value("x-amz-security-token"))?;
+    }
 
     let crate::sigv4::SigV4Auth {
-        credential,
+        credential: credential_scope,
         signed_headers: _,
         signature,
     } = parsed;
@@ -392,13 +404,13 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
             .to_owned();
         let scope = format!(
             "{}/{}/{}/aws4_request",
-            credential.date, credential.region, credential.service
+            credential_scope.date, credential_scope.region, credential_scope.service
         );
         let signing_key = derive_signing_key(
-            record.secret_key(),
-            &credential.date,
-            &credential.region,
-            &credential.service,
+            credential.secret_key(),
+            &credential_scope.date,
+            &credential_scope.region,
+            &credential_scope.service,
         );
         let mut key_bytes = [0u8; 32];
         key_bytes.copy_from_slice(signing_key.as_ref());
@@ -407,7 +419,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
             seed_signature: signature,
             scope,
             timestamp,
-            access_key_id: credential.access_key_id.clone(),
+            access_key_id: credential.access_key_id().to_string(),
             seed_canonical_request,
         })
     } else {
@@ -416,13 +428,130 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
 
     Ok(AuthContext {
         mode: AuthMode::HeaderSigV4,
-        access_key_id: Some(credential.access_key_id),
-        identity: Some(record.identity().clone()),
-        authorization_profile: record.authorization_profile(),
+        access_key_id: Some(credential_scope.access_key_id),
+        identity: Some(credential.identity().clone()),
+        authorization_profile: credential.long_lived().map_or(
+            crate::AuthorizationProfile::Standard,
+            crate::StoredCredential::authorization_profile,
+        ),
         request_epoch_secs,
-        signing_region: Some(credential.region),
+        signing_region: Some(credential_scope.region),
         streaming,
     })
+}
+
+fn resolve_header_credential<H: HeaderSource + ?Sized>(
+    auth: &crate::SigV4Auth,
+    headers: &H,
+    provider: &crate::IdentityProvider,
+    now_epoch_secs: u64,
+) -> Result<crate::AuthenticatedCredential, AuthError> {
+    if !crate::is_reserved_session_access_key_id(&auth.credential.access_key_id) {
+        let record = provider
+            .lookup_long_lived_credential(&auth.credential.access_key_id)
+            .map_err(AuthError::IdentityProviderFailure)?
+            .ok_or_else(|| unknown_access_key(&auth.credential.access_key_id))?;
+        if !record.is_enabled() {
+            return Err(unknown_access_key(&auth.credential.access_key_id));
+        }
+        validate_static_record_expiry(&record, now_epoch_secs)?;
+        return Ok(crate::AuthenticatedCredential::LongLived(record));
+    }
+
+    let unsigned_headers = unsigned_required_headers(&auth.signed_headers, headers);
+    if !unsigned_headers.is_empty() {
+        return Err(AuthError::UnsignedHeaders {
+            headers: unsigned_headers,
+        });
+    }
+    let token_selection = select_header_session_token(headers, &auth.credential.access_key_id)?;
+    provider
+        .authenticate_session_credential(
+            &auth.credential.access_key_id,
+            token_selection.selected,
+            now_epoch_secs,
+        )
+        .map_err(|error| {
+            map_header_session_authentication_error(
+                &auth.credential.access_key_id,
+                &token_selection,
+                error,
+            )
+        })
+}
+
+fn map_header_session_authentication_error(
+    access_key_id: &str,
+    token_selection: &HeaderSessionTokenSelection<'_>,
+    error: crate::SessionCredentialAuthenticationError,
+) -> AuthError {
+    match error {
+        crate::SessionCredentialAuthenticationError::InvalidCredential => {
+            unknown_access_key(access_key_id)
+        }
+        crate::SessionCredentialAuthenticationError::InvalidToken => {
+            token_selection.selected.map_or_else(
+                || unknown_access_key(access_key_id),
+                |token| AuthError::UnexpectedSecurityToken {
+                    token: token.to_string(),
+                },
+            )
+        }
+        crate::SessionCredentialAuthenticationError::ExpiredToken => {
+            debug_assert!(token_selection.selected.is_some());
+            AuthError::ExpiredSessionToken {
+                tokens: token_selection
+                    .presented
+                    .iter()
+                    .map(|token| (*token).to_string())
+                    .collect(),
+            }
+        }
+        crate::SessionCredentialAuthenticationError::KeyRingUnavailable => {
+            AuthError::SessionTokenKeyRingUnavailable
+        }
+        crate::SessionCredentialAuthenticationError::IdentityProvider(error) => {
+            AuthError::IdentityProviderFailure(error)
+        }
+    }
+}
+
+struct HeaderSessionTokenSelection<'a> {
+    selected: Option<&'a str>,
+    presented: Vec<&'a str>,
+}
+
+fn select_header_session_token<'a, H: HeaderSource + ?Sized>(
+    headers: &'a H,
+    access_key_id: &str,
+) -> Result<HeaderSessionTokenSelection<'a>, AuthError> {
+    let mut selected = None;
+    let mut presented = Vec::new();
+    let mut conflicting = false;
+    headers.visit(|name, value| {
+        if name != "x-amz-security-token" {
+            return;
+        }
+        presented.push(value);
+        match selected {
+            None => selected = Some(value),
+            Some(previous) if previous == value => {}
+            Some(_) => conflicting = true,
+        }
+    });
+    if conflicting {
+        return Err(unknown_access_key(access_key_id));
+    }
+    Ok(HeaderSessionTokenSelection {
+        selected: selected.filter(|token| !token.is_empty()),
+        presented,
+    })
+}
+
+fn unknown_access_key(access_key_id: &str) -> AuthError {
+    AuthError::UnknownAccessKey {
+        access_key_id: access_key_id.to_string(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -552,9 +681,9 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     let record = provider
         .lookup_long_lived_credential(credential.access_key_id)
         .map_err(AuthError::IdentityProviderFailure)?
-        .ok_or(AuthError::UnknownAccessKey)?;
+        .ok_or_else(|| unknown_access_key(credential.access_key_id))?;
     if !record.is_enabled() {
-        return Err(AuthError::UnknownAccessKey);
+        return Err(unknown_access_key(credential.access_key_id));
     }
     validate_static_record_expiry(&record, now_epoch_secs)?;
     let token = query_param_lossy(query_string, "X-Amz-Security-Token");
@@ -719,7 +848,7 @@ mod tests {
     use super::*;
     use crate::credential::{CredentialStore, SecretKey, StoredCredential};
     use s3_types::AccountIdentity;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
 
     struct FailingIdentityProvider(crate::IdentityProviderError);
 
@@ -744,6 +873,214 @@ mod tests {
         ) -> Result<Option<AccountIdentity>, crate::IdentityProviderError> {
             Err(self.0)
         }
+    }
+
+    enum SessionRoleState {
+        Present(Arc<crate::LiveRoleIdentity>),
+        Missing,
+        Failure(crate::IdentityProviderError),
+    }
+
+    struct SessionRoleProvider {
+        role: Arc<RwLock<SessionRoleState>>,
+    }
+
+    impl crate::IdentityProviderBackend for SessionRoleProvider {
+        fn lookup_long_lived_credential(
+            &self,
+            _access_key_id: &str,
+        ) -> Result<Option<Arc<StoredCredential>>, crate::IdentityProviderError> {
+            Ok(None)
+        }
+
+        fn lookup_live_role_identity(
+            &self,
+            stable_role_id: &crate::StableRoleId,
+        ) -> Result<Option<Arc<crate::LiveRoleIdentity>>, crate::IdentityProviderError> {
+            let state = self
+                .role
+                .read()
+                .map_err(|_| crate::IdentityProviderError::Unavailable)?;
+            match &*state {
+                SessionRoleState::Present(role) if role.role().stable_id() == stable_role_id => {
+                    Ok(Some(Arc::clone(role)))
+                }
+                SessionRoleState::Present(_) | SessionRoleState::Missing => Ok(None),
+                SessionRoleState::Failure(error) => Err(*error),
+            }
+        }
+
+        fn find_account_by_canonical_user_id(
+            &self,
+            _canonical_user_id: &s3_types::CanonicalUserId,
+        ) -> Result<Option<AccountIdentity>, crate::IdentityProviderError> {
+            Ok(None)
+        }
+    }
+
+    struct HeaderSessionFixture {
+        provider: crate::IdentityProvider,
+        role_state: Arc<RwLock<SessionRoleState>>,
+        access_key_id: String,
+        secret_key: SecretKey,
+        token: String,
+        now_epoch_secs: u64,
+    }
+
+    fn header_session_fixture(expires_at_offset_secs: i64) -> HeaderSessionFixture {
+        let now_epoch_secs = parse_amz_date("20260720T120000Z").unwrap();
+        let stable_role_id = crate::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
+        let role = crate::IamRoleIdentity::new(
+            crate::AwsAccountId::new("123456789012").unwrap(),
+            stable_role_id.clone(),
+            crate::RoleName::new("test-role").unwrap(),
+            crate::IamPath::new("/test/").unwrap(),
+        );
+        let live_role = crate::LiveRoleIdentity::new(
+            AccountIdentity::new(
+                "123456789012",
+                s3_types::CanonicalUserId::from_principal("123456789012"),
+                "test account",
+            ),
+            role,
+        )
+        .unwrap();
+        let role_state = Arc::new(RwLock::new(SessionRoleState::Present(Arc::new(live_role))));
+        let provider = crate::IdentityProvider::new(SessionRoleProvider {
+            role: Arc::clone(&role_state),
+        })
+        .unwrap();
+        let issuer = provider
+            .lookup_live_role_identity(&stable_role_id)
+            .unwrap()
+            .unwrap();
+        let access_key_id = "ARGS0123456789ABCDEFGHIJ".to_string();
+        let secret_key = SecretKey::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".to_string());
+        let expires_at_epoch_secs = i64::try_from(now_epoch_secs).unwrap() + expires_at_offset_secs;
+        let token = provider
+            .seal_session_credential_v1(
+                crate::GeneratedSessionCredentialMaterial::from_parts_for_test(
+                    access_key_id.clone(),
+                    secret_key.clone(),
+                ),
+                &issuer,
+                crate::RoleSessionName::new("test-session").unwrap(),
+                crate::SessionLifetime::new(
+                    i64::try_from(now_epoch_secs).unwrap() - 60,
+                    expires_at_epoch_secs,
+                )
+                .unwrap(),
+                Some(crate::SourceIdentity::new("source-user").unwrap()),
+            )
+            .unwrap();
+        HeaderSessionFixture {
+            provider,
+            role_state,
+            access_key_id,
+            secret_key,
+            token,
+            now_epoch_secs,
+        }
+    }
+
+    fn issue_header_session_token(
+        fixture: &HeaderSessionFixture,
+        access_key_id: &str,
+        secret_key: SecretKey,
+    ) -> String {
+        let stable_role_id = crate::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
+        let issuer = fixture
+            .provider
+            .lookup_live_role_identity(&stable_role_id)
+            .unwrap()
+            .unwrap();
+        fixture
+            .provider
+            .seal_session_credential_v1(
+                crate::GeneratedSessionCredentialMaterial::from_parts_for_test(
+                    access_key_id.to_string(),
+                    secret_key,
+                ),
+                &issuer,
+                crate::RoleSessionName::new("other-session").unwrap(),
+                crate::SessionLifetime::new(
+                    i64::try_from(fixture.now_epoch_secs).unwrap() - 60,
+                    i64::try_from(fixture.now_epoch_secs).unwrap() + 3_600,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+    }
+
+    fn signed_header_session_request(
+        access_key_id: &str,
+        signing_secret: &SecretKey,
+        tokens: &[&str],
+        cover_token: bool,
+        region: &str,
+        service: &str,
+        valid_signature: bool,
+    ) -> Vec<(String, String)> {
+        let mut headers = vec![
+            (
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            ),
+            ("x-amz-date".to_string(), "20260720T120000Z".to_string()),
+        ];
+        headers.extend(
+            tokens
+                .iter()
+                .map(|token| ("x-amz-security-token".to_string(), (*token).to_string())),
+        );
+        let signed_headers = if cover_token {
+            "host;x-amz-date;x-amz-security-token"
+        } else {
+            "host;x-amz-date"
+        };
+        let canonical_pairs: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| {
+                name == "host"
+                    || name == "x-amz-date"
+                    || (cover_token && name == "x-amz-security-token")
+            })
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let canonical_request = canonical_request(
+            "GET",
+            "/",
+            "",
+            &canonical_headers(&canonical_pairs),
+            signed_headers,
+            &sha256_hex(b""),
+        );
+        let scope = format!("20260720/{region}/{service}/aws4_request");
+        let string_to_sign = string_to_sign(
+            "20260720T120000Z",
+            &scope,
+            &sha256_hex(canonical_request.as_bytes()),
+        );
+        let signature = if valid_signature {
+            let signing_key = derive_signing_key(signing_secret, "20260720", region, service);
+            hex_encode_lower(
+                hmac::sign(
+                    &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
+                    string_to_sign.as_bytes(),
+                )
+                .as_ref(),
+            )
+        } else {
+            "0".repeat(64)
+        };
+        headers.push((
+            "authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key_id}/20260720/{region}/{service}/aws4_request, SignedHeaders={signed_headers}, Signature={signature}"
+            ),
+        ));
+        headers
     }
 
     fn account(principal: &str) -> AccountIdentity {
@@ -847,6 +1184,287 @@ mod tests {
         assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
         assert_eq!(ctx.configured_principal(), Some("AKIAIOSFODNN7EXAMPLE"));
         assert_eq!(ctx.request_epoch_secs, Some(1_369_353_600));
+    }
+
+    fn authenticate_header_session(
+        fixture: &HeaderSessionFixture,
+        headers: &[(String, String)],
+    ) -> Result<AuthContext, AuthError> {
+        authenticate_request(
+            "GET",
+            "/",
+            "",
+            headers,
+            b"",
+            &fixture.provider,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            fixture.now_epoch_secs,
+        )
+    }
+
+    #[test]
+    fn authenticate_header_session_credential_returns_typed_role_identity() {
+        let fixture = header_session_fixture(3_600);
+        let headers = signed_header_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token],
+            true,
+            "us-east-1",
+            "s3",
+            true,
+        );
+        let context = authenticate_header_session(&fixture, &headers).unwrap();
+
+        assert_eq!(context.mode, AuthMode::HeaderSigV4);
+        assert_eq!(
+            context.access_key_id.as_deref(),
+            Some(fixture.access_key_id.as_str())
+        );
+        assert_eq!(
+            context
+                .identity
+                .as_ref()
+                .unwrap()
+                .role_session()
+                .unwrap()
+                .session_name()
+                .as_str(),
+            "test-session"
+        );
+        assert!(context.configured_principal().is_none());
+        assert_eq!(
+            context.authorization_profile,
+            crate::AuthorizationProfile::Standard
+        );
+    }
+
+    #[test]
+    fn header_session_token_structure_and_binding_precede_signature_verification() {
+        let fixture = header_session_fixture(3_600);
+        let other_token = issue_header_session_token(
+            &fixture,
+            "ARGS1123456789ABCDEFGHIJ",
+            SecretKey::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn".to_string()),
+        );
+
+        for tokens in [Vec::new(), vec![""], vec![other_token.as_str()]] {
+            let headers = signed_header_session_request(
+                &fixture.access_key_id,
+                &fixture.secret_key,
+                &tokens,
+                !tokens.is_empty(),
+                "us-east-1",
+                "s3",
+                false,
+            );
+            assert!(matches!(
+                authenticate_header_session(&fixture, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        let malformed = "ARGST1.not-a-canonical-token";
+        let headers = signed_header_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[malformed],
+            true,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_header_session(&fixture, &headers),
+            Err(AuthError::UnexpectedSecurityToken { token }) if token == malformed
+        ));
+
+        let headers = signed_header_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token, &fixture.token],
+            true,
+            "us-east-1",
+            "s3",
+            true,
+        );
+        authenticate_header_session(&fixture, &headers).unwrap();
+
+        for valid_signature in [true, false] {
+            let headers = signed_header_session_request(
+                &fixture.access_key_id,
+                &fixture.secret_key,
+                &[&fixture.token, &other_token],
+                true,
+                "us-east-1",
+                "s3",
+                valid_signature,
+            );
+            assert!(matches!(
+                authenticate_header_session(&fixture, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        let headers = signed_header_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token],
+            true,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_header_session(&fixture, &headers),
+            Err(AuthError::SignatureMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn header_session_scope_and_coverage_precede_token_validation() {
+        let fixture = header_session_fixture(3_600);
+        let malformed = "ARGST1.not-a-canonical-token";
+
+        let wrong_region = signed_header_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[malformed],
+            true,
+            "us-west-2",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_header_session(&fixture, &wrong_region),
+            Err(AuthError::InvalidHeaderCredentialRegion {
+                provided_region,
+                expected_region,
+            }) if provided_region == "us-west-2" && expected_region == "us-east-1"
+        ));
+
+        let wrong_service = signed_header_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[malformed],
+            true,
+            "us-east-1",
+            "sts",
+            false,
+        );
+        assert!(matches!(
+            authenticate_header_session(&fixture, &wrong_service),
+            Err(AuthError::InvalidHeaderCredentialService {
+                provided_service,
+                expected_service,
+            }) if provided_service == "sts" && expected_service == "s3"
+        ));
+
+        let unsigned = signed_header_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[malformed],
+            false,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_header_session(&fixture, &unsigned),
+            Err(AuthError::UnsignedHeaders { headers })
+                if headers == ["x-amz-security-token"]
+        ));
+    }
+
+    #[test]
+    fn header_session_expiry_and_issuer_liveness_precede_signature_verification() {
+        let expired = header_session_fixture(0);
+        for valid_signature in [true, false] {
+            let headers = signed_header_session_request(
+                &expired.access_key_id,
+                &expired.secret_key,
+                &[&expired.token],
+                true,
+                "us-east-1",
+                "s3",
+                valid_signature,
+            );
+            assert!(matches!(
+                authenticate_header_session(&expired, &headers),
+                Err(AuthError::ExpiredSessionToken { tokens })
+                    if tokens.len() == 1 && tokens[0] == expired.token
+            ));
+        }
+
+        for valid_signature in [true, false] {
+            let headers = signed_header_session_request(
+                &expired.access_key_id,
+                &expired.secret_key,
+                &[&expired.token, &expired.token],
+                true,
+                "us-east-1",
+                "s3",
+                valid_signature,
+            );
+            assert!(matches!(
+                authenticate_header_session(&expired, &headers),
+                Err(AuthError::ExpiredSessionToken { tokens })
+                    if tokens.len() == 2
+                        && tokens.iter().all(|token| token == &expired.token)
+            ));
+        }
+
+        let missing = header_session_fixture(3_600);
+        *missing.role_state.write().unwrap() = SessionRoleState::Missing;
+        let headers = signed_header_session_request(
+            &missing.access_key_id,
+            &missing.secret_key,
+            &[&missing.token],
+            true,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_header_session(&missing, &headers),
+            Err(AuthError::UnknownAccessKey { .. })
+        ));
+
+        let unavailable = header_session_fixture(3_600);
+        *unavailable.role_state.write().unwrap() =
+            SessionRoleState::Failure(crate::IdentityProviderError::Unavailable);
+        let headers = signed_header_session_request(
+            &unavailable.access_key_id,
+            &unavailable.secret_key,
+            &[&unavailable.token],
+            true,
+            "us-east-1",
+            "s3",
+            false,
+        );
+        assert!(matches!(
+            authenticate_header_session(&unavailable, &headers),
+            Err(AuthError::IdentityProviderFailure(
+                crate::IdentityProviderError::Unavailable
+            ))
+        ));
+    }
+
+    #[test]
+    fn header_session_key_ring_failure_maps_to_distinct_internal_auth_error() {
+        let token_selection = HeaderSessionTokenSelection {
+            selected: Some("ARGST1.redacted"),
+            presented: vec!["ARGST1.redacted"],
+        };
+        assert!(matches!(
+            map_header_session_authentication_error(
+                "ARGS0123456789ABCDEFGHIJ",
+                &token_selection,
+                crate::SessionCredentialAuthenticationError::KeyRingUnavailable,
+            ),
+            AuthError::SessionTokenKeyRingUnavailable
+        ));
     }
 
     #[test]
@@ -1873,7 +2491,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::UnknownAccessKey));
+        assert!(matches!(err, AuthError::UnknownAccessKey { .. }));
     }
 
     // ── Presigned: unknown key ────────────────────────────────────────
@@ -1895,7 +2513,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::UnknownAccessKey));
+        assert!(matches!(err, AuthError::UnknownAccessKey { .. }));
     }
 
     // ── static credential token and expiry helpers ────────────────────
@@ -2579,7 +3197,13 @@ mod tests {
             aws_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::MalformedAuth));
+        assert!(matches!(
+            err,
+            AuthError::InvalidHeaderCredentialService {
+                provided_service,
+                expected_service,
+            } if provided_service == "iam" && expected_service == "s3"
+        ));
     }
 
     #[test]

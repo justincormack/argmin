@@ -178,7 +178,8 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::InternalError { .. }
         | ServerError::IntegrityError { .. }
         | ServerError::IdentityProvider(_)
-        | ServerError::Auth(auth::AuthError::IdentityProviderFailure(_)) => {
+        | ServerError::Auth(auth::AuthError::IdentityProviderFailure(_))
+        | ServerError::Auth(auth::AuthError::SessionTokenKeyRingUnavailable) => {
             INTERNAL_ERROR_MESSAGE.to_string()
         }
         ServerError::Auth(auth::AuthError::MissingAuth)
@@ -243,6 +244,12 @@ fn client_error_message(err: &ServerError) -> String {
         }) => format!(
             "The authorization header is malformed; the region '{provided_region}' is wrong; expecting '{expected_region}'"
         ),
+        ServerError::Auth(auth::AuthError::InvalidHeaderCredentialService {
+            provided_service,
+            expected_service,
+        }) => format!(
+            "The authorization header is malformed; incorrect service \"{provided_service}\". This endpoint belongs to \"{expected_service}\"."
+        ),
         ServerError::Auth(auth::AuthError::InvalidCredentialScope { param }) => {
             format!("invalid credential scope: {param}")
         }
@@ -258,8 +265,8 @@ fn client_error_message(err: &ServerError) -> String {
         }) => format!(
             "incorrect service \"{provided_service}\". This endpoint belongs to \"{expected_service}\"."
         ),
-        ServerError::Auth(auth::AuthError::UnknownAccessKey) => {
-            "unknown access key id".to_string()
+        ServerError::Auth(auth::AuthError::UnknownAccessKey { .. }) => {
+            "The AWS Access Key Id you provided does not exist in our records.".to_string()
         }
         ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
             "A header you provided implies functionality that is not implemented".to_string()
@@ -276,6 +283,9 @@ fn client_error_message(err: &ServerError) -> String {
             "The provided token is malformed or otherwise invalid.".to_string()
         }
         ServerError::Auth(auth::AuthError::ExpiredToken) => "token expired".to_string(),
+        ServerError::Auth(auth::AuthError::ExpiredSessionToken { .. }) => {
+            "The provided token has expired.".to_string()
+        }
         ServerError::Auth(auth::AuthError::MissingSignedHeader { header }) => {
             format!("missing required signed header: {header}")
         }
@@ -733,6 +743,10 @@ impl S3Response {
                 );
                 Self::new(403).chunked_xml_body(body)
             }
+            ServerError::Auth(auth::AuthError::UnknownAccessKey { access_key_id }) => {
+                let body = xml::invalid_access_key_error_xml(access_key_id, request_id, host_id);
+                Self::new(403).chunked_xml_body(body)
+            }
             ServerError::Auth(
                 auth::AuthError::MissingQueryParam { .. }
                 | auth::AuthError::InvalidQueryParam { .. },
@@ -766,6 +780,15 @@ impl S3Response {
                     request_id,
                     host_id,
                     expected_region,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::InvalidHeaderCredentialService { .. }) => {
+                let body = xml::error_xml_with_host_id(
+                    "AuthorizationHeaderMalformed",
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -817,6 +840,10 @@ impl S3Response {
                     request_id,
                     host_id,
                 );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::ExpiredSessionToken { tokens }) => {
+                let body = xml::expired_token_error_xml(tokens, request_id, host_id);
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
@@ -3894,6 +3921,49 @@ mod tests {
     }
 
     #[test]
+    fn header_credential_service_error_response_has_exact_body_without_region() {
+        let err = ServerError::Auth(auth::AuthError::InvalidHeaderCredentialService {
+            provided_service: "sts".to_string(),
+            expected_service: "s3".to_string(),
+        });
+        let resp = S3Response::error(&err, "/", TEST_HOST_ID);
+        assert_eq!(resp.status_code, 400);
+        assert_eq!(find_header(&resp, "x-amz-bucket-region"), None);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error>\
+             <Code>AuthorizationHeaderMalformed</Code>\
+             <Message>The authorization header is malformed; incorrect service \"sts\". This endpoint belongs to \"s3\".</Message>\
+             <RequestId>request-id</RequestId>\
+             <HostId>host-id</HostId>\
+             </Error>"
+        );
+    }
+
+    #[test]
+    fn invalid_access_key_error_response_echoes_key_with_exact_aws_shape() {
+        let err = ServerError::Auth(auth::AuthError::UnknownAccessKey {
+            access_key_id: "ARGS0123456789ABCDEFGHIJ".to_string(),
+        });
+        let resp = S3Response::error(&err, "/", TEST_HOST_ID);
+        assert_eq!(resp.status_code, 403);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error>\
+             <Code>InvalidAccessKeyId</Code>\
+             <Message>The AWS Access Key Id you provided does not exist in our records.</Message>\
+             <AWSAccessKeyId>ARGS0123456789ABCDEFGHIJ</AWSAccessKeyId>\
+             <RequestId>request-id</RequestId>\
+             <HostId>host-id</HostId>\
+             </Error>"
+        );
+    }
+
+    #[test]
     fn invalid_bucket_namespace_error_response_includes_bucket_namespace() {
         let err = ServerError::InvalidBucketNamespace {
             reason: "namespace mismatch".to_string(),
@@ -3939,6 +4009,28 @@ mod tests {
         assert!(body
             .contains("<Message>The provided token is malformed or otherwise invalid.</Message>"));
         assert!(body.contains("<Token-0>bad-token-causes-400</Token-0>"));
+    }
+
+    #[test]
+    fn duplicate_expired_session_token_response_matches_exact_aws_shape() {
+        let err = ServerError::Auth(auth::AuthError::ExpiredSessionToken {
+            tokens: vec!["expired-token".to_string(), "expired-token".to_string()],
+        });
+        let resp = S3Response::error(&err, "/", TEST_HOST_ID);
+        assert_eq!(resp.status_code, 400);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error>\
+             <Code>ExpiredToken</Code>\
+             <Message>The provided token has expired.</Message>\
+             <Token-0>expired-token</Token-0>\
+             <Token-1>expired-token</Token-1>\
+             <RequestId>request-id</RequestId>\
+             <HostId>host-id</HostId>\
+             </Error>"
+        );
     }
 
     #[test]
