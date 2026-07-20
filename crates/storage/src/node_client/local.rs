@@ -247,25 +247,29 @@ impl ShardReadHandleLease for LocalStorageNodeReadHandleLease {
 impl ShardAckNodeClient for LocalStorageNodeClient {
     fn register_written_shard_acks(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.register_written_shards_batch_exact(shard_batch)
     }
 
     fn validate_written_shard_ack(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
         ack: WriteAck,
     ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.validate_written_shard_ack(key, ack)
     }
 
-    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+    fn load_written_shard_ack(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         let stat = pg.stat_shard(key)?;
         Ok(WriteAck {
             crc64: stat.crc64,
@@ -275,14 +279,18 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
 
     fn load_written_shard_ack_for_historical_inspection(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
-        self.load_written_shard_ack(pg_id, key)
+        self.load_written_shard_ack(data_pg_id, key)
     }
 
-    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+    fn delete_written_shard_ack(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.delete_shard_record(key)
     }
 

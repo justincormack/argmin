@@ -9234,9 +9234,9 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
-        let pg_id = PgId::new(data_pg_id);
-        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
-        shard_ack_client.register_written_shard_acks(pg_id, shard_batch)?;
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
+        shard_ack_client.register_written_shard_acks(data_pg_id, shard_batch)?;
         Ok(())
     }
 
@@ -9290,13 +9290,12 @@ impl StorageCluster {
             }
         }
 
-        let pg_id = PgId::new(data_pg_id);
-        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
+        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(data_pg.pg_id())?;
         for (key, ack) in shard_batch {
-            shard_ack_client.validate_written_shard_ack(pg_id, key, *ack)?;
+            shard_ack_client.validate_written_shard_ack(data_pg, key, *ack)?;
         }
 
-        let data_pg = DataPgId::new(PgId::new(data_pg_id));
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         let locations = self
             .place_payload_shards(data_pg, ec, &placement_key)
@@ -11562,9 +11561,9 @@ impl StorageCluster {
         // Placed payload bytes are routed by LocalClusterMap; per-shard
         // CRC/size acks are metadata rows in the same PG and are read through
         // that PG's primary.
-        let pg_id = PgId::new(data_pg_id);
-        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
-        shard_ack_client.load_written_shard_ack(pg_id, shard_key)
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
+        shard_ack_client.load_written_shard_ack(data_pg_id, shard_key)
     }
 
     fn load_payload_shard_ack_for_pg_route_snapshot(
@@ -11573,13 +11572,13 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
-        let pg_id = PgId::new(data_pg_id);
-        if route.pg_id() != pg_id {
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        if route.pg_id() != data_pg_id.pg_id() {
             return Err(StoreError::PayloadShardSetMismatch {
                 reason: format!(
                     "historical shard ack route PG {} does not match data PG {}",
                     route.pg_id().get(),
-                    pg_id.get()
+                    data_pg_id.get()
                 ),
             });
         }
@@ -11587,7 +11586,7 @@ impl StorageCluster {
         if !route.acting_set().contains(&primary) {
             return Err(StoreError::NodeNotInActingSet {
                 node_id: primary.as_u32(),
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 cluster_epoch: route.cluster_epoch(),
             });
         }
@@ -11596,11 +11595,11 @@ impl StorageCluster {
             .node(primary)
             .ok_or(StoreError::NodeNotFound {
                 node_id: primary.as_u32(),
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 cluster_epoch: route.cluster_epoch(),
             })?;
         node.shard_ack_client()
-            .load_written_shard_ack_for_historical_inspection(pg_id, shard_key)
+            .load_written_shard_ack_for_historical_inspection(data_pg_id, shard_key)
     }
 
     fn segment_payload_locations(
@@ -11825,12 +11824,12 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_keys: &[ShardKey],
     ) -> Result<(), ObjectPgActionError> {
-        let pg_id = PgId::new(data_pg_id);
-        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let shard_ack_client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
         for shard_key in shard_keys {
             self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
                 .map_err(ObjectPgActionError::Store)?;
-            shard_ack_client.delete_written_shard_ack(pg_id, shard_key)?;
+            shard_ack_client.delete_written_shard_ack(data_pg_id, shard_key)?;
         }
         Ok(())
     }
@@ -11841,10 +11840,11 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_keys: &[ShardKey],
     ) {
-        let pg_id = PgId::new(data_pg_id);
-        let shard_ack_client = match self
-            .metadata_pg_primary_shard_ack_client_at_retained_epoch(operation_epoch, pg_id)
-        {
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let shard_ack_client = match self.metadata_pg_primary_shard_ack_client_at_retained_epoch(
+            operation_epoch,
+            data_pg_id.pg_id(),
+        ) {
             Ok(shard_ack_client) => shard_ack_client,
             Err(error) => {
                 self.emit_best_effort_payload_cleanup_error(
@@ -11863,7 +11863,7 @@ impl StorageCluster {
             }
             if let Err(error) = shard_ack_client.delete_written_shard_ack_at_retained_epoch(
                 operation_epoch,
-                pg_id,
+                data_pg_id,
                 shard_key,
             ) {
                 self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);

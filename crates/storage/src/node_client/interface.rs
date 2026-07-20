@@ -1014,34 +1014,42 @@ pub(crate) trait ObjectPayloadLeaseNodeClient: Send + Sync {
 pub(crate) trait ShardAckNodeClient: Send + Sync {
     fn register_written_shard_acks(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), StoreError>;
 
     fn validate_written_shard_ack(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
         ack: WriteAck,
     ) -> Result<(), StoreError>;
 
-    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError>;
-
-    fn load_written_shard_ack_for_historical_inspection(
+    fn load_written_shard_ack(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError>;
 
-    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError>;
+    fn load_written_shard_ack_for_historical_inspection(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError>;
+
+    fn delete_written_shard_ack(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError>;
 
     fn delete_written_shard_ack_at_retained_epoch(
         &self,
         _cluster_epoch: ClusterEpoch,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<(), StoreError> {
-        self.delete_written_shard_ack(pg_id, key)
+        self.delete_written_shard_ack(data_pg_id, key)
     }
 
     fn record_placed_segment_shard_repair(

@@ -920,6 +920,35 @@ Thirteenth Phase 3 slice:
   the boundary checker, formatting, workspace-wide strict Clippy, and the full
   workspace suite (7,222 tests).
 
+Fourteenth Phase 3 slice:
+
+- written-shard acknowledgement registration, validation, loading,
+  historical inspection, current deletion, and retained-epoch deletion now
+  require `DataPgId` throughout `ShardAckNodeClient`. Cluster callers derive
+  the data role before selecting the metadata-primary acknowledgement client;
+  local adapters erase it only at the private PG-store boundary.
+- the Unix client deliberately erases `DataPgId` to raw `PgId` in the wire
+  request. Decoding does not confer a role: the Unix server validates the raw
+  PG against the applicable active or retained route and primary constraints,
+  then constructs its server-local `DataPgId` before accessing acknowledgement
+  rows.
+- an adversarial Unix regression submits a decoded unknown data PG to all five
+  acknowledgement RPC operation classes and requires `UnknownPg`. It checks
+  the record target remains absent immediately after rejected registration
+  and verifies a seeded acknowledgement canary retains its exact value after
+  both rejected registration and rejected deletion, so opposite mutation bugs
+  cannot cancel out. Existing positive, non-primary, historical-inspection,
+  and stale-route tests remain canaries.
+- repair/backfill and scavenger data-client signatures, non-forgeable
+  `DataPgId` construction, and request-scoped route capability values remain
+  open in Phase 3. This slice removes raw bucket/object/data role confusion
+  from the basic acknowledgement API but does not yet claim trusted data-role
+  construction.
+- the fourteenth slice passed its focused active, retained, non-primary,
+  stale-route, and unknown-data-PG regressions, the boundary checker,
+  formatting, workspace-wide strict Clippy, and the full workspace suite
+  (7,223 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

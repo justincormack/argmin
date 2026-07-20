@@ -296,7 +296,9 @@ use crate::storage_rpc::{
     STORAGE_RPC_FRAME_ENCODING_VERSION, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_PAYLOAD_LEN, STORAGE_RPC_SERVER_IDLE_TIMEOUT,
 };
-use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
+use crate::types::{
+    BucketState, ClusterEpoch, DataPgId, GenerationId, PgId, PgState, SessionId, WriteAck,
+};
 use crate::types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
@@ -8464,6 +8466,7 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_primary_pg(request.pg_id, "shard ack record") {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = DataPgId::new(request.pg_id);
         let shard_batch: Vec<(&crate::types::ShardKey, WriteAck)> = request
             .items
             .iter()
@@ -8471,7 +8474,7 @@ impl StorageNodeConnectionHandler {
             .collect();
         let response = match self
             .node
-            .get_pg(request.pg_id.get())
+            .get_pg(data_pg_id.get())
             .and_then(|pg| pg.register_written_shards_batch_exact(&shard_batch))
         {
             Ok(()) => encode_storage_rpc_success_response(&[]),
@@ -8492,7 +8495,8 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_primary_pg(request.pg_id, "shard ack validate") {
             return encode_storage_rpc_error_response(&error);
         }
-        let response = match self.validate_shard_ack_batch(request.pg_id, &request.items) {
+        let data_pg_id = DataPgId::new(request.pg_id);
+        let response = match self.validate_shard_ack_batch(data_pg_id.pg_id(), &request.items) {
             Ok(()) => encode_storage_rpc_success_response(&[]),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
         };
@@ -8511,7 +8515,8 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_primary_pg(request.pg_id, "shard ack load") {
             return encode_storage_rpc_error_response(&error);
         }
-        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+        let data_pg_id = DataPgId::new(request.pg_id);
+        let response = match self.node.get_pg(data_pg_id.get()).and_then(|pg| {
             let stat = pg.stat_shard(&request.shard_key)?;
             Ok(WriteAck {
                 crc64: stat.crc64,
@@ -8552,7 +8557,8 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+        let data_pg_id = DataPgId::new(request.pg_id);
+        let response = match self.node.get_pg(data_pg_id.get()).and_then(|pg| {
             let stat = pg.stat_shard(&request.shard_key)?;
             Ok(WriteAck {
                 crc64: stat.crc64,
@@ -8589,9 +8595,10 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
+        let data_pg_id = DataPgId::new(request.pg_id);
         let response = match self
             .node
-            .get_pg(request.pg_id.get())
+            .get_pg(data_pg_id.get())
             .and_then(|pg| pg.delete_shard_record(&request.shard_key))
         {
             Ok(()) => encode_storage_rpc_success_response(&[]),
@@ -12742,11 +12749,11 @@ mod tests {
         StorageRpcShardWriteRequest,
     };
     use crate::types::{
-        BucketName, BucketSubresourceAux, BucketSubresourceKind, CreateBucketConfig, DataPgId,
-        GenerationId, PgId, PlacedSegmentShardBackfillClaimRecord,
-        PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimRecord,
-        PlacedSegmentShardRepairWorkItem, PutBucketSubresource, SegmentStoredBytesRequest,
-        ShardIndex, ShardKey, ShardScavengerObservationKey, ShardScavengerObservationReason,
+        BucketName, BucketSubresourceAux, BucketSubresourceKind, CreateBucketConfig, GenerationId,
+        PgId, PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillWorkItem,
+        PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairWorkItem,
+        PutBucketSubresource, SegmentStoredBytesRequest, ShardIndex, ShardKey,
+        ShardScavengerObservationKey, ShardScavengerObservationReason,
         ShardScavengerObservationRecord, VersionId,
     };
 
@@ -17317,6 +17324,166 @@ mod tests {
         let pg = reopened.get_pg(0).unwrap();
         pg.validate_written_shard_ack(&existing_key, ack).unwrap();
         assert!(matches!(pg.stat_shard(&new_key), Err(StoreError::NotFound)));
+    }
+
+    #[test]
+    fn storage_node_server_rejects_unknown_data_pg_for_every_shard_ack_operation() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let record_key = test_shard_key(0);
+        let canary_key = test_shard_key(1);
+        let record_ack = WriteAck {
+            stored_size: 12,
+            crc64: 0x1234,
+        };
+        let canary_ack = WriteAck {
+            stored_size: 34,
+            crc64: 0x5678,
+        };
+        let batch = StorageRpcShardAckBatchRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(9),
+            items: vec![StorageRpcShardAckItem {
+                shard_key: record_key.clone(),
+                ack: record_ack,
+            }],
+        };
+        let unknown_record_item = StorageRpcShardAckItemRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(9),
+            shard_key: record_key.clone(),
+        };
+        let unknown_canary_item = StorageRpcShardAckItemRequest {
+            shard_key: canary_key.clone(),
+            ..unknown_record_item.clone()
+        };
+        let configured_record_item = StorageRpcShardAckItemRequest {
+            pg_id: PgId::new(0),
+            ..unknown_record_item.clone()
+        };
+        let configured_canary_item = StorageRpcShardAckItemRequest {
+            pg_id: PgId::new(0),
+            shard_key: canary_key.clone(),
+            ..unknown_record_item.clone()
+        };
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .register_written_shards_batch_exact(&[(&canary_key, canary_ack)])
+            .unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let record_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::ShardAckRecord,
+            encode_shard_ack_batch_request(&batch).unwrap(),
+        );
+        let record_error = decode_storage_rpc_response_payload(&record_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(record_error.code, StorageRpcErrorCode::UnknownPg);
+
+        let absent_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::ShardAckLoad,
+            encode_shard_ack_item_request(&configured_record_item),
+        );
+        let absent_error = decode_storage_rpc_response_payload(&absent_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(absent_error.code, StorageRpcErrorCode::NotFound);
+
+        let canary_after_record = send_frame(
+            &mut client,
+            3,
+            StorageRpcMessageKind::ShardAckLoad,
+            encode_shard_ack_item_request(&configured_canary_item),
+        );
+        let canary_after_record = decode_storage_rpc_response_payload(&canary_after_record.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_shard_ack_item_response(&canary_after_record).unwrap(),
+            StorageRpcShardAckItem {
+                shard_key: canary_key.clone(),
+                ack: canary_ack,
+            }
+        );
+
+        let read_only_requests = [
+            (
+                StorageRpcMessageKind::ShardAckValidate,
+                encode_shard_ack_batch_request(&batch).unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::ShardAckLoad,
+                encode_shard_ack_item_request(&unknown_record_item),
+            ),
+            (
+                StorageRpcMessageKind::ShardAckHistoricalLoad,
+                encode_shard_ack_item_request(&unknown_record_item),
+            ),
+        ];
+        for (index, (kind, payload)) in read_only_requests.into_iter().enumerate() {
+            let response = send_frame(&mut client, index as u64 + 4, kind, payload);
+            let error = decode_storage_rpc_response_payload(&response.payload)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::UnknownPg);
+        }
+
+        let delete_response = send_frame(
+            &mut client,
+            7,
+            StorageRpcMessageKind::ShardAckDelete,
+            encode_shard_ack_item_request(&unknown_canary_item),
+        );
+        let delete_error = decode_storage_rpc_response_payload(&delete_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(delete_error.code, StorageRpcErrorCode::UnknownPg);
+
+        let canary_after_delete = send_frame(
+            &mut client,
+            8,
+            StorageRpcMessageKind::ShardAckLoad,
+            encode_shard_ack_item_request(&configured_canary_item),
+        );
+        let canary_after_delete = decode_storage_rpc_response_payload(&canary_after_delete.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_shard_ack_item_response(&canary_after_delete).unwrap(),
+            StorageRpcShardAckItem {
+                shard_key: canary_key.clone(),
+                ack: canary_ack,
+            }
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = reopened.get_pg(0).unwrap();
+        assert!(matches!(
+            pg.stat_shard(&record_key),
+            Err(StoreError::NotFound)
+        ));
+        pg.validate_written_shard_ack(&canary_key, canary_ack)
+            .unwrap();
     }
 
     #[test]

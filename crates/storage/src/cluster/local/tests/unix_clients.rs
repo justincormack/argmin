@@ -649,8 +649,8 @@ fn payload_shard_writes_route_through_pluggable_shard_client() {
 }
 
 struct RecordingShardAckClient {
-    records: Mutex<Vec<(PgId, ShardKey, WriteAck)>>,
-    validates: Mutex<Vec<(PgId, ShardKey, WriteAck)>>,
+    records: Mutex<Vec<(DataPgId, ShardKey, WriteAck)>>,
+    validates: Mutex<Vec<(DataPgId, ShardKey, WriteAck)>>,
 }
 
 impl RecordingShardAckClient {
@@ -665,32 +665,32 @@ impl RecordingShardAckClient {
 impl ShardAckNodeClient for RecordingShardAckClient {
     fn register_written_shard_acks(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), StoreError> {
         let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         for (key, ack) in shard_batch {
-            records.push((pg_id, (*key).clone(), *ack));
+            records.push((data_pg_id, (*key).clone(), *ack));
         }
         Ok(())
     }
 
     fn validate_written_shard_ack(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
         ack: WriteAck,
     ) -> Result<(), StoreError> {
         self.validates
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((pg_id, key.clone(), ack));
+            .push((data_pg_id, key.clone(), ack));
         Ok(())
     }
 
     fn load_written_shard_ack(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
         Err(StoreError::NotFound)
@@ -698,13 +698,17 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn load_written_shard_ack_for_historical_inspection(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
-        self.load_written_shard_ack(pg_id, key)
+        self.load_written_shard_ack(data_pg_id, key)
     }
 
-    fn delete_written_shard_ack(&self, _pg_id: PgId, _key: &ShardKey) -> Result<(), StoreError> {
+    fn delete_written_shard_ack(
+        &self,
+        _data_pg_id: DataPgId,
+        _key: &ShardKey,
+    ) -> Result<(), StoreError> {
         Err(StoreError::NotFound)
     }
 
@@ -838,6 +842,7 @@ fn metadata_pg_primary_exposes_pluggable_shard_ack_client() {
     set_route_primary(&mut map, 1, NodeId::new(2));
 
     let pg_id = PgId::new(1);
+    let data_pg_id = DataPgId::new(pg_id);
     let key = ShardKey::new(&[0x51; 16], 88, 0);
     let ack = WriteAck {
         crc64: 1234,
@@ -847,10 +852,10 @@ fn metadata_pg_primary_exposes_pluggable_shard_ack_client() {
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
     node.shard_ack_client()
-        .register_written_shard_acks(pg_id, &[(&key, ack)])
+        .register_written_shard_acks(data_pg_id, &[(&key, ack)])
         .unwrap();
     node.shard_ack_client()
-        .validate_written_shard_ack(pg_id, &key, ack)
+        .validate_written_shard_ack(data_pg_id, &key, ack)
         .unwrap();
 
     assert_eq!(
@@ -858,14 +863,14 @@ fn metadata_pg_primary_exposes_pluggable_shard_ack_client() {
             .records
             .lock()
             .unwrap_or_else(|e| e.into_inner()),
-        vec![(pg_id, key.clone(), ack)]
+        vec![(data_pg_id, key.clone(), ack)]
     );
     assert_eq!(
         *recording_client_for_assert
             .validates
             .lock()
             .unwrap_or_else(|e| e.into_inner()),
-        vec![(pg_id, key, ack)]
+        vec![(data_pg_id, key, ack)]
     );
 }
 
@@ -1067,11 +1072,11 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
         .unwrap();
     primary
         .shard_ack_client()
-        .register_written_shard_acks(PgId::new(0), &[(&key, ack)])
+        .register_written_shard_acks(data_pg_id, &[(&key, ack)])
         .unwrap();
     primary
         .shard_ack_client()
-        .validate_written_shard_ack(PgId::new(0), &key, ack)
+        .validate_written_shard_ack(data_pg_id, &key, ack)
         .unwrap();
     assert_eq!(
         map.read_payload_shard(ClusterEpoch::INITIAL, location, &key, ack)

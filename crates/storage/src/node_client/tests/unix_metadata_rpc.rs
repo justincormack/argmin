@@ -26,10 +26,10 @@ fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
     let read_back = client.read_placed_shard(data_pg_id, &key, ack).unwrap();
     assert_eq!(read_back, b"remote payload");
     client
-        .register_written_shard_acks(PgId::new(0), &[(&key, ack)])
+        .register_written_shard_acks(data_pg_id, &[(&key, ack)])
         .unwrap();
     client
-        .validate_written_shard_acks(PgId::new(0), &[(&key, ack)])
+        .validate_written_shard_acks(data_pg_id, &[(&key, ack)])
         .unwrap();
     client.delete_placed_shard(data_pg_id, &key).unwrap();
     server_thread.join().unwrap();

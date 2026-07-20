@@ -141,30 +141,30 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn register_written_shard_acks(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), StoreError> {
-        let payload = self.encode_shard_ack_batch(pg_id, shard_batch)?;
+        let payload = self.encode_shard_ack_batch(data_pg_id, shard_batch)?;
         self.rpc_request(StorageRpcMessageKind::ShardAckRecord, payload)
             .map(|_| ())
     }
 
     pub(crate) fn validate_written_shard_acks(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), StoreError> {
-        let payload = self.encode_shard_ack_batch(pg_id, shard_batch)?;
+        let payload = self.encode_shard_ack_batch(data_pg_id, shard_batch)?;
         self.rpc_request(StorageRpcMessageKind::ShardAckValidate, payload)
             .map(|_| ())
     }
 
     pub(crate) fn load_written_shard_ack(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
-        let payload = self.encode_shard_ack_item(pg_id, key);
+        let payload = self.encode_shard_ack_item(data_pg_id, key);
         let response = self.rpc_request(StorageRpcMessageKind::ShardAckLoad, payload)?;
         let item = decode_shard_ack_item_response(&response).map_err(|error| {
             self.rpc_payload_error("decode shard ack load response", error.to_string())
@@ -180,10 +180,10 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn load_written_shard_ack_for_historical_inspection(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
-        let payload = self.encode_shard_ack_item(pg_id, key);
+        let payload = self.encode_shard_ack_item(data_pg_id, key);
         let response = self.rpc_request(StorageRpcMessageKind::ShardAckHistoricalLoad, payload)?;
         let item = decode_shard_ack_item_response(&response).map_err(|error| {
             self.rpc_payload_error(
@@ -202,22 +202,22 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn delete_written_shard_ack(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<(), StoreError> {
-        self.delete_written_shard_ack_at_epoch(self.cluster_epoch, pg_id, key)
+        self.delete_written_shard_ack_at_epoch(self.cluster_epoch, data_pg_id, key)
     }
 
     pub(crate) fn delete_written_shard_ack_at_epoch(
         &self,
         cluster_epoch: ClusterEpoch,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<(), StoreError> {
         let payload = encode_shard_ack_item_request(&StorageRpcShardAckItemRequest {
             node_id: self.node_id,
             cluster_epoch,
-            pg_id,
+            pg_id: data_pg_id.pg_id(),
             shard_key: key.clone(),
         });
         let response = self.rpc_request(StorageRpcMessageKind::ShardAckDelete, payload)?;
@@ -816,13 +816,13 @@ impl UnixStorageNodeClient {
 
     fn encode_shard_ack_batch(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<Vec<u8>, StoreError> {
         let request = StorageRpcShardAckBatchRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: data_pg_id.pg_id(),
             items: shard_batch
                 .iter()
                 .map(|(shard_key, ack)| StorageRpcShardAckItem {
@@ -836,11 +836,11 @@ impl UnixStorageNodeClient {
         })
     }
 
-    fn encode_shard_ack_item(&self, pg_id: PgId, key: &ShardKey) -> Vec<u8> {
+    fn encode_shard_ack_item(&self, data_pg_id: DataPgId, key: &ShardKey) -> Vec<u8> {
         encode_shard_ack_item_request(&StorageRpcShardAckItemRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            pg_id,
+            pg_id: data_pg_id.pg_id(),
             shard_key: key.clone(),
         })
     }
@@ -949,44 +949,59 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
 impl ShardAckNodeClient for UnixStorageNodeClient {
     fn register_written_shard_acks(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::register_written_shard_acks(self, pg_id, shard_batch)
+        UnixStorageNodeClient::register_written_shard_acks(self, data_pg_id, shard_batch)
     }
 
     fn validate_written_shard_ack(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
         ack: WriteAck,
     ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::validate_written_shard_acks(self, pg_id, &[(key, ack)])
+        UnixStorageNodeClient::validate_written_shard_acks(self, data_pg_id, &[(key, ack)])
     }
 
-    fn load_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<WriteAck, StoreError> {
-        UnixStorageNodeClient::load_written_shard_ack(self, pg_id, key)
+    fn load_written_shard_ack(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<WriteAck, StoreError> {
+        UnixStorageNodeClient::load_written_shard_ack(self, data_pg_id, key)
     }
 
     fn load_written_shard_ack_for_historical_inspection(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
-        UnixStorageNodeClient::load_written_shard_ack_for_historical_inspection(self, pg_id, key)
+        UnixStorageNodeClient::load_written_shard_ack_for_historical_inspection(
+            self, data_pg_id, key,
+        )
     }
 
-    fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {
-        UnixStorageNodeClient::delete_written_shard_ack(self, pg_id, key)
+    fn delete_written_shard_ack(
+        &self,
+        data_pg_id: DataPgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::delete_written_shard_ack(self, data_pg_id, key)
     }
 
     fn delete_written_shard_ack_at_retained_epoch(
         &self,
         cluster_epoch: ClusterEpoch,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::delete_written_shard_ack_at_epoch(self, cluster_epoch, pg_id, key)
+        UnixStorageNodeClient::delete_written_shard_ack_at_epoch(
+            self,
+            cluster_epoch,
+            data_pg_id,
+            key,
+        )
     }
 
     fn record_placed_segment_shard_repair(
