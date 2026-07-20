@@ -65,7 +65,7 @@ use storage::control_plane_raft::{
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
     ControlPlaneRaftLogId, ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy,
     ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerFrameKind,
-    ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
+    ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
@@ -94,8 +94,8 @@ const LOCK_NB: i32 = 4;
 const CONTROL_PLANE_RPC_WORKER_LIMIT: usize = 64;
 const CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT: usize = 8;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(test)]
 const CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT: usize = 64;
-const CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_WAL_SUFFIX_BYTES: u64 = 64 * 1024 * 1024;
 const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_MUTATIONS: u64 = 4_096;
 const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(60);
@@ -480,10 +480,10 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
             Path::new(&path),
             process_id,
         )
-        .and_then(|manifest| manifest.initialize_standalone_storage())
+        .and_then(|manifest| manifest.initialize_selected_process_state())
         {
             Ok(()) => {
-                println!("initialized static standalone cluster state");
+                println!("initialized static cluster process state");
                 Some(0)
             }
             Err(error) => {
@@ -2029,7 +2029,11 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("{error}");
         std::process::exit(1);
     });
-    let recovery_socket_path = control_plane_clock_recovery_socket_path(Path::new(socket_path));
+    let recovery_socket_path = config
+        .control_plane_clock_recovery_socket_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| control_plane_clock_recovery_socket_path(Path::new(socket_path)));
     let recovery_listener = bind_control_plane_clock_recovery_socket(&recovery_socket_path)
         .unwrap_or_else(|error| {
             eprintln!("{error}");
@@ -3023,6 +3027,7 @@ where
 struct ExperimentalRaftPeerListener {
     listener: UnixListener,
     policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
+    max_connections: usize,
 }
 
 fn build_experimental_raft_peer_transport_policy(
@@ -3045,8 +3050,18 @@ fn build_experimental_raft_peer_transport_policy(
     let mut policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
         cluster_name.to_string(),
         peer_endpoints,
-        ControlPlaneRaftPeerTransportLimits::default(),
+        config.control_plane_raft_peer_transport_limits,
+    )
+    .with_timeouts(
+        config.control_plane_raft_peer_connect_timeout,
+        config.control_plane_raft_peer_io_timeout,
     );
+    if let Some(identity) = &config.static_cluster_identity {
+        policy = policy.with_topology_identity(
+            identity.topology_generation,
+            identity.topology_digest.clone(),
+        );
+    }
     if let Some(auth_policy) =
         build_experimental_raft_peer_auth_policy(config, cluster_name, local_node_id)?
     {
@@ -3064,14 +3079,21 @@ fn build_experimental_raft_peer_auth_policy(
         return Ok(None);
     }
 
-    let local_configured = latest_auth_credential_by_version_then_id(
-        config
-            .control_plane_raft_auth_credentials
-            .iter()
-            .filter(|credential| credential.node_id == local_node_id),
-        |credential| credential.credential_id.as_str(),
-        |credential| credential.credential_version,
-    )
+    let mut local_candidates = config
+        .control_plane_raft_auth_credentials
+        .iter()
+        .filter(|credential| credential.node_id == local_node_id);
+    let local_configured = match &config.control_plane_raft_auth_signing_credential {
+        Some((credential_id, credential_version)) => local_candidates.find(|credential| {
+                credential.credential_id == *credential_id
+                    && credential.credential_version == *credential_version
+            }),
+        None => latest_auth_credential_by_version_then_id(
+            local_candidates,
+            |credential| credential.credential_id.as_str(),
+            |credential| credential.credential_version,
+        ),
+    }
     .ok_or_else(|| {
         format!(
             "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must include local Raft node id {local_node_id}"
@@ -3108,7 +3130,7 @@ fn configured_raft_peer_auth_credential(
         principal: ControlPlaneAuthPrincipal::RaftPeer {
             node_id: configured.node_id,
         },
-        secret: configured.secret.as_str().as_bytes().to_vec(),
+        secret: configured.secret.as_bytes().to_vec(),
     })
     .map_err(|error| {
         format!(
@@ -3326,6 +3348,7 @@ fn bind_experimental_raft_peer_listener_with_policy(
     Ok(Some(ExperimentalRaftPeerListener {
         listener,
         policy: Arc::new(policy),
+        max_connections: config.control_plane_raft_peer_max_connections,
     }))
 }
 
@@ -3337,6 +3360,7 @@ struct ExperimentalRaftPeerRpcWorkerContext {
     policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
     durability: Option<ExperimentalRaftPeerDurabilityContext>,
     active_workers: Arc<AtomicUsize>,
+    worker_limit: usize,
 }
 
 #[derive(Clone)]
@@ -3473,6 +3497,7 @@ fn spawn_experimental_raft_peer_rpc_worker(
         policy,
         durability,
         active_workers,
+        worker_limit,
     } = context;
     if durability
         .as_ref()
@@ -3483,17 +3508,12 @@ fn spawn_experimental_raft_peer_rpc_worker(
         );
         return;
     }
-    match active_workers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-        (active < CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT).then_some(active + 1)
-    }) {
-        Ok(_) => {}
-        Err(_) => {
-            eprintln!(
-                "experimental OpenRaft control-plane peer RPC rejected: worker limit {} reached",
-                CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT
-            );
-            return;
-        }
+    if !reserve_experimental_raft_peer_rpc_worker(&active_workers, worker_limit) {
+        eprintln!(
+            "experimental OpenRaft control-plane peer RPC rejected: worker limit {} reached",
+            worker_limit
+        );
+        return;
     }
 
     thread::spawn(move || {
@@ -3527,6 +3547,17 @@ fn spawn_experimental_raft_peer_rpc_worker(
         }
         active_workers.fetch_sub(1, Ordering::AcqRel);
     });
+}
+
+fn reserve_experimental_raft_peer_rpc_worker(
+    active_workers: &AtomicUsize,
+    worker_limit: usize,
+) -> bool {
+    active_workers
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            (active < worker_limit).then_some(active + 1)
+        })
+        .is_ok()
 }
 
 #[derive(Debug)]
@@ -3576,14 +3607,14 @@ where
 {
     ensure_experimental_raft_peer_not_durably_poisoned(durability.publication)?;
     stream
-        .set_read_timeout(Some(CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT))
+        .set_read_timeout(Some(policy.io_timeout()))
         .map_err(|source| ControlPlaneError::Io {
             context: "set control-plane OpenRaft peer stream read timeout",
             source,
         })
         .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
     stream
-        .set_write_timeout(Some(CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT))
+        .set_write_timeout(Some(policy.io_timeout()))
         .map_err(|source| ControlPlaneError::Io {
             context: "set control-plane OpenRaft peer stream write timeout",
             source,
@@ -3614,6 +3645,7 @@ where
         let identity = match experimental_raft_peer_auth_envelope_identity(
             &envelope,
             policy.cluster_name(),
+            policy.topology_identity(),
             local_node_id,
         ) {
             Ok(identity) => identity,
@@ -3682,6 +3714,7 @@ fn publish_experimental_raft_peer_response<T>(
 fn experimental_raft_peer_auth_envelope_identity(
     envelope: &ControlPlaneAuthEnvelope,
     expected_cluster_name: &str,
+    expected_topology: Option<&storage::control_plane_raft::ControlPlaneRaftTopologyIdentity>,
     local_node_id: ControlPlaneRaftNodeId,
 ) -> Result<ControlPlaneRaftPeerFrameIdentity, ControlPlaneError> {
     let source = match envelope.header().source() {
@@ -3704,11 +3737,13 @@ fn experimental_raft_peer_auth_envelope_identity(
             });
         }
     }
-    Ok(ControlPlaneRaftPeerFrameIdentity::new(
+    let mut identity = ControlPlaneRaftPeerFrameIdentity::new(
         expected_cluster_name.to_string(),
         source,
         local_node_id,
-    ))
+    );
+    identity.topology = expected_topology.cloned();
+    Ok(identity)
 }
 
 fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
@@ -3743,16 +3778,10 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
     })
     .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
     let response_frame = if let Some(auth_policy) = policy.auth_policy() {
+        let mut response_identity = request.identity.clone();
+        std::mem::swap(&mut response_identity.source, &mut response_identity.target);
         auth_policy
-            .sign_peer_frame(
-                &ControlPlaneRaftPeerFrameIdentity::new(
-                    request.identity.cluster_name.clone(),
-                    request.identity.target,
-                    request.identity.source,
-                ),
-                request.operation,
-                raw_response_frame,
-            )
+            .sign_peer_frame(&response_identity, request.operation, raw_response_frame)
             .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?
     } else {
         raw_response_frame
@@ -3921,6 +3950,7 @@ fn spawn_experimental_raft_peer_listener_loop(
                         policy: Arc::clone(&listener.policy),
                         durability: Some(durability.clone()),
                         active_workers: Arc::clone(&active_workers),
+                        worker_limit: listener.max_connections,
                     },
                 );
             }
@@ -4005,11 +4035,27 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             eprintln!("{error}");
             std::process::exit(1);
         });
+    let node_id: ControlPlaneRaftNodeId = config.control_plane_raft_node_id.unwrap_or(1);
+    if let Some(identity) = &config.static_cluster_identity {
+        static_cluster_state::bind_static_control_plane_identity(
+            identity,
+            node_id,
+            Path::new(state_path),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to bind static control-plane identity: {error}");
+            std::process::exit(1);
+        });
+    }
     let listener = bind_control_plane_socket(Path::new(socket_path)).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
     });
-    let recovery_socket_path = control_plane_clock_recovery_socket_path(Path::new(socket_path));
+    let recovery_socket_path = config
+        .control_plane_clock_recovery_socket_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| control_plane_clock_recovery_socket_path(Path::new(socket_path)));
     let recovery_listener = bind_control_plane_clock_recovery_socket(&recovery_socket_path)
         .unwrap_or_else(|error| {
             eprintln!("{error}");
@@ -4017,7 +4063,6 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         });
 
     let runtime = Handle::current();
-    let node_id: ControlPlaneRaftNodeId = config.control_plane_raft_node_id.unwrap_or(1);
     let cluster_name = config
         .control_plane_raft_cluster_name
         .clone()
@@ -4049,7 +4094,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 Path::new(state_path),
                 &durable_wal_path,
                 policy,
-                CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT,
+                config.control_plane_raft_peer_io_timeout,
             )
             .await?
         } else {
@@ -4073,6 +4118,27 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 eprintln!("{error}");
                 std::process::exit(1);
             });
+    if let Some(identity) = &config.static_cluster_identity {
+        store_experimental_raft_durable_restart_artifact(
+            &runtime,
+            &authority,
+            Path::new(state_path),
+            Some(&durable_checkpoint_lock),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to establish static control-plane state: {error}");
+            std::process::exit(1);
+        });
+        static_cluster_state::mark_static_control_plane_identity_established(
+            identity,
+            node_id,
+            Path::new(state_path),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to establish static control-plane identity: {error}");
+            std::process::exit(1);
+        });
+    }
     let active_raft_peer_rpc_workers = Arc::new(AtomicUsize::new(0));
     let durable_publication = ExperimentalRaftDurabilityPublication::new();
     let multi_node_raft_peer_mode = raft_peer_policy
@@ -5408,7 +5474,7 @@ fn configured_storage_node_auth_credential(
         node_id: NodeId::new(configured.node_id),
         credential_id: configured.credential_id.clone(),
         credential_version: configured.credential_version,
-        secret: configured.secret.as_str().as_bytes().to_vec(),
+        secret: configured.secret.as_bytes().to_vec(),
     })
     .map_err(|error| {
         format!(
@@ -5425,7 +5491,7 @@ fn configured_frontend_auth_credential(
         instance_id: configured.instance_id.clone(),
         credential_id: configured.credential_id.clone(),
         credential_version: configured.credential_version,
-        secret: configured.secret.as_str().as_bytes().to_vec(),
+        secret: configured.secret.as_bytes().to_vec(),
     })
     .map_err(|error| {
         format!(
@@ -5442,7 +5508,7 @@ fn configured_admin_auth_credential(
         instance_id: configured.instance_id.clone(),
         credential_id: configured.credential_id.clone(),
         credential_version: configured.credential_version,
-        secret: configured.secret.as_str().as_bytes().to_vec(),
+        secret: configured.secret.as_bytes().to_vec(),
     })
     .map_err(|error| {
         format!(
@@ -5531,9 +5597,12 @@ fn build_frontend_control_plane_client(
         .control_plane_frontend_auth_instance_id
         .as_deref()
         .expect("frontend auth credentials require local frontend instance id");
-    let configured = latest_frontend_auth_credential_for_instance(
+    let configured = select_frontend_auth_credential_for_instance(
         &config.control_plane_frontend_auth_credentials,
         instance_id,
+        config
+            .control_plane_frontend_auth_signing_credential
+            .as_ref(),
     )?;
     build_authenticated_frontend_control_plane_client_with_inner(
         client,
@@ -5681,9 +5750,12 @@ fn build_storage_node_control_plane_client(
         .control_plane_auth_cluster_id
         .as_deref()
         .expect("storage auth credentials require control-plane auth cluster id");
-    let configured = latest_storage_node_auth_credential_for_node(
+    let configured = select_storage_node_auth_credential_for_node(
         &config.control_plane_storage_auth_credentials,
         node_id.as_u32(),
+        config
+            .control_plane_storage_auth_signing_credential
+            .as_ref(),
     )?;
     let credential = configured_storage_node_auth_credential(configured)?
         .scoped_for_cluster_and_incarnation(cluster_id, node_incarnation)
@@ -5716,6 +5788,28 @@ fn latest_storage_node_auth_credential_for_node(
         })
 }
 
+fn select_storage_node_auth_credential_for_node<'a>(
+    credentials: &'a [ConfiguredControlPlaneStorageAuthCredential],
+    node_id: u32,
+    selected: Option<&(String, u64)>,
+) -> Result<&'a ConfiguredControlPlaneStorageAuthCredential, String> {
+    let Some((credential_id, credential_version)) = selected else {
+        return latest_storage_node_auth_credential_for_node(credentials, node_id);
+    };
+    credentials
+        .iter()
+        .find(|credential| {
+            credential.node_id == node_id
+                && credential.credential_id == *credential_id
+                && credential.credential_version == *credential_version
+        })
+        .ok_or_else(|| {
+            format!(
+                "configured storage-node signing credential {credential_id}:{credential_version} is unavailable for node {node_id}"
+            )
+        })
+}
+
 fn latest_frontend_auth_credential_for_instance<'a>(
     credentials: &'a [ConfiguredControlPlaneFrontendAuthCredential],
     instance_id: &str,
@@ -5730,6 +5824,28 @@ fn latest_frontend_auth_credential_for_instance<'a>(
     .ok_or_else(|| {
             format!(
                 "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must include local frontend instance id {instance_id}"
+            )
+        })
+}
+
+fn select_frontend_auth_credential_for_instance<'a>(
+    credentials: &'a [ConfiguredControlPlaneFrontendAuthCredential],
+    instance_id: &str,
+    selected: Option<&(String, u64)>,
+) -> Result<&'a ConfiguredControlPlaneFrontendAuthCredential, String> {
+    let Some((credential_id, credential_version)) = selected else {
+        return latest_frontend_auth_credential_for_instance(credentials, instance_id);
+    };
+    credentials
+        .iter()
+        .find(|credential| {
+            credential.instance_id == instance_id
+                && credential.credential_id == *credential_id
+                && credential.credential_version == *credential_version
+        })
+        .ok_or_else(|| {
+            format!(
+                "configured frontend signing credential {credential_id}:{credential_version} is unavailable for instance {instance_id}"
             )
         })
 }
@@ -6661,7 +6777,10 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
 mod tests {
     use super::*;
     use auth::SecretKey;
-    use config::{ConfiguredControlPlaneRaftAuthCredential, SecretConfigValue};
+    use config::{
+        BinarySecretConfigValue, ConfiguredControlPlaneRaftAuthCredential,
+        ConfiguredControlPlaneRaftPeerSocket, ConfiguredStaticClusterIdentity, SecretConfigValue,
+    };
     use openraft::impls::{BasicNode, Vote};
     use openraft::raft::{TransferLeaderRequest, VoteRequest};
     use storage::control_plane::{
@@ -6673,7 +6792,9 @@ mod tests {
         ControlPlaneAuthEnvelope, ControlPlaneAuthSignInput, ControlPlaneAuthTarget,
     };
     use storage::control_plane_raft::{
-        ControlPlaneRaftLeaderId, ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerRpcRequest,
+        ControlPlaneRaftLeaderId, ControlPlaneRaftPeerFrameIdentity,
+        ControlPlaneRaftPeerRpcRequest, ControlPlaneRaftPeerRpcResponse,
+        ControlPlaneRaftPeerTransportLimits,
     };
 
     #[test]
@@ -6690,6 +6811,25 @@ mod tests {
             CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT
         ));
         assert_eq!(recovery_workers.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn raft_peer_worker_admission_uses_configured_connection_limit() {
+        let active_workers = AtomicUsize::new(0);
+
+        assert!(reserve_experimental_raft_peer_rpc_worker(
+            &active_workers,
+            2
+        ));
+        assert!(reserve_experimental_raft_peer_rpc_worker(
+            &active_workers,
+            2
+        ));
+        assert!(!reserve_experimental_raft_peer_rpc_worker(
+            &active_workers,
+            2
+        ));
+        assert_eq!(active_workers.load(Ordering::Acquire), 2);
     }
 
     #[test]
@@ -7231,11 +7371,14 @@ mod tests {
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
             control_plane_state_path: None,
             control_plane_socket_path: None,
+            control_plane_clock_recovery_socket_path: None,
             control_plane_client_socket_paths: Vec::new(),
             control_plane_auth_cluster_id: None,
             control_plane_storage_auth_credentials: Vec::new(),
+            control_plane_storage_auth_signing_credential: None,
             control_plane_frontend_auth_instance_id: None,
             control_plane_frontend_auth_credentials: Vec::new(),
+            control_plane_frontend_auth_signing_credential: None,
             control_plane_admin_auth_instance_id: None,
             control_plane_admin_auth_credentials: Vec::new(),
             control_plane_experimental_raft: false,
@@ -7243,7 +7386,13 @@ mod tests {
             control_plane_raft_node_id: None,
             control_plane_raft_peer_socket_path: None,
             control_plane_raft_peer_sockets: Vec::new(),
+            control_plane_raft_peer_transport_limits: ControlPlaneRaftPeerTransportLimits::default(
+            ),
+            control_plane_raft_peer_max_connections: CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT,
+            control_plane_raft_peer_connect_timeout: Duration::from_secs(1),
+            control_plane_raft_peer_io_timeout: Duration::from_secs(1),
             control_plane_raft_auth_credentials: Vec::new(),
+            control_plane_raft_auth_signing_credential: None,
             control_plane_lease_scan_interval: std::time::Duration::from_millis(250),
             control_plane_frontend_refresh_interval: std::time::Duration::from_millis(250),
             control_plane_heartbeat_lease_duration: std::time::Duration::from_millis(2000),
@@ -7270,6 +7419,44 @@ mod tests {
     }
 
     #[test]
+    fn static_raft_peer_policy_binds_manifest_topology_identity() {
+        let mut config = test_server_config();
+        config.control_plane_raft_peer_socket_path = Some("/tmp/raft-1.sock".to_string());
+        config.control_plane_raft_peer_sockets = vec![
+            ConfiguredControlPlaneRaftPeerSocket {
+                node_id: 1,
+                socket_path: "/tmp/raft-1.sock".to_string(),
+            },
+            ConfiguredControlPlaneRaftPeerSocket {
+                node_id: 2,
+                socket_path: "/tmp/raft-2.sock".to_string(),
+            },
+        ];
+        config.static_cluster_identity = Some(ConfiguredStaticClusterIdentity {
+            cluster_id: "cluster-a".to_string(),
+            topology_generation: 7,
+            topology_digest: "a".repeat(64),
+            process_id: "control-1".to_string(),
+            process_identity_digest: "b".repeat(64),
+        });
+
+        let policy = build_experimental_raft_peer_transport_policy(&config, "cluster-a", 1)
+            .unwrap()
+            .unwrap();
+        let identity = policy.frame_identity(1, 2).unwrap();
+
+        assert_eq!(
+            identity.topology,
+            Some(
+                storage::control_plane_raft::ControlPlaneRaftTopologyIdentity {
+                    generation: 7,
+                    digest: "a".repeat(64),
+                }
+            )
+        );
+    }
+
+    #[test]
     fn storage_node_control_plane_client_uses_authenticated_client_when_configured() {
         let mut config = test_server_config();
         config.control_plane_auth_cluster_id = Some("control-auth".to_string());
@@ -7278,13 +7465,13 @@ mod tests {
                 node_id: 2,
                 credential_id: "storage-node".to_string(),
                 credential_version: 7,
-                secret: SecretConfigValue::new("storage-node-2-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("storage-node-2-secret".to_string()),
             },
             ConfiguredControlPlaneStorageAuthCredential {
                 node_id: 2,
                 credential_id: "storage-node".to_string(),
                 credential_version: 8,
-                secret: SecretConfigValue::new("storage-node-2-new-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("storage-node-2-new-secret".to_string()),
             },
         ];
 
@@ -7318,7 +7505,7 @@ mod tests {
                 node_id: node_id.as_u32(),
                 credential_id: "storage-node".to_string(),
                 credential_version: 7,
-                secret: SecretConfigValue::new("storage-node-2-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("storage-node-2-secret".to_string()),
             }];
         let storage_credential = configured_storage_node_auth_credential(
             &config.control_plane_storage_auth_credentials[0],
@@ -7396,7 +7583,7 @@ mod tests {
                 node_id: 1,
                 credential_id: "storage-node".to_string(),
                 credential_version: 7,
-                secret: SecretConfigValue::new("storage-node-1-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("storage-node-1-secret".to_string()),
             }];
 
         let result = build_storage_node_control_plane_client(
@@ -7422,13 +7609,13 @@ mod tests {
                 instance_id: "frontend-1".to_string(),
                 credential_id: "frontend".to_string(),
                 credential_version: 7,
-                secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("frontend-1-secret".to_string()),
             },
             ConfiguredControlPlaneFrontendAuthCredential {
                 instance_id: "frontend-1".to_string(),
                 credential_id: "frontend".to_string(),
                 credential_version: 8,
-                secret: SecretConfigValue::new("frontend-1-new-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("frontend-1-new-secret".to_string()),
             },
         ];
 
@@ -7448,13 +7635,13 @@ mod tests {
                 instance_id: "admin-1".to_string(),
                 credential_id: "admin".to_string(),
                 credential_version: 7,
-                secret: SecretConfigValue::new("admin-1-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("admin-1-secret".to_string()),
             },
             ConfiguredControlPlaneAdminAuthCredential {
                 instance_id: "admin-1".to_string(),
                 credential_id: "admin".to_string(),
                 credential_version: 8,
-                secret: SecretConfigValue::new("admin-1-new-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("admin-1-new-secret".to_string()),
             },
         ];
 
@@ -7474,7 +7661,7 @@ mod tests {
                 instance_id: "frontend-1".to_string(),
                 credential_id: "frontend".to_string(),
                 credential_version: 7,
-                secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("frontend-1-secret".to_string()),
             }];
 
         let result = build_frontend_control_plane_client(&config, "/tmp/argmin-control-plane.sock");
@@ -7494,14 +7681,14 @@ mod tests {
                 instance_id: "frontend-1".to_string(),
                 credential_id: "frontend".to_string(),
                 credential_version: 7,
-                secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("frontend-1-secret".to_string()),
             }];
         config.control_plane_admin_auth_credentials =
             vec![ConfiguredControlPlaneAdminAuthCredential {
                 instance_id: "admin-1".to_string(),
                 credential_id: "admin".to_string(),
                 credential_version: 8,
-                secret: SecretConfigValue::new("admin-1-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("admin-1-secret".to_string()),
             }];
 
         let verifier = build_control_plane_unix_auth_verifier(&config)
@@ -7529,7 +7716,7 @@ mod tests {
                 instance_id: "frontend-1".to_string(),
                 credential_id: "frontend".to_string(),
                 credential_version: 7,
-                secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("frontend-1-secret".to_string()),
             }];
 
         let error = build_control_plane_unix_auth_verifier(&config)
@@ -7547,7 +7734,7 @@ mod tests {
                 instance_id: "admin-1".to_string(),
                 credential_id: "admin".to_string(),
                 credential_version: 7,
-                secret: SecretConfigValue::new("admin-1-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("admin-1-secret".to_string()),
             }];
 
         let verifier = build_control_plane_unix_auth_verifier(&config)
@@ -10719,6 +10906,89 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_peer_rpc_worker_preserves_static_topology_through_auth() {
+        let harness = experimental_raft_test_harness("peer-static-topology-auth");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-static-topology-auth-{}",
+            std::process::id()
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name.clone(), 1, 1)
+            .with_topology(7, "topology-a");
+        let operation = ControlPlaneAuthOperation::RaftVote;
+        let request_frame = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
+            last_log_id: None,
+            leadership_transfer: false,
+        })
+        .encode_frame_for_peer(&identity)
+        .expect("topology-bound peer request should encode");
+        let signed_request = experimental_raft_signed_peer_frame(
+            &cluster_name,
+            experimental_raft_peer_auth_credential(
+                &cluster_name,
+                1,
+                "raft-node-1",
+                1,
+                "node-1-test-secret",
+            ),
+            1,
+            operation,
+            request_frame,
+        );
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name,
+            [(1, "node-1".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        )
+        .with_topology_identity(7, "topology-a")
+        .with_auth_policy(experimental_raft_peer_auth_policy(
+            &identity.cluster_name,
+            1,
+            1,
+        ));
+        let (mut client_stream, mut server_stream) =
+            UnixStream::pair().expect("test UnixStream pair should create");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &signed_request)
+            .expect("client should write topology-bound authenticated frame");
+
+        handle_experimental_raft_peer_rpc_before_ack(
+            harness.runtime.handle(),
+            &harness.authority,
+            &mut server_stream,
+            1,
+            &policy,
+            ExperimentalRaftPeerRpcDurability {
+                artifact_path: None,
+                checkpoint_lock: None,
+                publication: None,
+            },
+        )
+        .expect("topology-bound authenticated worker request should succeed");
+
+        let signed_response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        )
+        .expect("worker should return an authenticated response");
+        let mut response_identity = identity;
+        std::mem::swap(&mut response_identity.source, &mut response_identity.target);
+        let response_frame = policy
+            .auth_policy()
+            .expect("test policy should have auth")
+            .verify_peer_frame(
+                &signed_response,
+                &response_identity,
+                operation,
+                ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+            )
+            .expect("response auth should preserve topology identity");
+        ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(&response_frame, &response_identity)
+            .expect("authenticated topology-bound response should decode");
+
+        harness.shutdown();
+    }
+
+    #[test]
     fn experimental_raft_peer_rpc_rejects_expired_transfer_leader_auth_before_dispatch() {
         let harness = experimental_raft_test_harness("peer-transfer-leader-auth-before-dispatch");
         let cluster_name = format!(
@@ -10913,19 +11183,19 @@ mod tests {
                 node_id: 2,
                 credential_id: "raft-node-2".to_string(),
                 credential_version: 1,
-                secret: SecretConfigValue::new("node-2-old-test-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("node-2-old-test-secret".to_string()),
             },
             ConfiguredControlPlaneRaftAuthCredential {
                 node_id: 2,
                 credential_id: "raft-node-2".to_string(),
                 credential_version: 2,
-                secret: SecretConfigValue::new("node-2-new-test-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("node-2-new-test-secret".to_string()),
             },
             ConfiguredControlPlaneRaftAuthCredential {
                 node_id: 1,
                 credential_id: "raft-node-1".to_string(),
                 credential_version: 1,
-                secret: SecretConfigValue::new("node-1-test-secret".to_string()),
+                secret: BinarySecretConfigValue::from_utf8("node-1-test-secret".to_string()),
             },
         ];
 

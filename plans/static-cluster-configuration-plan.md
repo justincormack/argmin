@@ -142,6 +142,19 @@ identity or PG verification and retains it for the complete local storage
 cluster lifetime. A second process selecting the same process identity and data
 directory therefore fails before opening mutable PG state.
 
+Replicated control-plane process identity is initialized through the same
+command, once per configured authority process id. This creates only the
+integrity-protected, unestablished process/Raft identity sidecar; it does not
+create membership or an empty replacement node. Ordinary startup requires that
+sidecar and marks it established only after publishing the first nonempty
+restart artifact plus its durable sentinel. Thereafter startup requires that
+complete pair and rejects an empty WAL, missing state, or corruption of the
+sidecar lifecycle flag. The peer listener and checkpoint monitor start only
+after that first artifact and established marker are durable, so no peer
+mutation can be acknowledged under an unestablished identity. Lost authority
+state requires the separate committed replacement ceremony rather than
+rerunning initialization under the old Raft node id.
+
 ## Version 1 TOML Shape
 
 The following example is a three-host replicated deployment with EC 2+1 and
@@ -688,6 +701,10 @@ placement.
 itself to authorize peer traffic. It replaces separate config-file notions of
 an auth cluster id and a Raft cluster name. Scoped credentials and durable
 identities derive their domain-separated cluster namespace from it.
+The current Unix Raft runtime receives a canonical, non-configurable internal
+cluster name derived from `(cluster.id, topology_generation, topology_digest)`;
+this preserves the existing artifact/WAL identity boundary without
+reintroducing a second operator-controlled cluster identity.
 
 Every authenticated Raft peer request and response additionally carries the
 canonical topology generation and topology digest in its frame identity. Those
@@ -875,11 +892,15 @@ Progress as of 2026-07-19:
   and runtime regressions cover mixed-mode rejection, unchanged env-only
   behavior, nonzero storage-node identity, exact data-directory use, and the
   absence of an unserved control-plane refresh path.
-- This Slice 3 activation is deliberately limited to standalone, Unix-only,
-  internal-auth-disabled manifests with no secret or TLS references.
-  Replicated, TCP, and secret-bearing manifests fail before runtime
-  construction. Existing process-level Unix test fixtures still need to move
-  to shared manifest builders as those process profiles are activated.
+- Slice 3 now also maps same-host replicated Unix control-plane processes. The
+  mapping uses the exact manifest authority state, control-plane,
+  clock-recovery, Raft-peer, storage bootstrap, and routed client socket paths.
+  Raft listener admission uses the selected endpoint profile's exact
+  `max_connections` bound, while frame limits and connect/I/O timeouts use that
+  same profile.
+  Cross-host/TCP endpoints remain rejected until that transport exists.
+  Storage-node/frontend replicated process mapping and migration of existing
+  process fixtures to shared manifest builders remain open.
 - Slice 4's standalone storage sub-slice is implemented: file-mode
   `all-in-one` configuration carries the process identity into runtime,
   `initialize-cluster-state` durably publishes identity only after complete PG
@@ -899,12 +920,28 @@ Progress as of 2026-07-19:
   PEM section types, validates CA constraints and signing usage, bounds total
   selected-process material, verifies local listener
   certificate/key/trust/server-name consistency, and has a separate redacted
-  `validate-cluster-material` preflight command. Runtime construction from
-  these typed values remains part of replicated process mapping; raw material
-  is not converted back into legacy env-style strings.
-- Raft/control-plane durable identity and authenticated-frame binding,
-  replicated initialization/replacement lifecycle, resolved-material runtime
-  activation, production replicated mapping, and TCP transport remain open.
+  `validate-cluster-material` preflight command. Replicated Unix control-plane
+  mapping consumes resolved binary credential bytes directly, keeps verifier
+  credentials distinct from the manifest-selected signer during rotation, and
+  never converts secrets back into legacy env-style strings. Storage/frontend
+  activation and TLS/TCP construction remain open.
+- Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
+  no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
+  by explicit `initialize-cluster-state` while holding the same process state
+  lock used by ordinary startup, checked before listeners open, and marked
+  established only after the first durable Raft artifact and sentinel are
+  published. Existing state without the sidecar, ordinary startup on an empty
+  destination, changed cluster/topology/process/node identity, corrupted
+  lifecycle state, and an established sidecar without its complete restart
+  pair fail closed; complete relocation remains valid. Static peer policies
+  preserve topology generation/digest through authenticated worker request and
+  response identities and reject fresh-manifest mismatches before OpenRaft
+  dispatch. Manifest validation builds one host-scoped runtime path namespace
+  covering authority state and fixed sidecars, temporary filename prefixes,
+  storage data directories, and Unix sockets; exact or ancestor collisions
+  fail before filesystem mutation.
+  Explicit bootstrap/snapshot topology certificates, replicated replacement
+  lifecycle, storage/frontend process mapping, and TCP transport remain open.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;

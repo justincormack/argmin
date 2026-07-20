@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use storage::control_plane::MAX_HEARTBEAT_LEASE_MS;
+use storage::control_plane_raft::ControlPlaneRaftPeerTransportLimits;
 use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS;
 use storage::LocalUnixStorageNodeClientConfig;
 
@@ -56,7 +57,7 @@ pub(crate) struct ConfiguredControlPlaneRaftAuthCredential {
     pub(crate) node_id: u64,
     pub(crate) credential_id: String,
     pub(crate) credential_version: u64,
-    pub(crate) secret: SecretConfigValue,
+    pub(crate) secret: BinarySecretConfigValue,
 }
 
 impl fmt::Debug for ConfiguredControlPlaneRaftAuthCredential {
@@ -75,7 +76,7 @@ pub(crate) struct ConfiguredControlPlaneStorageAuthCredential {
     pub(crate) node_id: u32,
     pub(crate) credential_id: String,
     pub(crate) credential_version: u64,
-    pub(crate) secret: SecretConfigValue,
+    pub(crate) secret: BinarySecretConfigValue,
 }
 
 impl fmt::Debug for ConfiguredControlPlaneStorageAuthCredential {
@@ -94,7 +95,7 @@ pub(crate) struct ConfiguredControlPlaneFrontendAuthCredential {
     pub(crate) instance_id: String,
     pub(crate) credential_id: String,
     pub(crate) credential_version: u64,
-    pub(crate) secret: SecretConfigValue,
+    pub(crate) secret: BinarySecretConfigValue,
 }
 
 impl fmt::Debug for ConfiguredControlPlaneFrontendAuthCredential {
@@ -113,7 +114,7 @@ pub(crate) struct ConfiguredControlPlaneAdminAuthCredential {
     pub(crate) instance_id: String,
     pub(crate) credential_id: String,
     pub(crate) credential_version: u64,
-    pub(crate) secret: SecretConfigValue,
+    pub(crate) secret: BinarySecretConfigValue,
 }
 
 impl fmt::Debug for ConfiguredControlPlaneAdminAuthCredential {
@@ -274,6 +275,35 @@ impl fmt::Debug for SecretConfigValue {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct BinarySecretConfigValue(Vec<u8>);
+
+impl BinarySecretConfigValue {
+    pub(crate) fn from_utf8(value: String) -> Self {
+        Self(value.into_bytes())
+    }
+
+    pub(crate) fn from_bytes(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for BinarySecretConfigValue {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+impl fmt::Debug for BinarySecretConfigValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&observability::redacted("config_binary_secret"), f)
+    }
+}
+
 /// Resolved server configuration, loaded from one supported configuration mode.
 /// Configuration for the S3 server.
 #[derive(Debug, Clone)]
@@ -295,13 +325,16 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_rpc_control_admission_wait_timeout: Duration,
     pub(crate) control_plane_state_path: Option<String>,
     pub(crate) control_plane_socket_path: Option<String>,
+    pub(crate) control_plane_clock_recovery_socket_path: Option<String>,
     pub(crate) control_plane_client_socket_paths: Vec<String>,
     pub(crate) control_plane_auth_cluster_id: Option<String>,
     pub(crate) control_plane_storage_auth_credentials:
         Vec<ConfiguredControlPlaneStorageAuthCredential>,
+    pub(crate) control_plane_storage_auth_signing_credential: Option<(String, u64)>,
     pub(crate) control_plane_frontend_auth_instance_id: Option<String>,
     pub(crate) control_plane_frontend_auth_credentials:
         Vec<ConfiguredControlPlaneFrontendAuthCredential>,
+    pub(crate) control_plane_frontend_auth_signing_credential: Option<(String, u64)>,
     pub(crate) control_plane_admin_auth_instance_id: Option<String>,
     pub(crate) control_plane_admin_auth_credentials: Vec<ConfiguredControlPlaneAdminAuthCredential>,
     pub(crate) control_plane_experimental_raft: bool,
@@ -309,7 +342,12 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_raft_node_id: Option<u64>,
     pub(crate) control_plane_raft_peer_socket_path: Option<String>,
     pub(crate) control_plane_raft_peer_sockets: Vec<ConfiguredControlPlaneRaftPeerSocket>,
+    pub(crate) control_plane_raft_peer_transport_limits: ControlPlaneRaftPeerTransportLimits,
+    pub(crate) control_plane_raft_peer_max_connections: usize,
+    pub(crate) control_plane_raft_peer_connect_timeout: Duration,
+    pub(crate) control_plane_raft_peer_io_timeout: Duration,
     pub(crate) control_plane_raft_auth_credentials: Vec<ConfiguredControlPlaneRaftAuthCredential>,
+    pub(crate) control_plane_raft_auth_signing_credential: Option<(String, u64)>,
     pub(crate) control_plane_lease_scan_interval: Duration,
     pub(crate) control_plane_frontend_refresh_interval: Duration,
     pub(crate) control_plane_heartbeat_lease_duration: Duration,
@@ -962,11 +1000,14 @@ impl ServerConfig {
             storage_node_rpc_control_admission_wait_timeout,
             control_plane_state_path,
             control_plane_socket_path,
+            control_plane_clock_recovery_socket_path: None,
             control_plane_client_socket_paths,
             control_plane_auth_cluster_id,
             control_plane_storage_auth_credentials,
+            control_plane_storage_auth_signing_credential: None,
             control_plane_frontend_auth_instance_id,
             control_plane_frontend_auth_credentials,
+            control_plane_frontend_auth_signing_credential: None,
             control_plane_admin_auth_instance_id,
             control_plane_admin_auth_credentials,
             control_plane_experimental_raft,
@@ -974,7 +1015,13 @@ impl ServerConfig {
             control_plane_raft_node_id,
             control_plane_raft_peer_socket_path,
             control_plane_raft_peer_sockets,
+            control_plane_raft_peer_transport_limits: ControlPlaneRaftPeerTransportLimits::default(
+            ),
+            control_plane_raft_peer_max_connections: 64,
+            control_plane_raft_peer_connect_timeout: Duration::from_secs(1),
+            control_plane_raft_peer_io_timeout: Duration::from_secs(1),
             control_plane_raft_auth_credentials,
+            control_plane_raft_auth_signing_credential: None,
             control_plane_lease_scan_interval,
             control_plane_frontend_refresh_interval,
             control_plane_heartbeat_lease_duration,
@@ -1317,7 +1364,7 @@ fn parse_control_plane_raft_auth_credentials(
             node_id,
             credential_id: credential_id.to_string(),
             credential_version,
-            secret: SecretConfigValue::new(secret.to_string()),
+            secret: BinarySecretConfigValue::from_utf8(secret.to_string()),
         };
         if !seen.insert((node_id, entry.credential_id.clone(), credential_version)) {
             return Err(format!(
@@ -1398,7 +1445,7 @@ fn parse_control_plane_storage_auth_credentials(
             node_id,
             credential_id: credential_id.to_string(),
             credential_version,
-            secret: SecretConfigValue::new(secret.to_string()),
+            secret: BinarySecretConfigValue::from_utf8(secret.to_string()),
         };
         if !seen.insert((node_id, entry.credential_id.clone(), credential_version)) {
             return Err(format!(
@@ -1475,7 +1522,7 @@ fn parse_control_plane_frontend_auth_credentials(
             instance_id: instance_id.to_string(),
             credential_id: credential_id.to_string(),
             credential_version,
-            secret: SecretConfigValue::new(secret.to_string()),
+            secret: BinarySecretConfigValue::from_utf8(secret.to_string()),
         };
         if !seen.insert((
             entry.instance_id.clone(),
@@ -1553,7 +1600,7 @@ fn parse_control_plane_admin_auth_credentials(
             instance_id: instance_id.to_string(),
             credential_id: credential_id.to_string(),
             credential_version,
-            secret: SecretConfigValue::new(secret.to_string()),
+            secret: BinarySecretConfigValue::from_utf8(secret.to_string()),
         };
         if !seen.insert((
             entry.instance_id.clone(),
@@ -2070,13 +2117,13 @@ mod tests {
                     node_id: 1,
                     credential_id: "storage-node".to_string(),
                     credential_version: 3,
-                    secret: SecretConfigValue::new("storage-1-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("storage-1-secret".to_string()),
                 },
                 ConfiguredControlPlaneStorageAuthCredential {
                     node_id: 2,
                     credential_id: "storage-node".to_string(),
                     credential_version: 3,
-                    secret: SecretConfigValue::new("storage-2-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("storage-2-secret".to_string()),
                 },
             ]
         );
@@ -2091,13 +2138,13 @@ mod tests {
                     instance_id: "frontend-a".to_string(),
                     credential_id: "frontend".to_string(),
                     credential_version: 5,
-                    secret: SecretConfigValue::new("frontend-a-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("frontend-a-secret".to_string()),
                 },
                 ConfiguredControlPlaneFrontendAuthCredential {
                     instance_id: "frontend-b".to_string(),
                     credential_id: "frontend".to_string(),
                     credential_version: 5,
-                    secret: SecretConfigValue::new("frontend-b-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("frontend-b-secret".to_string()),
                 },
             ]
         );
@@ -2112,13 +2159,13 @@ mod tests {
                     instance_id: "admin-a".to_string(),
                     credential_id: "admin".to_string(),
                     credential_version: 6,
-                    secret: SecretConfigValue::new("admin-a-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("admin-a-secret".to_string()),
                 },
                 ConfiguredControlPlaneAdminAuthCredential {
                     instance_id: "admin-b".to_string(),
                     credential_id: "admin".to_string(),
                     credential_version: 6,
-                    secret: SecretConfigValue::new("admin-b-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("admin-b-secret".to_string()),
                 },
             ]
         );
@@ -2362,19 +2409,19 @@ mod tests {
                     node_id: 1,
                     credential_id: "storage-node".to_string(),
                     credential_version: 4,
-                    secret: SecretConfigValue::new("storage-1-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("storage-1-secret".to_string()),
                 },
                 ConfiguredControlPlaneStorageAuthCredential {
                     node_id: 1,
                     credential_id: "storage-node".to_string(),
                     credential_version: 5,
-                    secret: SecretConfigValue::new("storage-1-new-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("storage-1-new-secret".to_string(),),
                 },
                 ConfiguredControlPlaneStorageAuthCredential {
                     node_id: 2,
                     credential_id: "storage-node".to_string(),
                     credential_version: 4,
-                    secret: SecretConfigValue::new("storage-2-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("storage-2-secret".to_string()),
                 },
             ]
         );
@@ -2385,7 +2432,7 @@ mod tests {
         assert!(!debug.contains("admin-1-secret"));
         assert!(!debug.contains("frontend-a-secret"));
         assert!(!debug.contains("frontend-b-secret"));
-        assert!(debug.contains("config_secret"));
+        assert!(debug.contains("config_binary_secret"));
     }
 
     #[test]
@@ -2653,19 +2700,19 @@ mod tests {
                     instance_id: "frontend-1".to_string(),
                     credential_id: "frontend".to_string(),
                     credential_version: 4,
-                    secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("frontend-1-secret".to_string()),
                 },
                 ConfiguredControlPlaneFrontendAuthCredential {
                     instance_id: "frontend-1".to_string(),
                     credential_id: "frontend".to_string(),
                     credential_version: 5,
-                    secret: SecretConfigValue::new("frontend-1-new-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("frontend-1-new-secret".to_string(),),
                 },
                 ConfiguredControlPlaneFrontendAuthCredential {
                     instance_id: "frontend-2".to_string(),
                     credential_id: "frontend".to_string(),
                     credential_version: 4,
-                    secret: SecretConfigValue::new("frontend-2-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("frontend-2-secret".to_string()),
                 },
             ]
         );
@@ -2673,7 +2720,7 @@ mod tests {
         assert!(!debug.contains("frontend-1-secret"));
         assert!(!debug.contains("frontend-1-new-secret"));
         assert!(!debug.contains("frontend-2-secret"));
-        assert!(debug.contains("config_secret"));
+        assert!(debug.contains("config_binary_secret"));
     }
 
     #[test]
@@ -2734,19 +2781,19 @@ mod tests {
                     instance_id: "admin-1".to_string(),
                     credential_id: "admin".to_string(),
                     credential_version: 4,
-                    secret: SecretConfigValue::new("admin-1-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("admin-1-secret".to_string()),
                 },
                 ConfiguredControlPlaneAdminAuthCredential {
                     instance_id: "admin-1".to_string(),
                     credential_id: "admin".to_string(),
                     credential_version: 5,
-                    secret: SecretConfigValue::new("admin-1-new-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("admin-1-new-secret".to_string(),),
                 },
                 ConfiguredControlPlaneAdminAuthCredential {
                     instance_id: "admin-2".to_string(),
                     credential_id: "admin".to_string(),
                     credential_version: 4,
-                    secret: SecretConfigValue::new("admin-2-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("admin-2-secret".to_string()),
                 },
             ]
         );
@@ -2754,7 +2801,7 @@ mod tests {
         assert!(!debug.contains("admin-1-secret"));
         assert!(!debug.contains("admin-1-new-secret"));
         assert!(!debug.contains("admin-2-secret"));
-        assert!(debug.contains("config_secret"));
+        assert!(debug.contains("config_binary_secret"));
     }
 
     #[test]
@@ -2925,19 +2972,19 @@ mod tests {
                     node_id: 11,
                     credential_id: "raft-peer".to_string(),
                     credential_version: 7,
-                    secret: SecretConfigValue::new("peer-11-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("peer-11-secret".to_string()),
                 },
                 ConfiguredControlPlaneRaftAuthCredential {
                     node_id: 11,
                     credential_id: "raft-peer".to_string(),
                     credential_version: 8,
-                    secret: SecretConfigValue::new("peer-11-new-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("peer-11-new-secret".to_string(),),
                 },
                 ConfiguredControlPlaneRaftAuthCredential {
                     node_id: 12,
                     credential_id: "raft-peer".to_string(),
                     credential_version: 7,
-                    secret: SecretConfigValue::new("peer-12-secret".to_string()),
+                    secret: BinarySecretConfigValue::from_utf8("peer-12-secret".to_string()),
                 },
             ]
         );
@@ -2945,7 +2992,7 @@ mod tests {
         assert!(!debug.contains("peer-11-secret"));
         assert!(!debug.contains("peer-11-new-secret"));
         assert!(!debug.contains("peer-12-secret"));
-        assert!(debug.contains("config_secret"));
+        assert!(debug.contains("config_binary_secret"));
     }
 
     #[test]

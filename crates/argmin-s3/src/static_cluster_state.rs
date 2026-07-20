@@ -16,6 +16,10 @@ const STORAGE_IDENTITY_MAGIC: &[u8; 8] = b"ARGSSID\0";
 const SQLITE_FILE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
 const STORAGE_IDENTITY_VERSION: u16 = 1;
 const STORAGE_IDENTITY_MAX_BYTES: u64 = 1_024;
+const CONTROL_PLANE_IDENTITY_MAGIC: &[u8; 8] = b"ARGSCPID";
+const CONTROL_PLANE_IDENTITY_VERSION: u16 = 2;
+const CONTROL_PLANE_IDENTITY_DIGEST_BYTES: usize = 64;
+const CONTROL_PLANE_IDENTITY_MAX_BYTES: u64 = 1_024;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
@@ -27,6 +31,431 @@ struct StaticStorageIdentity {
     process_id: String,
     process_identity_digest: String,
     storage_node_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaticControlPlaneIdentity {
+    cluster_id: String,
+    topology_generation: u64,
+    topology_digest: String,
+    process_id: String,
+    process_identity_digest: String,
+    raft_node_id: u64,
+    established: bool,
+}
+
+impl StaticControlPlaneIdentity {
+    fn new(config: &ConfiguredStaticClusterIdentity, raft_node_id: u64) -> Self {
+        Self {
+            cluster_id: config.cluster_id.clone(),
+            topology_generation: config.topology_generation,
+            topology_digest: config.topology_digest.clone(),
+            process_id: config.process_id.clone(),
+            process_identity_digest: config.process_identity_digest.clone(),
+            raft_node_id,
+            established: false,
+        }
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::with_capacity(256);
+        bytes.extend_from_slice(CONTROL_PLANE_IDENTITY_MAGIC);
+        bytes.extend_from_slice(&CONTROL_PLANE_IDENTITY_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.topology_generation.to_be_bytes());
+        bytes.extend_from_slice(&self.raft_node_id.to_be_bytes());
+        bytes.push(u8::from(self.established));
+        encode_string(&mut bytes, &self.cluster_id, "cluster id")?;
+        encode_string(&mut bytes, &self.topology_digest, "topology digest")?;
+        encode_string(&mut bytes, &self.process_id, "process id")?;
+        encode_string(
+            &mut bytes,
+            &self.process_identity_digest,
+            "process identity digest",
+        )?;
+        let digest = auth::canonical::sha256_hex(&bytes);
+        bytes.extend_from_slice(digest.as_bytes());
+        if bytes.len() > CONTROL_PLANE_IDENTITY_MAX_BYTES as usize {
+            return Err("static control-plane identity exceeds its size bound".to_string());
+        }
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let body_len = bytes
+            .len()
+            .checked_sub(CONTROL_PLANE_IDENTITY_DIGEST_BYTES)
+            .ok_or_else(|| "static control-plane identity has a truncated digest".to_string())?;
+        let (body, actual_digest) = bytes.split_at(body_len);
+        let expected_digest = auth::canonical::sha256_hex(body);
+        if actual_digest != expected_digest.as_bytes() {
+            return Err("static control-plane identity has an invalid digest".to_string());
+        }
+        let mut decoder = IdentityDecoder::new(body);
+        let magic = decoder.take(CONTROL_PLANE_IDENTITY_MAGIC.len(), "magic")?;
+        if magic != CONTROL_PLANE_IDENTITY_MAGIC {
+            return Err("static control-plane identity has invalid magic".to_string());
+        }
+        let version = decoder.read_u16("version")?;
+        if version != CONTROL_PLANE_IDENTITY_VERSION {
+            return Err("static control-plane identity has an unsupported version".to_string());
+        }
+        let topology_generation = decoder.read_u64("topology generation")?;
+        let raft_node_id = decoder.read_u64("Raft node id")?;
+        let established = match decoder.take(1, "established flag")?[0] {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(
+                    "static control-plane identity has an invalid established flag".to_string(),
+                );
+            }
+        };
+        let cluster_id = decoder.read_string("cluster id")?;
+        let topology_digest = decoder.read_string("topology digest")?;
+        let process_id = decoder.read_string("process id")?;
+        let process_identity_digest = decoder.read_string("process identity digest")?;
+        if !decoder.is_empty() {
+            return Err("static control-plane identity has trailing bytes".to_string());
+        }
+        Ok(Self {
+            cluster_id,
+            topology_generation,
+            topology_digest,
+            process_id,
+            process_identity_digest,
+            raft_node_id,
+            established,
+        })
+    }
+
+    fn verify(&self, expected: &Self) -> Result<(), String> {
+        if self.cluster_id != expected.cluster_id {
+            return Err("static control-plane identity belongs to a different cluster".to_string());
+        }
+        if self.topology_generation != expected.topology_generation {
+            return Err(
+                "static control-plane identity has a different topology generation".to_string(),
+            );
+        }
+        if self.topology_digest != expected.topology_digest {
+            return Err(
+                "static control-plane identity has a different topology digest".to_string(),
+            );
+        }
+        if self.process_id != expected.process_id {
+            return Err("static control-plane identity belongs to a different process".to_string());
+        }
+        if self.process_identity_digest != expected.process_identity_digest {
+            return Err(
+                "static control-plane identity has a different process identity".to_string(),
+            );
+        }
+        if self.raft_node_id != expected.raft_node_id {
+            return Err(
+                "static control-plane identity belongs to a different Raft node".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn initialize_static_control_plane_identity(
+    identity: &ConfiguredStaticClusterIdentity,
+    raft_node_id: u64,
+    state_path: &Path,
+) -> Result<(), String> {
+    initialize_static_control_plane_identity_after_lock(identity, raft_node_id, state_path, || {})
+}
+
+fn initialize_static_control_plane_identity_after_lock<F>(
+    identity: &ConfiguredStaticClusterIdentity,
+    raft_node_id: u64,
+    state_path: &Path,
+    after_lock: F,
+) -> Result<(), String>
+where
+    F: FnOnce(),
+{
+    let _state_lock = crate::acquire_control_plane_state_lock(state_path)?;
+    after_lock();
+    let expected = StaticControlPlaneIdentity::new(identity, raft_node_id);
+    let identity_path = static_control_plane_identity_path(state_path);
+    if identity_path.try_exists().map_err(|error| {
+        format!(
+            "inspect static control-plane identity {}: {error}",
+            identity_path.display()
+        )
+    })? {
+        let actual = read_static_control_plane_identity(&identity_path)?;
+        actual.verify(&expected)?;
+        if actual.established {
+            return Err(
+                "static control-plane identity is already established; use ordinary startup"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    if control_plane_state_evidence_exists(state_path)? {
+        return Err(format!(
+            "cannot initialize static control-plane identity beside existing durable state {}; use an explicit replacement ceremony",
+            state_path.display()
+        ));
+    }
+    ensure_private_control_plane_state_parent(state_path)?;
+    publish_new_static_control_plane_identity(&identity_path, &expected)
+}
+
+pub(crate) fn bind_static_control_plane_identity(
+    identity: &ConfiguredStaticClusterIdentity,
+    raft_node_id: u64,
+    state_path: &Path,
+) -> Result<(), String> {
+    let expected = StaticControlPlaneIdentity::new(identity, raft_node_id);
+    let identity_path = static_control_plane_identity_path(state_path);
+    if identity_path.try_exists().map_err(|error| {
+        format!(
+            "inspect static control-plane identity {}: {error}",
+            identity_path.display()
+        )
+    })? {
+        let actual = read_static_control_plane_identity(&identity_path)?;
+        actual.verify(&expected)?;
+        if actual.established && !control_plane_established_restart_set_exists(state_path)? {
+            return Err(format!(
+                "established static control-plane identity exists without its durable Raft state {}; relocate the complete state set or use an explicit replacement ceremony",
+                state_path.display()
+            ));
+        }
+        return Ok(());
+    }
+
+    let existing_state = control_plane_state_evidence_exists(state_path)?;
+    Err(if existing_state {
+        format!(
+            "static control-plane identity is missing beside existing durable state {}; relocate the complete state set or use an explicit replacement ceremony",
+            state_path.display()
+        )
+    } else {
+        format!(
+            "static control-plane identity is not initialized beside {}; run initialize-cluster-state before startup",
+            state_path.display()
+        )
+    })
+}
+
+pub(crate) fn mark_static_control_plane_identity_established(
+    identity: &ConfiguredStaticClusterIdentity,
+    raft_node_id: u64,
+    state_path: &Path,
+) -> Result<(), String> {
+    if !control_plane_established_restart_set_exists(state_path)? {
+        return Err(
+            "cannot establish static control-plane identity before the durable Raft artifact and sentinel exist"
+                .to_string(),
+        );
+    }
+    let identity_path = static_control_plane_identity_path(state_path);
+    let mut actual = read_static_control_plane_identity(&identity_path)?;
+    actual.verify(&StaticControlPlaneIdentity::new(identity, raft_node_id))?;
+    if actual.established {
+        return Ok(());
+    }
+    actual.established = true;
+    replace_static_control_plane_identity(&identity_path, &actual)
+}
+
+fn replace_static_control_plane_identity(
+    identity_path: &Path,
+    identity: &StaticControlPlaneIdentity,
+) -> Result<(), String> {
+    let parent = identity_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let next_path = identity_path.with_extension("identity.next");
+    if next_path.try_exists().map_err(|error| {
+        format!(
+            "inspect prepared static control-plane identity {}: {error}",
+            next_path.display()
+        )
+    })? {
+        fs::remove_file(&next_path).map_err(|error| {
+            format!(
+                "remove stale prepared static control-plane identity {}: {error}",
+                next_path.display()
+            )
+        })?;
+        sync_directory(
+            parent,
+            "sync removal of stale static control-plane identity",
+        )?;
+    }
+    create_control_plane_identity_file(&next_path, identity)?;
+    sync_directory(parent, "sync prepared static control-plane identity")?;
+    fs::rename(&next_path, identity_path).map_err(|error| {
+        format!(
+            "publish static control-plane identity {}: {error}",
+            identity_path.display()
+        )
+    })?;
+    sync_directory(parent, "sync published static control-plane identity")
+}
+
+fn static_control_plane_identity_path(state_path: &Path) -> std::path::PathBuf {
+    let file_name = state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("control-plane.state");
+    state_path.with_file_name(format!("{file_name}.static-identity"))
+}
+
+fn publish_new_static_control_plane_identity(
+    identity_path: &Path,
+    identity: &StaticControlPlaneIdentity,
+) -> Result<(), String> {
+    let parent = identity_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let next_path = identity_path.with_extension("identity.next");
+    if next_path.try_exists().map_err(|error| {
+        format!(
+            "inspect prepared static control-plane identity {}: {error}",
+            next_path.display()
+        )
+    })? {
+        fs::remove_file(&next_path).map_err(|error| {
+            format!(
+                "remove incomplete static control-plane identity {}: {error}",
+                next_path.display()
+            )
+        })?;
+        sync_directory(
+            parent,
+            "sync removal of incomplete static control-plane identity",
+        )?;
+    }
+    create_control_plane_identity_file(&next_path, identity)?;
+    sync_directory(parent, "sync prepared static control-plane identity")?;
+    fs::rename(&next_path, identity_path).map_err(|error| {
+        format!(
+            "publish static control-plane identity {}: {error}",
+            identity_path.display()
+        )
+    })?;
+    sync_directory(parent, "sync published static control-plane identity")
+}
+
+fn ensure_private_control_plane_state_parent(state_path: &Path) -> Result<(), String> {
+    ensure_control_plane_state_parent_directory(state_path)
+        .map_err(|error| format!("durably create static control-plane state directory: {error}"))?;
+    let parent = state_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            "static control-plane state path must have an explicit parent directory".to_string()
+        })?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE)).map_err(
+        |error| {
+            format!(
+                "set private permissions on static control-plane state directory {}: {error}",
+                parent.display()
+            )
+        },
+    )?;
+    sync_directory(parent, "sync static control-plane state directory")
+}
+
+fn control_plane_state_evidence_exists(state_path: &Path) -> Result<bool, String> {
+    let file_name = state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("control-plane.state");
+    for path in [
+        state_path.to_path_buf(),
+        state_path.with_file_name(format!("{file_name}.sentinel")),
+        state_path.with_file_name(format!("{file_name}.wal")),
+    ] {
+        if path.try_exists().map_err(|error| {
+            format!(
+                "inspect existing static control-plane state {}: {error}",
+                path.display()
+            )
+        })? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn control_plane_established_restart_set_exists(state_path: &Path) -> Result<bool, String> {
+    let file_name = state_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("control-plane.state");
+    let sentinel_path = state_path.with_file_name(format!("{file_name}.sentinel"));
+    Ok(state_file_is_nonempty_regular(state_path)?
+        && state_file_is_nonempty_regular(&sentinel_path)?)
+}
+
+fn state_file_is_nonempty_regular(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(format!(
+                    "static control-plane state evidence {} is not a regular file",
+                    path.display()
+                ));
+            }
+            Ok(metadata.len() != 0)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "inspect static control-plane state evidence {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn create_control_plane_identity_file(
+    path: &Path,
+    identity: &StaticControlPlaneIdentity,
+) -> Result<(), String> {
+    let bytes = identity.encode()?;
+    let mut options = OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(PRIVATE_FILE_MODE);
+    let mut file = options.open(path).map_err(|error| {
+        format!(
+            "create static control-plane identity {}: {error}",
+            path.display()
+        )
+    })?;
+    file.write_all(&bytes).map_err(|error| {
+        format!(
+            "write static control-plane identity {}: {error}",
+            path.display()
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "sync static control-plane identity {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn read_static_control_plane_identity(path: &Path) -> Result<StaticControlPlaneIdentity, String> {
+    let bytes = read_bounded_identity_file(
+        path,
+        CONTROL_PLANE_IDENTITY_MAX_BYTES,
+        "static control-plane identity",
+    )?;
+    StaticControlPlaneIdentity::decode(&bytes)
 }
 
 impl StaticStorageIdentity {
@@ -547,36 +976,40 @@ fn sync_identity_file(path: &Path, context: &'static str) -> Result<(), String> 
 }
 
 fn read_static_storage_identity(path: &Path) -> Result<StaticStorageIdentity, String> {
+    let bytes =
+        read_bounded_identity_file(path, STORAGE_IDENTITY_MAX_BYTES, "static storage identity")?;
+    StaticStorageIdentity::decode(&bytes)
+}
+
+fn read_bounded_identity_file(
+    path: &Path,
+    max_bytes: u64,
+    label: &'static str,
+) -> Result<Vec<u8>, String> {
     let mut options = OpenOptions::new();
     options
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     let file = options
         .open(path)
-        .map_err(|error| format!("open static storage identity {}: {error}", path.display()))?;
-    let metadata = file.metadata().map_err(|error| {
-        format!(
-            "inspect static storage identity {}: {error}",
-            path.display()
-        )
-    })?;
+        .map_err(|error| format!("open {label} {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?;
     if !metadata.is_file() {
-        return Err(format!(
-            "static storage identity {} is not a regular file",
-            path.display()
-        ));
+        return Err(format!("{label} {} is not a regular file", path.display()));
     }
-    if metadata.len() > STORAGE_IDENTITY_MAX_BYTES {
-        return Err("static storage identity exceeds its size bound".to_string());
+    if metadata.len() > max_bytes {
+        return Err(format!("{label} exceeds its size bound"));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(STORAGE_IDENTITY_MAX_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| format!("read static storage identity {}: {error}", path.display()))?;
-    if bytes.len() > STORAGE_IDENTITY_MAX_BYTES as usize {
-        return Err("static storage identity exceeds its size bound".to_string());
+        .map_err(|error| format!("read {label} {}: {error}", path.display()))?;
+    if bytes.len() > max_bytes as usize {
+        return Err(format!("{label} exceeds its size bound"));
     }
-    StaticStorageIdentity::decode(&bytes)
+    Ok(bytes)
 }
 
 fn encode_string(bytes: &mut Vec<u8>, value: &str, field: &str) -> Result<(), String> {
@@ -686,6 +1119,188 @@ mod tests {
             ec_shape,
             ClusterEpoch::INITIAL,
         )
+    }
+
+    fn write_control_plane_restart_set(state_path: &Path) {
+        let file_name = state_path.file_name().unwrap().to_str().unwrap();
+        fs::write(state_path, b"durable artifact").unwrap();
+        fs::write(
+            state_path.with_file_name(format!("{file_name}.sentinel")),
+            b"durable sentinel",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn static_control_plane_identity_requires_explicit_initialization_and_reopens_exact_identity() {
+        let temp = test_util::tempdir();
+        let state_path = temp.path().join("control.state");
+        let expected = identity("control-1", "b");
+
+        let error = bind_static_control_plane_identity(&expected, 101, &state_path).unwrap_err();
+        assert!(error.contains("run initialize-cluster-state"));
+        initialize_static_control_plane_identity(&expected, 101, &state_path).unwrap();
+        bind_static_control_plane_identity(&expected, 101, &state_path).unwrap();
+
+        let identity_path = static_control_plane_identity_path(&state_path);
+        assert!(identity_path.is_file());
+        assert_eq!(
+            read_static_control_plane_identity(&identity_path).unwrap(),
+            StaticControlPlaneIdentity::new(&expected, 101)
+        );
+    }
+
+    #[test]
+    fn static_control_plane_identity_initialization_rejects_concurrent_initializer() {
+        let temp = test_util::tempdir();
+        let state_path = temp.path().join("control.state");
+        let expected = identity("control-1", "b");
+        let first_path = state_path.clone();
+        let first_expected = expected.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let first = std::thread::spawn(move || {
+            initialize_static_control_plane_identity_after_lock(
+                &first_expected,
+                101,
+                &first_path,
+                || {
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        locked_rx.recv().unwrap();
+
+        let error =
+            initialize_static_control_plane_identity(&expected, 101, &state_path).unwrap_err();
+        assert!(error.contains("already locked by another manager"));
+
+        release_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        bind_static_control_plane_identity(&expected, 101, &state_path).unwrap();
+    }
+
+    #[test]
+    fn static_control_plane_identity_rejects_changed_process_or_topology() {
+        let temp = test_util::tempdir();
+        let state_path = temp.path().join("control.state");
+        initialize_static_control_plane_identity(&identity("control-1", "b"), 101, &state_path)
+            .unwrap();
+
+        let process_error =
+            bind_static_control_plane_identity(&identity("control-2", "c"), 101, &state_path)
+                .unwrap_err();
+        assert!(process_error.contains("different process"));
+
+        let mut changed_topology = identity("control-1", "b");
+        changed_topology.topology_generation += 1;
+        let topology_error =
+            bind_static_control_plane_identity(&changed_topology, 101, &state_path).unwrap_err();
+        assert!(topology_error.contains("topology generation"));
+    }
+
+    #[test]
+    fn static_control_plane_identity_rejects_existing_state_without_sidecar() {
+        let temp = test_util::tempdir();
+        let state_path = temp.path().join("control.state");
+        fs::write(&state_path, b"existing artifact").unwrap();
+
+        let error =
+            bind_static_control_plane_identity(&identity("control-1", "b"), 101, &state_path)
+                .unwrap_err();
+
+        assert!(error.contains("identity is missing beside existing durable state"));
+    }
+
+    #[test]
+    fn static_control_plane_identity_rejects_existing_wal_without_sidecar() {
+        let temp = test_util::tempdir();
+        let state_path = temp.path().join("control.state");
+        fs::write(temp.path().join("control.state.wal"), b"existing WAL").unwrap();
+
+        let error =
+            bind_static_control_plane_identity(&identity("control-1", "b"), 101, &state_path)
+                .unwrap_err();
+
+        assert!(error.contains("identity is missing beside existing durable state"));
+    }
+
+    #[test]
+    fn static_control_plane_established_identity_rejects_empty_destination() {
+        let temp = test_util::tempdir();
+        let state_path = temp.path().join("control.state");
+        let expected = identity("control-1", "b");
+        initialize_static_control_plane_identity(&expected, 101, &state_path).unwrap();
+        write_control_plane_restart_set(&state_path);
+        mark_static_control_plane_identity_established(&expected, 101, &state_path).unwrap();
+        fs::remove_file(&state_path).unwrap();
+
+        let error = bind_static_control_plane_identity(&expected, 101, &state_path).unwrap_err();
+
+        assert!(error.contains("established static control-plane identity exists without"));
+    }
+
+    #[test]
+    fn static_control_plane_complete_relocation_preserves_identity_binding() {
+        let temp = test_util::tempdir();
+        let source_path = temp.path().join("source.state");
+        let destination_path = temp.path().join("destination.state");
+        let expected = identity("control-1", "b");
+        initialize_static_control_plane_identity(&expected, 101, &source_path).unwrap();
+        write_control_plane_restart_set(&source_path);
+        mark_static_control_plane_identity_established(&expected, 101, &source_path).unwrap();
+
+        fs::copy(&source_path, &destination_path).unwrap();
+        fs::copy(
+            source_path.with_file_name("source.state.sentinel"),
+            destination_path.with_file_name("destination.state.sentinel"),
+        )
+        .unwrap();
+        fs::copy(
+            static_control_plane_identity_path(&source_path),
+            static_control_plane_identity_path(&destination_path),
+        )
+        .unwrap();
+
+        bind_static_control_plane_identity(&expected, 101, &destination_path).unwrap();
+    }
+
+    #[test]
+    fn static_control_plane_established_identity_rejects_empty_wal_as_restart_evidence() {
+        let temp = test_util::tempdir();
+        let state_path = temp.path().join("control.state");
+        let expected = identity("control-1", "b");
+        initialize_static_control_plane_identity(&expected, 101, &state_path).unwrap();
+        write_control_plane_restart_set(&state_path);
+        mark_static_control_plane_identity_established(&expected, 101, &state_path).unwrap();
+        fs::remove_file(&state_path).unwrap();
+        fs::remove_file(temp.path().join("control.state.sentinel")).unwrap();
+        File::create(temp.path().join("control.state.wal")).unwrap();
+
+        let error = bind_static_control_plane_identity(&expected, 101, &state_path).unwrap_err();
+
+        assert!(error.contains("established static control-plane identity exists without"));
+    }
+
+    #[test]
+    fn static_control_plane_identity_digest_covers_established_state() {
+        let temp = test_util::tempdir();
+        let state_path = temp.path().join("control.state");
+        let expected = identity("control-1", "b");
+        initialize_static_control_plane_identity(&expected, 101, &state_path).unwrap();
+        write_control_plane_restart_set(&state_path);
+        mark_static_control_plane_identity_established(&expected, 101, &state_path).unwrap();
+        let identity_path = static_control_plane_identity_path(&state_path);
+        let mut bytes = fs::read(&identity_path).unwrap();
+        let established_offset = CONTROL_PLANE_IDENTITY_MAGIC.len() + 2 + 8 + 8;
+        assert_eq!(bytes[established_offset], 1);
+        bytes[established_offset] = 0;
+        fs::write(&identity_path, bytes).unwrap();
+
+        let error = bind_static_control_plane_identity(&expected, 101, &state_path).unwrap_err();
+
+        assert!(error.contains("invalid digest"));
     }
 
     #[test]

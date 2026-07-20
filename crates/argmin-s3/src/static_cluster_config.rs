@@ -1,4 +1,9 @@
-use crate::config::{ConfiguredStaticClusterIdentity, ServerConfig};
+use crate::config::{
+    BinarySecretConfigValue, ConfiguredControlPlaneAdminAuthCredential,
+    ConfiguredControlPlaneFrontendAuthCredential, ConfiguredControlPlaneRaftAuthCredential,
+    ConfiguredControlPlaneRaftPeerSocket, ConfiguredControlPlaneStorageAuthCredential,
+    ConfiguredStaticClusterIdentity, ConfiguredStorageNodeSocket, ServerConfig,
+};
 use ec::EcConfig;
 use placement::{
     ClusterMap, Level, NodeId, NodeInfo, PlacementConfig, PlacementConstraint, Placer, TopologyKey,
@@ -15,9 +20,11 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use storage::control_plane_raft::{
     ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
 };
@@ -882,6 +889,363 @@ impl ValidatedStaticClusterManifest {
         )
     }
 
+    pub(crate) fn initialize_selected_process_state(&self) -> Result<(), String> {
+        match self.manifest.deployment.mode {
+            DeploymentMode::Standalone => self.initialize_standalone_storage(),
+            DeploymentMode::Replicated => {
+                let selected = &self.manifest.processes[self.selected_process_index];
+                if selected.kind != ProcessKind::ControlPlane {
+                    return Err(
+                        "replicated state initialization currently supports control-plane processes only"
+                            .to_string(),
+                    );
+                }
+                let authority = self
+                    .manifest
+                    .authorities
+                    .iter()
+                    .find(|authority| authority.process_id == selected.id)
+                    .ok_or_else(|| {
+                        "selected replicated control-plane process has no authority".to_string()
+                    })?;
+                let raft_node_id = authority.raft_node_id.ok_or_else(|| {
+                    "selected replicated authority has no Raft node id".to_string()
+                })?;
+                crate::static_cluster_state::initialize_static_control_plane_identity(
+                    &self.configured_static_identity(),
+                    raft_node_id,
+                    &authority.state_path,
+                )
+            }
+        }
+    }
+
+    fn replicated_unix_control_plane_server_config<F>(
+        &self,
+        material: &ResolvedStaticClusterMaterial,
+        get: F,
+    ) -> Result<ServerConfig, String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if self.manifest.deployment.mode != DeploymentMode::Replicated {
+            return Err(
+                "replicated control-plane mapping requires deployment mode replicated".to_string(),
+            );
+        }
+        if self.manifest.deployment.internal_auth != InternalAuth::Required {
+            return Err(
+                "replicated control-plane mapping requires internal authentication".to_string(),
+            );
+        }
+        if !material.tls_identities.is_empty() || !material.tls_trust_bundles.is_empty() {
+            return Err(
+                "TCP static cluster runtime activation is not implemented; replicated Unix mapping cannot consume TLS material"
+                    .to_string(),
+            );
+        }
+
+        let selected = &self.manifest.processes[self.selected_process_index];
+        if selected.kind != ProcessKind::ControlPlane {
+            return Err(
+                "this static runtime slice currently maps replicated control-plane processes only"
+                    .to_string(),
+            );
+        }
+        let authority = self
+            .manifest
+            .authorities
+            .iter()
+            .find(|authority| authority.process_id == selected.id)
+            .ok_or_else(|| "selected control-plane process has no authority".to_string())?;
+        let raft_node_id = authority
+            .raft_node_id
+            .ok_or_else(|| "selected replicated authority has no Raft node id".to_string())?;
+
+        let local_control_path =
+            self.preferred_owned_unix_endpoint_path(selected, EndpointProtocol::ControlPlane)?;
+        let local_recovery_path = self.preferred_owned_unix_endpoint_path(
+            selected,
+            EndpointProtocol::AuthorityClockRecovery,
+        )?;
+        let local_raft_path =
+            self.preferred_owned_unix_endpoint_path(selected, EndpointProtocol::RaftPeer)?;
+        let local_raft_endpoint =
+            self.preferred_owned_endpoint(selected, EndpointProtocol::RaftPeer)?;
+        let local_raft_transport = self
+            .manifest
+            .transport_profiles
+            .iter()
+            .find(|profile| profile.id == local_raft_endpoint.transport_profile_id)
+            .expect("validated Raft endpoint transport profile exists");
+        let raft_transport_limits = ControlPlaneRaftPeerTransportLimits {
+            max_frame_bytes: usize::try_from(local_raft_transport.max_frame_bytes)
+                .map_err(|_| "Raft frame limit does not fit usize".to_string())?,
+            max_append_entries: usize::try_from(self.manifest.raft.max_append_entries)
+                .map_err(|_| "Raft append-entry limit does not fit usize".to_string())?,
+            max_append_entries_bytes: usize::try_from(self.manifest.raft.max_append_bytes)
+                .map_err(|_| "Raft append-byte limit does not fit usize".to_string())?,
+            max_snapshot_bytes: usize::try_from(self.manifest.raft.max_snapshot_bytes)
+                .map_err(|_| "Raft snapshot limit does not fit usize".to_string())?,
+        };
+
+        let process_by_id = self
+            .manifest
+            .processes
+            .iter()
+            .map(|process| (process.id.as_str(), process))
+            .collect::<BTreeMap<_, _>>();
+        let mut raft_peer_sockets = Vec::new();
+        let mut control_plane_client_socket_paths = Vec::new();
+        for peer_authority in &self.manifest.authorities {
+            let peer_process = process_by_id
+                .get(peer_authority.process_id.as_str())
+                .expect("validated authority process exists");
+            if peer_process.host_id != selected.host_id {
+                return Err(
+                    "TCP static cluster runtime activation is not implemented; a replicated Unix authority cannot reach a voter on another host"
+                        .to_string(),
+                );
+            }
+            let peer_node_id = peer_authority
+                .raft_node_id
+                .expect("validated replicated authority has a Raft node id");
+            raft_peer_sockets.push(ConfiguredControlPlaneRaftPeerSocket {
+                node_id: peer_node_id,
+                socket_path: self
+                    .preferred_owned_unix_endpoint_path(peer_process, EndpointProtocol::RaftPeer)?,
+            });
+            control_plane_client_socket_paths.push(self.preferred_owned_unix_endpoint_path(
+                peer_process,
+                EndpointProtocol::ControlPlane,
+            )?);
+        }
+        raft_peer_sockets.sort_by_key(|peer| peer.node_id);
+
+        let storage_process_by_node = self
+            .manifest
+            .storage_nodes
+            .iter()
+            .map(|storage_node| {
+                (
+                    storage_node.node_id,
+                    process_by_id
+                        .get(storage_node.process_id.as_str())
+                        .expect("validated storage-node process exists"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut storage_node_sockets = Vec::new();
+        for (node_id, storage_process) in storage_process_by_node {
+            if storage_process.host_id != selected.host_id {
+                return Err(
+                    "TCP static cluster runtime activation is not implemented; a replicated Unix authority cannot bootstrap a storage node on another host"
+                        .to_string(),
+                );
+            }
+            storage_node_sockets.push(ConfiguredStorageNodeSocket {
+                node_id,
+                socket_path: self.preferred_owned_unix_endpoint_path(
+                    storage_process,
+                    EndpointProtocol::StorageRpc,
+                )?,
+            });
+        }
+
+        let mut raft_auth_credentials = Vec::new();
+        let mut storage_auth_credentials = Vec::new();
+        let mut frontend_auth_credentials = Vec::new();
+        let mut admin_auth_credentials = Vec::new();
+        let mut raft_signer = None;
+        for credential in &material.auth_credentials {
+            let secret = BinarySecretConfigValue::from_bytes(credential.secret.clone());
+            let signer = (
+                credential.credential_id.clone(),
+                credential.credential_version,
+            );
+            match (&credential.principal.principal, &credential.principal.id) {
+                (AuthPrincipal::RaftPeer, CredentialPrincipalId::Node(node_id)) => {
+                    raft_auth_credentials.push(ConfiguredControlPlaneRaftAuthCredential {
+                        node_id: *node_id,
+                        credential_id: credential.credential_id.clone(),
+                        credential_version: credential.credential_version,
+                        secret,
+                    });
+                    if credential.use_for_signing && *node_id == raft_node_id {
+                        raft_signer = Some(signer);
+                    }
+                }
+                (AuthPrincipal::StorageNode, CredentialPrincipalId::Node(node_id)) => {
+                    storage_auth_credentials.push(ConfiguredControlPlaneStorageAuthCredential {
+                        node_id: u32::try_from(*node_id).map_err(|_| {
+                            "resolved storage-node auth principal does not fit u32".to_string()
+                        })?,
+                        credential_id: credential.credential_id.clone(),
+                        credential_version: credential.credential_version,
+                        secret,
+                    });
+                }
+                (AuthPrincipal::Frontend, CredentialPrincipalId::Instance(instance_id)) => {
+                    frontend_auth_credentials.push(ConfiguredControlPlaneFrontendAuthCredential {
+                        instance_id: instance_id.clone(),
+                        credential_id: credential.credential_id.clone(),
+                        credential_version: credential.credential_version,
+                        secret,
+                    });
+                }
+                (AuthPrincipal::Admin, CredentialPrincipalId::Instance(instance_id)) => {
+                    admin_auth_credentials.push(ConfiguredControlPlaneAdminAuthCredential {
+                        instance_id: instance_id.clone(),
+                        credential_id: credential.credential_id.clone(),
+                        credential_version: credential.credential_version,
+                        secret,
+                    });
+                }
+                (AuthPrincipal::Maintenance, _) => {
+                    return Err(
+                        "maintenance-principal runtime activation is not implemented".to_string(),
+                    );
+                }
+                _ => {
+                    return Err(
+                        "resolved static auth credential has a mismatched principal identity"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        let raft_signer = raft_signer.ok_or_else(|| {
+            "selected replicated authority has no active Raft signing credential".to_string()
+        })?;
+        let admin_instance_id = selected.admin_instance_id.clone().ok_or_else(|| {
+            "selected replicated control-plane process has no admin instance id".to_string()
+        })?;
+
+        let mut manifest_values = BTreeMap::<&'static str, String>::new();
+        manifest_values.insert("ARGMIN_PROCESS_ROLE", "control-plane".to_string());
+        manifest_values.insert(
+            "ARGMIN_PG_COUNT",
+            self.manifest.storage.pg_count.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_STORAGE_CLUSTER_EPOCH",
+            self.manifest.storage.initial_cluster_epoch.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_EC_K",
+            self.manifest.storage.ec_data_shards.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_EC_M",
+            self.manifest.storage.ec_parity_shards.to_string(),
+        );
+        manifest_values.insert("ARGMIN_REGION", self.manifest.cluster.region.clone());
+        manifest_values.insert("ARGMIN_HOST_ID", selected.host_id.clone());
+        manifest_values.insert(
+            "ARGMIN_CONTROL_PLANE_STATE_PATH",
+            authority.state_path.to_string_lossy().into_owned(),
+        );
+        manifest_values.insert(
+            "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+            local_control_path.clone(),
+        );
+        manifest_values.insert("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "1".to_string());
+        manifest_values.insert(
+            "ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME",
+            self.raft_cluster_identity(),
+        );
+        manifest_values.insert(
+            "ARGMIN_CONTROL_PLANE_RAFT_NODE_ID",
+            raft_node_id.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+            local_raft_path.clone(),
+        );
+        let mut config = ServerConfig::from_lookup(|key| {
+            manifest_values.get(key).cloned().or_else(|| get(key))
+        })?;
+        config.control_plane_state_path = Some(authority.state_path.to_string_lossy().into_owned());
+        config.control_plane_socket_path = Some(local_control_path);
+        config.control_plane_clock_recovery_socket_path = Some(local_recovery_path);
+        config.control_plane_client_socket_paths = control_plane_client_socket_paths;
+        config.control_plane_auth_cluster_id = Some(self.manifest.cluster.id.clone());
+        config.control_plane_storage_auth_credentials = storage_auth_credentials;
+        config.control_plane_frontend_auth_credentials = frontend_auth_credentials;
+        config.control_plane_admin_auth_instance_id = Some(admin_instance_id);
+        config.control_plane_admin_auth_credentials = admin_auth_credentials;
+        config.control_plane_raft_cluster_name = Some(self.raft_cluster_identity());
+        config.control_plane_raft_peer_socket_path = Some(local_raft_path);
+        config.control_plane_raft_peer_sockets = raft_peer_sockets;
+        config.control_plane_raft_peer_transport_limits = raft_transport_limits;
+        config.control_plane_raft_peer_max_connections =
+            usize::try_from(local_raft_transport.max_connections)
+                .map_err(|_| "Raft connection limit does not fit usize".to_string())?;
+        config.control_plane_raft_peer_connect_timeout =
+            Duration::from_millis(local_raft_transport.connect_timeout_ms);
+        config.control_plane_raft_peer_io_timeout =
+            Duration::from_millis(local_raft_transport.io_timeout_ms);
+        config.control_plane_raft_auth_credentials = raft_auth_credentials;
+        config.control_plane_raft_auth_signing_credential = Some(raft_signer);
+        config.storage_node_sockets = storage_node_sockets;
+        config.static_cluster_identity = Some(self.configured_static_identity());
+        Ok(config)
+    }
+
+    fn configured_static_identity(&self) -> ConfiguredStaticClusterIdentity {
+        let selected = &self.manifest.processes[self.selected_process_index];
+        ConfiguredStaticClusterIdentity {
+            cluster_id: self.manifest.cluster.id.clone(),
+            topology_generation: self.manifest.cluster.topology_generation,
+            topology_digest: self.topology_digest.clone(),
+            process_id: selected.id.clone(),
+            process_identity_digest: self.process_identity_digest.clone(),
+        }
+    }
+
+    fn raft_cluster_identity(&self) -> String {
+        format!(
+            "{}:topology:{}:{}",
+            self.manifest.cluster.id,
+            self.manifest.cluster.topology_generation,
+            self.topology_digest
+        )
+    }
+
+    fn preferred_owned_unix_endpoint_path(
+        &self,
+        owner: &ProcessInput,
+        protocol: EndpointProtocol,
+    ) -> Result<String, String> {
+        let endpoint = self.preferred_owned_endpoint(owner, protocol)?;
+        match parse_endpoint_address(&endpoint.advertise, true)? {
+            EndpointAddress::Unix(path) => Ok(path.to_string_lossy().into_owned()),
+            EndpointAddress::Tcp { .. } => Err(format!(
+                "TCP static cluster runtime activation is not implemented for endpoint {}",
+                endpoint.id
+            )),
+        }
+    }
+
+    fn preferred_owned_endpoint(
+        &self,
+        owner: &ProcessInput,
+        protocol: EndpointProtocol,
+    ) -> Result<&EndpointInput, String> {
+        self.manifest
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.owner_process_id == owner.id)
+            .filter(|endpoint| endpoint.protocol == protocol)
+            .min_by_key(|endpoint| (endpoint.priority, endpoint.id.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "process {} has no endpoint for protocol {protocol:?}",
+                    owner.id
+                )
+            })
+    }
+
     fn standalone_legacy_server_config<F>(&self, get: F) -> Result<ServerConfig, String>
     where
         F: Fn(&str) -> Option<String>,
@@ -1037,9 +1401,14 @@ where
                 }
             }
             let manifest = load_static_cluster_manifest_structural(config_path, process_id)?;
-            let config = manifest.standalone_legacy_server_config(get)?;
             validate_filesystem(&manifest)?;
-            Ok(config)
+            match manifest.manifest.deployment.mode {
+                DeploymentMode::Standalone => manifest.standalone_legacy_server_config(get),
+                DeploymentMode::Replicated => {
+                    let material = manifest.resolve_selected_process_material()?;
+                    manifest.replicated_unix_control_plane_server_config(&material, get)
+                }
+            }
         }
     }
 }
@@ -2080,9 +2449,10 @@ fn validate_static_cluster_manifest(
         &tls_trust_bundles,
         &manifest.deployment,
     )?;
-    validate_global_durable_path_uniqueness(
+    validate_global_runtime_path_namespace(
         &manifest.authorities,
         &manifest.storage_nodes,
+        &manifest.endpoints,
         &processes,
     )?;
     let initial_pg_acting_sets = validate_deployment(
@@ -2483,33 +2853,218 @@ fn validate_storage_nodes<'a>(
     Ok(result)
 }
 
-fn validate_global_durable_path_uniqueness(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimePathReservationKind {
+    File,
+    Directory,
+    FilenamePrefix,
+}
+
+#[derive(Debug)]
+struct RuntimePathReservation {
+    host_id: String,
+    path: PathBuf,
+    kind: RuntimePathReservationKind,
+    label: String,
+}
+
+fn validate_global_runtime_path_namespace(
     authorities: &[AuthorityInput],
     storage_nodes: &[StorageNodeInput],
+    endpoints: &[EndpointInput],
     processes: &BTreeMap<&str, &ProcessInput>,
 ) -> Result<(), String> {
-    let mut paths = BTreeSet::new();
+    let mut reservations = Vec::new();
     for authority in authorities {
         let process = processes[authority.process_id.as_str()];
-        let path = normalize_absolute_path(&authority.state_path, "authority state path")?;
-        if !paths.insert((process.host_id.as_str(), path)) {
-            return Err(format!(
-                "duplicate durable state/data path on host {}",
-                process.host_id
-            ));
+        let state_path = normalize_absolute_path(&authority.state_path, "authority state path")?;
+        reserve_runtime_path(
+            &mut reservations,
+            process.host_id.as_str(),
+            state_path.clone(),
+            RuntimePathReservationKind::File,
+            format!("authority {} state", authority.id),
+        );
+        for (suffix, label) in [
+            (".sentinel", "Raft artifact sentinel"),
+            (".wal", "Raft WAL"),
+            (".lock", "process state lock"),
+            (".static-identity", "static identity"),
+            (".identity.next", "prepared static identity"),
+            (".clock", "authority-clock checkpoint"),
+            (".clock.tmp", "prepared authority-clock checkpoint"),
+            (".identity", "standalone identity"),
+            (".identity.tmp", "prepared standalone identity"),
+            (".journal", "standalone journal"),
+            (".initialized", "standalone initialization marker"),
+            (
+                ".initialized.tmp",
+                "prepared standalone initialization marker",
+            ),
+        ] {
+            reserve_runtime_path(
+                &mut reservations,
+                process.host_id.as_str(),
+                path_with_suffix(&state_path, suffix),
+                RuntimePathReservationKind::File,
+                format!("authority {} {label}", authority.id),
+            );
+        }
+        reserve_runtime_path(
+            &mut reservations,
+            process.host_id.as_str(),
+            state_path.with_extension("tmp"),
+            RuntimePathReservationKind::File,
+            format!("authority {} prepared standalone snapshot", authority.id),
+        );
+        for (base_path, label) in [
+            (state_path.clone(), "Raft artifact temporary file"),
+            (
+                path_with_suffix(&state_path, ".sentinel"),
+                "Raft artifact sentinel temporary file",
+            ),
+            (
+                path_with_suffix(&state_path, ".wal"),
+                "Raft WAL temporary file",
+            ),
+            (
+                path_with_suffix(&state_path, ".journal"),
+                "standalone journal temporary file",
+            ),
+        ] {
+            reserve_runtime_path(
+                &mut reservations,
+                process.host_id.as_str(),
+                path_with_suffix(&base_path, ".tmp."),
+                RuntimePathReservationKind::FilenamePrefix,
+                format!("authority {} {label}", authority.id),
+            );
         }
     }
     for storage_node in storage_nodes {
         let process = processes[storage_node.process_id.as_str()];
         let path = normalize_absolute_path(&storage_node.data_dir, "storage data path")?;
-        if !paths.insert((process.host_id.as_str(), path)) {
-            return Err(format!(
-                "duplicate durable state/data path on host {}",
-                process.host_id
-            ));
+        reserve_runtime_path(
+            &mut reservations,
+            process.host_id.as_str(),
+            path,
+            RuntimePathReservationKind::Directory,
+            format!("storage node {} data directory", storage_node.node_id),
+        );
+    }
+    for endpoint in endpoints {
+        let process = processes[endpoint.owner_process_id.as_str()];
+        let EndpointAddress::Unix(path) = parse_endpoint_address(&endpoint.listen, true)? else {
+            continue;
+        };
+        reserve_runtime_path(
+            &mut reservations,
+            process.host_id.as_str(),
+            path,
+            RuntimePathReservationKind::File,
+            format!("endpoint {} Unix socket", endpoint.id),
+        );
+    }
+
+    let mut exact_paths = BTreeMap::<(String, PathBuf), usize>::new();
+    for (index, reservation) in reservations.iter().enumerate() {
+        let key = (reservation.host_id.clone(), reservation.path.clone());
+        if let Some(previous) = exact_paths.insert(key, index) {
+            return runtime_path_collision(&reservations[previous], reservation);
+        }
+    }
+    for reservation in &reservations {
+        for ancestor in reservation.path.ancestors().skip(1) {
+            let Some(previous) =
+                exact_paths.get(&(reservation.host_id.clone(), ancestor.to_path_buf()))
+            else {
+                continue;
+            };
+            return runtime_path_collision(&reservations[*previous], reservation);
+        }
+    }
+
+    let mut reservations_by_parent = BTreeMap::<(String, PathBuf), Vec<usize>>::new();
+    for (index, reservation) in reservations.iter().enumerate() {
+        let Some(parent) = reservation.path.parent() else {
+            continue;
+        };
+        reservations_by_parent
+            .entry((reservation.host_id.clone(), parent.to_path_buf()))
+            .or_default()
+            .push(index);
+    }
+    for indexes in reservations_by_parent.values_mut() {
+        indexes.sort_by(|left, right| {
+            reservations[*left]
+                .path
+                .file_name()
+                .expect("runtime path reservation has a file name")
+                .as_bytes()
+                .cmp(
+                    reservations[*right]
+                        .path
+                        .file_name()
+                        .expect("runtime path reservation has a file name")
+                        .as_bytes(),
+                )
+        });
+        for (position, index) in indexes.iter().enumerate() {
+            let prefix = &reservations[*index];
+            if prefix.kind != RuntimePathReservationKind::FilenamePrefix {
+                continue;
+            }
+            let prefix_bytes = prefix
+                .path
+                .file_name()
+                .expect("runtime path prefix reservation has a file name")
+                .as_bytes();
+            if let Some(candidate_index) = indexes.get(position + 1) {
+                let candidate = &reservations[*candidate_index];
+                let candidate_bytes = candidate
+                    .path
+                    .file_name()
+                    .expect("runtime path reservation has a file name")
+                    .as_bytes();
+                if !candidate_bytes.starts_with(prefix_bytes) {
+                    continue;
+                }
+                return runtime_path_collision(prefix, candidate);
+            }
         }
     }
     Ok(())
+}
+
+fn reserve_runtime_path(
+    reservations: &mut Vec<RuntimePathReservation>,
+    host_id: &str,
+    path: PathBuf,
+    kind: RuntimePathReservationKind,
+    label: String,
+) {
+    reservations.push(RuntimePathReservation {
+        host_id: host_id.to_string(),
+        path,
+        kind,
+        label,
+    });
+}
+
+fn runtime_path_collision(
+    first: &RuntimePathReservation,
+    second: &RuntimePathReservation,
+) -> Result<(), String> {
+    Err(format!(
+        "runtime path collision on host {}: {} conflicts with {}",
+        first.host_id, first.label, second.label
+    ))
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut result = path.as_os_str().to_os_string();
+    result.push(suffix);
+    PathBuf::from(result)
 }
 
 fn validate_tls_identities(identities: &[TlsIdentityInput]) -> Result<BTreeSet<&str>, String> {
@@ -4018,6 +4573,189 @@ mod tests {
             .replace("/srv/argmin/data-1", data_mount.to_str().unwrap())
     }
 
+    fn replicated_unix_manifest() -> String {
+        let mut manifest = r#"
+schema_version = 1
+tls_identities = []
+tls_trust_bundles = []
+
+[cluster]
+id = "replicated-unix"
+topology_generation = 9
+region = "us-east-1"
+
+[deployment]
+mode = "replicated"
+failure_domain = "disk"
+failure_tolerance = 1
+internal_auth = "required"
+
+[storage]
+pg_count = 4
+ec_data_shards = 2
+ec_parity_shards = 1
+initial_cluster_epoch = 3
+
+[raft]
+max_append_entries = 64
+max_append_bytes = 8388608
+max_snapshot_bytes = 15728640
+
+[[transport_profiles]]
+id = "internal"
+max_frame_bytes = 16777216
+max_connections = 64
+connect_timeout_ms = 1000
+io_timeout_ms = 5000
+
+[[hosts]]
+id = "host-1"
+zone = "zone-a"
+rack = "rack-1"
+"#
+        .to_string();
+        for number in 1..=3 {
+            writeln!(
+                manifest,
+                r#"
+[[disks]]
+id = "control-disk-{number}"
+host_id = "host-1"
+mount_path = "/srv/argmin/control-{number}"
+
+[[disks]]
+id = "data-disk-{number}"
+host_id = "host-1"
+mount_path = "/srv/argmin/data-{number}"
+
+[[processes]]
+id = "control-{number}"
+host_id = "host-1"
+kind = "control-plane"
+admin_instance_id = "admin-{number}"
+
+[[processes]]
+id = "storage-{number}"
+host_id = "host-1"
+kind = "storage-node"
+
+[[authorities]]
+id = "authority-{number}"
+kind = "raft-voter"
+raft_node_id = {raft_node_id}
+process_id = "control-{number}"
+disk_id = "control-disk-{number}"
+state_path = "/srv/argmin/control-{number}/control.state"
+
+[[storage_nodes]]
+node_id = {number}
+process_id = "storage-{number}"
+disk_id = "data-disk-{number}"
+data_dir = "/srv/argmin/data-{number}/node"
+"#,
+                raft_node_id = 100 + number
+            )
+            .unwrap();
+            for (protocol, name) in [
+                ("raft-peer", "raft"),
+                ("control-plane", "control"),
+                ("authority-clock-recovery", "clock"),
+            ] {
+                writeln!(
+                    manifest,
+                    r#"
+[[endpoints]]
+id = "{name}-{number}"
+owner_process_id = "control-{number}"
+protocol = "{protocol}"
+priority = 10
+listen = "unix:///run/argmin/{name}-{number}.sock"
+advertise = "unix:///run/argmin/{name}-{number}.sock"
+transport_profile_id = "internal"
+"#
+                )
+                .unwrap();
+            }
+            writeln!(
+                manifest,
+                r#"
+[[endpoints]]
+id = "storage-{number}"
+owner_process_id = "storage-{number}"
+protocol = "storage-rpc"
+priority = 10
+listen = "unix:///run/argmin/storage-{number}.sock"
+advertise = "unix:///run/argmin/storage-{number}.sock"
+transport_profile_id = "internal"
+"#
+            )
+            .unwrap();
+            for (principal, id_field, id_value, credential_id) in [
+                (
+                    "raft-peer",
+                    "node_id",
+                    (100 + number).to_string(),
+                    format!("raft-{number}"),
+                ),
+                (
+                    "storage-node",
+                    "node_id",
+                    number.to_string(),
+                    format!("storage-{number}"),
+                ),
+                (
+                    "admin",
+                    "instance_id",
+                    format!("\"admin-{number}\""),
+                    format!("admin-{number}"),
+                ),
+            ] {
+                writeln!(
+                    manifest,
+                    r#"
+[[auth_credentials]]
+principal = "{principal}"
+{id_field} = {id_value}
+credential_id = "{credential_id}"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:/run/argmin-secrets/{credential_id}.key"
+"#
+                )
+                .unwrap();
+            }
+        }
+        manifest
+    }
+
+    fn resolved_test_material(
+        manifest: &ValidatedStaticClusterManifest,
+    ) -> ResolvedStaticClusterMaterial {
+        ResolvedStaticClusterMaterial {
+            auth_credentials: manifest
+                .manifest
+                .auth_credentials
+                .iter()
+                .map(|credential| ResolvedStaticAuthCredential {
+                    principal: credential_principal_key(credential).unwrap(),
+                    credential_id: credential.credential_id.clone(),
+                    credential_version: credential.credential_version,
+                    use_for_signing: credential.use_for_signing,
+                    accept_from_ms: credential.accept_from_ms,
+                    accept_until_ms: credential.accept_until_ms,
+                    secret: if credential.credential_id == "raft-1" {
+                        vec![0, 0xff, 7]
+                    } else {
+                        credential.credential_id.as_bytes().to_vec()
+                    },
+                })
+                .collect(),
+            tls_identities: BTreeMap::new(),
+            tls_trust_bundles: BTreeMap::new(),
+        }
+    }
+
     fn standalone_manifest() -> String {
         r#"
 schema_version = 1
@@ -4385,6 +5123,202 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
     }
 
     #[test]
+    fn static_cluster_manifest_maps_replicated_unix_control_plane_with_binary_auth() {
+        let manifest_text =
+            replicated_unix_manifest().replace("max_connections = 64", "max_connections = 17");
+        let manifest = parse_static_cluster_manifest(&manifest_text, "control-1").unwrap();
+        let mut material = resolved_test_material(&manifest);
+        material
+            .auth_credentials
+            .push(ResolvedStaticAuthCredential {
+                principal: CredentialPrincipalKey {
+                    principal: AuthPrincipal::RaftPeer,
+                    id: CredentialPrincipalId::Node(101),
+                },
+                credential_id: "raft-1-next".to_string(),
+                credential_version: 2,
+                use_for_signing: false,
+                accept_from_ms: 0,
+                accept_until_ms: None,
+                secret: vec![9, 8, 7],
+            });
+        let environment = standalone_runtime_environment();
+
+        let config = manifest
+            .replicated_unix_control_plane_server_config(&material, |key| {
+                environment.get(key).cloned()
+            })
+            .unwrap();
+
+        assert_eq!(config.process_role, ProcessRole::ControlPlane);
+        assert!(config.control_plane_experimental_raft);
+        assert_eq!(config.control_plane_raft_node_id, Some(101));
+        assert_eq!(config.control_plane_raft_peer_max_connections, 17);
+        assert_eq!(
+            config.control_plane_state_path.as_deref(),
+            Some("/srv/argmin/control-1/control.state")
+        );
+        assert_eq!(
+            config.control_plane_socket_path.as_deref(),
+            Some("/run/argmin/control-1.sock")
+        );
+        assert_eq!(
+            config.control_plane_clock_recovery_socket_path.as_deref(),
+            Some("/run/argmin/clock-1.sock")
+        );
+        assert_eq!(
+            config.control_plane_raft_peer_socket_path.as_deref(),
+            Some("/run/argmin/raft-1.sock")
+        );
+        assert_eq!(
+            config.control_plane_raft_peer_transport_limits,
+            ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 16 * 1024 * 1024,
+                max_append_entries: 64,
+                max_append_entries_bytes: 8 * 1024 * 1024,
+                max_snapshot_bytes: 15 * 1024 * 1024,
+            }
+        );
+        assert_eq!(
+            config.control_plane_raft_peer_connect_timeout,
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            config.control_plane_raft_peer_io_timeout,
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.control_plane_raft_peer_sockets,
+            vec![
+                ConfiguredControlPlaneRaftPeerSocket {
+                    node_id: 101,
+                    socket_path: "/run/argmin/raft-1.sock".to_string(),
+                },
+                ConfiguredControlPlaneRaftPeerSocket {
+                    node_id: 102,
+                    socket_path: "/run/argmin/raft-2.sock".to_string(),
+                },
+                ConfiguredControlPlaneRaftPeerSocket {
+                    node_id: 103,
+                    socket_path: "/run/argmin/raft-3.sock".to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            config.control_plane_client_socket_paths,
+            vec![
+                "/run/argmin/control-1.sock",
+                "/run/argmin/control-2.sock",
+                "/run/argmin/control-3.sock",
+            ]
+        );
+        assert_eq!(
+            config.control_plane_auth_cluster_id.as_deref(),
+            Some("replicated-unix")
+        );
+        assert_eq!(
+            config.control_plane_raft_auth_signing_credential,
+            Some(("raft-1".to_string(), 1))
+        );
+        let local_raft_credential = config
+            .control_plane_raft_auth_credentials
+            .iter()
+            .find(|credential| credential.node_id == 101)
+            .unwrap();
+        assert_eq!(local_raft_credential.secret.as_bytes(), &[0, 0xff, 7]);
+        let raft_cluster_name = config.control_plane_raft_cluster_name.unwrap();
+        assert!(raft_cluster_name.starts_with("replicated-unix:topology:9:"));
+        assert!(raft_cluster_name.ends_with(manifest.topology_digest()));
+        let identity = config.static_cluster_identity.unwrap();
+        assert_eq!(identity.process_id, "control-1");
+        assert_eq!(
+            identity.process_identity_digest,
+            manifest.process_identity_digest()
+        );
+    }
+
+    #[test]
+    fn static_cluster_replicated_control_plane_requires_explicit_state_initialization() {
+        let temp = test_util::tempdir();
+        let control_dir = temp.path().join("control-1");
+        std::fs::create_dir(&control_dir).unwrap();
+        let manifest_text = replicated_unix_manifest()
+            .replace("/srv/argmin/control-1", control_dir.to_str().unwrap());
+        let manifest = parse_static_cluster_manifest(&manifest_text, "control-1").unwrap();
+        let identity = manifest.configured_static_identity();
+        let state_path = control_dir.join("control.state");
+
+        let error = crate::static_cluster_state::bind_static_control_plane_identity(
+            &identity,
+            101,
+            &state_path,
+        )
+        .unwrap_err();
+        assert!(error.contains("run initialize-cluster-state"));
+
+        manifest.initialize_selected_process_state().unwrap();
+        manifest.initialize_selected_process_state().unwrap();
+        crate::static_cluster_state::bind_static_control_plane_identity(
+            &identity,
+            101,
+            &state_path,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn static_cluster_loader_resolves_replicated_unix_control_plane_secrets() {
+        let temp = test_util::tempdir();
+        let material_dir = temp.path().join("secrets");
+        private_dir(&material_dir);
+        for credential_id in [
+            "raft-1",
+            "raft-2",
+            "raft-3",
+            "storage-1",
+            "storage-2",
+            "storage-3",
+            "admin-1",
+            "admin-2",
+            "admin-3",
+        ] {
+            write_material_file(
+                &material_dir.join(format!("{credential_id}.key")),
+                credential_id.as_bytes(),
+                0o600,
+            );
+        }
+        let manifest = replicated_unix_manifest()
+            .replace("/run/argmin-secrets", material_dir.to_str().unwrap());
+        let (_manifest_dir, manifest_path) = write_manifest(&manifest);
+        let environment = standalone_runtime_environment();
+
+        let config = load_server_config_from_inputs_with_filesystem_validator(
+            Some(&manifest_path),
+            Some("control-1"),
+            |key| environment.get(key).cloned(),
+            |_manifest| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(config.process_role, ProcessRole::ControlPlane);
+        assert_eq!(
+            config.control_plane_raft_auth_signing_credential,
+            Some(("raft-1".to_string(), 1))
+        );
+        assert_eq!(
+            config
+                .control_plane_raft_auth_credentials
+                .iter()
+                .find(|credential| credential.node_id == 101)
+                .unwrap()
+                .secret
+                .as_bytes(),
+            b"raft-1"
+        );
+    }
+
+    #[test]
     fn static_cluster_standalone_runtime_does_not_start_unserved_refresh_path() {
         let dir = test_util::tempdir();
         let disk_path = dir.path().join("disk");
@@ -4585,14 +5519,20 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
 
     #[test]
     fn static_cluster_runtime_loader_rejects_profiles_not_yet_runtime_mapped() {
-        let (_dir, replicated_path) = write_manifest(&replicated_manifest());
         let environment = standalone_runtime_environment();
-        let error =
-            load_server_config_from_inputs(Some(&replicated_path), Some("control-1"), |key| {
-                environment.get(key).cloned()
-            })
+        let replicated =
+            parse_static_cluster_manifest(&replicated_manifest(), "control-1").unwrap();
+        let error = replicated
+            .replicated_unix_control_plane_server_config(
+                &ResolvedStaticClusterMaterial {
+                    auth_credentials: Vec::new(),
+                    tls_identities: BTreeMap::new(),
+                    tls_trust_bundles: BTreeMap::new(),
+                },
+                |key| environment.get(key).cloned(),
+            )
             .unwrap_err();
-        assert!(error.contains("replicated cluster manifests require"));
+        assert!(error.contains("TCP static cluster runtime activation is not implemented"));
 
         let credentialed = format!(
             "{}{}",
@@ -4608,11 +5548,9 @@ accept_from_ms = 0
 secret_ref = "file:/run/argmin-secrets/storage-1.key"
 "#
         );
-        let (_dir, credentialed_path) = write_manifest(&credentialed);
-        let error =
-            load_server_config_from_inputs(Some(&credentialed_path), Some("all-1"), |key| {
-                environment.get(key).cloned()
-            })
+        let credentialed = parse_static_cluster_manifest(&credentialed, "all-1").unwrap();
+        let error = credentialed
+            .standalone_legacy_server_config(|key| environment.get(key).cloned())
             .unwrap_err();
         assert!(error.contains("no unresolved secret references"));
     }
@@ -5280,7 +6218,68 @@ transport_profile_id = "internal"
         );
         assert!(parse_static_cluster_manifest(&collision, "all-1")
             .unwrap_err()
-            .contains("duplicate durable state/data path"));
+            .contains("runtime path collision"));
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_unix_endpoint_on_authority_state_path() {
+        let collision = standalone_manifest().replace(
+            "unix:///run/argmin/control.sock",
+            "unix:///srv/argmin/control.state",
+        );
+        let error = parse_static_cluster_manifest(&collision, "all-1").unwrap_err();
+        assert!(error.contains("runtime path collision"));
+        assert!(error.contains("authority authority-1 state"));
+        assert!(error.contains("endpoint control-1 Unix socket"));
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_storage_path_on_derived_raft_file() {
+        let collision = replace_once(
+            &standalone_manifest(),
+            "data_dir = \"/srv/argmin/data\"",
+            "data_dir = \"/srv/argmin/control.state.wal\"",
+        );
+        let error = parse_static_cluster_manifest(&collision, "all-1").unwrap_err();
+        assert!(error.contains("runtime path collision"));
+        assert!(error.contains("Raft WAL"));
+        assert!(error.contains("storage node 1 data directory"));
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_unix_endpoint_inside_storage_directory() {
+        let collision = standalone_manifest().replace(
+            "unix:///run/argmin/storage.sock",
+            "unix:///srv/argmin/data/storage.sock",
+        );
+        let error = parse_static_cluster_manifest(&collision, "all-1").unwrap_err();
+        assert!(error.contains("runtime path collision"));
+        assert!(error.contains("storage node 1 data directory"));
+        assert!(error.contains("endpoint storage-1 Unix socket"));
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_unix_endpoint_in_temporary_file_namespace() {
+        let collision = standalone_manifest().replace(
+            "unix:///run/argmin/control.sock",
+            "unix:///srv/argmin/control.state.tmp.1234",
+        );
+        let error = parse_static_cluster_manifest(&collision, "all-1").unwrap_err();
+        assert!(error.contains("runtime path collision"));
+        assert!(error.contains("Raft artifact temporary file"));
+        assert!(error.contains("endpoint control-1 Unix socket"));
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_unix_endpoint_in_sentinel_temporary_namespace() {
+        let collision = standalone_manifest().replace(
+            "unix:///run/argmin/control.sock",
+            "unix:///srv/argmin/control.state.sentinel.tmp.1234",
+        );
+        let error = parse_static_cluster_manifest(&collision, "all-1").unwrap_err();
+        assert!(error.contains("runtime path collision"));
+        assert!(error.contains("Raft artifact sentinel temporary file"));
+        assert!(error.contains("endpoint control-1 Unix socket"));
     }
 
     #[test]

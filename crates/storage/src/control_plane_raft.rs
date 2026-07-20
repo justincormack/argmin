@@ -79,8 +79,15 @@ pub type ControlPlaneRaftEntry =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneRaftPeerFrameIdentity {
     pub cluster_name: String,
+    pub topology: Option<ControlPlaneRaftTopologyIdentity>,
     pub source: ControlPlaneRaftNodeId,
     pub target: ControlPlaneRaftNodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRaftTopologyIdentity {
+    pub generation: u64,
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,9 +105,19 @@ impl ControlPlaneRaftPeerFrameIdentity {
     ) -> Self {
         Self {
             cluster_name: cluster_name.into(),
+            topology: None,
             source,
             target,
         }
+    }
+
+    #[must_use]
+    pub fn with_topology(mut self, generation: u64, digest: impl Into<String>) -> Self {
+        self.topology = Some(ControlPlaneRaftTopologyIdentity {
+            generation,
+            digest: digest.into(),
+        });
+        self
     }
 }
 
@@ -821,8 +838,11 @@ fn peer_auth_replay_policy(
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftPeerTransportPolicy {
     cluster_name: String,
+    topology: Option<ControlPlaneRaftTopologyIdentity>,
     peers: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
     limits: ControlPlaneRaftPeerTransportLimits,
+    connect_timeout: Duration,
+    io_timeout: Duration,
     auth_policy: Option<Arc<ControlPlaneRaftPeerAuthPolicy>>,
 }
 
@@ -835,8 +855,11 @@ impl ControlPlaneRaftPeerTransportPolicy {
     ) -> Self {
         Self {
             cluster_name: cluster_name.into(),
+            topology: None,
             peers,
             limits,
+            connect_timeout: Duration::from_secs(1),
+            io_timeout: Duration::from_secs(1),
             auth_policy: None,
         }
     }
@@ -863,9 +886,40 @@ impl ControlPlaneRaftPeerTransportPolicy {
     }
 
     #[must_use]
+    pub fn topology_identity(&self) -> Option<&ControlPlaneRaftTopologyIdentity> {
+        self.topology.as_ref()
+    }
+
+    #[must_use]
     pub fn with_auth_policy(mut self, auth_policy: ControlPlaneRaftPeerAuthPolicy) -> Self {
         self.auth_policy = Some(Arc::new(auth_policy));
         self
+    }
+
+    #[must_use]
+    pub fn with_topology_identity(mut self, generation: u64, digest: impl Into<String>) -> Self {
+        self.topology = Some(ControlPlaneRaftTopologyIdentity {
+            generation,
+            digest: digest.into(),
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeouts(mut self, connect_timeout: Duration, io_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self.io_timeout = io_timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    #[must_use]
+    pub fn io_timeout(&self) -> Duration {
+        self.io_timeout
     }
 
     #[must_use]
@@ -1041,11 +1095,10 @@ impl ControlPlaneRaftPeerTransportPolicy {
                 rpc_name: "peer_frame",
             });
         }
-        Ok(ControlPlaneRaftPeerFrameIdentity::new(
-            self.cluster_name.clone(),
-            source,
-            target,
-        ))
+        let mut identity =
+            ControlPlaneRaftPeerFrameIdentity::new(self.cluster_name.clone(), source, target);
+        identity.topology.clone_from(&self.topology);
+        Ok(identity)
     }
 
     pub fn validate_incoming_frame_identity(
@@ -1057,6 +1110,13 @@ impl ControlPlaneRaftPeerTransportPolicy {
             return Err(ControlPlaneRaftPeerTransportRejection::ClusterMismatch {
                 expected: self.cluster_name.clone(),
                 actual: identity.cluster_name.clone(),
+            });
+        }
+        if identity.topology != self.topology {
+            return Err(ControlPlaneRaftPeerTransportRejection::TopologyMismatch {
+                cluster_name: self.cluster_name.clone(),
+                expected: self.topology.clone(),
+                actual: identity.topology.clone(),
             });
         }
         if identity.target != local_node_id {
@@ -1135,6 +1195,11 @@ pub enum ControlPlaneRaftPeerTransportRejection {
         expected: String,
         actual: String,
     },
+    TopologyMismatch {
+        cluster_name: String,
+        expected: Option<ControlPlaneRaftTopologyIdentity>,
+        actual: Option<ControlPlaneRaftTopologyIdentity>,
+    },
     UnknownSource {
         cluster_name: String,
         source: ControlPlaneRaftNodeId,
@@ -1182,6 +1247,14 @@ impl fmt::Display for ControlPlaneRaftPeerTransportRejection {
             Self::ClusterMismatch { expected, actual } => write!(
                 f,
                 "control-plane raft peer transport cluster identity mismatch: expected {expected}, got {actual}",
+            ),
+            Self::TopologyMismatch {
+                cluster_name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "control-plane raft peer transport cluster {cluster_name} topology identity mismatch: expected {expected:?}, got {actual:?}",
             ),
             Self::UnknownSource {
                 cluster_name,
@@ -1497,7 +1570,10 @@ impl ControlPlaneRaftUnixPeerNetwork {
         self.policy
             .validate_target_node(self.target, &self.node, rpc_name)
             .map_err(raft_rpc_error_from_transport_rejection)?;
-        connect_unix_stream_until(Path::new(&self.node.addr), deadline)
+        let connect_deadline = Instant::now()
+            .checked_add(self.policy.connect_timeout())
+            .map_or(deadline, |configured| configured.min(deadline));
+        connect_unix_stream_until(Path::new(&self.node.addr), connect_deadline)
             .map_err(|source| raft_unix_io_rpc_error("connect", self.target, source))
     }
 
@@ -5867,7 +5943,7 @@ const CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_COMMITTED: u8 = 3;
 const CONTROL_PLANE_RAFT_WAL_RECORD_TRUNCATE_AFTER: u8 = 4;
 const CONTROL_PLANE_RAFT_WAL_RECORD_PURGE: u8 = 5;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
-const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
+const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 2;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST: u8 = 1;
 const CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE: u8 = 2;
@@ -7965,6 +8041,14 @@ fn write_raft_peer_frame_identity(
         Some(identity) => {
             write_raft_u8(out, 1);
             write_raft_string(out, &identity.cluster_name)?;
+            match &identity.topology {
+                None => write_raft_u8(out, 0),
+                Some(topology) => {
+                    write_raft_u8(out, 1);
+                    write_raft_u64(out, topology.generation);
+                    write_raft_string(out, &topology.digest)?;
+                }
+            }
             write_raft_u64(out, identity.source);
             write_raft_u64(out, identity.target);
         }
@@ -7985,6 +8069,12 @@ fn validate_raft_peer_frame_identity(
         return Err(raft_artifact_protocol_error(format!(
             "control-plane OpenRaft peer RPC frame cluster identity mismatch: expected {}, got {}",
             expected.cluster_name, actual.cluster_name
+        )));
+    }
+    if actual.topology != expected.topology {
+        return Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft peer RPC frame topology identity mismatch: expected {:?}, got {:?}",
+            expected.topology, actual.topology
         )));
     }
     if actual.source != expected.source {
@@ -8287,11 +8377,13 @@ async fn handle_control_plane_raft_peer_snapshot_frame_with_identity(
 fn reverse_raft_peer_frame_identity(
     identity: &ControlPlaneRaftPeerFrameIdentity,
 ) -> ControlPlaneRaftPeerFrameIdentity {
-    ControlPlaneRaftPeerFrameIdentity::new(
+    let mut reversed = ControlPlaneRaftPeerFrameIdentity::new(
         identity.cluster_name.clone(),
         identity.target,
         identity.source,
-    )
+    );
+    reversed.topology.clone_from(&identity.topology);
+    reversed
 }
 
 fn durable_artifact_tmp_path(path: &Path) -> PathBuf {
@@ -9192,10 +9284,23 @@ impl<'a> RaftArtifactReader<'a> {
             0 => Ok(None),
             1 => {
                 let cluster_name = self.read_string()?;
+                let topology = match self.read_u8()? {
+                    0 => None,
+                    1 => Some(ControlPlaneRaftTopologyIdentity {
+                        generation: self.read_u64()?,
+                        digest: self.read_string()?,
+                    }),
+                    value => {
+                        return Err(raft_artifact_protocol_error(format!(
+                            "invalid control-plane OpenRaft peer RPC topology identity tag {value}"
+                        )));
+                    }
+                };
                 let source = self.read_u64()?;
                 let target = self.read_u64()?;
                 Ok(Some(ControlPlaneRaftPeerFrameIdentity {
                     cluster_name,
+                    topology,
                     source,
                     target,
                 }))
@@ -12141,7 +12246,8 @@ mod tests {
             leadership_transfer: false,
         };
         let expected =
-            ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-identity", 1, 2);
+            ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-identity", 1, 2)
+                .with_topology(7, "topology-a");
         let encoded = ControlPlaneRaftPeerRpcRequest::Vote(request)
             .encode_frame_for_peer(&expected)
             .unwrap();
@@ -12159,7 +12265,32 @@ mod tests {
 
         let err = ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(
             &encoded,
-            &ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-identity", 9, 2),
+            &ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-identity", 1, 2)
+                .with_topology(8, "topology-a"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("topology identity mismatch")
+        ));
+
+        let err = ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(
+            &encoded,
+            &ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-identity", 1, 2)
+                .with_topology(7, "topology-b"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("topology identity mismatch")
+        ));
+
+        let err = ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(
+            &encoded,
+            &ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-identity", 9, 2)
+                .with_topology(7, "topology-a"),
         )
         .unwrap_err();
         assert!(matches!(
@@ -12170,7 +12301,8 @@ mod tests {
 
         let err = ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(
             &encoded,
-            &ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-identity", 1, 9),
+            &ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-identity", 1, 9)
+                .with_topology(7, "topology-a"),
         )
         .unwrap_err();
         assert!(matches!(
@@ -12219,6 +12351,29 @@ mod tests {
             ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(&decoded_frame, &identity)
                 .unwrap();
         assert!(matches!(decoded, ControlPlaneRaftPeerRpcRequest::Vote(_)));
+    }
+
+    #[test]
+    fn control_plane_raft_peer_policy_rejects_fresh_topology_mismatch() {
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            "cluster-a",
+            [(1, "node-1".to_string()), (2, "node-2".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        )
+        .with_topology_identity(7, "topology-a");
+
+        let error = policy
+            .validate_incoming_frame_identity(
+                &ControlPlaneRaftPeerFrameIdentity::new("cluster-a", 1, 2)
+                    .with_topology(8, "topology-b"),
+                2,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneRaftPeerTransportRejection::TopologyMismatch { .. }
+        ));
     }
 
     #[test]
