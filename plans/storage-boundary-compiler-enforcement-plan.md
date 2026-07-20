@@ -1033,6 +1033,47 @@ Seventeenth Phase 3 slice:
   the storage boundary checker, all 2,156 storage tests, workspace-wide strict
   Clippy, and the full workspace suite (7,244 tests).
 
+Eighteenth Phase 3 slice:
+
+- `StorageClusterRuntimeMapHandle` now owns a route-admission gate shared by
+  every handle clone. `admit_current_route` returns a non-cloneable
+  `StorageClusterRouteAdmission`; replacement runtime-map publication drains
+  admitted requests and blocks new admission until publication completes.
+- the admission owns its pinned `StorageCluster` and permit but deliberately
+  does not dereference to the cluster API. `StorageCluster` itself is also no
+  longer `Clone`. Storage operations therefore cannot bypass the captured
+  deadline through the renewable cluster lease; operation-specific access
+  remains unavailable until those boundaries accept the admission explicitly.
+- the authority and process-local monotonic deadlines now form one coherent
+  lock-protected lease snapshot. Admission captures that pair under one read
+  lock, while renewal, replacement, and expiry update it under the matching
+  write lock. `require_valid_now` checks both current invalidation and the
+  captured lease, so a later same-generation renewal cannot extend a
+  long-running request's authority.
+- invalid unbounded candidates are rejected before beginning a drain. Focused
+  concurrency tests prove valid publication waits for release without polling
+  or sleeps, expired maps cannot be admitted, and an admitted deadline remains
+  expired after the underlying map is renewed. A deterministic capture/renewal
+  interleaving additionally proves renewal cannot publish one half of a lease
+  pair while admission captures the other: a test-only renewal `try_write`
+  fails while the capture hook holds the read guard, then succeeds immediately
+  after that guard is released.
+- the boundary checker now canonicalizes the recovery implementation helpers
+  introduced by the retained-route command reissue work back to their
+  registered semantic operations. The raw metadata-PG exception follows the
+  same implementation body, keeping the checker synchronized without adding a
+  second publisher classification.
+- this slice establishes the frontend guard and publication barrier only.
+  Threading it through coordinator request entry, then deriving operation- and
+  subject-bound active/retained/recovery capabilities for node-client calls,
+  remains open. The storage-node Unix boundary already has a per-frame
+  publication gate, but still needs server-local typed capabilities and
+  per-effect validation.
+- validation passed formatting, the storage boundary checker, the focused
+  eight-test runtime-map admission suite, its compile-fail API boundary
+  doctest, workspace-wide checks and strict Clippy, and the full workspace
+  suite (7,275 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

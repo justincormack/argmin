@@ -18,7 +18,9 @@ pub use local::{
     LocalUnixObjectListingMetadataNodeClientConfig, LocalUnixObjectVersionMetadataNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientConfig,
 };
-use local::{LocalClusterRuntimeState, MetadataCommandRecoveryAdmission};
+use local::{
+    LocalClusterRuntimeState, LocalRouteMapLeaseSnapshot, MetadataCommandRecoveryAdmission,
+};
 pub use request_ops::{BucketIdentityGenerations, DurableReclaimScanOutcome};
 
 use crate::control_plane::{
@@ -1256,7 +1258,6 @@ impl PendingMetadataCommandRefreshRecoveryError {
     }
 }
 
-#[derive(Clone)]
 pub struct StorageCluster {
     local_map: Arc<LocalClusterMap>,
     operation_epoch: ClusterEpoch,
@@ -1269,6 +1270,179 @@ pub struct StorageCluster {
 pub struct StorageClusterRuntimeMapHandle {
     cluster: Arc<RwLock<Arc<StorageCluster>>>,
     same_epoch_generations: Arc<Mutex<Vec<Weak<StorageCluster>>>>,
+    route_admission: StorageClusterRouteAdmissionGate,
+}
+
+#[derive(Clone, Default)]
+struct StorageClusterRouteAdmissionGate {
+    inner: Arc<StorageClusterRouteAdmissionGateInner>,
+}
+
+#[derive(Default)]
+struct StorageClusterRouteAdmissionGateInner {
+    state: Mutex<StorageClusterRouteAdmissionState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum StorageClusterRouteTransitionState {
+    #[default]
+    Open,
+    Draining,
+    Publishing,
+}
+
+#[derive(Debug, Default)]
+struct StorageClusterRouteAdmissionState {
+    active_requests: usize,
+    transition: StorageClusterRouteTransitionState,
+}
+
+impl StorageClusterRouteAdmissionGate {
+    fn acquire(&self) -> StorageClusterRouteAdmissionPermit {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.transition != StorageClusterRouteTransitionState::Open {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.active_requests = state
+            .active_requests
+            .checked_add(1)
+            .expect("route admission permit count must not overflow");
+        StorageClusterRouteAdmissionPermit { gate: self.clone() }
+    }
+
+    fn begin_publication(&self) -> StorageClusterRoutePublicationGuard {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.transition != StorageClusterRouteTransitionState::Open {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.transition = StorageClusterRouteTransitionState::Draining;
+        self.inner.changed.notify_all();
+        while state.active_requests != 0 {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.transition = StorageClusterRouteTransitionState::Publishing;
+        StorageClusterRoutePublicationGuard { gate: self.clone() }
+    }
+
+    #[cfg(test)]
+    fn wait_until_publication_is_pending(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.transition == StorageClusterRouteTransitionState::Open {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+struct StorageClusterRouteAdmissionPermit {
+    gate: StorageClusterRouteAdmissionGate,
+}
+
+impl Drop for StorageClusterRouteAdmissionPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active_requests = state
+            .active_requests
+            .checked_sub(1)
+            .expect("route admission permit count must not underflow");
+        self.gate.inner.changed.notify_all();
+    }
+}
+
+struct StorageClusterRoutePublicationGuard {
+    gate: StorageClusterRouteAdmissionGate,
+}
+
+impl Drop for StorageClusterRoutePublicationGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.transition = StorageClusterRouteTransitionState::Open;
+        self.gate.inner.changed.notify_all();
+    }
+}
+
+/// Non-cloneable request admission for one installed frontend route-map
+/// generation.
+///
+/// The guard prevents a replacement runtime map from being published while
+/// the request is admitted. Its absolute deadline is captured at admission,
+/// so a later lease renewal cannot extend authority already handed to a
+/// long-running request. It deliberately does not dereference to
+/// [`StorageCluster`]: storage operations must accept and validate an
+/// admission explicitly as those operation boundaries are migrated.
+///
+/// ```compile_fail
+/// use storage::StorageClusterRouteAdmission;
+///
+/// fn bypass_admission(admission: &StorageClusterRouteAdmission) {
+///     let _ = admission.local_node_count();
+/// }
+/// ```
+pub struct StorageClusterRouteAdmission {
+    cluster: Arc<StorageCluster>,
+    _permit: StorageClusterRouteAdmissionPermit,
+    admitted_lease: LocalRouteMapLeaseSnapshot,
+}
+
+impl StorageClusterRouteAdmission {
+    pub fn require_valid_now(&self) -> Result<(), StoreError> {
+        self.cluster.require_route_map_valid_now()?;
+        let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        if self
+            .cluster
+            .local_map
+            .route_map_lease_snapshot_is_valid_at(self.admitted_lease, local_monotonic_ms)
+        {
+            return Ok(());
+        }
+        Err(StoreError::RouteMapExpired {
+            cluster_epoch: self.cluster.cluster_epoch(),
+            valid_until_ms: self.admitted_lease.validity.valid_until_ms().unwrap_or(0),
+            now_ms: crate::clock::current_time_millis(),
+        })
+    }
+
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster.cluster_epoch()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1350,6 +1524,7 @@ impl StorageClusterRuntimeMapHandle {
         Self {
             same_epoch_generations: Arc::new(Mutex::new(vec![Arc::downgrade(&initial)])),
             cluster: Arc::new(RwLock::new(initial)),
+            route_admission: StorageClusterRouteAdmissionGate::default(),
         }
     }
 
@@ -1360,10 +1535,53 @@ impl StorageClusterRuntimeMapHandle {
             .clone()
     }
 
+    pub fn admit_current_route(&self) -> Result<StorageClusterRouteAdmission, StoreError> {
+        let permit = self.route_admission.acquire();
+        let cluster = self.current();
+        let admitted_lease = cluster.local_map.route_map_lease_snapshot();
+        let admission = StorageClusterRouteAdmission {
+            admitted_lease,
+            cluster,
+            _permit: permit,
+        };
+        admission.require_valid_now()?;
+        Ok(admission)
+    }
+
+    #[cfg(test)]
+    fn admit_current_route_with_lease_capture_hook<F>(
+        &self,
+        after_lease_read_lock: F,
+    ) -> Result<StorageClusterRouteAdmission, StoreError>
+    where
+        F: FnOnce(),
+    {
+        let permit = self.route_admission.acquire();
+        let cluster = self.current();
+        let admitted_lease = cluster
+            .local_map
+            .route_map_lease_snapshot_with_hook(after_lease_read_lock);
+        let admission = StorageClusterRouteAdmission {
+            admitted_lease,
+            cluster,
+            _permit: permit,
+        };
+        admission.require_valid_now()?;
+        Ok(admission)
+    }
+
     pub fn install(
         &self,
         candidate: Arc<StorageCluster>,
     ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
+        if candidate.route_map_valid_until_ms().is_none() {
+            return Err(
+                StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
+                    candidate: candidate.cluster_epoch(),
+                },
+            );
+        }
+        let _publication = self.route_admission.begin_publication();
         let mut current = self
             .cluster
             .write()
@@ -1374,15 +1592,7 @@ impl StorageClusterRuntimeMapHandle {
                 candidate: candidate.cluster_epoch(),
             });
         }
-        if candidate.route_map_valid_until_ms().is_none() {
-            return Err(
-                StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
-                    candidate: candidate.cluster_epoch(),
-                },
-            );
-        }
         if candidate.cluster_epoch() == current.cluster_epoch() {
-            let candidate_validity = candidate.route_map_validity();
             let candidate_digest = candidate.runtime_map_content_digest;
             let mut generations = self
                 .same_epoch_generations
@@ -1400,30 +1610,15 @@ impl StorageClusterRuntimeMapHandle {
                         if generation.runtime_map_content_digest.is_none()
                             && generation.route_map_valid_until_ms().is_none()
                         {
-                            generation.cap_route_map_validity(candidate_validity);
                             generation
                                 .local_map
-                                .replace_process_local_route_map_lease_from(&candidate.local_map);
+                                .replace_route_map_lease_from(&candidate.local_map);
                         }
                         return true;
                     }
-                    match (
-                        generation.route_map_valid_until_ms(),
-                        candidate_validity.valid_until_ms(),
-                    ) {
-                        (Some(current), Some(candidate)) if candidate < current => {
-                            generation.cap_route_map_validity(candidate_validity);
-                        }
-                        (None, Some(_)) => {
-                            generation.cap_route_map_validity(candidate_validity);
-                        }
-                        _ => {
-                            generation.extend_route_map_validity(candidate_validity);
-                        }
-                    }
                     generation
                         .local_map
-                        .replace_process_local_route_map_lease_from(&candidate.local_map);
+                        .replace_route_map_lease_from(&candidate.local_map);
                     true
                 } else {
                     false
@@ -1506,10 +1701,9 @@ impl StorageClusterRuntimeMapHandle {
                 return false;
             };
             if generation.cluster_epoch() == current_epoch {
-                generation.cap_route_map_validity(expiry);
                 generation
                     .local_map
-                    .expire_process_local_route_map_lease_at(local_monotonic_ms);
+                    .expire_route_map_lease_at(expiry, local_monotonic_ms);
                 true
             } else {
                 false
@@ -2039,6 +2233,158 @@ mod runtime_map_refresh_invalidation_tests {
                 now_ms: 4_000,
             }) if cluster_epoch == ClusterEpoch::INITIAL
         ));
+    }
+
+    #[test]
+    fn admitted_frontend_route_blocks_runtime_map_publication_until_release() {
+        let (pinned, handle, admission, candidate) =
+            crate::clock::with_time_override(1_000, || {
+                let pinned = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
+                pinned.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+                let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
+                let admission = handle.admit_current_route().unwrap();
+                let candidate = active_test_cluster(RouteMapValidity::until_ms(9_000).unwrap());
+                (pinned, handle, admission, candidate)
+            });
+        let installer_handle = handle.clone();
+        let installed_candidate = Arc::clone(&candidate);
+        let (installed_tx, installed_rx) = std::sync::mpsc::channel();
+        let installer = thread::spawn(move || {
+            installer_handle.install(installed_candidate).unwrap();
+            installed_tx.send(()).unwrap();
+        });
+
+        handle.route_admission.wait_until_publication_is_pending();
+        assert!(matches!(
+            installed_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(Arc::ptr_eq(&handle.current(), &pinned));
+
+        drop(admission);
+        installed_rx.recv().unwrap();
+        installer.join().unwrap();
+        assert!(Arc::ptr_eq(&handle.current(), &candidate));
+    }
+
+    #[test]
+    fn admitted_frontend_route_deadline_is_not_extended_by_later_renewal() {
+        let (cluster, admission) = crate::clock::with_time_override(1_000, || {
+            let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+            let admission = handle.admit_current_route().unwrap();
+            (cluster, admission)
+        });
+
+        crate::clock::with_time_override(1_000, || {
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+        });
+        crate::clock::with_time_override(6_000, || {
+            cluster.require_route_map_valid_now().unwrap();
+            assert!(matches!(
+                admission.require_valid_now(),
+                Err(StoreError::RouteMapExpired {
+                    cluster_epoch,
+                    valid_until_ms: 5_000,
+                    now_ms: 6_000,
+                }) if cluster_epoch == ClusterEpoch::INITIAL
+            ));
+        });
+    }
+
+    #[test]
+    fn admission_capture_serializes_with_same_generation_lease_replacement() {
+        let (cluster, renewed, handle) = crate::clock::with_time_override(1_000, || {
+            let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+            let renewed = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
+            renewed.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+            (cluster, renewed, handle)
+        });
+
+        let admission = crate::clock::with_time_override(1_000, || {
+            handle
+                .admit_current_route_with_lease_capture_hook(|| {
+                    assert!(
+                        !cluster
+                            .local_map
+                            .test_try_replace_route_map_lease_from(&renewed.local_map),
+                        "renewal must not acquire the lease write lock during capture"
+                    );
+                })
+                .unwrap()
+        });
+        assert!(
+            cluster
+                .local_map
+                .test_try_replace_route_map_lease_from(&renewed.local_map),
+            "renewal must acquire the lease write lock after capture"
+        );
+
+        assert_eq!(
+            admission.admitted_lease,
+            LocalRouteMapLeaseSnapshot {
+                validity: RouteMapValidity::until_ms(5_000).unwrap(),
+                local_valid_until_monotonic_ms: Some(5_000),
+            }
+        );
+        assert_eq!(
+            cluster.local_map.route_map_lease_snapshot(),
+            LocalRouteMapLeaseSnapshot {
+                validity: RouteMapValidity::until_ms(10_000).unwrap(),
+                local_valid_until_monotonic_ms: Some(10_000),
+            }
+        );
+        crate::clock::with_time_override(6_000, || {
+            cluster.require_route_map_valid_now().unwrap();
+            assert!(matches!(
+                admission.require_valid_now(),
+                Err(StoreError::RouteMapExpired {
+                    valid_until_ms: 5_000,
+                    now_ms: 6_000,
+                    ..
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn invalid_unbounded_candidate_is_rejected_without_draining_admitted_requests() {
+        let (handle, _admission) = crate::clock::with_time_override(1_000, || {
+            let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+            let handle = StorageClusterRuntimeMapHandle::new(cluster);
+            let admission = handle.admit_current_route().unwrap();
+            (handle, admission)
+        });
+        let candidate = active_test_cluster(RouteMapValidity::Forever);
+
+        assert!(matches!(
+            handle.install(candidate),
+            Err(
+                StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
+                    candidate: ClusterEpoch::INITIAL,
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn expired_frontend_route_cannot_be_admitted() {
+        crate::clock::with_time_override(5_000, || {
+            let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            let handle = StorageClusterRuntimeMapHandle::new(cluster);
+            assert!(matches!(
+                handle.admit_current_route(),
+                Err(StoreError::RouteMapExpired {
+                    cluster_epoch,
+                    valid_until_ms: 5_000,
+                    now_ms: 5_000,
+                }) if cluster_epoch == ClusterEpoch::INITIAL
+            ));
+        });
     }
 
     #[test]
@@ -4907,28 +5253,13 @@ impl StorageCluster {
         self.local_map.test_store_route_map_validity(validity);
     }
 
-    fn extend_route_map_validity(&self, candidate: RouteMapValidity) {
-        self.local_map.extend_route_map_validity(candidate);
-    }
-
-    fn cap_route_map_validity(&self, candidate: RouteMapValidity) {
-        self.local_map.cap_route_map_validity(candidate);
-    }
-
     fn replace_route_map_lease(
         &self,
         validity: RouteMapValidity,
         bound_lease: Option<BoundRouteMapLease>,
     ) {
-        match (self.route_map_valid_until_ms(), validity.valid_until_ms()) {
-            (Some(current), Some(candidate)) if candidate < current => {
-                self.cap_route_map_validity(validity);
-            }
-            (None, Some(_)) => self.cap_route_map_validity(validity),
-            _ => self.extend_route_map_validity(validity),
-        }
         self.local_map
-            .replace_process_local_route_map_lease(bound_lease);
+            .replace_route_map_lease(validity, bound_lease);
     }
 
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {

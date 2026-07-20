@@ -74,10 +74,10 @@ pub use cluster::{
     LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
     PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,
     PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
-    ReleasedObjectPayloadLease, ShardLocation, StorageCluster, StorageClusterRuntimeMapHandle,
-    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
-    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
-    StorageClusterRuntimeMapRefreshLoopSuccess,
+    ReleasedObjectPayloadLease, ShardLocation, StorageCluster, StorageClusterRouteAdmission,
+    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshLoop,
+    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
+    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{

@@ -5954,7 +5954,10 @@ fn pending_delete_finalized_bucket_recovery_uses_expired_active_route() {
         .unwrap();
     drop(primary_pg);
 
-    map.cap_route_map_validity(RouteMapValidity::until_ms(0).unwrap());
+    map.expire_route_map_lease_at(
+        RouteMapValidity::until_ms(0).unwrap(),
+        crate::clock::monotonic_time_millis(),
+    );
     assert!(
         matches!(
             cluster.pending_metadata_command_for_bucket(pg_id, &bucket),

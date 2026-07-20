@@ -462,7 +462,8 @@ migrated_metadata_pg_bypasses=$(
         if (in_test_hook) {
             next
         }
-        if (current_fn == "reissue_pending_metadata_command") {
+        if (current_fn == "reissue_pending_metadata_command" \
+            || current_fn == "reissue_pending_metadata_command_with_route_mode") {
             next
         }
         if ($0 ~ /\.metadata_command_client\(\)/ \
@@ -1903,6 +1904,12 @@ metadata_command_conflict_uses=$(
         }
         if (name == "next_object_metadata_command_id_or_drain_with_completion_admission") {
             return "next_object_metadata_command_id_or_drain"
+        }
+        if (name == "partial_exact_metadata_command_conflict_is_retryable_with_route_mode") {
+            return "partial_exact_metadata_command_conflict_is_retryable"
+        }
+        if (name == "reissue_pending_metadata_command_with_route_mode") {
+            return "reissue_pending_metadata_command"
         }
         if (name == "try_set_bucket_pg_pending_command_or_retry_with_work_budget") {
             return "try_set_bucket_pg_pending_command_or_retry"
