@@ -161,8 +161,10 @@ version-1 envelope, binds its access key in constant time, checks expiry, and
 only then resolves the stable issuer incarnation. Ordinary non-streaming S3
 Authorization-header authentication now selects and calls that path for the
 reserved `ARGS` namespace. Presigned-query authentication now does the same
-through its own query-versus-signed-header selector. POST Object and
-aws-chunked streaming authentication still use only the long-lived path.
+through its own query-versus-signed-header selector. POST Object now selects
+ordered multipart form-token inputs and calls the same shared session
+authentication path. Aws-chunked streaming authentication still uses only the
+long-lived path.
 Active static credentials retain their post-signature unexpected-token check,
 and expiring stored records remain static rather than becoming STS
 credentials.
@@ -2468,8 +2470,7 @@ workers. The maximum token is also checked in complete ordinary and aws-chunked
 write-header shapes against the server's 8,192-byte aggregate limit.
 Presigned-query authentication now accepts the same maximum issued token
 within its complete bounded query. POST authentication of that maximum token
-remains a Phase 2 request-path test because that mode still rejects all session
-credentials.
+is covered by its Phase 2 request-path test.
 
 Exit condition: all current S3 suites remain green, every frontend worker can
 open a test-sealed credential using the shared key ring, and no issued-session
@@ -2545,7 +2546,39 @@ the derived 742-byte maximum issued token within the bounded presigned query.
 The static-credential path retains its prior lookup, expiry, signature, and
 post-signature unexpected-token ordering.
 
-POST Object and streaming adapters still need their mode-specific
+The POST Object adapter is now complete as a separate mode-specific selector.
+It collects every `x-amz-security-token` multipart form field in wire order,
+uses the common session selection/authentication pipeline for `ARGS`
+credentials, and returns the typed assumed-role identity with the standard
+authorization profile. Scope remains ahead of form-token selection. A missing
+or empty token and an independently valid but mismatched token return
+`InvalidAccessKeyId`; malformed non-empty input returns `InvalidToken`;
+conflicting duplicates in either order return `InvalidAccessKeyId`; and
+identical duplicates authenticate as one effective token while retaining their
+ordered multiplicity for expiry rendering and POST-policy evaluation. Token
+opening, access-key binding, expiry, stable issuer liveness, provider failure,
+and key-ring failure remain ahead of policy-signature comparison. Static
+credentials preserve their prior lookup, expiry, HMAC, and post-signature
+unexpected-token behavior.
+
+The adapter also preserves POST's independent HTTP-header routing rule. Any
+present `x-amz-security-token` request header, including empty, malformed, or
+duplicated values, returns the exact HTTP 403 `AccessDenied` response with `No
+AWSAccessKey was presented.` before form scope, token, or policy-signature
+processing. Identical form-token duplicates with a valid HMAC continue into
+policy evaluation and produce AWS's exact condition-expression denial,
+whether the policy writes the exact token condition in the AWS-oracle object
+form or the equivalent array-form `eq` representation. The response includes
+the token only on the protocol surface; diagnostics and `Debug` remain
+redacted. A bad HMAC still wins before that policy-condition failure.
+Focused authentication and server-adapter tests cover the structural and
+binding matrix, both conflicting orders, identical duplicates with correct and
+bad HMACs, expired duplicate preservation, deletion and liveness-provider
+failure, scope precedence, typed assumed-role identity, exact response shapes,
+and successful authentication of the derived 742-byte maximum issued token
+through the server's parsed POST adapter path.
+
+The aws-chunked streaming adapter still needs its mode-specific
 selection/coverage wiring.
 
 Exit condition: directly sealed session credentials authenticate with

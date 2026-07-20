@@ -3718,6 +3718,12 @@ impl HttpFrontend {
             Self::require_content_sha256_for_sigv4_header_auth(req)?;
             return Err(ServerError::PostObjectHeaderAuthUnsupported);
         }
+        // AWS routes POST Object away from form authentication when this HTTP
+        // header is present, regardless of its value. The header is therefore
+        // neither decoded nor considered as a fallback form token.
+        if req.header_count("x-amz-security-token") != 0 {
+            return Err(ServerError::PostObjectNoAccessKeyPresented);
+        }
         let header_auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
 
         let field = |name: &str| -> Option<&str> {
@@ -3727,6 +3733,11 @@ impl HttpFrontend {
                 .map(|(_, v)| v.as_str())
         };
         let now = current_auth_epoch_secs()?;
+        let security_tokens = form_fields
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("x-amz-security-token"))
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
 
         let post_auth = if [
             "x-amz-algorithm",
@@ -3760,7 +3771,7 @@ impl HttpFrontend {
                             reason: "missing x-amz-signature".to_string(),
                         }
                     })?,
-                    security_token: field("x-amz-security-token"),
+                    security_tokens: &security_tokens,
                 },
                 &self.identity_provider,
                 auth::ExpectedCredentialScope::new(
@@ -4016,6 +4027,9 @@ impl HttpFrontend {
             } => ServerError::PostPolicyAccessDenied {
                 reason: format!("Access denied by POST policy condition on field '{field}'"),
             },
+            auth::PostPolicyError::ConditionExpressionFailed { expression } => {
+                ServerError::PostPolicyConditionAccessDenied { expression }
+            }
             auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed { .. } => {
                 ServerError::Auth(auth::AuthError::AccessDenied)
             }
@@ -6797,7 +6811,7 @@ mod tests {
         )
     }
 
-    fn install_expired_session_provider(frontend: &mut HttpFrontend) -> (String, String) {
+    fn install_expired_session_provider(frontend: &mut HttpFrontend) -> InstalledPostSession {
         let stable_role_id = auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
         let role = auth::IamRoleIdentity::new(
             auth::AwsAccountId::new("123456789012").unwrap(),
@@ -6826,6 +6840,7 @@ mod tests {
             .unwrap();
         let material = auth::generate_session_credential_material().unwrap();
         let access_key_id = material.access_key_id().to_string();
+        let secret_key = material.secret_key().clone();
         let now = i64::try_from(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -6843,7 +6858,106 @@ mod tests {
                 None,
             )
             .unwrap();
-        (access_key_id, token)
+        InstalledPostSession {
+            access_key_id,
+            secret_key,
+            token,
+        }
+    }
+
+    struct InstalledPostSession {
+        access_key_id: String,
+        secret_key: SecretKey,
+        token: String,
+    }
+
+    fn install_maximum_live_post_session(frontend: &mut HttpFrontend) -> InstalledPostSession {
+        let stable_role_id = auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
+        let role = auth::IamRoleIdentity::new(
+            auth::AwsAccountId::new("123456789012").unwrap(),
+            stable_role_id.clone(),
+            auth::RoleName::new("r".repeat(64)).unwrap(),
+            auth::IamPath::new("/test/").unwrap(),
+        );
+        let live_role = auth::LiveRoleIdentity::new(
+            s3_types::AccountIdentity::new(
+                "123456789012",
+                s3_types::CanonicalUserId::from_principal("123456789012"),
+                "test account",
+            ),
+            role,
+        )
+        .unwrap();
+        let mut roles = auth::RoleIdentityStore::new();
+        roles.add(live_role).unwrap();
+        frontend.identity_provider =
+            auth::IdentityProvider::in_memory_with_roles(auth::CredentialStore::new(), roles)
+                .unwrap();
+        let issuer = frontend
+            .identity_provider
+            .lookup_live_role_identity(&stable_role_id)
+            .unwrap()
+            .unwrap();
+        let material = auth::generate_session_credential_material().unwrap();
+        let access_key_id = material.access_key_id().to_string();
+        let secret_key = material.secret_key().clone();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let token = frontend
+            .identity_provider
+            .seal_session_credential_v1(
+                material,
+                &issuer,
+                auth::RoleSessionName::new("s".repeat(64)).unwrap(),
+                auth::SessionLifetime::new(now - 60, now + 3_600).unwrap(),
+                Some(auth::SourceIdentity::new("i".repeat(256)).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(token.len(), auth::MAX_ISSUED_V1_TOKEN_LEN);
+        InstalledPostSession {
+            access_key_id,
+            secret_key,
+            token,
+        }
+    }
+
+    fn issue_other_live_post_session(frontend: &HttpFrontend) -> InstalledPostSession {
+        let stable_role_id = auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
+        let issuer = frontend
+            .identity_provider
+            .lookup_live_role_identity(&stable_role_id)
+            .unwrap()
+            .unwrap();
+        let material = auth::generate_session_credential_material().unwrap();
+        let access_key_id = material.access_key_id().to_string();
+        let secret_key = material.secret_key().clone();
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let token = frontend
+            .identity_provider
+            .seal_session_credential_v1(
+                material,
+                &issuer,
+                auth::RoleSessionName::new("other-session").unwrap(),
+                auth::SessionLifetime::new(now - 60, now + 3_600).unwrap(),
+                None,
+            )
+            .unwrap();
+        InstalledPostSession {
+            access_key_id,
+            secret_key,
+            token,
+        }
     }
 
     fn signed_v4_put_req(body: &[u8], extra_headers: Vec<(String, String)>) -> S3Request {
@@ -6970,6 +7084,60 @@ mod tests {
             extra_fields
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.to_string())),
+        );
+        fields
+    }
+
+    fn signed_post_session_object_condition_policy_fields(
+        session: &InstalledPostSession,
+        security_tokens: &[&str],
+        valid_signature: bool,
+    ) -> Vec<(String, String)> {
+        use base64::Engine;
+
+        let (date, amz_date) = current_sigv4_timestamp();
+        let credential = format!("{}/{date}/us-east-1/s3/aws4_request", session.access_key_id);
+        let policy = format!(
+            concat!(
+                r#"{{"expiration":"2099-12-31T23:59:59Z","conditions":["#,
+                r#"{{"bucket":"mybucket"}},{{"key":"mykey"}},"#,
+                r#"{{"x-amz-algorithm":"AWS4-HMAC-SHA256"}},"#,
+                r#"{{"x-amz-credential":"{}"}},{{"x-amz-date":"{}"}},"#,
+                r#"{{"x-amz-security-token":"{}"}}]}}"#
+            ),
+            credential, amz_date, session.token
+        );
+        let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.as_bytes());
+        let wrong_secret = SecretKey::new("0000000000000000000000000000000000000000".to_string());
+        let signing_secret = if valid_signature {
+            &session.secret_key
+        } else {
+            &wrong_secret
+        };
+        let signing_key = auth::sigv4::derive_signing_key(signing_secret, &date, "us-east-1", "s3");
+        let signature = hex_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
+                policy_b64.as_bytes(),
+            )
+            .as_ref(),
+        );
+
+        let mut fields = vec![
+            ("key".to_string(), "mykey".to_string()),
+            (
+                "x-amz-algorithm".to_string(),
+                "AWS4-HMAC-SHA256".to_string(),
+            ),
+            ("x-amz-credential".to_string(), credential),
+            ("x-amz-date".to_string(), amz_date),
+            ("policy".to_string(), policy_b64),
+            ("x-amz-signature".to_string(), signature),
+        ];
+        fields.extend(
+            security_tokens
+                .iter()
+                .map(|token| ("x-amz-security-token".to_string(), (*token).to_string())),
         );
         fields
     }
@@ -7169,20 +7337,20 @@ mod tests {
     fn duplicate_expired_header_session_tokens_render_exact_aws_response_end_to_end() {
         let tmp = test_util::tempdir();
         let mut frontend = setup_frontend(tmp.path());
-        let (access_key_id, token) = install_expired_session_provider(&mut frontend);
+        let session = install_expired_session_provider(&mut frontend);
         let request = header_auth_request(
             http::Method::GET,
             "/",
-            &access_key_id,
+            &session.access_key_id,
             "s3",
-            &[&token, &token],
+            &[&session.token, &session.token],
         );
         let wire_ids = WireResponseIds::new("request-id", "host-id");
 
         let response = frontend.handle_s3_request(&request, &wire_ids);
         assert_eq!(response.status_code, 400);
         let body = String::from_utf8(response.into_test_body_bytes().unwrap()).unwrap();
-        let sanitized = body.replace(&token, "SESSION_TOKEN");
+        let sanitized = body.replace(&session.token, "SESSION_TOKEN");
         assert_eq!(
             sanitized,
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -10577,6 +10745,241 @@ mod tests {
             0,
             "policy-denied POST should not create a stream session"
         );
+    }
+
+    #[test]
+    fn prepare_streaming_post_object_object_condition_preserves_session_token_semantics() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        create_sigv4_test_bucket(&frontend.coordinator, "mybucket", false);
+        let session = install_maximum_live_post_session(&mut frontend);
+        let other_session = issue_other_live_post_session(&frontend);
+        let request = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "",
+            vec![(
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            )],
+            Vec::new(),
+        );
+
+        let fields =
+            signed_post_session_object_condition_policy_fields(&session, &[&session.token], true);
+        assert!(matches!(
+            frontend.prepare_streaming_post_object(
+                &request,
+                "mybucket",
+                &fields,
+                Some("upload.txt")
+            ),
+            Err(ServerError::AccessDenied)
+        ));
+
+        for tokens in [Vec::new(), vec![""]] {
+            let fields =
+                signed_post_session_object_condition_policy_fields(&session, &tokens, false);
+            assert!(matches!(
+                frontend.prepare_streaming_post_object(
+                    &request,
+                    "mybucket",
+                    &fields,
+                    Some("upload.txt")
+                ),
+                Err(ServerError::Auth(auth::AuthError::UnknownAccessKey { .. }))
+            ));
+        }
+
+        let malformed = "ARGST1.not-a-canonical-token";
+        let fields =
+            signed_post_session_object_condition_policy_fields(&session, &[malformed], false);
+        assert!(matches!(
+            frontend.prepare_streaming_post_object(
+                &request,
+                "mybucket",
+                &fields,
+                Some("upload.txt")
+            ),
+            Err(ServerError::Auth(
+                auth::AuthError::UnexpectedSecurityToken { token }
+            )) if token == malformed
+        ));
+
+        for tokens in [
+            [session.token.as_str(), other_session.token.as_str()],
+            [other_session.token.as_str(), session.token.as_str()],
+        ] {
+            let fields =
+                signed_post_session_object_condition_policy_fields(&session, &tokens, false);
+            assert!(matches!(
+                frontend.prepare_streaming_post_object(
+                    &request,
+                    "mybucket",
+                    &fields,
+                    Some("upload.txt")
+                ),
+                Err(ServerError::Auth(auth::AuthError::UnknownAccessKey { .. }))
+            ));
+        }
+
+        let fields = signed_post_session_object_condition_policy_fields(
+            &session,
+            &[&session.token, &session.token],
+            true,
+        );
+        match frontend.prepare_streaming_post_object(
+            &request,
+            "mybucket",
+            &fields,
+            Some("upload.txt"),
+        ) {
+            Err(ServerError::PostPolicyConditionAccessDenied { expression }) => {
+                let sanitized_expression =
+                    expression.as_str().replace(&session.token, "SESSION_TOKEN");
+                assert_eq!(
+                    sanitized_expression,
+                    "[\"eq\", \"$x-amz-security-token\", \"SESSION_TOKEN\"]"
+                );
+                assert!(!format!("{expression:?}").contains(&session.token));
+                let response = S3Response::error(
+                    &ServerError::PostPolicyConditionAccessDenied {
+                        expression: expression.clone(),
+                    },
+                    "/mybucket",
+                    "host-id",
+                );
+                assert_eq!(response.status_code, 403);
+                let body = String::from_utf8(response.into_test_body_bytes().unwrap()).unwrap();
+                let sanitized = body.replace(&session.token, "SESSION_TOKEN");
+                assert_eq!(
+                    sanitized,
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>AccessDenied</Code>\
+                     <Message>Invalid according to Policy: Policy Condition failed: \
+                     [\"eq\", \"$x-amz-security-token\", \"SESSION_TOKEN\"]</Message>\
+                     <RequestId>request-id</RequestId>\
+                     <HostId>host-id</HostId>\
+                     </Error>"
+                );
+            }
+            Err(error) => panic!("expected POST condition denial, got {error:?}"),
+            Ok(_) => panic!("expected POST condition denial, got success"),
+        }
+
+        for tokens in [
+            vec![session.token.as_str()],
+            vec![session.token.as_str(), session.token.as_str()],
+        ] {
+            let fields =
+                signed_post_session_object_condition_policy_fields(&session, &tokens, false);
+            assert!(matches!(
+                frontend.prepare_streaming_post_object(
+                    &request,
+                    "mybucket",
+                    &fields,
+                    Some("upload.txt")
+                ),
+                Err(ServerError::Auth(auth::AuthError::SignatureMismatch { .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn prepare_streaming_post_object_session_header_presence_precedes_form_authentication() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        create_sigv4_test_bucket(&frontend.coordinator, "mybucket", false);
+        let session = install_maximum_live_post_session(&mut frontend);
+        let fields =
+            signed_post_session_object_condition_policy_fields(&session, &[&session.token], false);
+
+        for header_values in [
+            vec![session.token.as_str()],
+            vec!["ARGST1.not-a-canonical-token"],
+            vec![""],
+            vec![session.token.as_str(), "ARGST1.not-a-canonical-token"],
+        ] {
+            let headers = std::iter::once((
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            ))
+            .chain(
+                header_values
+                    .into_iter()
+                    .map(|value| ("x-amz-security-token".to_string(), value.to_string())),
+            )
+            .collect();
+            let request = new_req(http::Method::POST, "/mybucket", "", headers, Vec::new());
+            assert!(matches!(
+                frontend.prepare_streaming_post_object(
+                    &request,
+                    "mybucket",
+                    &fields,
+                    Some("upload.txt")
+                ),
+                Err(ServerError::PostObjectNoAccessKeyPresented)
+            ));
+        }
+
+        let response = S3Response::error(
+            &ServerError::PostObjectNoAccessKeyPresented,
+            "/mybucket",
+            "host-id",
+        );
+        assert_eq!(response.status_code, 403);
+        let body = String::from_utf8(response.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error>\
+             <Code>AccessDenied</Code>\
+             <Message>No AWSAccessKey was presented.</Message>\
+             <RequestId>request-id</RequestId>\
+             <HostId>host-id</HostId>\
+             </Error>"
+        );
+    }
+
+    #[test]
+    fn prepare_streaming_post_object_preserves_duplicate_expired_tokens() {
+        let tmp = test_util::tempdir();
+        let mut frontend = setup_frontend(tmp.path());
+        create_sigv4_test_bucket(&frontend.coordinator, "mybucket", false);
+        let session = install_expired_session_provider(&mut frontend);
+        let fields = signed_post_session_object_condition_policy_fields(
+            &session,
+            &[&session.token, &session.token],
+            false,
+        );
+        let request = new_req(
+            http::Method::POST,
+            "/mybucket",
+            "",
+            vec![(
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            )],
+            Vec::new(),
+        );
+
+        match frontend.prepare_streaming_post_object(
+            &request,
+            "mybucket",
+            &fields,
+            Some("upload.txt"),
+        ) {
+            Err(ServerError::Auth(auth::AuthError::ExpiredSessionToken { tokens })) => {
+                assert!(tokens.len() == 2, "expected two echoed token values");
+                assert!(
+                    tokens.iter().all(|token| token == &session.token),
+                    "expected both echoed values to preserve the presented token"
+                );
+            }
+            Err(_) => panic!("expected expired session token"),
+            Ok(_) => panic!("expected expired session token, got success"),
+        }
     }
 
     #[test]

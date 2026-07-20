@@ -321,6 +321,12 @@ pub enum ServerError {
 
     #[error("post policy access denied: {reason}")]
     PostPolicyAccessDenied { reason: String },
+    #[error("POST policy condition access denied")]
+    PostPolicyConditionAccessDenied {
+        expression: auth::PostPolicyConditionExpression,
+    },
+    #[error("POST object request presented a session-token header without header authentication")]
+    PostObjectNoAccessKeyPresented,
 
     #[error("block public policy access denied for requester {requester_principal} on {bucket}")]
     BlockPublicPolicyAccessDenied {
@@ -640,6 +646,8 @@ impl ServerError {
             Self::AccessDenied
             | Self::ObjectLockProtectedAccessDenied
             | Self::PostPolicyAccessDenied { .. }
+            | Self::PostPolicyConditionAccessDenied { .. }
+            | Self::PostObjectNoAccessKeyPresented
             | Self::BlockPublicPolicyAccessDenied { .. }
             | Self::SseCBlockedAccessDenied { .. }
             | Self::AnonymousApiAccessDenied => "AccessDenied",
@@ -784,6 +792,8 @@ impl ServerError {
             Self::AccessDenied
             | Self::ObjectLockProtectedAccessDenied
             | Self::PostPolicyAccessDenied { .. }
+            | Self::PostPolicyConditionAccessDenied { .. }
+            | Self::PostObjectNoAccessKeyPresented
             | Self::BlockPublicPolicyAccessDenied { .. }
             | Self::SseCBlockedAccessDenied { .. }
             | Self::AnonymousApiAccessDenied => 403,

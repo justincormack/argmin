@@ -80,8 +80,8 @@ pub use identity::{
 };
 pub use post::{
     authenticate_post_sigv4, prepare_post_policy, validate_post_policy,
-    validate_prepared_post_policy_size, ExpectedCredentialScope, PostPolicyError, PostSigV4Request,
-    PreparedPostPolicy,
+    validate_prepared_post_policy_size, ExpectedCredentialScope, PostPolicyConditionExpression,
+    PostPolicyError, PostSigV4Request, PreparedPostPolicy,
 };
 pub use provider::{
     IdentityProvider, IdentityProviderBackend, IdentityProviderError, ResolvedRoleIdentity,

@@ -5,8 +5,8 @@
 use crate::credential::parse_credential_scope_ref;
 use crate::error::AuthError;
 use crate::request::{
-    validate_static_credential_has_no_token, validate_static_record_expiry, AuthContext, AuthMode,
-    ExpectedSigningRegion,
+    authenticate_presented_s3_session_credential, validate_static_credential_has_no_token,
+    validate_static_record_expiry, AuthContext, AuthMode, ExpectedSigningRegion,
 };
 use crate::sigv4;
 
@@ -24,6 +24,27 @@ enum PostPolicyCondition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedPostPolicy {
     conditions: Vec<PostPolicyCondition>,
+}
+
+/// A POST-policy condition expression echoed in AWS's client response.
+///
+/// Debug output is deliberately redacted because an expression can contain a
+/// session token. Callers should use [`Self::as_str`] only when constructing
+/// the protocol response.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PostPolicyConditionExpression(String);
+
+impl PostPolicyConditionExpression {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PostPolicyConditionExpression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&observability::redacted("post_policy_condition"), f)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -60,7 +81,8 @@ pub struct PostSigV4Request<'a> {
     pub date: &'a str,
     pub policy_b64: &'a str,
     pub signature_hex: &'a str,
-    pub security_token: Option<&'a str>,
+    /// Every `x-amz-security-token` form field in wire order.
+    pub security_tokens: &'a [&'a str],
 }
 
 /// Authenticate a POST Object request using SigV4 form fields.
@@ -112,23 +134,16 @@ pub fn authenticate_post_sigv4(
     let request_epoch_secs =
         crate::canonical::parse_amz_date(request.date).ok_or(AuthError::MalformedAuth)?;
 
-    // Look up the secret key
-    let record = provider
-        .lookup_long_lived_credential(credential.access_key_id)
-        .map_err(AuthError::IdentityProviderFailure)?
-        .ok_or_else(|| AuthError::UnknownAccessKey {
-            access_key_id: credential.access_key_id.to_string(),
-        })?;
-    if !record.is_enabled() {
-        return Err(AuthError::UnknownAccessKey {
-            access_key_id: credential.access_key_id.to_string(),
-        });
-    }
-    validate_static_record_expiry(&record, now_epoch_secs)?;
+    let authenticated_credential = resolve_post_credential(
+        credential.access_key_id,
+        request.security_tokens,
+        provider,
+        now_epoch_secs,
+    )?;
 
     // Derive signing key and compute expected signature
     let signing_key = sigv4::derive_signing_key(
-        record.secret_key(),
+        authenticated_credential.secret_key(),
         credential.date,
         credential.region,
         credential.service,
@@ -147,17 +162,55 @@ pub fn authenticate_post_sigv4(
             })),
         });
     }
-    validate_static_credential_has_no_token(request.security_token)?;
+    if authenticated_credential.long_lived().is_some() {
+        validate_static_credential_has_no_token(request.security_tokens.first().copied())?;
+    }
 
     Ok(AuthContext {
         mode: AuthMode::PostSigV4,
         access_key_id: Some(credential.access_key_id.to_string()),
-        identity: Some(record.identity().clone()),
-        authorization_profile: record.authorization_profile(),
+        identity: Some(authenticated_credential.identity().clone()),
+        authorization_profile: authenticated_credential.long_lived().map_or(
+            crate::AuthorizationProfile::Standard,
+            crate::StoredCredential::authorization_profile,
+        ),
         request_epoch_secs: Some(request_epoch_secs),
         signing_region: Some(credential.region.to_string()),
         streaming: None,
     })
+}
+
+fn resolve_post_credential(
+    access_key_id: &str,
+    security_tokens: &[&str],
+    provider: &crate::IdentityProvider,
+    now_epoch_secs: u64,
+) -> Result<crate::AuthenticatedCredential, AuthError> {
+    if crate::is_reserved_session_access_key_id(access_key_id) {
+        return authenticate_presented_s3_session_credential(
+            provider,
+            access_key_id,
+            security_tokens
+                .iter()
+                .map(|token| (*token).to_string())
+                .collect(),
+            now_epoch_secs,
+        );
+    }
+
+    let record = provider
+        .lookup_long_lived_credential(access_key_id)
+        .map_err(AuthError::IdentityProviderFailure)?
+        .ok_or_else(|| AuthError::UnknownAccessKey {
+            access_key_id: access_key_id.to_string(),
+        })?;
+    if !record.is_enabled() {
+        return Err(AuthError::UnknownAccessKey {
+            access_key_id: access_key_id.to_string(),
+        });
+    }
+    validate_static_record_expiry(&record, now_epoch_secs)?;
+    Ok(crate::AuthenticatedCredential::LongLived(record))
 }
 
 /// Error from POST policy validation.
@@ -176,6 +229,10 @@ pub enum PostPolicyError {
     ConditionFailed {
         condition: &'static str,
         field: Option<String>,
+    },
+    #[error("POST policy condition failed")]
+    ConditionExpressionFailed {
+        expression: PostPolicyConditionExpression,
     },
 }
 
@@ -358,6 +415,11 @@ pub fn prepare_post_policy(
             }
             PostPolicyCondition::FieldExact { field, expected } => {
                 covered_fields.insert(field.clone());
+                if let Some(expression) =
+                    duplicate_session_token_condition_expression(field, expected, form_fields)
+                {
+                    return Err(PostPolicyError::ConditionExpressionFailed { expression });
+                }
                 if find_field(form_fields, field) != Some(expected.as_str()) {
                     return Err(PostPolicyError::ConditionFailed {
                         condition: "exact match",
@@ -377,6 +439,11 @@ pub fn prepare_post_policy(
             }
             PostPolicyCondition::Eq { field, expected } => {
                 covered_fields.insert(field.clone());
+                if let Some(expression) =
+                    duplicate_session_token_condition_expression(field, expected, form_fields)
+                {
+                    return Err(PostPolicyError::ConditionExpressionFailed { expression });
+                }
                 if find_field(form_fields, field) != Some(expected.as_str()) {
                     return Err(PostPolicyError::ConditionFailed {
                         condition: "eq",
@@ -408,6 +475,30 @@ pub fn prepare_post_policy(
     }
 
     Ok(prepared)
+}
+
+fn duplicate_session_token_condition_expression(
+    field: &str,
+    expected: &str,
+    form_fields: &[(&str, &str)],
+) -> Option<PostPolicyConditionExpression> {
+    if !field.eq_ignore_ascii_case("x-amz-security-token")
+        || form_fields
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(field))
+            .count()
+            <= 1
+    {
+        return None;
+    }
+
+    let field_reference = format!("${field}");
+    Some(PostPolicyConditionExpression(format!(
+        "[{}, {}, {}]",
+        serde_json::to_string("eq").expect("static string serializes"),
+        serde_json::to_string(&field_reference).expect("valid field serializes"),
+        serde_json::to_string(expected).expect("valid policy value serializes"),
+    )))
 }
 
 /// Validate the final uploaded file size against a previously prepared policy.
@@ -480,7 +571,7 @@ mod tests {
     use super::*;
     use crate::credential::{CredentialStore, SecretKey, StoredCredential};
     use s3_types::AccountIdentity;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
 
     struct FailingIdentityProvider(crate::IdentityProviderError);
 
@@ -505,6 +596,198 @@ mod tests {
         ) -> Result<Option<AccountIdentity>, crate::IdentityProviderError> {
             Err(self.0)
         }
+    }
+
+    enum SessionRoleState {
+        Present(Arc<crate::LiveRoleIdentity>),
+        Missing,
+        Failure(crate::IdentityProviderError),
+    }
+
+    struct SessionRoleProvider {
+        role: Arc<RwLock<SessionRoleState>>,
+    }
+
+    impl crate::IdentityProviderBackend for SessionRoleProvider {
+        fn lookup_long_lived_credential(
+            &self,
+            _access_key_id: &str,
+        ) -> Result<Option<Arc<StoredCredential>>, crate::IdentityProviderError> {
+            Ok(None)
+        }
+
+        fn lookup_live_role_identity(
+            &self,
+            stable_role_id: &crate::StableRoleId,
+        ) -> Result<Option<Arc<crate::LiveRoleIdentity>>, crate::IdentityProviderError> {
+            let state = self
+                .role
+                .read()
+                .map_err(|_| crate::IdentityProviderError::Unavailable)?;
+            match &*state {
+                SessionRoleState::Present(role) if role.role().stable_id() == stable_role_id => {
+                    Ok(Some(Arc::clone(role)))
+                }
+                SessionRoleState::Present(_) | SessionRoleState::Missing => Ok(None),
+                SessionRoleState::Failure(error) => Err(*error),
+            }
+        }
+
+        fn find_account_by_canonical_user_id(
+            &self,
+            _canonical_user_id: &s3_types::CanonicalUserId,
+        ) -> Result<Option<AccountIdentity>, crate::IdentityProviderError> {
+            Ok(None)
+        }
+    }
+
+    struct PostSessionFixture {
+        provider: crate::IdentityProvider,
+        role_state: Arc<RwLock<SessionRoleState>>,
+        access_key_id: String,
+        secret_key: SecretKey,
+        token: String,
+        now_epoch_secs: u64,
+    }
+
+    fn post_session_fixture(expires_at_offset_secs: i64) -> PostSessionFixture {
+        post_session_fixture_with_identity(
+            expires_at_offset_secs,
+            "test-role",
+            "test-session",
+            Some("source-user"),
+        )
+    }
+
+    fn post_session_fixture_with_identity(
+        expires_at_offset_secs: i64,
+        role_name: &str,
+        session_name: &str,
+        source_identity: Option<&str>,
+    ) -> PostSessionFixture {
+        let now_epoch_secs = crate::canonical::parse_amz_date("20260720T120000Z").unwrap();
+        let stable_role_id = crate::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
+        let role = crate::IamRoleIdentity::new(
+            crate::AwsAccountId::new("123456789012").unwrap(),
+            stable_role_id.clone(),
+            crate::RoleName::new(role_name).unwrap(),
+            crate::IamPath::new("/test/").unwrap(),
+        );
+        let live_role = crate::LiveRoleIdentity::new(
+            AccountIdentity::new(
+                "123456789012",
+                s3_types::CanonicalUserId::from_principal("123456789012"),
+                "test account",
+            ),
+            role,
+        )
+        .unwrap();
+        let role_state = Arc::new(RwLock::new(SessionRoleState::Present(Arc::new(live_role))));
+        let provider = crate::IdentityProvider::new(SessionRoleProvider {
+            role: Arc::clone(&role_state),
+        })
+        .unwrap();
+        let issuer = provider
+            .lookup_live_role_identity(&stable_role_id)
+            .unwrap()
+            .unwrap();
+        let access_key_id = "ARGS0123456789ABCDEFGHIJ".to_string();
+        let secret_key = SecretKey::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".to_string());
+        let expires_at_epoch_secs = i64::try_from(now_epoch_secs).unwrap() + expires_at_offset_secs;
+        let token = provider
+            .seal_session_credential_v1(
+                crate::GeneratedSessionCredentialMaterial::from_parts_for_test(
+                    access_key_id.clone(),
+                    secret_key.clone(),
+                ),
+                &issuer,
+                crate::RoleSessionName::new(session_name).unwrap(),
+                crate::SessionLifetime::new(
+                    i64::try_from(now_epoch_secs).unwrap() - 60,
+                    expires_at_epoch_secs,
+                )
+                .unwrap(),
+                source_identity.map(|value| crate::SourceIdentity::new(value).unwrap()),
+            )
+            .unwrap();
+        PostSessionFixture {
+            provider,
+            role_state,
+            access_key_id,
+            secret_key,
+            token,
+            now_epoch_secs,
+        }
+    }
+
+    fn issue_post_session_token(
+        fixture: &PostSessionFixture,
+        access_key_id: &str,
+        secret_key: SecretKey,
+    ) -> String {
+        let stable_role_id = crate::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
+        let issuer = fixture
+            .provider
+            .lookup_live_role_identity(&stable_role_id)
+            .unwrap()
+            .unwrap();
+        fixture
+            .provider
+            .seal_session_credential_v1(
+                crate::GeneratedSessionCredentialMaterial::from_parts_for_test(
+                    access_key_id.to_string(),
+                    secret_key,
+                ),
+                &issuer,
+                crate::RoleSessionName::new("other-session").unwrap(),
+                crate::SessionLifetime::new(
+                    i64::try_from(fixture.now_epoch_secs).unwrap() - 60,
+                    i64::try_from(fixture.now_epoch_secs).unwrap() + 3_600,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+    }
+
+    fn authenticate_post_session(
+        fixture: &PostSessionFixture,
+        security_tokens: &[&str],
+        scope: (&str, &str),
+        valid_signature: bool,
+    ) -> Result<AuthContext, AuthError> {
+        let policy_b64 = "eyJleHBpcmF0aW9uIjoiMjA5OS0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbXX0=";
+        let (region, service) = scope;
+        let wrong_secret = SecretKey::new("0000000000000000000000000000000000000000".to_string());
+        let signing_secret = if valid_signature {
+            &fixture.secret_key
+        } else {
+            &wrong_secret
+        };
+        let signing_key = sigv4::derive_signing_key(signing_secret, "20260720", region, service);
+        let signature = sigv4::hex_encode(
+            sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes()).as_ref(),
+        );
+        let credential = format!(
+            "{}/20260720/{region}/{service}/aws4_request",
+            fixture.access_key_id
+        );
+        super::authenticate_post_sigv4(
+            PostSigV4Request {
+                algorithm: "AWS4-HMAC-SHA256",
+                credential: &credential,
+                date: "20260720T120000Z",
+                policy_b64,
+                signature_hex: &signature,
+                security_tokens,
+            },
+            &fixture.provider,
+            ExpectedCredentialScope::new(
+                ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+                "s3",
+            ),
+            fixture.now_epoch_secs,
+        )
     }
 
     fn assert_split_validation_matches(
@@ -566,7 +849,7 @@ mod tests {
                 date,
                 policy_b64,
                 signature_hex,
-                security_token: None,
+                security_tokens: &[],
             },
             provider,
             expected_scope,
@@ -668,6 +951,277 @@ mod tests {
     }
 
     #[test]
+    fn sigv4_post_session_returns_typed_role_identity() {
+        let fixture = post_session_fixture(3_600);
+        let context =
+            authenticate_post_session(&fixture, &[&fixture.token], ("us-east-1", "s3"), true)
+                .unwrap();
+
+        assert_eq!(context.mode, AuthMode::PostSigV4);
+        assert_eq!(
+            context.access_key_id.as_deref(),
+            Some(fixture.access_key_id.as_str())
+        );
+        assert_eq!(
+            context
+                .identity
+                .as_ref()
+                .unwrap()
+                .role_session()
+                .unwrap()
+                .session_name()
+                .as_str(),
+            "test-session"
+        );
+        assert!(context.configured_principal().is_none());
+        assert_eq!(
+            context.authorization_profile,
+            crate::AuthorizationProfile::Standard
+        );
+    }
+
+    #[test]
+    fn sigv4_post_authenticates_maximum_issued_session_token() {
+        let role_name = "r".repeat(crate::identity::ROLE_NAME_MAX_LEN);
+        let session_name = "s".repeat(crate::identity::ROLE_SESSION_NAME_MAX_LEN);
+        let source_identity = "i".repeat(crate::identity::SOURCE_IDENTITY_MAX_LEN);
+        let fixture = post_session_fixture_with_identity(
+            3_600,
+            &role_name,
+            &session_name,
+            Some(&source_identity),
+        );
+        assert_eq!(fixture.token.len(), crate::MAX_ISSUED_V1_TOKEN_LEN);
+
+        let context =
+            authenticate_post_session(&fixture, &[&fixture.token], ("us-east-1", "s3"), true)
+                .unwrap();
+        assert_eq!(
+            context
+                .identity
+                .unwrap()
+                .role_session()
+                .unwrap()
+                .session_name()
+                .as_str(),
+            session_name
+        );
+    }
+
+    #[test]
+    fn sigv4_post_session_token_structure_and_binding_precede_signature() {
+        let fixture = post_session_fixture(3_600);
+        let other_token = issue_post_session_token(
+            &fixture,
+            "ARGS1123456789ABCDEFGHIJ",
+            SecretKey::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn".to_string()),
+        );
+
+        for tokens in [Vec::new(), vec![""], vec![other_token.as_str()]] {
+            assert!(matches!(
+                authenticate_post_session(&fixture, &tokens, ("us-east-1", "s3"), false),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        let malformed = "ARGST1.not-a-canonical-token";
+        assert!(matches!(
+            authenticate_post_session(
+                &fixture,
+                &[malformed],
+                ("us-east-1", "s3"),
+                false
+            ),
+            Err(AuthError::UnexpectedSecurityToken { token }) if token == malformed
+        ));
+
+        authenticate_post_session(
+            &fixture,
+            &[&fixture.token, &fixture.token],
+            ("us-east-1", "s3"),
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            authenticate_post_session(
+                &fixture,
+                &[&fixture.token, &fixture.token],
+                ("us-east-1", "s3"),
+                false
+            ),
+            Err(AuthError::SignatureMismatch { .. })
+        ));
+
+        for valid_signature in [true, false] {
+            for tokens in [
+                [fixture.token.as_str(), other_token.as_str()],
+                [other_token.as_str(), fixture.token.as_str()],
+            ] {
+                assert!(matches!(
+                    authenticate_post_session(
+                        &fixture,
+                        &tokens,
+                        ("us-east-1", "s3"),
+                        valid_signature
+                    ),
+                    Err(AuthError::UnknownAccessKey { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn sigv4_post_session_scope_precedes_token_and_signature_validation() {
+        let fixture = post_session_fixture(3_600);
+        let other_token = issue_post_session_token(
+            &fixture,
+            "ARGS1123456789ABCDEFGHIJ",
+            SecretKey::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn".to_string()),
+        );
+        let malformed = "ARGST1.not-a-canonical-token";
+
+        let token_cases = [
+            Vec::new(),
+            vec![""],
+            vec![malformed],
+            vec![other_token.as_str()],
+            vec![fixture.token.as_str(), fixture.token.as_str()],
+            vec![fixture.token.as_str(), other_token.as_str()],
+            vec![other_token.as_str(), fixture.token.as_str()],
+        ];
+        for tokens in &token_cases {
+            assert!(matches!(
+                authenticate_post_session(&fixture, tokens, ("us-west-2", "s3"), false),
+                Err(AuthError::InvalidCredentialScopeRegion {
+                    provided_region,
+                    expected_region,
+                    ..
+                }) if provided_region == "us-west-2" && expected_region == "us-east-1"
+            ));
+            assert!(matches!(
+                authenticate_post_session(&fixture, tokens, ("us-east-1", "sts"), false),
+                Err(AuthError::InvalidCredentialScopeService {
+                    provided_service,
+                    expected_service,
+                    ..
+                }) if provided_service == "sts" && expected_service == "s3"
+            ));
+        }
+        assert!(matches!(
+            authenticate_post_session(&fixture, &[malformed], ("us-west-2", "sts"), false),
+            Err(AuthError::InvalidCredentialScopeRegion { .. })
+        ));
+
+        let missing = post_session_fixture(3_600);
+        *missing.role_state.write().unwrap() = SessionRoleState::Missing;
+        assert!(matches!(
+            authenticate_post_session(&missing, &[&missing.token], ("us-west-2", "s3"), false),
+            Err(AuthError::InvalidCredentialScopeRegion { .. })
+        ));
+
+        let unavailable = post_session_fixture(3_600);
+        *unavailable.role_state.write().unwrap() =
+            SessionRoleState::Failure(crate::IdentityProviderError::Unavailable);
+        assert!(matches!(
+            authenticate_post_session(
+                &unavailable,
+                &[&unavailable.token],
+                ("us-east-1", "sts"),
+                false
+            ),
+            Err(AuthError::InvalidCredentialScopeService { .. })
+        ));
+    }
+
+    #[test]
+    fn sigv4_post_session_expiry_and_liveness_precede_signature() {
+        let expired = post_session_fixture(0);
+        let live_mismatched_token = issue_post_session_token(
+            &expired,
+            "ARGS1123456789ABCDEFGHIJ",
+            SecretKey::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn".to_string()),
+        );
+
+        for valid_signature in [true, false] {
+            assert!(matches!(
+                authenticate_post_session(
+                    &expired,
+                    &[&expired.token, &expired.token],
+                    ("us-east-1", "s3"),
+                    valid_signature
+                ),
+                Err(AuthError::ExpiredSessionToken { tokens })
+                    if tokens.len() == 2
+                        && tokens.iter().all(|token| token == &expired.token)
+            ));
+        }
+
+        for tokens in [Vec::new(), vec![""]] {
+            assert!(matches!(
+                authenticate_post_session(&expired, &tokens, ("us-east-1", "s3"), false),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+        let malformed = "ARGST1.not-a-canonical-token";
+        assert!(matches!(
+            authenticate_post_session(
+                &expired,
+                &[malformed],
+                ("us-east-1", "s3"),
+                false
+            ),
+            Err(AuthError::UnexpectedSecurityToken { token }) if token == malformed
+        ));
+        for tokens in [
+            [expired.token.as_str(), live_mismatched_token.as_str()],
+            [live_mismatched_token.as_str(), expired.token.as_str()],
+        ] {
+            assert!(matches!(
+                authenticate_post_session(&expired, &tokens, ("us-east-1", "s3"), false),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        for scope in [("us-west-2", "s3"), ("us-east-1", "sts")] {
+            let error =
+                authenticate_post_session(&expired, &[&expired.token], scope, false).unwrap_err();
+            if scope.0 == "us-west-2" {
+                assert!(matches!(
+                    error,
+                    AuthError::InvalidCredentialScopeRegion { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    AuthError::InvalidCredentialScopeService { .. }
+                ));
+            }
+        }
+
+        let missing = post_session_fixture(3_600);
+        *missing.role_state.write().unwrap() = SessionRoleState::Missing;
+        assert!(matches!(
+            authenticate_post_session(&missing, &[&missing.token], ("us-east-1", "s3"), false),
+            Err(AuthError::UnknownAccessKey { .. })
+        ));
+
+        let unavailable = post_session_fixture(3_600);
+        *unavailable.role_state.write().unwrap() =
+            SessionRoleState::Failure(crate::IdentityProviderError::Unavailable);
+        assert!(matches!(
+            authenticate_post_session(
+                &unavailable,
+                &[&unavailable.token],
+                ("us-east-1", "s3"),
+                false
+            ),
+            Err(AuthError::IdentityProviderFailure(
+                crate::IdentityProviderError::Unavailable
+            ))
+        ));
+    }
+
+    #[test]
     fn sigv4_post_provider_failure_is_not_unknown_access_key() {
         let provider = crate::IdentityProvider::new(FailingIdentityProvider(
             crate::IdentityProviderError::Unavailable,
@@ -730,7 +1284,7 @@ mod tests {
                 date: "20250101T000000Z",
                 policy_b64: &policy_b64,
                 signature_hex: &sig_hex,
-                security_token: Some("unexpected"),
+                security_tokens: &["unexpected"],
             },
             &store,
             ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
@@ -761,7 +1315,7 @@ mod tests {
                 date: "20250101T000000Z",
                 policy_b64: &policy_b64,
                 signature_hex: &sig_hex,
-                security_token: None,
+                security_tokens: &[],
             },
             &store,
             ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
@@ -792,7 +1346,7 @@ mod tests {
                 date: "20250101T000000Z",
                 policy_b64: &policy_b64,
                 signature_hex: "0000000000000000000000000000000000000000000000000000000000000000",
-                security_token: None,
+                security_tokens: &[],
             },
             &store,
             ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
@@ -1281,6 +1835,33 @@ mod tests {
         ]);
         let form_fields = vec![("key", "exact-value")];
         validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap();
+    }
+
+    #[test]
+    fn policy_exact_duplicate_session_tokens_use_aws_expression_and_redact_debug() {
+        let token = "ARGST1.sensitive-session-token";
+        let form_fields = vec![
+            ("x-amz-security-token", token),
+            ("x-amz-security-token", token),
+        ];
+        for token_condition in [
+            serde_json::json!({"x-amz-security-token": token}),
+            serde_json::json!(["eq", "$x-amz-security-token", token]),
+        ] {
+            let b64 = future_policy_b64(&[serde_json::json!({"bucket": "b"}), token_condition]);
+            let error = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
+            match &error {
+                PostPolicyError::ConditionExpressionFailed { expression } => {
+                    assert_eq!(
+                        expression.as_str(),
+                        r#"["eq", "$x-amz-security-token", "ARGST1.sensitive-session-token"]"#
+                    );
+                }
+                other => panic!("expected condition expression failure, got {other:?}"),
+            }
+            assert!(!format!("{error:?}").contains(token));
+            assert!(!error.to_string().contains(token));
+        }
     }
 
     #[test]

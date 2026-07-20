@@ -465,19 +465,12 @@ fn resolve_header_credential<H: HeaderSource + ?Sized>(
         });
     }
     let token_selection = select_header_session_token(headers, &auth.credential.access_key_id)?;
-    provider
-        .authenticate_session_credential(
-            &auth.credential.access_key_id,
-            token_selection.selected.as_deref(),
-            now_epoch_secs,
-        )
-        .map_err(|error| {
-            map_s3_session_authentication_error(
-                &auth.credential.access_key_id,
-                &token_selection,
-                error,
-            )
-        })
+    authenticate_selected_s3_session_credential(
+        provider,
+        &auth.credential.access_key_id,
+        token_selection,
+        now_epoch_secs,
+    )
 }
 
 fn map_s3_session_authentication_error(
@@ -545,6 +538,38 @@ fn session_token_selection(
         selected: selected.filter(|token| !token.is_empty()),
         presented,
     })
+}
+
+pub(crate) fn authenticate_presented_s3_session_credential(
+    provider: &crate::IdentityProvider,
+    access_key_id: &str,
+    presented_tokens: Vec<String>,
+    now_epoch_secs: u64,
+) -> Result<crate::AuthenticatedCredential, AuthError> {
+    let token_selection = session_token_selection(presented_tokens, access_key_id)?;
+    authenticate_selected_s3_session_credential(
+        provider,
+        access_key_id,
+        token_selection,
+        now_epoch_secs,
+    )
+}
+
+fn authenticate_selected_s3_session_credential(
+    provider: &crate::IdentityProvider,
+    access_key_id: &str,
+    token_selection: SessionTokenSelection,
+    now_epoch_secs: u64,
+) -> Result<crate::AuthenticatedCredential, AuthError> {
+    provider
+        .authenticate_session_credential(
+            access_key_id,
+            token_selection.selected.as_deref(),
+            now_epoch_secs,
+        )
+        .map_err(|error| {
+            map_s3_session_authentication_error(access_key_id, &token_selection, error)
+        })
 }
 
 fn unknown_access_key(access_key_id: &str) -> AuthError {
@@ -784,15 +809,12 @@ fn resolve_presigned_credential<H: HeaderSource + ?Sized>(
 
     let token_selection =
         select_presigned_session_token(query_string, signed_headers, headers, access_key_id)?;
-    provider
-        .authenticate_session_credential(
-            access_key_id,
-            token_selection.selected.as_deref(),
-            now_epoch_secs,
-        )
-        .map_err(|error| {
-            map_s3_session_authentication_error(access_key_id, &token_selection, error)
-        })
+    authenticate_selected_s3_session_credential(
+        provider,
+        access_key_id,
+        token_selection,
+        now_epoch_secs,
+    )
 }
 
 fn select_presigned_session_token<H: HeaderSource + ?Sized>(

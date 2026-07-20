@@ -198,6 +198,13 @@ fn client_error_message(err: &ServerError) -> String {
             requester_principal, action, resource
         ),
         ServerError::PostPolicyAccessDenied { reason } => reason.clone(),
+        ServerError::PostPolicyConditionAccessDenied { expression } => format!(
+            "Invalid according to Policy: Policy Condition failed: {}",
+            expression.as_str()
+        ),
+        ServerError::PostObjectNoAccessKeyPresented => {
+            "No AWSAccessKey was presented.".to_string()
+        }
         ServerError::Auth(auth::AuthError::MalformedAuth) => {
             "malformed Authorization header".to_string()
         }
@@ -1085,8 +1092,15 @@ impl S3Response {
                 );
                 Self::new(400).chunked_xml_body(body)
             }
-            ServerError::PostPolicyAccessDenied { reason } => {
-                let body = xml::error_xml_with_host_id("AccessDenied", reason, request_id, host_id);
+            ServerError::PostPolicyAccessDenied { .. }
+            | ServerError::PostPolicyConditionAccessDenied { .. }
+            | ServerError::PostObjectNoAccessKeyPresented => {
+                let body = xml::error_xml_with_host_id(
+                    "AccessDenied",
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                );
                 Self::new(403).chunked_xml_body(body)
             }
             ServerError::NoSuchUpload { upload_id } => {
