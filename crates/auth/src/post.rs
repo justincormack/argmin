@@ -115,7 +115,7 @@ pub fn authenticate_post_sigv4(
     // Look up the secret key
     let record = provider
         .lookup_long_lived_credential(credential.access_key_id)
-        .map_err(|_| AuthError::IdentityProviderFailure)?
+        .map_err(AuthError::IdentityProviderFailure)?
         .ok_or(AuthError::UnknownAccessKey)?;
     if !record.is_enabled() {
         return Err(AuthError::UnknownAccessKey);
@@ -478,21 +478,28 @@ mod tests {
     use s3_types::AccountIdentity;
     use std::sync::Arc;
 
-    struct UnavailableIdentityProvider;
+    struct FailingIdentityProvider(crate::IdentityProviderError);
 
-    impl crate::IdentityProviderBackend for UnavailableIdentityProvider {
+    impl crate::IdentityProviderBackend for FailingIdentityProvider {
         fn lookup_long_lived_credential(
             &self,
             _access_key_id: &str,
         ) -> Result<Option<Arc<StoredCredential>>, crate::IdentityProviderError> {
-            Err(crate::IdentityProviderError::Unavailable)
+            Err(self.0)
+        }
+
+        fn lookup_live_role_identity(
+            &self,
+            _stable_role_id: &crate::StableRoleId,
+        ) -> Result<Option<Arc<crate::LiveRoleIdentity>>, crate::IdentityProviderError> {
+            Err(self.0)
         }
 
         fn find_account_by_canonical_user_id(
             &self,
             _canonical_user_id: &s3_types::CanonicalUserId,
         ) -> Result<Option<AccountIdentity>, crate::IdentityProviderError> {
-            Err(crate::IdentityProviderError::Unavailable)
+            Err(self.0)
         }
     }
 
@@ -512,10 +519,12 @@ mod tests {
 
     fn test_store() -> crate::IdentityProvider {
         let mut store = CredentialStore::new();
-        store.add(
-            "testAccessKey123".to_string(),
-            SecretKey::new("testSecretKey456".to_string()),
-        );
+        store
+            .add(
+                "testAccessKey123".to_string(),
+                SecretKey::new("testSecretKey456".to_string()),
+            )
+            .unwrap();
         crate::IdentityProvider::in_memory(store)
     }
 
@@ -656,7 +665,9 @@ mod tests {
 
     #[test]
     fn sigv4_post_provider_failure_is_not_unknown_access_key() {
-        let provider = crate::IdentityProvider::new(UnavailableIdentityProvider);
+        let provider = crate::IdentityProvider::new(FailingIdentityProvider(
+            crate::IdentityProviderError::Unavailable,
+        ));
         let (policy_b64, sig_hex) = signed_test_policy();
         let err = authenticate_post_sigv4(
             "AWS4-HMAC-SHA256",
@@ -671,7 +682,35 @@ mod tests {
             ),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::IdentityProviderFailure));
+        assert!(matches!(
+            err,
+            AuthError::IdentityProviderFailure(crate::IdentityProviderError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn sigv4_post_invalid_provider_record_preserves_failure_kind() {
+        let provider = crate::IdentityProvider::new(FailingIdentityProvider(
+            crate::IdentityProviderError::InvalidRecord,
+        ));
+        let (policy_b64, sig_hex) = signed_test_policy();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+            "20250101T000000Z",
+            &policy_b64,
+            &sig_hex,
+            &provider,
+            ExpectedCredentialScope::new(
+                ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+                "s3",
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::IdentityProviderFailure(crate::IdentityProviderError::InvalidRecord)
+        ));
     }
 
     #[test]
@@ -698,13 +737,15 @@ mod tests {
     #[test]
     fn sigv4_post_expired_token() {
         let mut store = CredentialStore::new();
-        store.add_record(configured_record(
-            "testAccessKey123",
-            "testSecretKey456",
-            "u1",
-            Some(100),
-            true,
-        ));
+        store
+            .add_record(configured_record(
+                "testAccessKey123",
+                "testSecretKey456",
+                "u1",
+                Some(100),
+                true,
+            ))
+            .unwrap();
         let store = crate::IdentityProvider::in_memory(store);
         let (policy_b64, sig_hex) = signed_test_policy();
         let err = super::authenticate_post_sigv4(
@@ -727,13 +768,15 @@ mod tests {
     #[test]
     fn sigv4_post_expired_token_with_bad_signature_reports_expired_token() {
         let mut store = CredentialStore::new();
-        store.add_record(configured_record(
-            "testAccessKey123",
-            "testSecretKey456",
-            "u1",
-            Some(100),
-            true,
-        ));
+        store
+            .add_record(configured_record(
+                "testAccessKey123",
+                "testSecretKey456",
+                "u1",
+                Some(100),
+                true,
+            ))
+            .unwrap();
         let store = crate::IdentityProvider::in_memory(store);
         let (policy_b64, _) = signed_test_policy();
         let err = super::authenticate_post_sigv4(
@@ -1576,7 +1619,9 @@ mod tests {
     #[test]
     fn sigv4_post_disabled_key() {
         let mut store = CredentialStore::new();
-        store.add_record(configured_record("AKID", "secret", "p", None, false));
+        store
+            .add_record(configured_record("AKID", "secret", "p", None, false))
+            .unwrap();
         let store = crate::IdentityProvider::in_memory(store);
         let err = authenticate_post_sigv4(
             "AWS4-HMAC-SHA256",

@@ -474,8 +474,10 @@ impl ServerError {
             Self::IntegrityError { .. } => "integrity_error",
             Self::SlowDown => "slow_down",
             Self::OperationAborted => "operation_aborted",
-            Self::IdentityProvider(_) => "identity_provider_unavailable",
-            Self::Auth(auth::AuthError::IdentityProviderFailure) => "identity_provider_unavailable",
+            Self::IdentityProvider(error)
+            | Self::Auth(auth::AuthError::IdentityProviderFailure(error)) => {
+                error.diagnostic_cause_label()
+            }
             Self::Auth(_) => "auth_error",
             _ => self.s3_error_code(),
         }
@@ -541,7 +543,7 @@ impl ServerError {
             ) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::IdentityProvider(_) => "InternalError",
-            Self::Auth(auth::AuthError::IdentityProviderFailure) => "InternalError",
+            Self::Auth(auth::AuthError::IdentityProviderFailure(_)) => "InternalError",
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
             Self::Auth(auth::AuthError::MultipleAuthMechanisms { .. }) => "InvalidArgument",
             Self::Auth(auth::AuthError::SignatureMismatch { .. }) => "SignatureDoesNotMatch",
@@ -700,7 +702,7 @@ impl ServerError {
             Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => 400,
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => 501,
             Self::IdentityProvider(_) => 500,
-            Self::Auth(auth::AuthError::IdentityProviderFailure) => 500,
+            Self::Auth(auth::AuthError::IdentityProviderFailure(_)) => 500,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidRequestHostId { .. }
@@ -1167,16 +1169,28 @@ mod tests {
 
     #[test]
     fn identity_provider_failure_is_internal_error() {
-        for err in [
-            ServerError::Auth(auth::AuthError::IdentityProviderFailure),
-            ServerError::IdentityProvider(auth::IdentityProviderError::Unavailable),
+        for (provider_error, expected_label) in [
+            (
+                auth::IdentityProviderError::Unavailable,
+                "identity_provider_unavailable",
+            ),
+            (
+                auth::IdentityProviderError::InvalidRecord,
+                "identity_provider_invalid_record",
+            ),
         ] {
-            assert_eq!(err.s3_error_code(), "InternalError");
-            assert_eq!(err.http_status(), 500);
-            assert_eq!(
-                err.diagnostic_cause_label(),
-                "identity_provider_unavailable"
-            );
+            for err in [
+                ServerError::Auth(auth::AuthError::IdentityProviderFailure(provider_error)),
+                ServerError::IdentityProvider(provider_error),
+            ] {
+                assert_eq!(err.s3_error_code(), "InternalError");
+                assert_eq!(err.http_status(), 500);
+                assert_eq!(err.diagnostic_cause_label(), expected_label);
+                assert_eq!(
+                    err.diagnostic_cause_chain(),
+                    format!("server_error>{expected_label}")
+                );
+            }
         }
     }
 

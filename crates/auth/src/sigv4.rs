@@ -197,7 +197,7 @@ pub(crate) fn verify_request_record<H: HeaderSource + ?Sized>(
     // Look up the secret key
     let record = provider
         .lookup_long_lived_credential(&auth.credential.access_key_id)
-        .map_err(|_| AuthError::IdentityProviderFailure)?
+        .map_err(AuthError::IdentityProviderFailure)?
         .ok_or(AuthError::UnknownAccessKey)?;
     if !record.is_enabled() {
         return Err(AuthError::UnknownAccessKey);
@@ -315,10 +315,12 @@ mod tests {
 
     fn example_store() -> crate::IdentityProvider {
         let mut store = CredentialStore::new();
-        store.add(
-            "AKIAIOSFODNN7EXAMPLE".to_string(),
-            SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-        );
+        store
+            .add(
+                "AKIAIOSFODNN7EXAMPLE".to_string(),
+                SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            )
+            .unwrap();
         crate::IdentityProvider::in_memory(store)
     }
 
@@ -701,15 +703,17 @@ mod tests {
     #[test]
     fn authenticate_header_disabled_key() {
         let mut store = CredentialStore::new();
-        store.add_record(crate::credential::StoredCredential::configured(
-            "AKIAIOSFODNN7EXAMPLE".to_string(),
-            SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            s3_types::AccountIdentity::from_principal("u1"),
-            crate::ConfiguredPrincipalIdentity::new("u1"),
-            crate::AuthorizationProfile::Standard,
-            None,
-            false,
-        ));
+        store
+            .add_record(crate::credential::StoredCredential::configured(
+                "AKIAIOSFODNN7EXAMPLE".to_string(),
+                SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+                s3_types::AccountIdentity::from_principal("u1"),
+                crate::ConfiguredPrincipalIdentity::new("u1"),
+                crate::AuthorizationProfile::Standard,
+                None,
+                false,
+            ))
+            .unwrap();
         let store = crate::IdentityProvider::in_memory(store);
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \

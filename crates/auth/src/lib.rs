@@ -63,20 +63,27 @@ pub use bucket_policy::{
 };
 pub use canonical::parse_amz_date;
 pub use credential::{
-    AuthorizationProfile, CredentialScope, CredentialStore, SecretKey, StoredCredential,
+    is_reserved_session_access_key_id, AuthenticatedCredential, AuthorizationProfile,
+    CredentialScope, CredentialStore, CredentialStoreError, DecodedSessionCredential, SecretKey,
+    SessionAuthorizationContext, SessionCredentialError, StoredCredential,
+    SESSION_ACCESS_KEY_ID_LEN, SESSION_ACCESS_KEY_ID_PREFIX, SESSION_SECRET_ACCESS_KEY_LEN,
 };
 pub use error::{AuthError, SignatureMismatchDiagnostics};
 pub use identity::{
     AssumedRoleId, AssumedRoleSessionArn, AssumedRoleSessionIdentity, AuthenticatedIdentity,
     AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleArn, IamRoleIdentity, IdentityError,
-    PrincipalIdentity, RoleName, RoleSessionName, SessionLifetime, SourceIdentity, StableRoleId,
+    LiveRoleIdentity, PrincipalIdentity, RoleName, RoleSessionName, SessionLifetime,
+    SourceIdentity, StableRoleId,
 };
 pub use post::{
     authenticate_post_sigv4, prepare_post_policy, validate_post_policy,
     validate_prepared_post_policy_size, ExpectedCredentialScope, PostPolicyError, PostSigV4Request,
     PreparedPostPolicy,
 };
-pub use provider::{IdentityProvider, IdentityProviderBackend, IdentityProviderError};
+pub use provider::{
+    IdentityProvider, IdentityProviderBackend, IdentityProviderError, ResolvedRoleIdentity,
+    RoleIdentityStore, RoleIdentityStoreError,
+};
 pub use request::{
     authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion, HeaderSource,
     StreamingSigningContext,

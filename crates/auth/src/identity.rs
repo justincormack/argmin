@@ -207,6 +207,36 @@ impl IamRoleIdentity {
     }
 }
 
+/// Authoritative live role incarnation and its S3 account identity.
+///
+/// Identity-provider backends construct this record from their own state. The
+/// account is stored alongside the IAM role so session authentication never
+/// accepts caller-supplied canonical-user or display-name fields.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LiveRoleIdentity {
+    account: AccountIdentity,
+    role: IamRoleIdentity,
+}
+
+impl LiveRoleIdentity {
+    pub fn new(account: AccountIdentity, role: IamRoleIdentity) -> Result<Self, IdentityError> {
+        if account.account_id() != Some(role.account_id().as_str()) {
+            return Err(IdentityError::AccountMismatch);
+        }
+        Ok(Self { account, role })
+    }
+
+    #[must_use]
+    pub fn account(&self) -> &AccountIdentity {
+        &self.account
+    }
+
+    #[must_use]
+    pub fn role(&self) -> &IamRoleIdentity {
+        &self.role
+    }
+}
+
 /// Validated issue and expiry times for a temporary session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionLifetime {
@@ -367,12 +397,19 @@ impl AuthenticatedIdentity {
         account: AccountIdentity,
         session: AssumedRoleSessionIdentity,
     ) -> Result<Self, IdentityError> {
+        Self::assumed_role_session_shared(account, Arc::new(session))
+    }
+
+    pub(crate) fn assumed_role_session_shared(
+        account: AccountIdentity,
+        session: Arc<AssumedRoleSessionIdentity>,
+    ) -> Result<Self, IdentityError> {
         if account.account_id() != Some(session.role().account_id().as_str()) {
             return Err(IdentityError::AccountMismatch);
         }
         Ok(Self {
             account,
-            principal: PrincipalIdentity::AssumedRoleSession(Arc::new(session)),
+            principal: PrincipalIdentity::AssumedRoleSession(session),
         })
     }
 
@@ -485,6 +522,21 @@ mod tests {
         assert_eq!(
             role("/").arn().as_str(),
             "arn:aws:iam::123456789012:role/test-role"
+        );
+    }
+
+    #[test]
+    fn live_role_identity_requires_authoritative_account_match() {
+        assert_eq!(
+            LiveRoleIdentity::new(account("210987654321"), role("/")).unwrap_err(),
+            IdentityError::AccountMismatch
+        );
+
+        let identity = LiveRoleIdentity::new(account("123456789012"), role("/")).unwrap();
+        assert_eq!(identity.account().account_id(), Some("123456789012"));
+        assert_eq!(
+            identity.role().stable_id().as_str(),
+            "ARGR0123456789ABCDEFGHIJ"
         );
     }
 

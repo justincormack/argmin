@@ -50,8 +50,8 @@ pub enum AuthError {
     },
     #[error("unknown access key id")]
     UnknownAccessKey,
-    #[error("identity provider unavailable")]
-    IdentityProviderFailure,
+    #[error("identity provider failure")]
+    IdentityProviderFailure(crate::IdentityProviderError),
     #[error("duplicate Authorization header")]
     DuplicateAuthorizationHeader,
     #[error("multiple authentication mechanisms supplied")]
@@ -181,7 +181,10 @@ impl std::fmt::Debug for AuthError {
                 )
                 .finish(),
             Self::UnknownAccessKey => f.write_str("UnknownAccessKey"),
-            Self::IdentityProviderFailure => f.write_str("IdentityProviderFailure"),
+            Self::IdentityProviderFailure(error) => f
+                .debug_tuple("IdentityProviderFailure")
+                .field(error)
+                .finish(),
             Self::DuplicateAuthorizationHeader => f.write_str("DuplicateAuthorizationHeader"),
             Self::MultipleAuthMechanisms { authorization } => f
                 .debug_struct("MultipleAuthMechanisms")

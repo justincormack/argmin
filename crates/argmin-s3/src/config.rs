@@ -416,6 +416,7 @@ impl ServerConfig {
                 .ok_or_else(|| "ARGMIN_SECRET_ACCESS_KEY is required".to_string())?;
             let uat_credentials = read_uat_credentials(&get, &account_id)?;
             reject_duplicate_access_keys(&access_key_id, &uat_credentials)?;
+            reject_reserved_session_access_keys(&access_key_id, &uat_credentials)?;
             let sse_s3_wrapping_key_b64 = get("ARGMIN_SSE_S3_WRAPPING_KEY")
                 .ok_or_else(|| "ARGMIN_SSE_S3_WRAPPING_KEY is required".to_string())?;
             (
@@ -1775,6 +1776,22 @@ fn reject_duplicate_access_keys(
                 credential.access_key_id
             ));
         }
+    }
+    Ok(())
+}
+
+fn reject_reserved_session_access_keys(
+    primary_access_key_id: &str,
+    uat_credentials: &[ConfiguredCredential],
+) -> Result<(), String> {
+    if auth::is_reserved_session_access_key_id(primary_access_key_id) {
+        return Err("ARGMIN_ACCESS_KEY_ID uses the reserved ARGS session namespace".to_string());
+    }
+    if uat_credentials
+        .iter()
+        .any(|credential| auth::is_reserved_session_access_key_id(&credential.access_key_id))
+    {
+        return Err("a UAT access key ID uses the reserved ARGS session namespace".to_string());
     }
     Ok(())
 }
@@ -3555,6 +3572,26 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("duplicate access key ID"));
+    }
+
+    #[test]
+    fn configured_long_lived_access_keys_reject_reserved_session_namespace() {
+        let err = ServerConfig::from_lookup(make_required_env(&[(
+            "ARGMIN_ACCESS_KEY_ID",
+            "ARGS-configured-primary",
+        )]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_ACCESS_KEY_ID"));
+        assert!(err.contains("reserved ARGS session namespace"));
+
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_UAT_ALT_ACCOUNT_ID", "444455556666"),
+            ("ARGMIN_UAT_ALT_ACCESS_KEY_ID", "ARGS-configured-alt"),
+            ("ARGMIN_UAT_ALT_SECRET_ACCESS_KEY", "alt-secret"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("UAT access key ID"));
+        assert!(err.contains("reserved ARGS session namespace"));
     }
 
     #[test]

@@ -1295,13 +1295,9 @@ impl HttpFrontend {
             .with_content_sha256(req.header("x-amz-content-sha256").map(str::to_string))
     }
 
-    fn identity_provider_error() -> ServerError {
-        ServerError::IdentityProvider(auth::IdentityProviderError::Unavailable)
-    }
-
     fn map_auth_error(error: auth::AuthError) -> ServerError {
         match error {
-            auth::AuthError::IdentityProviderFailure => Self::identity_provider_error(),
+            auth::AuthError::IdentityProviderFailure(error) => ServerError::IdentityProvider(error),
             error => ServerError::Auth(error),
         }
     }
@@ -6349,21 +6345,28 @@ mod tests {
     const TEST_SIGV4_SECRET: &str = "secret";
     const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
-    struct UnavailableIdentityProvider;
+    struct FailingIdentityProvider(auth::IdentityProviderError);
 
-    impl auth::IdentityProviderBackend for UnavailableIdentityProvider {
+    impl auth::IdentityProviderBackend for FailingIdentityProvider {
         fn lookup_long_lived_credential(
             &self,
             _access_key_id: &str,
         ) -> Result<Option<Arc<auth::StoredCredential>>, auth::IdentityProviderError> {
-            Err(auth::IdentityProviderError::Unavailable)
+            Err(self.0)
+        }
+
+        fn lookup_live_role_identity(
+            &self,
+            _stable_role_id: &auth::StableRoleId,
+        ) -> Result<Option<Arc<auth::LiveRoleIdentity>>, auth::IdentityProviderError> {
+            Err(self.0)
         }
 
         fn find_account_by_canonical_user_id(
             &self,
             _canonical_user_id: &s3_types::CanonicalUserId,
         ) -> Result<Option<auth::AccountIdentity>, auth::IdentityProviderError> {
-            Err(auth::IdentityProviderError::Unavailable)
+            Err(self.0)
         }
     }
 
@@ -6433,10 +6436,12 @@ mod tests {
         )
         .unwrap();
         let mut credentials = auth::CredentialStore::new();
-        credentials.add(
-            TEST_SIGV4_ACCESS_KEY.to_string(),
-            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
-        );
+        credentials
+            .add(
+                TEST_SIGV4_ACCESS_KEY.to_string(),
+                SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+            )
+            .unwrap();
         HttpFrontend {
             coordinator: Arc::new(coordinator),
             identity_provider: auth::IdentityProvider::in_memory(credentials),
@@ -6448,7 +6453,9 @@ mod tests {
     fn identity_provider_failure_fails_authentication_and_rendering_closed() {
         let tmp = test_util::tempdir();
         let mut frontend = setup_frontend(tmp.path());
-        frontend.identity_provider = auth::IdentityProvider::new(UnavailableIdentityProvider);
+        frontend.identity_provider = auth::IdentityProvider::new(FailingIdentityProvider(
+            auth::IdentityProviderError::Unavailable,
+        ));
 
         let request = signed_v4_put_req(b"", Vec::new());
         assert!(matches!(
@@ -6463,6 +6470,16 @@ mod tests {
             frontend.acl_owner_display_name("owner", &canonical_id),
             Err(ServerError::IdentityProvider(
                 auth::IdentityProviderError::Unavailable
+            ))
+        ));
+
+        frontend.identity_provider = auth::IdentityProvider::new(FailingIdentityProvider(
+            auth::IdentityProviderError::InvalidRecord,
+        ));
+        assert!(matches!(
+            frontend.authenticate(&request, None),
+            Err(ServerError::IdentityProvider(
+                auth::IdentityProviderError::InvalidRecord
             ))
         ));
     }

@@ -184,15 +184,17 @@ fn add_configured_credential(credentials: &mut CredentialStore, credential: &Con
         CanonicalUserId::from_principal(&credential.account_id),
         credential.display_name.clone(),
     );
-    credentials.add_record(StoredCredential::configured(
-        credential.access_key_id.clone(),
-        credential.secret_access_key.clone(),
-        account,
-        ConfiguredPrincipalIdentity::new(credential.principal.clone()),
-        authorization_profile(credential.authorization_profile),
-        None,
-        true,
-    ));
+    credentials
+        .add_record(StoredCredential::configured(
+            credential.access_key_id.clone(),
+            credential.secret_access_key.clone(),
+            account,
+            ConfiguredPrincipalIdentity::new(credential.principal.clone()),
+            authorization_profile(credential.authorization_profile),
+            None,
+            true,
+        ))
+        .expect("server configuration rejected reserved session access key namespace");
 }
 
 fn build_credential_store(config: &ServerConfig) -> CredentialStore {
@@ -202,15 +204,17 @@ fn build_credential_store(config: &ServerConfig) -> CredentialStore {
         CanonicalUserId::from_principal(&config.account_id),
         config.account_id.clone(),
     );
-    credentials.add_record(StoredCredential::configured(
-        config.access_key_id.clone(),
-        config.secret_access_key.clone(),
-        account,
-        ConfiguredPrincipalIdentity::new(config.account_id.clone()),
-        auth::AuthorizationProfile::OwnerAccountAdmin,
-        None,
-        true,
-    ));
+    credentials
+        .add_record(StoredCredential::configured(
+            config.access_key_id.clone(),
+            config.secret_access_key.clone(),
+            account,
+            ConfiguredPrincipalIdentity::new(config.account_id.clone()),
+            auth::AuthorizationProfile::OwnerAccountAdmin,
+            None,
+            true,
+        ))
+        .expect("server configuration rejected reserved session access key namespace");
     for credential in &config.uat_credentials {
         add_configured_credential(&mut credentials, credential);
     }

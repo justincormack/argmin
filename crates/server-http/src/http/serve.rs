@@ -5093,10 +5093,12 @@ mod tests {
         )
         .unwrap();
         let mut credentials = auth::CredentialStore::new();
-        credentials.add(
-            TEST_ACCESS_KEY.to_string(),
-            auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
-        );
+        credentials
+            .add(
+                TEST_ACCESS_KEY.to_string(),
+                auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
+            )
+            .unwrap();
         Arc::new(HttpFrontend {
             coordinator: Arc::new(coordinator),
             identity_provider: auth::IdentityProvider::in_memory(credentials),

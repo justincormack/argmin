@@ -178,7 +178,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::InternalError { .. }
         | ServerError::IntegrityError { .. }
         | ServerError::IdentityProvider(_)
-        | ServerError::Auth(auth::AuthError::IdentityProviderFailure) => {
+        | ServerError::Auth(auth::AuthError::IdentityProviderFailure(_)) => {
             INTERNAL_ERROR_MESSAGE.to_string()
         }
         ServerError::Auth(auth::AuthError::MissingAuth)
@@ -4523,8 +4523,14 @@ mod tests {
     #[test]
     fn error_response_identity_provider_failure_is_sanitized() {
         for err in [
-            ServerError::Auth(auth::AuthError::IdentityProviderFailure),
+            ServerError::Auth(auth::AuthError::IdentityProviderFailure(
+                auth::IdentityProviderError::Unavailable,
+            )),
             ServerError::IdentityProvider(auth::IdentityProviderError::Unavailable),
+            ServerError::Auth(auth::AuthError::IdentityProviderFailure(
+                auth::IdentityProviderError::InvalidRecord,
+            )),
+            ServerError::IdentityProvider(auth::IdentityProviderError::InvalidRecord),
         ] {
             let resp = S3Response::error(&err, "/x", TEST_HOST_ID);
             assert_eq!(resp.status_code, 500);
@@ -4532,6 +4538,7 @@ mod tests {
             assert!(body.contains("InternalError"));
             assert!(body.contains("We encountered an internal error. Please try again."));
             assert!(!body.contains("identity provider unavailable"));
+            assert!(!body.contains("identity provider returned an invalid identity record"));
         }
     }
 

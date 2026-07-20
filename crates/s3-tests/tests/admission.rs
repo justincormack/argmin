@@ -46,10 +46,12 @@ async fn start_server(
 
     let host_id = Arc::<str>::from(server_http::http::new_host_id());
     let mut credentials = auth::CredentialStore::default();
-    credentials.add(
-        s3_tests::server::TEST_ACCESS_KEY.to_string(),
-        auth::SecretKey::new(s3_tests::server::TEST_SECRET_KEY.to_string()),
-    );
+    credentials
+        .add(
+            s3_tests::server::TEST_ACCESS_KEY.to_string(),
+            auth::SecretKey::new(s3_tests::server::TEST_SECRET_KEY.to_string()),
+        )
+        .unwrap();
     let identity_provider = auth::IdentityProvider::in_memory(credentials);
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {

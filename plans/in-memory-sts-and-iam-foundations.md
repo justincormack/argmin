@@ -95,7 +95,7 @@ open work. Supported actions must not ignore security-relevant input.
 
 ## Current Repository State
 
-### Long-lived credential lookup is shared; role state and token keys remain
+### Long-lived credentials and stable role liveness are shared
 
 `auth::CredentialStore` is now a bootstrap collection consumed by an
 `IdentityProvider`. The initial provider owns that bounded in-memory state
@@ -105,13 +105,28 @@ handle. Lookups return owned immutable records and distinguish absence from
 backend failure, releasing the provider lock before canonicalization, HMAC,
 storage, or response work. Existing configured-key authentication remains
 unchanged, and an unavailable provider fails closed as an internal service
-failure rather than `InvalidAccessKeyId`.
+failure rather than `InvalidAccessKeyId`. The shared boundary validates access
+key, stable role ID, and canonical-user ID binding on custom-backend results.
+Unavailable and invalid-record failures remain typed through authentication
+and use distinct fixed redacted diagnostic labels, while both retain the same
+generic external `InternalError` response.
 
-The provider does not yet contain role identity/liveness records, and the
-process-local session-token sealing key ring does not exist. Phase 1 must add
-and share both before directly sealed sessions can be authenticated.
+The same provider now indexes minimal immutable live-role incarnations and
+their authoritative S3 account identities by stable role ID. The index rejects
+account/role mismatches, duplicate stable IDs, and duplicate live role ARNs.
+The shared provider validates that a backend result is bound to the requested
+stable ID before returning an opaque resolved-role value. Decoded session
+construction is crate-internal and accepts only that provider-resolved value,
+so callers cannot substitute a fabricated/deleted role or alternate canonical
+user/display-name fields. The index deliberately contains no mutable trust or
+permission-policy state. This is the narrow pre-signature liveness capability;
+current role authorization remains a later, separate provider capability. No
+production role fixture is seeded yet.
 
-### Stored credentials are explicitly long-lived
+The process-local session-token sealing key ring does not exist. Phase 1 must
+add and share it before directly sealed sessions can be authenticated.
+
+### Stored and decoded session credentials are distinct
 
 `StoredCredential` contains:
 
@@ -123,11 +138,24 @@ and share both before directly sealed sessions can be authenticated.
 - enabled state
 
 Its constructor accepts only a configured principal, so an assumed-role session
-cannot be inserted into the long-lived store. The separate decoded temporary
-credential type and the authenticated long-lived/session credential enum do not
-exist yet. Auth currently checks an optional expiry on stored records but then
-calls `validate_static_credential_has_no_token` on header, presigned, and POST
-paths. An expiring stored record is therefore not a usable STS credential.
+cannot be inserted into the long-lived store. `DecodedSessionCredential`
+instead requires an Argmin-namespaced 24-byte temporary access key ID, a
+40-byte secret access key, an account-matched assumed-role session identity
+with mandatory issue/expiry time, and an explicit versioned session
+authorization context. Its construction seam is exercised with a
+provider-resolved live-role/account record but remains unavailable to
+production callers until the token codec supplies authenticated payload
+fields. `AuthenticatedCredential` preserves the long-lived versus session kind
+while exposing only their common signing identity and secret material.
+Long-lived store insertion and server configuration reject the reserved
+`ARGS` namespace. The shared provider also refuses to query that namespace as
+long-lived and validates access-key binding on every custom-backend result, so
+a future backend cannot bypass the reservation.
+
+Auth does not yet open a supplied token or produce the session variant. It
+continues to check an optional expiry on stored records and then calls
+`validate_static_credential_has_no_token` on header, presigned, and POST paths.
+An expiring stored record is therefore still not a usable STS credential.
 
 ### Structured identity exists but session authentication does not
 
@@ -139,10 +167,9 @@ only the configured-principal variant, and existing S3 authorization paths
 explicitly require that variant rather than treating a role session as an
 existing configured user.
 
-The remaining Phase 1 work must add the decoded session credential, minimal
-stable role-liveness record, and shared key-ring substrate before any request
-can authenticate as that session identity. Session and principal tags remain
-later versioned policy context as described below.
+The remaining Phase 1 work must add the shared key-ring and token-codec
+substrate before any request can authenticate as a session identity. Session
+and principal tags remain later versioned policy context as described below.
 
 ### S3 has resource policies but not IAM identity policies
 
@@ -2374,14 +2401,21 @@ compatibility record.
   size/codec limits, and secure generation interfaces
 - add redaction, tamper rejection, and provider/key-ring failure behavior
 
-Progress as of 2026-07-19: structured account, configured-principal, and
+Progress as of 2026-07-20: structured account, configured-principal, and
 assumed-role-session identities exist with surface-specific ARN accessors;
 stored credentials accept only configured principals; and one cloneable
 identity-provider handle now supplies owned long-lived credential/account
-lookups to every frontend worker. Unknown credentials remain distinct from
-provider failure. The remaining Phase 1 slice is the decoded-session credential
-type, minimal stable role identity/liveness state, shared sealing key ring, and
-versioned token codec.
+lookups to every frontend worker. The provider also supplies a separate minimal
+stable role/account liveness lookup whose opaque result is required by the
+crate-internal decoded-session construction seam. Decoded session credentials
+are a distinct mandatory-lifetime credential kind that cannot enter the stored
+long-lived collection, and neither a custom backend nor bootstrap
+configuration can expose an `ARGS` key as long-lived. Unknown identities
+remain distinct from provider failure, and invalid provider records remain
+diagnostically distinct from provider outages across authentication and
+rendering paths. The remaining Phase 1 slice is the shared sealing key ring and
+versioned token codec, which will make the provider-backed construction seam
+available to production authentication.
 
 Exit condition: all current S3 suites remain green, every frontend worker can
 open a test-sealed credential using the shared key ring, and no issued-session
