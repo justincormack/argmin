@@ -9338,7 +9338,7 @@ impl StorageCluster {
             let data_pg = DataPgId::new(route.pg_id());
             let data_pg_id = data_pg.get();
             let scavenger_client = primary_node.shard_scavenger_client();
-            let shard_rows = scavenger_client.list_scavenger_shard_rows(route.pg_id())?;
+            let shard_rows = scavenger_client.list_scavenger_shard_rows(data_pg)?;
             let rows_by_key: HashMap<ShardKey, WriteAck> = shard_rows
                 .iter()
                 .map(|row| (row.key.clone(), row.ack))
@@ -9372,15 +9372,14 @@ impl StorageCluster {
 
             if !reference_scan_errors.is_empty() {
                 scavenger_client.record_shard_scavenger_observation(
-                    route.pg_id(),
+                    data_pg,
                     &Self::shard_scavenger_scan_incomplete_observation(
                         primary_node_id,
                         data_pg_id,
                         &reference_scan_errors,
                     ),
                 )?;
-                observations
-                    .extend(scavenger_client.list_shard_scavenger_observations(route.pg_id())?);
+                observations.extend(scavenger_client.list_shard_scavenger_observations(data_pg)?);
                 continue;
             }
 
@@ -9391,14 +9390,13 @@ impl StorageCluster {
                 }
                 for (node_id, errors) in errors_by_node {
                     scavenger_client.record_shard_scavenger_observation(
-                        route.pg_id(),
+                        data_pg,
                         &Self::shard_scavenger_scan_incomplete_observation(
                             node_id, data_pg_id, &errors,
                         ),
                     )?;
                 }
-                observations
-                    .extend(scavenger_client.list_shard_scavenger_observations(route.pg_id())?);
+                observations.extend(scavenger_client.list_shard_scavenger_observations(data_pg)?);
                 continue;
             }
 
@@ -9416,7 +9414,7 @@ impl StorageCluster {
                     let Some(row_ack) = rows_by_key.get(&file.key).copied() else {
                         active_observations.insert(observation_key.clone());
                         scavenger_client.record_shard_scavenger_observation(
-                            route.pg_id(),
+                            data_pg,
                             &ShardScavengerObservationRecord {
                                 key: observation_key,
                                 data_size: Some(file.size),
@@ -9435,7 +9433,7 @@ impl StorageCluster {
                     }
                     active_observations.insert(observation_key.clone());
                     scavenger_client.record_shard_scavenger_observation(
-                        route.pg_id(),
+                        data_pg,
                         &ShardScavengerObservationRecord {
                             key: observation_key,
                             data_size: Some(row_ack.stored_size),
@@ -9468,7 +9466,7 @@ impl StorageCluster {
                         };
                         active_observations.insert(observation_key.clone());
                         scavenger_client.record_shard_scavenger_observation(
-                            route.pg_id(),
+                            data_pg,
                             &ShardScavengerObservationRecord {
                                 key: observation_key,
                                 data_size: Some(row.ack.stored_size),
@@ -9506,7 +9504,7 @@ impl StorageCluster {
                 };
                 active_observations.insert(observation_key.clone());
                 scavenger_client.record_shard_scavenger_observation(
-                    route.pg_id(),
+                    data_pg,
                     &ShardScavengerObservationRecord {
                         key: observation_key,
                         data_size: Some(row.ack.stored_size),
@@ -9519,7 +9517,7 @@ impl StorageCluster {
                 )?;
             }
 
-            for observation in scavenger_client.list_shard_scavenger_observations(route.pg_id())? {
+            for observation in scavenger_client.list_shard_scavenger_observations(data_pg)? {
                 if observation.key.data_pg_id != data_pg_id
                     || observation.resolved_at.is_some()
                     || !matches!(
@@ -9534,11 +9532,11 @@ impl StorageCluster {
                 }
                 if !active_observations.contains(&observation.key) {
                     scavenger_client
-                        .resolve_shard_scavenger_observation(route.pg_id(), &observation.key)?;
+                        .resolve_shard_scavenger_observation(data_pg, &observation.key)?;
                 }
             }
 
-            observations.extend(scavenger_client.list_shard_scavenger_observations(route.pg_id())?);
+            observations.extend(scavenger_client.list_shard_scavenger_observations(data_pg)?);
         }
 
         Ok(observations)
@@ -9574,9 +9572,10 @@ impl StorageCluster {
             let node = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
+            let scan_pg_id = self.object_metadata_scan_pg(route.pg_id());
             for reference in node
                 .shard_scavenger_client()
-                .list_shard_scavenger_payload_references(route.pg_id())?
+                .list_shard_scavenger_payload_references(scan_pg_id)?
             {
                 match reference {
                     ShardScavengerPayloadReference::Placed(reference) => {
@@ -10107,8 +10106,9 @@ impl StorageCluster {
             };
             let references = match node
                 .shard_scavenger_client()
-                .list_shard_scavenger_payload_references(route.pg_id())
-            {
+                .list_shard_scavenger_payload_references(
+                    self.object_metadata_scan_pg(route.pg_id()),
+                ) {
                 Ok(references) => references,
                 Err(error) if shard_backfill_candidate_error_is_deferred(&error) => {
                     summary.deferred += 1;
@@ -11987,9 +11987,10 @@ impl StorageCluster {
                 .local_map
                 .metadata_pg_acting_nodes(self.operation_epoch(), object_pg_id)?
             {
+                let scan_pg_id = self.object_metadata_scan_pg(object_pg_id);
                 let references = node
                     .shard_scavenger_client()
-                    .list_shard_scavenger_payload_references(object_pg_id)?;
+                    .list_shard_scavenger_payload_references(scan_pg_id)?;
                 if references.iter().any(|reference| {
                     self.shard_scavenger_reference_matches_stream_segment(reference, segment)
                 }) {
@@ -12108,7 +12109,7 @@ impl StorageCluster {
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
         let pg_id = PgId::new(data_pg_id);
         self.metadata_pg_primary_client(pg_id)?
-            .list_shard_scavenger_observations(pg_id)
+            .list_shard_scavenger_observations(DataPgId::new(pg_id))
     }
 
     fn emit_best_effort_payload_cleanup_error(&self, operation: &'static str, error: &StoreError) {

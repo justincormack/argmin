@@ -529,14 +529,17 @@ impl ShardScavengerNodeClient for LocalStorageNodeClient {
             .list_scavenger_shard_files(data_pg_id.get())
     }
 
-    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+    fn list_scavenger_shard_rows(
+        &self,
+        data_pg_id: DataPgId,
+    ) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.list_scavenger_shard_rows()
     }
 
     fn list_shard_scavenger_payload_references(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.list_shard_scavenger_payload_references()
@@ -544,27 +547,27 @@ impl ShardScavengerNodeClient for LocalStorageNodeClient {
 
     fn record_shard_scavenger_observation(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         observation: &ShardScavengerObservationRecord,
     ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.record_shard_scavenger_observation(observation)
     }
 
     fn list_shard_scavenger_observations(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.list_shard_scavenger_observations()
     }
 
     fn resolve_shard_scavenger_observation(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardScavengerObservationKey,
     ) -> Result<(), StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.resolve_shard_scavenger_observation(key).map(|_| ())
     }
 }

@@ -8623,17 +8623,13 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcScavengerListFilesRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.node_id,
-            request.cluster_epoch,
-            PgId::new(request.data_pg_id.get()),
-        ) {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.data_pg_id)
+        {
             return encode_storage_rpc_error_response(&error);
         }
-        let response = match self
-            .node
-            .list_scavenger_shard_files(request.data_pg_id.get())
-        {
+        let data_pg_id = DataPgId::new(request.data_pg_id);
+        let response = match self.node.list_scavenger_shard_files(data_pg_id.get()) {
             Ok(scan) => {
                 let payload = encode_scavenger_list_files_response(&scan);
                 encode_storage_rpc_success_response(&payload)
@@ -8655,8 +8651,9 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_primary_pg(request.pg_id, "shard scavenger shard rows") {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = DataPgId::new(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.list_scavenger_shard_rows(request.pg_id) {
+        match local_client.list_scavenger_shard_rows(data_pg_id) {
             Ok(rows) => Ok(encode_storage_rpc_success_response(
                 &encode_scavenger_shard_rows_response(&rows),
             )),
@@ -8678,8 +8675,9 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let scan_pg_id = self.validated_object_metadata_scan_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.list_shard_scavenger_payload_references(request.pg_id) {
+        match local_client.list_shard_scavenger_payload_references(scan_pg_id) {
             Ok(references) => Ok(encode_storage_rpc_success_response(
                 &encode_scavenger_payload_references_response(&references),
             )),
@@ -8703,10 +8701,16 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = match validated_request_data_pg(
+            request.route.pg_id,
+            request.observation.key.data_pg_id,
+            "shard scavenger observation record",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client
-            .record_shard_scavenger_observation(request.route.pg_id, &request.observation)
-        {
+        match local_client.record_shard_scavenger_observation(data_pg_id, &request.observation) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }
@@ -8725,8 +8729,9 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = DataPgId::new(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.list_shard_scavenger_observations(request.pg_id) {
+        match local_client.list_shard_scavenger_observations(data_pg_id) {
             Ok(observations) => Ok(encode_storage_rpc_success_response(
                 &encode_scavenger_observations_response(&observations),
             )),
@@ -8750,8 +8755,16 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = match validated_request_data_pg(
+            request.route.pg_id,
+            request.key.data_pg_id,
+            "shard scavenger observation resolve",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.resolve_shard_scavenger_observation(request.route.pg_id, &request.key) {
+        match local_client.resolve_shard_scavenger_observation(data_pg_id, &request.key) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }
@@ -8773,7 +8786,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = match validated_placed_segment_data_pg(
+        let data_pg_id = match validated_request_data_pg(
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard repair record",
@@ -8832,7 +8845,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = match validated_placed_segment_data_pg(
+        let data_pg_id = match validated_request_data_pg(
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard repair resolve",
@@ -8916,7 +8929,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
-        let data_pg_id = match validated_placed_segment_data_pg(
+        let data_pg_id = match validated_request_data_pg(
             request.route.pg_id,
             request.claim.work_item.request.data_pg_id,
             "placed segment shard repair claim complete",
@@ -8965,7 +8978,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
-        let data_pg_id = match validated_placed_segment_data_pg(
+        let data_pg_id = match validated_request_data_pg(
             request.route.pg_id,
             request.claim.work_item.request.data_pg_id,
             "placed segment shard repair claim error",
@@ -9008,7 +9021,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = match validated_placed_segment_data_pg(
+        let data_pg_id = match validated_request_data_pg(
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard backfill record",
@@ -9094,7 +9107,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = match validated_placed_segment_data_pg(
+        let data_pg_id = match validated_request_data_pg(
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard backfill exists",
@@ -9131,7 +9144,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = match validated_placed_segment_data_pg(
+        let data_pg_id = match validated_request_data_pg(
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard backfill resolve",
@@ -9215,7 +9228,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
-        let data_pg_id = match validated_placed_segment_data_pg(
+        let data_pg_id = match validated_request_data_pg(
             request.route.pg_id,
             request.claim.work_item.request.data_pg_id,
             "placed segment shard backfill claim complete",
@@ -9264,7 +9277,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
-        let data_pg_id = match validated_placed_segment_data_pg(
+        let data_pg_id = match validated_request_data_pg(
             request.route.pg_id,
             request.claim.work_item.request.data_pg_id,
             "placed segment shard backfill claim error",
@@ -12185,7 +12198,7 @@ fn validate_placed_segment_shard_repair_claim_route_epoch(
     Ok(())
 }
 
-fn validated_placed_segment_data_pg(
+fn validated_request_data_pg(
     pg_id: PgId,
     request_data_pg_id: u32,
     operation: &'static str,
@@ -16881,7 +16894,7 @@ mod tests {
         let request = StorageRpcScavengerListFilesRequest {
             node_id: config.node_id,
             cluster_epoch: config.cluster_epoch,
-            data_pg_id: DataPgId::new(PgId::new(0)),
+            data_pg_id: PgId::new(0),
         };
         let response = send_frame(
             &mut client,
@@ -17865,6 +17878,159 @@ mod tests {
             .list_placed_segment_shard_backfills()
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn storage_node_server_shard_scavenger_rpcs_validate_roles_before_rows() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_ids = vec![0, 1];
+        config.pg_routes = vec![test_route(0), test_route(1)];
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let pg0_key = test_shard_key(0);
+        let pg0_observation = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: config.node_id.as_u32(),
+                data_pg_id: 0,
+                shard_index: pg0_key.shard_index(),
+                shard_key: pg0_key,
+            },
+            data_size: Some(12),
+            crc64: Some(0x1234),
+            file_exists: true,
+            shard_row_exists: true,
+            reason: ShardScavengerObservationReason::UnreferencedShardRowAndFile,
+            last_error: None,
+        };
+        let pg1_key = test_shard_key(1);
+        let pg1_observation = ShardScavengerObservationRecord {
+            key: ShardScavengerObservationKey {
+                node_id: config.node_id.as_u32(),
+                data_pg_id: 1,
+                shard_index: pg1_key.shard_index(),
+                shard_key: pg1_key,
+            },
+            data_size: None,
+            crc64: None,
+            file_exists: false,
+            shard_row_exists: false,
+            reason: ShardScavengerObservationReason::ScanIncomplete,
+            last_error: Some("pg 1 canary".to_string()),
+        };
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let (pg0_before, pg1_before) = {
+            let pg0 = server._node.get_pg(0).unwrap();
+            pg0.record_shard_scavenger_observation(&pg0_observation)
+                .unwrap();
+            let pg0_before = pg0.list_shard_scavenger_observations().unwrap();
+            let pg1 = server._node.get_pg(1).unwrap();
+            pg1.record_shard_scavenger_observation(&pg1_observation)
+                .unwrap();
+            let pg1_before = pg1.list_shard_scavenger_observations().unwrap();
+            (pg0_before, pg1_before)
+        };
+        let pg1_route = StorageRpcBucketPgRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(1),
+        };
+        let mut changed_pg0_observation = pg0_observation.clone();
+        changed_pg0_observation.last_error = Some("must not persist".to_string());
+        let unknown_route = StorageRpcBucketPgRequest {
+            pg_id: PgId::new(9),
+            ..pg1_route.clone()
+        };
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+        let mut client = UnixStream::connect(socket_path).unwrap();
+
+        let mismatched_requests = [
+            (
+                StorageRpcMessageKind::ShardScavengerObservationRecord,
+                encode_scavenger_observation_record_request(
+                    &StorageRpcScavengerObservationRecordRequest {
+                        route: pg1_route.clone(),
+                        observation: changed_pg0_observation,
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerObservationResolve,
+                encode_scavenger_observation_key_request(
+                    &StorageRpcScavengerObservationKeyRequest {
+                        route: pg1_route,
+                        key: pg0_observation.key.clone(),
+                    },
+                )
+                .unwrap(),
+            ),
+        ];
+        let mut request_id = 1u64;
+        for (kind, payload) in mismatched_requests {
+            let response = send_frame(&mut client, request_id, kind, payload);
+            request_id += 1;
+            let error = decode_storage_rpc_response_payload(&response.payload)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+        }
+
+        let unknown_requests = [
+            (
+                StorageRpcMessageKind::ShardScavengerListFiles,
+                encode_scavenger_list_files_request(&StorageRpcScavengerListFilesRequest {
+                    node_id: config.node_id,
+                    cluster_epoch: config.cluster_epoch,
+                    data_pg_id: PgId::new(9),
+                }),
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerShardRows,
+                encode_bucket_pg_request(&unknown_route).unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerPayloadReferences,
+                encode_bucket_pg_request(&unknown_route).unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::ShardScavengerObservations,
+                encode_bucket_pg_request(&unknown_route).unwrap(),
+            ),
+        ];
+        for (kind, payload) in unknown_requests {
+            let response = send_frame(&mut client, request_id, kind, payload);
+            request_id += 1;
+            let error = decode_storage_rpc_response_payload(&response.payload)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::UnknownPg);
+        }
+        drop(client);
+        join.join().unwrap();
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .get_pg(0)
+                .unwrap()
+                .list_shard_scavenger_observations()
+                .unwrap(),
+            pg0_before
+        );
+        assert_eq!(
+            reopened
+                .get_pg(1)
+                .unwrap()
+                .list_shard_scavenger_observations()
+                .unwrap(),
+            pg1_before
+        );
     }
 
     #[test]

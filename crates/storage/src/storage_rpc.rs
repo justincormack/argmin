@@ -3013,7 +3013,7 @@ pub(crate) struct StorageRpcShardAckItemRequest {
 pub(crate) struct StorageRpcScavengerListFilesRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
-    pub(crate) data_pg_id: DataPgId,
+    pub(crate) data_pg_id: PgId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9956,7 +9956,7 @@ pub(crate) fn decode_scavenger_list_files_request(
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
-    let data_pg_id = DataPgId::new(PgId::new(decoder.read_u32()?));
+    let data_pg_id = PgId::new(decoder.read_u32()?);
     decoder.finish()?;
     Ok(StorageRpcScavengerListFilesRequest {
         node_id,
@@ -18779,7 +18779,7 @@ mod tests {
         let request = StorageRpcScavengerListFilesRequest {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            data_pg_id: DataPgId::new(PgId::new(3)),
+            data_pg_id: PgId::new(3),
         };
 
         let request_bytes = encode_scavenger_list_files_request(&request);

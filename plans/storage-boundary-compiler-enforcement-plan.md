@@ -975,6 +975,36 @@ Fifteenth Phase 3 slice:
   checker, formatting, workspace-wide strict Clippy, and the full workspace
   suite (7,224 tests).
 
+Sixteenth Phase 3 slice:
+
+- `ShardScavengerNodeClient` now separates its remaining mixed roles:
+  shard-file/row and observation operations require `DataPgId`, while
+  payload-reference fan-out requires `ObjectMetadataScanPgId`. Cluster
+  scavenger, backfill-candidate, and best-effort stream-cleanup paths derive
+  those roles from installed topology before calling a node.
+- Unix clients erase those roles to the existing raw route fields. The
+  list-files request also now decodes its PG as raw `PgId`, so untrusted RPC
+  bytes do not confer a data role. The server constructs the applicable data
+  or object-scan role after raw route validation. Metadata-backed row,
+  payload-reference, and observation operations additionally require the
+  metadata primary; list-files intentionally scans each routed acting-set
+  node's local files without a primary requirement. Observation record/resolve
+  also require the embedded observation data PG to equal the routed PG before
+  accessing a store.
+- a two-PG adversarial Unix regression seeds complete observation canaries on
+  PG 0 and PG 1. Record and resolve requests routed through PG 1 but naming PG
+  0 require `PayloadDecode`; file, row, payload-reference, and observation
+  scans for unknown PG 9 require `UnknownPg`. Reopening storage proves both
+  canary rows, including timestamps, counts, error, and resolution state,
+  remain exact.
+- all `ShardScavengerNodeClient` PG parameters are now role-typed.
+  Non-forgeable `DataPgId` construction and request-scoped route capability
+  values remain open in Phase 3.
+- the sixteenth slice passed its focused RPC-codec, embedded/Unix scavenger,
+  backfill-candidate, and adversarial Unix regressions, the boundary checker,
+  formatting, workspace-wide strict Clippy, and the full workspace suite
+  (7,244 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

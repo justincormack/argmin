@@ -1155,27 +1155,30 @@ pub(crate) trait ShardScavengerNodeClient: Send + Sync {
         data_pg_id: DataPgId,
     ) -> Result<ScavengerShardFileScan, StoreError>;
 
-    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError>;
+    fn list_scavenger_shard_rows(
+        &self,
+        data_pg_id: DataPgId,
+    ) -> Result<Vec<ScavengerShardRow>, StoreError>;
 
     fn list_shard_scavenger_payload_references(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError>;
 
     fn record_shard_scavenger_observation(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         observation: &ShardScavengerObservationRecord,
     ) -> Result<(), StoreError>;
 
     fn list_shard_scavenger_observations(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError>;
 
     fn resolve_shard_scavenger_observation(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardScavengerObservationKey,
     ) -> Result<(), StoreError>;
 }

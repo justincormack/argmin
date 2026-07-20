@@ -238,7 +238,7 @@ impl UnixStorageNodeClient {
         let request = StorageRpcScavengerListFilesRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
-            data_pg_id,
+            data_pg_id: data_pg_id.pg_id(),
         };
         let payload = encode_scavenger_list_files_request(&request);
         let response = self.rpc_request(StorageRpcMessageKind::ShardScavengerListFiles, payload)?;
@@ -252,9 +252,9 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn list_scavenger_shard_rows(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<ScavengerShardRow>, StoreError> {
-        let request = self.bucket_pg_request(pg_id);
+        let request = self.bucket_pg_request(data_pg_id.pg_id());
         let payload = encode_bucket_pg_request(&request).map_err(|error| {
             self.rpc_payload_error(
                 "encode shard scavenger shard rows request",
@@ -272,9 +272,9 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn list_shard_scavenger_payload_references(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
-        let request = self.bucket_pg_request(pg_id);
+        let request = self.bucket_pg_request(pg_id.pg_id());
         let payload = encode_bucket_pg_request(&request).map_err(|error| {
             self.rpc_payload_error(
                 "encode shard scavenger payload references request",
@@ -295,11 +295,11 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn record_shard_scavenger_observation(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         observation: &ShardScavengerObservationRecord,
     ) -> Result<(), StoreError> {
         let request = StorageRpcScavengerObservationRecordRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             observation: observation.clone(),
         };
         let payload = encode_scavenger_observation_record_request(&request).map_err(|error| {
@@ -324,9 +324,9 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn list_shard_scavenger_observations(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
-        let request = self.bucket_pg_request(pg_id);
+        let request = self.bucket_pg_request(data_pg_id.pg_id());
         let payload = encode_bucket_pg_request(&request).map_err(|error| {
             self.rpc_payload_error(
                 "encode shard scavenger observations request",
@@ -345,11 +345,11 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn resolve_shard_scavenger_observation(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardScavengerObservationKey,
     ) -> Result<(), StoreError> {
         let request = StorageRpcScavengerObservationKeyRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             key: key.clone(),
         };
         let payload = encode_scavenger_observation_key_request(&request).map_err(|error| {
@@ -1231,38 +1231,41 @@ impl ShardScavengerNodeClient for UnixStorageNodeClient {
         UnixStorageNodeClient::list_scavenger_shard_files(self, data_pg_id)
     }
 
-    fn list_scavenger_shard_rows(&self, pg_id: PgId) -> Result<Vec<ScavengerShardRow>, StoreError> {
-        UnixStorageNodeClient::list_scavenger_shard_rows(self, pg_id)
+    fn list_scavenger_shard_rows(
+        &self,
+        data_pg_id: DataPgId,
+    ) -> Result<Vec<ScavengerShardRow>, StoreError> {
+        UnixStorageNodeClient::list_scavenger_shard_rows(self, data_pg_id)
     }
 
     fn list_shard_scavenger_payload_references(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Vec<ShardScavengerPayloadReference>, StoreError> {
         UnixStorageNodeClient::list_shard_scavenger_payload_references(self, pg_id)
     }
 
     fn record_shard_scavenger_observation(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         observation: &ShardScavengerObservationRecord,
     ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::record_shard_scavenger_observation(self, pg_id, observation)
+        UnixStorageNodeClient::record_shard_scavenger_observation(self, data_pg_id, observation)
     }
 
     fn list_shard_scavenger_observations(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
-        UnixStorageNodeClient::list_shard_scavenger_observations(self, pg_id)
+        UnixStorageNodeClient::list_shard_scavenger_observations(self, data_pg_id)
     }
 
     fn resolve_shard_scavenger_observation(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         key: &ShardScavengerObservationKey,
     ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::resolve_shard_scavenger_observation(self, pg_id, key)
+        UnixStorageNodeClient::resolve_shard_scavenger_observation(self, data_pg_id, key)
     }
 }
 
