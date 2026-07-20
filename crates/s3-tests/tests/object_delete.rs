@@ -909,7 +909,9 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
                 .delete_object()
                 .bucket(competing_bucket)
                 .key(marker_key)
-                .send()
+                .send_retrying_exact_operation_aborted(
+                    "insert competing marker during conditional batch-delete race",
+                )
                 .await
         });
         let (batch, competing) = tokio::join!(batch, competing);
