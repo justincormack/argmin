@@ -184,7 +184,7 @@ impl UnixStorageNodeReadHandleSession {
         let (locations, shard_keys): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
         let request = StorageRpcReadHandleAcquireRequest {
             read_operation_id: read_operation_id.into(),
-            locations,
+            locations: locations.iter().copied().map(Into::into).collect(),
             shard_keys,
         };
         let payload = encode_read_handle_acquire_request(&request).map_err(|error| {
@@ -203,7 +203,7 @@ impl UnixStorageNodeReadHandleSession {
                 ),
             ));
         }
-        Ok(response.locations)
+        Ok(locations)
     }
 
     pub(crate) fn release_read_handles(

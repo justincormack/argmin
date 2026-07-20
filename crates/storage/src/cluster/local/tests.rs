@@ -508,7 +508,7 @@ fn write_committed_direct_segment_for_with_versioning(
         })
         .unwrap()
         .unwrap();
-    let data_pg_id = DataPgId::new(PgId::new(written.data_pg_id));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(written.data_pg_id));
     let placement_key = super::super::segment_payload_placement_key(&segment_okh, generation_id);
     let locations = cluster
         .place_payload_shards(data_pg_id, written.ec, &placement_key)

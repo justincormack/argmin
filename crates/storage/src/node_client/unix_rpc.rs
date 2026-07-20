@@ -36,7 +36,7 @@ impl UnixStorageNodeClient {
         let expected_size = data.len() as u64;
         let expected_crc64 = checksum::crc64::checksum(data);
         let request = StorageRpcShardWriteRequest {
-            location: self.shard_location(data_pg_id, key),
+            location: self.shard_location(data_pg_id, key).into(),
             shard_key: key.clone(),
             expected_size,
             expected_crc64,
@@ -58,7 +58,7 @@ impl UnixStorageNodeClient {
         expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError> {
         let request = StorageRpcShardReadRequest {
-            location: self.shard_location(data_pg_id, key),
+            location: self.shard_location(data_pg_id, key).into(),
             shard_key: key.clone(),
             expected_ack,
         };
@@ -78,7 +78,7 @@ impl UnixStorageNodeClient {
         expected_ack: WriteAck,
     ) -> Result<Vec<u8>, StoreError> {
         let request = StorageRpcShardReadRequest {
-            location,
+            location: location.into(),
             shard_key: key.clone(),
             expected_ack,
         };
@@ -100,7 +100,7 @@ impl UnixStorageNodeClient {
         length: u64,
     ) -> Result<Vec<u8>, StoreError> {
         let request = StorageRpcShardReadRangeRequest {
-            location: self.shard_location(data_pg_id, key),
+            location: self.shard_location(data_pg_id, key).into(),
             shard_key: key.clone(),
             expected_ack,
             offset,
@@ -129,7 +129,7 @@ impl UnixStorageNodeClient {
         key: &ShardKey,
     ) -> Result<(), StoreError> {
         let request = StorageRpcShardDeleteRequest {
-            location,
+            location: location.into(),
             shard_key: key.clone(),
         };
         let payload = encode_shard_delete_request(&request).map_err(|error| {

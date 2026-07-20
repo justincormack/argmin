@@ -68,7 +68,7 @@ use crate::storage_rpc::{
 use crate::traits::PgMetadataStore;
 use crate::types::{
     BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
-    CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
+    CommitDirectPutObjectReq, CreateStreamUploadReq, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
     ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
@@ -88,6 +88,7 @@ use crate::types::{
     MultipartReclaimRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
     PutLiveObjectReq,
 };
+use crate::DataPgId;
 use crate::ObjectEtag;
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
@@ -2277,6 +2278,15 @@ fn metadata_transfer_prefix_proof_at_epoch(
 }
 
 impl StorageCluster {
+    fn validated_data_pg(&self, pg_id: PgId) -> Result<DataPgId, StoreError> {
+        self.local_map
+            .data_pg(pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+            })
+    }
+
     pub fn metadata_transfer_imported_proof_at_epoch(
         artifact: &PgMetadataTransferArtifact,
         destination_epoch: ClusterEpoch,
@@ -6118,7 +6128,7 @@ impl StorageCluster {
             .local_map
             .object_generation_segment_data_pg(bucket, key, generation_id, segment_index)
             .get();
-        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg = self.validated_data_pg(PgId::new(data_pg_id))?;
         let segment_vid = generation_id;
         let written_shards =
             self.write_placed_segment_payload_shards(data_pg, ec, segment_okh, segment_vid, data)?;
@@ -8963,7 +8973,7 @@ impl StorageCluster {
             m: segment_record.ec_m,
         };
         self.write_placed_segment_payload_shards(
-            DataPgId::new(PgId::new(segment_record.data_pg_id)),
+            self.validated_data_pg(PgId::new(segment_record.data_pg_id))?,
             ec,
             &segment_record.segment_okh,
             segment_record.segment_vid,
@@ -9234,7 +9244,7 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         let shard_ack_client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
         shard_ack_client.register_written_shard_acks(data_pg_id, shard_batch)?;
         Ok(())
@@ -9290,7 +9300,7 @@ impl StorageCluster {
             }
         }
 
-        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg = self.validated_data_pg(PgId::new(data_pg_id))?;
         let shard_ack_client = self.metadata_pg_primary_shard_ack_client(data_pg.pg_id())?;
         for (key, ack) in shard_batch {
             shard_ack_client.validate_written_shard_ack(data_pg, key, *ack)?;
@@ -9335,7 +9345,7 @@ impl StorageCluster {
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
             let primary_node_id = primary_node.node_id().as_u32();
-            let data_pg = DataPgId::new(route.pg_id());
+            let data_pg = self.validated_data_pg(route.pg_id())?;
             let data_pg_id = data_pg.get();
             let scavenger_client = primary_node.shard_scavenger_client();
             let shard_rows = scavenger_client.list_scavenger_shard_rows(data_pg)?;
@@ -9671,7 +9681,7 @@ impl StorageCluster {
         placement_cluster_epoch: ClusterEpoch,
         ec: EcShape,
     ) -> Result<(), StoreError> {
-        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg = self.validated_data_pg(PgId::new(data_pg_id))?;
         let placement_key = segment_payload_placement_key(&okh, generation_id);
         let route =
             self.reconstructed_pg_route_at_epoch(data_pg.pg_id(), placement_cluster_epoch)?;
@@ -9887,7 +9897,7 @@ impl StorageCluster {
         let found = if placement_cluster_epoch == self.operation_epoch() {
             self.try_read_placed_segment_stored_bytes_into(req, dst, true)?
         } else {
-            let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+            let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
             let route =
                 self.reconstructed_pg_route_at_epoch(data_pg.pg_id(), placement_cluster_epoch)?;
             self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(&route, req, dst)?
@@ -9949,7 +9959,7 @@ impl StorageCluster {
         &self,
         data_pg_id: u32,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
             .list_placed_segment_shard_repairs(data_pg_id)
     }
@@ -9959,7 +9969,7 @@ impl StorageCluster {
         data_pg_id: u32,
         params: &PlacedSegmentShardRepairClaimAcquireParams,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         let client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
         let request = PlacedSegmentShardRepairClaimAcquire {
             claim_id: params.claim_id.clone(),
@@ -9976,7 +9986,7 @@ impl StorageCluster {
         &self,
         claim: &PlacedSegmentShardRepairClaimRecord,
     ) -> Result<bool, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(claim.work_item.request.data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(claim.work_item.request.data_pg_id))?;
         if claim.cluster_epoch != self.cluster_epoch() {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: data_pg_id.get(),
@@ -9994,7 +10004,7 @@ impl StorageCluster {
         last_error: &str,
         next_attempt_after: u64,
     ) -> Result<bool, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(claim.work_item.request.data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(claim.work_item.request.data_pg_id))?;
         if claim.cluster_epoch != self.cluster_epoch() {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: data_pg_id.get(),
@@ -10030,7 +10040,7 @@ impl StorageCluster {
         remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(work_item.request.data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(work_item.request.data_pg_id))?;
         self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
             .record_placed_segment_shard_backfill(
                 data_pg_id,
@@ -10044,7 +10054,7 @@ impl StorageCluster {
         &self,
         data_pg_id: u32,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
             .list_placed_segment_shard_backfills(data_pg_id)
     }
@@ -10053,7 +10063,7 @@ impl StorageCluster {
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(work_item.request.data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(work_item.request.data_pg_id))?;
         self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
             .placed_segment_shard_backfill_exists(data_pg_id, work_item)
     }
@@ -10064,7 +10074,7 @@ impl StorageCluster {
             if route.state() != PgState::Active {
                 continue;
             }
-            let data_pg_id = DataPgId::new(route.pg_id());
+            let data_pg_id = self.validated_data_pg(route.pg_id())?;
             depth = depth.saturating_add(
                 self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
                     .count_placed_segment_shard_backfills(data_pg_id)?,
@@ -10224,7 +10234,7 @@ impl StorageCluster {
         desired_route: &PgRouteSnapshot,
         req: SegmentStoredBytesRequest,
     ) -> Result<bool, StoreError> {
-        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
         let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
         let source_locations = self
             .place_payload_shards_for_pg_route_snapshot(
@@ -10300,7 +10310,7 @@ impl StorageCluster {
         data_pg_id: u32,
         params: &PlacedSegmentShardBackfillClaimAcquireParams,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         let client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
         let request = PlacedSegmentShardBackfillClaimAcquire {
             claim_id: params.claim_id.clone(),
@@ -10334,7 +10344,7 @@ impl StorageCluster {
         &self,
         claim: &PlacedSegmentShardBackfillClaimRecord,
     ) -> Result<bool, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(claim.work_item.request.data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(claim.work_item.request.data_pg_id))?;
         if claim.cluster_epoch != self.cluster_epoch() {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: data_pg_id.get(),
@@ -10352,7 +10362,7 @@ impl StorageCluster {
         last_error: &str,
         next_attempt_after: u64,
     ) -> Result<bool, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(claim.work_item.request.data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(claim.work_item.request.data_pg_id))?;
         if claim.cluster_epoch != self.cluster_epoch() {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: data_pg_id.get(),
@@ -10374,7 +10384,7 @@ impl StorageCluster {
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(work_item.request.data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(work_item.request.data_pg_id))?;
         self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
             .resolve_placed_segment_shard_backfill(data_pg_id, work_item)
     }
@@ -10409,7 +10419,7 @@ impl StorageCluster {
     ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
         validate_placed_segment_repair_ec_shape(req.ec)?;
-        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
         let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
         let locations = self
             .place_payload_shards(data_pg, req.ec, &placement_key)
@@ -10428,7 +10438,7 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
     ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
         validate_placed_segment_repair_ec_shape(req.ec)?;
-        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
         let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
         let locations = self
             .place_payload_shards_for_pg_route_snapshot(route, data_pg, req.ec, &placement_key)
@@ -10926,7 +10936,7 @@ impl StorageCluster {
             false => return Err(StoreError::NotFound),
         }
 
-        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
         let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
         let locations = self
             .place_payload_shards(data_pg, req.ec, &placement_key)
@@ -11059,7 +11069,7 @@ impl StorageCluster {
             return Ok(true);
         }
 
-        let data_pg = DataPgId::new(PgId::new(req.data_pg_id));
+        let data_pg = self.validated_data_pg(PgId::new(req.data_pg_id))?;
         let placement_key = segment_payload_placement_key(&req.segment_okh, req.segment_vid);
         let locations = self
             .place_payload_shards_for_pg_route_snapshot(route, data_pg, req.ec, &placement_key)
@@ -11533,7 +11543,7 @@ impl StorageCluster {
         request: SegmentStoredBytesRequest,
         shard_index: ShardIndex,
     ) -> Result<(), StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(request.data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(request.data_pg_id))?;
         let work_item = PlacedSegmentShardRepairWorkItem {
             request,
             shard_index,
@@ -11549,7 +11559,7 @@ impl StorageCluster {
         request: SegmentStoredBytesRequest,
         shard_index: ShardIndex,
     ) -> Result<(), StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(request.data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(request.data_pg_id))?;
         let work_item = PlacedSegmentShardRepairWorkItem {
             request,
             shard_index,
@@ -11566,7 +11576,7 @@ impl StorageCluster {
         // Placed payload bytes are routed by LocalClusterMap; per-shard
         // CRC/size acks are metadata rows in the same PG and are read through
         // that PG's primary.
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         let shard_ack_client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
         shard_ack_client.load_written_shard_ack(data_pg_id, shard_key)
     }
@@ -11577,7 +11587,7 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_key: &ShardKey,
     ) -> Result<WriteAck, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         if route.pg_id() != data_pg_id.pg_id() {
             return Err(StoreError::PayloadShardSetMismatch {
                 reason: format!(
@@ -11626,7 +11636,7 @@ impl StorageCluster {
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
     ) -> Result<Vec<ShardLocation>, StoreError> {
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         self.place_payload_shards(data_pg_id, ec, &placement_key)
             .map_err(cluster_build_error_to_store)
@@ -11641,7 +11651,7 @@ impl StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         let shard_keys = Self::payload_shard_set_keys(okh, generation_id, ec);
         self.delete_placed_payload_shard_keys(
-            DataPgId::new(PgId::new(data_pg_id)),
+            self.validated_data_pg(PgId::new(data_pg_id))?,
             ec,
             okh,
             generation_id,
@@ -11697,9 +11707,19 @@ impl StorageCluster {
         shard_keys: impl IntoIterator<Item = ShardKey>,
     ) {
         let shard_keys: Vec<ShardKey> = shard_keys.into_iter().collect();
+        let data_pg = match self.validated_data_pg(PgId::new(data_pg_id)) {
+            Ok(data_pg) => data_pg,
+            Err(error) => {
+                self.emit_best_effort_payload_cleanup_error(
+                    "validate placed payload cleanup data PG",
+                    &error,
+                );
+                return;
+            }
+        };
         self.delete_placed_payload_shard_keys_best_effort_at_epoch(
             operation_epoch,
-            DataPgId::new(PgId::new(data_pg_id)),
+            data_pg,
             ec,
             okh,
             generation_id,
@@ -11829,7 +11849,7 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_keys: &[ShardKey],
     ) -> Result<(), ObjectPgActionError> {
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         let shard_ack_client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
         for shard_key in shard_keys {
             self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
@@ -11845,7 +11865,16 @@ impl StorageCluster {
         data_pg_id: u32,
         shard_keys: &[ShardKey],
     ) {
-        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg_id = match self.validated_data_pg(PgId::new(data_pg_id)) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => {
+                self.emit_best_effort_payload_cleanup_error(
+                    "validate payload acknowledgement cleanup data PG",
+                    &error,
+                );
+                return;
+            }
+        };
         let shard_ack_client = match self.metadata_pg_primary_shard_ack_client_at_retained_epoch(
             operation_epoch,
             data_pg_id.pg_id(),
@@ -12055,7 +12084,7 @@ impl StorageCluster {
         segment_vid: GenerationId,
         shard_index: u8,
     ) -> Result<std::path::PathBuf, StoreError> {
-        let data_pg = DataPgId::new(PgId::new(data_pg_id));
+        let data_pg = self.validated_data_pg(PgId::new(data_pg_id))?;
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         let locations = self
             .place_payload_shards(data_pg, ec, &placement_key)
@@ -12109,7 +12138,7 @@ impl StorageCluster {
     ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
         let pg_id = PgId::new(data_pg_id);
         self.metadata_pg_primary_client(pg_id)?
-            .list_shard_scavenger_observations(DataPgId::new(pg_id))
+            .list_shard_scavenger_observations(self.validated_data_pg(pg_id)?)
     }
 
     fn emit_best_effort_payload_cleanup_error(&self, operation: &'static str, error: &StoreError) {
@@ -12762,7 +12791,7 @@ mod backfill_plan_tests {
                     shard_key: ShardKey::new(&[9; 16], 1, shard_index.get()),
                     location: ShardLocation::new(
                         ClusterEpoch::INITIAL,
-                        DataPgId::new(PgId::new(0)),
+                        DataPgId::new_for_test(PgId::new(0)),
                         shard_index,
                         NodeId::new(u32::from(shard_index.get())),
                     ),
@@ -12909,14 +12938,14 @@ mod backfill_plan_tests {
                 required_shards,
                 total_shards,
                 source_mask,
-                DataPgId::new(PgId::new(0)),
+                DataPgId::new_for_test(PgId::new(0)),
                 10,
             );
             let desired_health = generated_backfill_plan_test_health(
                 required_shards,
                 total_shards,
                 desired_mask,
-                DataPgId::new(PgId::new(1)),
+                DataPgId::new_for_test(PgId::new(1)),
                 100,
             );
 

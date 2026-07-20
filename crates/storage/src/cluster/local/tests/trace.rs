@@ -260,7 +260,7 @@ fn current_trace_location(
 ) -> ShardLocation {
     cluster
         .place_payload_shards(
-            DataPgId::new(PgId::new(0)),
+            DataPgId::new_for_test(PgId::new(0)),
             ec_shape,
             &written.placement_key,
         )
@@ -282,7 +282,7 @@ fn written_trace_location_for_epoch(
 fn arbitrary_current_location(current_epoch: ClusterEpoch) -> ShardLocation {
     ShardLocation::new(
         current_epoch,
-        DataPgId::new(PgId::new(0)),
+        DataPgId::new_for_test(PgId::new(0)),
         ShardIndex::new(0),
         NodeId::new(0),
     )
@@ -350,7 +350,7 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 let key = trace_shard_key(step, *seed);
                 let data = format!("trace-payload-{step}-{seed}").into_bytes();
                 match cluster.place_payload_shards(
-                    DataPgId::new(PgId::new(0)),
+                    DataPgId::new_for_test(PgId::new(0)),
                     ec_shape,
                     &placement_key,
                 ) {
@@ -821,14 +821,14 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 let historical_locations = cluster
                     .place_payload_shards_for_pg_route_snapshot(
                         &source_route,
-                        DataPgId::new(PgId::new(req.data_pg_id)),
+                        DataPgId::new_for_test(PgId::new(req.data_pg_id)),
                         req.ec,
                         &placement_key,
                     )
                     .unwrap();
                 let current_locations = cluster
                     .place_payload_shards(
-                        DataPgId::new(PgId::new(req.data_pg_id)),
+                        DataPgId::new_for_test(PgId::new(req.data_pg_id)),
                         req.ec,
                         &placement_key,
                     )
@@ -915,7 +915,7 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 let historical_locations = cluster
                     .place_payload_shards_for_pg_route_snapshot(
                         &source_route,
-                        DataPgId::new(PgId::new(req.data_pg_id)),
+                        DataPgId::new_for_test(PgId::new(req.data_pg_id)),
                         req.ec,
                         &placement_key,
                     )
@@ -923,7 +923,7 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 let desired_locations = cluster
                     .place_payload_shards_for_pg_route_snapshot(
                         &desired_route,
-                        DataPgId::new(PgId::new(req.data_pg_id)),
+                        DataPgId::new_for_test(PgId::new(req.data_pg_id)),
                         req.ec,
                         &placement_key,
                     )

@@ -25,7 +25,7 @@ use super::clients::{
     ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
     PlacedShardNodeClient, ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient,
 };
-use super::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
+use super::{BucketPgId, DataPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use crate::control_plane::{
     NodeHeartbeat, NodePgHeartbeatObservation, PendingMetadataCommandObservation, PgMetadataProof,
 };
@@ -505,6 +505,10 @@ impl LocalNodeRuntime {
         self.node.object_metadata_scan_pg(pg_id)
     }
 
+    pub(crate) fn data_pg(&self, pg_id: PgId) -> Option<DataPgId> {
+        self.node.data_pg(pg_id)
+    }
+
     pub(crate) fn write_erasure_coded_segment_shards_with<F>(
         &self,
         segment_okh: &[u8; 16],
@@ -761,6 +765,13 @@ impl SharedStorageNode {
             .binary_search(&pg_id.get())
             .ok()
             .map(|_| ObjectMetadataScanPgId(pg_id))
+    }
+
+    pub(in crate::node_runtime) fn data_pg(&self, pg_id: PgId) -> Option<DataPgId> {
+        self.pg_id_list
+            .binary_search(&pg_id.get())
+            .ok()
+            .map(|_| DataPgId::from_validated_placement(pg_id))
     }
 
     pub fn cluster_map_history_reference_summary(

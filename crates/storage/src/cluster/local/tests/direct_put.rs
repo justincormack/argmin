@@ -1785,7 +1785,7 @@ fn direct_put_publish_validation_fails_closed_when_acknowledged_shard_file_is_mi
             payload,
         )
         .unwrap();
-    let data_pg_id = DataPgId::new(PgId::new(written.data_pg_id));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(written.data_pg_id));
     let placement_key =
         super::super::super::segment_payload_placement_key(&segment_okh, generation_id);
     let locations = cluster

@@ -108,33 +108,6 @@ impl std::fmt::Display for PgId {
     }
 }
 
-/// PG containing payload shard data for an object segment or multipart part.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DataPgId(PgId);
-
-impl DataPgId {
-    #[must_use]
-    pub const fn new(pg_id: PgId) -> Self {
-        Self(pg_id)
-    }
-
-    #[must_use]
-    pub const fn pg_id(self) -> PgId {
-        self.0
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0.get()
-    }
-}
-
-impl From<DataPgId> for PgId {
-    fn from(value: DataPgId) -> Self {
-        value.pg_id()
-    }
-}
-
 /// Placement-group availability state for one cluster epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PgState {

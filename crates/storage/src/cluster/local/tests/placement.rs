@@ -47,7 +47,11 @@ fn current_payload_placement_uses_pg_acting_set() {
     let cluster = crate::StorageCluster::from_local_map(map).unwrap();
 
     let locations = cluster
-        .place_payload_shards(DataPgId::new(PgId::new(0)), ec_shape, b"acting-set-key")
+        .place_payload_shards(
+            DataPgId::new_for_test(PgId::new(0)),
+            ec_shape,
+            b"acting-set-key",
+        )
         .unwrap();
 
     assert_eq!(locations.len(), 2);
@@ -73,7 +77,7 @@ fn places_payload_shards_deterministically_on_distinct_nodes() {
     let cluster =
         crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape)
             .unwrap();
-    let data_pg_id = DataPgId::new(crate::PgId::new(3));
+    let data_pg_id = DataPgId::new_for_test(crate::PgId::new(3));
 
     let first = cluster
         .place_payload_shards(data_pg_id, ec_shape, b"stable-payload-key")
@@ -120,7 +124,7 @@ fn places_payload_shards_for_explicit_pg_route_without_current_route_lookup() {
     let cluster =
         crate::StorageCluster::open_local_nodes(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape)
             .unwrap();
-    let data_pg_id = DataPgId::new(crate::PgId::new(3));
+    let data_pg_id = DataPgId::new_for_test(crate::PgId::new(3));
     let placement_key = b"historical-placement-key";
 
     let current = cluster
@@ -180,7 +184,7 @@ fn payload_shard_node_selects_one_placed_shard() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
-    let data_pg_id = DataPgId::new(crate::PgId::new(1));
+    let data_pg_id = DataPgId::new_for_test(crate::PgId::new(1));
     let locations = map
         .place_payload_shards(
             ClusterEpoch::INITIAL,
@@ -219,7 +223,7 @@ fn payload_shard_node_rejects_index_outside_ec_shape() {
     let err = map
         .payload_shard_node(
             ClusterEpoch::INITIAL,
-            DataPgId::new(crate::PgId::new(0)),
+            DataPgId::new_for_test(crate::PgId::new(0)),
             ShardIndex::new(ec_shape.k + ec_shape.m),
             ec_shape,
             b"stable-payload-key",
@@ -258,7 +262,7 @@ fn place_payload_shards_rejects_unknown_pg() {
     let err = map
         .place_payload_shards(
             ClusterEpoch::INITIAL,
-            DataPgId::new(PgId::new(99)),
+            DataPgId::new_for_test(PgId::new(99)),
             SharedStorageNode::DEFAULT_EC_SHAPE,
             b"stable-payload-key",
         )
@@ -295,7 +299,7 @@ fn place_payload_shards_rejects_stale_operation_epoch() {
     let err = map
         .place_payload_shards(
             ClusterEpoch::new(2).unwrap(),
-            DataPgId::new(PgId::new(0)),
+            DataPgId::new_for_test(PgId::new(0)),
             SharedStorageNode::DEFAULT_EC_SHAPE,
             b"stable-payload-key",
         )
@@ -325,7 +329,7 @@ fn expired_route_maps_reject_payload_placement_and_shard_io() {
     ];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     map.test_set_route_map_validity(RouteMapValidity::until_ms_saturating(
         crate::clock::current_time_millis().saturating_add(60_000),
     ));
@@ -421,7 +425,7 @@ fn storage_cluster_dispatches_payload_shard_io_to_placed_local_node() {
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let data_pg_id = DataPgId::new(crate::PgId::new(1));
+    let data_pg_id = DataPgId::new_for_test(crate::PgId::new(1));
     let location = cluster
         .place_payload_shards(data_pg_id, ec_shape, b"stable-payload-key")
         .unwrap()[3];
@@ -613,7 +617,7 @@ fn stale_storage_cluster_handle_cannot_use_current_epoch_location() {
         ClusterEpoch::new(2).unwrap(),
     )
     .unwrap();
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let location = current_cluster
         .place_payload_shards(data_pg_id, ec_shape, b"current-epoch-location")
         .unwrap()[0];
@@ -886,7 +890,7 @@ fn placed_payload_shard_io_rejects_key_location_shard_index_mismatch() {
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    let data_pg_id = DataPgId::new(crate::PgId::new(1));
+    let data_pg_id = DataPgId::new_for_test(crate::PgId::new(1));
     let locations = cluster
         .place_payload_shards(data_pg_id, ec_shape, b"stable-payload-key")
         .unwrap();
@@ -968,7 +972,7 @@ fn payload_shard_io_rejects_stale_location_epoch() {
     .unwrap();
     let location = ShardLocation::new(
         ClusterEpoch::new(2).unwrap(),
-        DataPgId::new(crate::PgId::new(0)),
+        DataPgId::new_for_test(crate::PgId::new(0)),
         ShardIndex::new(0),
         NodeId::new(0),
     );
@@ -1009,7 +1013,7 @@ fn payload_shard_io_rejects_stale_operation_epoch_before_touching_node_store() {
     .unwrap();
     let location = ShardLocation::new(
         ClusterEpoch::INITIAL,
-        DataPgId::new(PgId::new(0)),
+        DataPgId::new_for_test(PgId::new(0)),
         ShardIndex::new(0),
         NodeId::new(0),
     );
@@ -1056,7 +1060,7 @@ fn payload_shard_io_rejects_node_outside_acting_set() {
     .unwrap();
     let location = ShardLocation::new(
         ClusterEpoch::INITIAL,
-        DataPgId::new(crate::PgId::new(0)),
+        DataPgId::new_for_test(crate::PgId::new(0)),
         ShardIndex::new(0),
         NodeId::new(99),
     );
@@ -1100,7 +1104,7 @@ fn payload_placement_and_shard_io_reject_all_non_active_pg_states() {
         map.pg_routes.get_mut(&PgId::new(0)).unwrap().state = state;
         let location = ShardLocation::new(
             ClusterEpoch::INITIAL,
-            DataPgId::new(PgId::new(0)),
+            DataPgId::new_for_test(PgId::new(0)),
             ShardIndex::new(0),
             NodeId::new(0),
         );
@@ -1109,7 +1113,7 @@ fn payload_placement_and_shard_io_reject_all_non_active_pg_states() {
         let err = map
             .place_payload_shards(
                 ClusterEpoch::INITIAL,
-                DataPgId::new(PgId::new(0)),
+                DataPgId::new_for_test(PgId::new(0)),
                 ec_shape,
                 b"non-active-placement",
             )
@@ -1213,7 +1217,11 @@ fn direct_put_payload_write_fails_closed_when_required_shard_node_leaves_acting_
     let segment_okh = [96; 16];
     let placement_key = crate::cluster::segment_payload_placement_key(&segment_okh, generation_id);
     let locations = cluster
-        .place_payload_shards(DataPgId::new(PgId::new(data_pg)), ec_shape, &placement_key)
+        .place_payload_shards(
+            DataPgId::new_for_test(PgId::new(data_pg)),
+            ec_shape,
+            &placement_key,
+        )
         .unwrap();
     let (removed_shard_index, removed_node) = locations
         .iter()
@@ -1304,7 +1312,7 @@ fn placed_segment_recovery_propagates_non_active_pg_route() {
             Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         let segment = write_committed_direct_segment(&cluster, b"phase-six-seven-route-read");
-        let data_pg_id = DataPgId::new(PgId::new(segment.written.data_pg_id));
+        let data_pg_id = DataPgId::new_for_test(PgId::new(segment.written.data_pg_id));
         drop(cluster);
 
         Arc::get_mut(&mut map)
@@ -1400,7 +1408,7 @@ fn placed_segment_recovery_propagates_missing_shard_pg_route() {
     let mut locations = segment.locations.clone();
     locations[0] = ShardLocation::new(
         ClusterEpoch::INITIAL,
-        DataPgId::new(PgId::new(99)),
+        DataPgId::new_for_test(PgId::new(99)),
         ShardIndex::new(0),
         locations[0].node_id(),
     );
@@ -1455,7 +1463,7 @@ fn placed_segment_recovery_propagates_node_not_in_acting_set() {
     let mut locations = segment.locations.clone();
     locations[0] = ShardLocation::new(
         ClusterEpoch::INITIAL,
-        DataPgId::new(PgId::new(segment.written.data_pg_id)),
+        DataPgId::new_for_test(PgId::new(segment.written.data_pg_id)),
         ShardIndex::new(0),
         NodeId::new(99),
     );
@@ -1510,7 +1518,7 @@ fn placed_segment_recovery_propagates_stale_shard_location() {
     let mut locations = segment.locations.clone();
     locations[0] = ShardLocation::new(
         ClusterEpoch::new(2).unwrap(),
-        DataPgId::new(PgId::new(segment.written.data_pg_id)),
+        DataPgId::new_for_test(PgId::new(segment.written.data_pg_id)),
         ShardIndex::new(0),
         locations[0].node_id(),
     );
@@ -1568,7 +1576,7 @@ fn placed_segment_recovery_propagates_shard_index_mismatch() {
     let mut locations = segment.locations.clone();
     locations[0] = ShardLocation::new(
         ClusterEpoch::INITIAL,
-        DataPgId::new(PgId::new(segment.written.data_pg_id)),
+        DataPgId::new_for_test(PgId::new(segment.written.data_pg_id)),
         ShardIndex::new(1),
         locations[0].node_id(),
     );
@@ -1638,7 +1646,7 @@ fn placed_segment_recovery_wraps_node_store_error_with_shard_route() {
     let mut locations = segment.locations.clone();
     locations[0] = ShardLocation::new(
         ClusterEpoch::INITIAL,
-        DataPgId::new(PgId::new(99)),
+        DataPgId::new_for_test(PgId::new(99)),
         ShardIndex::new(0),
         locations[0].node_id(),
     );
@@ -3788,7 +3796,7 @@ fn payload_shard_io_rejects_unknown_pg_before_touching_node_store() {
     .unwrap();
     let location = ShardLocation::new(
         ClusterEpoch::INITIAL,
-        DataPgId::new(PgId::new(99)),
+        DataPgId::new_for_test(PgId::new(99)),
         ShardIndex::new(0),
         NodeId::new(0),
     );

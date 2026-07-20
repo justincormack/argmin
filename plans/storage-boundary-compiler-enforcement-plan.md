@@ -1005,6 +1005,34 @@ Sixteenth Phase 3 slice:
   formatting, workspace-wide strict Clippy, and the full workspace suite
   (7,244 tests).
 
+Seventeenth Phase 3 slice:
+
+- `DataPgId` now lives beside the other role IDs inside the private
+  `node_runtime` boundary. It has no public or crate-visible raw constructor;
+  only installed `SharedStorageNode`/`LocalNodeRuntime` authorities can promote
+  a configured raw PG, while unit tests retain an explicit `new_for_test`
+  escape hatch under `cfg(test)`.
+- public placement-only `PgTopology` data-placement methods now return raw
+  `PgId`. `LocalClusterMap` converts their result through its installed node
+  runtime before exposing a `DataPgId`, and cluster paths that recover a data
+  PG from durable request/segment state fail closed with `ClusterPgNotFound`
+  unless the PG belongs to the installed runtime.
+- shard write, repair, read, range-read, delete, and read-handle Unix request
+  codecs now decode `StorageRpcShardLocation`, whose PG remains raw. Active,
+  retained-cleanup, and historical-inspection server validation promotes that
+  wire location to the typed `ShardLocation`; read-handle responses are
+  compared with the exact raw request before the Unix client returns its
+  original trusted typed locations.
+- existing unknown/stale PG, epoch, node, shard-I/O non-mutation, retained
+  historical access, and read-handle regressions continue to cover both local
+  and Unix boundaries. The Rust API now makes the non-forgeability property
+  structural rather than dependent on a source scanner.
+- request-scoped active, retained-cleanup, and recovery route capabilities
+  remain open in Phase 3.
+- the seventeenth slice passed formatting, workspace all-target compilation,
+  the storage boundary checker, all 2,156 storage tests, workspace-wide strict
+  Clippy, and the full workspace suite (7,244 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

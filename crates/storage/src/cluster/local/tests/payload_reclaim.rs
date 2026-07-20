@@ -869,13 +869,13 @@ fn payload_lease_for_shard_locations_prevalidates_nodes_before_acquire() {
     let locations = [
         ShardLocation::new(
             ClusterEpoch::INITIAL,
-            DataPgId::new(PgId::new(0)),
+            DataPgId::new_for_test(PgId::new(0)),
             ShardIndex::new(0),
             NodeId::new(0),
         ),
         ShardLocation::new(
             ClusterEpoch::INITIAL,
-            DataPgId::new(PgId::new(0)),
+            DataPgId::new_for_test(PgId::new(0)),
             ShardIndex::new(1),
             NodeId::new(99),
         ),

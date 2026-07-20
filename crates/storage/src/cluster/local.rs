@@ -2125,6 +2125,10 @@ impl LocalClusterMap {
             .object_metadata_scan_pg(pg_id)
     }
 
+    pub(crate) fn data_pg(&self, pg_id: PgId) -> Option<DataPgId> {
+        self.metadata_primary().runtime().data_pg(pg_id)
+    }
+
     pub(crate) fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {
         self.nodes.get(&node_id)
     }
@@ -2895,12 +2899,13 @@ impl LocalClusterMap {
         generation_id: GenerationId,
         segment_index: u32,
     ) -> DataPgId {
-        self.pg_topology.object_generation_segment_data_pg(
+        self.data_pg(self.pg_topology.object_generation_segment_data_pg(
             bucket,
             key,
             generation_id,
             segment_index,
-        )
+        ))
+        .expect("installed payload placement must select a configured data PG")
     }
 
     pub fn object_generation_multipart_part_data_pg(
@@ -2910,12 +2915,13 @@ impl LocalClusterMap {
         generation_id: GenerationId,
         part_number: u32,
     ) -> DataPgId {
-        self.pg_topology.object_generation_multipart_part_data_pg(
+        self.data_pg(self.pg_topology.object_generation_multipart_part_data_pg(
             bucket,
             key,
             generation_id,
             part_number,
-        )
+        ))
+        .expect("installed multipart placement must select a configured data PG")
     }
 
     pub(crate) fn write_erasure_coded_segment_shards_with<F>(

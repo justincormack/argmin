@@ -280,8 +280,8 @@ use crate::storage_rpc::{
     StorageRpcReadHandleReleaseResponse, StorageRpcScavengerListFilesRequest,
     StorageRpcScavengerObservationKeyRequest, StorageRpcScavengerObservationRecordRequest,
     StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardAckItemRequest,
-    StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
-    StorageRpcShardWriteRequest, StorageRpcStreamError,
+    StorageRpcShardDeleteRequest, StorageRpcShardLocation, StorageRpcShardReadRangeRequest,
+    StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
     StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
     StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
     StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
@@ -296,13 +296,12 @@ use crate::storage_rpc::{
     STORAGE_RPC_FRAME_ENCODING_VERSION, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_PAYLOAD_LEN, STORAGE_RPC_SERVER_IDLE_TIMEOUT,
 };
-use crate::types::{
-    BucketState, ClusterEpoch, DataPgId, GenerationId, PgId, PgState, SessionId, WriteAck,
-};
+use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
 use crate::types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
 };
+use crate::DataPgId;
 use crate::{
     BucketName, EcShape, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey,
     ShardLocation,
@@ -4624,14 +4623,19 @@ impl StorageNodeConnectionHandler {
         session: &mut StorageNodeSession,
         request: StorageRpcReadHandleAcquireRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_shard_locations(&request.locations) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let response = match session.acquire_read_handles(request) {
+        let locations = match self.validate_shard_locations(&request.locations) {
+            Ok(locations) => locations,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match session.acquire_read_handles(ValidatedReadHandleAcquireRequest {
+            read_operation_id: request.read_operation_id,
+            locations,
+            shard_keys: request.shard_keys,
+        }) {
             Ok(locations) => {
                 let payload =
                     encode_read_handle_acquire_response(&StorageRpcReadHandleAcquireResponse {
-                        locations,
+                        locations: locations.into_iter().map(Into::into).collect(),
                     })?;
                 encode_storage_rpc_success_response(&payload)
             }
@@ -8302,11 +8306,12 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcShardWriteRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_shard_location(request.location) {
-            return encode_storage_rpc_error_response(&error);
-        }
+        let location = match self.validate_shard_location(request.location) {
+            Ok(location) => location,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let response = match self.node.write_shard_file_if_absent(
-            request.location.data_pg_id().get(),
+            location.data_pg_id().get(),
             &request.shard_key,
             &request.payload,
         ) {
@@ -8323,11 +8328,12 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcShardWriteRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_shard_location(request.location) {
-            return encode_storage_rpc_error_response(&error);
-        }
+        let location = match self.validate_shard_location(request.location) {
+            Ok(location) => location,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let response = match self.node.write_shard_file(
-            request.location.data_pg_id().get(),
+            location.data_pg_id().get(),
             &request.shard_key,
             &request.payload,
         ) {
@@ -8344,30 +8350,33 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcShardReadRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_shard_location(request.location) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        self.shard_read_file_response(request)
+        let location = match self.validate_shard_location(request.location) {
+            Ok(location) => location,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        self.shard_read_file_response(location, request)
     }
 
     fn shard_historical_read_response(
         &self,
         request: StorageRpcShardReadRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_shard_location_for_historical_inspection(request.location)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        self.shard_read_file_response(request)
+        let location =
+            match self.validate_shard_location_for_historical_inspection(request.location) {
+                Ok(location) => location,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            };
+        self.shard_read_file_response(location, request)
     }
 
     fn shard_read_file_response(
         &self,
+        location: ShardLocation,
         request: StorageRpcShardReadRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         let response = match self
             .node
-            .read_shard_file(request.location.data_pg_id().get(), &request.shard_key)
+            .read_shard_file(location.data_pg_id().get(), &request.shard_key)
         {
             Ok(payload) => {
                 let actual_size = payload.len() as u64;
@@ -8398,12 +8407,13 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcShardReadRangeRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_shard_location(request.location) {
-            return encode_storage_rpc_error_response(&error);
-        }
+        let location = match self.validate_shard_location(request.location) {
+            Ok(location) => location,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let response = match self
             .node
-            .read_shard_file(request.location.data_pg_id().get(), &request.shard_key)
+            .read_shard_file(location.data_pg_id().get(), &request.shard_key)
         {
             Ok(payload) => {
                 let actual_size = payload.len() as u64;
@@ -8436,17 +8446,17 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcShardDeleteRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_shard_location_for_cleanup(request.location) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let _delete_fence = match self.try_begin_shard_delete(request.location, &request.shard_key)
-        {
+        let location = match self.validate_shard_location_for_cleanup(request.location) {
+            Ok(location) => location,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let _delete_fence = match self.try_begin_shard_delete(location, &request.shard_key) {
             Ok(delete_fence) => delete_fence,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
         let response = match self
             .node
-            .delete_shard_file(request.location.data_pg_id().get(), &request.shard_key)
+            .delete_shard_file(location.data_pg_id().get(), &request.shard_key)
         {
             Ok(()) => encode_storage_rpc_success_response(&[]),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
@@ -8466,7 +8476,7 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_primary_pg(request.pg_id, "shard ack record") {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let shard_batch: Vec<(&crate::types::ShardKey, WriteAck)> = request
             .items
             .iter()
@@ -8495,7 +8505,7 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_primary_pg(request.pg_id, "shard ack validate") {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let response = match self.validate_shard_ack_batch(data_pg_id.pg_id(), &request.items) {
             Ok(()) => encode_storage_rpc_success_response(&[]),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
@@ -8515,7 +8525,7 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_primary_pg(request.pg_id, "shard ack load") {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let response = match self.node.get_pg(data_pg_id.get()).and_then(|pg| {
             let stat = pg.stat_shard(&request.shard_key)?;
             Ok(WriteAck {
@@ -8557,7 +8567,7 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let response = match self.node.get_pg(data_pg_id.get()).and_then(|pg| {
             let stat = pg.stat_shard(&request.shard_key)?;
             Ok(WriteAck {
@@ -8595,7 +8605,7 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let response = match self
             .node
             .get_pg(data_pg_id.get())
@@ -8628,7 +8638,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.data_pg_id);
+        let data_pg_id = self.validated_data_pg(request.data_pg_id);
         let response = match self.node.list_scavenger_shard_files(data_pg_id.get()) {
             Ok(scan) => {
                 let payload = encode_scavenger_list_files_response(&scan);
@@ -8651,7 +8661,7 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = self.validate_primary_pg(request.pg_id, "shard scavenger shard rows") {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.list_scavenger_shard_rows(data_pg_id) {
             Ok(rows) => Ok(encode_storage_rpc_success_response(
@@ -8702,6 +8712,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.observation.key.data_pg_id,
             "shard scavenger observation record",
@@ -8729,7 +8740,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.list_shard_scavenger_observations(data_pg_id) {
             Ok(observations) => Ok(encode_storage_rpc_success_response(
@@ -8756,6 +8767,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.key.data_pg_id,
             "shard scavenger observation resolve",
@@ -8787,6 +8799,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard repair record",
@@ -8818,7 +8831,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.list_placed_segment_shard_repairs(data_pg_id) {
             Ok(repairs) => {
@@ -8846,6 +8859,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard repair resolve",
@@ -8877,7 +8891,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.route.pg_id);
+        let data_pg_id = self.validated_data_pg(request.route.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let Some(lease_deadline) = request.lease_deadline else {
             return encode_storage_rpc_error_response(&store_error_response(
@@ -8930,6 +8944,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.claim.work_item.request.data_pg_id,
             "placed segment shard repair claim complete",
@@ -8979,6 +8994,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.claim.work_item.request.data_pg_id,
             "placed segment shard repair claim error",
@@ -9022,6 +9038,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard backfill record",
@@ -9055,7 +9072,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.list_placed_segment_shard_backfills(data_pg_id) {
             Ok(backfills) => {
@@ -9080,7 +9097,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.pg_id);
+        let data_pg_id = self.validated_data_pg(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.count_placed_segment_shard_backfills(data_pg_id) {
             Ok(count) => {
@@ -9108,6 +9125,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard backfill exists",
@@ -9145,6 +9163,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.work_item.request.data_pg_id,
             "placed segment shard backfill resolve",
@@ -9176,7 +9195,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let data_pg_id = DataPgId::new(request.route.pg_id);
+        let data_pg_id = self.validated_data_pg(request.route.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let Some(lease_deadline) = request.lease_deadline else {
             return encode_storage_rpc_error_response(&store_error_response(
@@ -9229,6 +9248,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.claim.work_item.request.data_pg_id,
             "placed segment shard backfill claim complete",
@@ -9278,6 +9298,7 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
         let data_pg_id = match validated_request_data_pg(
+            &self.node,
             request.route.pg_id,
             request.claim.work_item.request.data_pg_id,
             "placed segment shard backfill claim error",
@@ -10871,12 +10892,13 @@ impl StorageNodeConnectionHandler {
 
     fn validate_shard_locations(
         &self,
-        locations: &[ShardLocation],
-    ) -> Result<(), StorageRpcErrorResponse> {
+        locations: &[StorageRpcShardLocation],
+    ) -> Result<Vec<ShardLocation>, StorageRpcErrorResponse> {
+        let mut validated = Vec::with_capacity(locations.len());
         for &location in locations {
-            self.validate_shard_location(location)?;
+            validated.push(self.validate_shard_location(location)?);
         }
-        Ok(())
+        Ok(validated)
     }
 
     fn try_begin_shard_delete(
@@ -10897,48 +10919,59 @@ impl StorageNodeConnectionHandler {
 
     fn validate_shard_location(
         &self,
-        location: ShardLocation,
-    ) -> Result<(), StorageRpcErrorResponse> {
-        self.validate_pg_route(
-            location.node_id(),
-            location.cluster_epoch(),
-            PgId::new(location.data_pg_id().get()),
-        )
+        location: StorageRpcShardLocation,
+    ) -> Result<ShardLocation, StorageRpcErrorResponse> {
+        self.validate_pg_route(location.node_id, location.cluster_epoch, location.pg_id)?;
+        Ok(self.validated_shard_location(location))
     }
 
     fn validate_shard_location_for_cleanup(
         &self,
-        location: ShardLocation,
-    ) -> Result<(), StorageRpcErrorResponse> {
+        location: StorageRpcShardLocation,
+    ) -> Result<ShardLocation, StorageRpcErrorResponse> {
         self.validate_pg_route_for_cleanup(
-            location.node_id(),
-            location.cluster_epoch(),
-            PgId::new(location.data_pg_id().get()),
-        )
+            location.node_id,
+            location.cluster_epoch,
+            location.pg_id,
+        )?;
+        Ok(self.validated_shard_location(location))
     }
 
     fn validate_shard_location_for_historical_inspection(
         &self,
-        location: ShardLocation,
-    ) -> Result<(), StorageRpcErrorResponse> {
-        if location.node_id() != self.config.node_id {
+        location: StorageRpcShardLocation,
+    ) -> Result<ShardLocation, StorageRpcErrorResponse> {
+        if location.node_id != self.config.node_id {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::UnknownNode,
                 message: format!(
                     "request targets node {}, but this storage node is {}",
-                    location.node_id().as_u32(),
+                    location.node_id.as_u32(),
                     self.config.node_id.as_u32()
                 ),
             });
         }
-        let pg_id = location.data_pg_id().get();
+        let pg_id = location.pg_id.get();
         if !self.config.pg_ids.contains(&pg_id) {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::UnknownPg,
                 message: format!("PG {pg_id} is not configured on this storage node"),
             });
         }
-        Ok(())
+        Ok(self.validated_shard_location(location))
+    }
+
+    fn validated_shard_location(&self, location: StorageRpcShardLocation) -> ShardLocation {
+        let data_pg_id = self
+            .node
+            .data_pg(location.pg_id)
+            .expect("validated shard route must belong to the installed topology");
+        ShardLocation::new(
+            location.cluster_epoch,
+            data_pg_id,
+            location.shard_index,
+            location.node_id,
+        )
     }
 
     fn validate_pg_route(
@@ -11582,6 +11615,12 @@ impl StorageNodeConnectionHandler {
             .expect("validated object metadata scan PG must belong to the installed topology")
     }
 
+    fn validated_data_pg(&self, pg_id: PgId) -> DataPgId {
+        self.node
+            .data_pg(pg_id)
+            .expect("validated data PG must belong to the installed topology")
+    }
+
     fn validate_primary_pg_for_bucket(
         &self,
         pg_id: PgId,
@@ -11958,6 +11997,12 @@ struct StorageNodeSession {
     current_rpc_context: Option<StorageNodeMetadataCommandLockContext>,
 }
 
+struct ValidatedReadHandleAcquireRequest {
+    read_operation_id: String,
+    locations: Vec<ShardLocation>,
+    shard_keys: Vec<ShardKey>,
+}
+
 impl StorageNodeSession {
     fn new(
         shared_handles: Arc<Mutex<StorageNodeReadHandleState>>,
@@ -12032,7 +12077,7 @@ impl StorageNodeSession {
 
     fn acquire_read_handles(
         &mut self,
-        request: StorageRpcReadHandleAcquireRequest,
+        request: ValidatedReadHandleAcquireRequest,
     ) -> Result<Vec<ShardLocation>, StorageRpcErrorResponse> {
         let entries: Vec<(ShardLocation, ShardKey)> = request
             .locations
@@ -12199,6 +12244,7 @@ fn validate_placed_segment_shard_repair_claim_route_epoch(
 }
 
 fn validated_request_data_pg(
+    node: &SharedStorageNode,
     pg_id: PgId,
     request_data_pg_id: u32,
     operation: &'static str,
@@ -12213,7 +12259,9 @@ fn validated_request_data_pg(
             ),
         });
     }
-    Ok(DataPgId::new(pg_id))
+    Ok(node
+        .data_pg(pg_id)
+        .expect("validated request data PG must belong to the installed topology"))
 }
 
 fn validate_placed_segment_shard_backfill_claim_route_epoch(
@@ -14000,12 +14048,15 @@ mod tests {
         ));
         server
             .connection_handler()
-            .validate_shard_location_for_historical_inspection(ShardLocation::new(
-                runtime_map.cluster_epoch(),
-                DataPgId::new(pg_id),
-                ShardIndex::new(0),
-                node_id,
-            ))
+            .validate_shard_location_for_historical_inspection(
+                ShardLocation::new(
+                    runtime_map.cluster_epoch(),
+                    DataPgId::new_for_test(pg_id),
+                    ShardIndex::new(0),
+                    node_id,
+                )
+                .into(),
+            )
             .unwrap();
     }
 
@@ -15083,7 +15134,7 @@ mod tests {
     fn read_handle_acquire_payload(read_operation_id: &str, location: ShardLocation) -> Vec<u8> {
         encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
             read_operation_id: read_operation_id.to_string(),
-            locations: vec![location],
+            locations: vec![location.into()],
             shard_keys: vec![test_shard_key(location.shard_index().get())],
         })
         .unwrap()
@@ -15101,7 +15152,7 @@ mod tests {
     ) -> ShardLocation {
         ShardLocation::new(
             ClusterEpoch::new(epoch).unwrap(),
-            DataPgId::new(PgId::new(pg_id)),
+            DataPgId::new_for_test(PgId::new(pg_id)),
             ShardIndex::new(shard_index),
             NodeId::new(node_id),
         )
@@ -16742,7 +16793,7 @@ mod tests {
             .unwrap();
         drop(node);
         let request = StorageRpcShardReadRequest {
-            location,
+            location: location.into(),
             shard_key: shard_key.clone(),
             expected_ack,
         };
@@ -16792,7 +16843,7 @@ mod tests {
         private_socket_dir(config.socket_path.parent().unwrap());
         let location = test_location(1, 0, 7);
         let request = StorageRpcShardReadRequest {
-            location,
+            location: location.into(),
             shard_key: test_shard_key(0),
             expected_ack: WriteAck {
                 stored_size: 9,
@@ -16842,7 +16893,7 @@ mod tests {
             .unwrap();
         drop(node);
         let request = StorageRpcShardReadRangeRequest {
-            location,
+            location: location.into(),
             shard_key,
             expected_ack,
             offset: 5,
@@ -16924,7 +16975,7 @@ mod tests {
         let shard_key = test_shard_key(0);
         let payload = b"first payload".to_vec();
         let request = StorageRpcShardWriteRequest {
-            location,
+            location: location.into(),
             shard_key: shard_key.clone(),
             expected_size: payload.len() as u64,
             expected_crc64: checksum::crc64::checksum(&payload),
@@ -16968,7 +17019,7 @@ mod tests {
 
         let different = b"different payload".to_vec();
         let different_request = StorageRpcShardWriteRequest {
-            location,
+            location: location.into(),
             shard_key: shard_key.clone(),
             expected_size: different.len() as u64,
             expected_crc64: checksum::crc64::checksum(&different),
@@ -17017,7 +17068,7 @@ mod tests {
         drop(node);
 
         let request = StorageRpcShardWriteRequest {
-            location,
+            location: location.into(),
             shard_key: shard_key.clone(),
             expected_size: repaired.len() as u64,
             expected_crc64: checksum::crc64::checksum(&repaired),
@@ -17062,7 +17113,7 @@ mod tests {
         let shard_key = test_shard_key(0);
         let payload = b"corrupt-before-write".to_vec();
         let request = StorageRpcShardWriteRequest {
-            location,
+            location: location.into(),
             shard_key: shard_key.clone(),
             expected_size: payload.len() as u64,
             expected_crc64: checksum::crc64::checksum(&payload),
@@ -17112,7 +17163,7 @@ mod tests {
         let location = test_location(1, 0, 7);
         let shard_key = test_shard_key(0);
         let request = StorageRpcShardDeleteRequest {
-            location,
+            location: location.into(),
             shard_key: shard_key.clone(),
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -17171,7 +17222,7 @@ mod tests {
         let mut client = UnixStream::connect(socket_path).unwrap();
         for (index, (location, expected_code)) in requests.into_iter().enumerate() {
             let request = StorageRpcShardDeleteRequest {
-                location,
+                location: location.into(),
                 shard_key: shard_key.clone(),
             };
             let response = send_frame(
@@ -20591,7 +20642,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let acquired = decode_read_handle_acquire_response(&success_payload).unwrap();
-        assert_eq!(acquired.locations, vec![location]);
+        assert_eq!(acquired.locations, vec![location.into()]);
         assert_eq!(server.read_handle_count(location), 1);
         drop(client);
         join.join().unwrap();
@@ -20628,7 +20679,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let acquired = decode_read_handle_acquire_response(&success_payload).unwrap();
-            assert_eq!(acquired.locations, vec![location]);
+            assert_eq!(acquired.locations, vec![location.into()]);
         }
         assert_eq!(server.read_handle_count(location), 1);
         drop(client);
@@ -20694,7 +20745,7 @@ mod tests {
 
         for i in 0..STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION {
             session
-                .acquire_read_handles(StorageRpcReadHandleAcquireRequest {
+                .acquire_read_handles(ValidatedReadHandleAcquireRequest {
                     read_operation_id: format!("read-op-{i}"),
                     locations: vec![location],
                     shard_keys: vec![test_shard_key(location.shard_index().get())],
@@ -20702,7 +20753,7 @@ mod tests {
                 .unwrap();
         }
         let error = session
-            .acquire_read_handles(StorageRpcReadHandleAcquireRequest {
+            .acquire_read_handles(ValidatedReadHandleAcquireRequest {
                 read_operation_id: "read-op-over-limit".to_string(),
                 locations: vec![location],
                 shard_keys: vec![test_shard_key(location.shard_index().get())],
@@ -20831,7 +20882,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let acquired = decode_read_handle_acquire_response(&success_payload).unwrap();
-        assert_eq!(acquired.locations, vec![second_location]);
+        assert_eq!(acquired.locations, vec![second_location.into()]);
         assert_eq!(server.read_handle_count(first_location), 0);
         assert_eq!(server.read_handle_count(second_location), 1);
         drop(client);

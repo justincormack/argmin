@@ -791,7 +791,7 @@ fn stream_append_publish_validation_fails_closed_when_acknowledged_shard_file_is
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, payload)
         .unwrap();
-    let data_pg_id = DataPgId::new(PgId::new(segment.data_pg_id));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(segment.data_pg_id));
     let placement_key = super::super::super::segment_payload_placement_key(
         &segment.segment_okh,
         segment.segment_vid,
@@ -1105,7 +1105,7 @@ fn stream_append_budget_exhaustion_after_competing_publish_preserves_payload() {
     let placement_key = segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
     let locations = cluster
         .place_payload_shards(
-            DataPgId::new(PgId::new(segment.data_pg_id)),
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
             ec_shape,
             &placement_key,
         )
@@ -1273,7 +1273,7 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
     let placement_key = segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
     let locations = cluster
         .place_payload_shards(
-            DataPgId::new(PgId::new(segment.data_pg_id)),
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
             ec_shape,
             &placement_key,
         )
@@ -1480,7 +1480,7 @@ fn stream_append_log_conflict_drain_failure_cleans_unreferenced_payload() {
     let placement_key = segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
     let locations = cluster
         .place_payload_shards(
-            DataPgId::new(PgId::new(segment.data_pg_id)),
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
             ec_shape,
             &placement_key,
         )
@@ -1650,7 +1650,7 @@ fn stream_append_unrelated_pending_duplicate_cleans_staged_payload() {
     );
     let locations = cluster
         .place_payload_shards(
-            DataPgId::new(PgId::new(conflicting_segment.data_pg_id)),
+            DataPgId::new_for_test(PgId::new(conflicting_segment.data_pg_id)),
             ec_shape,
             &placement_key,
         )
@@ -1814,7 +1814,7 @@ fn stream_append_unrelated_install_contention_cleans_staged_payload() {
     let placement_key = segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
     let locations = cluster
         .place_payload_shards(
-            DataPgId::new(PgId::new(segment.data_pg_id)),
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
             ec_shape,
             &placement_key,
         )

@@ -26,8 +26,8 @@ use crate::{
         BucketWriteDrainState, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes,
         ChecksumType, ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitCleanup,
         CompleteMultipartCommitRequest, CreateBucketConfig, CreateMultipartUploadReq,
-        CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
-        EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepBuckets,
+        CreateStreamUploadReq, DeleteMarkerRecord, DirectPutCommitStorageSnapshot, EcShape,
+        EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepBuckets,
         LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
         ListMultipartUploadsPageStart, ListMultipartUploadsReq, ListMultipartUploadsResp,
         ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp,
@@ -2956,9 +2956,33 @@ pub(crate) struct StorageRpcShardWriteItem {
     pub(crate) payload: Vec<u8>,
 }
 
+/// Raw shard location carried on the Unix RPC boundary.
+///
+/// Decoding this value does not confer a `DataPgId`. The storage-node server
+/// must validate the route (including retained-route rules where applicable)
+/// before promoting it to the typed `ShardLocation` used by node state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageRpcShardLocation {
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) shard_index: ShardIndex,
+    pub(crate) node_id: NodeId,
+}
+
+impl From<ShardLocation> for StorageRpcShardLocation {
+    fn from(location: ShardLocation) -> Self {
+        Self {
+            cluster_epoch: location.cluster_epoch(),
+            pg_id: location.data_pg_id().pg_id(),
+            shard_index: location.shard_index(),
+            node_id: location.node_id(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcShardWriteRequest {
-    pub(crate) location: ShardLocation,
+    pub(crate) location: StorageRpcShardLocation,
     pub(crate) shard_key: ShardKey,
     pub(crate) expected_size: u64,
     pub(crate) expected_crc64: u64,
@@ -2967,14 +2991,14 @@ pub(crate) struct StorageRpcShardWriteRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcShardReadRequest {
-    pub(crate) location: ShardLocation,
+    pub(crate) location: StorageRpcShardLocation,
     pub(crate) shard_key: ShardKey,
     pub(crate) expected_ack: WriteAck,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcShardReadRangeRequest {
-    pub(crate) location: ShardLocation,
+    pub(crate) location: StorageRpcShardLocation,
     pub(crate) shard_key: ShardKey,
     pub(crate) expected_ack: WriteAck,
     pub(crate) offset: u64,
@@ -2983,7 +3007,7 @@ pub(crate) struct StorageRpcShardReadRangeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcShardDeleteRequest {
-    pub(crate) location: ShardLocation,
+    pub(crate) location: StorageRpcShardLocation,
     pub(crate) shard_key: ShardKey,
 }
 
@@ -3116,13 +3140,13 @@ pub(crate) struct StorageRpcPlacedSegmentShardBackfillClaimErrorRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcReadHandleAcquireRequest {
     pub(crate) read_operation_id: String,
-    pub(crate) locations: Vec<ShardLocation>,
+    pub(crate) locations: Vec<StorageRpcShardLocation>,
     pub(crate) shard_keys: Vec<ShardKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcReadHandleAcquireResponse {
-    pub(crate) locations: Vec<ShardLocation>,
+    pub(crate) locations: Vec<StorageRpcShardLocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11928,10 +11952,10 @@ fn validate_shard_read_range(
 }
 
 fn validate_shard_location_matches_key(
-    location: &ShardLocation,
+    location: &StorageRpcShardLocation,
     shard_key: &ShardKey,
 ) -> Result<(), StorageRpcPayloadError> {
-    if location.shard_index() != shard_key.shard_index() {
+    if location.shard_index != shard_key.shard_index() {
         return Err(StorageRpcPayloadError::ShardLocationMismatch);
     }
     Ok(())
@@ -11977,7 +12001,7 @@ fn validate_read_handle_location_count(
 }
 
 fn validate_read_handle_locations(
-    locations: &[ShardLocation],
+    locations: &[StorageRpcShardLocation],
 ) -> Result<(), StorageRpcPayloadError> {
     for pair in locations.windows(2) {
         if shard_location_sort_key(pair[0]) >= shard_location_sort_key(pair[1]) {
@@ -11989,12 +12013,12 @@ fn validate_read_handle_locations(
     Ok(())
 }
 
-fn shard_location_sort_key(location: ShardLocation) -> (u64, u32, u8, u32) {
+fn shard_location_sort_key(location: StorageRpcShardLocation) -> (u64, u32, u8, u32) {
     (
-        location.cluster_epoch().get(),
-        location.data_pg_id().get(),
-        location.shard_index().get(),
-        location.node_id().as_u32(),
+        location.cluster_epoch.get(),
+        location.pg_id.get(),
+        location.shard_index.get(),
+        location.node_id.as_u32(),
     )
 }
 
@@ -12620,21 +12644,21 @@ impl<'a> StorageRpcDecoder<'a> {
         ShardKey::from_bytes(bytes).map_err(|_| StorageRpcPayloadError::Truncated)
     }
 
-    fn read_shard_location(&mut self) -> Result<ShardLocation, StorageRpcPayloadError> {
+    fn read_shard_location(&mut self) -> Result<StorageRpcShardLocation, StorageRpcPayloadError> {
         let cluster_epoch = ClusterEpoch::new(self.read_u64()?).ok_or(
             StorageRpcPayloadError::InvalidReadHandleAcquireRequest(
                 "cluster epoch must not be zero",
             ),
         )?;
-        let data_pg_id = DataPgId::new(PgId::new(self.read_u32()?));
+        let pg_id = PgId::new(self.read_u32()?);
         let shard_index = ShardIndex::new(self.read_u8()?);
         let node_id = NodeId::new(self.read_u32()?);
-        Ok(ShardLocation::new(
+        Ok(StorageRpcShardLocation {
             cluster_epoch,
-            data_pg_id,
+            pg_id,
             shard_index,
             node_id,
-        ))
+        })
     }
 
     fn read_bucket_claim_token(
@@ -15330,11 +15354,11 @@ fn put_string(out: &mut Vec<u8>, value: &str) {
     put_bytes(out, value.as_bytes());
 }
 
-fn put_shard_location(out: &mut Vec<u8>, location: ShardLocation) {
-    put_u64(out, location.cluster_epoch().get());
-    put_u32(out, location.data_pg_id().get());
-    put_u8(out, location.shard_index().get());
-    put_u32(out, location.node_id().as_u32());
+fn put_shard_location(out: &mut Vec<u8>, location: StorageRpcShardLocation) {
+    put_u64(out, location.cluster_epoch.get());
+    put_u32(out, location.pg_id.get());
+    put_u8(out, location.shard_index.get());
+    put_u32(out, location.node_id.as_u32());
 }
 
 fn put_claim_token(out: &mut Vec<u8>, token: &StorageRpcDurableClaimToken) {
@@ -21327,24 +21351,22 @@ mod tests {
         }
     }
 
-    fn test_shard_location(shard_index: u8) -> ShardLocation {
-        ShardLocation::new(
-            ClusterEpoch::INITIAL,
-            DataPgId::new(PgId::new(11)),
-            ShardIndex::new(shard_index),
-            NodeId::new(u32::from(shard_index) + 100),
-        )
+    fn test_shard_location(shard_index: u8) -> StorageRpcShardLocation {
+        StorageRpcShardLocation {
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(11),
+            shard_index: ShardIndex::new(shard_index),
+            node_id: NodeId::new(u32::from(shard_index) + 100),
+        }
     }
 
-    fn test_shard_location_for_data_pg(data_pg_id: usize) -> ShardLocation {
-        ShardLocation::new(
-            ClusterEpoch::INITIAL,
-            DataPgId::new(PgId::new(
-                u32::try_from(data_pg_id).expect("test PG id fits in u32"),
-            )),
-            ShardIndex::new(0),
-            NodeId::new(100),
-        )
+    fn test_shard_location_for_data_pg(data_pg_id: usize) -> StorageRpcShardLocation {
+        StorageRpcShardLocation {
+            cluster_epoch: ClusterEpoch::INITIAL,
+            pg_id: PgId::new(u32::try_from(data_pg_id).expect("test PG id fits in u32")),
+            shard_index: ShardIndex::new(0),
+            node_id: NodeId::new(100),
+        }
     }
 
     fn test_shard_key(shard_index: u8) -> ShardKey {

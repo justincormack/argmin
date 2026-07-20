@@ -253,9 +253,9 @@ use crate::types::{
     BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketState,
     BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
-    CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId,
-    DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot, EcShape, GenerationId,
-    LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, ListMultipartUploadsReq,
+    CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq, DirectPutCommitSnapshot,
+    DirectPutCommitStorageSnapshot, EcShape, GenerationId, LifecycleSweepBuckets,
+    LifecycleSweepClaimRecord, LifecycleSweepRoot, ListMultipartUploadsReq,
     ListMultipartUploadsResp, ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq,
     ListObjectsResp, ListPartsReq, ListedMultipartParts, LiveObjectRecord,
     MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
@@ -277,6 +277,7 @@ use crate::types::{
     UploadId, UploadState, VersionId, WriteAck,
 };
 use crate::BucketDeleteBeginRoot;
+use crate::DataPgId;
 
 #[path = "node_client/interface.rs"]
 mod interface;

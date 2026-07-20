@@ -17,7 +17,7 @@ fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
         config.socket_path.clone(),
     );
     let key = ShardKey::new(&[0x55; 16], 11, 0);
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
 
     assert_eq!(client.node_id(), NodeId::new(7));
     let ack = client
@@ -67,7 +67,7 @@ fn unix_storage_node_client_times_out_waiting_for_response() {
     let started = Instant::now();
     let err = client
         .read_placed_shard(
-            DataPgId::new(PgId::new(0)),
+            DataPgId::new_for_test(PgId::new(0)),
             &key,
             WriteAck {
                 stored_size: 1,
@@ -2204,7 +2204,7 @@ fn unix_storage_node_client_read_into_requires_full_shard_buffer() {
         config.socket_path.clone(),
     );
     let key = ShardKey::new(&[0x56; 16], 12, 0);
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let ack = client
         .write_placed_shard(data_pg_id, &key, b"remote payload")
         .unwrap();
@@ -2244,7 +2244,7 @@ fn unix_storage_node_read_handle_session_is_idempotent_and_disconnect_releases()
     );
     let location = crate::cluster::ShardLocation::new(
         config.cluster_epoch,
-        DataPgId::new(PgId::new(0)),
+        DataPgId::new_for_test(PgId::new(0)),
         crate::ShardIndex::new(0),
         config.node_id,
     );
@@ -2294,7 +2294,7 @@ fn unix_storage_node_delete_fails_while_read_handle_active() {
         config.socket_path.clone(),
     );
     let key = ShardKey::new(&[0x66; 16], 12, 0);
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let location = crate::cluster::ShardLocation::new(
         config.cluster_epoch,
         data_pg_id,
@@ -2442,7 +2442,7 @@ fn unix_storage_node_shard_write_admission_exhausts_before_socket_write() {
         .unwrap();
     let key = ShardKey::new(&[0x55; 16], 55, 0);
     let err = client
-        .write_placed_shard(DataPgId::new(PgId::new(0)), &key, &[0x5a; 4096])
+        .write_placed_shard(DataPgId::new_for_test(PgId::new(0)), &key, &[0x5a; 4096])
         .unwrap_err();
 
     assert!(matches!(
@@ -2553,12 +2553,12 @@ fn unix_storage_node_read_handle_session_rejects_mismatched_acquire_response() {
         let request = read_storage_rpc_frame_from(&mut stream).unwrap();
         let mismatched_location = crate::cluster::ShardLocation::new(
             ClusterEpoch::new(1).unwrap(),
-            DataPgId::new(PgId::new(0)),
+            DataPgId::new_for_test(PgId::new(0)),
             crate::ShardIndex::new(1),
             NodeId::new(7),
         );
         let payload = encode_read_handle_acquire_response(&StorageRpcReadHandleAcquireResponse {
-            locations: vec![mismatched_location],
+            locations: vec![mismatched_location.into()],
         })
         .unwrap();
         let response = StorageRpcFrame {
@@ -2572,7 +2572,7 @@ fn unix_storage_node_read_handle_session_rejects_mismatched_acquire_response() {
         UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
     let requested_location = crate::cluster::ShardLocation::new(
         ClusterEpoch::new(1).unwrap(),
-        DataPgId::new(PgId::new(0)),
+        DataPgId::new_for_test(PgId::new(0)),
         crate::ShardIndex::new(0),
         NodeId::new(7),
     );

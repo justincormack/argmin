@@ -99,7 +99,7 @@ pub use node::{
     BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome, ReclaimWorkItem,
 };
 pub(crate) use node_runtime::role_facade::ObjectMetadataScanPgId;
-pub use node_runtime::role_facade::{BucketPgId, ObjectMetadataPgId};
+pub use node_runtime::role_facade::{BucketPgId, DataPgId, ObjectMetadataPgId};
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) use pg_store::PgStore;
 pub use pg_store::{
@@ -140,18 +140,17 @@ pub use types::{
     ChecksumBytes, ChecksumType, ClusterEpoch, CommitDirectPutObjectReq, CommitMultipartReq,
     CompleteMultipartCommitCleanup, CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest,
     CompletedMultipartStalePayload, CreateBucketConfig, CreateMultipartUploadOutcome,
-    CreateMultipartUploadReq, CreateStreamUploadReq, DataLayout, DataPgId,
-    DeleteCurrentObjectOutcome, DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome,
-    DeletedCurrentObject, DeletedSpecificObjectVersion, DirectPutCommitSnapshot,
-    DirectPutCommitStorageSnapshot, DirectPutWrittenSegment, EcShape,
-    EffectiveBucketEncryptionConfig, EtagKind, ExpireCurrentObjectOutcome,
-    FinalizeDirectPutObjectOutcome, FinalizeStreamPartCleanup, FinalizeStreamPartOutcome,
-    FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
-    InvalidChecksumConfig, LegalHoldStatus, LifecycleSweepBuckets, LifecycleSweepClaimRecord,
-    LifecycleSweepRoot, LifecycleSweepRootSource, ListMultipartUploadsPageStart,
-    ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
-    ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsReq, ListPartsResp,
-    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
+    CreateMultipartUploadReq, CreateStreamUploadReq, DataLayout, DeleteCurrentObjectOutcome,
+    DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome, DeletedCurrentObject,
+    DeletedSpecificObjectVersion, DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot,
+    DirectPutWrittenSegment, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
+    ExpireCurrentObjectOutcome, FinalizeDirectPutObjectOutcome, FinalizeStreamPartCleanup,
+    FinalizeStreamPartOutcome, FinalizeStreamPutOutcome, GenerationId,
+    InsertCurrentDeleteMarkerOutcome, InvalidChecksumConfig, LegalHoldStatus,
+    LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
+    ListMultipartUploadsPageStart, ListMultipartUploadsReq, ListMultipartUploadsResp,
+    ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsReq,
+    ListPartsResp, ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
     ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource, ManagedEncryptionAlgorithm,
     MultipartChecksumConfig, MultipartCompletionFingerprint, MultipartCompletionPreflight,
     MultipartCompletionReplay, MultipartCompletionSnapshot, MultipartObjectIdentity,

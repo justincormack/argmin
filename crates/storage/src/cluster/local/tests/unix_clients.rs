@@ -303,7 +303,7 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
         })
     ));
 
-    let data_pg_id = DataPgId::new(pg_id);
+    let data_pg_id = DataPgId::new_for_test(pg_id);
     let shard_key = ShardKey::new(&[0x5A; 16], generation_id.get(), 0);
     let location = ShardLocation::new(epoch, data_pg_id, shard_key.shard_index(), node_id);
     let mut narrow_leases = Vec::new();
@@ -625,7 +625,7 @@ fn payload_shard_writes_route_through_pluggable_shard_client() {
     let recording_client_for_assert = Arc::clone(&recording_client);
     map.replace_shard_client_for_tests(NodeId::new(1), recording_client);
 
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let key = ShardKey::new(&[0x41; 16], 77, 0);
     let location = ShardLocation::new(
         ClusterEpoch::INITIAL,
@@ -845,7 +845,7 @@ fn metadata_pg_primary_exposes_pluggable_shard_ack_client() {
     set_route_primary(&mut map, 1, NodeId::new(2));
 
     let pg_id = PgId::new(1);
-    let data_pg_id = DataPgId::new(pg_id);
+    let data_pg_id = DataPgId::new_for_test(pg_id);
     let key = ShardKey::new(&[0x51; 16], 88, 0);
     let ack = WriteAck {
         crc64: 1234,
@@ -956,7 +956,7 @@ fn partial_multi_node_read_handle_acquire_failure_releases_prior_handles() {
     map.replace_shard_read_handle_client_for_tests(NodeId::new(1), ok_client);
     map.replace_shard_read_handle_client_for_tests(NodeId::new(2), failing_client);
 
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let key_0 = ShardKey::new(&[0x57; 16], 91, 0);
     let key_1 = ShardKey::new(&[0x58; 16], 91, 1);
     let location_0 = ShardLocation::new(
@@ -1058,7 +1058,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
     )])
     .unwrap();
 
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let key = ShardKey::new(&[0x61; 16], 99, 0);
     let location = ShardLocation::new(
         ClusterEpoch::INITIAL,
@@ -1250,7 +1250,7 @@ fn frontend_unix_shard_mode_uses_storage_node_owned_data_dir() {
     )])
     .unwrap();
 
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let key = ShardKey::new(&[0x64; 16], 102, 0);
     let location = ShardLocation::new(
         ClusterEpoch::INITIAL,
@@ -3954,7 +3954,7 @@ fn unix_shard_client_install_rejects_relative_socket_paths_before_mutation() {
             if path == Path::new("relative-node-1.sock")
     ));
 
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let key = ShardKey::new(&[0x62; 16], 100, 0);
     let location = ShardLocation::new(
         ClusterEpoch::INITIAL,
@@ -3991,7 +3991,7 @@ fn unix_shard_client_fails_closed_when_storage_node_is_unavailable() {
     )])
     .unwrap();
 
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let key = ShardKey::new(&[0x63; 16], 101, 0);
     let location = ShardLocation::new(
         ClusterEpoch::INITIAL,
@@ -6851,7 +6851,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
     );
     let written_locations = source_cluster
         .place_payload_shards(
-            DataPgId::new(PgId::new(segment.data_pg_id)),
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
             EcShape {
                 k: segment.ec_k,
                 m: segment.ec_m,
@@ -7286,7 +7286,7 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
     );
     let written_locations = source_cluster
         .place_payload_shards(
-            DataPgId::new(PgId::new(segment.data_pg_id)),
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
             EcShape {
                 k: segment.ec_k,
                 m: segment.ec_m,
@@ -7767,7 +7767,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
         );
         let written_locations = source_cluster
             .place_payload_shards(
-                DataPgId::new(PgId::new(segment.data_pg_id)),
+                DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
                 EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -8718,7 +8718,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
     );
     let locations = current_cluster
         .place_payload_shards(
-            DataPgId::new(PgId::new(segment.data_pg_id)),
+            DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
             EcShape {
                 k: segment.ec_k,
                 m: segment.ec_m,
@@ -9007,7 +9007,7 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
         );
         let locations = current_cluster
             .place_payload_shards(
-                DataPgId::new(PgId::new(segment.data_pg_id)),
+                DataPgId::new_for_test(PgId::new(segment.data_pg_id)),
                 EcShape {
                     k: segment.ec_k,
                     m: segment.ec_m,
@@ -9534,7 +9534,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let socket_path = tmp.path().join("sockets").join("historical-node-1.sock");
     private_socket_dir(socket_path.parent().unwrap());
     let remote_data_dir = tmp.path().join("historical-remote-node-1");
-    let data_pg_id = DataPgId::new(PgId::new(0));
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let historical_epoch = ClusterEpoch::new(7).unwrap();
     let historical_route = crate::control_plane::PgRouteSnapshot::reconstructed(
         historical_epoch,

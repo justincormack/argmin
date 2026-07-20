@@ -392,7 +392,7 @@ fn cluster_shard_scavenger_reports_wrong_node_file_and_expected_missing_file() {
         .unwrap();
 
     let misplaced_shard = &written.written_shards[0].key;
-    let data_pg = DataPgId::new(PgId::new(written.data_pg_id));
+    let data_pg = DataPgId::new_for_test(PgId::new(written.data_pg_id));
     let placement_key =
         super::super::super::segment_payload_placement_key(&segment_okh, generation_id);
     let locations = cluster

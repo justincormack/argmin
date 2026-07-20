@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 
-use crate::types::{BucketName, DataPgId, GenerationId, ObjectKey, PgId};
+use crate::types::{BucketName, GenerationId, ObjectKey, PgId};
 
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const PG_HASH_STACK_LIMIT: usize = 32 + 63 + 1 + 1024 + 1 + 20 + 1 + 10;
@@ -109,7 +109,7 @@ impl PgTopology {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Vec<DataPgId> {
+    ) -> Vec<PgId> {
         self.object_generation_data_pg_set_with_width(
             bucket,
             key,
@@ -125,7 +125,7 @@ impl PgTopology {
         key: &ObjectKey,
         generation_id: GenerationId,
         width: NonZeroUsize,
-    ) -> Vec<DataPgId> {
+    ) -> Vec<PgId> {
         let width = width.get().min(self.pg_ids.len());
         let mut ranked: Vec<(u64, u32)> = self
             .pg_ids
@@ -145,7 +145,7 @@ impl PgTopology {
         ranked
             .into_iter()
             .take(width)
-            .map(|(_, pg_id)| DataPgId::new(PgId::new(pg_id)))
+            .map(|(_, pg_id)| PgId::new(pg_id))
             .collect()
     }
 
@@ -155,7 +155,7 @@ impl PgTopology {
         key: &ObjectKey,
         generation_id: GenerationId,
         segment_index: u32,
-    ) -> DataPgId {
+    ) -> PgId {
         self.object_generation_segment_data_pg_with_width(
             bucket,
             key,
@@ -173,7 +173,7 @@ impl PgTopology {
         generation_id: GenerationId,
         segment_index: u32,
         width: NonZeroUsize,
-    ) -> DataPgId {
+    ) -> PgId {
         let set = self.object_generation_data_pg_set_with_width(bucket, key, generation_id, width);
         let band_index = segment_index / DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE;
         set[band_index as usize % set.len()]
@@ -185,7 +185,7 @@ impl PgTopology {
         key: &ObjectKey,
         generation_id: GenerationId,
         part_number: u32,
-    ) -> DataPgId {
+    ) -> PgId {
         let part_band_index = u64::from(part_number.saturating_sub(1));
         self.object_generation_band_data_pg(bucket, key, generation_id, part_band_index)
     }
@@ -197,7 +197,7 @@ impl PgTopology {
         generation_id: GenerationId,
         part_number: u32,
         segment_index: u32,
-    ) -> DataPgId {
+    ) -> PgId {
         let part_band_index = u64::from(part_number.saturating_sub(1));
         let segment_band_index =
             u64::from(segment_index / DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE);
@@ -215,7 +215,7 @@ impl PgTopology {
         key: &ObjectKey,
         generation_id: GenerationId,
         band_index: u64,
-    ) -> DataPgId {
+    ) -> PgId {
         let set = self.object_generation_data_pg_set(bucket, key, generation_id);
         set[(band_index % set.len() as u64) as usize]
     }

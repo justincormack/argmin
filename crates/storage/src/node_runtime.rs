@@ -7,6 +7,41 @@
 
 use crate::types::PgId;
 
+/// PG containing payload shard data for an object segment or multipart part.
+///
+/// A standalone placement-only `PgTopology` returns raw `PgId` values. Only
+/// installed runtime maps and storage nodes may promote those values after
+/// validating placement or an active/retained route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DataPgId(PgId);
+
+impl DataPgId {
+    pub(in crate::node_runtime) const fn from_validated_placement(pg_id: PgId) -> Self {
+        Self(pg_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new_for_test(pg_id: PgId) -> Self {
+        Self(pg_id)
+    }
+
+    #[must_use]
+    pub const fn pg_id(self) -> PgId {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl From<DataPgId> for PgId {
+    fn from(value: DataPgId) -> Self {
+        value.pg_id()
+    }
+}
+
 /// PG containing bucket metadata for one bucket name.
 ///
 /// The private field lives inside the node-runtime boundary so a standalone
@@ -146,7 +181,7 @@ pub(super) mod node_facade {
 }
 
 pub(super) mod role_facade {
-    pub use super::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
+    pub use super::{BucketPgId, DataPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 }
 
 pub(super) mod client_facade {
