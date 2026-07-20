@@ -52,7 +52,8 @@ async fn start_server(
             auth::SecretKey::new(s3_tests::server::TEST_SECRET_KEY.to_string()),
         )
         .unwrap();
-    let identity_provider = auth::IdentityProvider::in_memory(credentials);
+    let identity_provider =
+        auth::IdentityProvider::in_memory(credentials).expect("initialize session-token key ring");
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
             let sse_s3_provider = ManagedWrappingKeyConfig::from_base64(

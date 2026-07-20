@@ -2,11 +2,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+
 use crate::{
     AssumedRoleSessionIdentity, AuthenticatedIdentity, ConfiguredPrincipalIdentity, IdentityError,
+    ResolvedRoleIdentity, RoleSessionName, SessionLifetime, SourceIdentity,
 };
-#[cfg(test)]
-use crate::{ResolvedRoleIdentity, RoleSessionName, SessionLifetime, SourceIdentity};
 
 /// Prefix reserved for Argmin-issued temporary access keys.
 pub const SESSION_ACCESS_KEY_ID_PREFIX: &str = "ARGS";
@@ -14,6 +16,117 @@ pub const SESSION_ACCESS_KEY_ID_PREFIX: &str = "ARGS";
 pub const SESSION_ACCESS_KEY_ID_LEN: usize = 24;
 /// Exact length of an Argmin-issued temporary secret access key.
 pub const SESSION_SECRET_ACCESS_KEY_LEN: usize = 40;
+const SESSION_ACCESS_KEY_SUFFIX_LEN: usize =
+    SESSION_ACCESS_KEY_ID_LEN - SESSION_ACCESS_KEY_ID_PREFIX.len();
+const SESSION_ACCESS_KEY_ALPHABET: &[u8; 36] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const SESSION_SECRET_RANDOM_LEN: usize = 30;
+
+/// Failure to generate unpredictable temporary credential material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SessionCredentialGenerationError {
+    #[error("secure random generation failed")]
+    EntropyUnavailable,
+}
+
+/// Newly generated temporary access-key material ready to seal into a token.
+pub struct GeneratedSessionCredentialMaterial {
+    access_key_id: String,
+    secret_key: SecretKey,
+}
+
+impl GeneratedSessionCredentialMaterial {
+    #[must_use]
+    pub fn access_key_id(&self) -> &str {
+        &self.access_key_id
+    }
+
+    #[must_use]
+    pub fn secret_key(&self) -> &SecretKey {
+        &self.secret_key
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (String, SecretKey) {
+        (self.access_key_id, self.secret_key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(access_key_id: String, secret_key: SecretKey) -> Self {
+        assert!(valid_session_access_key_id(&access_key_id));
+        assert!(valid_session_secret_access_key(secret_key.as_str()));
+        Self {
+            access_key_id,
+            secret_key,
+        }
+    }
+}
+
+impl std::fmt::Debug for GeneratedSessionCredentialMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratedSessionCredentialMaterial")
+            .field(
+                "access_key_id",
+                &observability::escaped(&self.access_key_id),
+            )
+            .field("secret_key", &self.secret_key)
+            .finish()
+    }
+}
+
+trait SessionCredentialRandomSource {
+    fn fill(&self, output: &mut [u8]) -> Result<(), SessionCredentialGenerationError>;
+}
+
+impl SessionCredentialRandomSource for ring::rand::SystemRandom {
+    fn fill(&self, output: &mut [u8]) -> Result<(), SessionCredentialGenerationError> {
+        ring::rand::SecureRandom::fill(self, output)
+            .map_err(|_| SessionCredentialGenerationError::EntropyUnavailable)
+    }
+}
+
+/// Generate an Argmin-namespaced session access key and a 240-bit secret key.
+pub fn generate_session_credential_material(
+) -> Result<GeneratedSessionCredentialMaterial, SessionCredentialGenerationError> {
+    generate_session_credential_material_with(&ring::rand::SystemRandom::new())
+}
+
+fn generate_session_credential_material_with(
+    random: &dyn SessionCredentialRandomSource,
+) -> Result<GeneratedSessionCredentialMaterial, SessionCredentialGenerationError> {
+    // Rejection sampling removes the bias that byte modulo 36 would introduce.
+    const UNBIASED_BYTE_CEILING: u8 = (u8::MAX / SESSION_ACCESS_KEY_ALPHABET.len() as u8)
+        * SESSION_ACCESS_KEY_ALPHABET.len() as u8;
+    let mut suffix = [0_u8; SESSION_ACCESS_KEY_SUFFIX_LEN];
+    let mut suffix_len = 0;
+    while suffix_len < suffix.len() {
+        let mut candidates = [0_u8; 32];
+        random.fill(&mut candidates)?;
+        for candidate in candidates {
+            if candidate >= UNBIASED_BYTE_CEILING {
+                continue;
+            }
+            suffix[suffix_len] = SESSION_ACCESS_KEY_ALPHABET
+                [usize::from(candidate) % SESSION_ACCESS_KEY_ALPHABET.len()];
+            suffix_len += 1;
+            if suffix_len == suffix.len() {
+                break;
+            }
+        }
+    }
+    let mut access_key_id = String::with_capacity(SESSION_ACCESS_KEY_ID_LEN);
+    access_key_id.push_str(SESSION_ACCESS_KEY_ID_PREFIX);
+    access_key_id.push_str(std::str::from_utf8(&suffix).expect("ASCII access-key alphabet"));
+
+    let mut secret_bytes = [0_u8; SESSION_SECRET_RANDOM_LEN];
+    random.fill(&mut secret_bytes)?;
+    let secret_key = URL_SAFE_NO_PAD.encode(secret_bytes);
+    debug_assert_eq!(secret_key.len(), SESSION_SECRET_ACCESS_KEY_LEN);
+
+    Ok(GeneratedSessionCredentialMaterial {
+        access_key_id,
+        secret_key: SecretKey::new(secret_key),
+    })
+}
 
 /// Rejected long-lived credential-store mutation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -179,8 +292,7 @@ pub struct DecodedSessionCredential {
 }
 
 impl DecodedSessionCredential {
-    #[cfg(test)]
-    fn version1(
+    pub(crate) fn version1(
         access_key_id: String,
         secret_key: SecretKey,
         issuer: &ResolvedRoleIdentity,
@@ -303,8 +415,7 @@ impl AuthenticatedCredential {
     }
 }
 
-#[cfg(test)]
-fn valid_session_access_key_id(value: &str) -> bool {
+pub(crate) fn valid_session_access_key_id(value: &str) -> bool {
     value.len() == SESSION_ACCESS_KEY_ID_LEN
         && value.starts_with(SESSION_ACCESS_KEY_ID_PREFIX)
         && value[SESSION_ACCESS_KEY_ID_PREFIX.len()..]
@@ -312,8 +423,7 @@ fn valid_session_access_key_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
 }
 
-#[cfg(test)]
-fn valid_session_secret_access_key(value: &str) -> bool {
+pub(crate) fn valid_session_secret_access_key(value: &str) -> bool {
     value.len() == SESSION_SECRET_ACCESS_KEY_LEN
         && value
             .bytes()
@@ -477,7 +587,42 @@ impl Default for CredentialStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashSet, VecDeque};
+    use std::sync::Mutex;
+
     use super::*;
+
+    struct FixedRandom {
+        bytes: Mutex<VecDeque<u8>>,
+    }
+
+    impl FixedRandom {
+        fn new(bytes: impl IntoIterator<Item = u8>) -> Self {
+            Self {
+                bytes: Mutex::new(bytes.into_iter().collect()),
+            }
+        }
+    }
+
+    impl SessionCredentialRandomSource for FixedRandom {
+        fn fill(&self, output: &mut [u8]) -> Result<(), SessionCredentialGenerationError> {
+            let mut bytes = self.bytes.lock().unwrap();
+            for output_byte in output {
+                *output_byte = bytes
+                    .pop_front()
+                    .ok_or(SessionCredentialGenerationError::EntropyUnavailable)?;
+            }
+            Ok(())
+        }
+    }
+
+    struct FailingRandom;
+
+    impl SessionCredentialRandomSource for FailingRandom {
+        fn fill(&self, _output: &mut [u8]) -> Result<(), SessionCredentialGenerationError> {
+            Err(SessionCredentialGenerationError::EntropyUnavailable)
+        }
+    }
 
     fn session_credential() -> Result<DecodedSessionCredential, SessionCredentialError> {
         let role = crate::IamRoleIdentity::new(
@@ -497,7 +642,8 @@ mod tests {
         .unwrap();
         let mut roles = crate::RoleIdentityStore::new();
         roles.add(live_role).unwrap();
-        let provider = crate::IdentityProvider::in_memory_with_roles(CredentialStore::new(), roles);
+        let provider =
+            crate::IdentityProvider::in_memory_with_roles(CredentialStore::new(), roles).unwrap();
         let issuer = provider
             .lookup_live_role_identity(
                 &crate::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap(),
@@ -518,6 +664,54 @@ mod tests {
     fn get_missing_key() {
         let store = CredentialStore::new();
         assert!(store.get_record("nonexistent").is_none());
+    }
+
+    #[test]
+    fn session_credential_generation_uses_unbiased_argmin_shapes() {
+        let candidates = (252_u8..=255)
+            .cycle()
+            .take(12)
+            .chain(0_u8..20)
+            .chain(0_u8..30);
+        let material =
+            generate_session_credential_material_with(&FixedRandom::new(candidates)).unwrap();
+        assert_eq!(material.access_key_id(), "ARGSABCDEFGHIJKLMNOPQRST");
+        assert_eq!(material.access_key_id().len(), SESSION_ACCESS_KEY_ID_LEN);
+        assert_eq!(
+            material.secret_key().as_str(),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd"
+        );
+        assert_eq!(
+            material.secret_key().as_str().len(),
+            SESSION_SECRET_ACCESS_KEY_LEN
+        );
+        assert!(valid_session_access_key_id(material.access_key_id()));
+        assert!(valid_session_secret_access_key(
+            material.secret_key().as_str()
+        ));
+        let debug = format!("{material:?}");
+        assert!(!debug.contains(material.secret_key().as_str()));
+        assert!(debug.contains("<redacted:secret_key>"));
+    }
+
+    #[test]
+    fn session_credential_generation_fails_closed_when_entropy_is_unavailable() {
+        assert!(matches!(
+            generate_session_credential_material_with(&FailingRandom),
+            Err(SessionCredentialGenerationError::EntropyUnavailable)
+        ));
+    }
+
+    #[test]
+    fn generated_session_access_keys_are_unique_and_never_use_aws_namespaces() {
+        let mut access_key_ids = HashSet::new();
+        for _ in 0..256 {
+            let material = generate_session_credential_material().unwrap();
+            assert!(material.access_key_id().starts_with("ARGS"));
+            assert!(!material.access_key_id().starts_with("ASIA"));
+            assert!(!material.access_key_id().starts_with("AKIA"));
+            assert!(access_key_ids.insert(material.access_key_id().to_string()));
+        }
     }
 
     #[test]
@@ -661,7 +855,8 @@ mod tests {
         .unwrap();
         let mut roles = crate::RoleIdentityStore::new();
         roles.add(live_role).unwrap();
-        let provider = crate::IdentityProvider::in_memory_with_roles(CredentialStore::new(), roles);
+        let provider =
+            crate::IdentityProvider::in_memory_with_roles(CredentialStore::new(), roles).unwrap();
         let issuer = provider
             .lookup_live_role_identity(valid.session().role().stable_id())
             .unwrap()

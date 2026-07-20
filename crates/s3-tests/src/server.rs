@@ -227,7 +227,8 @@ impl TestServer {
                 auth::AuthorizationProfile::OwnerAccountAdmin,
             ))
             .unwrap();
-        let identity_provider = auth::IdentityProvider::in_memory(credentials);
+        let identity_provider = auth::IdentityProvider::in_memory(credentials)
+            .expect("initialize session-token key ring");
         let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
                 let sse_c_validator = server_core::sse::SseCustomerValidatorConfig::from_base64(

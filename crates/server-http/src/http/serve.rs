@@ -5101,7 +5101,8 @@ mod tests {
             .unwrap();
         Arc::new(HttpFrontend {
             coordinator: Arc::new(coordinator),
-            identity_provider: auth::IdentityProvider::in_memory(credentials),
+            identity_provider: auth::IdentityProvider::in_memory(credentials)
+                .expect("initialize session-token key ring"),
             host_id: Arc::<str>::from("host-id"),
         })
     }

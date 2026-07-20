@@ -123,8 +123,11 @@ permission-policy state. This is the narrow pre-signature liveness capability;
 current role authorization remains a later, separate provider capability. No
 production role fixture is seeded yet.
 
-The process-local session-token sealing key ring does not exist. Phase 1 must
-add and share it before directly sealed sessions can be authenticated.
+The provider now owns one process-local session-token sealing key ring and
+shares it with every clone handed to a frontend worker. The ring starts with a
+random 256-bit AES-GCM key, public 16-byte key ID, four-byte nonce prefix,
+atomic 64-bit issuance counter, and 16-byte credential domain. There is no
+issued-session collection.
 
 ### Stored and decoded session credentials are distinct
 
@@ -142,18 +145,20 @@ cannot be inserted into the long-lived store. `DecodedSessionCredential`
 instead requires an Argmin-namespaced 24-byte temporary access key ID, a
 40-byte secret access key, an account-matched assumed-role session identity
 with mandatory issue/expiry time, and an explicit versioned session
-authorization context. Its construction seam is exercised with a
-provider-resolved live-role/account record but remains unavailable to
-production callers until the token codec supplies authenticated payload
-fields. `AuthenticatedCredential` preserves the long-lived versus session kind
-while exposing only their common signing identity and secret material.
+authorization context. Production construction is available only after the
+shared token codec authenticates its payload and the provider resolves the
+stable live-role/account record. `AuthenticatedCredential` preserves the
+long-lived versus session kind while exposing only their common signing
+identity and secret material.
 Long-lived store insertion and server configuration reject the reserved
 `ARGS` namespace. The shared provider also refuses to query that namespace as
 long-lived and validates access-key binding on every custom-backend result, so
 a future backend cannot bypass the reservation.
 
-Auth does not yet open a supplied token or produce the session variant. It
-continues to check an optional expiry on stored records and then calls
+Auth can seal and strictly open the version-1 envelope through the shared
+provider, but request authentication does not yet select that path or produce
+the session variant. It continues to check an optional expiry on stored records
+and then calls
 `validate_static_credential_has_no_token` on header, presigned, and POST paths.
 An expiring stored record is therefore still not a usable STS credential.
 
@@ -167,9 +172,8 @@ only the configured-principal variant, and existing S3 authorization paths
 explicitly require that variant rather than treating a role session as an
 existing configured user.
 
-The remaining Phase 1 work must add the shared key-ring and token-codec
-substrate before any request can authenticate as a session identity. Session
-and principal tags remain later versioned policy context as described below.
+The remaining request-authentication plumbing belongs to Phase 2. Session and
+principal tags remain later versioned policy context as described below.
 
 ### S3 has resource policies but not IAM identity policies
 
@@ -367,14 +371,15 @@ as well as every separately presented token.
 ### 3. Share identity state and token keys, not issued sessions
 
 All frontend workers in a process should hold the same provider handle. The
-first implementation can use `Arc` plus a standard-library lock around bounded
+first implementation can use `Arc` plus a standard-library lock around
 in-memory state, with these separable capabilities:
 
 - resolve a long-lived credential for authentication
 - resolve accounts/users/roles for policy and principal validation
 - evaluate or retrieve attached identity/trust/session policies
 - seal and open session credential envelopes using a shared versioned key ring
-- inspect bounded, non-secret status
+- inspect non-secret status whose output is bounded by the configured key-ring
+  record limit
 
 Authentication lookup must return an owned immutable record or `Arc` and
 release the identity-state lock before canonicalization, token cryptography, or
@@ -441,20 +446,23 @@ containing one of those parameters is rejected before issuance.
 Bound allocation before base64 decoding. Version 1 accepts at most 21,853 ASCII
 bytes (`ARGST1.` plus the unpadded base64 expansion of a 16,384-byte frame) and
 at most 16,384 decoded frame bytes as defensive decoder limits. Issuance has a
-separate, smaller invariant. Treating each of the three 64-scalar variable
-identity fields as its maximum 256-byte UTF-8 encoding gives a maximum 891-byte
-plaintext, 935-byte frame, and 1,254-byte external token. Define that result as
-`MAX_ISSUED_V1_TOKEN_LEN`; derive it from the field/frame constants and assert it
-after sealing so a future field change cannot silently enlarge issued tokens.
+separate, smaller invariant. The AWS-pinned role-name, role-session-name, and
+source-identity patterns are ASCII-only, with respective maxima of 64, 64, and
+256 bytes. Together with their length/presence fields and the fixed payload,
+these give a maximum 507-byte plaintext, 551-byte frame, and 742-byte external
+token. Define that result as `MAX_ISSUED_V1_TOKEN_LEN`; derive it from the typed
+field/frame constants and assert it after sealing so a future field change
+cannot silently enlarge issued tokens.
 Exceeding it is an internal invariant failure, never a credential returned to
 the client. Focused tests must construct every version-1 field at its maximum
 accepted encoded size, sign ordinary PutObject and aws-chunked requests with the
 result, and assert that each complete request-header section remains within the
-server's 8,192-byte limit. Presigned-query and POST Object tests must exercise
-the same maximum token through their respective transport. A future envelope
-version may change the issuance ceiling only after AWS parameter-length probes
-and matching header, Query, POST, and streaming transport coverage establish
-that the resulting credentials work in every required authentication mode.
+server's 8,192-byte limit. Before any STS issuance route is enabled, the Phase 2
+request-path tests must also authenticate the same maximum token through
+presigned-query and POST Object. A future envelope version may change the
+issuance ceiling only after AWS parameter-length probes and matching header,
+Query, POST, and streaming transport coverage establish that the resulting
+credentials work in every required authentication mode.
 Compact encoding or compression is a Phase 6 design decision, not permission to
 issue an oversized version-1 token.
 
@@ -480,10 +488,22 @@ and counter. Rotation changes issuance to that new key immediately while
 retaining the old key for validation. An old validation key must remain until
 the maximum possible expiry of every session it issued; removing it is
 immediate bulk revocation and is never a transparent rotation step. Key-ring
-APIs and configuration validation must make reactivation unrepresentable, and
-tests must cover attempted validation-only and removed-key promotion as well as
+APIs and configuration validation must make reactivation unrepresentable.
+Removal drops the decrypting key but retains an internal key-ID tombstone and a
+one-way key-material fingerprint for the lifetime of the ring, so neither the
+ID nor the same AES material under another ID can return with a reset nonce
+allocator. Tests must cover attempted validation-only and removed-key
+promotion, duplicate live and removed key material under another ID, and
 concurrent rotation/issuance. Configured multi-frontend use also requires the
 same explicit credential domain and identity provider on every frontend.
+The initial process-local ring has no production rotation surface, so it stays
+at one record. Before configured or administrative rotation is exposed, the
+key-ring configuration and transition API must impose a finite maximum on the
+total of active, validation-only, and removed records and fail closed when that
+history is full. Removed tombstones count toward that limit and are never
+evicted or compacted within the credential domain; planned rotation beyond the
+limit requires starting a new domain and intentionally invalidating all tokens
+from the old domain.
 No configured key may become active for issuance across process restarts or on
 multiple frontends until that later implementation provides a non-repeating
 nonce allocation for the key's entire lifetime; loading it as validation-only
@@ -495,8 +515,11 @@ key IDs, and active/validation-only state, never raw key material, tokens,
 decoded secrets, or session payloads.
 
 Because issuance stores nothing, there is no issued-session capacity, expiry
-scan, or tombstone requirement. Memory remains bounded by the existing request
-admission controls plus strict encoded-token and decoded-payload limits.
+scan, or per-session tombstone requirement. Per-request memory remains bounded
+by the existing admission controls plus strict encoded-token and
+decoded-payload limits. The separate per-key tombstones above are retained for
+the ring's lifetime; their eventual production memory bound comes from the
+mandatory total key-record limit, not from request admission.
 
 ### 5. Add token-aware authentication once, shared by every SigV4 mode
 
@@ -1679,7 +1702,7 @@ Version 1 carries no inline or managed session policy; those unsupported
 parameters remain explicit request errors until Phase 6 pins their character
 limits and introduces a transport-safe later envelope version. The 16,384-byte
 decoded limit is only a defensive decoder allocation bound. Issuance is capped
-at the derived 1,254-byte external-token maximum and must prove its maximum
+at the derived 742-byte external-token maximum and must prove its maximum
 field shapes fit the complete 8,192-byte PutObject and aws-chunked header
 sections as well as the presigned and POST transports.
 
@@ -1697,9 +1720,10 @@ work: one active issuance key, unique validation-only key IDs, an explicit
 shared domain, irreversible `Active -> ValidationOnly -> Removed` transitions,
 and overlap until every session issued by a retired key has expired. Removing a
 validation key is intentional bulk revocation; an old key is never promoted and
-never receives a reset nonce allocator. This resolves the envelope encoding,
-missing-token routing, and key-overlap questions without adding a production
-dependency.
+never receives a reset nonce allocator. Removed IDs and one-way key-material
+fingerprints remain as internal tombstones, including after the decrypting key
+has been dropped. This resolves the envelope encoding, missing-token routing,
+and key-overlap questions without adding a production dependency.
 
 The STS signing-scope slice completed on 2026-07-14. The existing configured
 regional endpoint success is its positive control. Complete STS response
@@ -2401,7 +2425,7 @@ compatibility record.
   size/codec limits, and secure generation interfaces
 - add redaction, tamper rejection, and provider/key-ring failure behavior
 
-Progress as of 2026-07-20: structured account, configured-principal, and
+Completed on 2026-07-20. Structured account, configured-principal, and
 assumed-role-session identities exist with surface-specific ARN accessors;
 stored credentials accept only configured principals; and one cloneable
 identity-provider handle now supplies owned long-lived credential/account
@@ -2413,9 +2437,34 @@ long-lived collection, and neither a custom backend nor bootstrap
 configuration can expose an `ARGS` key as long-lived. Unknown identities
 remain distinct from provider failure, and invalid provider records remain
 diagnostically distinct from provider outages across authentication and
-rendering paths. The remaining Phase 1 slice is the shared sealing key ring and
-versioned token codec, which will make the provider-backed construction seam
-available to production authentication.
+rendering paths. The shared sealing key ring and versioned token codec complete
+the Phase 1 slice. The provider now owns that ring, and every frontend
+clone shares its credential domain and keys. Version 1 uses `ARGST1.`,
+canonical unpadded URL-safe base64, AES-256-GCM, fixed authenticated associated
+data, a random per-key nonce prefix plus atomic counter, strict defensive decode
+bounds, strict typed payload reconstruction, and a derived 742-byte issuance
+ceiling. The codec rejects unknown keys/versions, non-canonical encoding,
+truncation, tampering, invalid fields, impossible lifetimes, and trailing data
+without exposing bearer material. Opening then resolves the stable role
+incarnation and authoritative account before constructing a session
+credential.
+
+Temporary access/secret generation uses the Argmin-owned `ARGS` namespace,
+unbiased rejection sampling for the 20-character suffix, and 30 random bytes
+encoded as a 40-character URL-safe secret. The production provider sealing
+boundary consumes that opaque generated-material type; arbitrary raw access and
+secret values can reach sealing only from test-only constructors. Focused tests
+cover entropy failure, shape and uniqueness sampling, maximum-field issuance,
+tampering and domain/key mismatch, every plaintext truncation, nonce
+exhaustion, concurrent issuance and rotation, rejected validation-only and
+removed-ID reactivation, duplicate live and removed AES material under another
+ID, irreversible validation-key removal, key-ring poisoning, redaction, issuer
+deletion, cross-provider rejection, and actual opening through two frontend
+workers. The maximum token is also checked in complete ordinary and aws-chunked
+write-header shapes against the server's 8,192-byte aggregate limit.
+Presigned-query and POST authentication of the same maximum issued token remain
+Phase 2 request-path tests because those modes still reject all session
+credentials.
 
 Exit condition: all current S3 suites remain green, every frontend worker can
 open a test-sealed credential using the shared key ring, and no issued-session

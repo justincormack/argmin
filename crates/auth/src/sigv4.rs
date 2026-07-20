@@ -321,7 +321,7 @@ mod tests {
                 SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             )
             .unwrap();
-        crate::IdentityProvider::in_memory(store)
+        crate::IdentityProvider::in_memory(store).unwrap()
     }
 
     fn aws_example_time() -> u64 {
@@ -714,7 +714,7 @@ mod tests {
                 false,
             ))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-date, \

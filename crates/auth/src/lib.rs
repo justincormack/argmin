@@ -23,6 +23,7 @@ pub mod identity;
 pub mod post;
 pub mod provider;
 pub mod request;
+mod session_token;
 pub mod sigv4;
 
 pub use s3_types::AccountIdentity;
@@ -63,10 +64,12 @@ pub use bucket_policy::{
 };
 pub use canonical::parse_amz_date;
 pub use credential::{
-    is_reserved_session_access_key_id, AuthenticatedCredential, AuthorizationProfile,
-    CredentialScope, CredentialStore, CredentialStoreError, DecodedSessionCredential, SecretKey,
-    SessionAuthorizationContext, SessionCredentialError, StoredCredential,
-    SESSION_ACCESS_KEY_ID_LEN, SESSION_ACCESS_KEY_ID_PREFIX, SESSION_SECRET_ACCESS_KEY_LEN,
+    generate_session_credential_material, is_reserved_session_access_key_id,
+    AuthenticatedCredential, AuthorizationProfile, CredentialScope, CredentialStore,
+    CredentialStoreError, DecodedSessionCredential, GeneratedSessionCredentialMaterial, SecretKey,
+    SessionAuthorizationContext, SessionCredentialError, SessionCredentialGenerationError,
+    StoredCredential, SESSION_ACCESS_KEY_ID_LEN, SESSION_ACCESS_KEY_ID_PREFIX,
+    SESSION_SECRET_ACCESS_KEY_LEN,
 };
 pub use error::{AuthError, SignatureMismatchDiagnostics};
 pub use identity::{
@@ -87,6 +90,11 @@ pub use provider::{
 pub use request::{
     authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion, HeaderSource,
     StreamingSigningContext,
+};
+pub use session_token::{
+    SessionTokenKeyRingInitError, SessionTokenKeyRingStatus, SessionTokenOpenError,
+    SessionTokenSealError, MAX_DECODED_SESSION_TOKEN_FRAME_LEN, MAX_ENCODED_SESSION_TOKEN_LEN,
+    MAX_ISSUED_V1_TOKEN_LEN, SESSION_TOKEN_V1_PREFIX,
 };
 pub use sigv4::{parse_auth_header, SigV4Auth};
 

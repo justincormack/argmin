@@ -6515,7 +6515,11 @@ async fn run_frontend_server(
         .map(storage::StorageClusterRuntimeMapRefreshLoop::status_handle);
 
     // Build frontend pool sharing the same storage cluster and identity-provider handles.
-    let identity_provider = auth::IdentityProvider::in_memory(build_credential_store(&config));
+    let identity_provider = auth::IdentityProvider::in_memory(build_credential_store(&config))
+        .unwrap_or_else(|error| {
+            eprintln!("failed to initialize session-token key ring: {error}");
+            std::process::exit(1);
+        });
     let mut frontends = Vec::with_capacity(config.workers as usize);
     for _ in 0..config.workers {
         let coordinator =

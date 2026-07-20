@@ -777,7 +777,7 @@ mod tests {
                 SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             )
             .unwrap();
-        crate::IdentityProvider::in_memory(store)
+        crate::IdentityProvider::in_memory(store).unwrap()
     }
 
     fn aws_example_time() -> u64 {
@@ -853,7 +853,8 @@ mod tests {
     fn header_provider_failure_is_not_unknown_access_key() {
         let provider = crate::IdentityProvider::new(FailingIdentityProvider(
             crate::IdentityProviderError::Unavailable,
-        ));
+        ))
+        .unwrap();
         let headers = aws_example_signed_headers();
         let err = authenticate_request(
             "GET",
@@ -877,7 +878,8 @@ mod tests {
     fn header_invalid_provider_record_preserves_failure_kind() {
         let provider = crate::IdentityProvider::new(FailingIdentityProvider(
             crate::IdentityProviderError::InvalidRecord,
-        ));
+        ))
+        .unwrap();
         let headers = aws_example_signed_headers();
         let err = authenticate_request(
             "GET",
@@ -1065,7 +1067,8 @@ mod tests {
     fn presigned_provider_failure_is_not_unknown_access_key() {
         let provider = crate::IdentityProvider::new(FailingIdentityProvider(
             crate::IdentityProviderError::Unavailable,
-        ));
+        ))
+        .unwrap();
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000";
         let headers = [("host", "examplebucket.s3.amazonaws.com")];
         let err = authenticate_request(
@@ -1090,7 +1093,8 @@ mod tests {
     fn presigned_invalid_provider_record_preserves_failure_kind() {
         let provider = crate::IdentityProvider::new(FailingIdentityProvider(
             crate::IdentityProviderError::InvalidRecord,
-        ));
+        ))
+        .unwrap();
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=0000000000000000000000000000000000000000000000000000000000000000";
         let headers = [("host", "examplebucket.s3.amazonaws.com")];
         let err = authenticate_request(
@@ -1342,7 +1346,7 @@ mod tests {
                 true,
             ))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let headers = [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
             ("host", "examplebucket.s3.amazonaws.com"),
@@ -1377,7 +1381,7 @@ mod tests {
                 true,
             ))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let headers = [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"),
             ("host", "examplebucket.s3.amazonaws.com"),
@@ -1854,7 +1858,7 @@ mod tests {
                 false,
             ))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(
@@ -2179,7 +2183,7 @@ mod tests {
                 true,
             ))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-Security-Token=wrong-token&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(
@@ -2231,7 +2235,7 @@ mod tests {
                 true,
             ))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let query = sign_test_presigned_query(
             "GET",
             "/",
@@ -2266,7 +2270,7 @@ mod tests {
                 true,
             ))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(

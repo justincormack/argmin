@@ -6444,7 +6444,8 @@ mod tests {
             .unwrap();
         HttpFrontend {
             coordinator: Arc::new(coordinator),
-            identity_provider: auth::IdentityProvider::in_memory(credentials),
+            identity_provider: auth::IdentityProvider::in_memory(credentials)
+                .expect("initialize session-token key ring"),
             host_id: Arc::<str>::from("host-id"),
         }
     }
@@ -6455,7 +6456,8 @@ mod tests {
         let mut frontend = setup_frontend(tmp.path());
         frontend.identity_provider = auth::IdentityProvider::new(FailingIdentityProvider(
             auth::IdentityProviderError::Unavailable,
-        ));
+        ))
+        .expect("initialize session-token key ring");
 
         let request = signed_v4_put_req(b"", Vec::new());
         assert!(matches!(
@@ -6475,13 +6477,106 @@ mod tests {
 
         frontend.identity_provider = auth::IdentityProvider::new(FailingIdentityProvider(
             auth::IdentityProviderError::InvalidRecord,
-        ));
+        ))
+        .expect("initialize session-token key ring");
         assert!(matches!(
             frontend.authenticate(&request, None),
             Err(ServerError::IdentityProvider(
                 auth::IdentityProviderError::InvalidRecord
             ))
         ));
+    }
+
+    #[test]
+    fn frontend_workers_share_and_open_one_process_local_session_token() {
+        let first_dir = test_util::tempdir();
+        let second_dir = test_util::tempdir();
+        let mut first = setup_frontend(first_dir.path());
+        let mut second = setup_frontend(second_dir.path());
+        let account_id = auth::AwsAccountId::new("123456789012").unwrap();
+        let stable_role_id = auth::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
+        let role_name = "r".repeat(64);
+        let session_name = "s".repeat(64);
+        let role = auth::IamRoleIdentity::new(
+            account_id,
+            stable_role_id.clone(),
+            auth::RoleName::new(role_name).unwrap(),
+            auth::IamPath::new("/test/").unwrap(),
+        );
+        let live_role = auth::LiveRoleIdentity::new(
+            s3_types::AccountIdentity::new(
+                "123456789012",
+                s3_types::CanonicalUserId::from_principal("123456789012"),
+                "test account",
+            ),
+            role,
+        )
+        .unwrap();
+        let mut roles = auth::RoleIdentityStore::new();
+        roles.add(live_role).unwrap();
+        let provider =
+            auth::IdentityProvider::in_memory_with_roles(auth::CredentialStore::new(), roles)
+                .unwrap();
+        first.identity_provider = provider.clone();
+        second.identity_provider = provider;
+        let issuer = first
+            .identity_provider
+            .lookup_live_role_identity(&stable_role_id)
+            .unwrap()
+            .unwrap();
+        let material = auth::generate_session_credential_material().unwrap();
+        let access_key_id = material.access_key_id().to_string();
+        let token = first
+            .identity_provider
+            .seal_session_credential_v1(
+                material,
+                &issuer,
+                auth::RoleSessionName::new(session_name).unwrap(),
+                auth::SessionLifetime::new(1_700_000_000, 1_700_003_600).unwrap(),
+                Some(auth::SourceIdentity::new("i".repeat(256)).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(token.len(), auth::MAX_ISSUED_V1_TOKEN_LEN);
+
+        for frontend in [&first, &second] {
+            let opened = frontend
+                .identity_provider
+                .open_session_token(&token)
+                .unwrap();
+            assert_eq!(opened.session().role().stable_id(), &stable_role_id);
+        }
+
+        let payload_hash = "0".repeat(64);
+        let ordinary_signed_headers = "host;x-amz-content-sha256;x-amz-date;x-amz-security-token";
+        let ordinary_authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/20260720/us-east-1/s3/aws4_request, SignedHeaders={ordinary_signed_headers}, Signature={}",
+            "0".repeat(64)
+        );
+        let ordinary_headers = [
+            ("host", "examplebucket.s3.us-east-1.amazonaws.com"),
+            ("x-amz-content-sha256", payload_hash.as_str()),
+            ("x-amz-date", "20260720T120000Z"),
+            ("x-amz-security-token", token.as_str()),
+            ("authorization", ordinary_authorization.as_str()),
+        ];
+        validate_write_request_header_section_size(&ordinary_headers).unwrap();
+
+        let streaming_signed_headers = "content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-security-token";
+        let streaming_authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key_id}/20260720/us-east-1/s3/aws4_request, SignedHeaders={streaming_signed_headers}, Signature={}",
+            "0".repeat(64)
+        );
+        let streaming_headers = [
+            ("host", "examplebucket.s3.us-east-1.amazonaws.com"),
+            ("content-encoding", "aws-chunked"),
+            ("content-length", "1234"),
+            ("x-amz-decoded-content-length", "1024"),
+            ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+            ("x-amz-date", "20260720T120000Z"),
+            ("x-amz-security-token", token.as_str()),
+            ("authorization", streaming_authorization.as_str()),
+        ];
+        validate_write_request_header_section_size(&streaming_headers).unwrap();
     }
 
     fn configured_identity(account: auth::AccountIdentity) -> auth::AuthenticatedIdentity {

@@ -525,7 +525,7 @@ mod tests {
                 SecretKey::new("testSecretKey456".to_string()),
             )
             .unwrap();
-        crate::IdentityProvider::in_memory(store)
+        crate::IdentityProvider::in_memory(store).unwrap()
     }
 
     fn configured_record(
@@ -667,7 +667,8 @@ mod tests {
     fn sigv4_post_provider_failure_is_not_unknown_access_key() {
         let provider = crate::IdentityProvider::new(FailingIdentityProvider(
             crate::IdentityProviderError::Unavailable,
-        ));
+        ))
+        .unwrap();
         let (policy_b64, sig_hex) = signed_test_policy();
         let err = authenticate_post_sigv4(
             "AWS4-HMAC-SHA256",
@@ -692,7 +693,8 @@ mod tests {
     fn sigv4_post_invalid_provider_record_preserves_failure_kind() {
         let provider = crate::IdentityProvider::new(FailingIdentityProvider(
             crate::IdentityProviderError::InvalidRecord,
-        ));
+        ))
+        .unwrap();
         let (policy_b64, sig_hex) = signed_test_policy();
         let err = authenticate_post_sigv4(
             "AWS4-HMAC-SHA256",
@@ -746,7 +748,7 @@ mod tests {
                 true,
             ))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let (policy_b64, sig_hex) = signed_test_policy();
         let err = super::authenticate_post_sigv4(
             PostSigV4Request {
@@ -777,7 +779,7 @@ mod tests {
                 true,
             ))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let (policy_b64, _) = signed_test_policy();
         let err = super::authenticate_post_sigv4(
             PostSigV4Request {
@@ -1622,7 +1624,7 @@ mod tests {
         store
             .add_record(configured_record("AKID", "secret", "p", None, false))
             .unwrap();
-        let store = crate::IdentityProvider::in_memory(store);
+        let store = crate::IdentityProvider::in_memory(store).unwrap();
         let err = authenticate_post_sigv4(
             "AWS4-HMAC-SHA256",
             "AKID/20250101/us-east-1/s3/aws4_request",

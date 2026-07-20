@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::{
-    is_reserved_session_access_key_id, CredentialStore, LiveRoleIdentity, StableRoleId,
-    StoredCredential,
+    is_reserved_session_access_key_id, CredentialStore, DecodedSessionCredential,
+    GeneratedSessionCredentialMaterial, LiveRoleIdentity, RoleSessionName, SessionLifetime,
+    SessionTokenKeyRingInitError, SessionTokenKeyRingStatus, SessionTokenOpenError,
+    SessionTokenSealError, SourceIdentity, StableRoleId, StoredCredential,
 };
 
 /// Conflicting live-role identity in process-local bootstrap state.
@@ -134,26 +136,32 @@ pub trait IdentityProviderBackend: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct IdentityProvider {
     backend: Arc<dyn IdentityProviderBackend>,
+    session_token_key_ring: Arc<crate::session_token::SessionTokenKeyRing>,
 }
 
 impl IdentityProvider {
     /// Wrap an identity-provider backend in a shared handle.
-    #[must_use]
-    pub fn new(backend: impl IdentityProviderBackend) -> Self {
-        Self {
+    pub fn new(
+        backend: impl IdentityProviderBackend,
+    ) -> Result<Self, SessionTokenKeyRingInitError> {
+        Ok(Self {
             backend: Arc::new(backend),
-        }
+            session_token_key_ring: Arc::new(
+                crate::session_token::SessionTokenKeyRing::new_process_local()?,
+            ),
+        })
     }
 
     /// Build the initial process-local in-memory provider.
-    #[must_use]
-    pub fn in_memory(credentials: CredentialStore) -> Self {
+    pub fn in_memory(credentials: CredentialStore) -> Result<Self, SessionTokenKeyRingInitError> {
         Self::in_memory_with_roles(credentials, RoleIdentityStore::new())
     }
 
     /// Build the process-local provider with configured credentials and roles.
-    #[must_use]
-    pub fn in_memory_with_roles(credentials: CredentialStore, roles: RoleIdentityStore) -> Self {
+    pub fn in_memory_with_roles(
+        credentials: CredentialStore,
+        roles: RoleIdentityStore,
+    ) -> Result<Self, SessionTokenKeyRingInitError> {
         Self::new(InMemoryIdentityProvider {
             state: RwLock::new(InMemoryIdentityState { credentials, roles }),
         })
@@ -207,6 +215,63 @@ impl IdentityProvider {
             return Err(IdentityProviderError::InvalidRecord);
         }
         Ok(account)
+    }
+
+    /// Seal one version-1 temporary credential using a provider-resolved live
+    /// role and the shared process-local key ring.
+    pub fn seal_session_credential_v1(
+        &self,
+        material: GeneratedSessionCredentialMaterial,
+        issuer: &ResolvedRoleIdentity,
+        session_name: RoleSessionName,
+        lifetime: SessionLifetime,
+        source_identity: Option<SourceIdentity>,
+    ) -> Result<String, SessionTokenSealError> {
+        let (access_key_id, secret_key) = material.into_parts();
+        let credential = DecodedSessionCredential::version1(
+            access_key_id,
+            secret_key,
+            issuer,
+            session_name,
+            lifetime,
+            source_identity,
+        )
+        .map_err(|_| SessionTokenSealError::InvalidCredential)?;
+        crate::session_token::seal_v1(&self.session_token_key_ring, &credential)
+    }
+
+    /// Open a versioned token, resolve its stable issuer incarnation, and
+    /// construct a typed session credential from the authoritative role and
+    /// account record.
+    pub fn open_session_token(
+        &self,
+        token: &str,
+    ) -> Result<DecodedSessionCredential, SessionTokenOpenError> {
+        let opened = crate::session_token::open_v1(&self.session_token_key_ring, token)?;
+        let issuer = self
+            .lookup_live_role_identity(crate::session_token::opened_stable_role_id(&opened))?
+            .ok_or(SessionTokenOpenError::IssuerNotFound)?;
+        if issuer.role().account_id() != crate::session_token::opened_account_id(&opened)
+            || issuer.role().name() != crate::session_token::opened_role_name(&opened)
+        {
+            return Err(SessionTokenOpenError::InvalidToken);
+        }
+        DecodedSessionCredential::version1(
+            crate::session_token::opened_access_key_id(&opened).to_string(),
+            crate::session_token::opened_secret_key(&opened).clone(),
+            &issuer,
+            crate::session_token::opened_session_name(&opened).clone(),
+            crate::session_token::opened_lifetime(&opened),
+            crate::session_token::opened_source_identity(&opened).cloned(),
+        )
+        .map_err(|_| SessionTokenOpenError::InvalidToken)
+    }
+
+    /// Return non-secret status for the shared session-token key ring.
+    pub fn session_token_key_ring_status(
+        &self,
+    ) -> Result<SessionTokenKeyRingStatus, SessionTokenSealError> {
+        self.session_token_key_ring.status()
     }
 }
 
@@ -375,9 +440,13 @@ mod tests {
 
     #[test]
     fn cloned_handles_share_one_backend() {
-        let provider = IdentityProvider::in_memory(CredentialStore::new());
+        let provider = IdentityProvider::in_memory(CredentialStore::new()).unwrap();
         let clone = provider.clone();
         assert!(Arc::ptr_eq(&provider.backend, &clone.backend));
+        assert!(Arc::ptr_eq(
+            &provider.session_token_key_ring,
+            &clone.session_token_key_ring
+        ));
     }
 
     #[test]
@@ -386,7 +455,7 @@ mod tests {
         credentials
             .add("AKID".to_string(), SecretKey::new("secret".to_string()))
             .unwrap();
-        let provider = IdentityProvider::in_memory(credentials);
+        let provider = IdentityProvider::in_memory(credentials).unwrap();
 
         let record = provider
             .lookup_long_lived_credential("AKID")
@@ -408,7 +477,8 @@ mod tests {
             role: None,
             account: None,
             credential_lookups: Arc::clone(&credential_lookups),
-        });
+        })
+        .unwrap();
 
         assert!(provider
             .lookup_long_lived_credential("ARGS0123456789ABCDEFGHIJ")
@@ -427,7 +497,8 @@ mod tests {
             role: None,
             account: None,
             credential_lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
+        })
+        .unwrap();
 
         assert!(matches!(
             provider.lookup_long_lived_credential("AKID"),
@@ -442,7 +513,8 @@ mod tests {
             role: None,
             account: None,
             credential_lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
+        })
+        .unwrap();
 
         assert!(matches!(
             provider.lookup_long_lived_credential("AKID"),
@@ -463,7 +535,8 @@ mod tests {
                 "other account",
             )),
             credential_lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
+        })
+        .unwrap();
 
         assert!(matches!(
             provider.find_account_by_canonical_user_id(&requested),
@@ -479,7 +552,8 @@ mod tests {
                 "requested account",
             )),
             credential_lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
+        })
+        .unwrap();
         assert_eq!(
             provider
                 .find_account_by_canonical_user_id(&requested)
@@ -516,7 +590,8 @@ mod tests {
         let stable_id = StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
         let mut roles = RoleIdentityStore::new();
         roles.add(role(stable_id.as_str(), "test-role")).unwrap();
-        let provider = IdentityProvider::in_memory_with_roles(CredentialStore::new(), roles);
+        let provider =
+            IdentityProvider::in_memory_with_roles(CredentialStore::new(), roles).unwrap();
 
         let stored = provider
             .lookup_live_role_identity(&stable_id)
@@ -537,7 +612,8 @@ mod tests {
             role: Some(Arc::new(role("ARGR0123456789ABCDEFGHIJ", "test-role"))),
             account: None,
             credential_lookups: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
+        })
+        .unwrap();
 
         assert!(matches!(
             provider
@@ -561,7 +637,12 @@ mod tests {
             panic!("poison identity state for test");
         })
         .join();
-        let provider = IdentityProvider { backend };
+        let provider = IdentityProvider {
+            backend,
+            session_token_key_ring: Arc::new(
+                crate::session_token::SessionTokenKeyRing::new_process_local().unwrap(),
+            ),
+        };
 
         assert!(matches!(
             provider.lookup_long_lived_credential("missing"),
@@ -572,5 +653,21 @@ mod tests {
                 .lookup_live_role_identity(&StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap()),
             Err(IdentityProviderError::Unavailable)
         ));
+    }
+
+    #[test]
+    fn poisoned_session_token_key_ring_is_typed_unavailability() {
+        let provider = IdentityProvider::in_memory(CredentialStore::new()).unwrap();
+        let poison_target = Arc::clone(&provider.session_token_key_ring);
+        let _ = std::thread::spawn(move || {
+            let _panic_guard = SuppressExpectedPanicOutput::new();
+            poison_target.poison_state_for_test();
+        })
+        .join();
+
+        assert_eq!(
+            provider.session_token_key_ring_status(),
+            Err(SessionTokenSealError::KeyRingUnavailable)
+        );
     }
 }

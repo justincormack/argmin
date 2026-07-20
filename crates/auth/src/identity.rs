@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 const STABLE_ROLE_ID_PREFIX: &str = "ARGR";
 const GENERATED_ID_SUFFIX_LEN: usize = 20;
-const STABLE_ROLE_ID_LEN: usize = STABLE_ROLE_ID_PREFIX.len() + GENERATED_ID_SUFFIX_LEN;
-const ROLE_NAME_MAX_LEN: usize = 64;
+pub(crate) const STABLE_ROLE_ID_LEN: usize = STABLE_ROLE_ID_PREFIX.len() + GENERATED_ID_SUFFIX_LEN;
+pub(crate) const ROLE_NAME_MAX_LEN: usize = 64;
 const IAM_PATH_MAX_LEN: usize = 512;
 const ROLE_SESSION_NAME_MIN_LEN: usize = 2;
-const ROLE_SESSION_NAME_MAX_LEN: usize = 64;
+pub(crate) const ROLE_SESSION_NAME_MAX_LEN: usize = 64;
 const SOURCE_IDENTITY_MIN_LEN: usize = 2;
-const SOURCE_IDENTITY_MAX_LEN: usize = 256;
+pub(crate) const SOURCE_IDENTITY_MAX_LEN: usize = 256;
 
 /// A rejected structured identity field or inconsistent identity composition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
