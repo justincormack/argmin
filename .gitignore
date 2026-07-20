@@ -9,13 +9,9 @@ nohup.out
 # ignore tmp and build directories
 tmp/
 /target/
-/crates/s3-diff-tests/target/
 # environments
 .direnv/
 .env
-/crates/s3-diff-tests/Cargo.lock
-# Obsidian notes checkout
-/notes/
 # data for buckets
 /data/
 # profiles
