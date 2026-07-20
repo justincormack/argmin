@@ -100,6 +100,21 @@ and deployment-policy validation as startup will use, and emits only redacted
 cluster/process identity diagnostics. It does not resolve secret bytes, open
 mutable state, or start listeners.
 
+Operators can separately validate the selected process's referenced material:
+
+```text
+argmin-s3 validate-cluster-material /etc/argmin/cluster.toml control-1
+```
+
+This command first performs the complete structural and selected-host
+filesystem validation, then resolves only the credentials needed for the
+selected process's own principals and listener verification boundaries, its
+local TCP listener identities, and trust bundles needed by its outbound
+protocols. It emits only redacted counts. It never prints resolved bytes,
+private keys, certificate contents, or MAC material. This is deliberately
+separate from `validate-cluster-config`, so offline topology validation does not
+require access to machine-local secrets.
+
 Standalone file-mode storage is initialized explicitly:
 
 ```text
@@ -472,6 +487,31 @@ The file resolver must bound secret-file size before allocation, require a
 regular file, reject empty content, and use platform-appropriate ownership and
 permission checks. Exact deployment and rotation mechanics remain part of the
 auth production-rollout slice.
+
+The version-1 file resolver atomically opens each final path without following
+a symlink. Private MAC/key files must be owned by the effective process user and
+must grant no group/other permissions. Certificate and CA files must have the
+same ownership and must not be group/other writable. Credential files are
+bounded to 4 KiB, private keys to 64 KiB, and certificate chains/trust bundles
+to 1 MiB before allocation. A selected process may resolve at most 256 files
+and 16 MiB of material in total; the remaining aggregate budget is checked
+against each opened file's metadata before allocation. Startup material
+includes only credentials whose acceptance window contains the sampled startup
+authority time and requires exactly one active signing credential for every
+required principal. Outbound trust-bundle selection follows both process
+topology and authenticated capabilities, so an admin or maintenance principal
+resolves remote control-plane and authority-clock-recovery bundles even when
+hosted by a control-plane process.
+
+TLS material uses exact PEM typing. Certificate-chain and trust-bundle files
+may contain only certificate sections, private-key files must contain exactly
+one supported private-key section, and non-PEM text or additional section types
+are rejected. Every configured trust anchor must parse as X.509 and carry
+critical `basicConstraints` with `CA=true` plus critical `keyUsage` containing
+`keyCertSign`; a leaf certificate is never promoted to a root merely because
+rustls can parse it. TLS resolution then verifies private-key compatibility,
+builds the explicit root store, and proves each local TCP certificate chains to
+that store and matches its configured server name.
 
 ## TLS Contract
 
@@ -852,9 +892,19 @@ Progress as of 2026-07-19:
   runtime open. Complete path relocation is accepted because paths remain
   outside durable identity, while empty, partial, wrong-cluster,
   wrong-generation, and wrong-process state is rejected.
+- Slice 5's material-resolution sub-slice is implemented: a selected process
+  resolves bounded no-follow files into redacted binary credential material,
+  rustls certified keys, and explicit root stores. Resolution is role/listener
+  scoped, applies startup-static credential rotation windows, enforces exact
+  PEM section types, validates CA constraints and signing usage, bounds total
+  selected-process material, verifies local listener
+  certificate/key/trust/server-name consistency, and has a separate redacted
+  `validate-cluster-material` preflight command. Runtime construction from
+  these typed values remains part of replicated process mapping; raw material
+  is not converted back into legacy env-style strings.
 - Raft/control-plane durable identity and authenticated-frame binding,
-  replicated initialization/replacement lifecycle, secret resolution,
-  production replicated mapping, and TCP transport remain open.
+  replicated initialization/replacement lifecycle, resolved-material runtime
+  activation, production replicated mapping, and TCP transport remain open.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;
@@ -883,8 +933,11 @@ Progress as of 2026-07-19:
    - add wrong-cluster, wrong-process, wrong-generation, changed-endpoint,
      empty-relocation, and incomplete-relocation restart tests.
 5. **Secret/TLS resolution**
-   - resolve bounded file references after validation;
-   - construct existing scoped auth credentials and rustls identities;
+   - resolve bounded file references after validation (implemented);
+   - construct typed binary credential material and validated rustls identities
+     (implemented);
+   - activate those values in the existing scoped-auth runtime without
+     converting them through legacy string configuration;
    - enforce replicated and TCP mandatory-auth policy; and
    - prove diagnostics and errors remain redacted.
 6. **Authenticated TCP control-plane transport**

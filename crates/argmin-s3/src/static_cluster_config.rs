@@ -3,6 +3,12 @@ use ec::EcConfig;
 use placement::{
     ClusterMap, Level, NodeId, NodeInfo, PlacementConfig, PlacementConstraint, Placer, TopologyKey,
 };
+use rustls::client::danger::ServerCertVerifier;
+use rustls::client::WebPkiServerVerifier;
+use rustls::pki_types::pem::{PemObject, SectionKind};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::sign::CertifiedKey;
+use rustls::RootCertStore;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -11,9 +17,13 @@ use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use storage::control_plane_raft::{
     ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
 };
+use x509_cert::der::Decode;
+use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
+use x509_cert::Certificate;
 
 const CLUSTER_MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const CLUSTER_MANIFEST_MAX_COLLECTION_ITEMS: usize = 4_096;
@@ -29,6 +39,12 @@ const CLUSTER_MANIFEST_MAX_RAFT_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const CLUSTER_MANIFEST_MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const CLUSTER_MANIFEST_RAFT_APPEND_FIXED_FRAME_OVERHEAD_BYTES: u64 = 64 * 1024;
 const CLUSTER_MANIFEST_RAFT_SNAPSHOT_FIXED_FRAME_OVERHEAD_BYTES: u64 = 64 * 1024;
+const CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES: u64 = 4 * 1024;
+const CLUSTER_MANIFEST_MAX_TLS_CERTIFICATE_BYTES: u64 = 1024 * 1024;
+const CLUSTER_MANIFEST_MAX_TLS_PRIVATE_KEY_BYTES: u64 = 64 * 1024;
+const CLUSTER_MANIFEST_MAX_TLS_TRUST_BUNDLE_BYTES: u64 = 1024 * 1024;
+const CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_FILES: usize = 256;
+const CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const INITIAL_PG_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin-initial-pg-placement-v1";
 const TOPOLOGY_IDENTITY_DOMAIN: &str = "argmin-static-cluster-topology-v1";
 const PROCESS_IDENTITY_DOMAIN: &str = "argmin-static-cluster-process-identity-v1";
@@ -303,6 +319,155 @@ pub(crate) struct ValidatedStaticClusterManifest {
     full_config_fingerprint: String,
 }
 
+struct ResolvedStaticAuthCredential {
+    principal: CredentialPrincipalKey,
+    credential_id: String,
+    credential_version: u64,
+    use_for_signing: bool,
+    accept_from_ms: u64,
+    accept_until_ms: Option<u64>,
+    secret: Vec<u8>,
+}
+
+impl fmt::Debug for ResolvedStaticAuthCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedStaticAuthCredential")
+            .field("principal", &self.principal)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("use_for_signing", &self.use_for_signing)
+            .field("accept_from_ms", &self.accept_from_ms)
+            .field("accept_until_ms", &self.accept_until_ms)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for ResolvedStaticAuthCredential {
+    fn drop(&mut self) {
+        self.secret.fill(0);
+    }
+}
+
+struct ResolvedStaticTlsIdentity {
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl fmt::Debug for ResolvedStaticTlsIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedStaticTlsIdentity")
+            .field("certificate_count", &self.certified_key.cert.len())
+            .field("private_key", &"<redacted>")
+            .finish()
+    }
+}
+
+struct ResolvedStaticTlsTrustBundle {
+    roots: Arc<RootCertStore>,
+}
+
+impl fmt::Debug for ResolvedStaticTlsTrustBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedStaticTlsTrustBundle")
+            .field("root_count", &self.roots.len())
+            .finish()
+    }
+}
+
+pub(crate) struct ResolvedStaticClusterMaterial {
+    auth_credentials: Vec<ResolvedStaticAuthCredential>,
+    tls_identities: BTreeMap<String, ResolvedStaticTlsIdentity>,
+    tls_trust_bundles: BTreeMap<String, ResolvedStaticTlsTrustBundle>,
+}
+
+#[derive(Clone, Copy)]
+struct StaticMaterialLimits {
+    max_files: usize,
+    max_bytes: u64,
+}
+
+impl StaticMaterialLimits {
+    const PRODUCTION: Self = Self {
+        max_files: CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_FILES,
+        max_bytes: CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_BYTES,
+    };
+}
+
+struct StaticMaterialBudget {
+    limits: StaticMaterialLimits,
+    files_read: usize,
+    bytes_read: u64,
+}
+
+impl StaticMaterialBudget {
+    fn new(limits: StaticMaterialLimits) -> Self {
+        Self {
+            limits,
+            files_read: 0,
+            bytes_read: 0,
+        }
+    }
+
+    fn read(
+        &mut self,
+        reference: &str,
+        per_file_max_bytes: u64,
+        access: StaticMaterialFileAccess,
+        label: &str,
+    ) -> Result<Vec<u8>, String> {
+        if self.files_read >= self.limits.max_files {
+            return Err(format!(
+                "selected-process material exceeds the {}-file aggregate limit",
+                self.limits.max_files
+            ));
+        }
+        let remaining_bytes = self
+            .limits
+            .max_bytes
+            .checked_sub(self.bytes_read)
+            .ok_or_else(|| {
+                "selected-process material exceeded its aggregate byte limit".to_string()
+            })?;
+        let bytes = read_static_material_file_with_aggregate_limit(
+            reference,
+            per_file_max_bytes,
+            remaining_bytes,
+            access,
+            label,
+        )?;
+        self.files_read += 1;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| "selected-process material byte count overflowed".to_string())?;
+        Ok(bytes)
+    }
+}
+
+impl fmt::Debug for ResolvedStaticClusterMaterial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedStaticClusterMaterial")
+            .field("auth_credentials", &self.auth_credentials)
+            .field("tls_identities", &self.tls_identities)
+            .field("tls_trust_bundles", &self.tls_trust_bundles)
+            .finish()
+    }
+}
+
+impl ResolvedStaticClusterMaterial {
+    pub(crate) fn auth_credential_count(&self) -> usize {
+        self.auth_credentials.len()
+    }
+
+    pub(crate) fn tls_identity_count(&self) -> usize {
+        self.tls_identities.len()
+    }
+
+    pub(crate) fn tls_trust_bundle_count(&self) -> usize {
+        self.tls_trust_bundles.len()
+    }
+}
+
 impl ValidatedStaticClusterManifest {
     pub(crate) fn cluster_id(&self) -> &str {
         &self.manifest.cluster.id
@@ -333,6 +498,348 @@ impl ValidatedStaticClusterManifest {
 
     pub(crate) fn full_config_fingerprint(&self) -> &str {
         &self.full_config_fingerprint
+    }
+
+    pub(crate) fn resolve_selected_process_material(
+        &self,
+    ) -> Result<ResolvedStaticClusterMaterial, String> {
+        self.resolve_selected_process_material_at(storage::clock::current_time_millis())
+    }
+
+    fn resolve_selected_process_material_at(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ResolvedStaticClusterMaterial, String> {
+        self.resolve_selected_process_material_at_with_limits(
+            authority_now_ms,
+            StaticMaterialLimits::PRODUCTION,
+        )
+    }
+
+    fn resolve_selected_process_material_at_with_limits(
+        &self,
+        authority_now_ms: u64,
+        limits: StaticMaterialLimits,
+    ) -> Result<ResolvedStaticClusterMaterial, String> {
+        let mut material_budget = StaticMaterialBudget::new(limits);
+        let required_principals = self.selected_process_auth_principals()?;
+        let active_credentials = self
+            .manifest
+            .auth_credentials
+            .iter()
+            .filter_map(|credential| {
+                let principal = credential_principal_key(credential)
+                    .expect("validated credential has a canonical principal");
+                let active = credential.accept_from_ms <= authority_now_ms
+                    && credential
+                        .accept_until_ms
+                        .is_none_or(|until_ms| authority_now_ms < until_ms);
+                (required_principals.contains(&principal) && active)
+                    .then_some((credential, principal))
+            })
+            .collect::<Vec<_>>();
+        if self.manifest.deployment.internal_auth == InternalAuth::Required {
+            for required in &required_principals {
+                let active_signers = active_credentials
+                    .iter()
+                    .filter(|(credential, principal)| {
+                        principal == required && credential.use_for_signing
+                    })
+                    .count();
+                if active_signers != 1 {
+                    return Err(format!(
+                        "required principal {required:?} must have exactly one signing credential active at process startup"
+                    ));
+                }
+            }
+        }
+        let auth_credentials = active_credentials
+            .into_iter()
+            .map(|(credential, principal)| {
+                let secret = material_budget.read(
+                    &credential.secret_ref,
+                    CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+                    StaticMaterialFileAccess::Private,
+                    "credential secret",
+                )?;
+                Ok(ResolvedStaticAuthCredential {
+                    principal,
+                    credential_id: credential.credential_id.clone(),
+                    credential_version: credential.credential_version,
+                    use_for_signing: credential.use_for_signing,
+                    accept_from_ms: credential.accept_from_ms,
+                    accept_until_ms: credential.accept_until_ms,
+                    secret,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let selected_process = &self.manifest.processes[self.selected_process_index];
+        let local_tcp_endpoints = self
+            .manifest
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.owner_process_id == selected_process.id)
+            .filter(|endpoint| endpoint.advertise.starts_with("tcp://"))
+            .collect::<Vec<_>>();
+        let required_tls_identity_ids = local_tcp_endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.tls_identity_id.as_deref())
+            .collect::<BTreeSet<_>>();
+        let required_tls_trust_bundle_ids = self
+            .selected_process_outbound_tls_protocols()
+            .into_iter()
+            .flat_map(|protocol| {
+                self.manifest
+                    .endpoints
+                    .iter()
+                    .filter(move |endpoint| endpoint.protocol == protocol)
+            })
+            .filter(|endpoint| endpoint.advertise.starts_with("tcp://"))
+            .filter_map(|endpoint| endpoint.tls_trust_bundle_id.as_deref())
+            .chain(
+                local_tcp_endpoints
+                    .iter()
+                    .filter_map(|endpoint| endpoint.tls_trust_bundle_id.as_deref()),
+            )
+            .collect::<BTreeSet<_>>();
+
+        let provider = rustls::crypto::ring::default_provider();
+        let mut tls_identities = BTreeMap::new();
+        for identity in self
+            .manifest
+            .tls_identities
+            .iter()
+            .filter(|identity| required_tls_identity_ids.contains(identity.id.as_str()))
+        {
+            let certificate_bytes = material_budget.read(
+                &identity.certificate_ref,
+                CLUSTER_MANIFEST_MAX_TLS_CERTIFICATE_BYTES,
+                StaticMaterialFileAccess::Public,
+                "TLS certificate chain",
+            )?;
+            let certificates = parse_exact_certificate_pem(
+                &certificate_bytes,
+                &format!("TLS identity {} certificate reference", identity.id),
+            )?;
+            let private_key_bytes = material_budget.read(
+                &identity.private_key_ref,
+                CLUSTER_MANIFEST_MAX_TLS_PRIVATE_KEY_BYTES,
+                StaticMaterialFileAccess::Private,
+                "TLS private key",
+            )?;
+            let private_key = parse_exact_private_key_pem(
+                &private_key_bytes,
+                &format!("TLS identity {} private-key reference", identity.id),
+            )?;
+            let certified_key = CertifiedKey::from_der(certificates, private_key, &provider)
+                .map_err(|_| {
+                    format!(
+                        "TLS identity {} certificate and private key are incompatible",
+                        identity.id
+                    )
+                })?;
+            tls_identities.insert(
+                identity.id.clone(),
+                ResolvedStaticTlsIdentity {
+                    certified_key: Arc::new(certified_key),
+                },
+            );
+        }
+
+        let mut tls_trust_bundles = BTreeMap::new();
+        for bundle in self
+            .manifest
+            .tls_trust_bundles
+            .iter()
+            .filter(|bundle| required_tls_trust_bundle_ids.contains(bundle.id.as_str()))
+        {
+            let bundle_bytes = material_budget.read(
+                &bundle.ca_bundle_ref,
+                CLUSTER_MANIFEST_MAX_TLS_TRUST_BUNDLE_BYTES,
+                StaticMaterialFileAccess::Public,
+                "TLS trust bundle",
+            )?;
+            let certificates = parse_exact_certificate_pem(
+                &bundle_bytes,
+                &format!("TLS trust bundle {} reference", bundle.id),
+            )?;
+            let mut roots = RootCertStore::empty();
+            for certificate in certificates {
+                validate_ca_trust_anchor(&certificate).map_err(|_| {
+                    format!(
+                        "TLS trust bundle {} must contain only CA certificates with critical CA constraints and certificate-signing usage",
+                        bundle.id
+                    )
+                })?;
+                roots.add(certificate).map_err(|_| {
+                    format!(
+                        "TLS trust bundle {} must contain only valid CA certificates",
+                        bundle.id
+                    )
+                })?;
+            }
+            tls_trust_bundles.insert(
+                bundle.id.clone(),
+                ResolvedStaticTlsTrustBundle {
+                    roots: Arc::new(roots),
+                },
+            );
+        }
+
+        for endpoint in local_tcp_endpoints {
+            let identity_id = endpoint
+                .tls_identity_id
+                .as_deref()
+                .expect("validated TCP endpoint has a TLS identity");
+            let trust_bundle_id = endpoint
+                .tls_trust_bundle_id
+                .as_deref()
+                .expect("validated TCP endpoint has a TLS trust bundle");
+            let server_name = endpoint
+                .tls_server_name
+                .as_deref()
+                .expect("validated TCP endpoint has a TLS server name");
+            let identity = tls_identities
+                .get(identity_id)
+                .expect("selected-process TLS identity was resolved");
+            let trust_bundle = tls_trust_bundles
+                .get(trust_bundle_id)
+                .expect("selected-process TLS trust bundle was resolved");
+            let verifier = WebPkiServerVerifier::builder_with_provider(
+                Arc::clone(&trust_bundle.roots),
+                Arc::new(provider.clone()),
+            )
+            .build()
+            .map_err(|_| {
+                format!(
+                    "TCP endpoint {} has an invalid TLS trust bundle",
+                    endpoint.id
+                )
+            })?;
+            let server_name = ServerName::try_from(server_name.to_string()).map_err(|_| {
+                format!(
+                    "TCP endpoint {} has an invalid TLS server name",
+                    endpoint.id
+                )
+            })?;
+            let (end_entity, intermediates) =
+                identity.certified_key.cert.split_first().ok_or_else(|| {
+                    format!(
+                        "TCP endpoint {} TLS identity has no certificate",
+                        endpoint.id
+                    )
+                })?;
+            verifier
+                .verify_server_cert(
+                    end_entity,
+                    intermediates,
+                    &server_name,
+                    &[],
+                    UnixTime::now(),
+                )
+                .map_err(|_| {
+                    format!(
+                        "TCP endpoint {} TLS certificate does not match its server name or trust bundle",
+                        endpoint.id
+                    )
+                })?;
+        }
+
+        Ok(ResolvedStaticClusterMaterial {
+            auth_credentials,
+            tls_identities,
+            tls_trust_bundles,
+        })
+    }
+
+    fn selected_process_auth_principals(&self) -> Result<BTreeSet<CredentialPrincipalKey>, String> {
+        let selected_process = &self.manifest.processes[self.selected_process_index];
+        let mut required = BTreeSet::new();
+
+        required.extend(
+            self.manifest
+                .authorities
+                .iter()
+                .filter(|authority| authority.process_id == selected_process.id)
+                .filter_map(|authority| authority.raft_node_id)
+                .map(|node_id| CredentialPrincipalKey {
+                    principal: AuthPrincipal::RaftPeer,
+                    id: CredentialPrincipalId::Node(node_id),
+                }),
+        );
+        required.extend(
+            self.manifest
+                .storage_nodes
+                .iter()
+                .filter(|storage_node| storage_node.process_id == selected_process.id)
+                .map(|storage_node| CredentialPrincipalKey {
+                    principal: AuthPrincipal::StorageNode,
+                    id: CredentialPrincipalId::Node(u64::from(storage_node.node_id)),
+                }),
+        );
+        if let Some(instance_id) = &selected_process.frontend_instance_id {
+            required.insert(CredentialPrincipalKey {
+                principal: AuthPrincipal::Frontend,
+                id: CredentialPrincipalId::Instance(instance_id.clone()),
+            });
+        }
+        if let Some(instance_id) = &selected_process.admin_instance_id {
+            required.insert(CredentialPrincipalKey {
+                principal: AuthPrincipal::Admin,
+                id: CredentialPrincipalId::Instance(instance_id.clone()),
+            });
+        }
+        if let Some(instance_id) = &selected_process.maintenance_instance_id {
+            required.insert(CredentialPrincipalKey {
+                principal: AuthPrincipal::Maintenance,
+                id: CredentialPrincipalId::Instance(instance_id.clone()),
+            });
+        }
+
+        for endpoint in self
+            .manifest
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.owner_process_id == selected_process.id)
+        {
+            let accepted_roles = match endpoint.protocol {
+                EndpointProtocol::RaftPeer => &[AuthPrincipal::RaftPeer][..],
+                EndpointProtocol::ControlPlane
+                | EndpointProtocol::AuthorityClockRecovery
+                | EndpointProtocol::StorageRpc => &[
+                    AuthPrincipal::StorageNode,
+                    AuthPrincipal::Frontend,
+                    AuthPrincipal::Admin,
+                    AuthPrincipal::Maintenance,
+                ][..],
+            };
+            for credential in &self.manifest.auth_credentials {
+                if accepted_roles.contains(&credential.principal) {
+                    required.insert(credential_principal_key(credential)?);
+                }
+            }
+        }
+        Ok(required)
+    }
+
+    fn selected_process_outbound_tls_protocols(&self) -> BTreeSet<EndpointProtocol> {
+        let selected_process = &self.manifest.processes[self.selected_process_index];
+        let mut protocols = BTreeSet::new();
+        if selected_process.kind.has_control_plane() {
+            protocols.insert(EndpointProtocol::RaftPeer);
+        }
+        if selected_process.kind.has_storage_node() || selected_process.kind.has_frontend() {
+            protocols.insert(EndpointProtocol::ControlPlane);
+            protocols.insert(EndpointProtocol::StorageRpc);
+        }
+        if selected_process.admin_instance_id.is_some()
+            || selected_process.maintenance_instance_id.is_some()
+        {
+            protocols.insert(EndpointProtocol::ControlPlane);
+            protocols.insert(EndpointProtocol::AuthorityClockRecovery);
+        }
+        protocols
     }
 
     pub(crate) fn initialize_standalone_storage(&self) -> Result<(), String> {
@@ -569,13 +1076,13 @@ impl fmt::Debug for ValidatedStaticClusterManifest {
     }
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum CredentialPrincipalId {
     Node(u64),
     Instance(String),
 }
 
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CredentialPrincipalKey {
     principal: AuthPrincipal,
     id: CredentialPrincipalId,
@@ -3117,6 +3624,234 @@ fn validate_file_reference(value: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn parse_exact_pem_sections(
+    bytes: &[u8],
+    label: &str,
+) -> Result<Vec<(SectionKind, Vec<u8>)>, String> {
+    if !bytes.is_ascii() {
+        return Err(format!("{label} contains non-ASCII PEM content"));
+    }
+
+    let mut declared_kinds = Vec::new();
+    let mut open_section: Option<(SectionKind, Vec<u8>)> = None;
+    for raw_line in bytes.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let Some((kind, section_label)) = open_section.as_ref() else {
+            if line.is_empty() {
+                continue;
+            }
+            let section_label = line
+                .strip_prefix(b"-----BEGIN ")
+                .and_then(|line| line.strip_suffix(b"-----"))
+                .ok_or_else(|| format!("{label} contains content outside a PEM section"))?;
+            let kind = SectionKind::try_from(section_label)
+                .map_err(|_| format!("{label} contains an unsupported PEM section"))?;
+            open_section = Some((kind, section_label.to_vec()));
+            continue;
+        };
+
+        if let Some(end_label) = line
+            .strip_prefix(b"-----END ")
+            .and_then(|line| line.strip_suffix(b"-----"))
+        {
+            if end_label != section_label {
+                return Err(format!("{label} contains a mismatched PEM end marker"));
+            }
+            declared_kinds.push(*kind);
+            open_section = None;
+        } else if line.starts_with(b"-----BEGIN ") || line.starts_with(b"-----END ") {
+            return Err(format!(
+                "{label} contains a nested or malformed PEM section"
+            ));
+        }
+    }
+    if open_section.is_some() {
+        return Err(format!("{label} contains an unterminated PEM section"));
+    }
+    if declared_kinds.is_empty() {
+        return Err(format!("{label} contains no PEM sections"));
+    }
+
+    let parsed = <(SectionKind, Vec<u8>)>::pem_slice_iter(bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| format!("{label} contains malformed PEM"))?;
+    if parsed.len() != declared_kinds.len()
+        || parsed
+            .iter()
+            .zip(&declared_kinds)
+            .any(|((actual, _), declared)| actual != declared)
+    {
+        return Err(format!("{label} contains unparsed PEM content"));
+    }
+    Ok(parsed)
+}
+
+fn parse_exact_certificate_pem(
+    bytes: &[u8],
+    label: &str,
+) -> Result<Vec<CertificateDer<'static>>, String> {
+    parse_exact_pem_sections(bytes, label)?
+        .into_iter()
+        .map(|(kind, der)| {
+            if kind != SectionKind::Certificate {
+                return Err(format!(
+                    "{label} must contain certificate PEM sections only"
+                ));
+            }
+            Ok(CertificateDer::from(der))
+        })
+        .collect()
+}
+
+fn parse_exact_private_key_pem(
+    bytes: &[u8],
+    label: &str,
+) -> Result<PrivateKeyDer<'static>, String> {
+    let sections = parse_exact_pem_sections(bytes, label)?;
+    if sections.len() != 1
+        || !matches!(
+            sections[0].0,
+            SectionKind::RsaPrivateKey | SectionKind::PrivateKey | SectionKind::EcPrivateKey
+        )
+    {
+        return Err(format!(
+            "{label} must contain exactly one private-key PEM section"
+        ));
+    }
+    PrivateKeyDer::from_pem_slice(bytes).map_err(|_| format!("{label} contains malformed PEM"))
+}
+
+fn validate_ca_trust_anchor(certificate: &CertificateDer<'_>) -> Result<(), ()> {
+    let certificate = Certificate::from_der(certificate.as_ref()).map_err(|_| ())?;
+    let Some((basic_constraints_critical, basic_constraints)) = certificate
+        .tbs_certificate()
+        .get_extension::<BasicConstraints>()
+        .map_err(|_| ())?
+    else {
+        return Err(());
+    };
+    if !basic_constraints_critical || !basic_constraints.ca {
+        return Err(());
+    }
+    let Some((key_usage_critical, key_usage)) = certificate
+        .tbs_certificate()
+        .get_extension::<KeyUsage>()
+        .map_err(|_| ())?
+    else {
+        return Err(());
+    };
+    if !key_usage_critical || !key_usage.key_cert_sign() {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StaticMaterialFileAccess {
+    Private,
+    Public,
+}
+
+#[cfg(test)]
+fn read_static_material_file(
+    reference: &str,
+    max_bytes: u64,
+    access: StaticMaterialFileAccess,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    read_static_material_file_with_aggregate_limit(reference, max_bytes, u64::MAX, access, label)
+}
+
+fn read_static_material_file_with_aggregate_limit(
+    reference: &str,
+    max_bytes: u64,
+    aggregate_remaining_bytes: u64,
+    access: StaticMaterialFileAccess,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let path = reference
+        .strip_prefix("file:")
+        .ok_or_else(|| format!("{label} reference must use file:"))?;
+    let path = Path::new(path);
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options
+        .open(path)
+        .map_err(|error| format!("open {label} reference {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect {label} reference {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{label} reference {} is not a regular file",
+            path.display()
+        ));
+    }
+    let effective_uid = {
+        // SAFETY: geteuid has no preconditions and does not mutate memory.
+        unsafe { libc::geteuid() }
+    };
+    if metadata.uid() != effective_uid {
+        return Err(format!(
+            "{label} reference {} is not owned by the effective process user",
+            path.display()
+        ));
+    }
+    let mode = metadata.mode() & 0o777;
+    match access {
+        StaticMaterialFileAccess::Private if mode & 0o077 != 0 => {
+            return Err(format!(
+                "{label} reference {} grants group or other permissions",
+                path.display()
+            ));
+        }
+        StaticMaterialFileAccess::Public if mode & 0o022 != 0 => {
+            return Err(format!(
+                "{label} reference {} is group or other writable",
+                path.display()
+            ));
+        }
+        StaticMaterialFileAccess::Private | StaticMaterialFileAccess::Public => {}
+    }
+    if metadata.len() == 0 {
+        return Err(format!("{label} reference {} is empty", path.display()));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{label} reference {} exceeds {max_bytes} bytes",
+            path.display()
+        ));
+    }
+    if metadata.len() > aggregate_remaining_bytes {
+        return Err(format!(
+            "selected-process material exceeds its aggregate byte limit while loading {label} reference {}",
+            path.display()
+        ));
+    }
+    let bounded_capacity = usize::try_from(metadata.len())
+        .unwrap_or(usize::MAX)
+        .min(max_bytes as usize);
+    let mut bytes = Vec::with_capacity(bounded_capacity);
+    file.take(max_bytes.min(aggregate_remaining_bytes) + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read {label} reference {}: {error}", path.display()))?;
+    if bytes.len() > max_bytes as usize {
+        return Err(format!(
+            "{label} reference {} exceeds {max_bytes} bytes",
+            path.display()
+        ));
+    }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > aggregate_remaining_bytes {
+        return Err(format!(
+            "selected-process material exceeds its aggregate byte limit while loading {label} reference {}",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
 fn validate_identifier(value: &str, max_len: usize, field: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > max_len
@@ -3191,6 +3926,62 @@ mod tests {
     fn private_dir(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn write_material_file(path: &Path, bytes: &[u8], mode: u32) {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn materialized_replicated_manifest(
+        selected_process_id: &str,
+    ) -> (test_util::TempDir, ValidatedStaticClusterManifest) {
+        let dir = test_util::tempdir();
+        let material_dir = dir.path().join("material");
+        private_dir(&material_dir);
+        write_material_file(
+            &material_dir.join("cluster-ca.pem"),
+            include_bytes!("../../s3-tests/testdata/ca-cert.pem"),
+            0o644,
+        );
+        write_material_file(
+            &material_dir.join("host-1.crt"),
+            include_bytes!("../../s3-tests/testdata/localhost-cert.pem"),
+            0o644,
+        );
+        write_material_file(
+            &material_dir.join("host-1.key"),
+            include_bytes!("../../s3-tests/testdata/localhost-key.pem"),
+            0o600,
+        );
+        for principal in ["raft", "storage", "admin"] {
+            for number in 1..=3 {
+                let secret = if principal == "raft" && number == 1 {
+                    vec![0, 1, 2, 0xff]
+                } else {
+                    format!("{principal}-{number}-secret").into_bytes()
+                };
+                write_material_file(
+                    &material_dir.join(format!("{principal}-{number}.key")),
+                    &secret,
+                    0o600,
+                );
+            }
+        }
+        let manifest = replicated_manifest()
+            .replace("/run/argmin-secrets", material_dir.to_str().unwrap())
+            .replace("tcp://control-1.internal:", "tcp://localhost:")
+            .replace("tcp://storage-1.internal:", "tcp://localhost:")
+            .replace(
+                "tls_server_name = \"control-1.internal\"",
+                "tls_server_name = \"localhost\"",
+            )
+            .replace(
+                "tls_server_name = \"storage-1.internal\"",
+                "tls_server_name = \"localhost\"",
+            );
+        let validated = parse_static_cluster_manifest(&manifest, selected_process_id).unwrap();
+        (dir, validated)
     }
 
     fn validate_test_selected_host_filesystem(
@@ -4519,6 +5310,299 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         let malformed = format!("{}\ninline_secret = \"{secret}\"\n", standalone_manifest());
         let error = parse_static_cluster_manifest(&malformed, "all-1").unwrap_err();
         assert!(!error.contains(secret));
+    }
+
+    #[test]
+    fn static_cluster_material_resolution_is_selected_process_scoped_and_redacted() {
+        let (_dir, control_manifest) = materialized_replicated_manifest("control-1");
+        let control_material = control_manifest
+            .resolve_selected_process_material()
+            .unwrap();
+        assert_eq!(control_material.auth_credential_count(), 9);
+        assert_eq!(control_material.tls_identity_count(), 1);
+        assert_eq!(control_material.tls_trust_bundle_count(), 1);
+        assert_eq!(
+            control_material
+                .auth_credentials
+                .iter()
+                .find(|credential| credential.credential_id == "raft-1")
+                .unwrap()
+                .secret
+                .as_slice(),
+            &[0, 1, 2, 0xff]
+        );
+        let debug = format!("{control_material:?}");
+        assert!(!debug.contains("raft-1-secret"));
+        assert!(!debug.contains("BEGIN PRIVATE KEY"));
+        assert!(!debug.contains(char::from(0xff)));
+
+        let (_dir, storage_manifest) = materialized_replicated_manifest("storage-1");
+        let storage_material = storage_manifest
+            .resolve_selected_process_material()
+            .unwrap();
+        assert_eq!(storage_material.auth_credential_count(), 6);
+        assert!(storage_material
+            .auth_credentials
+            .iter()
+            .all(|credential| credential.principal.principal != AuthPrincipal::RaftPeer));
+        assert_eq!(storage_material.tls_identity_count(), 1);
+        assert_eq!(storage_material.tls_trust_bundle_count(), 1);
+    }
+
+    #[test]
+    fn static_cluster_material_resolution_applies_startup_rotation_windows() {
+        let (_dir, mut manifest) = materialized_replicated_manifest("control-1");
+        let old_index = manifest
+            .manifest
+            .auth_credentials
+            .iter()
+            .position(|credential| credential.credential_id == "raft-1")
+            .unwrap();
+        manifest.manifest.auth_credentials[old_index].accept_until_ms = Some(100);
+        let mut next = manifest.manifest.auth_credentials[old_index].clone();
+        next.credential_id = "raft-1-next".to_string();
+        next.credential_version = 2;
+        next.accept_from_ms = 100;
+        next.accept_until_ms = None;
+        next.secret_ref = "file:/missing/future-raft-credential".to_string();
+        manifest.manifest.auth_credentials.push(next);
+
+        let before_rotation = manifest.resolve_selected_process_material_at(99).unwrap();
+        assert!(before_rotation
+            .auth_credentials
+            .iter()
+            .any(|credential| credential.credential_id == "raft-1"));
+        assert!(before_rotation
+            .auth_credentials
+            .iter()
+            .all(|credential| credential.credential_id != "raft-1-next"));
+
+        assert!(manifest
+            .resolve_selected_process_material_at(100)
+            .unwrap_err()
+            .contains("future-raft-credential"));
+
+        manifest.manifest.auth_credentials[old_index].accept_until_ms = Some(90);
+        assert!(manifest
+            .resolve_selected_process_material_at(95)
+            .unwrap_err()
+            .contains("exactly one signing credential active"));
+    }
+
+    #[test]
+    fn static_cluster_material_resolution_loads_role_required_remote_trust_bundles() {
+        let (dir, mut manifest) = materialized_replicated_manifest("control-1");
+        let remote_ca_path = dir.path().join("material/remote-control-ca.pem");
+        write_material_file(
+            &remote_ca_path,
+            include_bytes!("../../s3-tests/testdata/ca-cert.pem"),
+            0o644,
+        );
+        manifest
+            .manifest
+            .tls_trust_bundles
+            .push(TlsTrustBundleInput {
+                id: "remote-control-ca".to_string(),
+                ca_bundle_ref: format!("file:{}", remote_ca_path.display()),
+            });
+        for endpoint in manifest.manifest.endpoints.iter_mut().filter(|endpoint| {
+            endpoint.owner_process_id != "control-1"
+                && matches!(
+                    endpoint.protocol,
+                    EndpointProtocol::ControlPlane | EndpointProtocol::AuthorityClockRecovery
+                )
+        }) {
+            endpoint.tls_trust_bundle_id = Some("remote-control-ca".to_string());
+        }
+
+        let material = manifest.resolve_selected_process_material().unwrap();
+
+        assert_eq!(material.tls_trust_bundle_count(), 2);
+        assert!(material.tls_trust_bundles.contains_key("remote-control-ca"));
+    }
+
+    #[test]
+    fn static_cluster_material_resolution_enforces_aggregate_file_and_byte_limits() {
+        let (_dir, manifest) = materialized_replicated_manifest("control-1");
+        let file_error = manifest
+            .resolve_selected_process_material_at_with_limits(
+                0,
+                StaticMaterialLimits {
+                    max_files: 1,
+                    max_bytes: CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_BYTES,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            file_error.contains("file aggregate limit"),
+            "unexpected error: {file_error}"
+        );
+
+        let byte_error = manifest
+            .resolve_selected_process_material_at_with_limits(
+                0,
+                StaticMaterialLimits {
+                    max_files: CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_FILES,
+                    max_bytes: 3,
+                },
+            )
+            .unwrap_err();
+        assert!(
+            byte_error.contains("aggregate byte limit"),
+            "unexpected error: {byte_error}"
+        );
+    }
+
+    #[test]
+    fn static_cluster_material_reader_rejects_unsafe_files_before_allocation() {
+        let dir = test_util::tempdir();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        write_material_file(&target, b"secret", 0o600);
+        symlink(&target, &link).unwrap();
+        let link_reference = format!("file:{}", link.display());
+        assert!(read_static_material_file(
+            &link_reference,
+            CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+            StaticMaterialFileAccess::Private,
+            "credential secret",
+        )
+        .unwrap_err()
+        .contains("open credential secret"));
+
+        let permissive = dir.path().join("permissive");
+        write_material_file(&permissive, b"secret", 0o640);
+        let permissive_reference = format!("file:{}", permissive.display());
+        assert!(read_static_material_file(
+            &permissive_reference,
+            CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+            StaticMaterialFileAccess::Private,
+            "credential secret",
+        )
+        .unwrap_err()
+        .contains("group or other permissions"));
+
+        let empty = dir.path().join("empty");
+        write_material_file(&empty, b"", 0o600);
+        let empty_reference = format!("file:{}", empty.display());
+        assert!(read_static_material_file(
+            &empty_reference,
+            CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+            StaticMaterialFileAccess::Private,
+            "credential secret",
+        )
+        .unwrap_err()
+        .contains("is empty"));
+
+        let oversized = dir.path().join("oversized");
+        write_material_file(
+            &oversized,
+            &vec![b'x'; CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES as usize + 1],
+            0o600,
+        );
+        let oversized_reference = format!("file:{}", oversized.display());
+        assert!(read_static_material_file(
+            &oversized_reference,
+            CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+            StaticMaterialFileAccess::Private,
+            "credential secret",
+        )
+        .unwrap_err()
+        .contains("exceeds"));
+    }
+
+    #[test]
+    fn static_cluster_material_resolution_rejects_malformed_or_untrusted_tls_without_leaks() {
+        let (dir, manifest) = materialized_replicated_manifest("control-1");
+        let certificate_path = dir.path().join("material/host-1.crt");
+        let sentinel = b"DO-NOT-LOG-TLS-CONTENT";
+        write_material_file(&certificate_path, sentinel, 0o644);
+        let error = manifest.resolve_selected_process_material().unwrap_err();
+        assert!(error.contains("content outside a PEM section"));
+        assert!(!error.contains(std::str::from_utf8(sentinel).unwrap()));
+
+        let (_dir, mut manifest) = materialized_replicated_manifest("control-1");
+        for endpoint in manifest
+            .manifest
+            .endpoints
+            .iter_mut()
+            .filter(|endpoint| endpoint.owner_process_id == "control-1")
+        {
+            endpoint.tls_server_name = Some("wrong.internal".to_string());
+        }
+        assert!(manifest
+            .resolve_selected_process_material()
+            .unwrap_err()
+            .contains("does not match its server name or trust bundle"));
+    }
+
+    #[test]
+    fn static_cluster_material_resolution_rejects_non_ca_trust_anchors() {
+        let (dir, manifest) = materialized_replicated_manifest("control-1");
+        let trust_bundle_path = dir.path().join("material/cluster-ca.pem");
+        let mut mixed_bundle = include_bytes!("../../s3-tests/testdata/ca-cert.pem").to_vec();
+        mixed_bundle
+            .extend_from_slice(include_bytes!("../../s3-tests/testdata/localhost-cert.pem"));
+        write_material_file(&trust_bundle_path, &mixed_bundle, 0o644);
+
+        let error = manifest.resolve_selected_process_material().unwrap_err();
+
+        assert!(
+            error.contains("critical CA constraints and certificate-signing usage"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn static_cluster_material_resolution_rejects_unexpected_pem_sections() {
+        let (dir, manifest) = materialized_replicated_manifest("control-1");
+        let certificate_path = dir.path().join("material/host-1.crt");
+        let mut certificate_with_key =
+            include_bytes!("../../s3-tests/testdata/localhost-cert.pem").to_vec();
+        certificate_with_key
+            .extend_from_slice(include_bytes!("../../s3-tests/testdata/localhost-key.pem"));
+        write_material_file(&certificate_path, &certificate_with_key, 0o644);
+        let error = manifest.resolve_selected_process_material().unwrap_err();
+        assert!(
+            error.contains("certificate PEM sections only"),
+            "unexpected error: {error}"
+        );
+
+        let (dir, manifest) = materialized_replicated_manifest("control-1");
+        let private_key_path = dir.path().join("material/host-1.key");
+        let mut duplicate_keys =
+            include_bytes!("../../s3-tests/testdata/localhost-key.pem").to_vec();
+        duplicate_keys
+            .extend_from_slice(include_bytes!("../../s3-tests/testdata/localhost-key.pem"));
+        write_material_file(&private_key_path, &duplicate_keys, 0o600);
+        let error = manifest.resolve_selected_process_material().unwrap_err();
+        assert!(
+            error.contains("exactly one private-key PEM section"),
+            "unexpected error: {error}"
+        );
+
+        let (dir, manifest) = materialized_replicated_manifest("control-1");
+        let trust_bundle_path = dir.path().join("material/cluster-ca.pem");
+        let mut bundle_with_key = include_bytes!("../../s3-tests/testdata/ca-cert.pem").to_vec();
+        bundle_with_key
+            .extend_from_slice(include_bytes!("../../s3-tests/testdata/localhost-key.pem"));
+        write_material_file(&trust_bundle_path, &bundle_with_key, 0o644);
+        let error = manifest.resolve_selected_process_material().unwrap_err();
+        assert!(
+            error.contains("certificate PEM sections only"),
+            "unexpected error: {error}"
+        );
+
+        let (dir, manifest) = materialized_replicated_manifest("control-1");
+        let trust_bundle_path = dir.path().join("material/cluster-ca.pem");
+        let mut bundle_with_text = b"unexpected material\n".to_vec();
+        bundle_with_text.extend_from_slice(include_bytes!("../../s3-tests/testdata/ca-cert.pem"));
+        write_material_file(&trust_bundle_path, &bundle_with_text, 0o644);
+        let error = manifest.resolve_selected_process_material().unwrap_err();
+        assert!(
+            error.contains("content outside a PEM section"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

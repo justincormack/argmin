@@ -32,6 +32,7 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
+x509-cert = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 openraft = { version = "=0.10.0-alpha.30", default-features = false }
