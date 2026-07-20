@@ -1394,7 +1394,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn payload_reclaim_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -1404,7 +1404,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn get_bucket_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::get_bucket_payload_reclaim_root(self, pg_id, bucket)
@@ -1412,14 +1412,14 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn get_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::get_payload_reclaim_root(self, pg_id)
     }
 
     fn get_object_payload_reclaim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -1435,14 +1435,14 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::object_payload_reclaim_claim(self, pg_id)
     }
 
     fn acquire_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         key: &ObjectKey,
@@ -1474,7 +1474,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
 
     fn release_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         claim: &ObjectPayloadReclaimClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::release_object_payload_reclaim_claim(self, pg_id, claim)
@@ -2769,7 +2769,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn payload_reclaim_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -3699,7 +3699,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn get_bucket_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -3710,7 +3710,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn get_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::get_payload_reclaim_root(&*pg)?)
@@ -3718,7 +3718,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn get_object_payload_reclaim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -3738,7 +3738,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::object_payload_reclaim_claim(&*pg)?)
@@ -3746,7 +3746,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn acquire_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         key: &ObjectKey,
@@ -3778,7 +3778,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
 
     fn release_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         claim: &ObjectPayloadReclaimClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;

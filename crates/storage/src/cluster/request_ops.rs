@@ -6543,19 +6543,17 @@ impl super::StorageCluster {
     ) -> Result<Vec<PayloadReclaimRoot>, BucketWriteDrainError> {
         let mut roots = Vec::new();
         for pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(pg_id);
+            let scan_pg_id = self.object_metadata_scan_pg(pg_id);
             let node = self
                 .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
             if let Some(root) = node
                 .object_mutation_metadata_client()
-                .get_bucket_payload_reclaim_root(PgId::new(pg_id), bucket)
+                .get_bucket_payload_reclaim_root(scan_pg_id, bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
             {
-                self.validate_bucket_payload_reclaim_root_for_pg(
-                    PgId::new(pg_id),
-                    &root,
-                    node.node_id(),
-                )?;
+                self.validate_bucket_payload_reclaim_root_for_pg(pg_id, &root, node.node_id())?;
                 roots.push(root);
             }
         }
@@ -8142,11 +8140,12 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .object_mutation_metadata_client()
-            .payload_reclaim_exists(pg_id, bucket, key, generation_id)
+            .payload_reclaim_exists(object_pg_id, bucket, key, generation_id)
     }
 
     pub fn get_object_tags_if<E>(
@@ -10301,7 +10300,8 @@ impl super::StorageCluster {
         generation_id: GenerationId,
     ) -> Result<super::ObjectPayloadReclaimAttempt, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(ReclaimObjectPayloadIfUnleased);
-        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let pg_id = object_pg_id.pg_id();
         let emit_outcome = |outcome: &'static str| {
             let _ = observability::emit_object_payload_reclaim_event(
                 super::TRACE_TARGET,
@@ -10367,7 +10367,7 @@ impl super::StorageCluster {
             }
 
             mutation_client
-                .get_object_payload_reclaim(pg_id, bucket, key, generation_id)
+                .get_object_payload_reclaim(object_pg_id, bucket, key, generation_id)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
         };
 
@@ -10399,7 +10399,7 @@ impl super::StorageCluster {
         let claimed_at = crate::clock::current_time_millis();
         let claim = mutation_client
             .acquire_object_payload_reclaim_claim(
-                pg_id,
+                object_pg_id,
                 bucket,
                 bucket_incarnation_generation,
                 key,
@@ -10420,7 +10420,7 @@ impl super::StorageCluster {
 
         let release_reclaim_claim = || -> Result<(), ObjectPgActionError> {
             mutation_client
-                .release_object_payload_reclaim_claim(pg_id, &claim)
+                .release_object_payload_reclaim_claim(object_pg_id, &claim)
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
         };
 
@@ -10578,6 +10578,7 @@ impl super::StorageCluster {
         let mut scan = DurableObjectPayloadReclaimScan::default();
         for pg_id in self.metadata_pg_ids() {
             let pg_id = PgId::new(pg_id);
+            let scan_pg_id = self.object_metadata_scan_pg(pg_id);
             let emit_scan = |outcome: &'static str| {
                 let _ = observability::emit_object_payload_reclaim_durable_scan(
                     super::TRACE_TARGET,
@@ -10609,7 +10610,7 @@ impl super::StorageCluster {
             };
             let root = match node
                 .object_mutation_metadata_client()
-                .get_payload_reclaim_root(pg_id)
+                .get_payload_reclaim_root(scan_pg_id)
             {
                 Ok(root) => root,
                 Err(error) => {
@@ -13683,7 +13684,7 @@ impl super::StorageCluster {
             }
             match node
                 .object_mutation_metadata_client()
-                .object_payload_reclaim_claim(object_pg_id)
+                .object_payload_reclaim_claim(scan_pg_id)
             {
                 Ok(Some(claim)) => {
                     payload_reclaim_claims.push(BucketDeleteDebugPayloadReclaimClaim {
@@ -13712,7 +13713,7 @@ impl super::StorageCluster {
             }
             let root = match node
                 .object_mutation_metadata_client()
-                .get_bucket_payload_reclaim_root(object_pg_id, bucket)
+                .get_bucket_payload_reclaim_root(scan_pg_id, bucket)
             {
                 Ok(Some(root)) => root,
                 Ok(None) => continue,
@@ -13738,7 +13739,7 @@ impl super::StorageCluster {
             let reclaim_details = match node
                 .object_mutation_metadata_client()
                 .get_object_payload_reclaim(
-                    object_pg_id,
+                    self.object_metadata_pg(&root.bucket, &root.key),
                     &root.bucket,
                     &root.key,
                     root.generation_id,

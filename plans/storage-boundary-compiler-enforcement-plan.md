@@ -889,6 +889,37 @@ Twelfth Phase 3 slice:
   the boundary checker, formatting, workspace-wide strict Clippy, and the full
   workspace suite (7,196 tests).
 
+Thirteenth Phase 3 slice:
+
+- exact-object payload-reclaim existence, durable command lookup, claim
+  acquisition, and claim release now require `ObjectMetadataPgId`.
+  Bucket-scoped and all-PG reclaim-root discovery, together with per-PG claim
+  discovery, require `ObjectMetadataScanPgId`. The duplicate methods on the
+  transitional `StorageNodeClient` aggregate carry the same roles.
+- cluster reclaim execution derives one exact-object role for `(bucket, key)`;
+  bucket-delete visibility/debug and durable reclaim discovery derive scan
+  roles only from installed object-metadata PGs. Raw PG IDs remain only for
+  routing, generic metadata-command work, diagnostics, and returned-row
+  placement validation.
+- local adapters erase the roles only at the private raw-node boundary. Unix
+  adapters serialize their raw route evidence, and the Unix server reconstructs
+  the applicable role only after route, primary, and, for exact operations,
+  object-placement validation.
+- both reclaim-root scan endpoints and the reclaim-claim scan endpoint now
+  validate every returned `(bucket, key)` against the scanned PG before
+  responding. This closes a pre-existing Unix boundary gap where misplaced
+  durable reclaim state could be returned to the cluster.
+- a dedicated two-PG Unix regression installs equivalent reclaim roots and
+  active claims on the correct and wrong PGs. Correct exact-object and scan
+  calls are positive canaries; test-forged wrong exact roles and misplaced
+  scan results must fail with the exact `PayloadDecode` placement error. It
+  also proves a rejected wrong-PG claim release does not mutate the claim.
+- shard-ack/scavenger data-client signatures, `DataPgId` construction, and
+  request-scoped route capability values remain open in Phase 3.
+- the thirteenth slice passed its focused payload-reclaim Unix regressions,
+  the boundary checker, formatting, workspace-wide strict Clippy, and the full
+  workspace suite (7,222 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

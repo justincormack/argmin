@@ -2318,11 +2318,12 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn payload_reclaim_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
+        let pg_id = pg_id.pg_id();
         let request = StorageRpcObjectPayloadReclaimExistsRequest {
             object: self.object_request(pg_id, bucket, key),
             generation_id,
@@ -2342,9 +2343,10 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn get_bucket_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let pg_id = pg_id.pg_id();
         let request = StorageRpcBucketRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
@@ -2370,8 +2372,9 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn get_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError> {
+        let pg_id = pg_id.pg_id();
         let payload = self.encode_metadata_command_state_request(pg_id);
         let response = self
             .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimRoot, payload)
@@ -2387,11 +2390,12 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn get_object_payload_reclaim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
+        let pg_id = pg_id.pg_id();
         let request = StorageRpcObjectPayloadReclaimExistsRequest {
             object: self.object_request(pg_id, bucket, key),
             generation_id,
@@ -2421,8 +2425,9 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        let pg_id = pg_id.pg_id();
         let payload = self.encode_metadata_command_state_request(pg_id);
         let response = self
             .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimClaimGet, payload)
@@ -2450,7 +2455,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         key: &ObjectKey,
@@ -2463,6 +2468,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         lease_deadline: Option<u64>,
         now: u64,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        let pg_id = pg_id.pg_id();
         let request = StorageRpcObjectPayloadReclaimClaimAcquireRequest {
             object: StorageRpcObjectRequest {
                 node_id: self.node_id,
@@ -2522,9 +2528,10 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
 
     fn release_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         claim: &ObjectPayloadReclaimClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError> {
+        let pg_id = pg_id.pg_id();
         let request = StorageRpcObjectPayloadReclaimClaimRecordRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,

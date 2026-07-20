@@ -2008,7 +2008,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         && upload.key == listed_stream_request.key));
     let reclaim_root = ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
         &client,
-        PgId::new(0),
+        ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
         &bucket,
     )
     .unwrap()
@@ -2016,14 +2016,16 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     assert_eq!(reclaim_root.bucket, bucket);
     assert_eq!(reclaim_root.key, key);
     assert_eq!(reclaim_root.generation_id, reclaim_generation_id);
-    let pg_reclaim_root =
-        ObjectMutationMetadataNodeClient::get_payload_reclaim_root(&client, PgId::new(0))
-            .unwrap()
-            .expect("seeded PG reclaim root should exist");
+    let pg_reclaim_root = ObjectMutationMetadataNodeClient::get_payload_reclaim_root(
+        &client,
+        ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+    )
+    .unwrap()
+    .expect("seeded PG reclaim root should exist");
     assert_eq!(pg_reclaim_root, reclaim_root);
     let object_reclaim = ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         reclaim_generation_id,
@@ -2039,7 +2041,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     ));
     let claim = ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         1,
         &key,
@@ -2057,14 +2059,16 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     assert_eq!(claim.bucket, bucket);
     assert_eq!(claim.key, key);
     assert_eq!(claim.generation_id, reclaim_generation_id);
-    let loaded_claim =
-        ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, PgId::new(0))
-            .unwrap()
-            .expect("seeded object reclaim claim should load");
+    let loaded_claim = ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(
+        &client,
+        ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+    )
+    .unwrap()
+    .expect("seeded object reclaim claim should load");
     assert_eq!(loaded_claim, claim);
     ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &claim,
     )
     .unwrap();
@@ -2082,7 +2086,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         .unwrap_err();
     assert!(ObjectMutationMetadataNodeClient::payload_reclaim_exists(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         reclaim_generation_id,
@@ -2090,7 +2094,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     .unwrap());
     assert!(!ObjectMutationMetadataNodeClient::payload_reclaim_exists(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         GenerationId::new(22).unwrap(),
@@ -2574,7 +2578,7 @@ fn unix_payload_reclaim_exists_requires_pg_primary() {
 
     let err = ObjectMutationMetadataNodeClient::payload_reclaim_exists(
         &client,
-        PgId::new(0),
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
         GenerationId::new(1).unwrap(),
@@ -2609,7 +2613,7 @@ fn unix_bucket_payload_reclaim_root_requires_pg_primary() {
 
     let err = ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
         &client,
-        PgId::new(0),
+        ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
         &bucket,
     )
     .unwrap_err();
@@ -2639,8 +2643,11 @@ fn unix_object_payload_reclaim_root_requires_pg_primary() {
         config.socket_path.clone(),
     );
 
-    let err = ObjectMutationMetadataNodeClient::get_payload_reclaim_root(&client, PgId::new(0))
-        .unwrap_err();
+    let err = ObjectMutationMetadataNodeClient::get_payload_reclaim_root(
+        &client,
+        ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+    )
+    .unwrap_err();
 
     assert!(matches!(
         err,
@@ -2650,6 +2657,249 @@ fn unix_object_payload_reclaim_root_requires_pg_primary() {
         })
     ));
     server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
+    macro_rules! assert_object_payload_decode {
+        ($result:expr) => {
+            assert!(matches!(
+                $result.unwrap_err(),
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                })
+            ));
+        };
+    }
+    macro_rules! assert_bucket_payload_decode {
+        ($result:expr) => {
+            assert!(matches!(
+                $result.unwrap_err(),
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                })
+            ));
+        };
+    }
+
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes.push(StorageNodePgRoute {
+        pg_id: 1,
+        cluster_epoch: ClusterEpoch::new(1).unwrap(),
+        state: crate::types::PgState::Active,
+        primary_node_id: NodeId::new(7),
+        acting_set: vec![NodeId::new(7)],
+    });
+    let bucket = crate::tests::bucket_name("object-reclaim-role-rpc-bucket");
+    let generation_id = GenerationId::new(91).unwrap();
+    let (key, correct_raw_pg, wrong_raw_pg, correct_claim, wrong_claim) = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let key = (0..100)
+            .map(|index| crate::tests::object_key(format!("reclaim-key-{index}")))
+            .find(|key| node.pg_topology().object_pg_for(&bucket, key) == 1)
+            .expect("two-PG topology must place a test object on PG 1");
+        let correct_raw_pg = 1;
+        let wrong_raw_pg = 0;
+        let reclaim = ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: 12,
+            segments: Vec::new(),
+        };
+        let mut claims = Vec::new();
+        for raw_pg_id in [correct_raw_pg, wrong_raw_pg] {
+            let pg = node.get_pg(raw_pg_id).unwrap();
+            PgMetadataStore::put_object_segments_reclaim(&*pg, &reclaim).unwrap();
+            claims.push(
+                PgMetadataStore::acquire_object_payload_reclaim_claim(
+                    &*pg,
+                    &bucket,
+                    1,
+                    &key,
+                    generation_id,
+                    ObjectPayloadReclaimKind::ObjectSegments,
+                    "object-reclaim-role-claim",
+                    "object-reclaim-role-owner",
+                    ClusterEpoch::new(1).unwrap(),
+                    100,
+                    Some(1_000),
+                    100,
+                )
+                .unwrap()
+                .expect("seeded reclaim must be claimable on either PG"),
+            );
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        (
+            key,
+            correct_raw_pg,
+            wrong_raw_pg,
+            claims.remove(0),
+            claims.remove(0),
+        )
+    };
+    let correct_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_raw_pg));
+    let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_raw_pg));
+    let correct_scan_pg = ObjectMetadataScanPgId::new_for_test(PgId::new(correct_raw_pg));
+    let wrong_scan_pg = ObjectMetadataScanPgId::new_for_test(PgId::new(wrong_raw_pg));
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..16)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        config.socket_path.clone(),
+    );
+
+    assert!(ObjectMutationMetadataNodeClient::payload_reclaim_exists(
+        &client,
+        correct_pg,
+        &bucket,
+        &key,
+        generation_id,
+    )
+    .unwrap());
+    assert_object_payload_decode!(ObjectMutationMetadataNodeClient::payload_reclaim_exists(
+        &client,
+        wrong_pg,
+        &bucket,
+        &key,
+        generation_id,
+    ));
+
+    let reclaim = ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
+        &client,
+        correct_pg,
+        &bucket,
+        &key,
+        generation_id,
+    )
+    .unwrap()
+    .expect("correctly routed reclaim must load");
+    assert_eq!(reclaim.kind(), ObjectPayloadReclaimKind::ObjectSegments);
+    assert_bucket_payload_decode!(
+        ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
+            &client,
+            wrong_pg,
+            &bucket,
+            &key,
+            generation_id,
+        )
+    );
+
+    let acquired = ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
+        &client,
+        correct_pg,
+        &bucket,
+        1,
+        &key,
+        generation_id,
+        ObjectPayloadReclaimKind::ObjectSegments,
+        "object-reclaim-role-claim",
+        "object-reclaim-role-owner",
+        ClusterEpoch::new(1).unwrap(),
+        100,
+        Some(1_000),
+        100,
+    )
+    .unwrap()
+    .expect("correctly routed reclaim claim must load idempotently");
+    assert_eq!(acquired, correct_claim);
+    assert_bucket_payload_decode!(
+        ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
+            &client,
+            wrong_pg,
+            &bucket,
+            1,
+            &key,
+            generation_id,
+            ObjectPayloadReclaimKind::ObjectSegments,
+            "object-reclaim-role-claim",
+            "object-reclaim-role-owner",
+            ClusterEpoch::new(1).unwrap(),
+            100,
+            Some(1_000),
+            100,
+        )
+    );
+
+    let bucket_root = ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
+        &client,
+        correct_scan_pg,
+        &bucket,
+    )
+    .unwrap()
+    .expect("correct scan PG must return its reclaim root");
+    assert_eq!(bucket_root.key, key);
+    assert_bucket_payload_decode!(
+        ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
+            &client,
+            wrong_scan_pg,
+            &bucket,
+        )
+    );
+
+    let pg_root =
+        ObjectMutationMetadataNodeClient::get_payload_reclaim_root(&client, correct_scan_pg)
+            .unwrap()
+            .expect("correct scan PG must return its reclaim root");
+    assert_eq!(pg_root.key, key);
+    assert_bucket_payload_decode!(ObjectMutationMetadataNodeClient::get_payload_reclaim_root(
+        &client,
+        wrong_scan_pg,
+    ));
+
+    let loaded_claim =
+        ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, correct_scan_pg)
+            .unwrap()
+            .expect("correct scan PG must return its reclaim claim");
+    assert_eq!(loaded_claim, correct_claim);
+    assert_bucket_payload_decode!(
+        ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, wrong_scan_pg)
+    );
+
+    assert_bucket_payload_decode!(
+        ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+            &client,
+            wrong_pg,
+            &wrong_claim,
+        )
+    );
+    assert_bucket_payload_decode!(
+        ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, wrong_scan_pg)
+    );
+
+    ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
+        &client,
+        correct_pg,
+        &correct_claim,
+    )
+    .unwrap();
+    assert!(
+        ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, correct_scan_pg)
+            .unwrap()
+            .is_none()
+    );
+
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]

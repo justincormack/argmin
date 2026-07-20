@@ -6491,7 +6491,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let root = match ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_scan_pg(request.pg_id),
             &request.bucket,
         ) {
             Ok(root) => root,
@@ -6499,6 +6499,16 @@ impl StorageNodeConnectionHandler {
                 return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
             }
         };
+        if let Some(root) = &root {
+            if let Err(error) = self.validate_pg_for_object(
+                request.pg_id,
+                &root.bucket,
+                &root.key,
+                "object bucket payload reclaim root",
+            ) {
+                return encode_storage_rpc_error_response(&error);
+            }
+        }
         let payload =
             encode_payload_reclaim_root_response(&StorageRpcPayloadReclaimRootResponse { root });
         Ok(encode_storage_rpc_success_response(&payload))
@@ -6526,7 +6536,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let exists = match ObjectMutationMetadataNodeClient::payload_reclaim_exists(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             request.generation_id,
@@ -6558,13 +6568,23 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let root = match ObjectMutationMetadataNodeClient::get_payload_reclaim_root(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_scan_pg(request.pg_id),
         ) {
             Ok(root) => root,
             Err(error) => {
                 return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
             }
         };
+        if let Some(root) = &root {
+            if let Err(error) = self.validate_pg_for_object(
+                request.pg_id,
+                &root.bucket,
+                &root.key,
+                "object payload reclaim root",
+            ) {
+                return encode_storage_rpc_error_response(&error);
+            }
+        }
         let payload =
             encode_payload_reclaim_root_response(&StorageRpcPayloadReclaimRootResponse { root });
         Ok(encode_storage_rpc_success_response(&payload))
@@ -6592,7 +6612,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let reclaim = match ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             &request.object.key,
             request.generation_id,
@@ -6631,7 +6651,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
             &local_client,
-            request.object.pg_id,
+            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
             &request.object.bucket,
             request.bucket_incarnation_generation,
             &request.object.key,
@@ -6671,9 +6691,19 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_scan_pg(request.pg_id),
         ) {
             Ok(record) => {
+                if let Some(record) = &record {
+                    if let Err(error) = self.validate_pg_for_object(
+                        request.pg_id,
+                        &record.bucket,
+                        &record.key,
+                        "object payload reclaim claim get",
+                    ) {
+                        return encode_storage_rpc_error_response(&error);
+                    }
+                }
                 let payload = encode_object_payload_reclaim_claim_optional_record_response(
                     &StorageRpcObjectPayloadReclaimClaimOptionalRecordResponse { record },
                 )?;
@@ -6705,7 +6735,7 @@ impl StorageNodeConnectionHandler {
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
             &local_client,
-            request.pg_id,
+            self.validated_object_metadata_pg(&request.record.bucket, &request.record.key),
             &request.record,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),

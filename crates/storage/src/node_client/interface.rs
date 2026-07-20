@@ -579,7 +579,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn payload_reclaim_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -587,18 +587,18 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn get_bucket_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
 
     fn get_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
 
     fn get_object_payload_reclaim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -606,13 +606,13 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         key: &ObjectKey,
@@ -628,7 +628,7 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
 
     fn release_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         claim: &ObjectPayloadReclaimClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
@@ -1737,7 +1737,7 @@ pub(crate) trait StorageNodeClient:
 
     fn payload_reclaim_exists(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -1887,18 +1887,18 @@ pub(crate) trait StorageNodeClient:
 
     fn get_bucket_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
         bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
 
     fn get_payload_reclaim_root(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
 
     fn get_object_payload_reclaim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
@@ -1906,13 +1906,13 @@ pub(crate) trait StorageNodeClient:
 
     fn object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         key: &ObjectKey,
@@ -1928,7 +1928,7 @@ pub(crate) trait StorageNodeClient:
 
     fn release_object_payload_reclaim_claim(
         &self,
-        pg_id: PgId,
+        pg_id: ObjectMetadataPgId,
         claim: &ObjectPayloadReclaimClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
