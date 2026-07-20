@@ -160,10 +160,12 @@ credential into the session variant. That boundary strictly opens the
 version-1 envelope, binds its access key in constant time, checks expiry, and
 only then resolves the stable issuer incarnation. Ordinary non-streaming S3
 Authorization-header authentication now selects and calls that path for the
-reserved `ARGS` namespace. Presigned, POST Object, and aws-chunked streaming
-authentication still use only the long-lived path. Active static credentials
-retain their post-signature unexpected-token check, and expiring stored records
-remain static rather than becoming STS credentials.
+reserved `ARGS` namespace. Presigned-query authentication now does the same
+through its own query-versus-signed-header selector. POST Object and
+aws-chunked streaming authentication still use only the long-lived path.
+Active static credentials retain their post-signature unexpected-token check,
+and expiring stored records remain static rather than becoming STS
+credentials.
 
 ### Structured session authentication exists but role authorization does not
 
@@ -2464,8 +2466,9 @@ ID, irreversible validation-key removal, key-ring poisoning, redaction, issuer
 deletion, cross-provider rejection, and actual opening through two frontend
 workers. The maximum token is also checked in complete ordinary and aws-chunked
 write-header shapes against the server's 8,192-byte aggregate limit.
-Presigned-query and POST authentication of the same maximum issued token remain
-Phase 2 request-path tests because those modes still reject all session
+Presigned-query authentication now accepts the same maximum issued token
+within its complete bounded query. POST authentication of that maximum token
+remains a Phase 2 request-path test because that mode still rejects all session
 credentials.
 
 Exit condition: all current S3 suites remain green, every frontend worker can
@@ -2519,8 +2522,31 @@ wrong-service responses on an existing bucket receive
 `x-amz-bucket-region`, as do the previously pinned presigned wrong-region and
 wrong-service responses; object-scoped requests, missing buckets, and POST
 Object retain their pinned exclusions. Active and inactive static credential
-ordering is unchanged. Presigned, POST, and streaming adapters still need
-their mode-specific selection/coverage wiring.
+ordering is unchanged.
+
+The presigned-query adapter is now complete as a separate mode-specific
+selector. It retains every `X-Amz-Security-Token` query member in wire order,
+collapses identical values, and rejects conflicting values in either order.
+When `x-amz-security-token` is declared in `X-Amz-SignedHeaders`, all values
+from that signed header location are selected instead and the query location
+cannot rescue a missing, empty, malformed, mismatched, expired, or conflicting
+header selection. A present but unsigned token header still produces
+`HeadersNotSigned` before the query token is resolved. Scope validation remains
+before both token locations, issuer liveness, and HMAC comparison. Selected
+token opening, binding, expiry, deleted-issuer, and provider-failure decisions
+remain before HMAC comparison, while a live correctly bound token with a bad
+HMAC reaches `SignatureDoesNotMatch`. Expired identical duplicates retain
+their complete ordered presentation for the shared exact `ExpiredToken`
+response. Focused tests cover correct and bad signatures, both conflicting
+orders, signed-header authority, structural-token collisions with expiry,
+scope collisions at both token locations, deletion and provider failure at
+both locations, typed assumed-role identity, and successful authentication of
+the derived 742-byte maximum issued token within the bounded presigned query.
+The static-credential path retains its prior lookup, expiry, signature, and
+post-signature unexpected-token ordering.
+
+POST Object and streaming adapters still need their mode-specific
+selection/coverage wiring.
 
 Exit condition: directly sealed session credentials authenticate with
 AWS-pinned token/signature/expiry precedence on every SigV4 mode and produce a

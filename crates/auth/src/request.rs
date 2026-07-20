@@ -468,11 +468,11 @@ fn resolve_header_credential<H: HeaderSource + ?Sized>(
     provider
         .authenticate_session_credential(
             &auth.credential.access_key_id,
-            token_selection.selected,
+            token_selection.selected.as_deref(),
             now_epoch_secs,
         )
         .map_err(|error| {
-            map_header_session_authentication_error(
+            map_s3_session_authentication_error(
                 &auth.credential.access_key_id,
                 &token_selection,
                 error,
@@ -480,9 +480,9 @@ fn resolve_header_credential<H: HeaderSource + ?Sized>(
         })
 }
 
-fn map_header_session_authentication_error(
+fn map_s3_session_authentication_error(
     access_key_id: &str,
-    token_selection: &HeaderSessionTokenSelection<'_>,
+    token_selection: &SessionTokenSelection,
     error: crate::SessionCredentialAuthenticationError,
 ) -> AuthError {
     match error {
@@ -490,7 +490,7 @@ fn map_header_session_authentication_error(
             unknown_access_key(access_key_id)
         }
         crate::SessionCredentialAuthenticationError::InvalidToken => {
-            token_selection.selected.map_or_else(
+            token_selection.selected.as_deref().map_or_else(
                 || unknown_access_key(access_key_id),
                 |token| AuthError::UnexpectedSecurityToken {
                     token: token.to_string(),
@@ -500,11 +500,7 @@ fn map_header_session_authentication_error(
         crate::SessionCredentialAuthenticationError::ExpiredToken => {
             debug_assert!(token_selection.selected.is_some());
             AuthError::ExpiredSessionToken {
-                tokens: token_selection
-                    .presented
-                    .iter()
-                    .map(|token| (*token).to_string())
-                    .collect(),
+                tokens: token_selection.presented.clone(),
             }
         }
         crate::SessionCredentialAuthenticationError::KeyRingUnavailable => {
@@ -516,33 +512,36 @@ fn map_header_session_authentication_error(
     }
 }
 
-struct HeaderSessionTokenSelection<'a> {
-    selected: Option<&'a str>,
-    presented: Vec<&'a str>,
+struct SessionTokenSelection {
+    selected: Option<String>,
+    presented: Vec<String>,
 }
 
-fn select_header_session_token<'a, H: HeaderSource + ?Sized>(
-    headers: &'a H,
+fn select_header_session_token<H: HeaderSource + ?Sized>(
+    headers: &H,
     access_key_id: &str,
-) -> Result<HeaderSessionTokenSelection<'a>, AuthError> {
-    let mut selected = None;
+) -> Result<SessionTokenSelection, AuthError> {
     let mut presented = Vec::new();
-    let mut conflicting = false;
     headers.visit(|name, value| {
-        if name != "x-amz-security-token" {
-            return;
-        }
-        presented.push(value);
-        match selected {
-            None => selected = Some(value),
-            Some(previous) if previous == value => {}
-            Some(_) => conflicting = true,
+        if name == "x-amz-security-token" {
+            presented.push(value.to_string());
         }
     });
-    if conflicting {
+    session_token_selection(presented, access_key_id)
+}
+
+fn session_token_selection(
+    presented: Vec<String>,
+    access_key_id: &str,
+) -> Result<SessionTokenSelection, AuthError> {
+    let selected = presented.first().cloned();
+    if selected
+        .as_ref()
+        .is_some_and(|first| presented.iter().skip(1).any(|token| token != first))
+    {
         return Err(unknown_access_key(access_key_id));
     }
-    Ok(HeaderSessionTokenSelection {
+    Ok(SessionTokenSelection {
         selected: selected.filter(|token| !token.is_empty()),
         presented,
     })
@@ -678,20 +677,14 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         });
     }
 
-    let record = provider
-        .lookup_long_lived_credential(credential.access_key_id)
-        .map_err(AuthError::IdentityProviderFailure)?
-        .ok_or_else(|| unknown_access_key(credential.access_key_id))?;
-    if !record.is_enabled() {
-        return Err(unknown_access_key(credential.access_key_id));
-    }
-    validate_static_record_expiry(&record, now_epoch_secs)?;
-    let token = query_param_lossy(query_string, "X-Amz-Security-Token");
-    let signed_header_token = signed_headers
-        .iter()
-        .any(|signed_header| signed_header == &"x-amz-security-token")
-        .then(|| headers.first_value("x-amz-security-token"))
-        .flatten();
+    let authenticated_credential = resolve_presigned_credential(
+        credential.access_key_id,
+        query_string,
+        &signed_headers,
+        headers,
+        provider,
+        now_epoch_secs,
+    )?;
 
     let signed_header_pairs = collect_signed_headers(&signed_headers, headers);
     let signed_header_pair_refs = signed_header_pairs
@@ -724,7 +717,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     );
     let sts = string_to_sign(request_date.as_ref(), &scope, &canonical_hash);
     let signing_key = derive_signing_key(
-        record.secret_key(),
+        authenticated_credential.secret_key(),
         credential.date,
         credential.region,
         credential.service,
@@ -745,17 +738,87 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
             })),
         });
     }
-    validate_static_credential_has_no_token(token.as_deref().or(signed_header_token))?;
+    if authenticated_credential.long_lived().is_some() {
+        let token = query_param_lossy(query_string, "X-Amz-Security-Token");
+        let signed_header_token = signed_headers
+            .iter()
+            .any(|signed_header| signed_header == &"x-amz-security-token")
+            .then(|| headers.first_value("x-amz-security-token"))
+            .flatten();
+        validate_static_credential_has_no_token(token.as_deref().or(signed_header_token))?;
+    }
 
     Ok(AuthContext {
         mode: AuthMode::PresignedSigV4,
         access_key_id: Some(credential.access_key_id.to_owned()),
-        identity: Some(record.identity().clone()),
-        authorization_profile: record.authorization_profile(),
+        identity: Some(authenticated_credential.identity().clone()),
+        authorization_profile: authenticated_credential.long_lived().map_or(
+            crate::AuthorizationProfile::Standard,
+            crate::StoredCredential::authorization_profile,
+        ),
         request_epoch_secs: Some(request_epoch),
         signing_region: Some(credential.region.to_owned()),
         streaming: None,
     })
+}
+
+fn resolve_presigned_credential<H: HeaderSource + ?Sized>(
+    access_key_id: &str,
+    query_string: &str,
+    signed_headers: &[&str],
+    headers: &H,
+    provider: &crate::IdentityProvider,
+    now_epoch_secs: u64,
+) -> Result<crate::AuthenticatedCredential, AuthError> {
+    if !crate::is_reserved_session_access_key_id(access_key_id) {
+        let record = provider
+            .lookup_long_lived_credential(access_key_id)
+            .map_err(AuthError::IdentityProviderFailure)?
+            .ok_or_else(|| unknown_access_key(access_key_id))?;
+        if !record.is_enabled() {
+            return Err(unknown_access_key(access_key_id));
+        }
+        validate_static_record_expiry(&record, now_epoch_secs)?;
+        return Ok(crate::AuthenticatedCredential::LongLived(record));
+    }
+
+    let token_selection =
+        select_presigned_session_token(query_string, signed_headers, headers, access_key_id)?;
+    provider
+        .authenticate_session_credential(
+            access_key_id,
+            token_selection.selected.as_deref(),
+            now_epoch_secs,
+        )
+        .map_err(|error| {
+            map_s3_session_authentication_error(access_key_id, &token_selection, error)
+        })
+}
+
+fn select_presigned_session_token<H: HeaderSource + ?Sized>(
+    query_string: &str,
+    signed_headers: &[&str],
+    headers: &H,
+    access_key_id: &str,
+) -> Result<SessionTokenSelection, AuthError> {
+    let mut presented = Vec::new();
+    // AWS makes a declared signed header authoritative over the query
+    // location. A declared-but-missing header therefore does not fall back to
+    // X-Amz-Security-Token.
+    if signed_headers.contains(&"x-amz-security-token") {
+        headers.visit(|name, value| {
+            if name == "x-amz-security-token" {
+                presented.push(value.to_string());
+            }
+        });
+    } else {
+        presented.extend(
+            query_params_lossy(query_string, "X-Amz-Security-Token")
+                .into_iter()
+                .map(Cow::into_owned),
+        );
+    }
+    session_token_selection(presented, access_key_id)
 }
 
 fn presigned_unsigned_required_headers<H, S>(signed_headers: &[S], headers: &H) -> Vec<String>
@@ -827,6 +890,22 @@ fn query_param_lossy<'a>(query: &'a str, name: &str) -> Option<Cow<'a, str>> {
         let val = parts.next().unwrap_or("");
         Some(percent_decode_lossy(val))
     })
+}
+
+fn query_params_lossy<'a>(query: &'a str, name: &str) -> Vec<Cow<'a, str>> {
+    query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .filter_map(move |pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?;
+            if key != name {
+                return None;
+            }
+            let val = parts.next().unwrap_or("");
+            Some(percent_decode_lossy(val))
+        })
+        .collect()
 }
 
 fn query_without_signature(query: &str) -> String {
@@ -928,12 +1007,26 @@ mod tests {
     }
 
     fn header_session_fixture(expires_at_offset_secs: i64) -> HeaderSessionFixture {
+        session_fixture_with_identity(
+            expires_at_offset_secs,
+            "test-role",
+            "test-session",
+            Some("source-user"),
+        )
+    }
+
+    fn session_fixture_with_identity(
+        expires_at_offset_secs: i64,
+        role_name: &str,
+        session_name: &str,
+        source_identity: Option<&str>,
+    ) -> HeaderSessionFixture {
         let now_epoch_secs = parse_amz_date("20260720T120000Z").unwrap();
         let stable_role_id = crate::StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap();
         let role = crate::IamRoleIdentity::new(
             crate::AwsAccountId::new("123456789012").unwrap(),
             stable_role_id.clone(),
-            crate::RoleName::new("test-role").unwrap(),
+            crate::RoleName::new(role_name).unwrap(),
             crate::IamPath::new("/test/").unwrap(),
         );
         let live_role = crate::LiveRoleIdentity::new(
@@ -964,13 +1057,13 @@ mod tests {
                     secret_key.clone(),
                 ),
                 &issuer,
-                crate::RoleSessionName::new("test-session").unwrap(),
+                crate::RoleSessionName::new(session_name).unwrap(),
                 crate::SessionLifetime::new(
                     i64::try_from(now_epoch_secs).unwrap() - 60,
                     expires_at_epoch_secs,
                 )
                 .unwrap(),
-                Some(crate::SourceIdentity::new("source-user").unwrap()),
+                source_identity.map(|value| crate::SourceIdentity::new(value).unwrap()),
             )
             .unwrap();
         HeaderSessionFixture {
@@ -1081,6 +1174,89 @@ mod tests {
             ),
         ));
         headers
+    }
+
+    fn signed_presigned_session_request(
+        access_key_id: &str,
+        signing_secret: &SecretKey,
+        query_tokens: &[&str],
+        header_tokens: &[&str],
+        sign_token_header: bool,
+        scope: (&str, &str),
+        valid_signature: bool,
+    ) -> (String, Vec<(String, String)>) {
+        let (region, service) = scope;
+        let host = "examplebucket.s3.amazonaws.com";
+        let signed_headers = if sign_token_header {
+            "host;x-amz-security-token"
+        } else {
+            "host"
+        };
+        let credential = format!("{access_key_id}/20260720/{region}/{service}/aws4_request");
+        let mut query = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date=20260720T120000Z&X-Amz-Expires=900",
+            crate::canonical::uri_encode(&credential)
+        );
+        for token in query_tokens {
+            query.push_str("&X-Amz-Security-Token=");
+            query.push_str(&crate::canonical::uri_encode(token));
+        }
+        query.push_str("&X-Amz-SignedHeaders=");
+        query.push_str(&crate::canonical::uri_encode(signed_headers));
+
+        let mut headers = vec![("host".to_string(), host.to_string())];
+        headers.extend(
+            header_tokens
+                .iter()
+                .map(|token| ("x-amz-security-token".to_string(), (*token).to_string())),
+        );
+        let canonical_pairs = headers
+            .iter()
+            .filter(|(name, _)| {
+                name == "host" || (sign_token_header && name == "x-amz-security-token")
+            })
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let canonical_request = canonical_request(
+            "GET",
+            "/",
+            &canonical_query_string(&query),
+            &canonical_headers(&canonical_pairs),
+            signed_headers,
+            "UNSIGNED-PAYLOAD",
+        );
+        let scope = format!("20260720/{region}/{service}/aws4_request");
+        let string_to_sign = string_to_sign(
+            "20260720T120000Z",
+            &scope,
+            &sha256_hex(canonical_request.as_bytes()),
+        );
+        let signature = if valid_signature {
+            let signing_key = derive_signing_key(signing_secret, "20260720", region, service);
+            hex_encode_lower(
+                hmac::sign(
+                    &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
+                    string_to_sign.as_bytes(),
+                )
+                .as_ref(),
+            )
+        } else {
+            "0".repeat(64)
+        };
+        query.push_str("&X-Amz-Signature=");
+        query.push_str(&signature);
+        (query, headers)
+    }
+
+    fn presigned_token_location<'a>(
+        sign_token_header: bool,
+        tokens: &'a [&'a str],
+    ) -> (&'a [&'a str], &'a [&'a str]) {
+        if sign_token_header {
+            (&[], tokens)
+        } else {
+            (tokens, &[])
+        }
     }
 
     fn account(principal: &str) -> AccountIdentity {
@@ -1194,6 +1370,24 @@ mod tests {
             "GET",
             "/",
             "",
+            headers,
+            b"",
+            &fixture.provider,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            fixture.now_epoch_secs,
+        )
+    }
+
+    fn authenticate_presigned_session(
+        fixture: &HeaderSessionFixture,
+        query: &str,
+        headers: &[(String, String)],
+    ) -> Result<AuthContext, AuthError> {
+        authenticate_request(
+            "GET",
+            "/",
+            query,
             headers,
             b"",
             &fixture.provider,
@@ -1452,13 +1646,505 @@ mod tests {
     }
 
     #[test]
+    fn authenticate_presigned_session_credential_returns_typed_role_identity() {
+        let fixture = header_session_fixture(3_600);
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token],
+            &[],
+            false,
+            ("us-east-1", "s3"),
+            true,
+        );
+        let context = authenticate_presigned_session(&fixture, &query, &headers).unwrap();
+
+        assert_eq!(context.mode, AuthMode::PresignedSigV4);
+        assert_eq!(
+            context.access_key_id.as_deref(),
+            Some(fixture.access_key_id.as_str())
+        );
+        assert_eq!(
+            context
+                .identity
+                .as_ref()
+                .unwrap()
+                .role_session()
+                .unwrap()
+                .session_name()
+                .as_str(),
+            "test-session"
+        );
+        assert!(context.configured_principal().is_none());
+        assert_eq!(
+            context.authorization_profile,
+            crate::AuthorizationProfile::Standard
+        );
+    }
+
+    #[test]
+    fn presigned_authenticates_maximum_issued_session_token_within_query_limit() {
+        let role_name = "r".repeat(crate::identity::ROLE_NAME_MAX_LEN);
+        let session_name = "s".repeat(crate::identity::ROLE_SESSION_NAME_MAX_LEN);
+        let source_identity = "i".repeat(crate::identity::SOURCE_IDENTITY_MAX_LEN);
+        let fixture =
+            session_fixture_with_identity(3_600, &role_name, &session_name, Some(&source_identity));
+        assert_eq!(
+            fixture.token.len(),
+            crate::session_token::MAX_ISSUED_V1_TOKEN_LEN
+        );
+
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token],
+            &[],
+            false,
+            ("us-east-1", "s3"),
+            true,
+        );
+        assert!(query.len() <= MAX_PRESIGNED_QUERY_LEN);
+        let context = authenticate_presigned_session(&fixture, &query, &headers).unwrap();
+        assert_eq!(
+            context
+                .identity
+                .unwrap()
+                .role_session()
+                .unwrap()
+                .session_name()
+                .as_str(),
+            session_name
+        );
+    }
+
+    #[test]
+    fn presigned_query_session_token_structure_and_binding_precede_signature() {
+        let fixture = header_session_fixture(3_600);
+        let other_token = issue_header_session_token(
+            &fixture,
+            "ARGS1123456789ABCDEFGHIJ",
+            SecretKey::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn".to_string()),
+        );
+
+        for tokens in [Vec::new(), vec![""], vec![other_token.as_str()]] {
+            let (query, headers) = signed_presigned_session_request(
+                &fixture.access_key_id,
+                &fixture.secret_key,
+                &tokens,
+                &[],
+                false,
+                ("us-east-1", "s3"),
+                false,
+            );
+            assert!(matches!(
+                authenticate_presigned_session(&fixture, &query, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        let malformed = "ARGST1.not-a-canonical-token";
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[malformed],
+            &[],
+            false,
+            ("us-east-1", "s3"),
+            false,
+        );
+        assert!(matches!(
+            authenticate_presigned_session(&fixture, &query, &headers),
+            Err(AuthError::UnexpectedSecurityToken { token }) if token == malformed
+        ));
+
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token, &fixture.token],
+            &[],
+            false,
+            ("us-east-1", "s3"),
+            true,
+        );
+        authenticate_presigned_session(&fixture, &query, &headers).unwrap();
+
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token],
+            &[],
+            false,
+            ("us-east-1", "s3"),
+            false,
+        );
+        assert!(matches!(
+            authenticate_presigned_session(&fixture, &query, &headers),
+            Err(AuthError::SignatureMismatch { .. })
+        ));
+
+        for valid_signature in [true, false] {
+            for tokens in [
+                [fixture.token.as_str(), other_token.as_str()],
+                [other_token.as_str(), fixture.token.as_str()],
+            ] {
+                let (query, headers) = signed_presigned_session_request(
+                    &fixture.access_key_id,
+                    &fixture.secret_key,
+                    &tokens,
+                    &[],
+                    false,
+                    ("us-east-1", "s3"),
+                    valid_signature,
+                );
+                assert!(matches!(
+                    authenticate_presigned_session(&fixture, &query, &headers),
+                    Err(AuthError::UnknownAccessKey { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn presigned_signed_session_token_header_is_authoritative() {
+        let fixture = header_session_fixture(3_600);
+        let other_token = issue_header_session_token(
+            &fixture,
+            "ARGS1123456789ABCDEFGHIJ",
+            SecretKey::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn".to_string()),
+        );
+
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&other_token],
+            &[&fixture.token],
+            true,
+            ("us-east-1", "s3"),
+            true,
+        );
+        authenticate_presigned_session(&fixture, &query, &headers).unwrap();
+
+        for valid_signature in [true, false] {
+            let (query, headers) = signed_presigned_session_request(
+                &fixture.access_key_id,
+                &fixture.secret_key,
+                &[&fixture.token],
+                &[&other_token],
+                true,
+                ("us-east-1", "s3"),
+                valid_signature,
+            );
+            assert!(matches!(
+                authenticate_presigned_session(&fixture, &query, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        for header_tokens in [Vec::new(), vec![""]] {
+            let (query, headers) = signed_presigned_session_request(
+                &fixture.access_key_id,
+                &fixture.secret_key,
+                &[&fixture.token],
+                &header_tokens,
+                true,
+                ("us-east-1", "s3"),
+                false,
+            );
+            assert!(matches!(
+                authenticate_presigned_session(&fixture, &query, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        let malformed = "ARGST1.not-a-canonical-token";
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token],
+            &[malformed],
+            true,
+            ("us-east-1", "s3"),
+            false,
+        );
+        assert!(matches!(
+            authenticate_presigned_session(&fixture, &query, &headers),
+            Err(AuthError::UnexpectedSecurityToken { token }) if token == malformed
+        ));
+
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&other_token],
+            &[&fixture.token, &fixture.token],
+            true,
+            ("us-east-1", "s3"),
+            true,
+        );
+        authenticate_presigned_session(&fixture, &query, &headers).unwrap();
+
+        for valid_signature in [true, false] {
+            let (query, headers) = signed_presigned_session_request(
+                &fixture.access_key_id,
+                &fixture.secret_key,
+                &[&fixture.token],
+                &[&fixture.token, &other_token],
+                true,
+                ("us-east-1", "s3"),
+                valid_signature,
+            );
+            assert!(matches!(
+                authenticate_presigned_session(&fixture, &query, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn presigned_unsigned_session_token_header_precedes_selected_query_token() {
+        let fixture = header_session_fixture(3_600);
+        let malformed = "ARGST1.not-a-canonical-token";
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token],
+            &[malformed],
+            false,
+            ("us-east-1", "s3"),
+            false,
+        );
+        assert!(matches!(
+            authenticate_presigned_session(&fixture, &query, &headers),
+            Err(AuthError::UnsignedHeaders { headers })
+                if headers == ["x-amz-security-token"]
+        ));
+    }
+
+    #[test]
+    fn presigned_session_scope_precedes_token_selection_and_signature() {
+        let fixture = header_session_fixture(3_600);
+        let malformed = "ARGST1.not-a-canonical-token";
+
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[malformed],
+            &[],
+            false,
+            ("us-west-2", "s3"),
+            false,
+        );
+        assert!(matches!(
+            authenticate_presigned_session(&fixture, &query, &headers),
+            Err(AuthError::InvalidQueryCredentialRegion {
+                provided_region,
+                expected_region,
+                ..
+            }) if provided_region == "us-west-2" && expected_region == "us-east-1"
+        ));
+
+        let (query, headers) = signed_presigned_session_request(
+            &fixture.access_key_id,
+            &fixture.secret_key,
+            &[&fixture.token],
+            &[&fixture.token, malformed],
+            true,
+            ("us-east-1", "sts"),
+            false,
+        );
+        assert!(matches!(
+            authenticate_presigned_session(&fixture, &query, &headers),
+            Err(AuthError::InvalidQueryCredentialService {
+                provided_service,
+                expected_service,
+                ..
+            }) if provided_service == "sts" && expected_service == "s3"
+        ));
+    }
+
+    #[test]
+    fn presigned_session_expiry_and_liveness_precede_signature() {
+        let expired = header_session_fixture(0);
+        let live_mismatched_token = issue_header_session_token(
+            &expired,
+            "ARGS1123456789ABCDEFGHIJ",
+            SecretKey::new("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn".to_string()),
+        );
+        for sign_token_header in [false, true] {
+            let duplicate_tokens = [expired.token.as_str(), expired.token.as_str()];
+            let (query_tokens, header_tokens) =
+                presigned_token_location(sign_token_header, &duplicate_tokens);
+            let (query, headers) = signed_presigned_session_request(
+                &expired.access_key_id,
+                &expired.secret_key,
+                query_tokens,
+                header_tokens,
+                sign_token_header,
+                ("us-east-1", "s3"),
+                false,
+            );
+            assert!(matches!(
+                authenticate_presigned_session(&expired, &query, &headers),
+                Err(AuthError::ExpiredSessionToken { tokens })
+                    if tokens.len() == 2
+                        && tokens.iter().all(|token| token == &expired.token)
+            ));
+
+            for tokens in [Vec::new(), vec![""]] {
+                let (query_tokens, header_tokens) =
+                    presigned_token_location(sign_token_header, &tokens);
+                let (query, headers) = signed_presigned_session_request(
+                    &expired.access_key_id,
+                    &expired.secret_key,
+                    query_tokens,
+                    header_tokens,
+                    sign_token_header,
+                    ("us-east-1", "s3"),
+                    false,
+                );
+                assert!(matches!(
+                    authenticate_presigned_session(&expired, &query, &headers),
+                    Err(AuthError::UnknownAccessKey { .. })
+                ));
+            }
+
+            let malformed = "ARGST1.not-a-canonical-token";
+            let malformed_tokens = [malformed];
+            let (query_tokens, header_tokens) =
+                presigned_token_location(sign_token_header, &malformed_tokens);
+            let (query, headers) = signed_presigned_session_request(
+                &expired.access_key_id,
+                &expired.secret_key,
+                query_tokens,
+                header_tokens,
+                sign_token_header,
+                ("us-east-1", "s3"),
+                false,
+            );
+            assert!(matches!(
+                authenticate_presigned_session(&expired, &query, &headers),
+                Err(AuthError::UnexpectedSecurityToken { token }) if token == malformed
+            ));
+
+            for tokens in [
+                [expired.token.as_str(), live_mismatched_token.as_str()],
+                [live_mismatched_token.as_str(), expired.token.as_str()],
+            ] {
+                let (query_tokens, header_tokens) =
+                    presigned_token_location(sign_token_header, &tokens);
+                let (query, headers) = signed_presigned_session_request(
+                    &expired.access_key_id,
+                    &expired.secret_key,
+                    query_tokens,
+                    header_tokens,
+                    sign_token_header,
+                    ("us-east-1", "s3"),
+                    false,
+                );
+                assert!(matches!(
+                    authenticate_presigned_session(&expired, &query, &headers),
+                    Err(AuthError::UnknownAccessKey { .. })
+                ));
+            }
+        }
+
+        let (query, headers) = signed_presigned_session_request(
+            &expired.access_key_id,
+            &expired.secret_key,
+            &[&live_mismatched_token],
+            &[&expired.token],
+            true,
+            ("us-east-1", "s3"),
+            false,
+        );
+        assert!(matches!(
+            authenticate_presigned_session(&expired, &query, &headers),
+            Err(AuthError::ExpiredSessionToken { tokens })
+                if tokens == [expired.token.clone()]
+        ));
+
+        for (region, service) in [("us-west-2", "s3"), ("us-east-1", "sts")] {
+            for sign_token_header in [false, true] {
+                let tokens = [expired.token.as_str()];
+                let (query_tokens, header_tokens) =
+                    presigned_token_location(sign_token_header, &tokens);
+                let (query, headers) = signed_presigned_session_request(
+                    &expired.access_key_id,
+                    &expired.secret_key,
+                    query_tokens,
+                    header_tokens,
+                    sign_token_header,
+                    (region, service),
+                    false,
+                );
+                let error = authenticate_presigned_session(&expired, &query, &headers).unwrap_err();
+                if region != "us-east-1" {
+                    assert!(matches!(
+                        error,
+                        AuthError::InvalidQueryCredentialRegion { .. }
+                    ));
+                } else {
+                    assert!(matches!(
+                        error,
+                        AuthError::InvalidQueryCredentialService { .. }
+                    ));
+                }
+            }
+        }
+
+        let missing = header_session_fixture(3_600);
+        *missing.role_state.write().unwrap() = SessionRoleState::Missing;
+        for sign_token_header in [false, true] {
+            let tokens = [missing.token.as_str()];
+            let (query_tokens, header_tokens) =
+                presigned_token_location(sign_token_header, &tokens);
+            let (query, headers) = signed_presigned_session_request(
+                &missing.access_key_id,
+                &missing.secret_key,
+                query_tokens,
+                header_tokens,
+                sign_token_header,
+                ("us-east-1", "s3"),
+                false,
+            );
+            assert!(matches!(
+                authenticate_presigned_session(&missing, &query, &headers),
+                Err(AuthError::UnknownAccessKey { .. })
+            ));
+        }
+
+        let unavailable = header_session_fixture(3_600);
+        *unavailable.role_state.write().unwrap() =
+            SessionRoleState::Failure(crate::IdentityProviderError::Unavailable);
+        for sign_token_header in [false, true] {
+            let tokens = [unavailable.token.as_str()];
+            let (query_tokens, header_tokens) =
+                presigned_token_location(sign_token_header, &tokens);
+            let (query, headers) = signed_presigned_session_request(
+                &unavailable.access_key_id,
+                &unavailable.secret_key,
+                query_tokens,
+                header_tokens,
+                sign_token_header,
+                ("us-east-1", "s3"),
+                false,
+            );
+            assert!(matches!(
+                authenticate_presigned_session(&unavailable, &query, &headers),
+                Err(AuthError::IdentityProviderFailure(
+                    crate::IdentityProviderError::Unavailable
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn header_session_key_ring_failure_maps_to_distinct_internal_auth_error() {
-        let token_selection = HeaderSessionTokenSelection {
-            selected: Some("ARGST1.redacted"),
-            presented: vec!["ARGST1.redacted"],
+        let token_selection = SessionTokenSelection {
+            selected: Some("ARGST1.redacted".to_string()),
+            presented: vec!["ARGST1.redacted".to_string()],
         };
         assert!(matches!(
-            map_header_session_authentication_error(
+            map_s3_session_authentication_error(
                 "ARGS0123456789ABCDEFGHIJ",
                 &token_selection,
                 crate::SessionCredentialAuthenticationError::KeyRingUnavailable,
@@ -2576,6 +3262,14 @@ mod tests {
     #[test]
     fn query_param_no_value() {
         assert_eq!(query_param("key", "key"), Some("".to_string()));
+    }
+
+    #[test]
+    fn query_params_preserve_duplicate_order_and_decode_each_value() {
+        assert_eq!(
+            query_params_lossy("key=first%20value&other=x&key=second%2Bvalue", "key"),
+            ["first value", "second+value"]
+        );
     }
 
     #[test]
