@@ -714,7 +714,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn record_placed_segment_shard_repair(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardRepairWorkItem,
         _last_error: Option<&str>,
     ) -> Result<(), StoreError> {
@@ -723,14 +723,14 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn list_placed_segment_shard_repairs(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
         Ok(Vec::new())
     }
 
     fn acquire_placed_segment_shard_repair_claim(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _request: &PlacedSegmentShardRepairClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
         Ok(None)
@@ -738,7 +738,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn complete_placed_segment_shard_repair_claim(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _cluster_epoch: ClusterEpoch,
         _claim: &PlacedSegmentShardRepairClaimRecord,
     ) -> Result<bool, StoreError> {
@@ -747,7 +747,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn record_placed_segment_shard_repair_claim_error(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _cluster_epoch: ClusterEpoch,
         _claim: &PlacedSegmentShardRepairClaimRecord,
         _last_error: &str,
@@ -758,7 +758,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn resolve_placed_segment_shard_repair(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardRepairWorkItem,
     ) -> Result<(), StoreError> {
         Ok(())
@@ -766,7 +766,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn record_placed_segment_shard_backfill(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardBackfillWorkItem,
         _remaining_tolerance: u8,
         _last_error: Option<&str>,
@@ -776,18 +776,21 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn list_placed_segment_shard_backfills(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
         Ok(Vec::new())
     }
 
-    fn count_placed_segment_shard_backfills(&self, _pg_id: PgId) -> Result<usize, StoreError> {
+    fn count_placed_segment_shard_backfills(
+        &self,
+        _data_pg_id: DataPgId,
+    ) -> Result<usize, StoreError> {
         Ok(0)
     }
 
     fn placed_segment_shard_backfill_exists(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError> {
         Ok(false)
@@ -795,7 +798,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn acquire_placed_segment_shard_backfill_claim(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _request: &PlacedSegmentShardBackfillClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
         Ok(None)
@@ -803,7 +806,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn complete_placed_segment_shard_backfill_claim(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _cluster_epoch: ClusterEpoch,
         _claim: &PlacedSegmentShardBackfillClaimRecord,
     ) -> Result<bool, StoreError> {
@@ -812,7 +815,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn record_placed_segment_shard_backfill_claim_error(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _cluster_epoch: ClusterEpoch,
         _claim: &PlacedSegmentShardBackfillClaimRecord,
         _last_error: &str,
@@ -823,7 +826,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
     fn resolve_placed_segment_shard_backfill(
         &self,
-        _pg_id: PgId,
+        _data_pg_id: DataPgId,
         _work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
         Ok(())

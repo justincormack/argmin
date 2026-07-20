@@ -296,146 +296,157 @@ impl ShardAckNodeClient for LocalStorageNodeClient {
 
     fn record_placed_segment_shard_repair(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardRepairWorkItem,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
-        validate_placed_segment_shard_repair_route(pg_id, work_item)?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        validate_placed_segment_shard_repair_route(data_pg_id.pg_id(), work_item)?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.record_placed_segment_shard_repair(work_item, last_error)
     }
 
     fn list_placed_segment_shard_repairs(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.list_placed_segment_shard_repairs()
     }
 
     fn acquire_placed_segment_shard_repair_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         request: &PlacedSegmentShardRepairClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.acquire_placed_segment_shard_repair_claim(request)
     }
 
     fn complete_placed_segment_shard_repair_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardRepairClaimRecord,
     ) -> Result<bool, StoreError> {
-        validate_placed_segment_shard_repair_claim_epoch(pg_id, cluster_epoch, claim)?;
-        validate_placed_segment_shard_repair_route(pg_id, &claim.work_item)?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        validate_placed_segment_shard_repair_claim_epoch(data_pg_id.pg_id(), cluster_epoch, claim)?;
+        validate_placed_segment_shard_repair_route(data_pg_id.pg_id(), &claim.work_item)?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.complete_placed_segment_shard_repair_claim(claim)
     }
 
     fn record_placed_segment_shard_repair_claim_error(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardRepairClaimRecord,
         last_error: &str,
         next_attempt_after: u64,
     ) -> Result<bool, StoreError> {
-        validate_placed_segment_shard_repair_claim_epoch(pg_id, cluster_epoch, claim)?;
-        validate_placed_segment_shard_repair_route(pg_id, &claim.work_item)?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        validate_placed_segment_shard_repair_claim_epoch(data_pg_id.pg_id(), cluster_epoch, claim)?;
+        validate_placed_segment_shard_repair_route(data_pg_id.pg_id(), &claim.work_item)?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.record_placed_segment_shard_repair_claim_error(claim, last_error, next_attempt_after)
     }
 
     fn resolve_placed_segment_shard_repair(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardRepairWorkItem,
     ) -> Result<(), StoreError> {
-        validate_placed_segment_shard_repair_route(pg_id, work_item)?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        validate_placed_segment_shard_repair_route(data_pg_id.pg_id(), work_item)?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.resolve_placed_segment_shard_repair(work_item)
             .map(|_| ())
     }
 
     fn record_placed_segment_shard_backfill(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
         remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
-        validate_placed_segment_shard_backfill_route(pg_id, work_item)?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        validate_placed_segment_shard_backfill_route(data_pg_id.pg_id(), work_item)?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.record_placed_segment_shard_backfill(work_item, remaining_tolerance, last_error)
     }
 
     fn list_placed_segment_shard_backfills(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.list_placed_segment_shard_backfills()
     }
 
-    fn count_placed_segment_shard_backfills(&self, pg_id: PgId) -> Result<usize, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+    fn count_placed_segment_shard_backfills(
+        &self,
+        data_pg_id: DataPgId,
+    ) -> Result<usize, StoreError> {
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.placed_segment_shard_backfill_count()
     }
 
     fn placed_segment_shard_backfill_exists(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError> {
-        validate_placed_segment_shard_backfill_route(pg_id, work_item)?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        validate_placed_segment_shard_backfill_route(data_pg_id.pg_id(), work_item)?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.placed_segment_shard_backfill_exists(work_item)
     }
 
     fn acquire_placed_segment_shard_backfill_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         request: &PlacedSegmentShardBackfillClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.acquire_placed_segment_shard_backfill_claim(request)
     }
 
     fn complete_placed_segment_shard_backfill_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardBackfillClaimRecord,
     ) -> Result<bool, StoreError> {
-        validate_placed_segment_shard_backfill_claim_epoch(pg_id, cluster_epoch, claim)?;
-        validate_placed_segment_shard_backfill_route(pg_id, &claim.work_item)?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        validate_placed_segment_shard_backfill_claim_epoch(
+            data_pg_id.pg_id(),
+            cluster_epoch,
+            claim,
+        )?;
+        validate_placed_segment_shard_backfill_route(data_pg_id.pg_id(), &claim.work_item)?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.complete_placed_segment_shard_backfill_claim(claim)
     }
 
     fn record_placed_segment_shard_backfill_claim_error(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardBackfillClaimRecord,
         last_error: &str,
         next_attempt_after: u64,
     ) -> Result<bool, StoreError> {
-        validate_placed_segment_shard_backfill_claim_epoch(pg_id, cluster_epoch, claim)?;
-        validate_placed_segment_shard_backfill_route(pg_id, &claim.work_item)?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        validate_placed_segment_shard_backfill_claim_epoch(
+            data_pg_id.pg_id(),
+            cluster_epoch,
+            claim,
+        )?;
+        validate_placed_segment_shard_backfill_route(data_pg_id.pg_id(), &claim.work_item)?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.record_placed_segment_shard_backfill_claim_error(claim, last_error, next_attempt_after)
     }
 
     fn resolve_placed_segment_shard_backfill(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
-        validate_placed_segment_shard_backfill_route(pg_id, work_item)?;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        validate_placed_segment_shard_backfill_route(data_pg_id.pg_id(), work_item)?;
+        let pg = self.storage_node.get_pg(data_pg_id.get())?;
         pg.resolve_placed_segment_shard_backfill(work_item)
             .map(|_| ())
     }

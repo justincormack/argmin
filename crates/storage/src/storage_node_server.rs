@@ -8773,9 +8773,17 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = match validated_placed_segment_data_pg(
+            request.route.pg_id,
+            request.work_item.request.data_pg_id,
+            "placed segment shard repair record",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.record_placed_segment_shard_repair(
-            request.route.pg_id,
+            data_pg_id,
             &request.work_item,
             request.last_error.as_deref(),
         ) {
@@ -8797,8 +8805,9 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = DataPgId::new(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.list_placed_segment_shard_repairs(request.pg_id) {
+        match local_client.list_placed_segment_shard_repairs(data_pg_id) {
             Ok(repairs) => {
                 let payload = encode_placed_segment_shard_repairs_response(&repairs)?;
                 Ok(encode_storage_rpc_success_response(&payload))
@@ -8823,10 +8832,16 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = match validated_placed_segment_data_pg(
+            request.route.pg_id,
+            request.work_item.request.data_pg_id,
+            "placed segment shard repair resolve",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client
-            .resolve_placed_segment_shard_repair(request.route.pg_id, &request.work_item)
-        {
+        match local_client.resolve_placed_segment_shard_repair(data_pg_id, &request.work_item) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }
@@ -8849,6 +8864,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = DataPgId::new(request.route.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let Some(lease_deadline) = request.lease_deadline else {
             return encode_storage_rpc_error_response(&store_error_response(
@@ -8865,8 +8881,7 @@ impl StorageNodeConnectionHandler {
             lease_deadline,
             now: request.now,
         };
-        match local_client.acquire_placed_segment_shard_repair_claim(request.route.pg_id, &acquire)
-        {
+        match local_client.acquire_placed_segment_shard_repair_claim(data_pg_id, &acquire) {
             Ok(record) => {
                 let payload = encode_placed_segment_shard_repair_claim_optional_record_response(
                     &StorageRpcPlacedSegmentShardRepairClaimOptionalRecordResponse { record },
@@ -8901,9 +8916,17 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
+        let data_pg_id = match validated_placed_segment_data_pg(
+            request.route.pg_id,
+            request.claim.work_item.request.data_pg_id,
+            "placed segment shard repair claim complete",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.complete_placed_segment_shard_repair_claim(
-            request.route.pg_id,
+            data_pg_id,
             request.route.cluster_epoch,
             &request.claim,
         ) {
@@ -8942,9 +8965,17 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
+        let data_pg_id = match validated_placed_segment_data_pg(
+            request.route.pg_id,
+            request.claim.work_item.request.data_pg_id,
+            "placed segment shard repair claim error",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.record_placed_segment_shard_repair_claim_error(
-            request.route.pg_id,
+            data_pg_id,
             request.route.cluster_epoch,
             &request.claim,
             &request.last_error,
@@ -8977,9 +9008,17 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = match validated_placed_segment_data_pg(
+            request.route.pg_id,
+            request.work_item.request.data_pg_id,
+            "placed segment shard backfill record",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.record_placed_segment_shard_backfill(
-            request.route.pg_id,
+            data_pg_id,
             &request.work_item,
             request.remaining_tolerance,
             request.last_error.as_deref(),
@@ -9003,8 +9042,9 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = DataPgId::new(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.list_placed_segment_shard_backfills(request.pg_id) {
+        match local_client.list_placed_segment_shard_backfills(data_pg_id) {
             Ok(backfills) => {
                 let payload = encode_placed_segment_shard_backfills_response(&backfills)?;
                 Ok(encode_storage_rpc_success_response(&payload))
@@ -9027,8 +9067,9 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = DataPgId::new(request.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client.count_placed_segment_shard_backfills(request.pg_id) {
+        match local_client.count_placed_segment_shard_backfills(data_pg_id) {
             Ok(count) => {
                 let payload = encode_placed_segment_shard_backfill_count_response(count)?;
                 Ok(encode_storage_rpc_success_response(&payload))
@@ -9053,10 +9094,16 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = match validated_placed_segment_data_pg(
+            request.route.pg_id,
+            request.work_item.request.data_pg_id,
+            "placed segment shard backfill exists",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client
-            .placed_segment_shard_backfill_exists(request.route.pg_id, &request.work_item)
-        {
+        match local_client.placed_segment_shard_backfill_exists(data_pg_id, &request.work_item) {
             Ok(value) => {
                 let payload =
                     encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
@@ -9084,10 +9131,16 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = match validated_placed_segment_data_pg(
+            request.route.pg_id,
+            request.work_item.request.data_pg_id,
+            "placed segment shard backfill resolve",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match local_client
-            .resolve_placed_segment_shard_backfill(request.route.pg_id, &request.work_item)
-        {
+        match local_client.resolve_placed_segment_shard_backfill(data_pg_id, &request.work_item) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error)),
         }
@@ -9110,6 +9163,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
+        let data_pg_id = DataPgId::new(request.route.pg_id);
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         let Some(lease_deadline) = request.lease_deadline else {
             return encode_storage_rpc_error_response(&store_error_response(
@@ -9126,9 +9180,7 @@ impl StorageNodeConnectionHandler {
             lease_deadline,
             now: request.now,
         };
-        match local_client
-            .acquire_placed_segment_shard_backfill_claim(request.route.pg_id, &acquire)
-        {
+        match local_client.acquire_placed_segment_shard_backfill_claim(data_pg_id, &acquire) {
             Ok(record) => {
                 let payload = encode_placed_segment_shard_backfill_claim_optional_record_response(
                     &StorageRpcPlacedSegmentShardBackfillClaimOptionalRecordResponse { record },
@@ -9163,9 +9215,17 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
+        let data_pg_id = match validated_placed_segment_data_pg(
+            request.route.pg_id,
+            request.claim.work_item.request.data_pg_id,
+            "placed segment shard backfill claim complete",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.complete_placed_segment_shard_backfill_claim(
-            request.route.pg_id,
+            data_pg_id,
             request.route.cluster_epoch,
             &request.claim,
         ) {
@@ -9204,9 +9264,17 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }
+        let data_pg_id = match validated_placed_segment_data_pg(
+            request.route.pg_id,
+            request.claim.work_item.request.data_pg_id,
+            "placed segment shard backfill claim error",
+        ) {
+            Ok(data_pg_id) => data_pg_id,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
         match local_client.record_placed_segment_shard_backfill_claim_error(
-            request.route.pg_id,
+            data_pg_id,
             request.route.cluster_epoch,
             &request.claim,
             &request.last_error,
@@ -12117,6 +12185,24 @@ fn validate_placed_segment_shard_repair_claim_route_epoch(
     Ok(())
 }
 
+fn validated_placed_segment_data_pg(
+    pg_id: PgId,
+    request_data_pg_id: u32,
+    operation: &'static str,
+) -> Result<DataPgId, StorageRpcErrorResponse> {
+    if request_data_pg_id != pg_id.get() {
+        return Err(StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: format!(
+                "{operation} data PG {} does not match routed PG {}",
+                request_data_pg_id,
+                pg_id.get()
+            ),
+        });
+    }
+    Ok(DataPgId::new(pg_id))
+}
+
 fn validate_placed_segment_shard_backfill_claim_route_epoch(
     pg_id: PgId,
     route_epoch: ClusterEpoch,
@@ -12724,10 +12810,19 @@ mod tests {
         encode_metadata_command_transfer_checkpoint_base_request,
         encode_metadata_command_transfer_empty_state_request,
         encode_metadata_command_transfer_matching_state_request,
-        encode_read_handle_acquire_request, encode_read_handle_release_request,
-        encode_scavenger_list_files_request, encode_scavenger_observation_key_request,
-        encode_scavenger_observation_record_request, encode_shard_ack_batch_request,
-        encode_shard_ack_item_request, encode_shard_delete_request,
+        encode_placed_segment_shard_backfill_claim_acquire_request,
+        encode_placed_segment_shard_backfill_claim_error_request,
+        encode_placed_segment_shard_backfill_claim_record_request,
+        encode_placed_segment_shard_backfill_item_request,
+        encode_placed_segment_shard_backfill_record_request,
+        encode_placed_segment_shard_repair_claim_acquire_request,
+        encode_placed_segment_shard_repair_claim_error_request,
+        encode_placed_segment_shard_repair_claim_record_request,
+        encode_placed_segment_shard_repair_item_request,
+        encode_placed_segment_shard_repair_record_request, encode_read_handle_acquire_request,
+        encode_read_handle_release_request, encode_scavenger_list_files_request,
+        encode_scavenger_observation_key_request, encode_scavenger_observation_record_request,
+        encode_shard_ack_batch_request, encode_shard_ack_item_request, encode_shard_delete_request,
         encode_shard_read_range_request, encode_shard_read_request, encode_shard_write_request,
         encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
         StorageRpcBucketMarkDeletingCommandBuildOutcome,
@@ -12741,7 +12836,17 @@ mod tests {
         StorageRpcMetadataCommandTransferAdoptRequest,
         StorageRpcMetadataCommandTransferCheckpointBaseRequest,
         StorageRpcMetadataCommandTransferEmptyStateRequest,
-        StorageRpcMetadataCommandTransferMatchingStateRequest, StorageRpcReadHandleAcquireRequest,
+        StorageRpcMetadataCommandTransferMatchingStateRequest,
+        StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest,
+        StorageRpcPlacedSegmentShardBackfillClaimErrorRequest,
+        StorageRpcPlacedSegmentShardBackfillClaimRecordRequest,
+        StorageRpcPlacedSegmentShardBackfillItemRequest,
+        StorageRpcPlacedSegmentShardBackfillRecordRequest,
+        StorageRpcPlacedSegmentShardRepairClaimAcquireRequest,
+        StorageRpcPlacedSegmentShardRepairClaimErrorRequest,
+        StorageRpcPlacedSegmentShardRepairClaimRecordRequest,
+        StorageRpcPlacedSegmentShardRepairItemRequest,
+        StorageRpcPlacedSegmentShardRepairRecordRequest, StorageRpcReadHandleAcquireRequest,
         StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
         StorageRpcScavengerObservationKeyRequest, StorageRpcScavengerObservationRecordRequest,
         StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardAckItemRequest,
@@ -12750,7 +12855,8 @@ mod tests {
     };
     use crate::types::{
         BucketName, BucketSubresourceAux, BucketSubresourceKind, CreateBucketConfig, GenerationId,
-        PgId, PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillWorkItem,
+        PgId, PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
+        PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
         PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairWorkItem,
         PutBucketSubresource, SegmentStoredBytesRequest, ShardIndex, ShardKey,
         ShardScavengerObservationKey, ShardScavengerObservationReason,
@@ -17484,6 +17590,281 @@ mod tests {
         ));
         pg.validate_written_shard_ack(&canary_key, canary_ack)
             .unwrap();
+    }
+
+    #[test]
+    fn storage_node_server_repair_and_backfill_rpcs_validate_data_pg_before_rows() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_ids = vec![0, 1];
+        config.pg_routes = vec![test_route(0), test_route(1)];
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let route = StorageRpcBucketPgRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(1),
+        };
+        let unknown_route = StorageRpcBucketPgRequest {
+            pg_id: PgId::new(9),
+            ..route.clone()
+        };
+        let request = SegmentStoredBytesRequest {
+            data_pg_id: 0,
+            segment_okh: [0xAC; 16],
+            segment_vid: GenerationId::new(42).unwrap(),
+            stored_size: 1024,
+            segment_crc64: 0x1234,
+            ec: EcShape { k: 4, m: 2 },
+        };
+        let repair_work_item = PlacedSegmentShardRepairWorkItem {
+            request,
+            shard_index: ShardIndex::new(5),
+        };
+        let backfill_work_item = PlacedSegmentShardBackfillWorkItem {
+            request,
+            source_cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(2).unwrap(),
+        };
+        let repair_acquire = PlacedSegmentShardRepairClaimAcquire {
+            claim_id: "repair-canary-claim".to_string(),
+            owner_token: "repair-canary-owner".to_string(),
+            cluster_epoch: config.cluster_epoch,
+            claimed_at: 10,
+            lease_deadline: 20,
+            now: 10,
+        };
+        let backfill_acquire = PlacedSegmentShardBackfillClaimAcquire {
+            claim_id: "backfill-canary-claim".to_string(),
+            owner_token: "backfill-canary-owner".to_string(),
+            cluster_epoch: config.cluster_epoch,
+            claimed_at: 10,
+            lease_deadline: 20,
+            now: 10,
+        };
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let (
+            repair_records_before,
+            repair_claim_before,
+            backfill_records_before,
+            backfill_claim_before,
+        ) = {
+            let pg = server._node.get_pg(0).unwrap();
+            pg.record_placed_segment_shard_repair(&repair_work_item, None)
+                .unwrap();
+            let repair_claim = pg
+                .acquire_placed_segment_shard_repair_claim(&repair_acquire)
+                .unwrap()
+                .unwrap();
+            pg.record_placed_segment_shard_backfill(
+                &backfill_work_item,
+                backfill_work_item.request.ec.m,
+                None,
+            )
+            .unwrap();
+            let backfill_claim = pg
+                .acquire_placed_segment_shard_backfill_claim(&backfill_acquire)
+                .unwrap()
+                .unwrap();
+            (
+                pg.list_placed_segment_shard_repairs().unwrap(),
+                repair_claim,
+                pg.list_placed_segment_shard_backfills().unwrap(),
+                backfill_claim,
+            )
+        };
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+        let mut client = UnixStream::connect(socket_path).unwrap();
+
+        let mismatched_requests = [
+            (
+                StorageRpcMessageKind::PlacedSegmentShardRepairRecord,
+                encode_placed_segment_shard_repair_record_request(
+                    &StorageRpcPlacedSegmentShardRepairRecordRequest {
+                        route: route.clone(),
+                        work_item: repair_work_item,
+                        last_error: None,
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardRepairResolve,
+                encode_placed_segment_shard_repair_item_request(
+                    &StorageRpcPlacedSegmentShardRepairItemRequest {
+                        route: route.clone(),
+                        work_item: repair_work_item,
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardRepairClaimComplete,
+                encode_placed_segment_shard_repair_claim_record_request(
+                    &StorageRpcPlacedSegmentShardRepairClaimRecordRequest {
+                        route: route.clone(),
+                        claim: repair_claim_before.clone(),
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardRepairClaimError,
+                encode_placed_segment_shard_repair_claim_error_request(
+                    &StorageRpcPlacedSegmentShardRepairClaimErrorRequest {
+                        route: route.clone(),
+                        claim: repair_claim_before.clone(),
+                        last_error: "must not persist".to_string(),
+                        next_attempt_after: 30,
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardBackfillRecord,
+                encode_placed_segment_shard_backfill_record_request(
+                    &StorageRpcPlacedSegmentShardBackfillRecordRequest {
+                        route: route.clone(),
+                        work_item: backfill_work_item,
+                        remaining_tolerance: backfill_work_item.request.ec.m,
+                        last_error: None,
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardBackfillExists,
+                encode_placed_segment_shard_backfill_item_request(
+                    &StorageRpcPlacedSegmentShardBackfillItemRequest {
+                        route: route.clone(),
+                        work_item: backfill_work_item,
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardBackfillResolve,
+                encode_placed_segment_shard_backfill_item_request(
+                    &StorageRpcPlacedSegmentShardBackfillItemRequest {
+                        route: route.clone(),
+                        work_item: backfill_work_item,
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardBackfillClaimComplete,
+                encode_placed_segment_shard_backfill_claim_record_request(
+                    &StorageRpcPlacedSegmentShardBackfillClaimRecordRequest {
+                        route: route.clone(),
+                        claim: backfill_claim_before.clone(),
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardBackfillClaimError,
+                encode_placed_segment_shard_backfill_claim_error_request(
+                    &StorageRpcPlacedSegmentShardBackfillClaimErrorRequest {
+                        route,
+                        claim: backfill_claim_before.clone(),
+                        last_error: "must not persist".to_string(),
+                        next_attempt_after: 30,
+                    },
+                )
+                .unwrap(),
+            ),
+        ];
+        let mut request_id = 1u64;
+        for (kind, payload) in mismatched_requests {
+            let response = send_frame(&mut client, request_id, kind, payload);
+            request_id += 1;
+            let error = decode_storage_rpc_response_payload(&response.payload)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+        }
+
+        let unknown_requests = [
+            (
+                StorageRpcMessageKind::PlacedSegmentShardRepairs,
+                encode_bucket_pg_request(&unknown_route).unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardRepairClaimAcquire,
+                encode_placed_segment_shard_repair_claim_acquire_request(
+                    &StorageRpcPlacedSegmentShardRepairClaimAcquireRequest {
+                        route: unknown_route.clone(),
+                        claim_id: "unknown-repair-claim".to_string(),
+                        owner_token: "unknown-repair-owner".to_string(),
+                        claimed_at: 10,
+                        lease_deadline: Some(20),
+                        now: 10,
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardBackfills,
+                encode_bucket_pg_request(&unknown_route).unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardBackfillCount,
+                encode_bucket_pg_request(&unknown_route).unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::PlacedSegmentShardBackfillClaimAcquire,
+                encode_placed_segment_shard_backfill_claim_acquire_request(
+                    &StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest {
+                        route: unknown_route,
+                        claim_id: "unknown-backfill-claim".to_string(),
+                        owner_token: "unknown-backfill-owner".to_string(),
+                        claimed_at: 10,
+                        lease_deadline: Some(20),
+                        now: 10,
+                    },
+                )
+                .unwrap(),
+            ),
+        ];
+        for (kind, payload) in unknown_requests {
+            let response = send_frame(&mut client, request_id, kind, payload);
+            request_id += 1;
+            let error = decode_storage_rpc_response_payload(&response.payload)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::UnknownPg);
+        }
+        drop(client);
+        join.join().unwrap();
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg0 = reopened.get_pg(0).unwrap();
+        let repairs = pg0.list_placed_segment_shard_repairs().unwrap();
+        assert_eq!(repairs, repair_records_before);
+        let repair_claim_after = pg0
+            .acquire_placed_segment_shard_repair_claim(&repair_acquire)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repair_claim_after, repair_claim_before);
+        let backfills = pg0.list_placed_segment_shard_backfills().unwrap();
+        assert_eq!(backfills, backfill_records_before);
+        let backfill_claim_after = pg0
+            .acquire_placed_segment_shard_backfill_claim(&backfill_acquire)
+            .unwrap()
+            .unwrap();
+        assert_eq!(backfill_claim_after, backfill_claim_before);
+        let pg1 = reopened.get_pg(1).unwrap();
+        assert!(pg1.list_placed_segment_shard_repairs().unwrap().is_empty());
+        assert!(pg1
+            .list_placed_segment_shard_backfills()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

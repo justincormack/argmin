@@ -396,12 +396,12 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn record_placed_segment_shard_repair(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardRepairWorkItem,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
         let request = StorageRpcPlacedSegmentShardRepairRecordRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             work_item: *work_item,
             last_error: last_error.map(ToOwned::to_owned),
         };
@@ -428,9 +428,9 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn list_placed_segment_shard_repairs(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
-        let request = self.bucket_pg_request(pg_id);
+        let request = self.bucket_pg_request(data_pg_id.pg_id());
         let payload = encode_bucket_pg_request(&request).map_err(|error| {
             self.rpc_payload_error(
                 "encode placed segment shard repairs request",
@@ -449,11 +449,11 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn acquire_placed_segment_shard_repair_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         acquire: &PlacedSegmentShardRepairClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
         let request = StorageRpcPlacedSegmentShardRepairClaimAcquireRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             claim_id: acquire.claim_id.clone(),
             owner_token: acquire.owner_token.clone(),
             claimed_at: acquire.claimed_at,
@@ -484,11 +484,11 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn complete_placed_segment_shard_repair_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         claim: &PlacedSegmentShardRepairClaimRecord,
     ) -> Result<bool, StoreError> {
         let request = StorageRpcPlacedSegmentShardRepairClaimRecordRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             claim: claim.clone(),
         };
         let payload =
@@ -514,13 +514,13 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn record_placed_segment_shard_repair_claim_error(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         claim: &PlacedSegmentShardRepairClaimRecord,
         last_error: &str,
         next_attempt_after: u64,
     ) -> Result<bool, StoreError> {
         let request = StorageRpcPlacedSegmentShardRepairClaimErrorRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             claim: claim.clone(),
             last_error: last_error.to_string(),
             next_attempt_after,
@@ -548,11 +548,11 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn resolve_placed_segment_shard_repair(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardRepairWorkItem,
     ) -> Result<(), StoreError> {
         let request = StorageRpcPlacedSegmentShardRepairItemRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             work_item: *work_item,
         };
         let payload =
@@ -578,13 +578,13 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn record_placed_segment_shard_backfill(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
         remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
         let request = StorageRpcPlacedSegmentShardBackfillRecordRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             work_item: *work_item,
             remaining_tolerance,
             last_error: last_error.map(ToOwned::to_owned),
@@ -612,9 +612,9 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn list_placed_segment_shard_backfills(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
-        let request = self.bucket_pg_request(pg_id);
+        let request = self.bucket_pg_request(data_pg_id.pg_id());
         let payload = encode_bucket_pg_request(&request).map_err(|error| {
             self.rpc_payload_error(
                 "encode placed segment shard backfills request",
@@ -633,9 +633,9 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn count_placed_segment_shard_backfills(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<usize, StoreError> {
-        let request = self.bucket_pg_request(pg_id);
+        let request = self.bucket_pg_request(data_pg_id.pg_id());
         let payload = encode_bucket_pg_request(&request).map_err(|error| {
             self.rpc_payload_error(
                 "encode placed segment shard backfill count request",
@@ -656,11 +656,11 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn placed_segment_shard_backfill_exists(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError> {
         let request = StorageRpcPlacedSegmentShardBackfillItemRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             work_item: *work_item,
         };
         let payload =
@@ -686,11 +686,11 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn acquire_placed_segment_shard_backfill_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         acquire: &PlacedSegmentShardBackfillClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
         let request = StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             claim_id: acquire.claim_id.clone(),
             owner_token: acquire.owner_token.clone(),
             claimed_at: acquire.claimed_at,
@@ -720,11 +720,11 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn complete_placed_segment_shard_backfill_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         claim: &PlacedSegmentShardBackfillClaimRecord,
     ) -> Result<bool, StoreError> {
         let request = StorageRpcPlacedSegmentShardBackfillClaimRecordRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             claim: claim.clone(),
         };
         let payload = encode_placed_segment_shard_backfill_claim_record_request(&request).map_err(
@@ -751,13 +751,13 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn record_placed_segment_shard_backfill_claim_error(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         claim: &PlacedSegmentShardBackfillClaimRecord,
         last_error: &str,
         next_attempt_after: u64,
     ) -> Result<bool, StoreError> {
         let request = StorageRpcPlacedSegmentShardBackfillClaimErrorRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             claim: claim.clone(),
             last_error: last_error.to_string(),
             next_attempt_after,
@@ -786,11 +786,11 @@ impl UnixStorageNodeClient {
 
     pub(crate) fn resolve_placed_segment_shard_backfill(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
         let request = StorageRpcPlacedSegmentShardBackfillItemRequest {
-            route: self.bucket_pg_request(pg_id),
+            route: self.bucket_pg_request(data_pg_id.pg_id()),
             work_item: *work_item,
         };
         let payload =
@@ -1006,63 +1006,63 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 
     fn record_placed_segment_shard_repair(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardRepairWorkItem,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
         UnixStorageNodeClient::record_placed_segment_shard_repair(
-            self, pg_id, work_item, last_error,
+            self, data_pg_id, work_item, last_error,
         )
     }
 
     fn list_placed_segment_shard_repairs(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
-        UnixStorageNodeClient::list_placed_segment_shard_repairs(self, pg_id)
+        UnixStorageNodeClient::list_placed_segment_shard_repairs(self, data_pg_id)
     }
 
     fn acquire_placed_segment_shard_repair_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         request: &PlacedSegmentShardRepairClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
         if request.cluster_epoch != self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: request.cluster_epoch,
                 current_epoch: self.cluster_epoch,
             });
         }
-        UnixStorageNodeClient::acquire_placed_segment_shard_repair_claim(self, pg_id, request)
+        UnixStorageNodeClient::acquire_placed_segment_shard_repair_claim(self, data_pg_id, request)
     }
 
     fn complete_placed_segment_shard_repair_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardRepairClaimRecord,
     ) -> Result<bool, StoreError> {
         if claim.cluster_epoch != cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: claim.cluster_epoch,
                 current_epoch: cluster_epoch,
             });
         }
         if cluster_epoch != self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: cluster_epoch,
                 current_epoch: self.cluster_epoch,
             });
         }
-        UnixStorageNodeClient::complete_placed_segment_shard_repair_claim(self, pg_id, claim)
+        UnixStorageNodeClient::complete_placed_segment_shard_repair_claim(self, data_pg_id, claim)
     }
 
     fn record_placed_segment_shard_repair_claim_error(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardRepairClaimRecord,
         last_error: &str,
@@ -1070,21 +1070,21 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
     ) -> Result<bool, StoreError> {
         if claim.cluster_epoch != cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: claim.cluster_epoch,
                 current_epoch: cluster_epoch,
             });
         }
         if cluster_epoch != self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: cluster_epoch,
                 current_epoch: self.cluster_epoch,
             });
         }
         UnixStorageNodeClient::record_placed_segment_shard_repair_claim_error(
             self,
-            pg_id,
+            data_pg_id,
             claim,
             last_error,
             next_attempt_after,
@@ -1093,22 +1093,22 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 
     fn resolve_placed_segment_shard_repair(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardRepairWorkItem,
     ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::resolve_placed_segment_shard_repair(self, pg_id, work_item)
+        UnixStorageNodeClient::resolve_placed_segment_shard_repair(self, data_pg_id, work_item)
     }
 
     fn record_placed_segment_shard_backfill(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
         remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
         UnixStorageNodeClient::record_placed_segment_shard_backfill(
             self,
-            pg_id,
+            data_pg_id,
             work_item,
             remaining_tolerance,
             last_error,
@@ -1117,64 +1117,69 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 
     fn list_placed_segment_shard_backfills(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
-        UnixStorageNodeClient::list_placed_segment_shard_backfills(self, pg_id)
+        UnixStorageNodeClient::list_placed_segment_shard_backfills(self, data_pg_id)
     }
 
-    fn count_placed_segment_shard_backfills(&self, pg_id: PgId) -> Result<usize, StoreError> {
-        UnixStorageNodeClient::count_placed_segment_shard_backfills(self, pg_id)
+    fn count_placed_segment_shard_backfills(
+        &self,
+        data_pg_id: DataPgId,
+    ) -> Result<usize, StoreError> {
+        UnixStorageNodeClient::count_placed_segment_shard_backfills(self, data_pg_id)
     }
 
     fn placed_segment_shard_backfill_exists(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError> {
-        UnixStorageNodeClient::placed_segment_shard_backfill_exists(self, pg_id, work_item)
+        UnixStorageNodeClient::placed_segment_shard_backfill_exists(self, data_pg_id, work_item)
     }
 
     fn acquire_placed_segment_shard_backfill_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         request: &PlacedSegmentShardBackfillClaimAcquire,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
         if request.cluster_epoch != self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: request.cluster_epoch,
                 current_epoch: self.cluster_epoch,
             });
         }
-        UnixStorageNodeClient::acquire_placed_segment_shard_backfill_claim(self, pg_id, request)
+        UnixStorageNodeClient::acquire_placed_segment_shard_backfill_claim(
+            self, data_pg_id, request,
+        )
     }
 
     fn complete_placed_segment_shard_backfill_claim(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardBackfillClaimRecord,
     ) -> Result<bool, StoreError> {
         if claim.cluster_epoch != cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: claim.cluster_epoch,
                 current_epoch: cluster_epoch,
             });
         }
         if cluster_epoch != self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: cluster_epoch,
                 current_epoch: self.cluster_epoch,
             });
         }
-        UnixStorageNodeClient::complete_placed_segment_shard_backfill_claim(self, pg_id, claim)
+        UnixStorageNodeClient::complete_placed_segment_shard_backfill_claim(self, data_pg_id, claim)
     }
 
     fn record_placed_segment_shard_backfill_claim_error(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         cluster_epoch: ClusterEpoch,
         claim: &PlacedSegmentShardBackfillClaimRecord,
         last_error: &str,
@@ -1182,21 +1187,21 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
     ) -> Result<bool, StoreError> {
         if claim.cluster_epoch != cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: claim.cluster_epoch,
                 current_epoch: cluster_epoch,
             });
         }
         if cluster_epoch != self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: cluster_epoch,
                 current_epoch: self.cluster_epoch,
             });
         }
         UnixStorageNodeClient::record_placed_segment_shard_backfill_claim_error(
             self,
-            pg_id,
+            data_pg_id,
             claim,
             last_error,
             next_attempt_after,
@@ -1205,10 +1210,10 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 
     fn resolve_placed_segment_shard_backfill(
         &self,
-        pg_id: PgId,
+        data_pg_id: DataPgId,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
-        UnixStorageNodeClient::resolve_placed_segment_shard_backfill(self, pg_id, work_item)
+        UnixStorageNodeClient::resolve_placed_segment_shard_backfill(self, data_pg_id, work_item)
     }
 }
 

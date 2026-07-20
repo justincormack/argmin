@@ -949,6 +949,32 @@ Fourteenth Phase 3 slice:
   formatting, workspace-wide strict Clippy, and the full workspace suite
   (7,223 tests).
 
+Fifteenth Phase 3 slice:
+
+- durable placed-shard repair and backfill registration, listing, counting,
+  existence checks, claim acquisition/completion/error recording, and
+  resolution now require `DataPgId` throughout `ShardAckNodeClient`. Cluster
+  callers derive the data role from the routed PG or the work item's
+  `SegmentStoredBytesRequest`; local adapters erase it only at the private
+  PG-store boundary.
+- the Unix client erases `DataPgId` to the existing raw route request. The
+  server first validates that raw route and its primary, then requires every
+  item-bearing request or claim to name the same data PG before constructing
+  the server-local role. Route/work-item mismatches fail as `PayloadDecode`
+  rather than reaching a PG and surfacing an internal store error.
+- a two-PG adversarial Unix regression seeds claimed repair and backfill
+  canaries on PG 0, submits every item-bearing operation through configured PG
+  1, and requires `PayloadDecode`. Route-only list/count/claim-acquire
+  operations submitted to unknown PG 9 require `UnknownPg`; afterward the PG 0
+  canaries remain exact and PG 1 remains empty.
+- the remaining mixed-role `ShardScavengerNodeClient` signatures,
+  non-forgeable `DataPgId` construction, and request-scoped route capability
+  values remain open in Phase 3.
+- the fifteenth slice passed its focused RPC-codec, durable-claim,
+  scavenger-to-backfill, and adversarial Unix regressions, the boundary
+  checker, formatting, workspace-wide strict Clippy, and the full workspace
+  suite (7,224 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

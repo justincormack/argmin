@@ -9950,9 +9950,9 @@ impl StorageCluster {
         &self,
         data_pg_id: u32,
     ) -> Result<Vec<PlacedSegmentShardRepairRecord>, StoreError> {
-        let pg_id = PgId::new(data_pg_id);
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .list_placed_segment_shard_repairs(pg_id)
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+            .list_placed_segment_shard_repairs(data_pg_id)
     }
 
     pub fn acquire_placed_segment_shard_repair_claim(
@@ -9960,8 +9960,8 @@ impl StorageCluster {
         data_pg_id: u32,
         params: &PlacedSegmentShardRepairClaimAcquireParams,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
-        let pg_id = PgId::new(data_pg_id);
-        let client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
         let request = PlacedSegmentShardRepairClaimAcquire {
             claim_id: params.claim_id.clone(),
             owner_token: params.owner_token.clone(),
@@ -9970,23 +9970,23 @@ impl StorageCluster {
             lease_deadline: params.lease_deadline,
             now: params.now,
         };
-        client.acquire_placed_segment_shard_repair_claim(pg_id, &request)
+        client.acquire_placed_segment_shard_repair_claim(data_pg_id, &request)
     }
 
     pub fn complete_placed_segment_shard_repair_claim(
         &self,
         claim: &PlacedSegmentShardRepairClaimRecord,
     ) -> Result<bool, StoreError> {
-        let pg_id = PgId::new(claim.work_item.request.data_pg_id);
+        let data_pg_id = DataPgId::new(PgId::new(claim.work_item.request.data_pg_id));
         if claim.cluster_epoch != self.cluster_epoch() {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: claim.cluster_epoch,
                 current_epoch: self.cluster_epoch(),
             });
         }
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .complete_placed_segment_shard_repair_claim(pg_id, self.cluster_epoch(), claim)
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+            .complete_placed_segment_shard_repair_claim(data_pg_id, self.cluster_epoch(), claim)
     }
 
     pub fn record_placed_segment_shard_repair_claim_error(
@@ -9995,17 +9995,17 @@ impl StorageCluster {
         last_error: &str,
         next_attempt_after: u64,
     ) -> Result<bool, StoreError> {
-        let pg_id = PgId::new(claim.work_item.request.data_pg_id);
+        let data_pg_id = DataPgId::new(PgId::new(claim.work_item.request.data_pg_id));
         if claim.cluster_epoch != self.cluster_epoch() {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: claim.cluster_epoch,
                 current_epoch: self.cluster_epoch(),
             });
         }
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
             .record_placed_segment_shard_repair_claim_error(
-                pg_id,
+                data_pg_id,
                 self.cluster_epoch(),
                 claim,
                 last_error,
@@ -10031,27 +10031,32 @@ impl StorageCluster {
         remaining_tolerance: u8,
         last_error: Option<&str>,
     ) -> Result<(), StoreError> {
-        let pg_id = PgId::new(work_item.request.data_pg_id);
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .record_placed_segment_shard_backfill(pg_id, work_item, remaining_tolerance, last_error)
+        let data_pg_id = DataPgId::new(PgId::new(work_item.request.data_pg_id));
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+            .record_placed_segment_shard_backfill(
+                data_pg_id,
+                work_item,
+                remaining_tolerance,
+                last_error,
+            )
     }
 
     pub fn list_placed_segment_shard_backfills(
         &self,
         data_pg_id: u32,
     ) -> Result<Vec<PlacedSegmentShardBackfillRecord>, StoreError> {
-        let pg_id = PgId::new(data_pg_id);
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .list_placed_segment_shard_backfills(pg_id)
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+            .list_placed_segment_shard_backfills(data_pg_id)
     }
 
     pub fn placed_segment_shard_backfill_exists(
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<bool, StoreError> {
-        let pg_id = PgId::new(work_item.request.data_pg_id);
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .placed_segment_shard_backfill_exists(pg_id, work_item)
+        let data_pg_id = DataPgId::new(PgId::new(work_item.request.data_pg_id));
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+            .placed_segment_shard_backfill_exists(data_pg_id, work_item)
     }
 
     pub fn placed_segment_shard_backfill_backlog_depth(&self) -> Result<usize, StoreError> {
@@ -10060,10 +10065,10 @@ impl StorageCluster {
             if route.state() != PgState::Active {
                 continue;
             }
-            let pg_id = route.pg_id();
+            let data_pg_id = DataPgId::new(route.pg_id());
             depth = depth.saturating_add(
-                self.metadata_pg_primary_shard_ack_client(pg_id)?
-                    .count_placed_segment_shard_backfills(pg_id)?,
+                self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+                    .count_placed_segment_shard_backfills(data_pg_id)?,
             );
         }
         Ok(depth)
@@ -10295,8 +10300,8 @@ impl StorageCluster {
         data_pg_id: u32,
         params: &PlacedSegmentShardBackfillClaimAcquireParams,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
-        let pg_id = PgId::new(data_pg_id);
-        let client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
+        let data_pg_id = DataPgId::new(PgId::new(data_pg_id));
+        let client = self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?;
         let request = PlacedSegmentShardBackfillClaimAcquire {
             claim_id: params.claim_id.clone(),
             owner_token: params.owner_token.clone(),
@@ -10305,7 +10310,7 @@ impl StorageCluster {
             lease_deadline: params.lease_deadline,
             now: params.now,
         };
-        client.acquire_placed_segment_shard_backfill_claim(pg_id, &request)
+        client.acquire_placed_segment_shard_backfill_claim(data_pg_id, &request)
     }
 
     pub fn acquire_next_placed_segment_shard_backfill_claim(
@@ -10329,16 +10334,16 @@ impl StorageCluster {
         &self,
         claim: &PlacedSegmentShardBackfillClaimRecord,
     ) -> Result<bool, StoreError> {
-        let pg_id = PgId::new(claim.work_item.request.data_pg_id);
+        let data_pg_id = DataPgId::new(PgId::new(claim.work_item.request.data_pg_id));
         if claim.cluster_epoch != self.cluster_epoch() {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: claim.cluster_epoch,
                 current_epoch: self.cluster_epoch(),
             });
         }
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .complete_placed_segment_shard_backfill_claim(pg_id, self.cluster_epoch(), claim)
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+            .complete_placed_segment_shard_backfill_claim(data_pg_id, self.cluster_epoch(), claim)
     }
 
     pub fn record_placed_segment_shard_backfill_claim_error(
@@ -10347,17 +10352,17 @@ impl StorageCluster {
         last_error: &str,
         next_attempt_after: u64,
     ) -> Result<bool, StoreError> {
-        let pg_id = PgId::new(claim.work_item.request.data_pg_id);
+        let data_pg_id = DataPgId::new(PgId::new(claim.work_item.request.data_pg_id));
         if claim.cluster_epoch != self.cluster_epoch() {
             return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
+                pg_id: data_pg_id.get(),
                 operation_epoch: claim.cluster_epoch,
                 current_epoch: self.cluster_epoch(),
             });
         }
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
             .record_placed_segment_shard_backfill_claim_error(
-                pg_id,
+                data_pg_id,
                 self.cluster_epoch(),
                 claim,
                 last_error,
@@ -10369,9 +10374,9 @@ impl StorageCluster {
         &self,
         work_item: &PlacedSegmentShardBackfillWorkItem,
     ) -> Result<(), StoreError> {
-        let pg_id = PgId::new(work_item.request.data_pg_id);
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .resolve_placed_segment_shard_backfill(pg_id, work_item)
+        let data_pg_id = DataPgId::new(PgId::new(work_item.request.data_pg_id));
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+            .resolve_placed_segment_shard_backfill(data_pg_id, work_item)
     }
 
     pub fn repair_placed_segment_payload_shard(
@@ -11528,13 +11533,13 @@ impl StorageCluster {
         request: SegmentStoredBytesRequest,
         shard_index: ShardIndex,
     ) -> Result<(), StoreError> {
-        let pg_id = PgId::new(request.data_pg_id);
+        let data_pg_id = DataPgId::new(PgId::new(request.data_pg_id));
         let work_item = PlacedSegmentShardRepairWorkItem {
             request,
             shard_index,
         };
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .record_placed_segment_shard_repair(pg_id, &work_item, None)?;
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+            .record_placed_segment_shard_repair(data_pg_id, &work_item, None)?;
         self.enqueue_placed_segment_shard_repair(request, shard_index);
         Ok(())
     }
@@ -11544,13 +11549,13 @@ impl StorageCluster {
         request: SegmentStoredBytesRequest,
         shard_index: ShardIndex,
     ) -> Result<(), StoreError> {
-        let pg_id = PgId::new(request.data_pg_id);
+        let data_pg_id = DataPgId::new(PgId::new(request.data_pg_id));
         let work_item = PlacedSegmentShardRepairWorkItem {
             request,
             shard_index,
         };
-        self.metadata_pg_primary_shard_ack_client(pg_id)?
-            .resolve_placed_segment_shard_repair(pg_id, &work_item)
+        self.metadata_pg_primary_shard_ack_client(data_pg_id.pg_id())?
+            .resolve_placed_segment_shard_repair(data_pg_id, &work_item)
     }
 
     fn load_payload_shard_ack(
