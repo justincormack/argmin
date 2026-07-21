@@ -3566,129 +3566,31 @@ impl HttpFrontend {
         })
     }
 
-    /// If the request uses aws-chunked encoding, decode the body and return
-    /// a new `S3Request` with the decoded payload. Returns None for non-chunked requests.
-    ///
-    /// Used only in unit tests — production uses `IncrementalChunkedDecoder`
-    /// via the streaming path in serve.rs.
+    /// Exercise the production aws-chunked parser and incremental decoder with
+    /// a request whose complete wire body is already in memory.
     #[cfg(test)]
     fn maybe_decode_chunked(
         &self,
         req: &S3Request,
         auth: &AuthContext,
     ) -> Result<Option<S3Request>, ServerError> {
-        let content_sha = match req.header("x-amz-content-sha256") {
-            Some(v) if v.starts_with("STREAMING-") => v,
-            _ => return Ok(None),
+        let chunked = serve::parse_chunked_mode(req)?;
+        let mut decoder = match serve::make_chunked_decoder(&chunked, auth.streaming.as_ref())? {
+            Some(decoder) => decoder,
+            None => return Ok(None),
         };
-
-        // Whitelist allowed streaming tokens.
-        match content_sha {
-            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-            | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
-            | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {}
-            _ => {
-                return Err(ServerError::UnsupportedStreamingToken {
-                    token: content_sha.to_string(),
-                });
-            }
-        }
-
-        // Require x-amz-decoded-content-length.
-        let expected_str = req
-            .header("x-amz-decoded-content-length")
-            .ok_or(ServerError::MissingContentLength)?;
-        let expected_len =
-            expected_str
-                .parse::<usize>()
-                .map_err(|_| ServerError::InvalidRequest {
-                    reason: format!("invalid x-amz-decoded-content-length: {expected_str}"),
-                })?;
-
-        let is_trailer_mode = content_sha.ends_with("-TRAILER");
-
-        let is_signed = content_sha.starts_with("STREAMING-AWS4-HMAC-SHA256");
-
-        let streaming_ctx = if is_signed {
-            Some(auth.streaming.as_ref().ok_or_else(|| {
-                ServerError::Auth(auth::AuthError::SignatureMismatch { diagnostics: None })
-            })?)
-        } else {
-            None
-        };
-
-        let decoded = chunked::decode_chunked_body(&req.body, streaming_ctx, is_trailer_mode)?;
-
-        // Validate decoded length.
-        if decoded.data.len() != expected_len {
-            return Err(ServerError::MalformedChunkedBody {
-                reason: format!(
-                    "decoded content length mismatch: expected {}, got {}",
-                    expected_len,
-                    decoded.data.len()
-                ),
-            });
-        }
-
-        // Trailer declaration validation.
-        // Content trailers = trailers excluding x-amz-trailer-signature.
-        let content_trailers: Vec<&(String, String)> = decoded
-            .trailers
-            .iter()
-            .filter(|(k, _)| k != "x-amz-trailer-signature")
-            .collect();
-
-        let declared_trailer = req.header("x-amz-trailer");
-
-        if !is_trailer_mode && !content_trailers.is_empty() {
+        let data = decoder.feed(&req.body)?;
+        if !decoder.is_done() {
             return Err(ServerError::IncompleteBody);
         }
-
-        if !content_trailers.is_empty() && declared_trailer.is_none() {
-            return Err(ServerError::MalformedTrailerError {
-                reason: "trailers present in body but x-amz-trailer header missing".to_string(),
-            });
-        }
-
-        if let Some(declared) = declared_trailer {
-            // Parse declared trailer names as comma-separated list.
-            let declared_names: Vec<String> = declared
-                .split(',')
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect();
-
-            if content_trailers.is_empty() {
-                return Err(ServerError::MalformedTrailerError {
-                    reason: format!(
-                        "x-amz-trailer header declares {declared} but no trailers in body"
-                    ),
-                });
-            }
-            // Check that all content trailers were declared.
-            for (name, _) in &content_trailers {
-                if !declared_names.iter().any(|d| d == name.as_str()) {
-                    return Err(ServerError::MalformedTrailerError {
-                        reason: format!(
-                            "undeclared trailer in body: {name} (declared: {declared})"
-                        ),
-                    });
-                }
-            }
-            // Check that all declared names appear in body (exact-set).
-            let body_names: Vec<&str> = content_trailers.iter().map(|(k, _)| k.as_str()).collect();
-            for name in &declared_names {
-                if !body_names.contains(&name.as_str()) {
-                    return Err(ServerError::MalformedTrailerError {
-                        reason: format!(
-                            "declared trailer missing from body: {name} (declared: {declared})"
-                        ),
-                    });
-                }
-            }
-        }
-
-        Ok(Some(req.with_decoded_body(decoded.data, decoded.trailers)))
+        let trailers = decoder.into_trailers();
+        serve::validate_chunked_post_decode(
+            &chunked,
+            u64::try_from(data.len()).expect("decoded test body length fits in u64"),
+            &trailers,
+            req.header("x-amz-trailer"),
+        )?;
+        Ok(Some(req.with_decoded_body(data, trailers)))
     }
 
     // ── Streaming write helpers ─────────────────────────────────────
@@ -4300,6 +4202,7 @@ impl HttpFrontend {
             },
             sse_customer: sse_customer_request,
             authorized_write: RwLock::new(authorized_write),
+            auth_mode: auth.mode,
             streaming_signing: auth.streaming,
         })
     }
@@ -4575,6 +4478,7 @@ impl HttpFrontend {
                 response_headers: ChecksumResponseHeaders(checksum_response),
             },
             sse_customer: begin.sse_customer,
+            auth_mode: auth.mode,
             streaming_signing: auth.streaming,
         })
     }
@@ -4803,6 +4707,9 @@ struct StreamingPutContext {
     checksum: StreamingPutChecksumContract,
     sse_customer: Option<SseCustomerRequest>,
     authorized_write: RwLock<AuthorizedPutObjectWrite>,
+    /// Authentication mode controls whether streaming payload markers activate
+    /// aws-chunked decoding. AWS only does so for header SigV4.
+    auth_mode: auth::AuthMode,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     streaming_signing: Option<auth::StreamingSigningContext>,
 }
@@ -4836,6 +4743,9 @@ struct StreamingPartContext {
     expected_bucket_owner: Option<String>,
     checksum: StreamingPartChecksumContract,
     sse_customer: Option<SseCustomerWriteContext>,
+    /// Authentication mode controls whether streaming payload markers activate
+    /// aws-chunked decoding. AWS only does so for header SigV4.
+    auth_mode: auth::AuthMode,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     streaming_signing: Option<auth::StreamingSigningContext>,
 }
@@ -13144,7 +13054,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_streaming_without_context_returns_signature_mismatch() {
+    fn signed_streaming_modes_without_context_are_internal_invariant_failures() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
 
@@ -13161,24 +13071,33 @@ mod tests {
             streaming: None, // missing!
         };
 
-        let req = new_req(
-            http::Method::PUT,
-            "/mybucket/key",
-            "",
-            vec![
-                (
-                    "x-amz-content-sha256".to_string(),
-                    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
-                ),
-                ("content-encoding".to_string(), "aws-chunked".to_string()),
-                ("x-amz-decoded-content-length".to_string(), "5".to_string()),
-            ],
-            b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
-        );
+        for content_sha256 in [
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        ] {
+            let req = new_req(
+                http::Method::PUT,
+                "/mybucket/key",
+                "",
+                vec![
+                    (
+                        "x-amz-content-sha256".to_string(),
+                        content_sha256.to_string(),
+                    ),
+                    ("content-encoding".to_string(), "aws-chunked".to_string()),
+                    ("x-amz-decoded-content-length".to_string(), "5".to_string()),
+                ],
+                b"5\r\nhello\r\n0\r\n\r\n".to_vec(),
+            );
 
-        match fe.maybe_decode_chunked(&req, &auth) {
-            Err(ServerError::Auth(auth::AuthError::SignatureMismatch { .. })) => {} // expected
-            other => panic!("expected SignatureMismatch, got {:?}", other.err()),
+            let Err(ServerError::InternalError { reason }) = fe.maybe_decode_chunked(&req, &auth)
+            else {
+                panic!("expected an internal signing-context invariant failure");
+            };
+            assert!(
+                reason.contains("missing its authenticated signing context"),
+                "unexpected internal error: {reason}"
+            );
         }
     }
 

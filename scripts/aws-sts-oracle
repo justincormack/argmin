@@ -450,6 +450,41 @@ wait_for_streaming_bucket_policy_success() {
     echo "streaming-bucket-policy-success: ok"
 }
 
+wait_for_streaming_head_absence_success() {
+    local attempt consecutive_not_found=0 error_file ready=false
+
+    error_file="$tmpdir/streaming-head-absence-convergence.err"
+    : >"$error_file"
+    for ((attempt = 1; attempt <= 15; attempt++)); do
+        if aws_with_session_credentials \
+            "$STS_TEST_RECREATED_ROLE_ACCESS_KEY" \
+            "$STS_TEST_RECREATED_ROLE_SECRET_KEY" \
+            "$STS_TEST_RECREATED_ROLE_SESSION_TOKEN" \
+            s3api head-object \
+            --bucket "$STS_TEST_POST_BUCKET" \
+            --key streaming-presigned-head-absence-convergence \
+            >/dev/null 2>"$error_file"; then
+            consecutive_not_found=0
+        elif grep -Fq \
+            '(404) when calling the HeadObject operation' \
+            "$error_file"; then
+            ((consecutive_not_found += 1))
+            if ((consecutive_not_found == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_not_found=0
+        fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        cat "$error_file" >&2
+        external_s3_test_die "streaming bucket policy did not converge to HeadObject not found"
+    fi
+    echo "streaming-head-absence-success: ok"
+}
+
 wait_for_session_context_bucket_policy_success() {
     local attempt consecutive_successes=0 empty_body error_file key ready=false
     local -a keys=(
@@ -570,6 +605,8 @@ wait_for_get_bucket_tagging_denied() {
 }
 
 declare -a created_role_names=()
+declare -a created_multipart_keys=()
+declare -a created_multipart_upload_ids=()
 created_disabled_access_key=""
 created_disabled_user=""
 created_bucket=""
@@ -616,6 +653,16 @@ cleanup_assume_role_fixture() {
         fi
         if ! aws_primary iam delete-role --role-name "$role_name"; then
             echo "error: failed to delete temporary STS oracle role $role_name" >&2
+            ((status != 0)) || status=1
+        fi
+    done
+    local multipart_index
+    for multipart_index in "${!created_multipart_upload_ids[@]}"; do
+        if ! aws_primary s3api abort-multipart-upload \
+            --bucket "$created_bucket" \
+            --key "${created_multipart_keys[$multipart_index]}" \
+            --upload-id "${created_multipart_upload_ids[$multipart_index]}"; then
+            echo "error: failed to abort temporary STS oracle multipart upload ${created_multipart_upload_ids[$multipart_index]}" >&2
             ((status != 0)) || status=1
         fi
     done
@@ -1584,8 +1631,15 @@ create_assume_role_fixture() {
                     Sid: "AllowRecreatedRoleStreamingOracle",
                     Effect: "Allow",
                     Principal: {AWS: $role_principal},
-                    Action: "s3:PutObject",
+                    Action: ["s3:GetObject", "s3:PutObject"],
                     Resource: ($bucket_arn + "/streaming-*")
+                },
+                {
+                    Sid: "AllowRecreatedRoleStreamingOracleList",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:ListBucket",
+                    Resource: $bucket_arn
                 },
                 {
                     Sid: "AllowIamRolePrincipal",
@@ -1701,7 +1755,34 @@ create_assume_role_fixture() {
         --bucket "$STS_TEST_POST_BUCKET" \
         --policy "file://${streaming_bucket_policy}"
     wait_for_streaming_bucket_policy_success
+    wait_for_streaming_head_absence_success
     wait_for_session_context_bucket_policy_success
+
+    export STS_TEST_PRESIGNED_STREAMING_STATIC_MULTIPART_KEY="streaming-presigned-static-multipart"
+    export STS_TEST_PRESIGNED_STREAMING_STATIC_UPLOAD_ID
+    STS_TEST_PRESIGNED_STREAMING_STATIC_UPLOAD_ID="$(aws_primary s3api create-multipart-upload \
+        --bucket "$STS_TEST_POST_BUCKET" \
+        --key "$STS_TEST_PRESIGNED_STREAMING_STATIC_MULTIPART_KEY" \
+        --query UploadId \
+        --output text)"
+    created_multipart_keys+=("$STS_TEST_PRESIGNED_STREAMING_STATIC_MULTIPART_KEY")
+    created_multipart_upload_ids+=("$STS_TEST_PRESIGNED_STREAMING_STATIC_UPLOAD_ID")
+
+    export STS_TEST_PRESIGNED_STREAMING_SESSION_MULTIPART_KEY="streaming-presigned-session-multipart"
+    export STS_TEST_PRESIGNED_STREAMING_SESSION_UPLOAD_ID
+    STS_TEST_PRESIGNED_STREAMING_SESSION_UPLOAD_ID="$(aws_with_session_credentials \
+        "$STS_TEST_RECREATED_ROLE_ACCESS_KEY" \
+        "$STS_TEST_RECREATED_ROLE_SECRET_KEY" \
+        "$STS_TEST_RECREATED_ROLE_SESSION_TOKEN" \
+        s3api create-multipart-upload \
+        --bucket "$STS_TEST_POST_BUCKET" \
+        --key "$STS_TEST_PRESIGNED_STREAMING_SESSION_MULTIPART_KEY" \
+        --query UploadId \
+        --output text)"
+    created_multipart_keys+=("$STS_TEST_PRESIGNED_STREAMING_SESSION_MULTIPART_KEY")
+    created_multipart_upload_ids+=("$STS_TEST_PRESIGNED_STREAMING_SESSION_UPLOAD_ID")
+    echo "presigned-streaming-multipart-fixtures: ok"
+
     wait_for_get_bucket_tagging_denied \
         list-tags-distinct-action \
         "$STS_TEST_POST_BUCKET"

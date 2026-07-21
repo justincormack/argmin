@@ -104,6 +104,11 @@ client requests where the input is not a server fault. Known cases:
 - `CompleteMultipartUpload` for a checksum-configured upload when the supplied
   valid parts are not consecutive from part 1, such as completing with part 2
   alone. Argmin returns `400 InvalidRequest`.
+- Presigned `PutObject` with a signed- or unsigned-trailer streaming marker
+  when the raw request body exceeds `x-amz-decoded-content-length`, including
+  an aws-chunked framed body. AWS returns `500 InternalError`; Argmin returns
+  `400 MalformedTrailerError`. The corresponding presigned `UploadPart`
+  request already returns `400 MalformedTrailerError` on AWS.
 
 Argmin intentionally does not match the `500 InternalError` status in these
 cases. Treating malformed client input as a server fault would be the wrong

@@ -14,128 +14,11 @@ use ring::{digest, hmac};
 
 use crate::error::ServerError;
 
-/// Result of decoding an aws-chunked body.
-#[derive(Debug)]
-pub struct DecodedBody {
-    /// The decoded payload data (chunks concatenated).
-    pub data: Vec<u8>,
-    /// Trailing headers (e.g. x-amz-checksum-crc32).
-    pub trailers: Vec<(String, String)>,
-}
-
 /// Minimum chunk size for non-final chunks (matches AWS S3 behavior).
 const MIN_CHUNK_SIZE: usize = 8192;
 const MAX_CHUNKED_LINE_BYTES: usize = 16 * 1024;
 const MAX_CHUNKED_TRAILER_BYTES: usize = 64 * 1024;
 const MAX_CHUNKED_TRAILER_COUNT: usize = 128;
-
-/// Decode an aws-chunked body, optionally verifying per-chunk signatures.
-///
-/// `streaming` must be `Some` for STREAMING-AWS4-HMAC-SHA256-* modes
-/// and `None` for STREAMING-UNSIGNED-PAYLOAD-* modes.
-///
-/// Used only in unit tests — production uses `IncrementalChunkedDecoder`
-/// via the streaming path in serve.rs.
-#[cfg(test)]
-pub(super) fn decode_chunked_body(
-    wire: &[u8],
-    streaming: Option<&StreamingSigningContext>,
-    trailer_mode: bool,
-) -> Result<DecodedBody, ServerError> {
-    let mut pos = 0;
-    let mut data = Vec::new();
-    let mut prev_sig = streaming.map(|s| s.seed_signature.clone());
-    let mut chunk_number: usize = 0;
-    let mut prev_chunk_size: Option<usize> = None;
-
-    loop {
-        // Read the chunk header line (up to \r\n).
-        let line_end = find_crlf(wire, pos).ok_or_else(|| ServerError::MalformedChunkedBody {
-            reason: "missing CRLF after chunk size".to_string(),
-        })?;
-        let line = &wire[pos..line_end];
-        pos = line_end + 2; // skip \r\n
-
-        // Parse: {hex-size}[;chunk-signature={hex}]
-        let (chunk_size, chunk_sig) = parse_chunk_header(line)?;
-
-        // In signed mode, every chunk MUST include a chunk-signature.
-        if streaming.is_some() && chunk_sig.is_none() {
-            return Err(ServerError::MalformedChunkedBody {
-                reason: "missing chunk-signature in signed chunked upload".to_string(),
-            });
-        }
-
-        if chunk_size == 0 {
-            // Terminal chunk. Verify its signature if signed.
-            if let Some(ctx) = &streaming {
-                let terminal_sig = chunk_sig.as_deref().unwrap();
-                verify_chunk_signature(ctx, prev_sig.as_deref().unwrap(), b"", terminal_sig)?;
-                prev_sig = Some(terminal_sig.to_string());
-            }
-
-            // Parse trailing headers until empty line.
-            let trailers = parse_trailers(wire, &mut pos)?;
-
-            // Verify trailer signature if in signed trailer mode.
-            if trailer_mode {
-                if let Some(ctx) = &streaming {
-                    verify_trailer_signature(ctx, prev_sig.as_deref().unwrap(), &trailers)?;
-                }
-            }
-
-            // Strip the trailer signature from returned trailers — it's a signing
-            // mechanism, not a content trailer.
-            let trailers: Vec<(String, String)> = trailers
-                .into_iter()
-                .filter(|(k, _)| k != "x-amz-trailer-signature")
-                .collect();
-
-            return Ok(DecodedBody { data, trailers });
-        }
-
-        // If this is a new data chunk after a previous one, the previous chunk
-        // must have been >= MIN_CHUNK_SIZE. Only the last data chunk before the
-        // terminal 0-chunk may be smaller.
-        if let Some(prev_size) = prev_chunk_size {
-            if prev_size < MIN_CHUNK_SIZE {
-                return Err(ServerError::InvalidChunkSize {
-                    chunk: chunk_number,
-                    chunk_size: prev_size,
-                    min_size: MIN_CHUNK_SIZE,
-                });
-            }
-        }
-
-        // Read chunk_size bytes of data.
-        if pos + chunk_size > wire.len() {
-            return Err(ServerError::MalformedChunkedBody {
-                reason: "chunk data truncated".to_string(),
-            });
-        }
-        let chunk_data = &wire[pos..pos + chunk_size];
-        pos += chunk_size;
-
-        // Expect \r\n after chunk data.
-        if pos + 2 > wire.len() || wire[pos] != b'\r' || wire[pos + 1] != b'\n' {
-            return Err(ServerError::MalformedChunkedBody {
-                reason: "missing CRLF after chunk data".to_string(),
-            });
-        }
-        pos += 2;
-
-        // Verify chunk signature if signed.
-        if let Some(ctx) = &streaming {
-            let sig = chunk_sig.as_deref().unwrap();
-            verify_chunk_signature(ctx, prev_sig.as_deref().unwrap(), chunk_data, sig)?;
-            prev_sig = Some(sig.to_string());
-        }
-
-        data.extend_from_slice(chunk_data);
-        chunk_number += 1;
-        prev_chunk_size = Some(chunk_size);
-    }
-}
 
 /// Find \r\n starting from `start` in `data`. Returns index of \r.
 fn find_crlf(data: &[u8], start: usize) -> Option<usize> {
@@ -239,45 +122,6 @@ fn parse_chunk_header(line: &[u8]) -> Result<(usize, Option<String>), ServerErro
     });
 
     Ok((size, sig))
-}
-
-/// Parse trailing headers after the terminal chunk.
-///
-/// Used only by `decode_chunked_body` (test-only batch decoder).
-/// The incremental decoder handles trailers inline in its state machine.
-#[cfg(test)]
-fn parse_trailers(wire: &[u8], pos: &mut usize) -> Result<Vec<(String, String)>, ServerError> {
-    let mut trailers = Vec::new();
-    loop {
-        if *pos >= wire.len() {
-            // End of input without the required trailing CRLF terminator.
-            return Err(ServerError::IncompleteBody);
-        }
-
-        // Empty line (\r\n) marks end of trailers.
-        if *pos + 1 < wire.len() && wire[*pos] == b'\r' && wire[*pos + 1] == b'\n' {
-            *pos += 2;
-            break;
-        }
-
-        let line_end = find_crlf(wire, *pos).ok_or_else(|| ServerError::MalformedChunkedBody {
-            reason: "unterminated trailer line".to_string(),
-        })?;
-        let line = &wire[*pos..line_end];
-        *pos = line_end + 2;
-
-        let line_str =
-            std::str::from_utf8(line).map_err(|_| ServerError::MalformedChunkedBody {
-                reason: "non-UTF8 trailer".to_string(),
-            })?;
-
-        if let Some((key, value)) = line_str.split_once(':') {
-            trailers.push((key.trim().to_ascii_lowercase(), value.trim().to_string()));
-        } else {
-            return Err(ServerError::IncompleteBody);
-        }
-    }
-    Ok(trailers)
 }
 
 /// Verify a single chunk's signature.
@@ -708,6 +552,31 @@ impl IncrementalChunkedDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct DecodedBody {
+        data: Vec<u8>,
+        trailers: Vec<(String, String)>,
+    }
+
+    /// Convenience adapter for tests that have a complete wire body in memory.
+    /// Decoding and signature verification are performed by the production
+    /// incremental state machine.
+    fn decode_chunked_body(
+        wire: &[u8],
+        streaming: Option<&StreamingSigningContext>,
+        trailer_mode: bool,
+    ) -> Result<DecodedBody, ServerError> {
+        let mut decoder = IncrementalChunkedDecoder::new(streaming.cloned(), trailer_mode);
+        let data = decoder.feed(wire)?;
+        if !decoder.is_done() {
+            return Err(ServerError::IncompleteBody);
+        }
+        Ok(DecodedBody {
+            data,
+            trailers: decoder.into_trailers(),
+        })
+    }
 
     #[test]
     fn decode_unsigned_single_chunk() {

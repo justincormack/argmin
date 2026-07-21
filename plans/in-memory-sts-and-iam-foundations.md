@@ -573,6 +573,39 @@ conflicting orders, plus a present unsigned token, invalidated old sessions,
 bad seed signatures, and bad first-chunk signatures. Wrong region wins when
 region and service are both wrong.
 
+That aws-chunked rule is specific to Authorization-header SigV4. AWS does not
+activate aws-chunked decoding merely because a presigned request carries one
+of the three supported `STREAMING-*` payload markers. Exact presigned
+PutObject probes repeat the matrix with configured long-lived and assumed-role
+credentials, sign the complete streaming header set, and establish:
+
+- a signed aws-chunked wire body, whether its chunk signatures are valid,
+  invalid, or absent, is treated as raw bytes. For the non-trailer signed
+  marker AWS returns HTTP 400 `IncompleteBody`, comparing
+  `x-amz-decoded-content-length` with the raw wire byte count and rendering
+  both as `NumberBytesExpected` and `NumberBytesProvided`
+- an ordinary raw body whose length exactly equals
+  `x-amz-decoded-content-length` is hashed as-is. Each streaming marker is
+  treated as the literal client hash and produces HTTP 400
+  `XAmzContentSHA256Mismatch`; this response omits `Resource`
+- for PutObject, a raw trailer-marker body shorter than the declared length is
+  `IncompleteBody`, an exact-length body is the same hash mismatch, and an
+  overlong or aws-chunked framed body reproducibly returns generic HTTP 500
+  `InternalError`. The signed framed case was repeated three consecutive times
+- UploadPart was probed independently against live multipart uploads. Its
+  non-trailer signed-marker behavior matches PutObject, but either trailer
+  marker returns `IncompleteBody` for a short raw body and HTTP 400
+  `MalformedTrailerError` for exact, overlong, or framed bodies. A signed
+  framed case was repeated three times. A signed ListParts request after every
+  failed probe confirmed that no part was stored. Signed HeadObject checks
+  after every failed PutObject likewise confirmed that no object was stored,
+  including after each generic HTTP 500 response
+
+The initial local implementation must therefore carry authentication mode to
+the body adapter. Header SigV4 constructs the production incremental decoder;
+presigned SigV4 follows the separately pinned raw-body validation path. A
+generic `STREAMING-*` classifier must not imply a common decoder decision.
+
 Credential validation should have one common decision path used by STS and S3
 header, presigned, POST Object, and streaming authentication:
 
@@ -2598,6 +2631,28 @@ request-header shape containing the 742-byte maximum issued token remains below
 the 8,192-byte transport ceiling. Because the seed canonical request
 necessarily contains the bearer token for AWS's client-visible chunk-signature
 error body, its diagnostic `Debug` form is explicitly redacted.
+
+Presigned streaming-marker handling is also complete as a distinct body
+adapter. Authentication still validates the presigned seed request and returns
+no chunk-signing context, matching AWS: the handler counts and hashes the raw
+body instead of decoding aws-chunked framing. Non-trailer length mismatches,
+exact-length PutObject hash mismatches, and UploadPart trailer errors use the
+exact AWS XML shapes. PutObject's client-triggerable trailer overrun is the one
+intentional exception: AWS returns `500 InternalError`, while Argmin follows
+the repository's fail-on-500 safety rule and returns the same deterministic
+`400 MalformedTrailerError` used by AWS UploadPart. This incompatibility is
+recorded in the compatibility guide. PutObject never starts a write session on
+this path, and UploadPart aborts its prepared session before returning the
+error. End-to-end tests cover both operations and prove no object or part is
+committed.
+
+Signed aws-chunked decoder construction now requires a streaming signing
+context and treats its absence as an internal authentication/adapter invariant
+failure, preserving the repository's fail-on-500 diagnostics; it cannot
+silently downgrade to unsigned chunk parsing. Tests exercise the same
+production incremental decoder used by the network handlers through a thin
+feed/finish adapter. The former duplicate test-only batch decoder has been
+removed.
 
 The AWS oracle separately confirms temporary credentials for signed payload
 trailers and unsigned payload trailers: success, missing and malformed tokens,

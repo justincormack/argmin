@@ -511,7 +511,8 @@ fn client_error_message(err: &ServerError) -> String {
             "A query parameter you provided implies functionality that is not implemented"
                 .to_string()
         }
-        ServerError::XAmzContentSHA256Mismatch { .. } => {
+        ServerError::XAmzContentSHA256Mismatch { .. }
+        | ServerError::PresignedStreamingContentSHA256Mismatch { .. } => {
             "The provided 'x-amz-content-sha256' header does not match what was computed."
                 .to_string()
         }
@@ -522,6 +523,10 @@ fn client_error_message(err: &ServerError) -> String {
                 .to_string()
         }
         ServerError::IncompleteBody => "The request body terminated unexpectedly".to_string(),
+        ServerError::PresignedStreamingIncompleteBody { .. } => {
+            "You did not provide the number of bytes specified by the Content-Length HTTP header"
+                .to_string()
+        }
         ServerError::MissingContentLength => {
             "You must provide the Content-Length HTTP header.".to_string()
         }
@@ -835,6 +840,28 @@ impl S3Response {
                 );
                 Self::new(400).chunked_xml_body(body)
             }
+            ServerError::PresignedStreamingContentSHA256Mismatch {
+                client_hash,
+                server_hash,
+            } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>XAmzContentSHA256Mismatch</Code>\
+                     <Message>{}</Message>\
+                     <ClientComputedContentSHA256>{}</ClientComputedContentSHA256>\
+                     <S3ComputedContentSHA256>{}</S3ComputedContentSHA256>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape(&client_error_message(err)),
+                    xml::xml_escape(client_hash),
+                    xml::xml_escape(server_hash),
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
             ServerError::Auth(auth::AuthError::UnsignedHeaders { headers }) => {
                 let body =
                     xml::headers_not_signed_error_xml(&headers.join(";"), request_id, host_id);
@@ -1138,6 +1165,23 @@ impl S3Response {
                     host_id,
                 );
                 Self::new(err.http_status()).chunked_xml_body(body)
+            }
+            ServerError::PresignedStreamingIncompleteBody { expected, provided } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>IncompleteBody</Code>\
+                     <Message>{}</Message>\
+                     <NumberBytesExpected>{expected}</NumberBytesExpected>\
+                     <NumberBytesProvided>{provided}</NumberBytesProvided>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape(&client_error_message(err)),
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
+                );
+                Self::new(400).chunked_xml_body(body)
             }
             ServerError::InvalidChunkSize {
                 chunk,
@@ -4703,6 +4747,47 @@ mod tests {
                 assert!(!body.contains(leak), "unexpected leak {leak:?} in {body}");
             }
         }
+    }
+
+    #[test]
+    fn presigned_streaming_errors_have_aws_golden_xml_shapes() {
+        let incomplete = S3Response::error(
+            &ServerError::PresignedStreamingIncompleteBody {
+                expected: 20,
+                provided: 193,
+            },
+            "/bucket/key",
+            TEST_HOST_ID,
+        );
+        assert_eq!(incomplete.status_code, 400);
+        assert_eq!(
+            String::from_utf8(incomplete.into_test_body_bytes().unwrap()).unwrap(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error><Code>IncompleteBody</Code>\
+             <Message>You did not provide the number of bytes specified by the Content-Length HTTP header</Message>\
+             <NumberBytesExpected>20</NumberBytesExpected>\
+             <NumberBytesProvided>193</NumberBytesProvided>\
+             <RequestId>request-id</RequestId><HostId>host-id</HostId></Error>"
+        );
+
+        let mismatch = S3Response::error(
+            &ServerError::PresignedStreamingContentSHA256Mismatch {
+                client_hash: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
+                server_hash: "computed".to_string(),
+            },
+            "/bucket/key",
+            TEST_HOST_ID,
+        );
+        assert_eq!(mismatch.status_code, 400);
+        assert_eq!(
+            String::from_utf8(mismatch.into_test_body_bytes().unwrap()).unwrap(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error><Code>XAmzContentSHA256Mismatch</Code>\
+             <Message>The provided 'x-amz-content-sha256' header does not match what was computed.</Message>\
+             <ClientComputedContentSHA256>STREAMING-AWS4-HMAC-SHA256-PAYLOAD</ClientComputedContentSHA256>\
+             <S3ComputedContentSHA256>computed</S3ComputedContentSHA256>\
+             <RequestId>request-id</RequestId><HostId>host-id</HostId></Error>"
+        );
     }
 
     #[test]

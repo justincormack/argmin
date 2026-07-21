@@ -123,7 +123,7 @@ impl TrailingChecksumHasher {
 /// Identifies which streaming write operation a request maps to.
 /// Whether the request body uses aws-chunked encoding.
 #[derive(Debug, PartialEq, Clone)]
-enum ChunkedMode {
+pub(super) enum ChunkedMode {
     /// Plain HTTP body (Content-Length).
     None,
     /// aws-chunked with per-chunk signatures, no trailers.
@@ -1988,7 +1988,7 @@ fn buffered_body_limit_for_operation(op: &S3Operation) -> usize {
 ///
 /// Returns `ChunkedMode::None` for plain PUT bodies (including missing
 /// `x-amz-content-sha256`, `UNSIGNED-PAYLOAD`, and fixed SHA256 hashes).
-fn parse_chunked_mode(req: &S3Request) -> Result<ChunkedMode, ServerError> {
+pub(super) fn parse_chunked_mode(req: &S3Request) -> Result<ChunkedMode, ServerError> {
     let Some(content_sha256) = req.header("x-amz-content-sha256") else {
         return Ok(ChunkedMode::None);
     };
@@ -3034,6 +3034,101 @@ async fn handle_streaming_post_object(
     }
 }
 
+#[derive(Clone, Copy)]
+enum PresignedStreamingOperation {
+    PutObject,
+    UploadPart,
+}
+
+async fn presigned_streaming_body_error(
+    body: &mut Incoming,
+    chunked: &ChunkedMode,
+    operation: PresignedStreamingOperation,
+    idle_timeout: Duration,
+) -> ServerError {
+    let Some(expected) = chunked.expected_len() else {
+        return ServerError::InternalError {
+            reason: "presigned streaming validation called for a plain body".to_string(),
+        };
+    };
+    let client_hash = match chunked {
+        ChunkedMode::Signed { .. } => "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+        ChunkedMode::SignedTrailer { .. } => "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+        ChunkedMode::UnsignedTrailer { .. } => "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        ChunkedMode::None => unreachable!("plain bodies returned above"),
+    };
+
+    let mut provided = 0u64;
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    loop {
+        match tokio::time::timeout(idle_timeout, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    let Some(new_total) = provided.checked_add(data.len() as u64) else {
+                        return ServerError::ObjectTooLarge {
+                            size: u64::MAX,
+                            max: MAX_OBJECT_SIZE,
+                        };
+                    };
+                    provided = new_total;
+                    if provided > MAX_OBJECT_SIZE {
+                        return ServerError::ObjectTooLarge {
+                            size: provided,
+                            max: MAX_OBJECT_SIZE,
+                        };
+                    }
+                    hasher.update(data);
+                }
+            }
+            Ok(Some(Err(_))) => {
+                return ServerError::InvalidRequest {
+                    reason: "failed to read request body".to_string(),
+                };
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return ServerError::InvalidRequest {
+                    reason: "request body read timed out".to_string(),
+                };
+            }
+        }
+    }
+
+    if provided < expected {
+        return ServerError::PresignedStreamingIncompleteBody { expected, provided };
+    }
+
+    if provided == expected
+        && !(matches!(operation, PresignedStreamingOperation::UploadPart)
+            && chunked.is_trailer_mode())
+    {
+        return ServerError::PresignedStreamingContentSHA256Mismatch {
+            client_hash: client_hash.to_string(),
+            server_hash: sha256_hex_from_digest(hasher.finish().as_ref()),
+        };
+    }
+
+    match chunked {
+        ChunkedMode::Signed { .. } => {
+            ServerError::PresignedStreamingIncompleteBody { expected, provided }
+        }
+        ChunkedMode::SignedTrailer { .. } | ChunkedMode::UnsignedTrailer { .. } => {
+            ServerError::MalformedTrailerError {
+                reason: match operation {
+                    PresignedStreamingOperation::PutObject => {
+                        "presigned PutObject trailer body exceeds the declared decoded length"
+                    }
+                    PresignedStreamingOperation::UploadPart => {
+                        "presigned UploadPart does not accept this trailer body shape"
+                    }
+                }
+                .to_string(),
+            }
+        }
+        ChunkedMode::None => unreachable!("plain bodies returned above"),
+    }
+}
+
 /// Handle a streaming `PutObject`: read body frame-by-frame, feed chunks to
 /// coordinator append API, finalize atomically.
 ///
@@ -3102,8 +3197,21 @@ async fn handle_streaming_put(
             .await;
         }
     };
+    if ctx.auth_mode == auth::AuthMode::PresignedSigV4 && chunked != ChunkedMode::None {
+        let err = presigned_streaming_body_error(
+            &mut body,
+            &chunked,
+            PresignedStreamingOperation::PutObject,
+            idle_timeout,
+        )
+        .await;
+        return error_response(&err, &wire_ids);
+    }
     // Build chunked decoder if needed.
-    let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
+    let mut decoder = match make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref()) {
+        Ok(decoder) => decoder,
+        Err(err) => return error_response(&err, &wire_ids),
+    };
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
         .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
@@ -3972,6 +4080,17 @@ async fn handle_streaming_part(
             .await;
         }
     };
+    if ctx.auth_mode == auth::AuthMode::PresignedSigV4 && chunked != ChunkedMode::None {
+        let err = presigned_streaming_body_error(
+            &mut body,
+            &chunked,
+            PresignedStreamingOperation::UploadPart,
+            idle_timeout,
+        )
+        .await;
+        abort_streaming_part_ctx(&state, &ctx).await;
+        return error_response(&err, &wire_ids);
+    }
     if trailing_hasher.is_none() {
         if let Some(upload_algorithm) = ctx.checksum.upload_checksum_algorithm {
             trailing_hasher = Some(TrailingChecksumHasher::from_algorithm(upload_algorithm));
@@ -3979,7 +4098,10 @@ async fn handle_streaming_part(
     }
 
     // Build chunked decoder if needed.
-    let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
+    let mut decoder = match make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref()) {
+        Ok(decoder) => decoder,
+        Err(err) => return error_response(&err, &wire_ids),
+    };
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
         .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
@@ -4715,7 +4837,7 @@ async fn ingest_streaming_part_payload(
 ///
 /// Checks decoded content length matches declared, and trailer declarations
 /// are consistent with actual trailers in the body.
-fn validate_chunked_post_decode(
+pub(super) fn validate_chunked_post_decode(
     chunked: &ChunkedMode,
     total_decoded: u64,
     trailers: &[(String, String)],
@@ -4874,22 +4996,28 @@ fn sha256_hex_from_digest(bytes: &[u8]) -> String {
 }
 
 /// Create an incremental chunked decoder for the given mode, or None for plain bodies.
-fn make_chunked_decoder(
+pub(super) fn make_chunked_decoder(
     mode: &ChunkedMode,
     streaming_ctx: Option<&auth::StreamingSigningContext>,
-) -> Option<super::chunked::IncrementalChunkedDecoder> {
-    match mode {
+) -> Result<Option<super::chunked::IncrementalChunkedDecoder>, ServerError> {
+    let decoder = match mode {
         ChunkedMode::None => None,
         ChunkedMode::Signed { expected_len } => Some(
             super::chunked::IncrementalChunkedDecoder::new_with_expected_len(
-                streaming_ctx.cloned(),
+                Some(streaming_ctx.cloned().ok_or_else(|| ServerError::InternalError {
+                    reason: "signed aws-chunked mode is missing its authenticated signing context"
+                        .to_string(),
+                })?),
                 false,
                 Some(*expected_len),
             ),
         ),
         ChunkedMode::SignedTrailer { expected_len } => Some(
             super::chunked::IncrementalChunkedDecoder::new_with_expected_len(
-                streaming_ctx.cloned(),
+                Some(streaming_ctx.cloned().ok_or_else(|| ServerError::InternalError {
+                    reason: "signed aws-chunked trailer mode is missing its authenticated signing context"
+                        .to_string(),
+                })?),
                 true,
                 Some(*expected_len),
             ),
@@ -4901,7 +5029,8 @@ fn make_chunked_decoder(
                 Some(*expected_len),
             ),
         ),
-    }
+    };
+    Ok(decoder)
 }
 
 /// Acquire a frontend from the pool using round-robin with `try_lock`.
@@ -6337,6 +6466,11 @@ Connection: close\r\n\r\n",
         scope: String,
     }
 
+    struct PresignedStreamingRequest {
+        uri: String,
+        headers: Vec<(String, String)>,
+    }
+
     fn sign_headers(
         method: &str,
         uri: &str,
@@ -6488,6 +6622,91 @@ Connection: close\r\n\r\n",
         }
     }
 
+    fn presign_streaming_request(
+        method: &str,
+        path_and_query: &str,
+        host: &str,
+        payload_hash: &str,
+        decoded_content_length: usize,
+        wire_content_length: usize,
+        trailer: Option<&str>,
+    ) -> PresignedStreamingRequest {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let days = secs / 86400;
+        let (year, month, day) = days_to_ymd(days);
+        let time_of_day = secs % 86400;
+        let hour = time_of_day / 3600;
+        let minute = (time_of_day % 3600) / 60;
+        let second = time_of_day % 60;
+        let amz_date = format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z");
+        let date = &amz_date[..8];
+        let scope = format!("{date}/us-east-1/s3/aws4_request");
+        let decoded_content_length = decoded_content_length.to_string();
+        let wire_content_length = wire_content_length.to_string();
+        let mut headers = vec![
+            ("content-encoding".to_string(), "aws-chunked".to_string()),
+            ("content-length".to_string(), wire_content_length),
+            ("host".to_string(), host.to_string()),
+            ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
+            (
+                "x-amz-decoded-content-length".to_string(),
+                decoded_content_length,
+            ),
+        ];
+        if let Some(trailer) = trailer {
+            headers.push(("x-amz-trailer".to_string(), trailer.to_string()));
+        }
+        headers.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let signed_headers = headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+        let header_refs = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let canonical_headers = canonical_headers(&header_refs);
+        let (path, operation_query) = path_and_query
+            .split_once('?')
+            .unwrap_or((path_and_query, ""));
+        let credential = auth::canonical::uri_encode(&format!("{TEST_ACCESS_KEY}/{scope}"));
+        let signed_headers_encoded = auth::canonical::uri_encode(&signed_headers);
+        let mut query_without_signature = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={credential}&X-Amz-Date={amz_date}&X-Amz-Expires=900&X-Amz-SignedHeaders={signed_headers_encoded}"
+        );
+        if !operation_query.is_empty() {
+            query_without_signature.push('&');
+            query_without_signature.push_str(operation_query);
+        }
+        let canonical_query = canonical_query_string(&query_without_signature);
+        let canonical_request = canonical_request(
+            method,
+            path,
+            &canonical_query,
+            &canonical_headers,
+            &signed_headers,
+            payload_hash,
+        );
+        let string_to_sign =
+            string_to_sign(&amz_date, &scope, &sha256_hex(canonical_request.as_bytes()));
+        let signing_key = derive_signing_key(
+            &auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
+            date,
+            "us-east-1",
+            "s3",
+        );
+        let signature =
+            hex_encode(hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes()).as_ref());
+        PresignedStreamingRequest {
+            uri: format!("{path}?{query_without_signature}&X-Amz-Signature={signature}"),
+            headers,
+        }
+    }
+
     fn chunk_signature(
         signing_key: &[u8],
         timestamp: &str,
@@ -6556,6 +6775,31 @@ Connection: close\r\n\r\n",
         stream.write_all(request.as_bytes()).unwrap();
         stream.write_all(body).unwrap();
         read_http_response(&mut stream, Duration::from_secs(5))
+    }
+
+    fn send_presigned_streaming_request(
+        addr: &str,
+        path_and_query: &str,
+        payload_hash: &str,
+        decoded_content_length: usize,
+        trailer: Option<&str>,
+        body: &[u8],
+    ) -> String {
+        let presigned = presign_streaming_request(
+            "PUT",
+            path_and_query,
+            addr,
+            payload_hash,
+            decoded_content_length,
+            body.len(),
+            trailer,
+        );
+        let mut request = format!("PUT {} HTTP/1.1\r\n", presigned.uri);
+        for (name, value) in presigned.headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        send_raw_http_request(addr, &request, body)
     }
 
     fn assert_signed_head_not_found(addr: &str, bucket: &str, key: &str) {
@@ -7819,6 +8063,279 @@ Connection: close\r\n\r\n",
             "streaming session leaked after PutObject bad terminal signature"
         );
         assert_signed_head_not_found(&addr, "mybucket", "mykey");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn presigned_streaming_markers_validate_the_raw_put_body_like_aws() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let payload = b"hello";
+        let zero_signature = "0".repeat(64);
+        let signed_wire = format!(
+            "5;chunk-signature={zero_signature}\r\nhello\r\n\
+             0;chunk-signature={zero_signature}\r\n\r\n"
+        )
+        .into_bytes();
+        let response = send_presigned_streaming_request(
+            &addr,
+            "/mybucket/signed-wire",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            payload.len(),
+            None,
+            &signed_wire,
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(
+            response.contains("<Code>IncompleteBody</Code>"),
+            "{response}"
+        );
+        assert!(
+            response.contains("<NumberBytesExpected>5</NumberBytesExpected>"),
+            "{response}"
+        );
+        assert!(
+            response.contains(&format!(
+                "<NumberBytesProvided>{}</NumberBytesProvided>",
+                signed_wire.len()
+            )),
+            "{response}"
+        );
+        assert!(!response.contains("<Resource>"), "{response}");
+        assert_signed_head_not_found(&addr, "mybucket", "signed-wire");
+
+        let unsigned_wire = b"5\r\nhello\r\n0\r\n\r\n";
+        let response = send_presigned_streaming_request(
+            &addr,
+            "/mybucket/missing-chunk-signatures",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            payload.len(),
+            None,
+            unsigned_wire,
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(
+            response.contains("<Code>IncompleteBody</Code>"),
+            "{response}"
+        );
+        assert!(
+            response.contains(&format!(
+                "<NumberBytesProvided>{}</NumberBytesProvided>",
+                unsigned_wire.len()
+            )),
+            "{response}"
+        );
+        assert_signed_head_not_found(&addr, "mybucket", "missing-chunk-signatures");
+
+        let response = send_presigned_streaming_request(
+            &addr,
+            "/mybucket/raw-exact",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            payload.len(),
+            None,
+            payload,
+        );
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(
+            response.contains("<Code>XAmzContentSHA256Mismatch</Code>"),
+            "{response}"
+        );
+        assert!(
+            response.contains(
+                "<ClientComputedContentSHA256>STREAMING-AWS4-HMAC-SHA256-PAYLOAD</ClientComputedContentSHA256>"
+            ),
+            "{response}"
+        );
+        assert!(
+            response.contains(&format!(
+                "<S3ComputedContentSHA256>{}</S3ComputedContentSHA256>",
+                sha256_hex(payload)
+            )),
+            "{response}"
+        );
+        assert!(!response.contains("<Resource>"), "{response}");
+        assert_signed_head_not_found(&addr, "mybucket", "raw-exact");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn presigned_streaming_put_trailer_bodies_use_safe_client_errors() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let zero_signature = "0".repeat(64);
+        let signed_wire = format!(
+            "5;chunk-signature={zero_signature}\r\nhello\r\n\
+             0;chunk-signature={zero_signature}\r\n\
+             x-amz-checksum-crc32:NhCmhg==\r\n\
+             x-amz-trailer-signature:{zero_signature}\r\n\r\n"
+        )
+        .into_bytes();
+        let unsigned_wire = b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n";
+
+        for (key, payload_hash, wire) in [
+            (
+                "signed-trailer",
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                signed_wire.as_slice(),
+            ),
+            (
+                "unsigned-trailer",
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                unsigned_wire.as_slice(),
+            ),
+        ] {
+            let response = send_presigned_streaming_request(
+                &addr,
+                &format!("/mybucket/{key}"),
+                payload_hash,
+                5,
+                Some("x-amz-checksum-crc32"),
+                wire,
+            );
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(
+                response.contains("<Code>MalformedTrailerError</Code>"),
+                "{response}"
+            );
+            assert_signed_head_not_found(&addr, "mybucket", key);
+
+            let raw_key = format!("{key}-raw-exact");
+            let response = send_presigned_streaming_request(
+                &addr,
+                &format!("/mybucket/{raw_key}"),
+                payload_hash,
+                5,
+                Some("x-amz-checksum-crc32"),
+                b"hello",
+            );
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(
+                response.contains("<Code>XAmzContentSHA256Mismatch</Code>"),
+                "{response}"
+            );
+            assert!(response.contains(payload_hash), "{response}");
+            assert!(!response.contains("<Resource>"), "{response}");
+            assert_signed_head_not_found(&addr, "mybucket", &raw_key);
+
+            let short_key = format!("{key}-raw-short");
+            let response = send_presigned_streaming_request(
+                &addr,
+                &format!("/mybucket/{short_key}"),
+                payload_hash,
+                5,
+                Some("x-amz-checksum-crc32"),
+                b"hell",
+            );
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(
+                response.contains("<Code>IncompleteBody</Code>"),
+                "{response}"
+            );
+            assert!(
+                response.contains("<NumberBytesExpected>5</NumberBytesExpected>"),
+                "{response}"
+            );
+            assert!(
+                response.contains("<NumberBytesProvided>4</NumberBytesProvided>"),
+                "{response}"
+            );
+            assert_signed_head_not_found(&addr, "mybucket", &short_key);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn presigned_streaming_marker_does_not_decode_or_commit_an_upload_part() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let upload_id = create_test_bucket_and_upload(&frontend, "mybucket", "mykey");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let zero_signature = "0".repeat(64);
+        let wire = format!(
+            "5;chunk-signature={zero_signature}\r\nhello\r\n\
+             0;chunk-signature={zero_signature}\r\n\r\n"
+        )
+        .into_bytes();
+        let response = send_presigned_streaming_request(
+            &addr,
+            &format!("/mybucket/mykey?partNumber=1&uploadId={upload_id}"),
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            5,
+            None,
+            &wire,
+        );
+
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(
+            response.contains("<Code>IncompleteBody</Code>"),
+            "{response}"
+        );
+
+        let signed_trailer_wire = format!(
+            "5;chunk-signature={zero_signature}\r\nhello\r\n\
+             0;chunk-signature={zero_signature}\r\n\
+             x-amz-checksum-crc32:NhCmhg==\r\n\
+             x-amz-trailer-signature:{zero_signature}\r\n\r\n"
+        )
+        .into_bytes();
+        let unsigned_trailer_wire = b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n";
+        for (payload_hash, body, expected_code) in [
+            (
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                signed_trailer_wire.as_slice(),
+                "MalformedTrailerError",
+            ),
+            (
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                b"hello".as_slice(),
+                "MalformedTrailerError",
+            ),
+            (
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+                b"hell".as_slice(),
+                "IncompleteBody",
+            ),
+            (
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                unsigned_trailer_wire.as_slice(),
+                "MalformedTrailerError",
+            ),
+            (
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                b"hello".as_slice(),
+                "MalformedTrailerError",
+            ),
+            (
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                b"hell".as_slice(),
+                "IncompleteBody",
+            ),
+        ] {
+            let response = send_presigned_streaming_request(
+                &addr,
+                &format!("/mybucket/mykey?partNumber=1&uploadId={upload_id}"),
+                payload_hash,
+                5,
+                Some("x-amz-checksum-crc32"),
+                body,
+            );
+            assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(
+                response.contains(&format!("<Code>{expected_code}</Code>")),
+                "{response}"
+            );
+            assert_signed_list_parts_empty(&addr, "mybucket", "mykey", &upload_id);
+        }
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming session leaked after presigned UploadPart rejection"
+        );
+        assert_signed_list_parts_empty(&addr, "mybucket", "mykey", &upload_id);
     }
 
     #[tokio::test(flavor = "multi_thread")]

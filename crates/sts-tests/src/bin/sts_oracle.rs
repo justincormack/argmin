@@ -4178,6 +4178,670 @@ fn build_s3_unsigned_trailer_body(data: &[u8]) -> Vec<u8> {
     .into_bytes()
 }
 
+#[derive(Clone, Copy)]
+enum S3PresignedStreamingBody {
+    SignedRawExactLength,
+    SignedValid,
+    SignedBadChunkSignature,
+    SignedMissingChunkSignatures,
+    SignedTrailerValid,
+    SignedTrailerBadSignature,
+    SignedTrailerRawExactLength,
+    SignedTrailerRawShort,
+    SignedTrailerRawLong,
+    UnsignedTrailerValid,
+    UnsignedTrailerRawExactLength,
+    UnsignedTrailerRawShort,
+    UnsignedTrailerRawLong,
+}
+
+impl S3PresignedStreamingBody {
+    fn payload_hash(self) -> &'static str {
+        match self {
+            Self::SignedRawExactLength
+            | Self::SignedValid
+            | Self::SignedBadChunkSignature
+            | Self::SignedMissingChunkSignatures => STREAMING_PAYLOAD_HASH,
+            Self::SignedTrailerValid
+            | Self::SignedTrailerBadSignature
+            | Self::SignedTrailerRawExactLength
+            | Self::SignedTrailerRawShort
+            | Self::SignedTrailerRawLong => STREAMING_SIGNED_TRAILER_PAYLOAD_HASH,
+            Self::UnsignedTrailerValid
+            | Self::UnsignedTrailerRawExactLength
+            | Self::UnsignedTrailerRawShort
+            | Self::UnsignedTrailerRawLong => STREAMING_UNSIGNED_TRAILER_PAYLOAD_HASH,
+        }
+    }
+
+    fn has_checksum_trailer(self) -> bool {
+        matches!(
+            self,
+            Self::SignedTrailerValid
+                | Self::SignedTrailerBadSignature
+                | Self::SignedTrailerRawExactLength
+                | Self::SignedTrailerRawShort
+                | Self::SignedTrailerRawLong
+                | Self::UnsignedTrailerValid
+                | Self::UnsignedTrailerRawExactLength
+                | Self::UnsignedTrailerRawShort
+                | Self::UnsignedTrailerRawLong
+        )
+    }
+}
+
+fn s3_presigned_streaming_wire_length(body_kind: S3PresignedStreamingBody) -> usize {
+    let placeholder_signature = S3StreamingSignature {
+        authorization: String::new(),
+        amz_date: "20260721T000000Z".to_string(),
+        canonical_request: String::new(),
+        scope: "20260721/us-east-1/s3/aws4_request".to_string(),
+        seed_signature: "0".repeat(64),
+        signing_key: vec![0; 32],
+    };
+    match body_kind {
+        S3PresignedStreamingBody::SignedRawExactLength => STREAMING_DATA.len(),
+        S3PresignedStreamingBody::SignedValid
+        | S3PresignedStreamingBody::SignedBadChunkSignature => {
+            build_s3_streaming_body(&placeholder_signature, STREAMING_DATA, false)
+                .0
+                .len()
+        }
+        S3PresignedStreamingBody::SignedMissingChunkSignatures => format!(
+            "{:x}\r\n{}\r\n0\r\n\r\n",
+            STREAMING_DATA.len(),
+            String::from_utf8_lossy(STREAMING_DATA)
+        )
+        .len(),
+        S3PresignedStreamingBody::SignedTrailerValid
+        | S3PresignedStreamingBody::SignedTrailerBadSignature => {
+            build_s3_signed_trailer_body(&placeholder_signature, STREAMING_DATA, false)
+                .0
+                .len()
+        }
+        S3PresignedStreamingBody::SignedTrailerRawExactLength => STREAMING_DATA.len(),
+        S3PresignedStreamingBody::SignedTrailerRawShort => STREAMING_DATA.len() - 1,
+        S3PresignedStreamingBody::SignedTrailerRawLong => STREAMING_DATA.len() + 1,
+        S3PresignedStreamingBody::UnsignedTrailerValid => {
+            build_s3_unsigned_trailer_body(STREAMING_DATA).len()
+        }
+        S3PresignedStreamingBody::UnsignedTrailerRawExactLength => STREAMING_DATA.len(),
+        S3PresignedStreamingBody::UnsignedTrailerRawShort => STREAMING_DATA.len() - 1,
+        S3PresignedStreamingBody::UnsignedTrailerRawLong => STREAMING_DATA.len() + 1,
+    }
+}
+
+struct S3PresignedStreamingResult {
+    response: RawResponse,
+    signature: S3StreamingSignature,
+    first_chunk_signature: Option<String>,
+    trailer_signature: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum S3PresignedStreamingTarget<'a> {
+    PutObject,
+    UploadPart { key: &'a str, upload_id: &'a str },
+}
+
+fn streaming_signature_from_presigned(
+    label: &str,
+    presigned: &PresignedRequest,
+    credentials: SignedRequestCredentials<'_>,
+    payload_hash: &str,
+) -> S3StreamingSignature {
+    let parsed = url::Url::parse(presigned.uri())
+        .unwrap_or_else(|error| panic!("{label}: invalid presigned streaming URL: {error}"));
+    let amz_date = required_presigned_query_value(&parsed, "X-Amz-Date", label);
+    let seed_signature = required_presigned_query_value(&parsed, "X-Amz-Signature", label);
+    let signed_headers = required_presigned_query_value(&parsed, "X-Amz-SignedHeaders", label);
+    let query_without_signature = parsed
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .filter(|part| !part.starts_with("X-Amz-Signature="))
+        .collect::<Vec<_>>()
+        .join("&");
+    let canonical_query = auth::canonical::canonical_query_string(&query_without_signature);
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            parsed
+                .port()
+                .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"))
+        })
+        .unwrap_or_else(|| panic!("{label}: presigned streaming URL has no host"));
+    let mut headers = vec![("host".to_string(), host)];
+    headers.extend(
+        presigned
+            .headers()
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    let header_refs = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let canonical_headers = auth::canonical::canonical_headers(&header_refs);
+    let canonical_request = auth::canonical::canonical_request(
+        "PUT",
+        parsed.path(),
+        &canonical_query,
+        &canonical_headers,
+        &signed_headers,
+        payload_hash,
+    );
+    let date = &amz_date[..8];
+    let scope = format!("{date}/{}/s3/aws4_request", credentials.region);
+    let secret = auth::SecretKey::new(credentials.secret_key.to_string());
+    let signing_key = auth::sigv4::derive_signing_key(&secret, date, credentials.region, "s3");
+    S3StreamingSignature {
+        authorization: String::new(),
+        amz_date,
+        canonical_request,
+        scope,
+        seed_signature,
+        signing_key: signing_key.as_ref().to_vec(),
+    }
+}
+
+fn send_s3_presigned_streaming_probe(
+    endpoint: &str,
+    bucket: &str,
+    label: &str,
+    target: S3PresignedStreamingTarget<'_>,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: Option<&str>,
+    body_kind: S3PresignedStreamingBody,
+) -> S3PresignedStreamingResult {
+    let object_key = match target {
+        S3PresignedStreamingTarget::PutObject => label,
+        S3PresignedStreamingTarget::UploadPart { key, .. } => key,
+    };
+    let mut url = format!("{endpoint}/{bucket}/{object_key}");
+    let mut query = Vec::new();
+    if let S3PresignedStreamingTarget::UploadPart { upload_id, .. } = target {
+        query.push("partNumber=1".to_string());
+        query.push(format!(
+            "uploadId={}",
+            auth::canonical::uri_encode(upload_id)
+        ));
+    }
+    if let Some(security_token) = security_token {
+        query.push(format!(
+            "X-Amz-Security-Token={}",
+            auth::canonical::uri_encode(security_token)
+        ));
+    }
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(&query.join("&"));
+    }
+    let mut headers = vec![
+        ("content-encoding".to_string(), "aws-chunked".to_string()),
+        (
+            "content-length".to_string(),
+            s3_presigned_streaming_wire_length(body_kind).to_string(),
+        ),
+        (
+            "x-amz-decoded-content-length".to_string(),
+            STREAMING_DATA.len().to_string(),
+        ),
+    ];
+    if body_kind.has_checksum_trailer() {
+        headers.push((
+            "x-amz-trailer".to_string(),
+            STREAMING_CHECKSUM_TRAILER_NAME.to_string(),
+        ));
+    }
+    let presigned = presign_url_for_service_with_credentials(
+        "PUT",
+        &url,
+        Duration::from_secs(900),
+        headers,
+        Some(body_kind.payload_hash()),
+        "s3",
+        credentials,
+    );
+    let signature = streaming_signature_from_presigned(
+        label,
+        &presigned,
+        credentials,
+        body_kind.payload_hash(),
+    );
+    let (body, first_chunk_signature, trailer_signature) = match body_kind {
+        S3PresignedStreamingBody::SignedRawExactLength
+        | S3PresignedStreamingBody::SignedTrailerRawExactLength
+        | S3PresignedStreamingBody::UnsignedTrailerRawExactLength => {
+            (STREAMING_DATA.to_vec(), None, None)
+        }
+        S3PresignedStreamingBody::SignedTrailerRawShort
+        | S3PresignedStreamingBody::UnsignedTrailerRawShort => (
+            STREAMING_DATA[..STREAMING_DATA.len() - 1].to_vec(),
+            None,
+            None,
+        ),
+        S3PresignedStreamingBody::SignedTrailerRawLong
+        | S3PresignedStreamingBody::UnsignedTrailerRawLong => {
+            let mut body = STREAMING_DATA.to_vec();
+            body.push(b'!');
+            (body, None, None)
+        }
+        S3PresignedStreamingBody::SignedValid => {
+            let (body, chunk_signature) =
+                build_s3_streaming_body(&signature, STREAMING_DATA, false);
+            (body, Some(chunk_signature), None)
+        }
+        S3PresignedStreamingBody::SignedBadChunkSignature => {
+            let (body, chunk_signature) = build_s3_streaming_body(&signature, STREAMING_DATA, true);
+            (body, Some(chunk_signature), None)
+        }
+        S3PresignedStreamingBody::SignedMissingChunkSignatures => (
+            format!(
+                "{:x}\r\n{}\r\n0\r\n\r\n",
+                STREAMING_DATA.len(),
+                String::from_utf8_lossy(STREAMING_DATA)
+            )
+            .into_bytes(),
+            None,
+            None,
+        ),
+        S3PresignedStreamingBody::SignedTrailerValid => {
+            let (body, _, trailer_signature) =
+                build_s3_signed_trailer_body(&signature, STREAMING_DATA, false);
+            (body, None, Some(trailer_signature))
+        }
+        S3PresignedStreamingBody::SignedTrailerBadSignature => {
+            let (body, _, trailer_signature) =
+                build_s3_signed_trailer_body(&signature, STREAMING_DATA, true);
+            (body, None, Some(trailer_signature))
+        }
+        S3PresignedStreamingBody::UnsignedTrailerValid => {
+            (build_s3_unsigned_trailer_body(STREAMING_DATA), None, None)
+        }
+    };
+    let mut request =
+        build_test_agent(endpoint, None, Duration::from_secs(120)).put(presigned.uri());
+    for (name, value) in presigned.headers() {
+        request = request.header(name, value);
+    }
+    let mut response = request
+        .send(&body)
+        .expect("presigned streaming AWS transport error");
+    let response_headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("presigned streaming AWS response header is valid UTF-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let (response_body, body_read_error) = match response.body_mut().read_to_string() {
+        Ok(body) => (body, None),
+        Err(error) => (String::new(), Some(error.to_string())),
+    };
+    S3PresignedStreamingResult {
+        response: RawResponse {
+            status: response.status().as_u16(),
+            headers: response_headers,
+            body: response_body,
+            body_read_error,
+        },
+        signature,
+        first_chunk_signature,
+        trailer_signature,
+    }
+}
+
+fn sanitized_s3_presigned_streaming_response(
+    result: &S3PresignedStreamingResult,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: Option<&str>,
+) -> RawResponse {
+    let tokens = security_token.into_iter().collect::<Vec<_>>();
+    let mut response =
+        s3_response_with_sanitized_body(&result.response, credentials.access_key, &tokens);
+    for sensitive in [
+        Some(result.signature.seed_signature.as_str()),
+        result.first_chunk_signature.as_deref(),
+        result.trailer_signature.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        response.body = response.body.replace(sensitive, "PRESENTED_SIGNATURE");
+        response.body = response
+            .body
+            .replace(&spaced_hex(sensitive), "PRESENTED_SIGNATURE_BYTES");
+    }
+    response
+}
+
+fn assert_s3_presigned_streaming_incomplete_body(
+    label: &str,
+    response: &RawResponse,
+    expected: usize,
+    provided: usize,
+) {
+    assert_shape(
+        label,
+        response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .sub("expected", expected.to_string())
+            .sub("provided", provided.to_string())
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>IncompleteBody</Code>\
+                 <Message>You did not provide the number of bytes specified by the Content-Length HTTP header</Message>\
+                 <NumberBytesExpected>{expected}</NumberBytesExpected>\
+                 <NumberBytesProvided>{provided}</NumberBytesProvided>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+}
+
+fn assert_s3_presigned_streaming_sha256_mismatch(
+    label: &str,
+    response: &RawResponse,
+    payload_hash: &str,
+) {
+    assert_shape(
+        label,
+        response,
+        &shape()
+            .status(400)
+            .headers(error_response_headers())
+            .sub("payload_hash", payload_hash)
+            .sub(
+                "computed_hash",
+                auth::canonical::sha256_hex(STREAMING_DATA),
+            )
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>XAmzContentSHA256Mismatch</Code>\
+                 <Message>The provided 'x-amz-content-sha256' header does not match what was computed.</Message>\
+                 <ClientComputedContentSHA256>{payload_hash}</ClientComputedContentSHA256>\
+                 <S3ComputedContentSHA256>{computed_hash}</S3ComputedContentSHA256>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+}
+
+fn assert_s3_presigned_streaming_internal_error(label: &str, response: &RawResponse) {
+    assert_shape(
+        label,
+        response,
+        &shape().status(500).headers(error_response_headers()).body(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>InternalError</Code>\
+                 <Message>We encountered an internal error. Please try again.</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+        ),
+    );
+}
+
+fn assert_s3_presigned_streaming_malformed_trailer(label: &str, response: &RawResponse) {
+    assert_shape(
+        label,
+        response,
+        &shape().status(400).headers(error_response_headers()).body(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>MalformedTrailerError</Code>\
+                 <Message>The request contained trailing data that was not well-formed or did not conform to our published schema.</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+        ),
+    );
+}
+
+fn assert_s3_presigned_streaming_upload_has_no_parts(
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    label: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: Option<&str>,
+) {
+    let url = format!(
+        "{endpoint}/{bucket}/{key}?uploadId={}",
+        auth::canonical::uri_encode(upload_id)
+    );
+    let headers = security_token
+        .map(|token| vec![("x-amz-security-token", token)])
+        .unwrap_or_default();
+    let response = send_signed_request_for_service_with_credentials(
+        "GET",
+        &url,
+        b"",
+        headers,
+        "s3",
+        credentials,
+    );
+    assert_eq!(response.status, 200, "{label}: ListParts did not succeed");
+    assert!(
+        !response.body.contains("<Part>"),
+        "{label}: failed UploadPart unexpectedly stored a part"
+    );
+}
+
+fn assert_s3_presigned_streaming_object_absent(
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+    label: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: Option<&str>,
+) {
+    let url = format!("{endpoint}/{bucket}/{key}");
+    let headers = security_token
+        .map(|token| vec![("x-amz-security-token", token)])
+        .unwrap_or_default();
+    let response = send_signed_request_for_service_with_credentials(
+        "HEAD",
+        &url,
+        b"",
+        headers,
+        "s3",
+        credentials,
+    );
+    assert_eq!(
+        response.status, 404,
+        "{label}: failed PutObject unexpectedly created an object"
+    );
+}
+
+fn run_s3_presigned_streaming_probes(
+    endpoint: &str,
+    bucket: &str,
+    credential_label: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: Option<&str>,
+    multipart_key: &str,
+    upload_id: &str,
+) {
+    let cases = [
+        (
+            "signed-raw-exact-length",
+            S3PresignedStreamingBody::SignedRawExactLength,
+        ),
+        ("signed-valid", S3PresignedStreamingBody::SignedValid),
+        (
+            "signed-bad-chunk-signature",
+            S3PresignedStreamingBody::SignedBadChunkSignature,
+        ),
+        (
+            "signed-missing-chunk-signatures",
+            S3PresignedStreamingBody::SignedMissingChunkSignatures,
+        ),
+        (
+            "signed-trailer-valid",
+            S3PresignedStreamingBody::SignedTrailerValid,
+        ),
+        (
+            "signed-trailer-valid-repeat-2",
+            S3PresignedStreamingBody::SignedTrailerValid,
+        ),
+        (
+            "signed-trailer-valid-repeat-3",
+            S3PresignedStreamingBody::SignedTrailerValid,
+        ),
+        (
+            "signed-trailer-bad-signature",
+            S3PresignedStreamingBody::SignedTrailerBadSignature,
+        ),
+        (
+            "signed-trailer-raw-exact-length",
+            S3PresignedStreamingBody::SignedTrailerRawExactLength,
+        ),
+        (
+            "signed-trailer-raw-short",
+            S3PresignedStreamingBody::SignedTrailerRawShort,
+        ),
+        (
+            "signed-trailer-raw-long",
+            S3PresignedStreamingBody::SignedTrailerRawLong,
+        ),
+        (
+            "unsigned-trailer-valid",
+            S3PresignedStreamingBody::UnsignedTrailerValid,
+        ),
+        (
+            "unsigned-trailer-raw-exact-length",
+            S3PresignedStreamingBody::UnsignedTrailerRawExactLength,
+        ),
+        (
+            "unsigned-trailer-raw-short",
+            S3PresignedStreamingBody::UnsignedTrailerRawShort,
+        ),
+        (
+            "unsigned-trailer-raw-long",
+            S3PresignedStreamingBody::UnsignedTrailerRawLong,
+        ),
+    ];
+    for (target_label, target) in [
+        ("put-object", S3PresignedStreamingTarget::PutObject),
+        (
+            "upload-part",
+            S3PresignedStreamingTarget::UploadPart {
+                key: multipart_key,
+                upload_id,
+            },
+        ),
+    ] {
+        for (case_label, body_kind) in cases {
+            let label =
+                format!("streaming-presigned-{target_label}-{case_label}-{credential_label}");
+            let result = send_s3_presigned_streaming_probe(
+                endpoint,
+                bucket,
+                &label,
+                target,
+                credentials,
+                security_token,
+                body_kind,
+            );
+            let response =
+                sanitized_s3_presigned_streaming_response(&result, credentials, security_token);
+            match (target, body_kind) {
+                (
+                    S3PresignedStreamingTarget::UploadPart { .. },
+                    S3PresignedStreamingBody::SignedTrailerValid
+                    | S3PresignedStreamingBody::SignedTrailerBadSignature
+                    | S3PresignedStreamingBody::SignedTrailerRawExactLength
+                    | S3PresignedStreamingBody::SignedTrailerRawLong
+                    | S3PresignedStreamingBody::UnsignedTrailerValid
+                    | S3PresignedStreamingBody::UnsignedTrailerRawExactLength
+                    | S3PresignedStreamingBody::UnsignedTrailerRawLong,
+                ) => {
+                    assert_s3_presigned_streaming_malformed_trailer(&label, &response);
+                }
+                (
+                    _,
+                    S3PresignedStreamingBody::SignedRawExactLength
+                    | S3PresignedStreamingBody::SignedTrailerRawExactLength
+                    | S3PresignedStreamingBody::UnsignedTrailerRawExactLength,
+                ) => {
+                    assert_s3_presigned_streaming_sha256_mismatch(
+                        &label,
+                        &response,
+                        body_kind.payload_hash(),
+                    );
+                }
+                (
+                    _,
+                    S3PresignedStreamingBody::SignedValid
+                    | S3PresignedStreamingBody::SignedBadChunkSignature
+                    | S3PresignedStreamingBody::SignedMissingChunkSignatures,
+                ) => {
+                    assert_s3_presigned_streaming_incomplete_body(
+                        &label,
+                        &response,
+                        STREAMING_DATA.len(),
+                        s3_presigned_streaming_wire_length(body_kind),
+                    );
+                }
+                (
+                    _,
+                    S3PresignedStreamingBody::SignedTrailerValid
+                    | S3PresignedStreamingBody::SignedTrailerBadSignature
+                    | S3PresignedStreamingBody::UnsignedTrailerValid,
+                ) => {
+                    assert_s3_presigned_streaming_internal_error(&label, &response);
+                }
+                (
+                    _,
+                    S3PresignedStreamingBody::SignedTrailerRawShort
+                    | S3PresignedStreamingBody::UnsignedTrailerRawShort,
+                ) => {
+                    assert_s3_presigned_streaming_incomplete_body(
+                        &label,
+                        &response,
+                        STREAMING_DATA.len(),
+                        s3_presigned_streaming_wire_length(body_kind),
+                    );
+                }
+                (
+                    S3PresignedStreamingTarget::PutObject,
+                    S3PresignedStreamingBody::SignedTrailerRawLong
+                    | S3PresignedStreamingBody::UnsignedTrailerRawLong,
+                ) => {
+                    assert_s3_presigned_streaming_internal_error(&label, &response);
+                }
+            }
+            match target {
+                S3PresignedStreamingTarget::PutObject => {
+                    assert_s3_presigned_streaming_object_absent(
+                        endpoint,
+                        bucket,
+                        &label,
+                        &label,
+                        credentials,
+                        security_token,
+                    );
+                }
+                S3PresignedStreamingTarget::UploadPart { .. } => {
+                    assert_s3_presigned_streaming_upload_has_no_parts(
+                        endpoint,
+                        bucket,
+                        multipart_key,
+                        upload_id,
+                        &label,
+                        credentials,
+                        security_token,
+                    );
+                }
+            }
+            println!("{label}: ok");
+        }
+    }
+}
+
 fn send_s3_adjacent_streaming_probe(
     endpoint: &str,
     bucket: &str,
@@ -11199,6 +11863,42 @@ fn main() {
         region: &region,
         tls_ca_pem: None,
     };
+    if env::var("STS_TEST_PRESIGNED_STREAMING_ONLY").as_deref() == Ok("1") {
+        let recreated_access_key = required_env("STS_TEST_RECREATED_ROLE_ACCESS_KEY");
+        let recreated_secret_key = required_env("STS_TEST_RECREATED_ROLE_SECRET_KEY");
+        let recreated_security_token = required_env("STS_TEST_RECREATED_ROLE_SESSION_TOKEN");
+        let bucket = required_env("STS_TEST_POST_BUCKET");
+        let static_multipart_key =
+            required_env("STS_TEST_PRESIGNED_STREAMING_STATIC_MULTIPART_KEY");
+        let static_upload_id = required_env("STS_TEST_PRESIGNED_STREAMING_STATIC_UPLOAD_ID");
+        let session_multipart_key =
+            required_env("STS_TEST_PRESIGNED_STREAMING_SESSION_MULTIPART_KEY");
+        let session_upload_id = required_env("STS_TEST_PRESIGNED_STREAMING_SESSION_UPLOAD_ID");
+        run_s3_presigned_streaming_probes(
+            &format!("https://s3.{region}.amazonaws.com"),
+            &bucket,
+            "static",
+            credentials,
+            None,
+            &static_multipart_key,
+            &static_upload_id,
+        );
+        run_s3_presigned_streaming_probes(
+            &format!("https://s3.{region}.amazonaws.com"),
+            &bucket,
+            "session",
+            SignedRequestCredentials {
+                access_key: &recreated_access_key,
+                secret_key: &recreated_secret_key,
+                region: &region,
+                tls_ca_pem: None,
+            },
+            Some(&recreated_security_token),
+            &session_multipart_key,
+            &session_upload_id,
+        );
+        return;
+    }
     if env::var("STS_TEST_DISABLED_CREDENTIAL_STAGE").as_deref() == Ok("active") {
         let disabled_access_key = required_env("STS_TEST_DISABLED_ACCESS_KEY");
         let disabled_secret_key = required_env("STS_TEST_DISABLED_SECRET_KEY");
@@ -11679,6 +12379,24 @@ fn main() {
             old_credentials: deleted_credentials,
             old_security_token: &deleted_security_token,
         };
+        run_s3_presigned_streaming_probes(
+            &format!("https://s3.{region}.amazonaws.com"),
+            &post_bucket,
+            "static",
+            credentials,
+            None,
+            &required_env("STS_TEST_PRESIGNED_STREAMING_STATIC_MULTIPART_KEY"),
+            &required_env("STS_TEST_PRESIGNED_STREAMING_STATIC_UPLOAD_ID"),
+        );
+        run_s3_presigned_streaming_probes(
+            &format!("https://s3.{region}.amazonaws.com"),
+            &post_bucket,
+            "session",
+            recreated_credentials,
+            Some(&recreated_security_token),
+            &required_env("STS_TEST_PRESIGNED_STREAMING_SESSION_MULTIPART_KEY"),
+            &required_env("STS_TEST_PRESIGNED_STREAMING_SESSION_UPLOAD_ID"),
+        );
         run_s3_streaming_session_authentication_probes(
             &format!("https://s3.{region}.amazonaws.com"),
             &post_bucket,

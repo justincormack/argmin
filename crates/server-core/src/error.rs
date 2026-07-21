@@ -407,6 +407,15 @@ pub enum ServerError {
         server_hash: String,
     },
 
+    /// Presigned requests carrying a streaming payload marker do not activate
+    /// AWS's aws-chunked decoder. This variant preserves that response's
+    /// distinct XML shape, which omits Resource.
+    #[error("presigned streaming x-amz-content-sha256 mismatch: client={client_hash}, server={server_hash}")]
+    PresignedStreamingContentSHA256Mismatch {
+        client_hash: String,
+        server_hash: String,
+    },
+
     #[error("malformed XML: {reason}")]
     MalformedXML { reason: String },
 
@@ -421,6 +430,11 @@ pub enum ServerError {
 
     #[error("incomplete body")]
     IncompleteBody,
+
+    /// Presigned streaming markers compare the raw body length with
+    /// x-amz-decoded-content-length and report both values in the response.
+    #[error("presigned streaming incomplete body: expected={expected}, provided={provided}")]
+    PresignedStreamingIncompleteBody { expected: u64, provided: u64 },
 
     #[error("missing content length")]
     MissingContentLength,
@@ -669,12 +683,15 @@ impl ServerError {
             }
             Self::MalformedPOSTRequest { .. } => "MalformedPOSTRequest",
             Self::MalformedChunkedBody { .. } => "InvalidRequest",
-            Self::IncompleteBody => "IncompleteBody",
+            Self::IncompleteBody | Self::PresignedStreamingIncompleteBody { .. } => {
+                "IncompleteBody"
+            }
             Self::MissingContentLength => "MissingContentLength",
             Self::UnsupportedStreamingToken { .. } => "InvalidArgument",
             Self::PostObjectHeaderAuthUnsupported => "InvalidArgument",
             Self::MalformedTrailerError { .. } => "MalformedTrailerError",
-            Self::XAmzContentSHA256Mismatch { .. } => "XAmzContentSHA256Mismatch",
+            Self::XAmzContentSHA256Mismatch { .. }
+            | Self::PresignedStreamingContentSHA256Mismatch { .. } => "XAmzContentSHA256Mismatch",
             Self::NotImplemented { .. }
             | Self::HeaderNotImplemented { .. }
             | Self::QueryParameterNotImplemented { .. }
@@ -780,11 +797,13 @@ impl ServerError {
             Self::AccessControlListNotSupported
             | Self::InvalidBucketAclWithObjectOwnership
             | Self::XAmzContentSHA256Mismatch { .. }
+            | Self::PresignedStreamingContentSHA256Mismatch { .. }
             | Self::MalformedXML { .. }
             | Self::IllegalVersioningConfiguration { .. }
             | Self::MalformedPOSTRequest { .. }
             | Self::MalformedChunkedBody { .. }
             | Self::IncompleteBody
+            | Self::PresignedStreamingIncompleteBody { .. }
             | Self::MalformedTrailerError { .. } => 400,
             Self::MissingContentLength => 411,
             Self::UnsupportedStreamingToken { .. } => 400,
