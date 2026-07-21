@@ -3659,6 +3659,64 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         )
         .map_err(StorageNodeObjectRouteError::Object)
     }
+
+    fn load_direct_put_commit_snapshot(
+        &self,
+        reservation_id: &SessionId,
+        generation_id: GenerationId,
+    ) -> Result<crate::DirectPutCommitStorageSnapshot, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            reservation_id,
+            generation_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn build_direct_put_commit_command(
+        &self,
+        request: &crate::CommitDirectPutObjectReq,
+        version_id: s3_types::VersionId,
+        expected_snapshot: &crate::DirectPutCommitStorageSnapshot,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        if request.bucket != *self.route.bucket
+            || request.key != *self.route.key
+            || request.bucket_write_reservation.bucket != *self.route.bucket
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "direct PUT command request does not match active object route"
+                        .to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        DirectPutMetadataNodeClient::build_direct_put_commit_command(
+            &local_client,
+            BuildDirectPutCommitCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                request,
+                version_id,
+                expected_snapshot,
+                bucket_write_reservation: &request.bucket_write_reservation,
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
 }
 
 impl StorageNodeRetainedBucketWriteReservationRoute<'_> {
@@ -4427,7 +4485,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::DirectPutCommitSnapshotLoad => {
                 match decode_direct_put_commit_snapshot_request(&frame.payload) {
-                    Ok(request) => self.direct_put_commit_snapshot_response(request),
+                    Ok(request) => self.direct_put_commit_snapshot_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4436,7 +4494,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::DirectPutCommitCommandBuild => {
                 match decode_direct_put_command_build_request(&frame.payload) {
-                    Ok(request) => self.direct_put_commit_command_build_response(request),
+                    Ok(request) => {
+                        self.direct_put_commit_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6700,44 +6760,37 @@ impl StorageNodeConnectionHandler {
 
     fn direct_put_commit_snapshot_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcDirectPutCommitSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "direct PUT commit snapshot load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match DirectPutMetadataNodeClient::load_direct_put_commit_snapshot(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            &request.reservation_id,
-            request.generation_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.load_direct_put_commit_snapshot(&request.reservation_id, request.generation_id)
+        {
             Ok(snapshot) => {
                 let payload = encode_direct_put_commit_snapshot_response(
                     &StorageRpcDirectPutCommitSnapshotResponse { snapshot },
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
         }
     }
 
     fn direct_put_commit_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcDirectPutCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if request.object.bucket != request.request.bucket
@@ -6751,33 +6804,25 @@ impl StorageNodeConnectionHandler {
                     .to_string(),
             });
         }
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
+        if request.object.key != request.request.key {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "direct PUT command request key does not match routed object key"
+                    .to_string(),
+            });
         }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "direct PUT commit command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match DirectPutMetadataNodeClient::build_direct_put_commit_command(
-            &local_client,
-            BuildDirectPutCommitCommandReq {
-                pg_id: self
-                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                cluster_epoch: request.object.cluster_epoch,
-                request: &request.request,
-                version_id: request.version_id,
-                expected_snapshot: &request.expected_snapshot,
-                bucket_write_reservation: &request.bucket_write_reservation,
-            },
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.build_direct_put_commit_command(
+            &request.request,
+            request.version_id,
+            &request.expected_snapshot,
         ) {
             Ok(command) => {
                 let payload = encode_direct_put_command_build_response(
@@ -6787,7 +6832,9 @@ impl StorageNodeConnectionHandler {
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(ObjectPgActionError::StaleDirectPutCommitSnapshot) => {
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleDirectPutCommitSnapshot,
+            )) => {
                 let payload = encode_direct_put_command_build_response(
                     &StorageRpcDirectPutCommandBuildResponse {
                         outcome: StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot,
@@ -6795,12 +6842,14 @@ impl StorageNodeConnectionHandler {
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id,
-                cluster_epoch,
-                log_index,
-            })) => {
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Store(
+                StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            ))) => {
                 emit_storage_node_metadata_command_log_conflict(
                     node_id,
                     pg_id,
@@ -6820,7 +6869,12 @@ impl StorageNodeConnectionHandler {
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
         }
     }
 
@@ -18341,6 +18395,42 @@ mod tests {
             bucket: bucket.clone(),
             key: key.clone(),
         };
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "active-object-route-proof".to_string(),
+            owner_token: "active-object-route-owner".to_string(),
+            cluster_epoch: config.cluster_epoch,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "direct-put".to_string(),
+            created_at: 1_000,
+            lease_deadline: 4_000,
+            target_context: Some(key.as_str().to_string()),
+        };
+        let direct_put_request = crate::CommitDirectPutObjectReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_reservation_id: reservation_id.clone(),
+            versioning: BucketVersioningState::Suspended,
+            owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: reserved_generation,
+            size: 12,
+            etag_crc64: 99,
+            ec: EcShape { k: 4, m: 2 },
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+            segment_index: 0,
+            segment_crc64: 99,
+            segment_okh: [7; 16],
+            segment_vid: GenerationId::new(10).unwrap(),
+            data_pg_id: 0,
+            bucket_write_reservation: proof.clone(),
+        };
 
         let foreign_permit = StorageNodeRouteAdmissionGate::default()
             .acquire(StorageNodeRouteAdmissionClass::Active);
@@ -18373,7 +18463,7 @@ mod tests {
                 .active_object_route(&active_permit, &request, "test acting-set object route")
                 .unwrap()
         });
-        crate::clock::with_time_override(1_000, || {
+        let direct_put_snapshot = crate::clock::with_time_override(1_000, || {
             assert_eq!(
                 primary_route
                     .generation_reservation(&reservation_id)
@@ -18388,7 +18478,77 @@ mod tests {
                 acting_set_route.next_version_id().unwrap(),
                 VersionId::from_u64(1)
             );
+            let snapshot = primary_route
+                .load_direct_put_commit_snapshot(&reservation_id, reserved_generation)
+                .unwrap();
+            assert_eq!(snapshot.auth_snapshot.existing_etag, None);
+            assert_eq!(snapshot.current, None);
+            let command = primary_route
+                .build_direct_put_commit_command(&direct_put_request, VersionId::Null, &snapshot)
+                .unwrap();
+            let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
+                panic!("active object route must build a direct PUT command");
+            };
+            assert!(commit.matches_request(&bucket, &key, &reservation_id, reserved_generation));
+            snapshot
         });
+
+        let mut mismatched_direct_put_request = direct_put_request.clone();
+        mismatched_direct_put_request.key = crate::tests::object_key("different-request-key");
+        let capability_mismatch = crate::clock::with_time_override(1_000, || {
+            primary_route.build_direct_put_commit_command(
+                &mismatched_direct_put_request,
+                VersionId::Null,
+                &direct_put_snapshot,
+            )
+        });
+        match capability_mismatch {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("does not match active object route"));
+            }
+            other => panic!("mismatched request must fail at the route capability: {other:?}"),
+        }
+
+        let mut mismatched_proof_request = direct_put_request.clone();
+        mismatched_proof_request.bucket_write_reservation.bucket =
+            crate::tests::bucket_name("different-proof-bucket");
+        let proof_mismatch = crate::clock::with_time_override(1_000, || {
+            primary_route.build_direct_put_commit_command(
+                &mismatched_proof_request,
+                VersionId::Null,
+                &direct_put_snapshot,
+            )
+        });
+        match proof_mismatch {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("does not match active object route"));
+            }
+            other => panic!("mismatched proof must fail at the route capability: {other:?}"),
+        }
+
+        let mut mismatched_object = request.clone();
+        mismatched_object.key = crate::tests::object_key("different-routed-key");
+        let mismatch_response = crate::clock::with_time_override(1_000, || {
+            handler
+                .direct_put_commit_command_build_response(
+                    &active_permit,
+                    StorageRpcDirectPutCommandBuildRequest {
+                        object: mismatched_object,
+                        request: direct_put_request.clone(),
+                        version_id: VersionId::Null,
+                        expected_snapshot: direct_put_snapshot.clone(),
+                        bucket_write_reservation: proof.clone(),
+                    },
+                )
+                .unwrap()
+        });
+        let mismatch_error = decode_storage_rpc_response_payload(&mismatch_response)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(mismatch_error.code, StorageRpcErrorCode::PayloadDecode);
+        assert!(mismatch_error.message.contains("key does not match"));
 
         let mut extended = config.clone();
         extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
@@ -18417,6 +18577,22 @@ mod tests {
                 (
                     "version allocation",
                     acting_set_route.next_version_id().map(|_| ()),
+                ),
+                (
+                    "direct PUT snapshot load",
+                    primary_route
+                        .load_direct_put_commit_snapshot(&reservation_id, reserved_generation)
+                        .map(|_| ()),
+                ),
+                (
+                    "direct PUT command build",
+                    primary_route
+                        .build_direct_put_commit_command(
+                            &direct_put_request,
+                            VersionId::Null,
+                            &direct_put_snapshot,
+                        )
+                        .map(|_| ()),
                 ),
             ];
             for (operation, result) in expired_operations {

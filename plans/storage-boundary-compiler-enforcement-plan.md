@@ -1560,6 +1560,41 @@ Twenty-ninth Phase 3 slice:
   regressions, all 2,197 storage tests, workspace-wide strict Clippy, and the
   full parallel workspace suite (7,399 tests).
 
+Thirtieth Phase 3 slice:
+
+- direct PUT commit snapshot loading and command construction now consume the
+  exact `StorageNodeActivePrimaryObjectRoute` established from the frame.
+  Both revalidate the immutable captured deadline immediately before local
+  node access; the command builder derives its trusted object PG and command
+  epoch from the route capability rather than accepting duplicate wire
+  authority.
+- capability migration exposed a contradictory-state gap in the internal RPC:
+  command construction checked the routed bucket and reservation proof but
+  did not require the routed object key to equal the embedded direct PUT
+  request key. The handler now rejects that mismatch as exact
+  `PayloadDecode`, and the capability independently binds the command request
+  to its bucket/key subject before constructing a command.
+- the deterministic active-object regression now loads a real direct PUT
+  snapshot, builds and validates its command, rejects a mismatched routed key,
+  extends the raw same-epoch route validity, and proves both operations fail
+  at the capability's original deadline while the durable generation
+  reservation remains exact.
+- review tightened the command capability so it no longer accepts a separate
+  reservation proof: command construction derives the proof from the bound
+  direct PUT request and rejects request subjects or proof buckets that do not
+  match its object route. Direct capability regressions independently pin both
+  rejection paths instead of relying on the RPC handler's defensive prechecks.
+- existing Unix snapshot, command-build, and equivalent-state wrong-PG tests
+  remain positive and adversarial canaries for the converted wire boundary.
+- object reads and mutations, listing scans, data operations, frontend
+  capability migration, and capability requirements on node-client traits
+  remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  active-object/direct-PUT deadline, key-binding, and proof-binding regression,
+  all three Unix direct-PUT/wrong-PG regressions, all 2,197 storage tests,
+  workspace-wide strict Clippy, and the full parallel workspace suite (7,399
+  tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
