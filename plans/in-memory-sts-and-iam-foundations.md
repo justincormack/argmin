@@ -2804,6 +2804,28 @@ ACL-enabled object authorization and all other S3 action families remain
 subsequent Phase 3 integration slices rather than inheriting untested generic
 composition.
 
+The same-account `GetObject` AWS matrix completed on 2026-07-21 as the evidence
+prerequisite for the next operation slice. Two unique path-bearing roles use
+the owner-managed permissions boundary, now limited to `s3:GetObject` and
+`s3:PutObject` on objects in prefixed test buckets. One role has identity
+allows on two exact object ARNs and the other has an explicit identity deny on
+one exact object ARN. A third, permissionless recreated role supplies the
+resource-policy-only case. Every role and inline policy is round-tripped
+through IAM, and the fixture requires three consecutive target-endpoint
+results for each decision before the raw oracle runs.
+
+On a same-account bucket, either an identity-policy allow with no matching
+resource statement or an exact role-principal resource-policy allow with no
+identity allow is sufficient for `GetObject`. An explicit identity deny wins
+over a matching resource allow, and an explicit resource deny wins over a
+matching identity allow. When neither source allows, AWS reports that no
+identity-based policy permits `s3:GetObject`. Complete raw goldens pin the
+successful empty-object response, including its semantic zero content length,
+and the principal-, action-, resource-, and policy-source-specific denial
+messages. Local `GetObject` role-policy composition remains deliberately
+disabled until the implementation and focused decision/HTTP coverage land as
+the next reviewed Phase 3 slice.
+
 - extend the minimal role identity records with role configuration, trust, and
   permission-policy state
 - add configured long-lived principal records and explicit identity-policy

@@ -947,6 +947,231 @@ wait_for_role_policy_session_sts_success() {
     echo "$label-sts-success: ok"
 }
 
+wait_for_role_get_object_result() {
+    local label="$1"
+    local access_key="$2"
+    local secret_key="$3"
+    local session_token="$4"
+    local key="$5"
+    local expected="$6"
+    local attempt consecutive_results=0 error_file output_file ready=false
+
+    error_file="$tmpdir/${label}-convergence.err"
+    output_file="$tmpdir/${label}-object"
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        : >"$error_file"
+        if aws_with_session_credentials \
+            "$access_key" \
+            "$secret_key" \
+            "$session_token" \
+            s3api get-object \
+            --bucket "$STS_TEST_POST_BUCKET" \
+            --key "$key" \
+            "$output_file" >/dev/null 2>"$error_file"; then
+            if [[ "$expected" == success ]]; then
+                ((consecutive_results += 1))
+            else
+                consecutive_results=0
+            fi
+        elif [[ "$expected" == explicit-identity-deny ]] && \
+            grep -Fq \
+                'An error occurred (AccessDenied) when calling the GetObject operation:' \
+                "$error_file" && \
+            grep -Fq 'with an explicit deny in an identity-based policy' "$error_file"; then
+            ((consecutive_results += 1))
+        elif [[ "$expected" == explicit-resource-deny ]] && \
+            grep -Fq \
+                'An error occurred (AccessDenied) when calling the GetObject operation:' \
+                "$error_file" && \
+            grep -Fq 'with an explicit deny in a resource-based policy' "$error_file"; then
+            ((consecutive_results += 1))
+        elif [[ "$expected" == implicit-deny ]] && \
+            grep -Fq \
+                'An error occurred (AccessDenied) when calling the GetObject operation:' \
+                "$error_file" && \
+            grep -Fq 'because no identity-based policy allows the s3:GetObject action' \
+                "$error_file"; then
+            ((consecutive_results += 1))
+        else
+            consecutive_results=0
+        fi
+        if ((consecutive_results == 3)); then
+            ready=true
+            break
+        fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        cat "$error_file" >&2
+        external_s3_test_die \
+            "$label did not converge to three consecutive S3 $expected responses"
+    fi
+    echo "$label-s3-$expected: ok"
+}
+
+create_role_get_object_fixture() {
+    local primary_arn="$1"
+    local primary_account="$2"
+    local role_suffix="$3"
+    local trust_policy="$4"
+    local allow_policy allow_session boundary_arn deny_policy deny_session empty_body key observed_policy
+
+    boundary_arn="arn:aws:iam::${primary_account}:policy/argmin-s3-tests/sts-oracle-role-boundary"
+    export STS_TEST_GET_ALLOW_ROLE_NAME="policy-mutation-get-allow-${role_suffix}"
+    export STS_TEST_GET_ALLOW_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_GET_ALLOW_ROLE_NAME}"
+    export STS_TEST_GET_ALLOW_SESSION_NAME="get-object-identity-allow"
+    export STS_TEST_GET_DENY_ROLE_NAME="policy-mutation-get-deny-${role_suffix}"
+    export STS_TEST_GET_DENY_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_GET_DENY_ROLE_NAME}"
+    export STS_TEST_GET_DENY_SESSION_NAME="get-object-identity-deny"
+
+    for key in \
+        role-get-identity-allow \
+        role-get-resource-allow \
+        role-get-identity-deny \
+        role-get-resource-deny \
+        role-get-neither; do
+        empty_body="$tmpdir/${key}-body"
+        : >"$empty_body"
+        aws_primary s3api put-object \
+            --bucket "$STS_TEST_POST_BUCKET" \
+            --key "$key" \
+            --content-type application/octet-stream \
+            --body "$empty_body" >/dev/null
+    done
+
+    assert_identity_decision \
+        same-account-get-allow-role \
+        aws_primary \
+        "$primary_arn" \
+        "$STS_TEST_GET_ALLOW_ROLE_ARN" \
+        implicitDeny
+    create_scoped_role \
+        "$STS_TEST_GET_ALLOW_ROLE_NAME" \
+        /argmin-sts-oracle/same-account/ \
+        "$trust_policy" \
+        "$STS_TEST_GET_ALLOW_ROLE_ARN" \
+        "" \
+        false \
+        "$boundary_arn"
+    [[ "$(aws_primary iam get-role \
+        --role-name "$STS_TEST_GET_ALLOW_ROLE_NAME" \
+        --query 'Role.PermissionsBoundary.PermissionsBoundaryArn' \
+        --output text)" == "$boundary_arn" ]] || \
+        external_s3_test_die "GetObject allow role does not have the required permissions boundary"
+    allow_policy="$tmpdir/role-get-object-allow.json"
+    jq -n \
+        --arg identity_allow "arn:aws:s3:::${STS_TEST_POST_BUCKET}/role-get-identity-allow" \
+        --arg resource_deny "arn:aws:s3:::${STS_TEST_POST_BUCKET}/role-get-resource-deny" \
+        '{
+            Version: "2012-10-17",
+            Statement: [{
+                Effect: "Allow",
+                Action: "s3:GetObject",
+                Resource: [$identity_allow, $resource_deny]
+            }]
+        }' >"$allow_policy"
+    aws_primary iam put-role-policy \
+        --role-name "$STS_TEST_GET_ALLOW_ROLE_NAME" \
+        --policy-name get-object-allow \
+        --policy-document "file://${allow_policy}"
+    observed_policy="$tmpdir/role-get-object-observed.json"
+    aws_primary iam get-role-policy \
+        --role-name "$STS_TEST_GET_ALLOW_ROLE_NAME" \
+        --policy-name get-object-allow \
+        --query PolicyDocument \
+        --output json >"$observed_policy"
+    [[ "$(jq -S -c . "$observed_policy")" == "$(jq -S -c . "$allow_policy")" ]] || \
+        external_s3_test_die "GetObject allow role policy did not round trip through IAM"
+    wait_for_assume_role_success \
+        same-account-get-allow-role \
+        aws_primary \
+        "$STS_TEST_GET_ALLOW_ROLE_ARN"
+    allow_session="$(aws_primary sts assume-role \
+        --role-arn "$STS_TEST_GET_ALLOW_ROLE_ARN" \
+        --role-session-name "$STS_TEST_GET_ALLOW_SESSION_NAME" \
+        --duration-seconds 3600 \
+        --output json)"
+    export STS_TEST_GET_ALLOW_ACCESS_KEY STS_TEST_GET_ALLOW_SECRET_KEY
+    export STS_TEST_GET_ALLOW_SESSION_TOKEN STS_TEST_GET_ALLOW_SESSION_ARN
+    STS_TEST_GET_ALLOW_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$allow_session")"
+    STS_TEST_GET_ALLOW_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$allow_session")"
+    STS_TEST_GET_ALLOW_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$allow_session")"
+    STS_TEST_GET_ALLOW_SESSION_ARN="$(jq -er '.AssumedRoleUser.Arn' <<<"$allow_session")"
+    [[ "$STS_TEST_GET_ALLOW_SESSION_ARN" == \
+        "arn:aws:sts::${primary_account}:assumed-role/${STS_TEST_GET_ALLOW_ROLE_NAME}/${STS_TEST_GET_ALLOW_SESSION_NAME}" ]] || \
+        external_s3_test_die "GetObject allow session has an unexpected ARN"
+    wait_for_role_get_object_result \
+        role-get-identity-allow-control \
+        "$STS_TEST_GET_ALLOW_ACCESS_KEY" \
+        "$STS_TEST_GET_ALLOW_SECRET_KEY" \
+        "$STS_TEST_GET_ALLOW_SESSION_TOKEN" \
+        role-get-identity-allow \
+        success
+
+    assert_identity_decision \
+        same-account-get-deny-role \
+        aws_primary \
+        "$primary_arn" \
+        "$STS_TEST_GET_DENY_ROLE_ARN" \
+        implicitDeny
+    create_scoped_role \
+        "$STS_TEST_GET_DENY_ROLE_NAME" \
+        /argmin-sts-oracle/same-account/ \
+        "$trust_policy" \
+        "$STS_TEST_GET_DENY_ROLE_ARN" \
+        "" \
+        false \
+        "$boundary_arn"
+    [[ "$(aws_primary iam get-role \
+        --role-name "$STS_TEST_GET_DENY_ROLE_NAME" \
+        --query 'Role.PermissionsBoundary.PermissionsBoundaryArn' \
+        --output text)" == "$boundary_arn" ]] || \
+        external_s3_test_die "GetObject deny role does not have the required permissions boundary"
+    deny_policy="$tmpdir/role-get-object-deny.json"
+    jq -n \
+        --arg resource "arn:aws:s3:::${STS_TEST_POST_BUCKET}/role-get-identity-deny" \
+        '{
+            Version: "2012-10-17",
+            Statement: [{Effect: "Deny", Action: "s3:GetObject", Resource: $resource}]
+        }' >"$deny_policy"
+    aws_primary iam put-role-policy \
+        --role-name "$STS_TEST_GET_DENY_ROLE_NAME" \
+        --policy-name get-object-deny \
+        --policy-document "file://${deny_policy}"
+    aws_primary iam get-role-policy \
+        --role-name "$STS_TEST_GET_DENY_ROLE_NAME" \
+        --policy-name get-object-deny \
+        --query PolicyDocument \
+        --output json >"$observed_policy"
+    [[ "$(jq -S -c . "$observed_policy")" == "$(jq -S -c . "$deny_policy")" ]] || \
+        external_s3_test_die "GetObject deny role policy did not round trip through IAM"
+    wait_for_assume_role_success \
+        same-account-get-deny-role \
+        aws_primary \
+        "$STS_TEST_GET_DENY_ROLE_ARN"
+    deny_session="$(aws_primary sts assume-role \
+        --role-arn "$STS_TEST_GET_DENY_ROLE_ARN" \
+        --role-session-name "$STS_TEST_GET_DENY_SESSION_NAME" \
+        --duration-seconds 3600 \
+        --output json)"
+    export STS_TEST_GET_DENY_ACCESS_KEY STS_TEST_GET_DENY_SECRET_KEY
+    export STS_TEST_GET_DENY_SESSION_TOKEN STS_TEST_GET_DENY_SESSION_ARN
+    STS_TEST_GET_DENY_ACCESS_KEY="$(jq -er '.Credentials.AccessKeyId' <<<"$deny_session")"
+    STS_TEST_GET_DENY_SECRET_KEY="$(jq -er '.Credentials.SecretAccessKey' <<<"$deny_session")"
+    STS_TEST_GET_DENY_SESSION_TOKEN="$(jq -er '.Credentials.SessionToken' <<<"$deny_session")"
+    STS_TEST_GET_DENY_SESSION_ARN="$(jq -er '.AssumedRoleUser.Arn' <<<"$deny_session")"
+    [[ "$STS_TEST_GET_DENY_SESSION_ARN" == \
+        "arn:aws:sts::${primary_account}:assumed-role/${STS_TEST_GET_DENY_ROLE_NAME}/${STS_TEST_GET_DENY_SESSION_NAME}" ]] || \
+        external_s3_test_die "GetObject deny session has an unexpected ARN"
+    wait_for_role_get_object_result \
+        role-get-identity-deny-control \
+        "$STS_TEST_GET_DENY_ACCESS_KEY" \
+        "$STS_TEST_GET_DENY_SECRET_KEY" \
+        "$STS_TEST_GET_DENY_SESSION_TOKEN" \
+        role-get-identity-deny \
+        explicit-identity-deny
+}
+
 create_role_policy_mutation_fixture() {
     local primary_arn="$1"
     local primary_account="$2"
@@ -1723,6 +1948,12 @@ create_assume_role_fixture() {
     STS_TEST_TOKEN_ISSUE_UPPER_BOUND="$(date -u \
         -d "@$((recreated_issue_epoch + 1))" '+%Y-%m-%dT%H:%M:%SZ')"
 
+    create_role_get_object_fixture \
+        "$primary_arn" \
+        "$primary_account" \
+        "$role_suffix" \
+        "$trust_policy"
+
     streaming_bucket_policy="$tmpdir/streaming-bucket-policy.json"
     jq -n \
         --arg role_principal "$STS_TEST_RECREATED_ROLE_ARN" \
@@ -1733,6 +1964,8 @@ create_assume_role_fixture() {
         --arg bucket_arn "arn:aws:s3:::${STS_TEST_POST_BUCKET}" \
         --arg primary_principal "$primary_arn" \
         --arg iam_user_principal "$STS_TEST_IAM_USER_CONTEXT_ARN" \
+        --arg get_allow_principal "$STS_TEST_GET_ALLOW_ROLE_ARN" \
+        --arg get_deny_principal "$STS_TEST_GET_DENY_ROLE_ARN" \
         '{
             Version: "2012-10-17",
             Statement: [
@@ -1742,6 +1975,27 @@ create_assume_role_fixture() {
                     Principal: {AWS: $primary_principal},
                     Action: "s3:GetBucketTagging",
                     Resource: $bucket_arn
+                },
+                {
+                    Sid: "AllowGetObjectByResourcePolicyOnly",
+                    Effect: "Allow",
+                    Principal: {AWS: $role_principal},
+                    Action: "s3:GetObject",
+                    Resource: ($bucket_arn + "/role-get-resource-allow")
+                },
+                {
+                    Sid: "AllowGetObjectWithIdentityDeny",
+                    Effect: "Allow",
+                    Principal: {AWS: $get_deny_principal},
+                    Action: "s3:GetObject",
+                    Resource: ($bucket_arn + "/role-get-identity-deny")
+                },
+                {
+                    Sid: "DenyGetObjectWithIdentityAllow",
+                    Effect: "Deny",
+                    Principal: {AWS: $get_allow_principal},
+                    Action: "s3:GetObject",
+                    Resource: ($bucket_arn + "/role-get-resource-deny")
                 },
                 {
                     Sid: "AllowMatchingIamUserPrincipalArn",
@@ -1901,6 +2155,34 @@ create_assume_role_fixture() {
     wait_for_streaming_head_absence_success
     wait_for_session_context_bucket_policy_success
     wait_for_iam_user_context_bucket_policy_success
+    wait_for_role_get_object_result \
+        role-get-resource-allow-control \
+        "$STS_TEST_RECREATED_ROLE_ACCESS_KEY" \
+        "$STS_TEST_RECREATED_ROLE_SECRET_KEY" \
+        "$STS_TEST_RECREATED_ROLE_SESSION_TOKEN" \
+        role-get-resource-allow \
+        success
+    wait_for_role_get_object_result \
+        role-get-identity-deny-resource-allow-control \
+        "$STS_TEST_GET_DENY_ACCESS_KEY" \
+        "$STS_TEST_GET_DENY_SECRET_KEY" \
+        "$STS_TEST_GET_DENY_SESSION_TOKEN" \
+        role-get-identity-deny \
+        explicit-identity-deny
+    wait_for_role_get_object_result \
+        role-get-resource-deny-identity-allow-control \
+        "$STS_TEST_GET_ALLOW_ACCESS_KEY" \
+        "$STS_TEST_GET_ALLOW_SECRET_KEY" \
+        "$STS_TEST_GET_ALLOW_SESSION_TOKEN" \
+        role-get-resource-deny \
+        explicit-resource-deny
+    wait_for_role_get_object_result \
+        role-get-neither-control \
+        "$STS_TEST_GET_ALLOW_ACCESS_KEY" \
+        "$STS_TEST_GET_ALLOW_SECRET_KEY" \
+        "$STS_TEST_GET_ALLOW_SESSION_TOKEN" \
+        role-get-neither \
+        implicit-deny
 
     export STS_TEST_PRESIGNED_STREAMING_STATIC_MULTIPART_KEY="streaming-presigned-static-multipart"
     export STS_TEST_PRESIGNED_STREAMING_STATIC_UPLOAD_ID

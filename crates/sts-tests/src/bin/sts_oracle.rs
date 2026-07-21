@@ -1769,6 +1769,151 @@ fn run_s3_role_policy_mutation_probes(
     );
 }
 
+struct S3RoleGetObjectProbeSet<'a> {
+    identity_allow_credentials: SignedRequestCredentials<'a>,
+    identity_allow_security_token: &'a str,
+    identity_allow_session_arn: &'a str,
+    resource_allow_credentials: SignedRequestCredentials<'a>,
+    resource_allow_security_token: &'a str,
+    resource_allow_session_arn: &'a str,
+    identity_deny_credentials: SignedRequestCredentials<'a>,
+    identity_deny_security_token: &'a str,
+    identity_deny_session_arn: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum S3RoleGetObjectExpected {
+    Success,
+    ImplicitDeny,
+    ExplicitIdentityDeny,
+    ExplicitResourceDeny,
+}
+
+fn assert_s3_role_get_object_result(
+    label: &str,
+    response: &RawResponse,
+    bucket: &str,
+    credentials: SignedRequestCredentials<'_>,
+    security_token: &str,
+    assumed_role_arn: &str,
+    expected: S3RoleGetObjectExpected,
+) {
+    if matches!(expected, S3RoleGetObjectExpected::Success) {
+        assert_shape(
+            label,
+            response,
+            &shape()
+                .status(200)
+                .headers(id_headers())
+                .header("accept-ranges", "bytes")
+                .header("last-modified", "{http_date}")
+                .header("etag", "\"d41d8cd98f00b204e9800998ecf8427e\"")
+                .header("x-amz-server-side-encryption", "AES256")
+                .header("content-type", "application/octet-stream")
+                .header("content-length", "0")
+                .body_empty(),
+        );
+        println!("{label}: ok");
+        return;
+    }
+
+    let response =
+        s3_response_with_sanitized_body(response, credentials.access_key, &[security_token]);
+    let suffix = match expected {
+        S3RoleGetObjectExpected::Success => unreachable!(),
+        S3RoleGetObjectExpected::ImplicitDeny => {
+            " because no identity-based policy allows the s3:GetObject action"
+        }
+        S3RoleGetObjectExpected::ExplicitIdentityDeny => {
+            " with an explicit deny in an identity-based policy"
+        }
+        S3RoleGetObjectExpected::ExplicitResourceDeny => {
+            " with an explicit deny in a resource-based policy"
+        }
+    };
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("assumed_role_arn", assumed_role_arn)
+            .sub("bucket", bucket)
+            .sub("key", label)
+            .sub("denial_suffix", suffix)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>User: {assumed_role_arn} is not authorized to perform: \
+                 s3:GetObject on resource: \"arn:aws:s3:::{bucket}/{key}\"{denial_suffix}</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{label}: ok");
+}
+
+fn run_s3_role_get_object_probes(
+    endpoint: &str,
+    bucket: &str,
+    fixture: S3RoleGetObjectProbeSet<'_>,
+) {
+    for (label, credentials, security_token, assumed_role_arn, expected) in [
+        (
+            "role-get-identity-allow",
+            fixture.identity_allow_credentials,
+            fixture.identity_allow_security_token,
+            fixture.identity_allow_session_arn,
+            S3RoleGetObjectExpected::Success,
+        ),
+        (
+            "role-get-resource-allow",
+            fixture.resource_allow_credentials,
+            fixture.resource_allow_security_token,
+            fixture.resource_allow_session_arn,
+            S3RoleGetObjectExpected::Success,
+        ),
+        (
+            "role-get-identity-deny",
+            fixture.identity_deny_credentials,
+            fixture.identity_deny_security_token,
+            fixture.identity_deny_session_arn,
+            S3RoleGetObjectExpected::ExplicitIdentityDeny,
+        ),
+        (
+            "role-get-resource-deny",
+            fixture.identity_allow_credentials,
+            fixture.identity_allow_security_token,
+            fixture.identity_allow_session_arn,
+            S3RoleGetObjectExpected::ExplicitResourceDeny,
+        ),
+        (
+            "role-get-neither",
+            fixture.identity_allow_credentials,
+            fixture.identity_allow_security_token,
+            fixture.identity_allow_session_arn,
+            S3RoleGetObjectExpected::ImplicitDeny,
+        ),
+    ] {
+        let response = send_signed_request_for_service_with_credentials(
+            "GET",
+            &format!("{endpoint}/{label}"),
+            b"",
+            [("x-amz-security-token", security_token)],
+            "s3",
+            credentials,
+        );
+        assert_s3_role_get_object_result(
+            label,
+            &response,
+            bucket,
+            credentials,
+            security_token,
+            assumed_role_arn,
+            expected,
+        );
+    }
+}
+
 fn build_s3_root_presigned_request(
     endpoint: &str,
     credentials: SignedRequestCredentials<'_>,
@@ -12514,6 +12659,39 @@ fn main() {
                     tls_ca_pem: None,
                 },
                 principal_arn: &iam_user_context_arn,
+            },
+        );
+        let get_allow_access_key = required_env("STS_TEST_GET_ALLOW_ACCESS_KEY");
+        let get_allow_secret_key = required_env("STS_TEST_GET_ALLOW_SECRET_KEY");
+        let get_allow_security_token = required_env("STS_TEST_GET_ALLOW_SESSION_TOKEN");
+        let get_allow_session_arn = required_env("STS_TEST_GET_ALLOW_SESSION_ARN");
+        let get_deny_access_key = required_env("STS_TEST_GET_DENY_ACCESS_KEY");
+        let get_deny_secret_key = required_env("STS_TEST_GET_DENY_SECRET_KEY");
+        let get_deny_security_token = required_env("STS_TEST_GET_DENY_SESSION_TOKEN");
+        let get_deny_session_arn = required_env("STS_TEST_GET_DENY_SESSION_ARN");
+        run_s3_role_get_object_probes(
+            &format!("https://{post_bucket}.s3.{region}.amazonaws.com"),
+            &post_bucket,
+            S3RoleGetObjectProbeSet {
+                identity_allow_credentials: SignedRequestCredentials {
+                    access_key: &get_allow_access_key,
+                    secret_key: &get_allow_secret_key,
+                    region: &region,
+                    tls_ca_pem: None,
+                },
+                identity_allow_security_token: &get_allow_security_token,
+                identity_allow_session_arn: &get_allow_session_arn,
+                resource_allow_credentials: recreated_credentials,
+                resource_allow_security_token: &recreated_security_token,
+                resource_allow_session_arn: &recreated_session_arn,
+                identity_deny_credentials: SignedRequestCredentials {
+                    access_key: &get_deny_access_key,
+                    secret_key: &get_deny_secret_key,
+                    region: &region,
+                    tls_ca_pem: None,
+                },
+                identity_deny_security_token: &get_deny_security_token,
+                identity_deny_session_arn: &get_deny_session_arn,
             },
         );
         let policy_pre_access_key = required_env("STS_TEST_POLICY_MUTATION_PRE_ACCESS_KEY");
