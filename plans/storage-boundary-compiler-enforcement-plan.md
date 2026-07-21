@@ -1421,6 +1421,40 @@ Twenty-fifth Phase 3 slice:
   capability requirements on node-client traits, and object/data active and
   retained capabilities remain open in Phase 3.
 
+Twenty-sixth Phase 3 slice:
+
+- the complete bucket-write drain RPC family now constructs server-local
+  route capabilities before reaching `LocalStorageNodeClient`. Begin,
+  heartbeat, expired-drain cleanup, existence, and get require the exact
+  active frame permit and a bucket-bound `StorageNodeActiveBucketRoute`; each
+  call revalidates the frame's captured deadline immediately before the local
+  read or mutation. Begin additionally binds its new drain epoch to the
+  admitted route, while heartbeat binds the complete record's bucket subject.
+- exact drain clear is classified separately as `RetainedCleanup` and consumes
+  a private, non-`Clone` `StorageNodeRetainedBucketWriteDrainRoute`. It binds
+  the admission domain/class, retained route, primary, bucket placement,
+  trusted bucket PG, and complete drain record. Like exact reservation
+  release, it may remove an older-epoch record through the current retained
+  primary but cannot create or extend drain authority.
+- a deterministic server-local regression creates and heartbeats a drain
+  under a 5,000ms captured route, renews the raw server route to 10,000ms, and
+  proves the original capability cannot begin, heartbeat, clear an expired
+  drain, or read at 6,000ms. The durable record remains byte-for-byte intact;
+  active-class and foreign-domain permits cannot construct retained authority,
+  while the exact retained capability then clears the record.
+- the Unix expired-route regression proves frame dispatch assigns exact clear
+  to retained cleanup. A dedicated two-PG adversarial matrix seeds identical
+  buckets and drain records on both configured PGs, then requires exact
+  `PayloadDecode` for wrong-PG begin, heartbeat, expired clear, exact clear,
+  existence, and get. The complete records on both PGs are compared after
+  every rejection, so mutation bugs cannot cancel one another.
+- validation passed formatting, the storage boundary checker, all six focused
+  active/retained and Unix drain regressions, workspace-wide strict Clippy,
+  and the full parallel workspace suite (7,382 tests).
+- lifecycle/delete claims, frontend capability migration, capability
+  requirements on node-client traits, and object/data active and retained
+  capabilities remain open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

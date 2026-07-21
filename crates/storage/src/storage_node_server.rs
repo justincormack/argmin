@@ -308,8 +308,9 @@ use crate::types::{
 use crate::DataPgId;
 use crate::{
     BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSubresourceKind, BucketWriteReservationProof, BucketWriteReservationRecord, EcShape,
-    NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey, ShardLocation,
+    BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationProof,
+    BucketWriteReservationRecord, EcShape, NodeId, ObjectKey, ObjectPgActionError,
+    RouteMapValidity, ShardKey, ShardLocation,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
@@ -3118,6 +3119,16 @@ struct StorageNodeRetainedMetadataCommandProofRoute<'a> {
     proof: &'a BucketWriteReservationProof,
 }
 
+struct StorageNodeRetainedBucketWriteDrainRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    pg_id: BucketPgId,
+    record: &'a BucketWriteDrainRecord,
+}
+
 impl StorageNodeActiveBucketRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
         self.fence
@@ -3258,6 +3269,116 @@ impl StorageNodeActiveBucketRoute<'_> {
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn begin_write_drain(
+        &self,
+        drain_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        created_at: u64,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        if cluster_epoch != self.fence.cluster_epoch {
+            return Err(StorageNodeBucketRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "bucket write drain begin epoch does not match active route"
+                        .to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
+            &local_client,
+            self.pg_id,
+            self.bucket,
+            drain_id,
+            owner_token,
+            cluster_epoch,
+            created_at,
+            lease_deadline,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn clear_expired_write_drain(
+        &self,
+        now: u64,
+    ) -> Result<Option<BucketWriteDrainRecord>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
+            &local_client,
+            self.pg_id,
+            self.bucket,
+            now,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn heartbeat_write_drain(
+        &self,
+        record: &BucketWriteDrainRecord,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteDrainRecord, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        if record.bucket != *self.bucket {
+            return Err(StorageNodeBucketRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "bucket write drain heartbeat subject does not match active route"
+                        .to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_drain(
+            &local_client,
+            self.pg_id,
+            record,
+            lease_deadline,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn write_drain_exists(&self) -> Result<bool, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
+            &local_client,
+            self.pg_id,
+            self.bucket,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn write_drain(&self) -> Result<Option<BucketWriteDrainRecord>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::durable_bucket_write_drain(
+            &local_client,
+            self.pg_id,
+            self.bucket,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
 }
 
 impl StorageNodeActiveBucketRoutePair<'_> {
@@ -3350,6 +3471,36 @@ impl StorageNodeRetainedMetadataCommandProofRoute<'_> {
             &local_client,
             self.pg_id,
             self.proof,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+}
+
+impl StorageNodeRetainedBucketWriteDrainRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
+        self.handler
+            .validate_retained_bucket_write_route(
+                self.route_permit,
+                self.node_id,
+                self.route_cluster_epoch,
+                self.raw_pg_id,
+                &self.record.bucket,
+                "bucket write drain clear",
+            )
+            .map(|_| ())
+            .map_err(StorageNodeBucketRouteError::Route)
+    }
+
+    fn clear(self) -> Result<(), StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+            &local_client,
+            self.pg_id,
+            self.record,
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
     }
@@ -3501,6 +3652,7 @@ impl StorageNodeConnectionHandler {
                 StorageRpcMessageKind::MetadataCommandPgLockRelease
                     | StorageRpcMessageKind::ProofRelease
                     | StorageRpcMessageKind::BucketWriteReservationRelease
+                    | StorageRpcMessageKind::BucketWriteDrainClear
                     | StorageRpcMessageKind::ShardDelete
                     | StorageRpcMessageKind::ShardAckDelete
                     | StorageRpcMessageKind::ObjectStreamUploadRetainedAbortPrepare
@@ -3691,7 +3843,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteDrainBegin => {
                 match decode_bucket_write_drain_begin_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_drain_begin_response(request),
+                    Ok(request) => self.bucket_write_drain_begin_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3700,7 +3852,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteDrainClear => {
                 match decode_bucket_write_drain_record_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_drain_clear_response(request),
+                    Ok(request) => self.bucket_write_drain_clear_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3709,7 +3861,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteDrainClearExpired => {
                 match decode_bucket_write_drain_clear_expired_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_drain_clear_expired_response(request),
+                    Ok(request) => {
+                        self.bucket_write_drain_clear_expired_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3718,7 +3872,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteDrainHeartbeat => {
                 match decode_bucket_write_drain_heartbeat_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_drain_heartbeat_response(request),
+                    Ok(request) => {
+                        self.bucket_write_drain_heartbeat_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3727,7 +3883,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteDrainGet => {
                 match decode_bucket_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_drain_get_response(request),
+                    Ok(request) => self.bucket_write_drain_get_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3754,7 +3910,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteDrainExists => {
                 match decode_bucket_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_drain_exists_response(request),
+                    Ok(request) => self.bucket_write_drain_exists_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5419,27 +5575,18 @@ impl StorageNodeConnectionHandler {
 
     fn bucket_write_drain_begin_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketWriteDrainBeginRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.bucket.node_id,
-            request.bucket.cluster_epoch,
-            request.bucket.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.bucket.pg_id,
-            &request.bucket.bucket,
+        let route = match self.active_bucket_route(
+            route_permit,
+            &request.bucket,
             "bucket write drain begin",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.bucket.pg_id),
-            &request.bucket.bucket,
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.begin_write_drain(
             &request.drain_id,
             &request.owner_token,
             request.bucket.cluster_epoch,
@@ -5454,9 +5601,9 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDrainConflict {
-                ..
-            })) => {
+            Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteDrainConflict { .. },
+            ))) => {
                 let payload = encode_bucket_write_drain_begin_response(
                     &StorageRpcBucketWriteDrainBeginResponse {
                         outcome: StorageRpcBucketWriteDrainBeginOutcome::Conflict,
@@ -5464,97 +5611,88 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_write_drain_clear_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketWriteDrainRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_cleanup(
+        let route = match self.retained_bucket_write_drain_route(
+            route_permit,
             request.node_id,
             request.route_cluster_epoch,
             request.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.pg_id,
-            &request.record.bucket,
+            &request.record,
             "bucket write drain clear",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.record,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.clear() {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_write_drain_clear_expired_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketWriteDrainClearExpiredRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.bucket.node_id,
-            request.bucket.cluster_epoch,
-            request.bucket.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.bucket.pg_id,
-            &request.bucket.bucket,
+        let route = match self.active_bucket_route(
+            route_permit,
+            &request.bucket,
             "bucket write drain clear expired",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.bucket.pg_id),
-            &request.bucket.bucket,
-            request.now,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.clear_expired_write_drain(request.now) {
             Ok(record) => {
                 let payload = encode_bucket_write_drain_optional_record_response(
                     &StorageRpcBucketWriteDrainOptionalRecordResponse { record },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_write_drain_heartbeat_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: crate::storage_rpc::StorageRpcBucketWriteDrainHeartbeatRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.route_cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
+        let route = match self.active_bucket_route_for_parts(
+            route_permit,
+            request.node_id,
+            request.route_cluster_epoch,
             request.pg_id,
             &request.record.bucket,
             "bucket write drain heartbeat",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_drain(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.record,
-            request.lease_deadline,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.heartbeat_write_drain(&request.record, request.lease_deadline) {
             Ok(record) => {
                 let payload = encode_bucket_write_drain_optional_record_response(
                     &StorageRpcBucketWriteDrainOptionalRecordResponse {
@@ -5563,7 +5701,10 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => encode_storage_rpc_error_response(
                 &bucket_write_drain_heartbeat_error_response(error),
             ),
         }
@@ -5571,26 +5712,15 @@ impl StorageNodeConnectionHandler {
 
     fn bucket_write_drain_exists_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.pg_id,
-            &request.bucket,
-            "bucket write drain exists",
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.bucket,
-        ) {
+        let route =
+            match self.active_bucket_route(route_permit, &request, "bucket write drain exists") {
+                Ok(route) => route,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            };
+        match route.write_drain_exists() {
             Ok(value) => {
                 let payload =
                     encode_metadata_command_bool_response(&StorageRpcMetadataCommandBoolResponse {
@@ -5598,39 +5728,38 @@ impl StorageNodeConnectionHandler {
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_write_drain_get_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        let route = match self.active_bucket_route(route_permit, &request, "bucket write drain get")
         {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.pg_id,
-            &request.bucket,
-            "bucket write drain get",
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::durable_bucket_write_drain(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.bucket,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.write_drain() {
             Ok(record) => {
                 let payload = encode_bucket_write_drain_optional_record_response(
                     &StorageRpcBucketWriteDrainOptionalRecordResponse { record },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -12721,6 +12850,34 @@ impl StorageNodeConnectionHandler {
         })
     }
 
+    fn retained_bucket_write_drain_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        record: &'a BucketWriteDrainRecord,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedBucketWriteDrainRoute<'a>, StorageRpcErrorResponse> {
+        let pg_id = self.validate_retained_bucket_write_route(
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            pg_id,
+            &record.bucket,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedBucketWriteDrainRoute {
+            handler: self,
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            raw_pg_id: pg_id.pg_id(),
+            pg_id,
+            record,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn validate_retained_bucket_write_route(
         &self,
@@ -14783,6 +14940,171 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn bucket_write_drain_capabilities_separate_active_and_retained_authority() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("bucket-write-drain-capability");
+        crate::clock::with_time_override(1_000, || {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+        });
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcBucketRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+        };
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_bucket_route(&active_permit, &request, "test bucket write drain")
+                .unwrap()
+        });
+        let drain = crate::clock::with_time_override(1_000, || {
+            let drain = route
+                .begin_write_drain(
+                    "captured-route-drain",
+                    "captured-route-drain-owner",
+                    config.cluster_epoch,
+                    1_000,
+                    4_000,
+                )
+                .unwrap();
+            let drain = route.heartbeat_write_drain(&drain, 4_500).unwrap();
+            assert!(route.write_drain_exists().unwrap());
+            assert_eq!(route.write_drain().unwrap(), Some(drain.clone()));
+            assert_eq!(route.clear_expired_write_drain(4_000).unwrap(), None);
+            drain
+        });
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(10_000)
+        );
+
+        crate::clock::with_time_override(6_000, || {
+            let expired_operations = [
+                (
+                    "begin",
+                    route
+                        .begin_write_drain(
+                            "expired-route-drain",
+                            "expired-route-drain-owner",
+                            config.cluster_epoch,
+                            6_000,
+                            9_000,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "heartbeat",
+                    route.heartbeat_write_drain(&drain, 9_000).map(|_| ()),
+                ),
+                (
+                    "clear expired",
+                    route.clear_expired_write_drain(6_000).map(|_| ()),
+                ),
+                ("exists", route.write_drain_exists().map(|_| ())),
+                ("get", route.write_drain().map(|_| ())),
+            ];
+            for (operation, result) in expired_operations {
+                match result {
+                    Err(StorageNodeBucketRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                        assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+                    }
+                    Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                        panic!("captured route should expire before drain {operation}: {error}")
+                    }
+                    Ok(()) => panic!("expired captured route performed drain {operation}"),
+                }
+            }
+        });
+        let assert_drain_unchanged = || {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket).unwrap(),
+                Some(drain.clone())
+            );
+        };
+        assert_drain_unchanged();
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_bucket_write_drain_route(
+            &active_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &drain,
+            "test bucket write drain clear",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active permit constructed retained drain authority"),
+        }
+        assert_drain_unchanged();
+
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_bucket_write_drain_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &drain,
+            "test bucket write drain clear",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign permit constructed retained drain authority"),
+        }
+        assert_drain_unchanged();
+
+        crate::clock::with_time_override(6_000, || {
+            handler
+                .retained_bucket_write_drain_route(
+                    &retained_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    &drain,
+                    "test bucket write drain clear",
+                )
+                .unwrap()
+                .clear()
+                .unwrap();
+        });
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+                .unwrap()
+                .is_none(),
+            "retained capability must clear the exact drain after active route expiry"
+        );
     }
 
     #[test]

@@ -2236,6 +2236,76 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof_after_route_expiry() 
 }
 
 #[test]
+fn unix_bucket_write_reservation_client_clears_exact_drain_after_route_expiry() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("drain-clear-expired-route-rpc-bucket");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let drain = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        let drain = PgMetadataStore::begin_durable_bucket_write_drain(
+            &*pg,
+            &bucket,
+            "expired-route-drain",
+            "expired-route-drain-owner",
+            config.cluster_epoch,
+            10,
+            20,
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        drain
+    };
+    config.route_map_validity = crate::RouteMapValidity::until_ms(1).unwrap();
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+        &client,
+        bucket_pg_id_for_test(0),
+        &drain,
+    )
+    .unwrap();
+    server_thread.join().unwrap();
+
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let pg = node.get_pg(0).unwrap();
+    assert!(
+        PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+            .unwrap()
+            .is_none(),
+        "retained drain clear must remove the exact drain after active route expiry"
+    );
+}
+
+#[test]
 fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
@@ -2698,6 +2768,174 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
             Some(reservation.clone()),
             "wrong-PG proof release must reject before mutating either durable canary"
         );
+    }
+}
+
+#[test]
+fn unix_bucket_write_drain_operations_reject_wrong_bucket_pg_before_access() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes = vec![
+        StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: config.cluster_epoch,
+            state: crate::types::PgState::Active,
+            primary_node_id: config.node_id,
+            acting_set: vec![config.node_id],
+        },
+        StorageNodePgRoute {
+            pg_id: 1,
+            cluster_epoch: config.cluster_epoch,
+            state: crate::types::PgState::Active,
+            primary_node_id: config.node_id,
+            acting_set: vec![config.node_id],
+        },
+    ];
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let (bucket, correct_pg_id, wrong_pg_id, drain) = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let (bucket, correct_pg_id) = (0..100)
+            .map(|index| crate::tests::bucket_name(format!("drain-rpc-wrong-pg-{index}")))
+            .map(|bucket| {
+                let pg_id = node.pg_topology().bucket_pg_for(&bucket);
+                (bucket, pg_id)
+            })
+            .find(|(_, pg_id)| *pg_id < 2)
+            .expect("two-PG topology must place a test bucket");
+        let wrong_pg_id = if correct_pg_id == 0 { 1 } else { 0 };
+        let mut drains = Vec::new();
+        for pg_id in [correct_pg_id, wrong_pg_id] {
+            let pg = node.get_pg(pg_id).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            drains.push(
+                PgMetadataStore::begin_durable_bucket_write_drain(
+                    &*pg,
+                    &bucket,
+                    "wrong-pg-drain",
+                    "wrong-pg-drain-owner",
+                    config.cluster_epoch,
+                    10,
+                    80,
+                )
+                .unwrap(),
+            );
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        assert_eq!(
+            drains[0], drains[1],
+            "wrong-PG drain canary must have equivalent durable state"
+        );
+        (bucket, correct_pg_id, wrong_pg_id, drains.remove(0))
+    };
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..6)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let wrong_pg = bucket_pg_id_for_test(wrong_pg_id);
+    let assert_payload_decode = |error: BucketSnapshotLoadError, operation: &str| {
+        assert!(
+            matches!(
+                &error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                })
+            ),
+            "wrong-PG {operation} must fail with PayloadDecode, got {error:?}"
+        );
+    };
+    let assert_drains_unchanged = || {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        for pg_id in [correct_pg_id, wrong_pg_id] {
+            let pg = node.get_pg(pg_id).unwrap();
+            assert_eq!(
+                PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket).unwrap(),
+                Some(drain.clone()),
+                "wrong-PG drain operation must not mutate PG {pg_id}"
+            );
+        }
+    };
+
+    let error = BucketWriteReservationNodeClient::durable_bucket_write_drain_exists(
+        &client, wrong_pg, &bucket,
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "drain exists");
+    assert_drains_unchanged();
+
+    let error =
+        BucketWriteReservationNodeClient::durable_bucket_write_drain(&client, wrong_pg, &bucket)
+            .unwrap_err();
+    assert_payload_decode(error, "drain get");
+    assert_drains_unchanged();
+
+    let error = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
+        &client,
+        wrong_pg,
+        &bucket,
+        "other-wrong-pg-drain",
+        "other-wrong-pg-drain-owner",
+        config.cluster_epoch,
+        20,
+        90,
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "drain begin");
+    assert_drains_unchanged();
+
+    let error = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_drain(
+        &client, wrong_pg, &drain, 90,
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "drain heartbeat");
+    assert_drains_unchanged();
+
+    let error = BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
+        &client, wrong_pg, &bucket, 100,
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "expired drain clear");
+    assert_drains_unchanged();
+
+    let error = BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+        &client, wrong_pg, &drain,
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "exact drain clear");
+    assert_drains_unchanged();
+
+    for thread in server_threads {
+        thread.join().unwrap();
     }
 }
 
