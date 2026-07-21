@@ -308,8 +308,8 @@ use crate::types::{
 use crate::DataPgId;
 use crate::{
     BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSubresourceKind, EcShape, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity,
-    ShardKey, ShardLocation,
+    BucketSubresourceKind, BucketWriteReservationProof, BucketWriteReservationRecord, EcShape,
+    NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey, ShardLocation,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
@@ -3032,7 +3032,7 @@ struct StorageNodeConnectionHandler {
 }
 
 #[derive(Debug)]
-enum StorageNodeActiveBucketRouteError {
+enum StorageNodeBucketRouteError {
     Route(StorageRpcErrorResponse),
     Bucket(BucketSnapshotLoadError),
 }
@@ -3050,17 +3050,27 @@ struct StorageNodeActiveBucketRoutePair<'a> {
     destination: StorageNodeActiveBucketRoute<'a>,
 }
 
+struct StorageNodeRetainedBucketWriteReservationRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    pg_id: BucketPgId,
+    record: &'a BucketWriteReservationRecord,
+}
+
 impl StorageNodeActiveBucketRoute<'_> {
-    fn require_valid_now(&self) -> Result<(), StorageNodeActiveBucketRouteError> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
         self.fence
             .validate_rpc_at(
                 crate::clock::current_time_millis(),
                 crate::clock::monotonic_time_millis(),
             )
-            .map_err(StorageNodeActiveBucketRouteError::Route)
+            .map_err(StorageNodeBucketRouteError::Route)
     }
 
-    fn head_bucket(&self, filtered: bool) -> Result<BucketInfo, StorageNodeActiveBucketRouteError> {
+    fn head_bucket(&self, filtered: bool) -> Result<BucketInfo, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
         let local_client = LocalStorageNodeClient::new(
             self.handler.config.node_id,
@@ -3071,13 +3081,13 @@ impl StorageNodeActiveBucketRoute<'_> {
         } else {
             BucketMetadataNodeClient::head_bucket_raw(&local_client, self.pg_id, self.bucket)
         };
-        result.map_err(StorageNodeActiveBucketRouteError::Bucket)
+        result.map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn get_subresource(
         &self,
         kind: BucketSubresourceKind,
-    ) -> Result<Option<String>, StorageNodeActiveBucketRouteError> {
+    ) -> Result<Option<String>, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
         let local_client = LocalStorageNodeClient::new(
             self.handler.config.node_id,
@@ -3089,13 +3099,13 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.bucket,
             kind,
         )
-        .map_err(StorageNodeActiveBucketRouteError::Bucket)
+        .map_err(StorageNodeBucketRouteError::Bucket)
     }
 
     fn load_snapshot(
         &self,
         request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshot, StorageNodeActiveBucketRouteError> {
+    ) -> Result<BucketSnapshot, StorageNodeBucketRouteError> {
         self.require_valid_now()?;
         let local_client = LocalStorageNodeClient::new(
             self.handler.config.node_id,
@@ -3107,7 +3117,88 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.bucket,
             request,
         )
-        .map_err(StorageNodeActiveBucketRouteError::Bucket)
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn acquire_write_reservation(
+        &self,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
+    ) -> Result<BucketWriteReservationRecord, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        if acquire.name != self.bucket {
+            return Err(StorageNodeBucketRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "bucket write reservation acquire subject does not match active route"
+                        .to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
+            &local_client,
+            self.pg_id,
+            acquire,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn validate_write_reservation(
+        &self,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<(), StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        if proof.bucket != *self.bucket {
+            return Err(StorageNodeBucketRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "bucket write reservation proof subject does not match active route"
+                        .to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
+            &local_client,
+            self.pg_id,
+            proof,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn heartbeat_write_reservation(
+        &self,
+        proof: &BucketWriteReservationProof,
+        lease_deadline: u64,
+    ) -> Result<BucketWriteReservationRecord, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        if proof.bucket != *self.bucket {
+            return Err(StorageNodeBucketRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message:
+                        "bucket write reservation heartbeat subject does not match active route"
+                            .to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
+            &local_client,
+            self.pg_id,
+            proof,
+            lease_deadline,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
     }
 }
 
@@ -3116,7 +3207,7 @@ impl StorageNodeActiveBucketRoutePair<'_> {
         &self,
         source_request: BucketSnapshotRequest,
         destination_request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshotPair, StorageNodeActiveBucketRouteError> {
+    ) -> Result<BucketSnapshotPair, StorageNodeBucketRouteError> {
         self.source.require_valid_now()?;
         self.destination.require_valid_now()?;
         let local_client = LocalStorageNodeClient::new(
@@ -3130,7 +3221,37 @@ impl StorageNodeActiveBucketRoutePair<'_> {
             self.destination.pg_id,
             (self.destination.bucket, destination_request),
         )
-        .map_err(StorageNodeActiveBucketRouteError::Bucket)
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+}
+
+impl StorageNodeRetainedBucketWriteReservationRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
+        self.handler
+            .validate_retained_bucket_write_reservation_route(
+                self.route_permit,
+                self.node_id,
+                self.route_cluster_epoch,
+                self.raw_pg_id,
+                self.record,
+                "bucket write reservation release",
+            )
+            .map(|_| ())
+            .map_err(StorageNodeBucketRouteError::Route)
+    }
+
+    fn release(self) -> Result<(), StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
+            &local_client,
+            self.pg_id,
+            self.record,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
     }
 }
 
@@ -3278,6 +3399,7 @@ impl StorageNodeConnectionHandler {
             let admission_class = if matches!(
                 frame.kind,
                 StorageRpcMessageKind::MetadataCommandPgLockRelease
+                    | StorageRpcMessageKind::BucketWriteReservationRelease
             ) {
                 StorageNodeRouteAdmissionClass::RetainedCleanup
             } else {
@@ -3419,7 +3541,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteReservationAcquire => {
                 match decode_bucket_write_reservation_acquire_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_reservation_acquire_response(request),
+                    Ok(request) => {
+                        self.bucket_write_reservation_acquire_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3428,7 +3552,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteReservationValidate => {
                 match decode_bucket_write_reservation_proof_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_reservation_validate_response(request),
+                    Ok(request) => {
+                        self.bucket_write_reservation_validate_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3437,7 +3563,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteReservationHeartbeat => {
                 match decode_bucket_write_reservation_heartbeat_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_reservation_heartbeat_response(request),
+                    Ok(request) => {
+                        self.bucket_write_reservation_heartbeat_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3446,7 +3574,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteReservationRelease => {
                 match decode_bucket_write_reservation_record_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_reservation_release_response(request),
+                    Ok(request) => {
+                        self.bucket_write_reservation_release_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5010,35 +5140,30 @@ impl StorageNodeConnectionHandler {
 
     fn bucket_write_reservation_acquire_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketWriteReservationAcquireRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
+        let route = match self.active_bucket_route_for_parts(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
             request.pg_id,
             &request.bucket,
             "bucket write reservation acquire",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            DurableBucketWriteReservationAcquire {
-                name: &request.bucket,
-                reservation_id: &request.reservation_id,
-                owner_token: &request.owner_token,
-                cluster_epoch: request.cluster_epoch,
-                operation_kind: &request.operation_kind,
-                created_at: request.created_at,
-                lease_deadline: request.lease_deadline,
-                target_context: request.target_context.as_deref(),
-            },
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.acquire_write_reservation(DurableBucketWriteReservationAcquire {
+            name: &request.bucket,
+            reservation_id: &request.reservation_id,
+            owner_token: &request.owner_token,
+            cluster_epoch: request.cluster_epoch,
+            operation_kind: &request.operation_kind,
+            created_at: request.created_at,
+            lease_deadline: request.lease_deadline,
+            target_context: request.target_context.as_deref(),
+        }) {
             Ok(record) => {
                 let payload = encode_bucket_write_reservation_record_response(
                     &StorageRpcBucketWriteReservationRecordResponse {
@@ -5047,7 +5172,9 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteDraining)) => {
+            Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteDraining,
+            ))) => {
                 let payload = encode_bucket_write_reservation_record_response(
                     &StorageRpcBucketWriteReservationRecordResponse {
                         outcome: StorageRpcBucketWriteReservationAcquireOutcome::Draining,
@@ -5055,7 +5182,9 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name })) => {
+            Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketNotFound { name },
+            ))) => {
                 let payload = encode_bucket_write_reservation_record_response(
                     &StorageRpcBucketWriteReservationRecordResponse {
                         outcome: StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound {
@@ -5065,60 +5194,59 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_write_reservation_validate_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketWriteReservationProofRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.route_cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
+        let route = match self.active_bucket_route_for_parts(
+            route_permit,
+            request.node_id,
+            request.route_cluster_epoch,
             request.pg_id,
             &request.proof.bucket,
             "bucket write reservation validate",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.proof,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.validate_write_reservation(&request.proof) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_write_reservation_heartbeat_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketWriteReservationHeartbeatRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.route_cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
+        let route = match self.active_bucket_route_for_parts(
+            route_permit,
+            request.node_id,
+            request.route_cluster_epoch,
             request.pg_id,
             &request.proof.bucket,
             "bucket write reservation heartbeat",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.proof,
-            request.lease_deadline,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.heartbeat_write_reservation(&request.proof, request.lease_deadline) {
             Ok(record) => {
                 let payload = encode_bucket_write_reservation_record_response(
                     &StorageRpcBucketWriteReservationRecordResponse {
@@ -5127,36 +5255,39 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_write_reservation_release_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketWriteReservationRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_cleanup(
+        let route = match self.retained_bucket_write_reservation_route(
+            route_permit,
             request.node_id,
             request.route_cluster_epoch,
             request.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.pg_id,
-            &request.record.bucket,
+            &request.record,
             "bucket write reservation release",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.record,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.release() {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -7977,7 +8108,7 @@ impl StorageNodeConnectionHandler {
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(StorageNodeActiveBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+            Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
                 MetadataError::BucketNotFound { name },
             ))) => {
                 let payload =
@@ -7986,10 +8117,10 @@ impl StorageNodeConnectionHandler {
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+            Err(StorageNodeBucketRouteError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)
             }
-            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
                 encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
             }
         }
@@ -8012,7 +8143,7 @@ impl StorageNodeConnectionHandler {
                 });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(StorageNodeActiveBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+            Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
                 MetadataError::BucketNotFound { name },
             ))) => {
                 let payload = encode_bucket_snapshot_response(&StorageRpcBucketSnapshotResponse {
@@ -8020,10 +8151,10 @@ impl StorageNodeConnectionHandler {
                 });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+            Err(StorageNodeBucketRouteError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)
             }
-            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
                 encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
             }
         }
@@ -8051,7 +8182,7 @@ impl StorageNodeConnectionHandler {
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(StorageNodeActiveBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+            Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
                 MetadataError::BucketNotFound { name },
             ))) => {
                 let payload =
@@ -8060,10 +8191,10 @@ impl StorageNodeConnectionHandler {
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+            Err(StorageNodeBucketRouteError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)
             }
-            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
                 encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
             }
         }
@@ -8381,10 +8512,10 @@ impl StorageNodeConnectionHandler {
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+            Err(StorageNodeBucketRouteError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)
             }
-            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
                 encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
             }
         }
@@ -12203,6 +12334,25 @@ impl StorageNodeConnectionHandler {
         request: &'a StorageRpcBucketRequest,
         operation: &'static str,
     ) -> Result<StorageNodeActiveBucketRoute<'a>, StorageRpcErrorResponse> {
+        self.active_bucket_route_for_parts(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            &request.bucket,
+            operation,
+        )
+    }
+
+    fn active_bucket_route_for_parts<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        bucket: &'a BucketName,
+        operation: &'static str,
+    ) -> Result<StorageNodeActiveBucketRoute<'a>, StorageRpcErrorResponse> {
         if !Arc::ptr_eq(&route_permit.gate.inner, &self.route_admission.inner) {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::Internal,
@@ -12220,7 +12370,8 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        self.validate_bucket_metadata_control_route(request, operation)?;
+        self.validate_pg_route(node_id, cluster_epoch, pg_id)?;
+        self.validate_primary_pg_for_bucket(pg_id, bucket, operation)?;
         let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
         fence.validate_rpc_at(
             crate::clock::current_time_millis(),
@@ -12230,9 +12381,89 @@ impl StorageNodeConnectionHandler {
             handler: self,
             _route_permit: route_permit,
             fence,
-            pg_id: self.node.bucket_metadata_pg_for(&request.bucket),
-            bucket: &request.bucket,
+            pg_id: self.node.bucket_metadata_pg_for(bucket),
+            bucket,
         })
+    }
+
+    fn retained_bucket_write_reservation_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        record: &'a BucketWriteReservationRecord,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedBucketWriteReservationRoute<'a>, StorageRpcErrorResponse> {
+        let pg_id = self.validate_retained_bucket_write_reservation_route(
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            pg_id,
+            record,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedBucketWriteReservationRoute {
+            handler: self,
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            raw_pg_id: pg_id.pg_id(),
+            pg_id,
+            record,
+        })
+    }
+
+    fn validate_retained_bucket_write_reservation_route(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        record: &BucketWriteReservationRecord,
+        operation: &'static str,
+    ) -> Result<BucketPgId, StorageRpcErrorResponse> {
+        if !Arc::ptr_eq(&route_permit.gate.inner, &self.route_admission.inner) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} route permit belongs to a different admission domain"
+                ),
+            });
+        }
+        if route_permit.class != StorageNodeRouteAdmissionClass::RetainedCleanup {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} requires retained-cleanup route admission, got {:?}",
+                    route_permit.class
+                ),
+            });
+        }
+        let route = self.cleanup_pg_route(node_id, route_cluster_epoch, pg_id)?;
+        if route.primary_node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not primary for {operation} on retained PG {} route",
+                    self.config.node_id.as_u32(),
+                    pg_id.get()
+                ),
+            });
+        }
+        let expected_pg_id = self.node.bucket_metadata_pg_for(&record.bucket);
+        if pg_id != expected_pg_id.pg_id() {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} PG {} does not match bucket {} PG {}",
+                    pg_id.get(),
+                    record.bucket.as_str(),
+                    expected_pg_id.get()
+                ),
+            });
+        }
+        Ok(expected_pg_id)
     }
 
     fn active_bucket_route_pair<'a>(
@@ -14075,6 +14306,9 @@ mod tests {
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let handler = server.connection_handler();
+        let route_permit = handler
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
         let serving_error = handler
             .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
             .unwrap_err();
@@ -14087,7 +14321,7 @@ mod tests {
             record: record.clone(),
         };
         let response = handler
-            .bucket_write_reservation_release_response(request)
+            .bucket_write_reservation_release_response(&route_permit, request)
             .unwrap();
         decode_storage_rpc_response_payload(&response)
             .unwrap()
@@ -14101,6 +14335,87 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn bucket_write_reservation_release_uses_retained_historical_primary_route() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let historical_epoch = config.cluster_epoch;
+        let bucket = crate::tests::bucket_name("historical-route-reservation-cleanup");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let record = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "reservation-historical-route-cleanup",
+                    owner_token: "owner-token-historical-route-cleanup",
+                    cluster_epoch: historical_epoch,
+                    operation_kind: "put-object",
+                    created_at: 10,
+                    lease_deadline: 20,
+                    target_context: Some("key=a"),
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            record
+        };
+
+        let historical_route = config.pg_routes[0].clone();
+        config.cluster_epoch = ClusterEpoch::new(historical_epoch.get() + 1).unwrap();
+        config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
+        config.pg_routes[0].acting_set = vec![config.node_id, NodeId::new(8)];
+        config.historical_pg_routes.push(historical_route);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let route_permit = handler
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let request = StorageRpcBucketWriteReservationRecordRequest {
+            node_id: config.node_id,
+            route_cluster_epoch: historical_epoch,
+            pg_id: PgId::new(0),
+            record: record.clone(),
+        };
+        let response = handler
+            .bucket_write_reservation_release_response(&route_permit, request)
+            .unwrap();
+        decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap();
+
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                &record.reservation_id,
+            )
+            .unwrap()
+            .is_none(),
+            "retained cleanup must use the historical route primary rather than the successor"
+        );
     }
 
     #[test]
@@ -16317,7 +16632,7 @@ mod tests {
         });
         capture_barrier.wait();
 
-        let mut extended = config;
+        let mut extended = config.clone();
         extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
         let installing_server = Arc::clone(&server);
         let installer = thread::spawn(move || {
@@ -16356,6 +16671,20 @@ mod tests {
                 )
                 .unwrap()
         });
+        let reservation = crate::clock::with_time_override(1_000, || {
+            route
+                .acquire_write_reservation(DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "captured-active-route-reservation",
+                    owner_token: "captured-active-route-owner",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind: "test-active-route",
+                    created_at: 1_000,
+                    lease_deadline: 4_000,
+                    target_context: Some("key=a"),
+                })
+                .unwrap()
+        });
         crate::clock::with_time_override(1_000, || {
             assert_eq!(route.head_bucket(true).unwrap().name, bucket);
             assert_eq!(
@@ -16388,14 +16717,17 @@ mod tests {
                     panic!("distinct active routes returned a same-bucket snapshot")
                 }
             }
+            route
+                .validate_write_reservation(&BucketWriteReservationProof::from(&reservation))
+                .unwrap();
         });
 
         crate::clock::with_time_override(6_000, || match route.head_bucket(true) {
-            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+            Err(StorageNodeBucketRouteError::Route(error)) => {
                 assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
                 assert!(error.message.contains("expired at 5000ms, now 6000ms"));
             }
-            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
                 panic!("captured route should expire before node access: {error}")
             }
             Ok(info) => panic!("expired captured route unexpectedly loaded {info:?}"),
@@ -16405,16 +16737,134 @@ mod tests {
                 BucketSnapshotRequest::default(),
                 BucketSnapshotRequest::default(),
             ) {
-                Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+                Err(StorageNodeBucketRouteError::Route(error)) => {
                     assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
                     assert!(error.message.contains("expired at 5000ms, now 6000ms"));
                 }
-                Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+                Err(StorageNodeBucketRouteError::Bucket(error)) => {
                     panic!("captured pair route should expire before node access: {error}")
                 }
                 Ok(pair) => panic!("expired captured pair route unexpectedly loaded {pair:?}"),
             }
         });
+        crate::clock::with_time_override(6_000, || {
+            match route.heartbeat_write_reservation(
+                &BucketWriteReservationProof::from(&reservation),
+                9_000,
+            ) {
+                Err(StorageNodeBucketRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                    assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+                }
+                Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                    panic!("captured route should expire before reservation heartbeat: {error}")
+                }
+                Ok(record) => {
+                    panic!("expired captured route unexpectedly renewed reservation {record:?}")
+                }
+            }
+            match route.acquire_write_reservation(DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "expired-active-route-reservation",
+                owner_token: "expired-active-route-owner",
+                cluster_epoch: config.cluster_epoch,
+                operation_kind: "test-expired-active-route",
+                created_at: 6_000,
+                lease_deadline: 9_000,
+                target_context: Some("key=b"),
+            }) {
+                Err(StorageNodeBucketRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                }
+                Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                    panic!("captured route should expire before reservation acquire: {error}")
+                }
+                Ok(record) => {
+                    panic!("expired captured route unexpectedly acquired reservation {record:?}")
+                }
+            }
+        });
+        let pg = server._node.get_pg(0).unwrap();
+        assert_eq!(
+            PgMetadataStore::durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                &reservation.reservation_id,
+            )
+            .unwrap(),
+            Some(reservation.clone()),
+            "expired active heartbeat must not mutate the reservation"
+        );
+        assert!(
+            PgMetadataStore::durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                "expired-active-route-reservation",
+            )
+            .unwrap()
+            .is_none(),
+            "expired active acquire must not create a reservation"
+        );
+        drop(pg);
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_bucket_write_reservation_route(
+            &route_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &reservation,
+            "test reservation release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active admission created retained cleanup authority"),
+        }
+        let foreign_retained_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_bucket_write_reservation_route(
+            &foreign_retained_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &reservation,
+            "test reservation release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign admission created retained cleanup authority"),
+        }
+        crate::clock::with_time_override(6_000, || {
+            handler
+                .retained_bucket_write_reservation_route(
+                    &retained_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    &reservation,
+                    "test reservation release",
+                )
+                .unwrap()
+                .release()
+                .unwrap();
+        });
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                &reservation.reservation_id,
+            )
+            .unwrap()
+            .is_none(),
+            "retained cleanup must release the exact expired active-route subject"
+        );
     }
 
     #[test]

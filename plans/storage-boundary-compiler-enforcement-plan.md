@@ -218,6 +218,14 @@ snapshots:
   capability; ordinary multi-step request scopes borrow the non-cloneable
   capability rather than manufacturing copies
 
+The deadline rule applies to active work and to cleanup that can create,
+renew, or broaden durable authority. A one-shot retained release of an exact
+already-held subject is deliberately non-escalating: it may proceed after the
+active route deadline so a timed-out request can shed a reservation, lock, or
+lease. Such a capability must be bound to the exact durable subject, must
+revalidate its retained route, placement, admission class, and admission
+domain immediately before the effect, and cannot acquire or renew authority.
+
 Capabilities are not serialized as trusted Rust values. A Unix request carries
 only route evidence. The storage-node server acquires its own request-scoped
 route-admission guard, validates the supplied route identity, deadline,
@@ -1244,6 +1252,49 @@ Twenty-second Phase 3 slice:
   storage-node server tests, three compile-fail API boundary doctests, the
   focused local and Unix snapshot regressions, workspace-wide checks and
   strict Clippy, and the full parallel workspace suite (7,326 tests).
+
+Twenty-third Phase 3 slice:
+
+- the Unix storage-node reservation acquire, proof-validation, and heartbeat
+  handlers now derive `StorageNodeActiveBucketRoute` from the exact active
+  frame permit before reaching `LocalStorageNodeClient`. Each effect
+  revalidates the captured route deadline and fixes the decoded bucket and
+  trusted `BucketPgId`; a proof or acquire subject cannot be substituted after
+  construction.
+- reservation release is classified separately as `RetainedCleanup` at frame
+  admission and constructs a private, one-shot
+  `StorageNodeRetainedBucketWriteReservationRoute`. It binds the complete
+  durable record, consumes the capability on release, and revalidates the
+  admission domain/class, retained route, retained-route primary, and bucket
+  placement immediately before deletion. Active authority cannot be promoted
+  into retained cleanup authority.
+- exact release remains deliberately available after the active route
+  deadline. This is a state-reducing cleanup exception rather than renewed
+  write authority: acquire, validate, and heartbeat retain the captured
+  active deadline, while release cannot create or extend a reservation. The
+  general capability model now records this distinction explicitly.
+- the deterministic server-local regression acquires and validates a
+  reservation under a 5,000ms active capability, publishes a same-generation
+  extension, then proves the original capability cannot heartbeat or acquire
+  at 6,000ms and leaves durable state byte-for-byte unchanged. Foreign-domain
+  and wrong-class permits cannot construct cleanup authority; the exact
+  retained capability then releases the original subject despite active-route
+  expiry. A separate route-transition regression moves the current primary,
+  retains the old route, and proves cleanup uses the retained historical
+  primary rather than requiring or mutating through the successor route.
+- the two-PG Unix adversarial regression now also seeds a real reservation on
+  the configured but wrong bucket PG. A retained release must return exact
+  `PayloadDecode` and leave that record unchanged, proving placement rejection
+  precedes local deletion. Existing Unix canaries cover the complete active
+  acquire/validate/heartbeat and retained release lifecycle, including an old
+  reservation identity released through a newer current route.
+- drains, lifecycle/delete claims, metadata-command proof release, frontend
+  admission threading, capability requirements on node-client traits, and
+  object/data active and retained capabilities remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, all 162
+  storage-node server tests, the focused active/retained reservation and Unix
+  wrong-PG regressions, workspace-wide checks and strict Clippy, and the full
+  parallel workspace suite (7,327 tests).
 
 ### Phase 4 — type metadata-command publication
 

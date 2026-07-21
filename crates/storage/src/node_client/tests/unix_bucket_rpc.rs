@@ -2334,7 +2334,7 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
     ];
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
-    let (bucket, correct_pg_id, wrong_pg_id) = {
+    let (bucket, correct_pg_id, wrong_pg_id, wrong_pg_release_record) = {
         let node = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
             &config.pg_ids,
@@ -2363,18 +2363,32 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
             .unwrap();
             pg.refresh_metadata_command_state_digest().unwrap();
         }
-        (
-            bucket,
-            correct_pg_id,
-            if correct_pg_id == 0 { 1 } else { 0 },
+        let wrong_pg_id = if correct_pg_id == 0 { 1 } else { 0 };
+        let wrong_pg = node.get_pg(wrong_pg_id).unwrap();
+        let wrong_pg_release_record = PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*wrong_pg,
+            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "wrong-pg-release-reservation",
+                owner_token: "wrong-pg-release-owner",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key"),
+            },
         )
+        .unwrap();
+        wrong_pg.refresh_metadata_command_state_digest().unwrap();
+        (bucket, correct_pg_id, wrong_pg_id, wrong_pg_release_record)
     };
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
     // One connection for each RPC below: head, correct snapshot, wrong
-    // snapshot, two pair orderings, create-command, and reservation acquire.
-    let server_threads: Vec<_> = (0..7)
+    // snapshot, two pair orderings, create-command, reservation acquire, and
+    // reservation release.
+    let server_threads: Vec<_> = (0..8)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2514,6 +2528,23 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
         "unexpected wrong-PG reservation error: {reservation_error:?}"
     );
 
+    let release_error = BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
+        &client,
+        wrong_bucket_pg,
+        &wrong_pg_release_record,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            release_error,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                code: StorageRpcErrorCode::PayloadDecode,
+                ..
+            })
+        ),
+        "unexpected wrong-PG reservation release error: {release_error:?}"
+    );
+
     for thread in server_threads {
         thread.join().unwrap();
     }
@@ -2537,6 +2568,17 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
             "wrong-PG reservation must not mutate PG {pg_id}"
         );
     }
+    let wrong_pg = node.get_pg(wrong_pg_id).unwrap();
+    assert_eq!(
+        PgMetadataStore::durable_bucket_write_reservation(
+            &*wrong_pg,
+            &bucket,
+            &wrong_pg_release_record.reservation_id,
+        )
+        .unwrap(),
+        Some(wrong_pg_release_record),
+        "wrong-PG retained release must not mutate the equivalent durable subject"
+    );
 }
 
 #[test]
