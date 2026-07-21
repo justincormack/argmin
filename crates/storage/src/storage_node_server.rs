@@ -3086,6 +3086,12 @@ enum StorageNodeBucketRouteError {
     Bucket(BucketSnapshotLoadError),
 }
 
+#[derive(Debug)]
+enum StorageNodeObjectRouteError {
+    Route(StorageRpcErrorResponse),
+    Object(ObjectPgActionError),
+}
+
 struct StorageNodeActiveBucketRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     _route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -3097,6 +3103,19 @@ struct StorageNodeActiveBucketRoute<'a> {
 struct StorageNodeActiveBucketRoutePair<'a> {
     source: StorageNodeActiveBucketRoute<'a>,
     destination: StorageNodeActiveBucketRoute<'a>,
+}
+
+struct StorageNodeActiveObjectRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    pg_id: ObjectMetadataPgId,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+}
+
+struct StorageNodeActivePrimaryObjectRoute<'a> {
+    route: StorageNodeActiveObjectRoute<'a>,
 }
 
 struct StorageNodeRetainedBucketWriteReservationRoute<'a> {
@@ -3577,6 +3596,68 @@ impl StorageNodeActiveBucketRoutePair<'_> {
             (self.destination.bucket, destination_request),
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+}
+
+impl StorageNodeActiveObjectRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeObjectRouteError> {
+        self.fence
+            .validate_rpc_at(
+                crate::clock::current_time_millis(),
+                crate::clock::monotonic_time_millis(),
+            )
+            .map_err(StorageNodeObjectRouteError::Route)
+    }
+
+    fn next_version_id(&self) -> Result<s3_types::VersionId, StorageNodeObjectRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        ObjectVersionMetadataNodeClient::next_object_version_id(
+            &local_client,
+            self.pg_id,
+            self.bucket,
+            self.key,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+}
+
+impl StorageNodeActivePrimaryObjectRoute<'_> {
+    fn next_generation_id(&self) -> Result<GenerationId, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectGenerationMetadataNodeClient::next_object_generation_id(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn generation_reservation(
+        &self,
+        reservation_id: &SessionId,
+    ) -> Result<GenerationId, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectGenerationMetadataNodeClient::object_generation_reservation(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            reservation_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
     }
 }
 
@@ -4326,7 +4407,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectGenerationNext => {
                 match decode_object_request(&frame.payload) {
-                    Ok(request) => self.object_generation_next_response(request),
+                    Ok(request) => self.object_generation_next_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4335,7 +4416,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectGenerationReservation => {
                 match decode_object_generation_reservation_request(&frame.payload) {
-                    Ok(request) => self.object_generation_reservation_response(request),
+                    Ok(request) => {
+                        self.object_generation_reservation_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4757,7 +4840,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectVersionNext => match decode_object_request(&frame.payload)
             {
-                Ok(request) => self.object_version_next_response(request),
+                Ok(request) => self.object_version_next_response(route_permit, request),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::PayloadDecode,
                     message: error.to_string(),
@@ -5659,28 +5742,18 @@ impl StorageNodeConnectionHandler {
 
     fn object_generation_next_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.pg_id,
-            &request.bucket,
-            &request.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request,
             "object generation allocation",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match ObjectGenerationMetadataNodeClient::next_object_generation_id(
-            &local_client,
-            self.validated_object_metadata_pg(&request.bucket, &request.key),
-            &request.bucket,
-            &request.key,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.next_generation_id() {
             Ok(generation_id) => {
                 let payload =
                     encode_object_generation_response(&StorageRpcObjectGenerationResponse {
@@ -5688,7 +5761,12 @@ impl StorageNodeConnectionHandler {
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
         }
     }
 
@@ -6560,75 +6638,57 @@ impl StorageNodeConnectionHandler {
 
     fn object_version_next_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_pg_for_object(
-            request.pg_id,
-            &request.bucket,
-            &request.key,
-            "object version allocation",
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match ObjectVersionMetadataNodeClient::next_object_version_id(
-            &local_client,
-            self.validated_object_metadata_pg(&request.bucket, &request.key),
-            &request.bucket,
-            &request.key,
-        ) {
+        let route =
+            match self.active_object_route(route_permit, &request, "object version allocation") {
+                Ok(route) => route,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            };
+        match route.next_version_id() {
             Ok(version_id) => {
                 let payload =
                     encode_object_version_response(&StorageRpcObjectVersionResponse { version_id });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
         }
     }
 
     fn object_generation_reservation_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectGenerationReservationRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object generation reservation lookup",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let outcome = match ObjectGenerationMetadataNodeClient::object_generation_reservation(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            &request.reservation_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let outcome = match route.generation_reservation(&request.reservation_id) {
             Ok(generation_id) => StorageRpcObjectGenerationReservationOutcome::Found(generation_id),
-            Err(ObjectPgActionError::Metadata(
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
                 crate::MetadataError::ObjectGenerationReservationNotFound { reservation_id },
-            )) => StorageRpcObjectGenerationReservationOutcome::NotFound {
+            ))) => StorageRpcObjectGenerationReservationOutcome::NotFound {
                 reservation_id: SessionId::try_from(reservation_id).map_err(|_| {
                     crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
                         "stored reservation id is invalid",
                     )
                 })?,
             },
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
             }
         };
@@ -13047,6 +13107,96 @@ impl StorageNodeConnectionHandler {
         })
     }
 
+    fn active_object_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcObjectRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeActiveObjectRoute<'a>, StorageRpcErrorResponse> {
+        if !Arc::ptr_eq(&route_permit.gate.inner, &self.route_admission.inner) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} route permit belongs to a different admission domain"
+                ),
+            });
+        }
+        if route_permit.class != StorageNodeRouteAdmissionClass::Active {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} requires active route admission, got {:?}",
+                    route_permit.class
+                ),
+            });
+        }
+        self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
+        self.validate_pg_for_object(request.pg_id, &request.bucket, &request.key, operation)?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        Ok(StorageNodeActiveObjectRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id: self
+                .node
+                .object_metadata_pg_for(&request.bucket, &request.key),
+            bucket: &request.bucket,
+            key: &request.key,
+        })
+    }
+
+    fn active_primary_object_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcObjectRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeActivePrimaryObjectRoute<'a>, StorageRpcErrorResponse> {
+        if !Arc::ptr_eq(&route_permit.gate.inner, &self.route_admission.inner) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} route permit belongs to a different admission domain"
+                ),
+            });
+        }
+        if route_permit.class != StorageNodeRouteAdmissionClass::Active {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} requires active route admission, got {:?}",
+                    route_permit.class
+                ),
+            });
+        }
+        self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
+        self.validate_primary_pg_for_object(
+            request.pg_id,
+            &request.bucket,
+            &request.key,
+            operation,
+        )?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        let route = StorageNodeActiveObjectRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id: self
+                .node
+                .object_metadata_pg_for(&request.bucket, &request.key),
+            bucket: &request.bucket,
+            key: &request.key,
+        };
+        Ok(StorageNodeActivePrimaryObjectRoute { route })
+    }
+
     fn retained_bucket_write_reservation_route<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -18158,6 +18308,143 @@ mod tests {
         );
         drop(admitted);
         installer.join().unwrap();
+    }
+
+    #[test]
+    fn active_object_routes_keep_their_captured_deadline_after_validity_extension() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("active-object-route-bucket");
+        let key = crate::tests::object_key("active-object-route-key");
+        let reservation_id = crate::tests::stream_session_id("active-object");
+        let reserved_generation = crate::clock::with_time_override(1_000, || {
+            let pg = server._node.get_pg(0).unwrap();
+            let generation =
+                PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id)
+                    .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            generation
+        });
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcObjectRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+            key: key.clone(),
+        };
+
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        match handler.active_object_route(&foreign_permit, &request, "test object route") {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign admission permit created an active object route"),
+        }
+        let cleanup_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.active_object_route(&cleanup_permit, &request, "test object route") {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires active route admission"));
+            }
+            Ok(_) => panic!("retained-cleanup permit created an active object route"),
+        }
+        drop(cleanup_permit);
+
+        let primary_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_primary_object_route(&active_permit, &request, "test primary object route")
+                .unwrap()
+        });
+        let acting_set_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_object_route(&active_permit, &request, "test acting-set object route")
+                .unwrap()
+        });
+        crate::clock::with_time_override(1_000, || {
+            assert_eq!(
+                primary_route
+                    .generation_reservation(&reservation_id)
+                    .unwrap(),
+                reserved_generation
+            );
+            assert_eq!(
+                primary_route.next_generation_id().unwrap(),
+                GenerationId::new(reserved_generation.get() + 1).unwrap()
+            );
+            assert_eq!(
+                acting_set_route.next_version_id().unwrap(),
+                VersionId::from_u64(1)
+            );
+        });
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(10_000)
+        );
+
+        crate::clock::with_time_override(6_000, || {
+            let expired_operations = [
+                (
+                    "generation reservation",
+                    primary_route
+                        .generation_reservation(&reservation_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "generation allocation",
+                    primary_route.next_generation_id().map(|_| ()),
+                ),
+                (
+                    "version allocation",
+                    acting_set_route.next_version_id().map(|_| ()),
+                ),
+            ];
+            for (operation, result) in expired_operations {
+                match result {
+                    Err(StorageNodeObjectRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                        assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+                    }
+                    Err(StorageNodeObjectRouteError::Object(error)) => {
+                        panic!("captured route should expire before {operation}: {error}")
+                    }
+                    Ok(()) => panic!("expired captured route performed {operation}"),
+                }
+            }
+        });
+
+        let pg = server._node.get_pg(0).unwrap();
+        assert_eq!(
+            PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &reservation_id,
+            )
+            .unwrap(),
+            reserved_generation,
+            "expired active object routes must leave durable reservation state exact"
+        );
     }
 
     #[test]

@@ -1529,6 +1529,37 @@ Twenty-eighth Phase 3 slice:
   traits, and object/data active and retained capabilities remain open in
   Phase 3.
 
+Twenty-ninth Phase 3 slice:
+
+- object-generation allocation and reservation lookup now require a private,
+  non-`Clone` `StorageNodeActivePrimaryObjectRoute` before reaching
+  `LocalStorageNodeClient`. The capability binds the exact bucket, key,
+  installed `ObjectMetadataPgId`, frame admission domain/class, primary route,
+  and captured route deadline. Object-version selection uses the matching
+  acting-set `StorageNodeActiveObjectRoute`, preserving its intentional
+  all-replica maximum scan rather than incorrectly requiring the metadata
+  primary.
+- both capability classes revalidate the frame's immutable deadline
+  immediately before node access. Primary construction preserves the prior
+  route, primary, and exact object-placement validation order; decoded wire
+  PGs never confer trusted object-role authority.
+- a deterministic server-local regression seeds a durable generation
+  reservation, exercises reservation lookup, next-generation selection, and
+  next-version selection, then extends the raw same-epoch route validity and
+  proves all three captured capabilities fail at their original deadline.
+  Foreign-domain and retained-cleanup permits cannot construct active object
+  authority, and the complete durable reservation remains unchanged.
+- existing Unix positive and two-PG adversarial tests cover all three RPCs,
+  including exact `PayloadDecode` rejection with equivalent wrong-PG state so
+  an unguarded node access would succeed.
+- direct PUT, object reads and mutations, listing scans, data operations,
+  frontend capability migration, and capability requirements on node-client
+  traits remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  active-object deadline regression, all three Unix positive/wrong-PG
+  regressions, all 2,197 storage tests, workspace-wide strict Clippy, and the
+  full parallel workspace suite (7,399 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
