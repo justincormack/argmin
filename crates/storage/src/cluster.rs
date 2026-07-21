@@ -69,11 +69,11 @@ use crate::storage_rpc::{
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 use crate::types::{
-    BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
-    CommitDirectPutObjectReq, CreateStreamUploadReq, DirectPutCommitSnapshot,
-    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
-    ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
+    BucketInfo, BucketName, BucketSubresourceKind, BucketWriteDrainRecord,
+    BucketWriteReservationRecord, ClusterEpoch, CommitDirectPutObjectReq, CreateStreamUploadReq,
+    DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
+    GenerationId, MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout,
+    ObjectReadSnapshot, ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
@@ -1461,6 +1461,67 @@ impl StorageClusterRouteAdmission {
     pub fn cluster_epoch(&self) -> ClusterEpoch {
         self.cluster.cluster_epoch()
     }
+
+    /// Derive active bucket-metadata authority for one bucket from this
+    /// request's admitted runtime-map generation.
+    pub fn active_bucket_route<'admission>(
+        &'admission self,
+        bucket: &BucketName,
+    ) -> Result<ActiveBucketRoute<'admission>, StoreError> {
+        self.require_valid_now()?;
+        Ok(ActiveBucketRoute {
+            admission: self,
+            bucket: bucket.clone(),
+            pg_id: self.cluster.bucket_metadata_pg(bucket),
+        })
+    }
+}
+
+/// Non-cloneable active bucket-metadata authority derived from one admitted
+/// frontend request.
+///
+/// The bucket and its routed PG are fixed at construction. Operations do not
+/// accept either value again, so callers cannot combine authority for one
+/// bucket with another subject or PG. Every operation also rechecks the
+/// admission's captured absolute deadline before reaching a node client.
+///
+/// ```compile_fail
+/// use storage::ActiveBucketRoute;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn cache_route(route: &ActiveBucketRoute<'_>) {
+///     require_clone(route);
+/// }
+/// ```
+pub struct ActiveBucketRoute<'admission> {
+    admission: &'admission StorageClusterRouteAdmission,
+    bucket: BucketName,
+    pg_id: BucketPgId,
+}
+
+impl ActiveBucketRoute<'_> {
+    pub fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        self.admission.require_valid_now()?;
+        let cluster = &self.admission.cluster;
+        cluster
+            .local_map
+            .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
+            .bucket_metadata_client()
+            .head_bucket_info(self.pg_id, &self.bucket)
+    }
+
+    pub fn get_bucket_subresource(
+        &self,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, BucketSnapshotLoadError> {
+        self.admission.require_valid_now()?;
+        let cluster = &self.admission.cluster;
+        cluster
+            .local_map
+            .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
+            .bucket_metadata_client()
+            .get_bucket_subresource(self.pg_id, &self.bucket, kind)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2337,6 +2398,38 @@ mod runtime_map_refresh_invalidation_tests {
                     valid_until_ms: 5_000,
                     now_ms: 6_000,
                 }) if cluster_epoch == ClusterEpoch::INITIAL
+            ));
+        });
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn active_bucket_route_rechecks_its_admitted_deadline_before_node_access() {
+        let cluster = crate::clock::with_time_override(1_000, || {
+            let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+            cluster
+        });
+        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+        let admission =
+            crate::clock::with_time_override(1_000, || handle.admit_current_route().unwrap());
+        let bucket = BucketName::try_from("capability-bucket").unwrap();
+        let route = crate::clock::with_time_override(1_000, || {
+            admission.active_bucket_route(&bucket).unwrap()
+        });
+
+        crate::clock::with_time_override(1_000, || {
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+        });
+        crate::clock::with_time_override(6_000, || {
+            cluster.require_route_map_valid_now().unwrap();
+            assert!(matches!(
+                route.head_bucket_info(),
+                Err(BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
+                    cluster_epoch,
+                    valid_until_ms: 5_000,
+                    now_ms: 6_000,
+                })) if cluster_epoch == ClusterEpoch::INITIAL
             ));
         });
     }

@@ -1122,6 +1122,48 @@ Nineteenth Phase 3 slice:
   server-HTTP tests, the focused S3 admission integration test,
   workspace-wide strict Clippy, and the full workspace suite (7,278 tests).
 
+Twentieth Phase 3 slice:
+
+- `StorageClusterRouteAdmission::active_bucket_route` now derives the first
+  operation-facing route capability from the exact admitted frontend map.
+  `ActiveBucketRoute` has private fields, is non-`Clone`, borrows its
+  admission, and fixes both the bucket identity and installed `BucketPgId` at
+  construction. Its operations take neither identity again, so a caller
+  cannot combine authority for one bucket with another bucket or PG.
+- the initial guarded API covers active bucket-info and bucket-subresource
+  reads. Each call revalidates the admission's captured absolute deadline
+  immediately before selecting the admitted cluster's node client. A later
+  renewal of the underlying map therefore cannot extend an existing request's
+  capability, and the operation never reselects `current()` from the runtime
+  map handle.
+- bucket-existence lookups used for wrong-region and denied/auth-error response
+  headers, OPTIONS CORS lookup, and actual-response CORS lookup now require the
+  exact admission and use `ActiveBucketRoute`. Streaming response CORS obtains
+  a fresh admitted route after the write has finished; optional authentication
+  error enrichment continues to fail closed by omitting the header if route
+  admission or the guarded read fails.
+- a compile-fail boundary proves the capability is not cloneable. A focused
+  deadline regression derives a bucket route, renews the underlying map, then
+  proves a read after the original deadline fails before node access. The Unix
+  bucket-metadata integration regression now exercises both guarded bucket
+  head and subresource reads against an installed Unix client, in addition to
+  the embedded HTTP coverage.
+- this slice intentionally exposes only the active bucket-read projection.
+  Main coordinator dispatch, object/data operations, durable bucket effects,
+  retained cleanup/recovery capabilities, capability requirements on the
+  node-client traits, and Unix server-local capability construction remain
+  open. Existing unguarded `StorageCluster` methods cannot be retired until
+  their request and background callers are classified and migrated.
+- validation passed formatting, the storage boundary checker, both storage
+  compile-fail doctests, the focused captured-deadline and Unix bucket-client
+  regressions, all 779 server-HTTP tests, workspace-wide strict Clippy, and the
+  full parallel workspace suite (7,325 tests). The full run exposed a separate
+  synthetic-clock mismatch in an authenticated Unix control-plane fixture:
+  its client advanced a fixed authority timestamp with local elapsed time
+  while its server clock stayed frozen. That fixture now uses the existing
+  fixed-clock request path, keeping its authentication assertion deterministic
+  under scheduler delay.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

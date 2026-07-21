@@ -24423,7 +24423,17 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             frontend_auth_credential("auth-cluster", "frontend-1"),
         );
-        let runtime_map = client.runtime_map_snapshot(2_000).unwrap();
+        let payload = client
+            .send_signed_read_only_request_with_read_timeout_and_clock(
+                ControlPlaneRpcKind::RuntimeMapSnapshot,
+                Vec::new(),
+                CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+                || Ok(2_000),
+            )
+            .unwrap();
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
 
         server.join().unwrap();
         assert!(runtime_map.cluster_epoch().get() >= 1);

@@ -239,6 +239,24 @@ impl Coordinator {
         self.unchecked_active_bucket_summary_for_storage_node(&self.storage_node(), name)
     }
 
+    pub(super) fn unchecked_active_bucket_summary_for_admitted_route(
+        &self,
+        admission: &StorageClusterRouteAdmission,
+        name: &BucketName,
+    ) -> Result<BucketSummary, ServerError> {
+        let info = admission
+            .active_bucket_route(name)
+            .map_err(map_store_error)?
+            .head_bucket_info()
+            .map_err(Self::map_bucket_snapshot_load_error)?;
+        if info.state != BucketState::Active {
+            return Err(ServerError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
+        Ok(Self::bucket_summary(info))
+    }
+
     pub(super) fn unchecked_active_bucket_summary_for_storage_node(
         &self,
         storage_node: &Arc<StorageCluster>,

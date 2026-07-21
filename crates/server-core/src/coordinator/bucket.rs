@@ -509,6 +509,24 @@ impl Coordinator {
         }
     }
 
+    pub fn bucket_exists_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        name: &BucketName,
+    ) -> Result<bool, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::bucket_exists_on_admitted_route",
+            "bucket={:?}",
+            name
+        );
+        match self.unchecked_active_bucket_summary_for_admitted_route(admission, name) {
+            Ok(_) => Ok(true),
+            Err(ServerError::BucketNotFound { .. }) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn list_buckets(
         &self,
         req: &ListBucketsRequest,
@@ -702,6 +720,7 @@ impl Coordinator {
 
     pub fn load_bucket_cors_config(
         &self,
+        admission: &storage::StorageClusterRouteAdmission,
         name: &BucketName,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
@@ -711,8 +730,10 @@ impl Coordinator {
             name
         );
         let authorized = self.authorize_load_bucket_cors_config_for(name);
-        self.storage_node()
-            .get_bucket_subresource(&authorized.bucket, storage::BucketSubresourceKind::Cors)
+        admission
+            .active_bucket_route(&authorized.bucket)
+            .map_err(super::map_store_error)?
+            .get_bucket_subresource(storage::BucketSubresourceKind::Cors)
             .map_err(Self::map_bucket_snapshot_load_error)
     }
 

@@ -68,16 +68,17 @@ mod traits {
 }
 
 pub use cluster::{
-    BucketWriteSnapshotAction, DurableReclaimScanOutcome, LeasedObjectReadSnapshotOutcome,
-    LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
-    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
-    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PgMetadataTransferArtifact,
-    PlacedSegmentShardBackfillCopyTarget, PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth,
-    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
-    ReleasedObjectPayloadLease, ShardLocation, StorageCluster, StorageClusterRouteAdmission,
-    StorageClusterRuntimeMapHandle, StorageClusterRuntimeMapRefreshLoop,
-    StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
-    StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
+    ActiveBucketRoute, BucketWriteSnapshotAction, DurableReclaimScanOutcome,
+    LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
+    LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
+    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
+    ObjectPayloadLease, PgMetadataTransferArtifact, PlacedSegmentShardBackfillCopyTarget,
+    PlacedSegmentShardBackfillPlan, PlacedSegmentShardHealth, PlacedSegmentShardSetHealth,
+    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, ReleasedObjectPayloadLease,
+    ShardLocation, StorageCluster, StorageClusterRouteAdmission, StorageClusterRuntimeMapHandle,
+    StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshLoopFailure,
+    StorageClusterRuntimeMapRefreshLoopStatus, StorageClusterRuntimeMapRefreshLoopStatusHandle,
+    StorageClusterRuntimeMapRefreshLoopSuccess,
 };
 #[cfg(feature = "test-hooks")]
 pub use cluster::{

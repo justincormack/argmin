@@ -995,14 +995,13 @@ impl HttpFrontend {
 
         // OPTIONS (preflight CORS) bypasses authentication.
         if let S3Operation::OptionsRequest { ref bucket, .. } = operation {
-            let _storage_route_admission = match self.coordinator.admit_storage_route_for_request()
-            {
+            let storage_route_admission = match self.coordinator.admit_storage_route_for_request() {
                 Ok(admission) => admission,
                 Err(err) => {
                     return S3Response::error_with_ids(&err, s3req.path(), wire_ids);
                 }
             };
-            return self.handle_options_request(s3req, bucket, wire_ids);
+            return self.handle_options_request(s3req, &storage_route_admission, bucket, wire_ids);
         }
 
         let actual_cors_bucket = operation.bucket_name().cloned();
@@ -1043,7 +1042,7 @@ impl HttpFrontend {
                 Ok(admission) => {
                     let result = if auth_bucket.is_some() {
                         if let Err(err) =
-                            self.enforce_bucket_region_for_operation(&operation, &auth)
+                            self.enforce_bucket_region_for_operation(&admission, &operation, &auth)
                         {
                             Err(err)
                         } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
@@ -1082,8 +1081,11 @@ impl HttpFrontend {
             .as_ref()
             .filter(|_| auth_error_needs_bucket_region_lookup)
             .is_some_and(|bucket| {
-                storage_route_admission.is_some()
-                    && self.coordinator.bucket_exists(bucket).unwrap_or(false)
+                storage_route_admission.as_ref().is_some_and(|admission| {
+                    self.coordinator
+                        .bucket_exists_on_admitted_route(admission, bucket)
+                        .unwrap_or(false)
+                })
             });
         let add_bucket_region_for_denied_discovery = denied_bucket_region_bucket
             .as_ref()
@@ -1094,8 +1096,11 @@ impl HttpFrontend {
                 )
             })
             .is_some_and(|bucket| {
-                storage_route_admission.is_some()
-                    && self.coordinator.bucket_exists(bucket).unwrap_or(false)
+                storage_route_admission.as_ref().is_some_and(|admission| {
+                    self.coordinator
+                        .bucket_exists_on_admitted_route(admission, bucket)
+                        .unwrap_or(false)
+                })
             });
         let mut resp = {
             observability::trace_scope!(
@@ -1162,7 +1167,7 @@ impl HttpFrontend {
                     storage_route_admission =
                         self.coordinator.admit_storage_route_for_request().ok();
                 }
-                if storage_route_admission.is_some() {
+                if let Some(admission) = storage_route_admission.as_ref() {
                     observability::trace_scope!(
                         TRACE_TARGET,
                         "HttpFrontend::apply_actual_cors",
@@ -1171,7 +1176,13 @@ impl HttpFrontend {
                         s3req.path(),
                         bucket
                     );
-                    self.apply_cors_headers(&mut resp, &bucket, origin, s3req.method.as_str());
+                    self.apply_cors_headers(
+                        admission,
+                        &mut resp,
+                        &bucket,
+                        origin,
+                        s3req.method.as_str(),
+                    );
                 }
             }
         }
@@ -1183,6 +1194,7 @@ impl HttpFrontend {
     fn handle_options_request(
         &self,
         req: &S3Request,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
         bucket: &BucketName,
         wire_ids: &WireResponseIds,
     ) -> S3Response {
@@ -1211,7 +1223,10 @@ impl HttpFrontend {
             .unwrap_or_default();
 
         // Load CORS config
-        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
+        let cors_config_xml = match self
+            .coordinator
+            .load_bucket_cors_config(storage_route_admission, bucket)
+        {
             Ok(Some(xml)) => xml,
             _ => return S3Response::forbidden_with_ids(wire_ids),
         };
@@ -1242,6 +1257,7 @@ impl HttpFrontend {
     /// has an Origin header and a matching CORS rule exists.
     pub(crate) fn actual_cors_headers(
         &self,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
         bucket: &BucketName,
         origin: &str,
         method: &str,
@@ -1249,7 +1265,10 @@ impl HttpFrontend {
         #[cfg(test)]
         self.actual_cors_metadata_lookup_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
+        let cors_config_xml = match self
+            .coordinator
+            .load_bucket_cors_config(storage_route_admission, bucket)
+        {
             Ok(Some(xml)) => xml,
             _ => return Vec::new(),
         };
@@ -1273,12 +1292,13 @@ impl HttpFrontend {
 
     fn apply_cors_headers(
         &self,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
         resp: &mut S3Response,
         bucket: &BucketName,
         origin: &str,
         method: &str,
     ) {
-        for (k, v) in self.actual_cors_headers(bucket, origin, method) {
+        for (k, v) in self.actual_cors_headers(storage_route_admission, bucket, origin, method) {
             resp.headers.push((k, v));
         }
     }
@@ -3409,8 +3429,15 @@ impl HttpFrontend {
                 expected_region,
             }) => {
                 let bucket_region_header = if let Some(bucket) = bucket {
+                    let bucket = parse_bucket_name(bucket)?;
                     self.coordinator
-                        .bucket_exists(&parse_bucket_name(bucket)?)?
+                        .admit_storage_route_for_request()
+                        .ok()
+                        .is_some_and(|admission| {
+                            self.coordinator
+                                .bucket_exists_on_admitted_route(&admission, &bucket)
+                                .unwrap_or(false)
+                        })
                 } else {
                     false
                 };
@@ -3463,17 +3490,19 @@ impl HttpFrontend {
 
     fn enforce_bucket_region_for_operation(
         &self,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
         operation: &S3Operation,
         auth: &AuthContext,
     ) -> Result<(), ServerError> {
         let Some(bucket) = operation.bucket_name() else {
             return Ok(());
         };
-        self.enforce_bucket_region(bucket, auth)
+        self.enforce_bucket_region(storage_route_admission, bucket, auth)
     }
 
     fn enforce_bucket_region(
         &self,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
         bucket: &BucketName,
         auth: &AuthContext,
     ) -> Result<(), ServerError> {
@@ -3487,7 +3516,9 @@ impl HttpFrontend {
             AuthMode::HeaderSigV4 => Err(ServerError::WrongRegion {
                 provided_region: signing_region.to_string(),
                 expected_region: self.coordinator.region().to_string(),
-                bucket_region_header: self.coordinator.bucket_exists(bucket)?,
+                bucket_region_header: self
+                    .coordinator
+                    .bucket_exists_on_admitted_route(storage_route_admission, bucket)?,
             }),
             AuthMode::PresignedSigV4 => Err(ServerError::Auth(
                 auth::AuthError::InvalidQueryCredentialRegion {
@@ -3518,11 +3549,12 @@ impl HttpFrontend {
 
     fn enforce_bucket_region_raw(
         &self,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
         bucket: &str,
         auth: &AuthContext,
     ) -> Result<(), ServerError> {
         let bucket = parse_bucket_name(bucket)?;
-        self.enforce_bucket_region(&bucket, auth)
+        self.enforce_bucket_region(storage_route_admission, &bucket, auth)
     }
 
     /// Reject streaming requests that fell through `is_streaming_write` in serve.rs.
@@ -3703,7 +3735,7 @@ impl HttpFrontend {
             &post_auth
         };
         let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
-        self.enforce_bucket_region_raw(bucket, effective_auth)?;
+        self.enforce_bucket_region_raw(&storage_route_admission, bucket, effective_auth)?;
 
         let post_policy = if let Some(policy_b64) = field("policy") {
             let mut field_pairs: Vec<(&str, &str)> = form_fields
@@ -4058,7 +4090,7 @@ impl HttpFrontend {
         Self::require_content_sha256_for_sigv4_header_auth(req)?;
         let auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
         let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
-        self.enforce_bucket_region_raw(bucket, &auth)?;
+        self.enforce_bucket_region_raw(&storage_route_admission, bucket, &auth)?;
         reject_directory_bucket_only_object_features(req)?;
 
         let object_lock = parse_object_lock_headers(req)?;
@@ -4413,7 +4445,7 @@ impl HttpFrontend {
         Self::require_content_sha256_for_sigv4_header_auth(req)?;
         let auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
         let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
-        self.enforce_bucket_region_raw(bucket, &auth)?;
+        self.enforce_bucket_region_raw(&storage_route_admission, bucket, &auth)?;
 
         let requester = self.requester_from_auth(&auth, req);
         let expected_bucket_owner = expected_bucket_owner(req).map(str::to_string);
@@ -7558,8 +7590,10 @@ mod tests {
             signing_region: Some("us-west-2".to_string()),
             streaming: None,
         };
+        let storage_route_admission = fe.coordinator.admit_storage_route_for_request().unwrap();
 
         match fe.enforce_bucket_region_for_operation(
+            &storage_route_admission,
             &S3Operation::PutObject {
                 bucket: test_bucket_name("mybucket"),
                 key: "key".to_string(),
@@ -7595,8 +7629,10 @@ mod tests {
             signing_region: Some("us-west-2".to_string()),
             streaming: None,
         };
+        let storage_route_admission = fe.coordinator.admit_storage_route_for_request().unwrap();
 
         match fe.enforce_bucket_region_for_operation(
+            &storage_route_admission,
             &S3Operation::PutObject {
                 bucket: test_bucket_name("missing"),
                 key: "key".to_string(),

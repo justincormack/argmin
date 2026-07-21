@@ -1831,6 +1831,17 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
         crate::BucketCreateAttemptOutcome::Created(_)
     ));
 
+    let runtime_map = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let admission = runtime_map.admit_current_route().unwrap();
+    let active_bucket_route = admission.active_bucket_route(&bucket).unwrap();
+    assert_eq!(active_bucket_route.head_bucket_info().unwrap().name, bucket);
+    assert_eq!(
+        active_bucket_route
+            .get_bucket_subresource(crate::BucketSubresourceKind::Cors)
+            .unwrap(),
+        None
+    );
+
     let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
     assert!(crate::PgMetadataStore::head_bucket_raw(&*frontend_pg, &bucket).is_err());
     let remote = SharedStorageNode::open_with_default_ec_shape(

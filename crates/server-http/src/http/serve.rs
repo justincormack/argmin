@@ -1893,11 +1893,11 @@ async fn append_actual_cors_headers(
     let method = method.to_string();
     let headers = spawn_blocking_with_trace(trace.clone(), move || {
         let frontend = acquire_frontend(&st);
-        let Ok(_storage_route_admission) = frontend.coordinator.admit_storage_route_for_request()
+        let Ok(storage_route_admission) = frontend.coordinator.admit_storage_route_for_request()
         else {
             return Vec::new();
         };
-        frontend.actual_cors_headers(&bucket, &origin, &method)
+        frontend.actual_cors_headers(&storage_route_admission, &bucket, &origin, &method)
     })
     .await
     .unwrap_or_default();
