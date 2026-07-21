@@ -2,6 +2,13 @@ use s3_types::{aws_account_id_from_principal, CanonicalUserId};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr};
 
+#[cfg(test)]
+use crate::policy::wildcard_matches;
+use crate::policy::{
+    action_pattern_matches, policy_value_wildcard_matches, PolicyStatementFields, PolicyValue,
+};
+pub use crate::policy::{PolicyConditionClause, PolicyEffect, PolicyEvaluation, PolicyVersion};
+
 mod condition_key;
 mod condition_op;
 
@@ -11,37 +18,6 @@ pub const MAX_BUCKET_POLICY_BYTES: usize = 20 * 1024;
 pub struct BucketPolicy {
     version: Option<PolicyVersion>,
     statements: Vec<PolicyStatement>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PolicyValue {
-    value: String,
-    escaped_wildcards: Vec<usize>,
-}
-
-impl PolicyValue {
-    fn literal(value: &str) -> Self {
-        Self {
-            value: value.to_string(),
-            escaped_wildcards: Vec::new(),
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        &self.value
-    }
-
-    fn wildcard_is_escaped(&self, char_index: usize) -> bool {
-        self.escaped_wildcards.binary_search(&char_index).is_ok()
-    }
-}
-
-impl std::ops::Deref for PolicyValue {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_str()
-    }
 }
 
 impl BucketPolicy {
@@ -997,38 +973,21 @@ impl<'a> PolicyRequest<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyEvaluation {
-    ExplicitDeny,
-    ExplicitAllow,
-    NoMatch,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyVersion {
-    V2008_10_17,
-    V2012_10_17,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyStatement {
-    sid: Option<String>,
-    effect: PolicyEffect,
     principal: PolicyPrincipal,
-    actions: Vec<String>,
-    resources: Vec<String>,
-    conditions: Vec<PolicyConditionClause>,
+    fields: PolicyStatementFields,
 }
 
 impl PolicyStatement {
     #[must_use]
     pub fn sid(&self) -> Option<&str> {
-        self.sid.as_deref()
+        self.fields.sid.as_deref()
     }
 
     #[must_use]
     pub fn effect(&self) -> PolicyEffect {
-        self.effect
+        self.fields.effect
     }
 
     #[must_use]
@@ -1038,21 +997,21 @@ impl PolicyStatement {
 
     #[must_use]
     pub fn actions(&self) -> &[String] {
-        &self.actions
+        &self.fields.actions
     }
 
     #[must_use]
     pub fn resources(&self) -> &[String] {
-        &self.resources
+        &self.fields.resources
     }
 
     #[must_use]
     pub fn conditions(&self) -> &[PolicyConditionClause] {
-        &self.conditions
+        &self.fields.conditions
     }
 
     fn allows_public_access(&self) -> bool {
-        if self.effect != PolicyEffect::Allow {
+        if self.fields.effect != PolicyEffect::Allow {
             return false;
         }
 
@@ -1060,7 +1019,7 @@ impl PolicyStatement {
             return false;
         }
 
-        !conditions_constrain_public_principal(&self.conditions)
+        !conditions_constrain_public_principal(&self.fields.conditions)
     }
 
     fn request_effect(
@@ -1078,12 +1037,12 @@ impl PolicyStatement {
         }
 
         match self.condition_match_result(request, variables_enabled) {
-            ConditionMatchResult::Matches => Some(self.effect),
+            ConditionMatchResult::Matches => Some(self.fields.effect),
             ConditionMatchResult::NoMatch => None,
             ConditionMatchResult::AcceptedButNotEvaluable => None,
             ConditionMatchResult::InputUnavailable => None,
             ConditionMatchResult::Unsupported => {
-                (self.effect == PolicyEffect::Deny).then_some(PolicyEffect::Deny)
+                (self.fields.effect == PolicyEffect::Deny).then_some(PolicyEffect::Deny)
             }
         }
     }
@@ -1093,7 +1052,8 @@ impl PolicyStatement {
     }
 
     fn matches_action(&self, action: &str) -> bool {
-        self.actions
+        self.fields
+            .actions
             .iter()
             .any(|pattern| action_pattern_matches(pattern, action))
     }
@@ -1104,7 +1064,7 @@ impl PolicyStatement {
         resource: &str,
         variables_enabled: bool,
     ) -> bool {
-        self.resources.iter().any(|pattern| {
+        self.fields.resources.iter().any(|pattern| {
             let pattern = if variables_enabled {
                 let Some(pattern) = expand_policy_template(pattern, request) else {
                     return false;
@@ -1118,7 +1078,7 @@ impl PolicyStatement {
     }
 
     fn references_bucket_tag_condition(&self) -> bool {
-        self.conditions.iter().any(|clause| {
+        self.fields.conditions.iter().any(|clause| {
             condition_key::clause_input(clause) == Some(condition_key::ConditionInput::Bucket)
         })
     }
@@ -1128,7 +1088,8 @@ impl PolicyStatement {
         action: PolicyAction,
         input: condition_key::ConditionInput,
     ) -> bool {
-        self.conditions
+        self.fields
+            .conditions
             .iter()
             .any(|clause| condition_key::clause_requires_input_for_action(clause, action, input))
     }
@@ -1139,12 +1100,13 @@ impl PolicyStatement {
             .chain(SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS.iter())
             .copied()
             .filter(|action| {
-                self.actions
+                self.fields
+                    .actions
                     .iter()
                     .any(|pattern| action_pattern_matches(pattern, action.as_str()))
             })
             .find_map(|action| {
-                self.conditions.iter().find_map(|clause| {
+                self.fields.conditions.iter().find_map(|clause| {
                     if !condition_key::is_known_condition_key(clause.key.as_str()) {
                         return Some(BucketPolicyError::malformed_with_detail(
                             "Policy has an invalid condition key",
@@ -1170,7 +1132,7 @@ impl PolicyStatement {
         let mut saw_unsupported = false;
         let mut saw_accepted_but_not_evaluable = false;
         let mut saw_input_unavailable = false;
-        for clause in &self.conditions {
+        for clause in &self.fields.conditions {
             match condition_clause_matches_request(clause, request, variables_enabled) {
                 ConditionMatchResult::Matches => {}
                 ConditionMatchResult::NoMatch => return ConditionMatchResult::NoMatch,
@@ -1204,7 +1166,7 @@ impl PolicyStatement {
         }
 
         push_json_field_name(out, "Effect", &mut first_field);
-        push_json_string(out, self.effect.as_str());
+        push_json_string(out, self.fields.effect.as_str());
 
         push_json_field_name(out, "Principal", &mut first_field);
         self.principal.push_normalized_json(out);
@@ -1215,28 +1177,12 @@ impl PolicyStatement {
         push_json_field_name(out, "Resource", &mut first_field);
         push_json_string_or_array(out, self.resources());
 
-        if !self.conditions.is_empty() {
+        if !self.fields.conditions.is_empty() {
             push_json_field_name(out, "Condition", &mut first_field);
             push_condition_map(out, self.conditions());
         }
 
         out.push('}');
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PolicyEffect {
-    Allow,
-    Deny,
-}
-
-impl PolicyEffect {
-    #[must_use]
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Allow => "Allow",
-            Self::Deny => "Deny",
-        }
     }
 }
 
@@ -1366,23 +1312,6 @@ impl PolicyPrincipal {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyConditionClause {
-    operator: String,
-    key: String,
-    values: Vec<String>,
-}
-
-impl PolicyVersion {
-    #[must_use]
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::V2008_10_17 => "2008-10-17",
-            Self::V2012_10_17 => "2012-10-17",
-        }
-    }
-}
-
 fn push_json_field_name(out: &mut String, field_name: &str, first_field: &mut bool) {
     if !*first_field {
         out.push(',');
@@ -1449,23 +1378,6 @@ fn push_condition_map(out: &mut String, clauses: &[PolicyConditionClause]) {
     out.push('}');
 }
 
-impl PolicyConditionClause {
-    #[must_use]
-    pub fn operator(&self) -> &str {
-        &self.operator
-    }
-
-    #[must_use]
-    pub fn key(&self) -> &str {
-        &self.key
-    }
-
-    #[must_use]
-    pub fn values(&self) -> &[String] {
-        &self.values
-    }
-}
-
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum BucketPolicyError {
     #[error("malformed policy: {reason}")]
@@ -1519,7 +1431,7 @@ impl BucketPolicy {
         let bucket_arn = format!("arn:aws:s3:::{bucket}");
         self.statements
             .iter()
-            .flat_map(|statement| statement.resources.iter())
+            .flat_map(|statement| statement.fields.resources.iter())
             .find(|resource| {
                 resource.as_str() != bucket_arn
                     && !resource
@@ -1645,12 +1557,8 @@ fn parse_statement(value: &Value, index: usize) -> Result<PolicyStatement, Bucke
     };
 
     Ok(PolicyStatement {
-        sid,
-        effect,
         principal,
-        actions,
-        resources,
-        conditions,
+        fields: PolicyStatementFields::new(sid, effect, actions, resources, conditions),
     })
 }
 
@@ -2002,18 +1910,17 @@ enum PolicyVariableValue {
 }
 
 fn push_policy_literal(output: &mut PolicyValue, value: &str) {
-    output.value.push_str(value);
+    output.push_pattern_fragment(value);
 }
 
 fn push_policy_variable(output: &mut PolicyValue, value: &PolicyVariableValue) {
     match value {
-        PolicyVariableValue::Text(value) => output.value.push_str(value),
-        PolicyVariableValue::LiteralWildcard(value @ ('*' | '?')) => {
-            let index = output.value.chars().count();
-            output.value.push(*value);
-            output.escaped_wildcards.push(index);
+        PolicyVariableValue::Text(value) => output.push_pattern_fragment(value),
+        PolicyVariableValue::LiteralWildcard('*') => output.push_literal_asterisk(),
+        PolicyVariableValue::LiteralWildcard('?') => output.push_literal_question_mark(),
+        PolicyVariableValue::LiteralWildcard(value) => {
+            output.push_pattern_fragment(&value.to_string());
         }
-        PolicyVariableValue::LiteralWildcard(value) => output.value.push(*value),
     }
 }
 
@@ -2075,46 +1982,6 @@ pub fn clause_supported_for_action_for_tests(
         values: vec!["test".to_string()],
     };
     condition_key::supports_clause_for_action(&clause, action)
-}
-
-fn action_pattern_matches(pattern: &str, action: &str) -> bool {
-    wildcard_matches(&pattern.to_ascii_lowercase(), &action.to_ascii_lowercase())
-}
-
-fn wildcard_matches(pattern: &str, value: &str) -> bool {
-    policy_value_wildcard_matches(&PolicyValue::literal(pattern), value)
-}
-
-fn policy_value_wildcard_matches(pattern: &PolicyValue, value: &str) -> bool {
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-    let value: Vec<char> = value.chars().collect();
-    let mut previous = vec![false; value.len() + 1];
-    previous[0] = true;
-
-    for (pattern_index, pattern_ch) in pattern_chars.into_iter().enumerate() {
-        let mut current = vec![false; value.len() + 1];
-        match pattern_ch {
-            '*' if !pattern.wildcard_is_escaped(pattern_index) => {
-                current[0] = previous[0];
-                for index in 1..=value.len() {
-                    current[index] = previous[index] || current[index - 1];
-                }
-            }
-            '?' if !pattern.wildcard_is_escaped(pattern_index) => {
-                current[1..(value.len() + 1)].copy_from_slice(&previous[..value.len()]);
-            }
-            _ => {
-                for (index, actual) in value.iter().enumerate() {
-                    if *actual == pattern_ch && previous[index] {
-                        current[index + 1] = true;
-                    }
-                }
-            }
-        }
-        previous = current;
-    }
-
-    previous[value.len()]
 }
 
 fn aws_principal_matches_request(requester_principal: &str, policy_value: &str) -> bool {

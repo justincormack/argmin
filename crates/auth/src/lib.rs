@@ -20,6 +20,7 @@ pub mod credential;
 mod encoding;
 pub mod error;
 pub mod identity;
+mod policy;
 pub mod post;
 pub mod provider;
 pub mod request;

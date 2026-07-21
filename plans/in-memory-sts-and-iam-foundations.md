@@ -2613,6 +2613,15 @@ use until Phase 3 supplies role authorization.
 
 ### Phase 3: IAM policy and role core
 
+Phase 3 began by extracting the policy version, effect, normalized condition
+clause, statement-field, evaluation-result, and wildcard/action matching
+primitives from the S3 bucket-policy implementation into a shared internal
+policy-language module. `BucketPolicy` remains the typed public S3 resource-
+policy wrapper and retains its existing parser, request adapter, validation,
+and composition behavior. Subsequent Phase 3 slices will build typed trust,
+identity, and session-policy wrappers over these shared primitives; they must
+not introduce a second permissive IAM parser or a universal request context.
+
 - extend the minimal role identity records with role configuration, trust, and
   permission-policy state
 - add configured long-lived principal records and explicit identity-policy
