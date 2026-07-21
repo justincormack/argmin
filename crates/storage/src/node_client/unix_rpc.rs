@@ -2858,6 +2858,50 @@ impl UnixStorageNodeClient {
 }
 
 impl MetadataCommandNodeClient for UnixStorageNodeClient {
+    fn apply_retained_stream_upload_abort(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.metadata_command_apply_and_record_with_kind(
+            pg_id,
+            command,
+            StorageRpcMessageKind::MetadataCommandRetainedAbortApply,
+            "decode retained stream abort apply response",
+        )
+    }
+
+    fn finish_retained_stream_upload_abort(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcMetadataCommandRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            command: command.clone(),
+        };
+        let payload = encode_metadata_command_request(&request).map_err(|error| {
+            self.rpc_payload_error(
+                "encode retained stream abort finish request",
+                error.to_string(),
+            )
+        })?;
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandRetainedAbortFinish,
+            payload,
+        )?;
+        decode_metadata_command_pending_slot_remove_response(&response)
+            .map(|response| response.removed)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode retained stream abort finish response",
+                    error.to_string(),
+                )
+            })
+    }
+
     fn open_metadata_command_critical_section(
         &self,
         pg_id: PgId,

@@ -110,14 +110,28 @@ impl Coordinator {
         storage_node: &Arc<StorageCluster>,
         authorized: &AuthorizedPutObjectWrite,
     ) -> Result<SessionId, ServerError> {
+        self.create_stream_put_session_for_authorized_write_with_storage_node_and_cleanup_deadline(
+            storage_node,
+            authorized,
+            None,
+        )
+    }
+
+    pub(super) fn create_stream_put_session_for_authorized_write_with_storage_node_and_cleanup_deadline(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        authorized: &AuthorizedPutObjectWrite,
+        cleanup_after: Option<u64>,
+    ) -> Result<SessionId, ServerError> {
         let stored_encryption = authorized.write_encryption.object_encryption();
         let session_id = Self::random_session_id("failed to generate session ID")?;
         storage_node
-            .create_put_object_stream_session_record(
+            .create_put_object_stream_session_record_with_cleanup_deadline(
                 authorized.bucket_typed(),
                 authorized.key_typed(),
                 &session_id,
                 stored_encryption,
+                cleanup_after,
             )
             .map_err(Self::map_object_pg_action_error)?;
 
@@ -137,6 +151,16 @@ impl Coordinator {
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
         self.authorize_put_object_write_with_storage_node(storage_node, req)
+    }
+
+    pub fn prepare_put_object_write_with_storage_admission(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &Arc<StorageCluster>,
+        req: &AuthorizePutObjectRequest<'_>,
+    ) -> Result<AuthorizedPutObjectWrite, ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.prepare_put_object_write_with_storage_node(storage_node, req)
     }
 
     pub(super) fn bucket_summary(info: BucketInfo) -> BucketSummary {
@@ -411,9 +435,9 @@ impl Coordinator {
                 Ok(ShardBackfillSweeper::disabled())
             }
         };
-        let stream_session_sweeper_factory = |storage_cluster: &Arc<StorageCluster>| {
+        let stream_session_sweeper_factory = |storage_handle: &StorageClusterRuntimeMapHandle| {
             if background_worker_mode.stream_session {
-                StreamSessionSweeper::acquire_shared(storage_cluster)
+                StreamSessionSweeper::acquire_shared(storage_handle)
             } else {
                 Ok(StreamSessionSweeper::disabled())
             }
@@ -474,7 +498,9 @@ impl Coordinator {
         I: FnOnce(
             &StorageClusterRuntimeMapHandle,
         ) -> Result<Arc<ShardBackfillSweeper>, ServerError>,
-        J: FnOnce(&Arc<StorageCluster>) -> Result<Arc<StreamSessionSweeper>, ServerError>,
+        J: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+        ) -> Result<Arc<StreamSessionSweeper>, ServerError>,
     {
         Self::new_with_shared_caches_and_background_sweeper_factories(
             StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster)),
@@ -534,7 +560,9 @@ impl Coordinator {
         I: FnOnce(
             &StorageClusterRuntimeMapHandle,
         ) -> Result<Arc<ShardBackfillSweeper>, ServerError>,
-        J: FnOnce(&Arc<StorageCluster>) -> Result<Arc<StreamSessionSweeper>, ServerError>,
+        J: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+        ) -> Result<Arc<StreamSessionSweeper>, ServerError>,
     {
         #[cfg(test)]
         let pg_topology = PgTopology::new(storage_cluster.test_pg_ids()).map_err(|reason| {
@@ -569,7 +597,7 @@ impl Coordinator {
         let shard_scavenger_sweeper = shard_scavenger_sweeper_factory(&storage_handle)?;
         let shard_repair_sweeper = shard_repair_sweeper_factory(&storage_cluster)?;
         let shard_backfill_sweeper = shard_backfill_sweeper_factory(&storage_handle)?;
-        let stream_session_sweeper = stream_session_sweeper_factory(&storage_cluster)?;
+        let stream_session_sweeper = stream_session_sweeper_factory(&storage_handle)?;
         Ok(Self {
             storage_node: storage_handle,
             shared_caches,

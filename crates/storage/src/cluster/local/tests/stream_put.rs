@@ -1208,6 +1208,7 @@ fn stream_put_heartbeat_updates_persisted_bucket_write_proof() {
             encryption: crate::ObjectEncryption::None,
         },
         initial_next_segment_vid: crate::GenerationId::MIN,
+        cleanup_after: None,
         bucket_write_reservation: initial_proof.clone(),
     };
 

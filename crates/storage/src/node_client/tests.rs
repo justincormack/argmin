@@ -156,6 +156,7 @@ fn upload_part_stream_upload_match_accepts_existing_row_without_create_proof() {
         },
         state: StreamUploadState::InProgress,
         created_at: command.session.created_at,
+        cleanup_after: command.cleanup_after,
         encryption: ObjectEncryption::None,
         next_segment_vid: command.initial_next_segment_vid,
         bucket_write_reservation: None,

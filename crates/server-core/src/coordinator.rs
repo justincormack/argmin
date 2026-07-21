@@ -136,6 +136,7 @@ fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
         | storage::StoreError::StaleMetadataOperation { .. }
         | storage::StoreError::StaleMetadataRoute { .. }
         | storage::StoreError::RouteMapExpired { .. }
+        | storage::StoreError::RouteAdmissionClusterMismatch { .. }
         | storage::StoreError::StaleShardOperation { .. }
         | storage::StoreError::StaleShardLocation { .. }
         | storage::StoreError::PgNotActive { .. }

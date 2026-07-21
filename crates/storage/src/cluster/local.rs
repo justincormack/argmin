@@ -3264,12 +3264,11 @@ impl LocalClusterMap {
         })
     }
 
-    pub(crate) fn metadata_pg_primary_node_at_retained_epoch(
+    pub(crate) fn metadata_pg_primary_node_for_retained_cleanup(
         &self,
         operation_epoch: ClusterEpoch,
         pg_id: PgId,
     ) -> Result<&LocalNodeStore, StoreError> {
-        self.require_route_map_valid_now()?;
         let route = self
             .reconstructed_pg_route_at_epoch(pg_id, operation_epoch)
             .ok_or(StoreError::StaleMetadataOperation {

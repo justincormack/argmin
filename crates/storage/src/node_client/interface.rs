@@ -419,6 +419,18 @@ pub(crate) trait ObjectListingMetadataNodeClient: Send + Sync {
 }
 
 pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
+    /// Prepare the exact state-reducing abort command used by a retained
+    /// stream-cleanup capability. Implementations must serialize session and
+    /// segment loading with pending-slot allocation.
+    fn prepare_retained_stream_upload_abort(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
+
     fn load_put_object_metadata_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -777,6 +789,7 @@ pub(crate) struct BuildCreateStreamUploadCommandReq<'a> {
     pub(crate) pg_id: ObjectMetadataPgId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) request: &'a CreateStreamUploadReq,
+    pub(crate) cleanup_after: Option<u64>,
     pub(crate) precondition: CreateStreamUploadPrecondition<'a>,
     pub(crate) bucket_write_reservation: &'a BucketWriteReservationProof,
 }
@@ -1184,6 +1197,22 @@ pub(crate) trait ShardScavengerNodeClient: Send + Sync {
 }
 
 pub(crate) trait MetadataCommandNodeClient: Send + Sync {
+    fn apply_retained_stream_upload_abort(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.apply_metadata_command_and_record(pg_id, command)
+    }
+
+    fn finish_retained_stream_upload_abort(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        self.remove_pending_metadata_command_slot(pg_id, command)
+    }
+
     fn open_metadata_command_critical_section(
         &self,
         pg_id: PgId,

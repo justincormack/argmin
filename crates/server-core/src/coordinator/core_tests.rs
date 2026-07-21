@@ -124,6 +124,29 @@ fn setup_coordinator_with_only_reclaim_worker(
     .unwrap()
 }
 
+fn setup_coordinator_with_only_stream_session_worker(
+    storage_handle: StorageClusterRuntimeMapHandle,
+    storage_cluster: Arc<StorageCluster>,
+) -> Coordinator {
+    Coordinator::new_with_shared_caches_and_background_sweeper_factories(
+        storage_handle,
+        Arc::clone(&storage_cluster),
+        shared_caches_for_storage_cluster(&storage_cluster),
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        (
+            false,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |_| Ok(ShardBackfillSweeper::disabled()),
+            StreamSessionSweeper::acquire_shared,
+        ),
+    )
+    .unwrap()
+}
+
 fn make_private_socket_dir(path: &std::path::Path) {
     std::fs::create_dir_all(path).unwrap();
     let mut perms = std::fs::metadata(path).unwrap().permissions();
@@ -951,6 +974,59 @@ fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
             }
         }
     }
+}
+
+#[test]
+fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    initial.test_store_route_map_validity(long_lived_test_route_map_validity());
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        setup_coordinator_with_only_stream_session_worker(handle.clone(), Arc::clone(&initial));
+    coord
+        .create_bucket_for_owner("default-owner", "stream-cleanup-refresh", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("stream-cleanup-refresh");
+    let key = trusted_object_key("key");
+    let session_id = storage::SessionId::try_from("81818181818181818181818181818181").unwrap();
+    let cleanup_after = storage::clock::current_time_millis().saturating_add(100);
+    initial
+        .create_put_object_stream_session_record_with_cleanup_deadline(
+            &bucket,
+            &key,
+            &session_id,
+            storage::ObjectEncryption::None,
+            Some(cleanup_after),
+        )
+        .unwrap();
+
+    install_same_store_same_epoch_runtime_map(&handle, &initial, tmp.path());
+    assert!(!Arc::ptr_eq(&coord.storage_node(), &initial));
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    loop {
+        match coord
+            .storage_node()
+            .load_stream_upload_session(&bucket, &key, &session_id)
+        {
+            Err(storage::ObjectPgActionError::Metadata(
+                storage::MetadataError::StreamSessionNotFound { .. },
+            )) => break,
+            Ok(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(_) => panic!("refreshed-map stream-session sweeper did not finish durable cleanup"),
+            Err(error) => panic!("unexpected durable stream cleanup error: {error:?}"),
+        }
+    }
+    assert!(matches!(
+        coord
+            .storage_node()
+            .test_object_generation_reservation_for(&bucket, &key, &session_id),
+        Err(storage::ObjectPgActionError::Metadata(
+            storage::MetadataError::ObjectGenerationReservationNotFound { .. }
+        ))
+    ));
 }
 
 #[test]

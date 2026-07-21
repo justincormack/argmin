@@ -348,7 +348,7 @@ impl StreamingAbortGuard {
 
     fn start_put_object_heartbeat(
         self: &Arc<Self>,
-        ctx: Arc<super::StreamingPutContext>,
+        ctx: Weak<super::StreamingPutContext>,
         session_id: SessionId,
     ) {
         if self.put_heartbeat_started.swap(true, Ordering::AcqRel) {
@@ -366,8 +366,10 @@ impl StreamingAbortGuard {
                     break;
                 }
                 drop(guard);
+                let Some(ctx) = ctx.upgrade() else {
+                    break;
+                };
                 let state = Arc::clone(&state);
-                let ctx = Arc::clone(&ctx);
                 let session_id = session_id.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let frontend = acquire_frontend(&state);
@@ -383,10 +385,10 @@ impl StreamingAbortGuard {
         ctx: &Arc<super::StreamingPutContext>,
         session_id: &SessionId,
     ) {
-        self.start_put_object_heartbeat(Arc::clone(ctx), session_id.clone());
+        self.start_put_object_heartbeat(Arc::downgrade(ctx), session_id.clone());
     }
 
-    fn start_post_object_heartbeat(self: &Arc<Self>, ctx: Arc<super::StreamingPostContext>) {
+    fn start_post_object_heartbeat(self: &Arc<Self>, ctx: Weak<super::StreamingPostContext>) {
         if self.put_heartbeat_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -402,8 +404,10 @@ impl StreamingAbortGuard {
                     break;
                 }
                 drop(guard);
+                let Some(ctx) = ctx.upgrade() else {
+                    break;
+                };
                 let state = Arc::clone(&state);
-                let ctx = Arc::clone(&ctx);
                 let _ = tokio::task::spawn_blocking(move || {
                     let frontend = acquire_frontend(&state);
                     frontend.heartbeat_streaming_post_object(&ctx)
@@ -417,7 +421,7 @@ impl StreamingAbortGuard {
         *lock_mutex_unpoisoned(&self.cleanup) = Some(StreamingAbortCleanup::Post {
             ctx: Arc::clone(ctx),
         });
-        self.start_post_object_heartbeat(Arc::clone(ctx));
+        self.start_post_object_heartbeat(Arc::downgrade(ctx));
     }
 
     fn arm_part(&self, ctx: &Arc<super::StreamingPartContext>) {
@@ -2664,6 +2668,31 @@ pub fn fuzz_streaming_request_entrypoints(
     }
 }
 
+fn route_bounded_body_frame_timeout(
+    admission: Option<&storage::StorageClusterRouteAdmission>,
+    idle_timeout: Duration,
+) -> Result<Duration, ServerError> {
+    let Some(admission) = admission else {
+        return Ok(idle_timeout);
+    };
+    let remaining = admission
+        .remaining_validity()
+        .map_err(|_| ServerError::OperationAborted)?;
+    Ok(remaining.map_or(idle_timeout, |remaining| idle_timeout.min(remaining)))
+}
+
+fn route_bounded_body_timeout_error(
+    admission: Option<&storage::StorageClusterRouteAdmission>,
+) -> ServerError {
+    if admission.is_some_and(|admission| admission.require_valid_now().is_err()) {
+        ServerError::OperationAborted
+    } else {
+        ServerError::InvalidRequest {
+            reason: "request body read timed out".to_string(),
+        }
+    }
+}
+
 async fn handle_streaming_post_object(
     state: Arc<ServerState>,
     s3req: S3Request,
@@ -2731,7 +2760,19 @@ async fn handle_streaming_post_object(
 
     let mut body = body;
     loop {
-        match tokio::time::timeout(idle_timeout, body.frame()).await {
+        let frame_timeout = match route_bounded_body_frame_timeout(
+            ctx.as_ref().map(|ctx| ctx.storage_route_admission()),
+            idle_timeout,
+        ) {
+            Ok(timeout) => timeout,
+            Err(err) => {
+                if let Some(ref c) = ctx {
+                    abort_streaming_post_object(&state, c).await;
+                }
+                return error_response(&err, &wire_ids);
+            }
+        };
+        match tokio::time::timeout(frame_timeout, body.frame()).await {
             Ok(Some(Ok(frame))) => {
                 if let Some(chunk) = frame.data_ref() {
                     let events = match parser.feed(chunk) {
@@ -2938,9 +2979,9 @@ async fn handle_streaming_post_object(
                     abort_streaming_post_object(&state, c).await;
                 }
                 return error_response(
-                    &ServerError::InvalidRequest {
-                        reason: "request body read timed out".to_string(),
-                    },
+                    &route_bounded_body_timeout_error(
+                        ctx.as_ref().map(|ctx| ctx.storage_route_admission()),
+                    ),
                     &wire_ids,
                 );
             }
@@ -3229,7 +3270,17 @@ async fn handle_streaming_put(
     let mut body_timing = StreamingBodyTiming::default();
     loop {
         let frame_wait_start = Instant::now();
-        let next_frame = tokio::time::timeout(idle_timeout, body.frame()).await;
+        let frame_timeout = match route_bounded_body_frame_timeout(
+            Some(ctx.storage_route_admission()),
+            idle_timeout,
+        ) {
+            Ok(timeout) => timeout,
+            Err(err) => {
+                abort_streaming(&state, &ctx, session_id.clone()).await;
+                return error_response(&err, &wire_ids);
+            }
+        };
+        let next_frame = tokio::time::timeout(frame_timeout, body.frame()).await;
         body_timing.frame_wait_us += elapsed_micros(frame_wait_start);
         match next_frame {
             Ok(Some(Ok(frame))) => {
@@ -3307,9 +3358,7 @@ async fn handle_streaming_put(
             Err(_) => {
                 abort_streaming(&state, &ctx, session_id.clone()).await;
                 return error_response(
-                    &ServerError::InvalidRequest {
-                        reason: "request body read timed out".to_string(),
-                    },
+                    &route_bounded_body_timeout_error(Some(ctx.storage_route_admission())),
                     &wire_ids,
                 );
             }
@@ -4115,7 +4164,17 @@ async fn handle_streaming_part(
     let mut body_timing = StreamingBodyTiming::default();
     loop {
         let frame_wait_start = Instant::now();
-        let next_frame = tokio::time::timeout(idle_timeout, body.frame()).await;
+        let frame_timeout = match route_bounded_body_frame_timeout(
+            Some(ctx.storage_route_admission()),
+            idle_timeout,
+        ) {
+            Ok(timeout) => timeout,
+            Err(err) => {
+                abort_streaming_part_ctx(&state, &ctx).await;
+                return error_response(&err, &wire_ids);
+            }
+        };
+        let next_frame = tokio::time::timeout(frame_timeout, body.frame()).await;
         body_timing.frame_wait_us += elapsed_micros(frame_wait_start);
         match next_frame {
             Ok(Some(Ok(frame))) => {
@@ -4191,9 +4250,7 @@ async fn handle_streaming_part(
             Err(_) => {
                 abort_streaming_part_ctx(&state, &ctx).await;
                 return error_response(
-                    &ServerError::InvalidRequest {
-                        reason: "request body read timed out".to_string(),
-                    },
+                    &route_bounded_body_timeout_error(Some(ctx.storage_route_admission())),
                     &wire_ids,
                 );
             }
@@ -5206,6 +5263,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn streaming_body_frame_timeout_uses_captured_route_deadline() {
+        let tmp = test_util::tempdir();
+        let cluster = open_test_storage_cluster(tmp.path(), &[0]);
+        let handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+        let admission = storage::clock::with_time_override(1_000, || {
+            cluster
+                .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
+            handle.admit_current_route().unwrap()
+        });
+
+        storage::clock::with_time_override(2_000, || {
+            assert_eq!(
+                route_bounded_body_frame_timeout(Some(&admission), Duration::from_secs(30))
+                    .unwrap(),
+                Duration::from_secs(3)
+            );
+        });
+        storage::clock::with_time_override(5_000, || {
+            assert!(matches!(
+                route_bounded_body_frame_timeout(Some(&admission), Duration::from_secs(30)),
+                Err(ServerError::OperationAborted)
+            ));
+        });
+    }
+
     /// Build a minimal `http::request::Parts` for testing `is_streaming_write`.
     fn make_parts(method: &str, uri: &str, headers: &[(&str, &str)]) -> http::request::Parts {
         let mut builder = http::Request::builder().method(method).uri(uri);
@@ -5671,6 +5754,679 @@ Connection: close\r\n\r\n",
         .expect("runtime-map publication should finish after the request disconnects")
         .unwrap();
         assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_streaming_put_route_releases_publication_before_client_disconnects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let tmp = test_util::tempdir();
+        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
+        create_test_bucket(&frontend, "route-expiry-bucket");
+        initial.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(
+                storage::clock::current_time_millis().saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+        let config = ServeConfig {
+            body_idle_timeout: Duration::from_secs(60),
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 1).await;
+
+        let payload = vec![b'r'; crate::coordinator::INTERNAL_SEGMENT_SIZE + 1024];
+        let signed = sign_headers("PUT", "/route-expiry-bucket/key", &addr, &payload, &[]);
+        let request = format!(
+            "PUT /route-expiry-bucket/key HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n",
+            signed.authorization,
+            signed.amz_date,
+            signed.amz_content_sha256,
+            payload.len()
+        );
+        let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        client.write_all(request.as_bytes()).await.unwrap();
+        client
+            .write_all(&payload[..crate::coordinator::INTERNAL_SEGMENT_SIZE + 1])
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let admitted_handle = storage_handle.clone();
+        tokio::task::spawn_blocking(move || {
+            admitted_handle.test_wait_until_route_request_is_admitted();
+        })
+        .await
+        .unwrap();
+
+        let session = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(session) = initial
+                    .list_stream_upload_sessions_best_effort()
+                    .into_iter()
+                    .find(|session| {
+                        session.bucket.as_str() == "route-expiry-bucket"
+                            && session.key.as_str() == "key"
+                    })
+                {
+                    if initial
+                        .test_list_stream_segments(
+                            &session.bucket,
+                            &session.key,
+                            &session.session_id,
+                        )
+                        .is_ok_and(|segments| !segments.is_empty())
+                    {
+                        break session;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("streaming PUT must promote and publish a staged segment before expiry");
+        let staged_segments = initial
+            .test_list_stream_segments(&session.bucket, &session.key, &session.session_id)
+            .unwrap();
+        assert!(!staged_segments.is_empty());
+        assert!(initial
+            .test_object_generation_reservation_for(
+                &session.bucket,
+                &session.key,
+                &session.session_id,
+            )
+            .is_ok());
+
+        let candidate = open_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
+        candidate.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(
+                storage::clock::current_time_millis().saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+        let install_handle = storage_handle.clone();
+        let installed_candidate = Arc::clone(&candidate);
+        let installer = std::thread::spawn(move || {
+            install_handle.install(installed_candidate).unwrap();
+        });
+
+        let pending_handle = storage_handle.clone();
+        tokio::task::spawn_blocking(move || {
+            pending_handle.test_wait_until_route_publication_is_pending();
+        })
+        .await
+        .unwrap();
+        initial.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(storage::clock::current_time_millis()).unwrap(),
+        );
+        client
+            .write_all(&payload[crate::coordinator::INTERNAL_SEGMENT_SIZE + 1..][..1])
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || installer.join().unwrap()),
+        )
+        .await
+        .expect("route expiry should release publication while the client remains connected")
+        .unwrap();
+        assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
+        assert!(initial
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .all(|candidate| candidate.session_id != session.session_id));
+        assert!(matches!(
+            initial.test_object_generation_reservation_for(
+                &session.bucket,
+                &session.key,
+                &session.session_id,
+            ),
+            Err(storage::ObjectPgActionError::Metadata(
+                storage::MetadataError::ObjectGenerationReservationNotFound { .. }
+            ))
+        ));
+        for segment in &staged_segments {
+            let ec = storage::EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            };
+            for shard_index in 0..(ec.k + ec.m) {
+                assert!(!initial
+                    .test_payload_shard_file_exists(
+                        segment.data_pg_id,
+                        ec,
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                        shard_index,
+                    )
+                    .unwrap());
+            }
+        }
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .expect("expired streaming request should receive a response")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(
+            response.contains("<Code>OperationAborted</Code>"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_and_upload_part_acquire_cleanup_authority_before_creating_sessions() {
+        let tmp = test_util::tempdir();
+        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let frontend = setup_frontend_with_storage_handle(storage_handle);
+        create_test_bucket(&frontend, "post-cleanup-authority-bucket");
+        initial.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(
+                storage::clock::current_time_millis().saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+
+        let expire = Arc::clone(&initial);
+        let hook = initial.test_install_before_retained_stream_cleanup_capability_hook(Arc::new(
+            move || {
+                expire.test_store_route_map_validity(
+                    storage::RouteMapValidity::until_ms(storage::clock::current_time_millis())
+                        .unwrap(),
+                );
+            },
+        ));
+        let request = make_s3req(
+            "POST",
+            "/post-cleanup-authority-bucket",
+            &[("host", "localhost")],
+        );
+        let fields = sign_post_policy_fields("post-cleanup-authority-bucket", "key", &[], &[]);
+        assert!(matches!(
+            frontend.prepare_streaming_post_object(
+                &request,
+                "post-cleanup-authority-bucket",
+                &fields,
+                Some("upload.txt"),
+            ),
+            Err(ServerError::OperationAborted)
+        ));
+        drop(hook);
+        assert!(initial.list_stream_upload_sessions_best_effort().is_empty());
+
+        initial.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(
+                storage::clock::current_time_millis().saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+        let upload_id =
+            create_test_bucket_and_upload(&frontend, "part-cleanup-authority-bucket", "key");
+        let expire = Arc::clone(&initial);
+        let hook = initial.test_install_before_retained_stream_cleanup_capability_hook(Arc::new(
+            move || {
+                expire.test_store_route_map_validity(
+                    storage::RouteMapValidity::until_ms(storage::clock::current_time_millis())
+                        .unwrap(),
+                );
+            },
+        ));
+        let uri = format!("/part-cleanup-authority-bucket/key?partNumber=1&uploadId={upload_id}");
+        let signed = sign_headers("PUT", &uri, "localhost", b"", &[]);
+        let request = make_s3req(
+            "PUT",
+            &uri,
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+            ],
+        );
+        assert!(matches!(
+            frontend.prepare_streaming_part(
+                &request,
+                "part-cleanup-authority-bucket",
+                "key",
+                &upload_id,
+                "1",
+            ),
+            Err(ServerError::OperationAborted)
+        ));
+        drop(hook);
+        assert!(initial.list_stream_upload_sessions_best_effort().is_empty());
+    }
+
+    #[test]
+    fn captured_admission_guards_put_post_and_upload_part_initial_mutations() {
+        let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let storage_cluster = frontend.coordinator.storage_node_for_request();
+
+        create_test_bucket(&frontend, "initial-mutation-post-bucket");
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
+        let renewed = Arc::clone(&storage_cluster);
+        let hook_clock = Arc::clone(&clock);
+        let hook = storage_cluster.test_install_after_retained_stream_cleanup_capability_hook(
+            Arc::new(move || {
+                renewed.test_store_route_map_validity(
+                    storage::RouteMapValidity::until_ms(5_000).unwrap(),
+                );
+                hook_clock.set(2_000);
+            }),
+        );
+        let post_request = make_s3req(
+            "POST",
+            "/initial-mutation-post-bucket",
+            &[("host", "localhost")],
+        );
+        let fields = sign_post_policy_fields("initial-mutation-post-bucket", "key", &[], &[]);
+        assert!(matches!(
+            frontend.prepare_streaming_post_object(
+                &post_request,
+                "initial-mutation-post-bucket",
+                &fields,
+                Some("key"),
+            ),
+            Err(ServerError::OperationAborted)
+        ));
+        assert!(frontend
+            .coordinator
+            .admit_storage_route_for_request()
+            .is_ok());
+        drop(hook);
+        assert!(storage_cluster
+            .list_stream_upload_sessions_best_effort()
+            .is_empty());
+
+        clock.set(1_000);
+        create_test_bucket(&frontend, "initial-mutation-put-bucket");
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
+        let renewed = Arc::clone(&storage_cluster);
+        let hook_clock = Arc::clone(&clock);
+        let hook = storage_cluster.test_install_after_retained_stream_cleanup_capability_hook(
+            Arc::new(move || {
+                renewed.test_store_route_map_validity(
+                    storage::RouteMapValidity::until_ms(5_000).unwrap(),
+                );
+                hook_clock.set(2_000);
+            }),
+        );
+        let put_body = b"body";
+        let signed = sign_headers(
+            "PUT",
+            "/initial-mutation-put-bucket/key",
+            "localhost",
+            put_body,
+            &[],
+        );
+        let content_length = put_body.len().to_string();
+        let put_request = make_s3req(
+            "PUT",
+            "/initial-mutation-put-bucket/key",
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+                ("content-length", &content_length),
+            ],
+        );
+        assert!(matches!(
+            frontend.prepare_streaming_put(
+                &put_request,
+                "initial-mutation-put-bucket",
+                "key",
+                false,
+            ),
+            Err(ServerError::OperationAborted)
+        ));
+        assert!(frontend
+            .coordinator
+            .admit_storage_route_for_request()
+            .is_ok());
+        drop(hook);
+        assert!(storage_cluster
+            .list_stream_upload_sessions_best_effort()
+            .is_empty());
+
+        clock.set(1_000);
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
+        let upload_id =
+            create_test_bucket_and_upload(&frontend, "initial-mutation-part-bucket", "key");
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
+        let renewed = Arc::clone(&storage_cluster);
+        let hook_clock = Arc::clone(&clock);
+        let hook = storage_cluster.test_install_after_retained_stream_cleanup_capability_hook(
+            Arc::new(move || {
+                renewed.test_store_route_map_validity(
+                    storage::RouteMapValidity::until_ms(5_000).unwrap(),
+                );
+                hook_clock.set(2_000);
+            }),
+        );
+        let uri = format!("/initial-mutation-part-bucket/key?partNumber=1&uploadId={upload_id}");
+        let signed = sign_headers("PUT", &uri, "localhost", b"", &[]);
+        let part_request = make_s3req(
+            "PUT",
+            &uri,
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+            ],
+        );
+        assert!(matches!(
+            frontend.prepare_streaming_part(
+                &part_request,
+                "initial-mutation-part-bucket",
+                "key",
+                &upload_id,
+                "1",
+            ),
+            Err(ServerError::OperationAborted)
+        ));
+        assert!(frontend
+            .coordinator
+            .admit_storage_route_for_request()
+            .is_ok());
+        drop(hook);
+        assert!(storage_cluster
+            .list_stream_upload_sessions_best_effort()
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_promoted_post_cleanup_handoff_does_not_block_route_publication() {
+        let tmp = test_util::tempdir();
+        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
+        create_test_bucket(&frontend, "post-route-expiry-bucket");
+        initial.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(
+                storage::clock::current_time_millis().saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+        let request = make_s3req(
+            "POST",
+            "/post-route-expiry-bucket",
+            &[("host", "localhost")],
+        );
+        let fields = sign_post_policy_fields("post-route-expiry-bucket", "key", &[], &[]);
+        let ctx = Arc::new(
+            frontend
+                .prepare_streaming_post_object(
+                    &request,
+                    "post-route-expiry-bucket",
+                    &fields,
+                    Some("upload.txt"),
+                )
+                .unwrap(),
+        );
+        frontend
+            .streaming_append_post_segment(&ctx, 0, b"promoted POST payload")
+            .unwrap();
+        let session_id = ctx.session_id().clone();
+        let bucket = ctx.bucket().clone();
+        let key = ctx.key().clone();
+        let staged_segments = initial
+            .test_list_stream_segments(&bucket, &key, &session_id)
+            .unwrap();
+        assert!(!staged_segments.is_empty());
+        let cleanup_after = initial
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .and_then(|session| session.cleanup_after)
+            .expect("HTTP stream creation must persist its route cleanup deadline");
+
+        let state = Arc::new(ServerState {
+            pool: vec![Arc::clone(&frontend)],
+            host_id: frontend.host_id.clone(),
+            counter: AtomicUsize::new(0),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            segment_buffer_pool: SegmentBufferPool::new(8),
+            config: ServeConfig::default(),
+        });
+        let abort_guard = StreamingAbortGuard::new(&state);
+        abort_guard.arm_post(&ctx);
+        let retained_abort_failure =
+            initial.test_install_before_retained_stream_abort_hook(Arc::new(|| {
+                Err(storage::ObjectPgActionError::Store(
+                    storage::StoreError::MetadataCommandContention {
+                        context: "test retained cleanup handoff",
+                    },
+                ))
+            }));
+
+        let candidate = open_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
+        candidate.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(
+                storage::clock::current_time_millis().saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+        let install_handle = storage_handle.clone();
+        let installed_candidate = Arc::clone(&candidate);
+        let installer = std::thread::spawn(move || {
+            install_handle.install(installed_candidate).unwrap();
+        });
+        let pending_handle = storage_handle.clone();
+        tokio::task::spawn_blocking(move || {
+            pending_handle.test_wait_until_route_publication_is_pending();
+        })
+        .await
+        .unwrap();
+        initial.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(storage::clock::current_time_millis()).unwrap(),
+        );
+        drop(ctx);
+        drop(abort_guard);
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || installer.join().unwrap()),
+        )
+        .await
+        .expect("durable POST cleanup handoff and sleeping heartbeat must release publication")
+        .unwrap();
+        assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
+        assert!(initial
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .any(|session| session.session_id == session_id));
+        drop(retained_abort_failure);
+        storage::clock::with_time_override(cleanup_after, || {
+            initial.test_store_route_map_validity(
+                storage::RouteMapValidity::until_ms(cleanup_after.saturating_add(1_000)).unwrap(),
+            );
+            assert_eq!(
+                initial.scavenge_abandoned_stream_sessions(60_000),
+                1,
+                "the durable deadline must let independent current-route cleanup finish"
+            );
+        });
+        assert!(initial
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .all(|session| session.session_id != session_id));
+        assert!(matches!(
+            initial.test_object_generation_reservation_for(&bucket, &key, &session_id),
+            Err(storage::ObjectPgActionError::Metadata(
+                storage::MetadataError::ObjectGenerationReservationNotFound { .. }
+            ))
+        ));
+        assert_staged_stream_shards_absent(&initial, &staged_segments);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_promoted_upload_part_cleanup_handoff_does_not_block_publication() {
+        let tmp = test_util::tempdir();
+        let initial = open_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let storage_handle = storage::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+        let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
+        let upload_id = create_test_bucket_and_upload(&frontend, "part-route-expiry-bucket", "key");
+        initial.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(
+                storage::clock::current_time_millis().saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+        let uri = format!("/part-route-expiry-bucket/key?partNumber=1&uploadId={upload_id}");
+        let signed = sign_headers("PUT", &uri, "localhost", b"", &[]);
+        let request = make_s3req(
+            "PUT",
+            &uri,
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+            ],
+        );
+        let ctx = Arc::new(
+            frontend
+                .prepare_streaming_part(
+                    &request,
+                    "part-route-expiry-bucket",
+                    "key",
+                    &upload_id,
+                    "1",
+                )
+                .unwrap(),
+        );
+        frontend
+            .streaming_append_part_segment(&ctx, 0, b"promoted UploadPart payload")
+            .unwrap();
+        let session_id = ctx.session_id().clone();
+        let bucket = ctx.bucket().clone();
+        let key = ctx.key().clone();
+        let staged_segments = initial
+            .test_list_stream_segments(&bucket, &key, &session_id)
+            .unwrap();
+        assert!(!staged_segments.is_empty());
+        let cleanup_after = initial
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .and_then(|session| session.cleanup_after)
+            .expect("UploadPart stream creation must persist its route cleanup deadline");
+
+        let state = Arc::new(ServerState {
+            pool: vec![Arc::clone(&frontend)],
+            host_id: frontend.host_id.clone(),
+            counter: AtomicUsize::new(0),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            segment_buffer_pool: SegmentBufferPool::new(8),
+            config: ServeConfig::default(),
+        });
+        let abort_guard = StreamingAbortGuard::new(&state);
+        abort_guard.arm_part(&ctx);
+        let retained_abort_failure =
+            initial.test_install_before_retained_stream_abort_hook(Arc::new(|| {
+                Err(storage::ObjectPgActionError::Store(
+                    storage::StoreError::MetadataCommandContention {
+                        context: "test retained UploadPart cleanup handoff",
+                    },
+                ))
+            }));
+
+        let candidate = open_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
+        candidate.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(
+                storage::clock::current_time_millis().saturating_add(3_600_000),
+            )
+            .unwrap(),
+        );
+        let install_handle = storage_handle.clone();
+        let installed_candidate = Arc::clone(&candidate);
+        let installer = std::thread::spawn(move || {
+            install_handle.install(installed_candidate).unwrap();
+        });
+        let pending_handle = storage_handle.clone();
+        tokio::task::spawn_blocking(move || {
+            pending_handle.test_wait_until_route_publication_is_pending();
+        })
+        .await
+        .unwrap();
+        initial.test_store_route_map_validity(
+            storage::RouteMapValidity::until_ms(storage::clock::current_time_millis()).unwrap(),
+        );
+        drop(ctx);
+        drop(abort_guard);
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::task::spawn_blocking(move || installer.join().unwrap()),
+        )
+        .await
+        .expect("durable UploadPart cleanup handoff must release route publication")
+        .unwrap();
+        assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
+        assert!(initial
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .any(|session| session.session_id == session_id));
+        drop(retained_abort_failure);
+        storage::clock::with_time_override(cleanup_after, || {
+            initial.test_store_route_map_validity(
+                storage::RouteMapValidity::until_ms(cleanup_after.saturating_add(1_000)).unwrap(),
+            );
+            assert_eq!(
+                initial.scavenge_abandoned_stream_sessions(60_000),
+                1,
+                "the durable deadline must independently clean UploadPart state"
+            );
+        });
+        assert!(initial
+            .list_stream_upload_sessions_best_effort()
+            .into_iter()
+            .all(|session| session.session_id != session_id));
+        assert_staged_stream_shards_absent(&initial, &staged_segments);
+    }
+
+    fn assert_staged_stream_shards_absent(
+        cluster: &storage::StorageCluster,
+        segments: &[storage::StreamUploadSegmentRecord],
+    ) {
+        for segment in segments {
+            let ec = storage::EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            };
+            for shard_index in 0..(ec.k + ec.m) {
+                assert!(!cluster
+                    .test_payload_shard_file_exists(
+                        segment.data_pg_id,
+                        ec,
+                        &segment.segment_okh,
+                        segment.segment_vid,
+                        shard_index,
+                    )
+                    .unwrap());
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8382,6 +9138,185 @@ Connection: close\r\n\r\n",
             0,
             "streaming PUT abort guard left a durable stream session behind"
         );
+    }
+
+    #[test]
+    fn same_epoch_renewal_does_not_extend_streaming_put_effect_authority() {
+        let clock = storage::clock::test_time_override_guard(1_000);
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "captured-stream-effect-deadline");
+        let storage_cluster = frontend.coordinator.storage_node_for_request();
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
+
+        let body = b"body completed before captured route expiry";
+        let signed = sign_headers(
+            "PUT",
+            "/captured-stream-effect-deadline/key",
+            "localhost",
+            body,
+            &[],
+        );
+        let content_length = body.len().to_string();
+        let req = make_s3req(
+            "PUT",
+            "/captured-stream-effect-deadline/key",
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+                ("content-length", &content_length),
+            ],
+        );
+        let ctx = frontend
+            .prepare_streaming_put(&req, "captured-stream-effect-deadline", "key", false)
+            .unwrap();
+        let session_id = frontend.start_streaming_put_session(&ctx).unwrap();
+        frontend
+            .streaming_append_segment(&ctx, &session_id, 0, body)
+            .unwrap();
+
+        // Renew the raw runtime-map generation before advancing beyond the
+        // request's immutable captured deadline. The completed body must not
+        // be committed through the renewed lease.
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
+        clock.set(2_000);
+
+        assert!(matches!(
+            frontend.heartbeat_streaming_put_object(&ctx, &session_id),
+            Err(ServerError::OperationAborted)
+        ));
+        assert!(matches!(
+            frontend.streaming_append_segment(&ctx, &session_id, 1, b"late"),
+            Err(ServerError::OperationAborted)
+        ));
+        assert!(matches!(
+            frontend.put_single_segment_object(&ctx, body, &[]),
+            Err(ServerError::OperationAborted)
+        ));
+        assert!(matches!(
+            frontend.finalize_streaming_put(
+                &ctx,
+                &session_id,
+                checksum::crc64::checksum(body),
+                body.len() as u64,
+                &[],
+            ),
+            Err(ServerError::OperationAborted)
+        ));
+        assert!(storage_cluster
+            .load_stream_upload_session(ctx.bucket(), ctx.key(), &session_id,)
+            .is_ok());
+
+        frontend.abort_streaming_put(&ctx, &session_id);
+        assert!(matches!(
+            storage_cluster.load_stream_upload_session(ctx.bucket(), ctx.key(), &session_id),
+            Err(storage::ObjectPgActionError::Metadata(
+                storage::MetadataError::StreamSessionNotFound { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn same_epoch_renewal_does_not_extend_post_or_upload_part_effect_authority() {
+        let clock = storage::clock::test_time_override_guard(1_000);
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "captured-post-effect-deadline");
+        let storage_cluster = frontend.coordinator.storage_node_for_request();
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
+
+        let post_body = b"POST body completed before captured route expiry";
+        let post_req = make_s3req(
+            "POST",
+            "/captured-post-effect-deadline",
+            &[("host", "localhost")],
+        );
+        let fields = sign_post_policy_fields("captured-post-effect-deadline", "key", &[], &[]);
+        let post_ctx = frontend
+            .prepare_streaming_post_object(
+                &post_req,
+                "captured-post-effect-deadline",
+                &fields,
+                Some("upload.txt"),
+            )
+            .unwrap();
+        frontend
+            .streaming_append_post_segment(&post_ctx, 0, post_body)
+            .unwrap();
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
+        clock.set(2_000);
+
+        assert!(matches!(
+            frontend.streaming_append_post_segment(&post_ctx, 1, b"late"),
+            Err(ServerError::OperationAborted)
+        ));
+        assert!(matches!(
+            frontend.finalize_streaming_post_object(
+                &post_ctx,
+                checksum::crc64::checksum(post_body),
+                post_body.len() as u64,
+                None,
+            ),
+            Err(ServerError::OperationAborted)
+        ));
+        frontend.abort_streaming_post_object(&post_ctx);
+        drop(post_ctx);
+
+        clock.set(1_000);
+        let upload_id =
+            create_test_bucket_and_upload(&frontend, "captured-part-effect-deadline", "key");
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
+        let part_body = b"UploadPart body completed before captured route expiry";
+        let uri = format!("/captured-part-effect-deadline/key?partNumber=1&uploadId={upload_id}");
+        let signed = sign_headers("PUT", &uri, "localhost", part_body, &[]);
+        let part_req = make_s3req(
+            "PUT",
+            &uri,
+            &[
+                ("host", "localhost"),
+                ("authorization", &signed.authorization),
+                ("x-amz-date", &signed.amz_date),
+                ("x-amz-content-sha256", &signed.amz_content_sha256),
+            ],
+        );
+        let part_ctx = frontend
+            .prepare_streaming_part(
+                &part_req,
+                "captured-part-effect-deadline",
+                "key",
+                &upload_id,
+                "1",
+            )
+            .unwrap();
+        frontend
+            .streaming_append_part_segment(&part_ctx, 0, part_body)
+            .unwrap();
+        storage_cluster
+            .test_store_route_map_validity(storage::RouteMapValidity::until_ms(5_000).unwrap());
+        clock.set(2_000);
+
+        assert!(matches!(
+            frontend.streaming_append_part_segment(&part_ctx, 1, b"late"),
+            Err(ServerError::OperationAborted)
+        ));
+        assert!(matches!(
+            frontend.finalize_streaming_part(
+                &part_ctx,
+                checksum::crc64::checksum(part_body),
+                part_body.len() as u64,
+                &[],
+                None,
+            ),
+            Err(ServerError::OperationAborted)
+        ));
+        frontend.abort_streaming_part(&part_ctx);
     }
 
     #[tokio::test(flavor = "multi_thread")]

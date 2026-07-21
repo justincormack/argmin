@@ -2080,27 +2080,26 @@ fn emit_shard_backfill_event(
 
 impl StreamSessionSweeper {
     pub(super) fn acquire_shared(
-        storage_cluster: &Arc<StorageCluster>,
+        storage_handle: &StorageClusterRuntimeMapHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = STREAM_SESSION_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<StreamSessionSweeper>>> =
             lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
-        let key = storage_cluster.process_local_registry_key();
+        let key = storage_handle.current().process_local_registry_key();
         if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
             return Ok(existing);
         }
 
-        let sweeper = Self::spawn(Arc::clone(storage_cluster))?;
+        let sweeper = Self::spawn(storage_handle.clone())?;
         registry.insert(key, Arc::downgrade(&sweeper));
         Ok(sweeper)
     }
 
-    fn spawn(storage_cluster: Arc<StorageCluster>) -> Result<Arc<Self>, ServerError> {
+    fn spawn(storage_handle: StorageClusterRuntimeMapHandle) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
-        let admission = background_work_admission_for(&storage_cluster);
         let sweeper = Arc::new(Self {
             stop: Arc::clone(&stop),
             wake: Arc::clone(&wake),
@@ -2110,6 +2109,8 @@ impl StreamSessionSweeper {
             .name("argmin-stream-session-sweeper".to_string())
             .spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
+                    let storage_cluster = storage_handle.current();
+                    let admission = background_work_admission_for(&storage_cluster);
                     if let Some(_permit) =
                         admission.try_acquire(BackgroundWorkClass::StreamSessionCleanup)
                     {

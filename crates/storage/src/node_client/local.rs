@@ -1,4 +1,5 @@
 use super::*;
+use crate::metadata_command::AbortStreamUploadCommand;
 use crate::BucketAclSummary;
 
 struct LocalObjectPayloadLease {
@@ -1160,6 +1161,77 @@ impl DirectPutMetadataNodeClient for LocalStorageNodeClient {
 }
 
 impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
+    fn prepare_retained_stream_upload_abort(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        let raw_pg_id = pg_id.pg_id();
+        if let Some(pending) =
+            <Self as MetadataCommandNodeClient>::pending_metadata_command_envelope(
+                self,
+                raw_pg_id,
+                cluster_epoch,
+            )?
+        {
+            return match pending.payload() {
+                MetadataCommandPayload::AbortStreamUpload(abort)
+                    if abort.bucket == *bucket
+                        && abort.key == *key
+                        && abort.session_id == *session_id =>
+                {
+                    Ok(Some(pending))
+                }
+                _ => Err(ObjectPgActionError::Store(
+                    StoreError::MetadataCommandContention {
+                        context: "retained stream abort found an unrelated pending command",
+                    },
+                )),
+            };
+        }
+
+        let stream_session = match <Self as StorageNodeClient>::load_stream_upload_session(
+            self, pg_id, bucket, key, session_id,
+        ) {
+            Ok(session) => session,
+            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let staged_segments = <Self as StorageNodeClient>::load_stream_upload_segments(
+            self, pg_id, bucket, key, session_id,
+        )?;
+        let command_id = <Self as MetadataCommandNodeClient>::next_metadata_command_id_at_least(
+            self,
+            raw_pg_id,
+            cluster_epoch,
+            MetadataCommandLogIndex::new(1).expect("metadata command log index starts at one"),
+        )?;
+        let command = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: session_id.clone(),
+                staged_segments,
+                stream_create_bucket_write_reservation: stream_session
+                    .bucket_write_reservation
+                    .clone(),
+            })),
+        );
+        <Self as MetadataCommandNodeClient>::try_insert_pending_metadata_command_slot(
+            self,
+            raw_pg_id,
+            &command,
+            Some(bucket),
+        )?;
+        Ok(Some(command))
+    }
+
     fn load_put_object_metadata_snapshot(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2992,9 +3064,10 @@ impl StorageNodeClient for LocalStorageNodeClient {
         Ok(MetadataCommandEnvelope::new(
             command_id,
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                     request.request.clone(),
                     crate::clock::current_time_millis(),
+                    request.cleanup_after,
                     request.bucket_write_reservation.clone(),
                 ),
             )),

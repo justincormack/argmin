@@ -1296,6 +1296,92 @@ Twenty-third Phase 3 slice:
   wrong-PG regressions, workspace-wide checks and strict Clippy, and the full
   parallel workspace suite (7,327 tests).
 
+Twenty-fourth Phase 3 slice:
+
+- security review found that the frontend publication barrier's lifetime was
+  still controlled by a streaming client's body duration. PUT, POST Object,
+  and UploadPart held their route admission through a per-frame idle timeout,
+  so a write-authorized client could trickle frames indefinitely. Once a
+  replacement entered `Draining`, that one request also blocked every later
+  route admission.
+- streaming body waits are now bounded by both the configured per-frame idle
+  timeout and the admission's captured process-monotonic route deadline. The
+  captured deadline is not extended by same-generation lease renewal. Route
+  expiry returns `OperationAborted` and makes one prompt retained cleanup
+  attempt through an explicit non-cloneable capability narrowed to the
+  admitted object. It may prepare and replicate only the exact
+  `AbortStreamUpload` command, release its retained bucket-write proof, delete
+  its staged shards and acknowledgements, and remove the exact pending slot.
+  Local and Unix clients use dedicated retained abort RPC kinds; storage-node
+  decoding revalidates the old active route, primary/acting-set role, object
+  placement, command epoch, and exact abort payload.
+- review showed that retrying retained cleanup indefinitely while keeping the
+  frontend admission alive merely recreated the publication stall when an old
+  acting-set node was unavailable. Every frontend-created PUT, POST Object,
+  and UploadPart stream session now persists the admission's immutable
+  authority deadline as its replicated durable cleanup handoff. POST Object
+  and UploadPart derive cleanup authority before their first durable stream
+  mutation; PUT derives it before authorization and reservation preparation.
+  All three initial prepare/begin calls now require the captured admission and
+  revalidate it immediately before accessing storage. If the
+  prompt retained abort fails, the request drops its route admission and the
+  stream-session sweeper resumes cleanup independently once the durable
+  deadline is due. The sweeper follows the current runtime-map handle on every
+  pass rather than retaining the expired map, and deadline cleanup covers both
+  PutObject and UploadPart sessions. Command, storage-RPC, and canonical-state
+  encoding versions advance to 3 for the new durable field; the lightweight
+  command-log header decoder also skips the field so an applied create command
+  can prove and remove its exact pending slot.
+- promoted PUT and POST heartbeat workers now retain only weak context
+  references while sleeping. They can no longer keep route admission alive
+  for the production ten-second heartbeat interval after the handler and its
+  cleanup worker have dropped their context.
+- streamed PUT, POST Object, and UploadPart now carry the captured admission
+  into capability-bearing coordinator effect APIs. Initial write preparation,
+  session creation, every append, direct PUT commit, heartbeat, and stream
+  finalization revalidate the
+  immutable admission immediately before dispatch through its captured
+  runtime-map generation; pairing it with another generation fails closed.
+  Same-epoch renewal regressions complete the body before expiry, renew the
+  raw generation, advance through the captured deadline, and prove that late
+  append, commit, heartbeat, and finalization return `OperationAborted` while
+  leaving the durable session available for cleanup.
+- runtime-map installation now revalidates a bounded candidate after admitted
+  requests have drained and after acquiring the current-map and generation
+  locks, immediately before any pinned-generation lease or current-map
+  mutation. A candidate that expired during the drain is rejected, the old map
+  remains installed, the publication guard reopens admission, and the refresh
+  loop reports a distinct `expired_route_map_validity` failure.
+- deterministic storage tests pin the captured remaining lifetime and pause
+  installation after drain while advancing the installer thread's clock,
+  proving an expired candidate cannot mutate current state. HTTP coverage
+  proves an authenticated streaming PUT blocks publication while its route is
+  valid, promotes beyond the single-segment buffer, then route expiry removes
+  its durable session, generation reservation, staged metadata, shard files,
+  and acknowledgements before publishing the replacement while the client
+  connection remains open. Matching promoted POST Object and UploadPart
+  regressions pin retained cleanup; the POST case also proves its sleeping
+  heartbeat does not retain admission. Failure-injection cases prove a failed
+  prompt abort releases publication while the durable session remains, then
+  deadline cleanup removes its metadata, reservation, acknowledgements, and
+  shards. A same-store runtime-map refresh regression proves the background
+  sweeper cleans through the newly published map. Capability-before-mutation
+  hooks prove PUT, POST Object, and UploadPart cannot prepare a write or create
+  a session when same-epoch renewal keeps the raw cluster live but the
+  captured admission expires after cleanup authority has been derived. A
+  shared timeout helper gives PUT, POST Object, and UploadPart the same
+  deadline behavior.
+- direct-install and background-refresh fixtures now bind candidates to valid
+  local deadlines. The background fixture uses current authority time because
+  caller-thread test-clock overrides are intentionally not inherited by the
+  refresh worker.
+- validation passed formatting, the storage boundary checker, workspace-wide
+  strict Clippy, and the focused initial-mutation and post-creation expiry
+  regressions for PUT, POST Object, and UploadPart. The full parallel suite
+  started 7,364 tests and reached the separately fixed conditional-delete race
+  failure before cancellation; the preceding slice's 7,363-test full run
+  remains clean.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

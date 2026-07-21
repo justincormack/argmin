@@ -76,7 +76,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 2;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 3;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(1);
@@ -637,6 +637,8 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandApplyAndRecord = 31,
     MetadataCommandRecoveryApplyAndRecord = 162,
     MetadataCommandRecoveryPendingSlotReplace = 163,
+    MetadataCommandRetainedAbortApply = 165,
+    MetadataCommandRetainedAbortFinish = 166,
     BucketHeadRaw = 32,
     BucketHeadInfo = 33,
     BucketCreateCommandBuild = 34,
@@ -684,6 +686,7 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectMultipartPartsList = 75,
     ObjectMultipartManagementLookup = 76,
     ObjectStreamUploadSessionLoad = 77,
+    ObjectStreamUploadRetainedAbortPrepare = 164,
     ObjectStreamUploadSegmentsLoad = 78,
     ObjectStreamSegmentAppendPrepare = 79,
     ObjectStreamUploadBucketWriteReservationUpdate = 84,
@@ -899,6 +902,12 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandRecoveryPendingSlotReplace => {
                 "metadata command recovery pending slot replace"
             }
+            Self::MetadataCommandRetainedAbortApply => {
+                "metadata command retained stream abort apply"
+            }
+            Self::MetadataCommandRetainedAbortFinish => {
+                "metadata command retained stream abort finish"
+            }
             Self::MetadataCommandPeeringReplayApplyAndRecord => {
                 "metadata command peering replay apply and record"
             }
@@ -967,6 +976,9 @@ impl StorageRpcMessageKind {
             Self::ObjectMultipartPartsList => "object multipart parts list",
             Self::ObjectMultipartManagementLookup => "object multipart management lookup",
             Self::ObjectStreamUploadSessionLoad => "object stream upload session load",
+            Self::ObjectStreamUploadRetainedAbortPrepare => {
+                "object stream upload retained abort prepare"
+            }
             Self::ObjectStreamUploadSegmentsLoad => "object stream upload segments load",
             Self::ObjectStreamSegmentAppendPrepare => "object stream segment append prepare",
             Self::ObjectStreamUploadBucketWriteReservationUpdate => {
@@ -1084,6 +1096,8 @@ impl StorageRpcMessageKind {
             31 => Ok(Self::MetadataCommandApplyAndRecord),
             162 => Ok(Self::MetadataCommandRecoveryApplyAndRecord),
             163 => Ok(Self::MetadataCommandRecoveryPendingSlotReplace),
+            165 => Ok(Self::MetadataCommandRetainedAbortApply),
+            166 => Ok(Self::MetadataCommandRetainedAbortFinish),
             32 => Ok(Self::BucketHeadRaw),
             33 => Ok(Self::BucketHeadInfo),
             34 => Ok(Self::BucketCreateCommandBuild),
@@ -1131,6 +1145,7 @@ impl StorageRpcMessageKind {
             75 => Ok(Self::ObjectMultipartPartsList),
             76 => Ok(Self::ObjectMultipartManagementLookup),
             77 => Ok(Self::ObjectStreamUploadSessionLoad),
+            164 => Ok(Self::ObjectStreamUploadRetainedAbortPrepare),
             78 => Ok(Self::ObjectStreamUploadSegmentsLoad),
             79 => Ok(Self::ObjectStreamSegmentAppendPrepare),
             84 => Ok(Self::ObjectStreamUploadBucketWriteReservationUpdate),
@@ -1981,6 +1996,7 @@ pub(crate) struct StorageRpcMultipartUploadMatchResponse {
 pub(crate) struct StorageRpcCreateStreamUploadCommandBuildRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) request: CreateStreamUploadReq,
+    pub(crate) cleanup_after: Option<u64>,
     pub(crate) precondition: StorageRpcCreateStreamUploadPrecondition,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
@@ -3620,6 +3636,8 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandAbandoned
         | StorageRpcMessageKind::MetadataCommandRecordAbandoned
         | StorageRpcMessageKind::MetadataCommandApplyAndRecord
+        | StorageRpcMessageKind::MetadataCommandRetainedAbortApply
+        | StorageRpcMessageKind::MetadataCommandRetainedAbortFinish
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord => {
             STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN
         }
@@ -3725,7 +3743,8 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad => {
             STORAGE_RPC_MAX_MULTIPART_ABORT_CLEANUP_REQUEST_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::ObjectStreamUploadSessionLoad => {
+        StorageRpcMessageKind::ObjectStreamUploadSessionLoad
+        | StorageRpcMessageKind::ObjectStreamUploadRetainedAbortPrepare => {
             STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate => {
@@ -5880,6 +5899,7 @@ pub(crate) fn encode_create_stream_upload_command_build_request(
     }
     let mut out = encode_object_request(&request.object);
     put_create_stream_upload_req(&mut out, &request.request);
+    put_optional_u64(&mut out, request.cleanup_after);
     put_create_stream_upload_precondition(&mut out, &request.precondition);
     put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
     Ok(out)
@@ -5891,6 +5911,7 @@ pub(crate) fn decode_create_stream_upload_command_build_request(
     let mut decoder = StorageRpcDecoder::new(bytes);
     let object = decoder.read_rpc_object_request()?;
     let request = decoder.read_create_stream_upload_req()?;
+    let cleanup_after = decoder.read_optional_u64()?;
     let precondition = decoder.read_create_stream_upload_precondition()?;
     let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
     decoder.finish()?;
@@ -5904,6 +5925,7 @@ pub(crate) fn decode_create_stream_upload_command_build_request(
     Ok(StorageRpcCreateStreamUploadCommandBuildRequest {
         object,
         request,
+        cleanup_after,
         precondition,
         bucket_write_reservation,
     })
@@ -14051,6 +14073,7 @@ impl<'a> StorageRpcDecoder<'a> {
                     "invalid initial stream segment generation",
                 ),
             )?,
+            cleanup_after: self.read_optional_u64()?,
             bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
         })
     }
@@ -14267,6 +14290,7 @@ impl<'a> StorageRpcDecoder<'a> {
                 StorageRpcPayloadError::InvalidObjectMetadataRequest("invalid stream upload state"),
             )?,
             created_at: self.read_u64()?,
+            cleanup_after: self.read_optional_u64()?,
             encryption: self.read_object_encryption()?,
             next_segment_vid: self.read_generation_id()?,
             bucket_write_reservation: self.read_optional_bucket_write_reservation_proof()?,
@@ -16252,6 +16276,7 @@ fn put_optional_create_stream_upload_command(
 fn put_create_stream_upload_command(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
     put_stream_upload_command_record(out, &command.session);
     put_u64(out, command.initial_next_segment_vid.get());
+    put_optional_u64(out, command.cleanup_after);
     put_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
@@ -16275,6 +16300,7 @@ fn put_stream_upload_record(out: &mut Vec<u8>, record: &StreamUploadRecord) {
     put_stream_upload_target(out, &record.target);
     put_u8(out, record.state as u8);
     put_u64(out, record.created_at);
+    put_optional_u64(out, record.cleanup_after);
     put_object_encryption(out, &record.encryption);
     put_u64(out, record.next_segment_vid.get());
     put_optional_bucket_write_reservation_proof(out, record.bucket_write_reservation.as_ref());
@@ -17284,7 +17310,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&2u16.to_le_bytes());
+        expected.extend_from_slice(&3u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -17295,15 +17321,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_one_fixture() {
+    fn storage_rpc_frame_rejects_version_two_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&2_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(1))
+            Err(StorageRpcFrameError::UnsupportedVersion(2))
         );
     }
 
@@ -17977,7 +18003,7 @@ mod tests {
             applied_log_index: 7,
             applied_log_hash: 0x1234,
             state_digest: 0x5678,
-            canonical_state_encoding_version: 2,
+            canonical_state_encoding_version: 3,
             table_digests: vec![MetadataCheckpointTableDigest {
                 table_name: "buckets".to_string(),
                 row_count: 1,
@@ -18038,27 +18064,27 @@ mod tests {
 
         assert_eq!(decoded, request.checkpoint);
 
-        let mut version_one_request = request.clone();
-        version_one_request
+        let mut version_two_request = request.clone();
+        version_two_request
             .checkpoint
-            .canonical_state_encoding_version = 1;
+            .canonical_state_encoding_version = 2;
         let bytes =
-            encode_metadata_command_transfer_checkpoint_base_request(&version_one_request).unwrap();
+            encode_metadata_command_transfer_checkpoint_base_request(&version_two_request).unwrap();
         assert_eq!(
             decode_metadata_command_transfer_checkpoint_base_request(&bytes),
             Err(
                 StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
-                    actual: 1,
+                    actual: 2,
                 }
             )
         );
         let bytes =
-            encode_metadata_command_checkpoint_payload(&version_one_request.checkpoint).unwrap();
+            encode_metadata_command_checkpoint_payload(&version_two_request.checkpoint).unwrap();
         assert_eq!(
             decode_metadata_command_checkpoint_payload(&bytes),
             Err(
                 StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
-                    actual: 1,
+                    actual: 2,
                 }
             )
         );

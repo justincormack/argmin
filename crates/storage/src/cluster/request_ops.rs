@@ -11063,6 +11063,22 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         request: BucketSnapshotRequest,
+        action: impl FnMut(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<(T, CreateStreamUploadReq), E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.create_put_object_stream_session_with_cleanup_deadline(
+            bucket, key, request, None, action,
+        )
+    }
+
+    pub fn create_put_object_stream_session_with_cleanup_deadline<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: BucketSnapshotRequest,
+        cleanup_after: Option<u64>,
         mut action: impl FnMut(
             BucketSnapshot,
             Option<StoredObject>,
@@ -11133,6 +11149,7 @@ impl super::StorageCluster {
                         pg_id: object_pg_id,
                         cluster_epoch: self.operation_epoch(),
                         request: &create,
+                        cleanup_after,
                         precondition: CreateStreamUploadPrecondition::PutObject {
                             expected_current: current_object.stored.as_ref(),
                             require_generation_reservation: true,
@@ -11188,10 +11205,22 @@ impl super::StorageCluster {
                 maybe_run_before_stream_put_create_pending_install_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                 );
-                if !self
+                let installed = match self
                     .try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command)
-                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                 {
+                    Ok(installed) => installed,
+                    Err(error) => {
+                        let _ = self.release_object_generation_reservation(
+                            bucket,
+                            key,
+                            &create.session_id,
+                        );
+                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                            error,
+                        ));
+                    }
+                };
+                if !installed {
                     let cleanup = self
                         .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
                         .and_then(|_| {
@@ -11740,6 +11769,15 @@ impl super::StorageCluster {
     pub fn begin_upload_part_stream_session<T, E>(
         &self,
         req: BeginUploadPartStreamSessionReq,
+        action: impl FnMut(&MultipartUploadRecord) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        self.begin_upload_part_stream_session_with_cleanup_deadline(req, None, action)
+    }
+
+    pub fn begin_upload_part_stream_session_with_cleanup_deadline<T, E>(
+        &self,
+        req: BeginUploadPartStreamSessionReq,
+        cleanup_after: Option<u64>,
         mut action: impl FnMut(
             &MultipartUploadRecord,
         ) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
@@ -11834,6 +11872,7 @@ impl super::StorageCluster {
                     pg_id: object_pg_id,
                     cluster_epoch: self.operation_epoch(),
                     request: &create,
+                    cleanup_after,
                     precondition: CreateStreamUploadPrecondition::UploadPart {
                         expected_upload: &upload,
                     },
@@ -11975,6 +12014,7 @@ impl super::StorageCluster {
                     pg_id: object_pg_id,
                     cluster_epoch: self.operation_epoch(),
                     request: &create,
+                    cleanup_after: None,
                     precondition: CreateStreamUploadPrecondition::UploadPart {
                         expected_upload: &upload,
                     },

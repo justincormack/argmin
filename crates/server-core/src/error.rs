@@ -896,6 +896,7 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
             _ => "shard_store_error",
         },
         StoreError::RouteMapExpired { .. } => "route_map_expired",
+        StoreError::RouteAdmissionClusterMismatch { .. } => "route_admission_cluster_mismatch",
         StoreError::StalePayloadOperation { .. } => "stale_payload_operation",
         StoreError::StaleMetadataPrimaryBridge { .. } => "stale_metadata_primary_bridge",
         StoreError::StaleMetadataOperation { .. } => "stale_metadata_operation",

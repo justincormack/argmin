@@ -2218,6 +2218,7 @@ impl PgStore {
         &self,
         session: &StreamUploadCommandRecord,
         initial_next_segment_vid: GenerationId,
+        cleanup_after: Option<u64>,
         bucket_write_reservation: Option<&BucketWriteReservationProof>,
     ) -> Result<(), MetadataError> {
         observability::trace_scope!(
@@ -2244,15 +2245,22 @@ impl PgStore {
         let operation_kind = bucket_write_reservation.map(|proof| proof.operation_kind.as_str());
         let created_at = bucket_write_reservation.map(|proof| proof.created_at as i64);
         let lease_deadline = bucket_write_reservation.map(|proof| proof.lease_deadline as i64);
+        let cleanup_after = cleanup_after
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|source| MetadataError::Db {
+                context: "create stream upload cleanup deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
         let target_context =
             bucket_write_reservation.and_then(|proof| proof.target_context.as_deref());
         self.conn
             .execute(
                 "INSERT INTO stream_uploads \
-                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state, next_segment_vid, \
+                 (session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, cleanup_after, encryption_type, encryption_state, next_segment_vid, \
                   bucket_write_reservation_id, bucket_write_owner_token, bucket_write_cluster_epoch, bucket_write_execution_generation, \
                   bucket_write_incarnation_generation, bucket_write_operation_kind, bucket_write_created_at, bucket_write_lease_deadline, bucket_write_target_context) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     session.session_id,
                     session.bucket,
@@ -2262,6 +2270,7 @@ impl PgStore {
                     part_number,
                     session.state as u8,
                     session.created_at as i64,
+                    cleanup_after,
                     encryption_type,
                     encryption_state,
                     initial_next_segment_vid.get() as i64,
@@ -2292,6 +2301,7 @@ impl PgStore {
             Ok(existing)
                 if StreamUploadCommandRecord::from(&existing) == command.session
                     && existing.next_segment_vid == command.initial_next_segment_vid
+                    && existing.cleanup_after == command.cleanup_after
                     && stream_upload_bucket_write_reservation_matches_command(
                         &existing, command,
                     ) =>
@@ -2309,6 +2319,7 @@ impl PgStore {
                 self.create_stream_upload_explicit(
                     &command.session,
                     command.initial_next_segment_vid,
+                    command.cleanup_after,
                     bucket_write_reservation,
                 )
             }
@@ -10868,7 +10879,7 @@ impl PgMetadataStore for PgStore {
             created_at: PgStore::now_millis(),
             encryption: req.encryption.clone(),
         };
-        self.create_stream_upload_explicit(&session, GenerationId::MIN, None)
+        self.create_stream_upload_explicit(&session, GenerationId::MIN, None, None)
     }
 
     fn get_stream_upload(

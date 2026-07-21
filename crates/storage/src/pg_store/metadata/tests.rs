@@ -4164,16 +4164,16 @@ fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
     assert_eq!(checkpoint.applied_log_index, state.applied_log_index);
     assert_eq!(checkpoint.applied_log_hash, state.applied_log_hash);
     assert_eq!(checkpoint.state_digest, state.state_digest);
-    assert_eq!(checkpoint.canonical_state_encoding_version, 2);
+    assert_eq!(checkpoint.canonical_state_encoding_version, 3);
     assert_eq!(checkpoint.table_digests.len(), METADATA_DIGEST_TABLES.len());
     assert_eq!(checkpoint.table_blocks.len(), METADATA_DIGEST_TABLES.len());
     assert_ne!(checkpoint.checkpoint_crc64, 0);
     checkpoint.verify().unwrap();
-    let mut version_one_checkpoint = checkpoint.clone();
-    version_one_checkpoint.canonical_state_encoding_version = 1;
+    let mut version_two_checkpoint = checkpoint.clone();
+    version_two_checkpoint.canonical_state_encoding_version = 2;
     assert_eq!(
-        version_one_checkpoint.verify(),
-        Err(MetadataCommandCheckpointValidationError::UnsupportedStateEncoding { actual: 1 })
+        version_two_checkpoint.verify(),
+        Err(MetadataCommandCheckpointValidationError::UnsupportedStateEncoding { actual: 2 })
     );
     assert_eq!(
         checkpoint
@@ -6249,6 +6249,7 @@ fn terminal_stream_upload_cleanup_record_excludes_allocator_floor() {
         },
         state: StreamUploadState::InProgress,
         created_at: 123,
+        cleanup_after: None,
         encryption: ObjectEncryption::None,
         next_segment_vid: GenerationId::new(2).unwrap(),
         bucket_write_reservation: None,
@@ -6285,6 +6286,7 @@ fn abort_multipart_command_accepts_lagging_stream_allocator_floor() {
         },
         state: StreamUploadState::InProgress,
         created_at: 456,
+        cleanup_after: None,
         encryption: ObjectEncryption::None,
         next_segment_vid: GenerationId::MIN,
         bucket_write_reservation: None,
@@ -6293,6 +6295,7 @@ fn abort_multipart_command_accepts_lagging_stream_allocator_floor() {
         .create_stream_upload_explicit(
             &StreamUploadCommandRecord::from(&session),
             session.next_segment_vid,
+            None,
             None,
         )
         .unwrap();

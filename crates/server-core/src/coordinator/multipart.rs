@@ -318,6 +318,16 @@ impl Coordinator {
         })
     }
 
+    pub fn append_stream_part_data_with_storage_admission(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: &AppendStreamPartRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.append_stream_part_data_with_storage_node(storage_node, req)
+    }
+
     /// Begin a streaming UploadPart session.
     ///
     /// Creates a `StreamUploadKind::UploadPart` session tied to the given
@@ -334,6 +344,15 @@ impl Coordinator {
         &self,
         storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &BeginStreamPartRequest<'_>,
+    ) -> Result<BeginStreamPartResult, ServerError> {
+        self.begin_stream_part_with_storage_node_and_cleanup_deadline(storage_node, req, None)
+    }
+
+    pub fn begin_stream_part_with_storage_node_and_cleanup_deadline(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: &BeginStreamPartRequest<'_>,
+        cleanup_after: Option<u64>,
     ) -> Result<BeginStreamPartResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -374,7 +393,7 @@ impl Coordinator {
                 }
                 proof_transferred_to_command = true;
                 storage_node
-                    .begin_upload_part_stream_session(
+                    .begin_upload_part_stream_session_with_cleanup_deadline(
                         storage::BeginUploadPartStreamSessionReq {
                             bucket: req.upload.bucket_name_typed().clone(),
                             key: req.upload.key_typed().clone(),
@@ -383,6 +402,7 @@ impl Coordinator {
                             session_id: session_id.clone(),
                             bucket_write_reservation: proof.clone(),
                         },
+                        cleanup_after,
                         |upload| {
                             let authorized =
                                 self.authorize_begin_stream_part_with_upload(
@@ -413,6 +433,21 @@ impl Coordinator {
                 storage::BucketWriteSnapshotAction::release(result)
             }
             },
+        )
+    }
+
+    pub fn begin_stream_part_with_storage_admission_and_cleanup_deadline(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: &BeginStreamPartRequest<'_>,
+        cleanup_after: Option<u64>,
+    ) -> Result<BeginStreamPartResult, ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.begin_stream_part_with_storage_node_and_cleanup_deadline(
+            storage_node,
+            req,
+            cleanup_after,
         )
     }
 
@@ -1490,6 +1525,16 @@ impl Coordinator {
 
         result.last_modified = last_modified;
         Ok(result)
+    }
+
+    pub fn finalize_stream_part_with_storage_admission(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: FinalizeStreamPartRequest,
+    ) -> Result<UploadPartResult, ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.finalize_stream_part_with_storage_node(storage_node, req)
     }
 
     #[cfg(test)]

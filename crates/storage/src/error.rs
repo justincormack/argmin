@@ -151,6 +151,14 @@ pub enum StoreError {
     },
 
     #[error(
+        "route admission for cluster epoch {admitted_epoch} was used with a different runtime-map generation at epoch {operation_epoch}"
+    )]
+    RouteAdmissionClusterMismatch {
+        admitted_epoch: ClusterEpoch,
+        operation_epoch: ClusterEpoch,
+    },
+
+    #[error(
         "metadata command for local node {node_id} PG {pg_id} has epoch {command_epoch}, current cluster epoch is {current_epoch}"
     )]
     StaleMetadataCommand {
@@ -444,6 +452,7 @@ impl StoreError {
             Self::StaleMetadataOperation { .. } => "stale_metadata_operation",
             Self::StaleMetadataRoute { .. } => "stale_metadata_route",
             Self::RouteMapExpired { .. } => "route_map_expired",
+            Self::RouteAdmissionClusterMismatch { .. } => "route_admission_cluster_mismatch",
             Self::StaleMetadataCommand { .. } => "stale_metadata_command",
             Self::MetadataCommandWrongPg { .. } => "metadata_command_wrong_pg",
             Self::MetadataCommandFromNonPrimary { .. } => "metadata_command_from_non_primary",

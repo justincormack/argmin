@@ -4197,6 +4197,9 @@ pub struct StreamUploadRecord {
     pub target: StreamUploadTarget,
     pub state: StreamUploadState,
     pub created_at: u64,
+    /// Fixed authority deadline after which an unfinished frontend stream is
+    /// durably eligible for cleanup by a later runtime-map generation.
+    pub cleanup_after: Option<u64>,
     pub encryption: ObjectEncryption,
     pub next_segment_vid: GenerationId,
     pub bucket_write_reservation: Option<crate::BucketWriteReservationProof>,

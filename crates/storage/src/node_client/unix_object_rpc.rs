@@ -1514,6 +1514,81 @@ impl DirectPutMetadataNodeClient for UnixStorageNodeClient {
 }
 
 impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
+    fn prepare_retained_stream_upload_abort(
+        &self,
+        pg_id: ObjectMetadataPgId,
+        cluster_epoch: ClusterEpoch,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(ObjectPgActionError::Store(
+                StoreError::StalePayloadOperation {
+                    pg_id: pg_id.get(),
+                    operation_epoch: cluster_epoch,
+                    current_epoch: self.cluster_epoch,
+                },
+            ));
+        }
+        let request = StorageRpcStreamUploadSessionRequest {
+            object: self.object_request(pg_id.pg_id(), bucket, key),
+            session_id: session_id.clone(),
+        };
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamUploadRetainedAbortPrepare,
+                encode_stream_upload_session_request(&request),
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_object_metadata_command_build_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode retained stream upload abort prepare response",
+                    error.to_string(),
+                ))
+            })?;
+        match response.outcome {
+            StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
+                match command.payload() {
+                    MetadataCommandPayload::AbortStreamUpload(abort)
+                        if command.id().cluster_epoch() == cluster_epoch
+                            && command.id().pg_id() == pg_id.pg_id()
+                            && abort.bucket == *bucket
+                            && abort.key == *key
+                            && abort.session_id == *session_id =>
+                    {
+                        Ok(Some(*command))
+                    }
+                    _ => Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate retained stream upload abort prepare response",
+                        "response is not the requested retained stream abort command".to_string(),
+                    ))),
+                }
+            }
+            StorageRpcObjectMetadataCommandBuildOutcome::Missing => Ok(None),
+            StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(self.metadata_command_log_conflict_error(
+                pg_id.pg_id(),
+                "decode retained stream upload abort prepare response",
+                node_id,
+                conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            )),
+            StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot => {
+                Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "decode retained stream upload abort prepare response",
+                    "retained stream abort prepare cannot return stale snapshot".to_string(),
+                )))
+            }
+        }
+    }
+
     fn matching_stream_upload_exists(
         &self,
         pg_id: ObjectMetadataPgId,
@@ -2037,6 +2112,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 &request.request.key,
             ),
             request: request.request.clone(),
+            cleanup_after: request.cleanup_after,
             precondition,
             bucket_write_reservation: request.bucket_write_reservation.clone(),
         };

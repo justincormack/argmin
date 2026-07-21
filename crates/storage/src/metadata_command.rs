@@ -25,7 +25,7 @@ use crate::types::{
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 2;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 3;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
@@ -219,7 +219,7 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     CreatePutObjectStreamSession => (
-        "create_put_object_stream_session",
+        "create_put_object_stream_session_with_cleanup_deadline",
         "CreateStreamUpload",
         SnapshotSensitive
     ),
@@ -234,7 +234,7 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     BeginUploadPartStreamSession => (
-        "begin_upload_part_stream_session",
+        "begin_upload_part_stream_session_with_cleanup_deadline",
         "CreateStreamUpload",
         SnapshotSensitive
     ),
@@ -1251,13 +1251,29 @@ impl BucketWriteReservationProof {
 pub(crate) struct CreateStreamUploadCommand {
     pub(crate) session: StreamUploadCommandRecord,
     pub(crate) initial_next_segment_vid: GenerationId,
+    pub(crate) cleanup_after: Option<u64>,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
 impl CreateStreamUploadCommand {
+    #[cfg(test)]
     pub(crate) fn from_request_with_bucket_write_reservation(
         request: CreateStreamUploadReq,
         created_at_millis: u64,
+        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Self {
+        Self::from_request_with_bucket_write_reservation_and_cleanup_deadline(
+            request,
+            created_at_millis,
+            None,
+            bucket_write_reservation,
+        )
+    }
+
+    pub(crate) fn from_request_with_bucket_write_reservation_and_cleanup_deadline(
+        request: CreateStreamUploadReq,
+        created_at_millis: u64,
+        cleanup_after: Option<u64>,
         bucket_write_reservation: BucketWriteReservationProof,
     ) -> Self {
         Self {
@@ -1271,6 +1287,7 @@ impl CreateStreamUploadCommand {
                 encryption: request.encryption,
             },
             initial_next_segment_vid: GenerationId::MIN,
+            cleanup_after,
             bucket_write_reservation,
         }
     }
@@ -1993,6 +2010,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                     session: self.read_stream_upload_command_record()?,
                     initial_next_segment_vid: self
                         .read_generation_id("initial next stream segment VID")?,
+                    cleanup_after: self.read_optional_u64_value()?,
                     bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
                 })),
             ),
@@ -2578,6 +2596,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.skip_object_encryption()?;
         self.read_nonzero_u64("next stream segment VID")?;
+        self.skip_optional_u64()?;
         self.skip_required_bucket_write_reservation_proof()
     }
 
@@ -3545,6 +3564,7 @@ fn encode_put_object_metadata(out: &mut Vec<u8>, command: &PutObjectMetadataComm
 fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCommand) {
     encode_stream_upload_command_record(out, &command.session);
     put_u64(out, command.initial_next_segment_vid.get());
+    encode_optional_u64(out, command.cleanup_after);
     encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
 }
 
@@ -4806,7 +4826,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0xa15745a8188c76de);
+        assert_eq!(envelope.checksum_crc64(), 0x2cedbbcee0471b9b);
     }
 
     #[test]
@@ -4847,14 +4867,14 @@ mod tests {
 
         let mut old_version = envelope.command_bytes();
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        old_version[version_offset..version_offset + 2].copy_from_slice(&1_u16.to_le_bytes());
+        old_version[version_offset..version_offset + 2].copy_from_slice(&2_u16.to_le_bytes());
         assert_eq!(
             decode_metadata_command_envelope(&old_version),
-            Err("unsupported metadata command encoding version 1".to_string())
+            Err("unsupported metadata command encoding version 2".to_string())
         );
         assert_eq!(
             decode_metadata_command_log_entry_header(&old_version),
-            Err("unsupported metadata command encoding version 1".to_string())
+            Err("unsupported metadata command encoding version 2".to_string())
         );
 
         let mut applied_with_trailing_bytes = envelope.command_bytes();
@@ -4906,7 +4926,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x09fcac682ce750cd);
+        assert_eq!(envelope.checksum_crc64(), 0x8446520ed42c3d88);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4934,7 +4954,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xd1ea4d3d9bcf9ffd);
+        assert_eq!(envelope.checksum_crc64(), 0x5c50b35b6304f2b8);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4999,7 +5019,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xf793db2a41406861);
+        assert_eq!(envelope.checksum_crc64(), 0x7a29254cb98b0524);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5080,13 +5100,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x00a41bfdc30fd605,
-                0x48eb013ee7de61a6,
-                0xa0a5a9f9316ce8b9,
-                0x69ffe7e9dc496192,
-                0x4ea0ddb829c6c9e1,
-                0x4d93e085fc790c08,
-                0x25f4dd3cb7b0d01a,
+                0x537adf8b82d9135f,
+                0x45ff77e0c8cc61a9,
+                0xc65c92e76ec7fbe8,
+                0x0824921168abb866,
+                0x2f7ba8409d241015,
+                0xc0291ee304b2614d,
+                0x442fa8c4035209ee,
             ]
         );
     }
@@ -5162,14 +5182,14 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x60d7c091911618a3,
-                0x28c4fec276df291d,
-                0xfbb117226a43fa1a,
-                0x745f8222cf120cd2,
-                0x7a4385c68015ff0f,
-                0xe798236c0bdec54c,
-                0xc2e5aef0208bbef4,
-                0x19febee3e6623ab2,
+                0xb7028dc9bfb93a15,
+                0x196ecf9957476ee5,
+                0x26261303b62b1b6b,
+                0x45f5b379ee8a4b2a,
+                0x87c9f7a875db9eab,
+                0xd63212372a4682b4,
+                0x3b498d8e0d93ecf6,
+                0x28548fb8c7fa7d4a,
             ]
         );
     }
@@ -5627,7 +5647,7 @@ mod tests {
                 bucket_write_reservation: bucket_write_reservation.clone(),
             })),
             MetadataCommandPayload::CreateStreamUpload(Box::new(
-                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
                     CreateStreamUploadReq {
                         session_id: stream_session_id.clone(),
                         bucket: bucket.clone(),
@@ -5636,6 +5656,7 @@ mod tests {
                         encryption: ObjectEncryption::None,
                     },
                     561,
+                    Some(9_999),
                     bucket_write_reservation.clone(),
                 ),
             )),
@@ -5753,36 +5774,36 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x372586f40e38cb61,
-                0x7daf5c99a96377fc,
-                0x43e9ce10ae0b12b4,
-                0x49bb63006d1c2924,
-                0xb09e67ab15c2e77b,
-                0x70be2b4801d91a85,
-                0xd7a09255b5079eaa,
-                0x2e5d0c30fca1995f,
-                0xe43a58b7fbb3aa33,
-                0xe2a042ba93f218b8,
-                0x3f171ef43702a933,
-                0x21c08a183c91cd20,
-                0x9217c71cd24a1a48,
-                0x4e203c119b2d2e2b,
-                0xfb2bd57cb5efbecc,
-                0x562226b6430c14d6,
-                0x8c1ade4137ca3577,
-                0xd71faa6ed41ccac2,
-                0x60ed7d15eb860b45,
-                0x55063a6319a4994e,
-                0x1ed582e14faab576,
-                0x67704a18fce0987b,
-                0x3016ea0efe2c8ecf,
-                0xfb5112a49179305b,
-                0x06c5520bee9e4d63,
-                0xcb3ee868eb7c7346,
-                0x355d299abfe44988,
-                0x721376b26e8b194b,
-                0x2686cc7f12b01922,
-                0xf29f8ff44f15cd4b,
+                0x1087afd0e772e3a8,
+                0x88cbac7c0d884c05,
+                0x87435164ef0de24d,
+                0x9908c90ebbc963c4,
+                0xa65809408410f284,
+                0xc7fe769314d311f6,
+                0xcdb8063c71f77a87,
+                0x89d57a224be2889f,
+                0x5006a5b5a0e7875e,
+                0x9ea415cbb76e40be,
+                0x4a2ff51f9109ee96,
+                0xd95781f9811379c8,
+                0xb0b60531c41ee2f9,
+                0xb82de8eecae45bd5,
+                0x5dcc900ca73e109a,
+                0xa02ff24912c56128,
+                0x1c41b88aae227bc5,
+                0xc958d56436086f37,
+                0xed7e1f505dc81b70,
+                0x3dad446be3c7eda9,
+                0xfe5da85ccf37e787,
+                0xc3946172712f54d6,
+                0x103df6891007e566,
+                0xc97c5b3ad6c0790d,
+                0x7d558aeddff5541f,
+                0xa9c2769bb42c02b4,
+                0x1e0ecf106b8e732b,
+                0x841ea24d3f426cb5,
+                0x3b27324471373c87,
+                0xabd73b670db95f1b,
             ]
         );
     }

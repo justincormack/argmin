@@ -20,6 +20,37 @@ use crate::sse::{
 };
 
 impl Coordinator {
+    pub(super) fn require_admitted_storage_effect(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+    ) -> Result<(), ServerError> {
+        admission
+            .require_valid_now_for(storage_node)
+            .map_err(super::map_store_error)
+    }
+
+    pub fn retained_stream_upload_cleanup(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<storage::RetainedStreamUploadCleanup, ServerError> {
+        admission
+            .retained_stream_upload_cleanup(bucket, key)
+            .map_err(super::map_store_error)
+    }
+
+    pub fn abort_stream_upload_with_retained_cleanup(
+        &self,
+        cleanup: &storage::RetainedStreamUploadCleanup,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
+        cleanup
+            .abort(session_id)
+            .map_err(Self::map_object_pg_action_error)
+    }
+
     pub fn prepare_sse_customer_write_context(
         &self,
         sse_customer: Option<&SseCustomerRequest>,

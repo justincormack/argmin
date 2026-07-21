@@ -557,6 +557,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ObjectStreamUploadMatch
         | StorageRpcMessageKind::ObjectMultipartUploadMatch
         | StorageRpcMessageKind::ObjectStreamUploadSessionLoad
+        | StorageRpcMessageKind::ObjectStreamUploadRetainedAbortPrepare
         | StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad
         | StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare
         | StorageRpcMessageKind::ObjectMultipartUploadLoad
@@ -607,6 +608,8 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace
         | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert
         | StorageRpcMessageKind::MetadataCommandApplyAndRecord
+        | StorageRpcMessageKind::MetadataCommandRetainedAbortApply
+        | StorageRpcMessageKind::MetadataCommandRetainedAbortFinish
         | StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord
         | StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord
         | StorageRpcMessageKind::MetadataCommandPgLockAcquire

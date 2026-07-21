@@ -89,6 +89,17 @@ impl Coordinator {
         self.put_object_from_authorized_write_with_storage_node(storage_node, req, authorized)
     }
 
+    pub fn commit_put_object_write_with_storage_admission(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: &AuthorizedPutObjectCommitRequest<'_>,
+        authorized: &AuthorizedPutObjectWrite,
+    ) -> Result<PutObjectResult, ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.commit_put_object_write_with_storage_node(storage_node, req, authorized)
+    }
+
     pub fn put_object_from_authorized_write(
         &self,
         req: &AuthorizedPutObjectCommitRequest<'_>,
@@ -396,15 +407,25 @@ impl Coordinator {
         storage_node: &std::sync::Arc<storage::StorageCluster>,
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<PreparedStreamPut, ServerError> {
+        self.begin_stream_put_with_storage_node_and_cleanup_deadline(storage_node, req, None)
+    }
+
+    pub fn begin_stream_put_with_storage_node_and_cleanup_deadline(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: &AuthorizePutObjectRequest<'_>,
+        cleanup_after: Option<u64>,
+    ) -> Result<PreparedStreamPut, ServerError> {
         let session_id = Self::random_session_id("failed to generate session ID")?;
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
         storage_node
-            .create_put_object_stream_session(
+            .create_put_object_stream_session_with_cleanup_deadline(
                 req.object.bucket.name_typed(),
                 req.object.key_typed(),
                 request.resolve_to_storage_request(),
+                cleanup_after,
                 |snapshot, existing_object| {
                     let bucket = self
                         .bucket_handle_loader()
@@ -442,6 +463,21 @@ impl Coordinator {
             .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 
+    pub fn begin_stream_put_with_storage_admission_and_cleanup_deadline(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: &AuthorizePutObjectRequest<'_>,
+        cleanup_after: Option<u64>,
+    ) -> Result<PreparedStreamPut, ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.begin_stream_put_with_storage_node_and_cleanup_deadline(
+            storage_node,
+            req,
+            cleanup_after,
+        )
+    }
+
     #[cfg(test)]
     pub fn begin_stream_put_session(
         &self,
@@ -458,6 +494,34 @@ impl Coordinator {
         self.create_stream_put_session_for_authorized_write_with_storage_node(
             storage_node,
             authorized,
+        )
+    }
+
+    pub fn begin_stream_put_session_with_storage_node_and_cleanup_deadline(
+        &self,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        authorized: &AuthorizedPutObjectWrite,
+        cleanup_after: Option<u64>,
+    ) -> Result<SessionId, ServerError> {
+        self.create_stream_put_session_for_authorized_write_with_storage_node_and_cleanup_deadline(
+            storage_node,
+            authorized,
+            cleanup_after,
+        )
+    }
+
+    pub fn begin_stream_put_session_with_storage_admission_and_cleanup_deadline(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        authorized: &AuthorizedPutObjectWrite,
+        cleanup_after: Option<u64>,
+    ) -> Result<SessionId, ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.begin_stream_put_session_with_storage_node_and_cleanup_deadline(
+            storage_node,
+            authorized,
+            cleanup_after,
         )
     }
 
@@ -519,6 +583,16 @@ impl Coordinator {
                 ),
             ),
         )
+    }
+
+    pub fn append_stream_put_data_with_storage_admission(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: &AppendStreamPutRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.append_stream_put_data_with_storage_node(storage_node, req)
     }
 
     /// Finalize a streaming PutObject session.
@@ -595,6 +669,23 @@ impl Coordinator {
             },
             authorized,
             AuthorizedWriteTags::Bound,
+        )
+    }
+
+    pub fn finalize_authorized_stream_put_with_storage_admission(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        req: &AuthorizedFinalizeStreamPutRequest<'_>,
+        authorized: &AuthorizedPutObjectWrite,
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<PutObjectResult, ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.finalize_authorized_stream_put_with_storage_node(
+            storage_node,
+            req,
+            authorized,
+            sse_customer,
         )
     }
 
@@ -850,5 +941,17 @@ impl Coordinator {
         storage_node
             .heartbeat_put_object_stream_session(bucket, key, session_id)
             .map_err(Self::map_object_pg_action_error)
+    }
+
+    pub fn heartbeat_stream_put_session_with_storage_admission(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        storage_node: &std::sync::Arc<storage::StorageCluster>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ServerError> {
+        self.require_admitted_storage_effect(admission, storage_node)?;
+        self.heartbeat_stream_put_session_with_storage_node(storage_node, bucket, key, session_id)
     }
 }

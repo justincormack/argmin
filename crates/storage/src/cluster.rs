@@ -629,6 +629,9 @@ fn pending_command_completes_stream_session(
 type StreamAbortHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+type RetainedStreamAbortHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 type MetadataCommandPendingInstallHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -668,6 +671,9 @@ pub type PayloadCleanupErrorTestHook = Arc<dyn Fn(&'static str, &StoreError) + S
 #[derive(Default)]
 struct StorageClusterTestHooks {
     before_stream_abort_storage: Option<StreamAbortHook>,
+    before_retained_stream_cleanup_capability: Option<StreamAbortHook>,
+    after_retained_stream_cleanup_capability: Option<StreamAbortHook>,
+    before_retained_stream_abort: Option<RetainedStreamAbortHook>,
     before_metadata_command_pending_install: Option<MetadataCommandPendingInstallHook>,
     before_direct_put_command_id: Option<DirectPutCommandIdHook>,
     before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
@@ -685,6 +691,21 @@ struct StorageClusterTestHooks {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct StreamAbortTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct RetainedStreamAbortTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct RetainedStreamCleanupCapabilityTestHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct AfterRetainedStreamCleanupCapabilityTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -750,6 +771,33 @@ pub struct PayloadCleanupTestHookGuard {
 impl Drop for StreamAbortTestHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_stream_abort_storage = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for RetainedStreamAbortTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().before_retained_stream_abort = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for RetainedStreamCleanupCapabilityTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .before_retained_stream_cleanup_capability = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for AfterRetainedStreamCleanupCapabilityTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .after_retained_stream_cleanup_capability = None;
     }
 }
 
@@ -1128,6 +1176,14 @@ pub enum StorageClusterRuntimeMapRefreshError {
     },
     #[error("refreshed runtime map for epoch {candidate} has unbounded route-map validity")]
     UnboundedRouteMapValidity { candidate: ClusterEpoch },
+    #[error(
+        "refreshed runtime map for epoch {candidate} expired before publication (valid until {valid_until_ms}, now {now_ms})"
+    )]
+    ExpiredRouteMapValidity {
+        candidate: ClusterEpoch,
+        valid_until_ms: u64,
+        now_ms: u64,
+    },
     #[error("storage cluster runtime-map refresh loop interval must be non-zero")]
     RefreshLoopZeroInterval,
     #[error("spawn storage cluster runtime-map refresh loop")]
@@ -1144,6 +1200,7 @@ impl StorageClusterRuntimeMapRefreshError {
             Self::Build(_) => "cluster_build",
             Self::EpochDowngrade { .. } => "epoch_downgrade",
             Self::UnboundedRouteMapValidity { .. } => "unbounded_route_map_validity",
+            Self::ExpiredRouteMapValidity { .. } => "expired_route_map_validity",
             Self::RefreshLoopZeroInterval => "refresh_loop_zero_interval",
             Self::RefreshLoopSpawn { .. } => "refresh_loop_spawn",
         }
@@ -1459,8 +1516,61 @@ impl StorageClusterRouteAdmission {
         })
     }
 
+    /// Revalidate this admission immediately before an effect through its
+    /// captured runtime-map generation. This rejects accidentally pairing an
+    /// admission with a renewable cluster handle from another generation.
+    pub fn require_valid_now_for(
+        &self,
+        storage_cluster: &Arc<StorageCluster>,
+    ) -> Result<(), StoreError> {
+        if !Arc::ptr_eq(&self.cluster, storage_cluster) {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: self.cluster.cluster_epoch(),
+                operation_epoch: storage_cluster.cluster_epoch(),
+            });
+        }
+        self.require_valid_now()
+    }
+
+    /// Return the remaining lifetime of this admission's captured route
+    /// authority. A bounded admission is never extended by a later route-map
+    /// renewal; callers may use this to bound waits which otherwise perform no
+    /// storage effect and therefore have no natural capability revalidation
+    /// point.
+    pub fn remaining_validity(&self) -> Result<Option<Duration>, StoreError> {
+        self.require_valid_now()?;
+        let Some(valid_until_monotonic_ms) = self.admitted_lease.local_valid_until_monotonic_ms
+        else {
+            return Ok(None);
+        };
+        let now_monotonic_ms = crate::clock::monotonic_time_millis();
+        let Some(remaining_ms) = valid_until_monotonic_ms.checked_sub(now_monotonic_ms) else {
+            return Err(StoreError::RouteMapExpired {
+                cluster_epoch: self.cluster.cluster_epoch(),
+                valid_until_ms: self.admitted_lease.validity.valid_until_ms().unwrap_or(0),
+                now_ms: crate::clock::current_time_millis(),
+            });
+        };
+        if remaining_ms == 0 {
+            return Err(StoreError::RouteMapExpired {
+                cluster_epoch: self.cluster.cluster_epoch(),
+                valid_until_ms: self.admitted_lease.validity.valid_until_ms().unwrap_or(0),
+                now_ms: crate::clock::current_time_millis(),
+            });
+        }
+        Ok(Some(Duration::from_millis(remaining_ms)))
+    }
+
     pub fn cluster_epoch(&self) -> ClusterEpoch {
         self.cluster.cluster_epoch()
+    }
+
+    /// Authority-clock deadline captured atomically with this admission.
+    /// Stream-session creation persists it as an immutable cleanup handoff;
+    /// unlike the process-monotonic deadline, it remains meaningful after a
+    /// process restart and runtime-map publication.
+    pub fn authority_valid_until_ms(&self) -> Option<u64> {
+        self.admitted_lease.validity.valid_until_ms()
     }
 
     /// Derive active bucket-metadata authority for one bucket from this
@@ -1492,6 +1602,62 @@ impl StorageClusterRouteAdmission {
             destination: destination.clone(),
             destination_pg_id: self.cluster.bucket_metadata_pg(destination),
         })
+    }
+
+    /// Narrow this admitted request to cleanup authority for one stream-upload
+    /// object. The returned capability can only remove an abandoned session
+    /// and its staged state from this admitted route generation; it cannot
+    /// publish object data or acquire new reservations.
+    pub fn retained_stream_upload_cleanup(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<RetainedStreamUploadCleanup, StoreError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.cluster
+            .maybe_run_before_retained_stream_cleanup_capability_hook();
+        self.require_valid_now()?;
+        let cleanup = RetainedStreamUploadCleanup {
+            cluster: Arc::clone(&self.cluster),
+            cluster_epoch: self.cluster.cluster_epoch(),
+            object_pg_id: self.cluster.object_metadata_pg(bucket, key),
+            bucket: bucket.clone(),
+            key: key.clone(),
+        };
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.cluster
+            .maybe_run_after_retained_stream_cleanup_capability_hook();
+        Ok(cleanup)
+    }
+}
+
+/// Request-scoped, subject-bound authority for removing one abandoned stream
+/// upload, including a prompt attempt after the active route deadline elapses.
+///
+/// This capability is intentionally non-cloneable. It retains only the route
+/// generation and object identity captured while the request was admitted. It
+/// is not the durable cleanup handoff: frontend-created stream sessions also
+/// persist the admission's immutable authority deadline, allowing the
+/// current-route sweeper to resume cleanup after this capability and the
+/// originating [`StorageClusterRouteAdmission`] have been dropped.
+pub struct RetainedStreamUploadCleanup {
+    cluster: Arc<StorageCluster>,
+    cluster_epoch: ClusterEpoch,
+    object_pg_id: ObjectMetadataPgId,
+    bucket: BucketName,
+    key: ObjectKey,
+}
+
+impl RetainedStreamUploadCleanup {
+    pub fn abort(&self, session_id: &SessionId) -> Result<(), ObjectPgActionError> {
+        self.cluster
+            .abort_stream_upload_session_with_retained_cleanup(
+                self.cluster_epoch,
+                self.object_pg_id,
+                &self.bucket,
+                &self.key,
+                session_id,
+            )
     }
 }
 
@@ -1807,6 +1973,14 @@ impl StorageClusterRuntimeMapHandle {
         &self,
         candidate: Arc<StorageCluster>,
     ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
+        self.install_with_after_drain(candidate, || {})
+    }
+
+    fn install_with_after_drain(
+        &self,
+        candidate: Arc<StorageCluster>,
+        after_drain: impl FnOnce(),
+    ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
         if candidate.route_map_valid_until_ms().is_none() {
             return Err(
                 StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
@@ -1815,6 +1989,7 @@ impl StorageClusterRuntimeMapHandle {
             );
         }
         let _publication = self.route_admission.begin_publication();
+        after_drain();
         let mut current = self
             .cluster
             .write()
@@ -1825,12 +2000,32 @@ impl StorageClusterRuntimeMapHandle {
                 candidate: candidate.cluster_epoch(),
             });
         }
+        let mut generations = self
+            .same_epoch_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(error) = candidate.require_route_map_valid_now() {
+            let (valid_until_ms, now_ms) = match error {
+                StoreError::RouteMapExpired {
+                    valid_until_ms,
+                    now_ms,
+                    ..
+                } => (valid_until_ms, now_ms),
+                _ => (
+                    candidate.route_map_valid_until_ms().unwrap_or(0),
+                    crate::clock::current_time_millis(),
+                ),
+            };
+            return Err(
+                StorageClusterRuntimeMapRefreshError::ExpiredRouteMapValidity {
+                    candidate: candidate.cluster_epoch(),
+                    valid_until_ms,
+                    now_ms,
+                },
+            );
+        }
         if candidate.cluster_epoch() == current.cluster_epoch() {
             let candidate_digest = candidate.runtime_map_content_digest;
-            let mut generations = self
-                .same_epoch_generations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             // Same-epoch authoritative refreshes update matching pinned
             // generations. A legacy/local unbounded generation has no digest;
             // it may only make the one-way transition to bounded validity.
@@ -1859,10 +2054,6 @@ impl StorageClusterRuntimeMapHandle {
             });
             generations.push(Arc::downgrade(&candidate));
         } else {
-            let mut generations = self
-                .same_epoch_generations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             generations.clear();
             generations.push(Arc::downgrade(&candidate));
         }
@@ -2447,12 +2638,20 @@ mod runtime_map_refresh_invalidation_tests {
 
     #[test]
     fn same_epoch_install_shrinks_pinned_generation_validity() {
-        let pinned = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
-        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
-        let old_current = handle.current();
-        let candidate = active_test_cluster(RouteMapValidity::until_ms(4_000).unwrap());
+        let (pinned, handle, old_current, candidate) =
+            crate::clock::with_time_override(1_000, || {
+                let pinned = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+                pinned.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+                let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
+                let old_current = handle.current();
+                let candidate = active_test_cluster(RouteMapValidity::until_ms(4_000).unwrap());
+                candidate.test_store_route_map_validity(RouteMapValidity::until_ms(4_000).unwrap());
+                (pinned, handle, old_current, candidate)
+            });
 
-        handle.install(Arc::clone(&candidate)).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            handle.install(Arc::clone(&candidate)).unwrap();
+        });
 
         assert_eq!(pinned.route_map_valid_until_ms(), Some(4_000));
         assert_eq!(old_current.route_map_valid_until_ms(), Some(4_000));
@@ -2477,13 +2676,16 @@ mod runtime_map_refresh_invalidation_tests {
                 let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
                 let admission = handle.admit_current_route().unwrap();
                 let candidate = active_test_cluster(RouteMapValidity::until_ms(9_000).unwrap());
+                candidate.test_store_route_map_validity(RouteMapValidity::until_ms(9_000).unwrap());
                 (pinned, handle, admission, candidate)
             });
         let installer_handle = handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let (installed_tx, installed_rx) = std::sync::mpsc::channel();
         let installer = thread::spawn(move || {
-            installer_handle.install(installed_candidate).unwrap();
+            crate::clock::with_time_override(1_000, || {
+                installer_handle.install(installed_candidate).unwrap();
+            });
             installed_tx.send(()).unwrap();
         });
 
@@ -2498,6 +2700,53 @@ mod runtime_map_refresh_invalidation_tests {
         installed_rx.recv().unwrap();
         installer.join().unwrap();
         assert!(Arc::ptr_eq(&handle.current(), &candidate));
+    }
+
+    #[test]
+    fn expired_candidate_is_rejected_after_admitted_requests_drain() {
+        let (current, handle, admission, candidate) =
+            crate::clock::with_time_override(1_000, || {
+                let current = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
+                current.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+                let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&current));
+                let admission = handle.admit_current_route().unwrap();
+                let candidate = active_test_cluster(RouteMapValidity::until_ms(1_500).unwrap());
+                candidate.test_store_route_map_validity(RouteMapValidity::until_ms(1_500).unwrap());
+                (current, handle, admission, candidate)
+            });
+        let installer_handle = handle.clone();
+        let installed_candidate = Arc::clone(&candidate);
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+        let installer = thread::spawn(move || {
+            let clock = crate::clock::test_time_override_guard(1_000);
+            installer_handle.install_with_after_drain(installed_candidate, || {
+                drained_tx.send(()).unwrap();
+                advance_rx.recv().unwrap();
+                clock.set(2_000);
+            })
+        });
+
+        handle.route_admission.wait_until_publication_is_pending();
+        drop(admission);
+        drained_rx.recv().unwrap();
+        advance_tx.send(()).unwrap();
+
+        assert!(matches!(
+            installer.join().unwrap(),
+            Err(
+                StorageClusterRuntimeMapRefreshError::ExpiredRouteMapValidity {
+                    candidate: ClusterEpoch::INITIAL,
+                    valid_until_ms: 1_500,
+                    now_ms: 2_000,
+                }
+            )
+        ));
+        assert!(Arc::ptr_eq(&handle.current(), &current));
+        assert!(!Arc::ptr_eq(&handle.current(), &candidate));
+        crate::clock::with_time_override(2_000, || {
+            handle.admit_current_route().unwrap();
+        });
     }
 
     #[test]
@@ -2533,6 +2782,61 @@ mod runtime_map_refresh_invalidation_tests {
                     valid_until_ms: 5_000,
                     now_ms: 6_000,
                 }) if cluster_epoch == ClusterEpoch::INITIAL
+            ));
+        });
+    }
+
+    #[test]
+    fn admitted_frontend_route_rejects_a_different_runtime_map_generation() {
+        crate::clock::with_time_override(1_000, || {
+            let admitted_cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            let unrelated_cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            admitted_cluster
+                .test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+            unrelated_cluster
+                .test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&admitted_cluster));
+            let admission = handle.admit_current_route().unwrap();
+
+            admission.require_valid_now_for(&admitted_cluster).unwrap();
+            assert!(matches!(
+                admission.require_valid_now_for(&unrelated_cluster),
+                Err(StoreError::RouteAdmissionClusterMismatch {
+                    admitted_epoch,
+                    operation_epoch,
+                }) if admitted_epoch == ClusterEpoch::INITIAL
+                    && operation_epoch == ClusterEpoch::INITIAL
+            ));
+        });
+    }
+
+    #[test]
+    fn admitted_frontend_route_remaining_validity_uses_captured_deadline() {
+        let (cluster, admission) = crate::clock::with_time_override(1_000, || {
+            let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
+            let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+            let admission = handle.admit_current_route().unwrap();
+            (cluster, admission)
+        });
+
+        crate::clock::with_time_override(1_000, || {
+            cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
+        });
+        crate::clock::with_time_override(2_000, || {
+            assert_eq!(
+                admission.remaining_validity().unwrap(),
+                Some(Duration::from_secs(3))
+            );
+        });
+        crate::clock::with_time_override(5_000, || {
+            assert!(matches!(
+                admission.remaining_validity(),
+                Err(StoreError::RouteMapExpired {
+                    valid_until_ms: 5_000,
+                    now_ms: 5_000,
+                    ..
+                })
             ));
         });
     }
@@ -5127,6 +5431,43 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_retained_stream_abort_hook(&self) -> Result<(), ObjectPgActionError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_retained_stream_abort
+            .clone();
+        hook.map_or(Ok(()), |hook| hook())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_before_retained_stream_cleanup_capability_hook(&self) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_retained_stream_cleanup_capability
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_after_retained_stream_cleanup_capability_hook(&self) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .after_retained_stream_cleanup_capability
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_metadata_command_pending_install_hook(&self) {
         let hook = self
             .test_hooks
@@ -6124,7 +6465,7 @@ impl StorageCluster {
     ) -> Result<&Arc<dyn ShardAckNodeClient>, StoreError> {
         let node = self
             .local_map
-            .metadata_pg_primary_node_at_retained_epoch(operation_epoch, pg_id)?;
+            .metadata_pg_primary_node_for_retained_cleanup(operation_epoch, pg_id)?;
         Ok(node.shard_ack_client())
     }
 
@@ -6502,7 +6843,7 @@ impl StorageCluster {
         let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
         let node = self
             .local_map
-            .metadata_pg_primary_node_at_retained_epoch(proof.cluster_epoch, PgId::new(pg_id))?;
+            .metadata_pg_primary_node_for_retained_cleanup(proof.cluster_epoch, PgId::new(pg_id))?;
         node.bucket_write_reservation_client()
             .release_metadata_command_bucket_write_reservation(
                 self.validated_bucket_metadata_pg(PgId::new(pg_id)),
@@ -6637,6 +6978,45 @@ impl StorageCluster {
     ) -> StreamAbortTestHookGuard {
         self.test_hooks.lock().unwrap().before_stream_abort_storage = Some(hook);
         StreamAbortTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_retained_stream_abort_hook(
+        &self,
+        hook: RetainedStreamAbortHook,
+    ) -> RetainedStreamAbortTestHookGuard {
+        self.test_hooks.lock().unwrap().before_retained_stream_abort = Some(hook);
+        RetainedStreamAbortTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_retained_stream_cleanup_capability_hook(
+        &self,
+        hook: StreamAbortHook,
+    ) -> RetainedStreamCleanupCapabilityTestHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_retained_stream_cleanup_capability = Some(hook);
+        RetainedStreamCleanupCapabilityTestHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_retained_stream_cleanup_capability_hook(
+        &self,
+        hook: StreamAbortHook,
+    ) -> AfterRetainedStreamCleanupCapabilityTestHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .after_retained_stream_cleanup_capability = Some(hook);
+        AfterRetainedStreamCleanupCapabilityTestHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }
@@ -9880,6 +10260,19 @@ impl StorageCluster {
         session_id: &SessionId,
         encryption: ObjectEncryption,
     ) -> Result<(), ObjectPgActionError> {
+        self.create_put_object_stream_session_record_with_cleanup_deadline(
+            bucket, key, session_id, encryption, None,
+        )
+    }
+
+    pub fn create_put_object_stream_session_record_with_cleanup_deadline(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        encryption: ObjectEncryption,
+        cleanup_after: Option<u64>,
+    ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mut work_budget = RequestWorkBudget::new(PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET, None)
             .for_operation("create_put_object_stream_session")
@@ -9900,11 +10293,16 @@ impl StorageCluster {
                 Err(error) => return Err(bucket_snapshot_error_to_object_pg_action_error(error)),
             };
             let proof = BucketWriteReservationProof::from(&reservation.record);
-            let result = self.create_put_object_stream_session_record_under_reservation(
-                bucket,
-                key,
-                session_id,
+            let request = CreateStreamUploadReq {
+                session_id: session_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                target: StreamUploadTarget::PutObject,
                 encryption,
+            };
+            let result = self.create_put_object_stream_session_record_under_reservation(
+                request,
+                cleanup_after,
                 proof.clone(),
                 &mut work_budget,
             );
@@ -9936,25 +10334,20 @@ impl StorageCluster {
 
     fn create_put_object_stream_session_record_under_reservation(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        encryption: ObjectEncryption,
+        request: CreateStreamUploadReq,
+        cleanup_after: Option<u64>,
         bucket_write_reservation: BucketWriteReservationProof,
         work_budget: &mut RequestWorkBudget,
     ) -> Result<BucketWriteReservationDisposition, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(
             CreatePutObjectStreamSessionRecordUnderReservation
         );
+        let bucket = &request.bucket;
+        let key = &request.key;
+        let session_id = &request.session_id;
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
-        let request = CreateStreamUploadReq {
-            session_id: session_id.clone(),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            target: StreamUploadTarget::PutObject,
-            encryption,
-        };
+        debug_assert_eq!(request.target, StreamUploadTarget::PutObject);
         loop {
             work_budget
                 .check("put object stream create retry budget exhausted")
@@ -9976,6 +10369,7 @@ impl StorageCluster {
                     pg_id: object_pg_id,
                     cluster_epoch: self.operation_epoch(),
                     request: &request,
+                    cleanup_after,
                     precondition: CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
                         require_generation_reservation: true,
                     },
@@ -10892,6 +11286,83 @@ impl StorageCluster {
         }
     }
 
+    fn abort_stream_upload_session_with_retained_cleanup(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        object_pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), ObjectPgActionError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.maybe_run_before_retained_stream_abort_hook()?;
+        if cluster_epoch != self.operation_epoch()
+            || object_pg_id != self.object_metadata_pg(bucket, key)
+        {
+            return Err(ObjectPgActionError::Store(
+                StoreError::StaleMetadataOperation {
+                    pg_id: object_pg_id.get(),
+                    operation_epoch: cluster_epoch,
+                    current_epoch: self.operation_epoch(),
+                },
+            ));
+        }
+        let pg_id = object_pg_id.pg_id();
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node_for_metadata_command_recovery(cluster_epoch, pg_id)?;
+        let Some(command) = primary
+            .object_mutation_metadata_client()
+            .prepare_retained_stream_upload_abort(
+                object_pg_id,
+                cluster_epoch,
+                bucket,
+                key,
+                session_id,
+            )?
+        else {
+            return Ok(());
+        };
+        let MetadataCommandPayload::AbortStreamUpload(abort) = command.payload() else {
+            return Err(ObjectPgActionError::Store(
+                StoreError::MetadataCommandContention {
+                    context: "retained stream cleanup prepared a non-abort command",
+                },
+            ));
+        };
+        if command.id().cluster_epoch() != cluster_epoch
+            || command.id().pg_id() != pg_id
+            || abort.bucket != *bucket
+            || abort.key != *key
+            || abort.session_id != *session_id
+        {
+            return Err(ObjectPgActionError::Store(
+                StoreError::MetadataCommandContention {
+                    context: "retained stream cleanup command does not match captured subject",
+                },
+            ));
+        }
+
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes_for_metadata_command_recovery(cluster_epoch, pg_id)?
+        {
+            node.metadata_command_client()
+                .apply_retained_stream_upload_abort(pg_id, &command)
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+        }
+
+        if let Some(proof) = &abort.stream_create_bucket_write_reservation {
+            self.release_stream_create_bucket_write_reservation_proof(proof)
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
+        }
+        self.delete_staged_stream_segment_payload_shards_at_retained_epoch(&abort.staged_segments)?;
+        primary
+            .metadata_command_client()
+            .finish_retained_stream_upload_abort(pg_id, &command)?;
+        Ok(())
+    }
+
     pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
         const STREAM_UPLOAD_SESSION_BEST_EFFORT_PAGE_LIMIT: u32 = 1024;
         let mut sessions = Vec::new();
@@ -10932,20 +11403,23 @@ impl StorageCluster {
     }
 
     pub fn scavenge_abandoned_stream_sessions(&self, max_age_ms: u64) -> usize {
-        let cutoff = crate::clock::current_time_millis().saturating_sub(max_age_ms);
+        let now = crate::clock::current_time_millis();
+        let cutoff = now.saturating_sub(max_age_ms);
         let mut count = 0;
 
         for session in self.list_stream_upload_sessions_best_effort() {
-            if session.created_at >= cutoff {
-                continue;
-            }
-            if session.target != StreamUploadTarget::PutObject {
-                continue;
-            }
-            match self.stream_upload_has_live_bucket_write_reservation(&session) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(_) => continue,
+            let durable_cleanup_due = session
+                .cleanup_after
+                .is_some_and(|cleanup_after| cleanup_after <= now);
+            if !durable_cleanup_due {
+                if session.created_at >= cutoff || session.target != StreamUploadTarget::PutObject {
+                    continue;
+                }
+                match self.stream_upload_has_live_bucket_write_reservation(&session) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(_) => continue,
+                }
             }
             match self.abort_stream_upload_session(
                 &session.bucket,
@@ -10953,21 +11427,25 @@ impl StorageCluster {
                 &session.session_id,
             ) {
                 Ok(()) => {
-                    let _ = self.release_object_generation_reservation(
-                        &session.bucket,
-                        &session.key,
-                        &session.session_id,
-                    );
+                    if session.target == StreamUploadTarget::PutObject {
+                        let _ = self.release_object_generation_reservation(
+                            &session.bucket,
+                            &session.key,
+                            &session.session_id,
+                        );
+                    }
                     count += 1;
                 }
                 Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
                     ..
                 })) => {
-                    let _ = self.release_object_generation_reservation(
-                        &session.bucket,
-                        &session.key,
-                        &session.session_id,
-                    );
+                    if session.target == StreamUploadTarget::PutObject {
+                        let _ = self.release_object_generation_reservation(
+                            &session.bucket,
+                            &session.key,
+                            &session.session_id,
+                        );
+                    }
                     count += 1;
                 }
                 Err(_) => {}
@@ -13041,6 +13519,80 @@ impl StorageCluster {
         for segment in segments {
             self.delete_stream_segment_payload_shards_best_effort(segment);
         }
+    }
+
+    fn delete_staged_stream_segment_payload_shards_at_retained_epoch(
+        &self,
+        segments: &[StreamUploadSegmentRecord],
+    ) -> Result<(), ObjectPgActionError> {
+        for segment in segments {
+            let data_pg_id = self.validated_data_pg(PgId::new(segment.data_pg_id))?;
+            let ec = EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            };
+            let placement_key =
+                segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
+            let route = self
+                .local_map
+                .reconstructed_pg_route_at_epoch(
+                    data_pg_id.pg_id(),
+                    segment.placement_cluster_epoch,
+                )
+                .ok_or_else(|| {
+                    ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "PG {} route for staged stream cleanup epoch {} is not retained",
+                            data_pg_id.get(),
+                            segment.placement_cluster_epoch.get()
+                        ),
+                    })
+                })?;
+            if route.state() != PgState::Active {
+                return Err(ObjectPgActionError::Store(StoreError::PgNotActive {
+                    pg_id: data_pg_id.get(),
+                    cluster_epoch: route.cluster_epoch(),
+                    state: route.state(),
+                }));
+            }
+            let locations = LocalClusterMap::place_payload_shards_for_pg_route(
+                route.cluster_epoch(),
+                data_pg_id,
+                ec,
+                &placement_key,
+                route.acting_set(),
+            )
+            .map_err(|error| ObjectPgActionError::Store(cluster_build_error_to_store(error)))?;
+            let shard_keys =
+                Self::payload_shard_set_keys(&segment.segment_okh, segment.segment_vid, ec);
+            for shard_key in &shard_keys {
+                let location = Self::placed_payload_shard_location(&locations, shard_key)
+                    .map_err(ObjectPgActionError::Store)?;
+                self.maybe_run_before_placed_payload_shard_delete_hook(shard_key)
+                    .map_err(ObjectPgActionError::Store)?;
+                self.local_map
+                    .delete_payload_shard_for_historical_cleanup(location, shard_key)
+                    .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
+            }
+            let shard_ack_client = self
+                .metadata_pg_primary_shard_ack_client_at_retained_epoch(
+                    segment.placement_cluster_epoch,
+                    data_pg_id.pg_id(),
+                )
+                .map_err(ObjectPgActionError::Store)?;
+            for shard_key in &shard_keys {
+                self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
+                    .map_err(ObjectPgActionError::Store)?;
+                shard_ack_client
+                    .delete_written_shard_ack_at_retained_epoch(
+                        segment.placement_cluster_epoch,
+                        data_pg_id,
+                        shard_key,
+                    )
+                    .map_err(ObjectPgActionError::Store)?;
+            }
+        }
+        Ok(())
     }
 
     fn delete_object_segment_payload_shards_best_effort(&self, segment: &ObjectSegmentRecord) {

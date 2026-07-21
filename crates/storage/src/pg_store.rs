@@ -104,7 +104,7 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
 FROM buckets WHERE name = ?1";
 
 const STREAM_UPLOAD_SELECT: &str = "\
-SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, encryption_type, encryption_state, next_segment_vid, \
+SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, created_at, cleanup_after, encryption_type, encryption_state, next_segment_vid, \
        bucket_write_reservation_id, bucket_write_owner_token, bucket_write_cluster_epoch, bucket_write_execution_generation, \
        bucket_write_incarnation_generation, bucket_write_operation_kind, bucket_write_created_at, bucket_write_lease_deadline, bucket_write_target_context \
 FROM stream_uploads";
@@ -362,15 +362,27 @@ fn parse_stream_upload_record(row: &Row<'_>) -> rusqlite::Result<StreamUploadRec
             )
         })?,
         created_at: row.get::<_, i64>(7)? as u64,
+        cleanup_after: row
+            .get::<_, Option<i64>>(8)?
+            .map(|value| {
+                u64::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
         encryption: PgStore::parse_object_encryption(
-            row.get::<_, u8>(8)?,
-            row.get::<_, Option<Vec<u8>>>(9)?,
-            8,
+            row.get::<_, u8>(9)?,
+            row.get::<_, Option<Vec<u8>>>(10)?,
             9,
+            10,
         )?,
         next_segment_vid: PgStore::parse_generation_id(
-            row.get::<_, i64>(10)?,
-            10,
+            row.get::<_, i64>(11)?,
+            11,
             "next_segment_vid",
         )?,
         bucket_write_reservation: parse_stream_upload_bucket_write_reservation(bucket, row)?,
@@ -381,20 +393,20 @@ fn parse_stream_upload_bucket_write_reservation(
     bucket: BucketName,
     row: &Row<'_>,
 ) -> rusqlite::Result<Option<BucketWriteReservationProof>> {
-    let Some(reservation_id) = row.get::<_, Option<String>>(11)? else {
+    let Some(reservation_id) = row.get::<_, Option<String>>(12)? else {
         return Ok(None);
     };
-    let cluster_epoch_raw: i64 = row.get(13)?;
+    let cluster_epoch_raw: i64 = row.get(14)?;
     let cluster_epoch = ClusterEpoch::new(u64::try_from(cluster_epoch_raw).map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
-            13,
+            14,
             rusqlite::types::Type::Integer,
             Box::from("invalid stream bucket write reservation cluster epoch"),
         )
     })?)
     .ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            13,
+            14,
             rusqlite::types::Type::Integer,
             Box::from("invalid stream bucket write reservation cluster epoch"),
         )
@@ -402,14 +414,14 @@ fn parse_stream_upload_bucket_write_reservation(
     Ok(Some(BucketWriteReservationProof {
         bucket,
         reservation_id,
-        owner_token: row.get(12)?,
+        owner_token: row.get(13)?,
         cluster_epoch,
-        bucket_execution_generation: row.get::<_, i64>(14)? as u64,
-        bucket_incarnation_generation: row.get::<_, i64>(15)? as u64,
-        operation_kind: row.get(16)?,
-        created_at: row.get::<_, i64>(17)? as u64,
-        lease_deadline: row.get::<_, i64>(18)? as u64,
-        target_context: row.get(19)?,
+        bucket_execution_generation: row.get::<_, i64>(15)? as u64,
+        bucket_incarnation_generation: row.get::<_, i64>(16)? as u64,
+        operation_kind: row.get(17)?,
+        created_at: row.get::<_, i64>(18)? as u64,
+        lease_deadline: row.get::<_, i64>(19)? as u64,
+        target_context: row.get(20)?,
     }))
 }
 
