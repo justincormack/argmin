@@ -1,0 +1,234 @@
+Slow uploads can stall route-map publication
+Link: https://chatgpt.com/codex/cloud/security/findings/2b64c293fa888191953d94d1e6da89f7?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 9a659be
+Author: justin@specialbusservice.com
+Created: 20/07/2026, 22:06:01
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed by [`afea45b4`](https://github.com/justincormack/argmin/commit/afea45b4)
+(`Enforce route admission across streaming writes`).
+
+Streaming PUT, POST Object, and UploadPart body waits are now bounded by both
+the configured per-frame idle timeout and the immutable process-monotonic
+deadline captured by their route admission. A same-generation lease renewal
+cannot extend that request deadline. Expiry returns `OperationAborted`, stops
+the request from performing further storage effects, and releases the route
+admission instead of allowing a trickle upload to hold publication in
+`Draining` indefinitely.
+
+Every frontend-created stream session persists the admission's authority-clock
+deadline as a durable cleanup handoff. The request derives a non-cloneable,
+object-scoped retained cleanup capability before its first durable stream
+mutation and makes one prompt abort attempt on expiry. If that attempt cannot
+reach the old acting set, the frontend still releases admission; the
+independent stream-session sweeper follows the current runtime map and removes
+the expired session, reservation, acknowledgements, and staged shards. PUT and
+POST heartbeat tasks retain only weak context references, so a sleeping
+heartbeat cannot extend admission lifetime after the request has unwound.
+
+Admission is also enforced at each storage-effect boundary. Initial PUT
+authorization/reservation preparation, POST session creation, UploadPart
+session creation, append, direct commit, heartbeat, and finalization all
+revalidate the captured admission against the exact runtime-map generation
+used for the operation. Tests renew the raw same-epoch cluster beyond the old
+deadline and prove that the raw cluster remains admissible while the earlier
+request is rejected before creating a reservation or session. This closes the
+renewal-based bypass as well as the original slow-body path.
+
+Runtime-map installation now revalidates a bounded candidate after admitted
+requests drain and immediately before publication. A candidate that expires
+during the drain is rejected without replacing the current map, and the gate
+returns to `Open` for later requests.
+
+Deterministic regressions cover publication blocking and release, post-drain
+candidate expiry, promoted PUT/POST/UploadPart cleanup, failed prompt cleanup
+with later durable sweeping, same-store runtime-map refresh, sleeping
+heartbeats, same-epoch renewal at initial and final storage effects, and
+cross-generation admission misuse. Formatting, the storage boundary checker,
+and workspace strict Clippy passed. The preceding complete workspace run
+passed 7,363 tests; the final initial-mutation regression brought the suite to
+7,364 tests, whose rerun reached a separately fixed conditional-delete race
+before nextest cancelled the remainder.
+
+# Summary
+Introduced: per-request route admission is retained across long streaming request bodies and globally blocks runtime-map publication and later admissions during publication. This creates a network-triggerable availability issue for control-plane-enabled deployments by allowing a slow authenticated streaming upload to stall frontend route updates and storage request handling.
+The new admission gate increments active_requests for each admitted route and route publication switches the gate to Draining, then waits until active_requests reaches zero. Streaming PUT/POST/UploadPart now stores the admission guard inside the streaming context, and the async body loop keeps that context alive while waiting for each body frame. Because the body timeout is per-frame, a client that is allowed to start a streaming write can keep the request alive by sending data slowly. When the control-plane refresh loop tries to install a new runtime map, begin_publication blocks until that slow request ends, and all new admissions block behind the Draining state. Additionally, install only checks that the candidate has a bounded validity before waiting; it does not re-check that the candidate is still valid after the potentially long drain, so a delayed publication can install an already-expired map and cause subsequent admissions to fail until another refresh succeeds.
+
+# Validation
+## Rubric
+- [x] Confirm route admission increments `active_requests`, blocks admissions when not Open, and releases only when the guard is dropped.
+- [x] Confirm runtime-map publication sets Draining and waits for all active requests, thereby blocking later admissions.
+- [x] Confirm streaming PUT/POST/UploadPart contexts retain the storage-route admission across the request-body frame loop with per-frame timeout semantics.
+- [x] Confirm `install()` rejects only unbounded candidates before draining and does not re-check expiry after a delayed drain.
+- [x] Produce a bounded dynamic PoC showing a held admission stalls publication/later admission and permits installation of an expired candidate.
+## Report
+Validated the availability finding with targeted Rust unit PoCs plus an LLDB trace. Direct crash attempt: `cargo test -p storage --lib poc_ -- --nocapture` did not crash, which is expected for this logical availability bug, but both PoC tests passed. Valgrind was unavailable (`valgrind: command not found`), and ASan could not be used on the stable toolchain (`-Z sanitizer=address` rejected as nightly-only). Debugger attempt succeeded with LLDB: a breakpoint at `crates/storage/src/cluster.rs:1337` showed the installer thread in `StorageClusterRouteAdmissionGate::begin_publication`, called from `StorageClusterRuntimeMapHandle::install` at `cluster.rs:1621`, matching the suspected blocking publication path.
+
+Code evidence: `acquire()` waits while the gate is not Open and increments `active_requests` at `crates/storage/src/cluster.rs:1302-1321`; `begin_publication()` sets Draining and waits for `active_requests == 0` at `cluster.rs:1324-1347`; the request permit is only released on `Drop` at `cluster.rs:1388-1399`; `install()` only checks that candidate validity is bounded before `begin_publication()` and does not revalidate after draining at `cluster.rs:1610-1621`. Streaming PUT acquires admission after auth at `crates/server-http/src/http/mod.rs:4142-4145`, stores it in `StreamingPutContext` at `mod.rs:4274-4277` and in the struct at `mod.rs:4777-4783`; the async body loop keeps `Arc<ctx>` alive while repeatedly waiting on `tokio::time::timeout(idle_timeout, body.frame())` at `crates/server-http/src/http/serve.rs:3112-3125`, so a slow body can retain the permit across per-frame waits.
+
+Dynamic evidence: added `poc_held_frontend_route_stalls_publication_and_later_admissions`, which holds an admitted route, starts `install()`, waits until publication is pending, starts a later admission, sleeps 100ms, and asserts both `installed_rx.try_recv()` and `admitted_rx.try_recv()` are still empty until the original admission is dropped. Added `poc_expired_candidate_can_be_published_after_drain`, which starts publication with a candidate valid until 1500ms, advances test time to 2000ms before releasing the held admission, and proves `install()` publishes that candidate by asserting `handle.current()` is the candidate and `require_route_map_valid_now()` returns `RouteMapExpired { valid_until_ms: 1500, now_ms: 2000 }`. Test output: `running 2 tests ... ok ... test result: ok. 2 passed; 0 failed`.
+
+# Evidence
+crates/server-http/src/http/mod.rs (L4142 to 4145)
+  Note: Streaming PutObject acquires a storage-route admission immediately after authentication.
+```
+        Self::require_content_sha256_for_sigv4_header_auth(req)?;
+        let auth = self.authenticate_with_payload_check(req, false, Some(bucket))?;
+        let storage_route_admission = self.coordinator.admit_storage_route_for_request()?;
+        self.enforce_bucket_region_raw(bucket, &auth)?;
+```
+
+crates/server-http/src/http/mod.rs (L4274 to 4277)
+  Note: The acquired admission is stored in StreamingPutContext, extending its lifetime beyond preparation.
+```
+        Ok(StreamingPutContext {
+            trace: current_trace_context(),
+            _storage_route_admission: storage_route_admission,
+            storage_node,
+```
+
+crates/server-http/src/http/serve.rs (L3112 to 3125)
+  Note: The streaming context is kept alive across the request-body loop, which waits with a per-frame idle timeout and can therefore be prolonged by a slow client.
+```
+    // 2. Stream body frames, accumulating into internal segment-sized buffers.
+    let ctx = Arc::new(ctx);
+    let abort_guard = StreamingAbortGuard::new(&state);
+    let mut hasher = checksum::crc64::Hasher::new();
+    let mut session_id: Option<SessionId> = None;
+    let mut segment_index: u32 = 0;
+    let mut buf = PooledSegmentBuffer::new(&state);
+    let mut total_size: u64 = 0;
+    let mut body_started_emitted = false;
+    let mut body_timing = StreamingBodyTiming::default();
+    loop {
+        let frame_wait_start = Instant::now();
+        let next_frame = tokio::time::timeout(idle_timeout, body.frame()).await;
+        body_timing.frame_wait_us += elapsed_micros(frame_wait_start);
+```
+
+crates/storage/src/cluster.rs (L1302 to 1321)
+  Note: Route admission increments active_requests and new admissions wait whenever the gate is not Open.
+```
+    fn acquire(&self) -> StorageClusterRouteAdmissionPermit {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.transition != StorageClusterRouteTransitionState::Open {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.active_requests = state
+            .active_requests
+            .checked_add(1)
+            .expect("route admission permit count must not overflow");
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.inner.changed.notify_all();
+        StorageClusterRouteAdmissionPermit { gate: self.clone() }
+```
+
+crates/storage/src/cluster.rs (L1324 to 1347)
+  Note: Runtime-map publication sets the gate to Draining and waits for every active request to release its admission, blocking new admitted work.
+```
+    fn begin_publication(&self) -> StorageClusterRoutePublicationGuard {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.transition != StorageClusterRouteTransitionState::Open {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.transition = StorageClusterRouteTransitionState::Draining;
+        self.inner.changed.notify_all();
+        while state.active_requests != 0 {
+            state = self
+                .inner
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.transition = StorageClusterRouteTransitionState::Publishing;
+        StorageClusterRoutePublicationGuard { gate: self.clone() }
+```
+
+crates/storage/src/cluster.rs (L1610 to 1624)
+  Note: install only rejects unbounded candidates before the potentially long drain; it does not revalidate the candidate's expiry after begin_publication returns.
+```
+    pub fn install(
+        &self,
+        candidate: Arc<StorageCluster>,
+    ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
+        if candidate.route_map_valid_until_ms().is_none() {
+            return Err(
+                StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
+                    candidate: candidate.cluster_epoch(),
+                },
+            );
+        }
+        let _publication = self.route_admission.begin_publication();
+        let mut current = self
+            .cluster
+            .write()
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. Static evidence and the prior executable PoC support that the bug is real and in main runtime code: streaming contexts retain route admission while body loops wait per frame, and install/begin_publication globally drain active requests. The attack is reachable from the S3 HTTP data plane for write-authorized clients and can affect other clients, so it is security-relevant availability impact. It does not justify high/critical because confidentiality and integrity are not directly compromised, exploitation requires write authorization or public-write configuration plus control-plane-enabled runtime-map refresh, default exposure is localhost:9000 with legacy-local role, and existing max connection/in-flight limits bound concurrency even though they do not prevent the single-request stall.
+## Likelihood
+high - The exploit mechanics are low complexity after prerequisites: start a write-authorized streaming upload and trickle frames under the per-frame timeout. Likelihood is moderated by requiring a reachable listener, write permission or public-write policy, and a non-default control-plane/runtime-map refresh deployment. | Remote network vector
+## Impact
+medium - A single slow admitted streaming write can stall runtime-map publication and block later storage-route admissions during Draining; validation also showed an expired candidate can be published after a delayed drain. This is service availability impact, not direct data theft, privilege escalation, or code execution.
+## Assumptions
+- The deployment uses the control-plane/runtime-map refresh path, e.g. a frontend or combined role with ARGMIN_CONTROL_PLANE_SOCKET_PATH configured.
+- The attacker can reach the argmin-s3 HTTP listener and can start a write operation, either with valid S3 write credentials or via an intentionally public-write bucket/policy.
+- A control-plane route-map publication/refresh occurs while the attacker's streaming upload is still admitted.
+- reachable HTTP S3 endpoint
+- write-authorized PutObject, POST Object, or UploadPart request
+- control-plane-enabled runtime-map refresh/publication path
+## Path
+S3 client -> streaming write -> admission permit held during slow body -> runtime-map install -> Draining waits for active_requests=0 -> later requests stall/fail
+## Path evidence
+- `crates/argmin-s3/src/config.rs:440-495` - Default listener is 127.0.0.1:9000 and max connection/in-flight request limits are environment-configurable.
+- `crates/argmin-s3/src/main.rs:6548-6632` - The main argmin-s3 binary binds a TCP listener, optionally enables TLS, and starts the HTTP server with configured connection and in-flight limits.
+- `crates/argmin-s3/src/main.rs:6635-6657` - If a control-plane socket is configured, the frontend starts the runtime-map refresh loop that can call the blocking publication path.
+- `crates/server-http/src/http/mod.rs:4142-4145` - Streaming PutObject authenticates and then acquires storage route admission before body streaming.
+- `crates/server-http/src/http/mod.rs:4274-4277` - The acquired route admission is stored in StreamingPutContext, extending the permit lifetime.
+- `crates/server-http/src/http/mod.rs:4777-4820` - Streaming PutObject, PostObject, and UploadPart contexts all contain _storage_route_admission.
+- `crates/server-http/src/http/serve.rs:182-213` - ServeConfig documents body_idle_timeout as a per-frame idle timeout that resets on each chunk and defaults to 30 seconds.
+- `crates/server-http/src/http/serve.rs:3112-3125` - The PutObject streaming loop keeps the Arc context alive while waiting for each frame with tokio::time::timeout(idle_timeout, body.frame()).
+- `crates/server-http/src/http/serve.rs:3996-4001` - UploadPart uses the same per-frame timeout body loop while the streaming part context is live.
+- `crates/storage/src/cluster.rs:1302-1321` - Route admission waits unless the transition state is Open and increments active_requests for admitted requests.
+- `crates/storage/src/cluster.rs:1324-1347` - Runtime-map publication sets the shared gate to Draining and waits until active_requests reaches zero.
+- `crates/storage/src/cluster.rs:1387-1399` - The active request count is decremented only when the admission permit is dropped.
+- `crates/storage/src/cluster.rs:1610-1624` - install checks only that the candidate has bounded validity before begin_publication, with no post-drain validity recheck at this point.
+- `crates/storage/src/cluster.rs:1767-1787` - Control-plane runtime-map refresh obtains a candidate and calls install, reaching the blocking publication path.
+## Narrative
+The finding is a real, reachable availability issue for control-plane-enabled argmin-s3 deployments. Streaming write handlers authenticate/authorize, then acquire a storage route admission and store it in the streaming context. The async body loops keep that context alive while waiting on a per-frame idle timeout, so a slow client can keep active_requests nonzero with minimal traffic. Runtime-map install calls begin_publication, which changes the shared gate to Draining and waits for all active requests to finish; while not Open, later admissions wait. The code also only checks that a candidate has bounded validity before the drain, not that it is still valid after a prolonged wait. Severity remains medium: it is network-triggerable and can affect service availability, but it requires write authorization or public-write configuration plus a control-plane refresh deployment, and it does not directly compromise confidentiality or integrity.
+## Controls
+- S3 SigV4/header or POST policy authentication before ordinary private writes
+- Coordinator authorization for PutObject/PostObject/UploadPart writes
+- Configurable max_connections and max_inflight_requests
+- Header and per-frame body idle timeouts
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Non-root process startup enforcement
+## Blindspots
+- No Kubernetes, Terraform, Docker Compose, or other deployment manifests were present, so actual public exposure and load balancer type could not be confirmed.
+- README describes frontend/combined remote-routing modes as in-progress/unsupported, while current code has configuration and tests for control-plane frontend refresh; real-world prevalence is uncertain.
+- Static repository review cannot measure operator-specific upload timeouts, reverse-proxy buffering, or external rate limiting that may reduce exploitability.
