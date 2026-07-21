@@ -247,14 +247,16 @@ async fn race_conditional_delete_with_put(
     let put_key = key.to_string();
     let put = tokio::spawn(async move {
         barrier.wait().await;
-        put_client
-            .put_object()
-            .bucket(put_bucket)
-            .key(put_key)
-            .metadata("replacement-state", replacement_state)
-            .body(ByteStream::from_static(replacement_body))
-            .send()
-            .await
+        s3_tests::retrying_exact_operation_aborted_result(|| {
+            let request = put_client
+                .put_object()
+                .bucket(put_bucket.clone())
+                .key(put_key.clone())
+                .metadata("replacement-state", replacement_state)
+                .body(ByteStream::from_static(replacement_body));
+            async move { request.send().await }
+        })
+        .await
     });
 
     let (delete, put) = tokio::join!(delete, put);
@@ -2590,7 +2592,9 @@ fn test_delete_object_ifmatch_races_current_replacement_across_versioning_states
                 .delete_object()
                 .bucket(marker_bucket)
                 .key(marker_race_key)
-                .send()
+                .send_retrying_exact_operation_aborted(
+                    "conditional delete-race competing marker insertion",
+                )
                 .await
         });
         let (conditional, marker) = tokio::join!(conditional, marker);

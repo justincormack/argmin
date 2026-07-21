@@ -287,17 +287,56 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
 {
-    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    retrying_operation_contention_result(
+        &mut op,
+        OperationContentionRetryScope::OperationAbortedOrSlowDown,
+    )
+    .await
+}
+
+pub async fn retrying_exact_operation_aborted_result<T, E, F, Fut>(
+    mut op: F,
+) -> Result<T, aws_sdk_s3::error::SdkError<E>>
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
+    retrying_operation_contention_result(
+        &mut op,
+        OperationContentionRetryScope::OperationAbortedOnly,
+    )
+    .await
+}
+
+async fn retrying_operation_contention_result<T, E, F, Fut>(
+    op: &mut F,
+    scope: OperationContentionRetryScope,
+) -> Result<T, aws_sdk_s3::error::SdkError<E>>
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
     let deadline = std::time::Instant::now() + configured_test_timeout();
+    let mut retry_error = None;
 
     loop {
+        if let Some(err) = retry_error.take() {
+            let Some(delay) = operation_contention_retry_delay(deadline, std::time::Instant::now())
+            else {
+                return Err(err);
+            };
+            tokio::time::sleep(delay).await;
+            if std::time::Instant::now() >= deadline {
+                return Err(err);
+            }
+        }
+
         match op().await {
             Ok(output) => return Ok(output),
-            Err(err)
-                if is_retryable_operation_contention(&err)
-                    && std::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(RETRY_DELAY).await;
+            Err(err) if scope.includes_sdk_error(&err, false) => {
+                retry_error = Some(err);
             }
             Err(err) => return Err(err),
         }
