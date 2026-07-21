@@ -1658,6 +1658,8 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    // One connection for each lifecycle RPC below: list, roots, acquire,
+    // heartbeat, record-error, and release.
     let server_threads: Vec<_> = (0..6)
         .map(|_| {
             let server = Arc::clone(&server);
@@ -2347,10 +2349,20 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
             })
             .find(|(_, pg_id)| *pg_id < 2)
             .expect("two-PG topology must place a test bucket");
-        let pg = node.get_pg(correct_pg_id).unwrap();
-        PgMetadataStore::create_bucket(&*pg, &bucket, "owner", &owner, &acl_grants, false, false)
+        for pg_id in [correct_pg_id, if correct_pg_id == 0 { 1 } else { 0 }] {
+            let pg = node.get_pg(pg_id).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &acl_grants,
+                false,
+                false,
+            )
             .unwrap();
-        pg.refresh_metadata_command_state_digest().unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
         (
             bucket,
             correct_pg_id,
@@ -2360,7 +2372,9 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..3)
+    // One connection for each RPC below: head, correct snapshot, wrong
+    // snapshot, two pair orderings, create-command, and reservation acquire.
+    let server_threads: Vec<_> = (0..7)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2377,7 +2391,66 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
         BucketMetadataNodeClient::head_bucket_raw(&client, wrong_bucket_pg, &bucket).unwrap_err();
     assert!(matches!(
         head_error,
-        BucketSnapshotLoadError::Store(StoreError::StorageRpc { .. })
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let correct_bucket_pg = BucketPgId::new_for_test(PgId::new(correct_pg_id));
+    let correct_snapshot = BucketMetadataNodeClient::load_bucket_snapshot(
+        &client,
+        correct_bucket_pg,
+        &bucket,
+        crate::BucketSnapshotRequest::default(),
+    )
+    .unwrap();
+    assert_eq!(correct_snapshot.bucket.name, bucket);
+
+    let snapshot_error = BucketMetadataNodeClient::load_bucket_snapshot(
+        &client,
+        wrong_bucket_pg,
+        &bucket,
+        crate::BucketSnapshotRequest::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        snapshot_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let pair_error = BucketMetadataNodeClient::load_bucket_snapshot_pair(
+        &client,
+        wrong_bucket_pg,
+        (&bucket, crate::BucketSnapshotRequest::default()),
+        correct_bucket_pg,
+        (&bucket, crate::BucketSnapshotRequest::default()),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        pair_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    let destination_pair_error = BucketMetadataNodeClient::load_bucket_snapshot_pair(
+        &client,
+        correct_bucket_pg,
+        (&bucket, crate::BucketSnapshotRequest::default()),
+        wrong_bucket_pg,
+        (&bucket, crate::BucketSnapshotRequest::default()),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        destination_pair_error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
     ));
 
     let create_config = crate::CreateBucketConfig {
@@ -2408,7 +2481,10 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
     .unwrap_err();
     assert!(matches!(
         create_error,
-        BucketSnapshotLoadError::Store(StoreError::StorageRpc { .. })
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
     ));
 
     let reservation_error =
@@ -2427,10 +2503,16 @@ fn unix_bucket_clients_reject_wrong_bucket_pg_before_bucket_access() {
             },
         )
         .unwrap_err();
-    assert!(matches!(
-        reservation_error,
-        BucketSnapshotLoadError::Store(StoreError::StorageRpc { .. })
-    ));
+    assert!(
+        matches!(
+            reservation_error,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                code: StorageRpcErrorCode::PayloadDecode,
+                ..
+            })
+        ),
+        "unexpected wrong-PG reservation error: {reservation_error:?}"
+    );
 
     for thread in server_threads {
         thread.join().unwrap();

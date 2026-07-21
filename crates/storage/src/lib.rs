@@ -68,7 +68,7 @@ mod traits {
 }
 
 pub use cluster::{
-    ActiveBucketRoute, BucketWriteSnapshotAction, DurableReclaimScanOutcome,
+    ActiveBucketRoute, ActiveBucketRoutePair, BucketWriteSnapshotAction, DurableReclaimScanOutcome,
     LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,

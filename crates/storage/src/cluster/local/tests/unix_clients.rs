@@ -1830,6 +1830,26 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
         outcome,
         crate::BucketCreateAttemptOutcome::Created(_)
     ));
+    let destination_bucket = crate::tests::bucket_name("remote-bucket-metadata-destination");
+    let destination_config = crate::CreateBucketConfig {
+        name: destination_bucket.as_str(),
+        owner_principal: "owner",
+        owner_canonical_id: &owner,
+        acl_grants: &acl_grants,
+        public_read: false,
+        public_write: false,
+        versioning: crate::BucketVersioningState::Disabled,
+        object_lock: crate::BucketObjectLockConfig::default(),
+        ownership_controls: crate::BucketOwnershipControls {
+            object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+        },
+    };
+    assert!(matches!(
+        cluster
+            .create_bucket_with_config_and_load_info(&destination_config)
+            .unwrap(),
+        crate::BucketCreateAttemptOutcome::Created(_)
+    ));
 
     let runtime_map = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
     let admission = runtime_map.admit_current_route().unwrap();
@@ -1841,6 +1861,45 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
             .unwrap(),
         None
     );
+    assert_eq!(
+        active_bucket_route
+            .load_bucket_snapshot(crate::BucketSnapshotRequest::default())
+            .unwrap()
+            .bucket
+            .name,
+        bucket
+    );
+    let pair = admission
+        .active_bucket_route_pair(&bucket, &destination_bucket)
+        .unwrap()
+        .load_bucket_snapshot_pair(
+            crate::BucketSnapshotRequest::default(),
+            crate::BucketSnapshotRequest::default(),
+        )
+        .unwrap();
+    match pair {
+        crate::BucketSnapshotPair::Distinct {
+            source,
+            destination,
+        } => {
+            assert_eq!(source.bucket.name, bucket);
+            assert_eq!(destination.bucket.name, destination_bucket);
+        }
+        crate::BucketSnapshotPair::Same { .. } => {
+            panic!("distinct bucket routes returned a same-bucket snapshot")
+        }
+    }
+    assert!(matches!(
+        admission
+            .active_bucket_route_pair(&bucket, &bucket)
+            .unwrap()
+            .load_bucket_snapshot_pair(
+                crate::BucketSnapshotRequest::default(),
+                crate::BucketSnapshotRequest::default(),
+            )
+            .unwrap(),
+        crate::BucketSnapshotPair::Same { .. }
+    ));
 
     let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
     assert!(crate::PgMetadataStore::head_bucket_raw(&*frontend_pg, &bucket).is_err());

@@ -1206,6 +1206,45 @@ Twenty-first Phase 3 slice:
   integration regressions, workspace-wide strict Clippy, and the full
   parallel workspace suite (7,326 tests).
 
+Twenty-second Phase 3 slice:
+
+- `ActiveBucketRoute` now covers a full single-bucket authorization snapshot,
+  while the new non-`Clone` `ActiveBucketRoutePair` fixes both bucket subjects
+  and their installed bucket PGs for CopyObject-style two-bucket snapshots.
+  The pair preserves the existing same-bucket request union and deterministic
+  cross-PG load order, but revalidates the admission's captured deadline
+  before each node selection and node-client access.
+- the Unix storage-node `BucketSnapshotLoad` and `BucketSnapshotPairLoad`
+  handlers now require the exact active frame permit and derive corresponding
+  server-local bucket capabilities before accessing `LocalStorageNodeClient`.
+  Both sides of a pair independently validate node, epoch, route, primary,
+  bucket placement, admission class, and admission domain. Snapshot loading
+  revalidates the coherent frame deadline immediately before node access.
+- the frontend Unix integration canary now creates two storage-node-owned
+  buckets and reads both a single authorization snapshot and a distinct
+  snapshot pair through the public admitted-route capabilities. The
+  deterministic deadline regressions cover single and paired snapshots on
+  both the frontend and server-local capabilities.
+- the two-PG adversarial Unix regression stores the same bucket on both PGs,
+  proves the correctly routed snapshot succeeds, and requires exact
+  `PayloadDecode` placement failures for a forged wrong role in either side of
+  a snapshot pair and at the durable write-reservation boundary. Equivalent
+  wrong-PG durable state ensures missing data cannot mask a server-side
+  validation gap. Its one-shot server acceptor count exactly matches all seven
+  asserted RPCs, so a client timeout cannot masquerade as placement rejection.
+- full-suite validation exposed an existing lifecycle-sweep Unix RPC test that
+  started seven one-shot server acceptors for six requests and then waited
+  forever for the unused thread. Its acceptor count now documents and exactly
+  matches the six exercised RPCs.
+- unguarded compatibility methods remain while their coordinator callers are
+  migrated. Bucket mutation command building, write reservations,
+  retained-cleanup/recovery authority, object/data operations, and capability
+  requirements on the node-client traits remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, all 161
+  storage-node server tests, three compile-fail API boundary doctests, the
+  focused local and Unix snapshot regressions, workspace-wide checks and
+  strict Clippy, and the full parallel workspace suite (7,326 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

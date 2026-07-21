@@ -2026,6 +2026,27 @@ fn bucket_snapshot_pair_routes_to_bucket_pg_primaries() {
         pair.destination().cors,
         crate::LoadedBucketSubresource::Loaded("<CORSConfiguration/>".to_string())
     );
+
+    let runtime_map = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&cluster));
+    let admission = runtime_map.admit_current_route().unwrap();
+    let admitted_pair = admission
+        .active_bucket_route_pair(&source_bucket, &destination_bucket)
+        .unwrap()
+        .load_bucket_snapshot_pair(
+            crate::BucketSnapshotRequest {
+                tags: crate::BucketSnapshotTagsRequest::Always,
+                ..Default::default()
+            },
+            crate::BucketSnapshotRequest {
+                cors: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(admitted_pair.source().bucket.name, source_bucket);
+    assert_eq!(admitted_pair.destination().bucket.name, destination_bucket);
+    assert_eq!(admitted_pair.source().tags, pair.source().tags);
+    assert_eq!(admitted_pair.destination().cors, pair.destination().cors);
 }
 
 #[test]

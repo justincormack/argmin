@@ -69,11 +69,12 @@ use crate::storage_rpc::{
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 use crate::types::{
-    BucketInfo, BucketName, BucketSubresourceKind, BucketWriteDrainRecord,
-    BucketWriteReservationRecord, ClusterEpoch, CommitDirectPutObjectReq, CreateStreamUploadReq,
-    DirectPutCommitSnapshot, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
-    GenerationId, MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout,
-    ObjectReadSnapshot, ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
+    BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
+    BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
+    CommitDirectPutObjectReq, CreateStreamUploadReq, DirectPutCommitSnapshot,
+    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectReadSnapshot,
+    ObjectSegmentRecord, PgId, PgState, PlacedSegmentShardBackfillClaimAcquire,
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
@@ -1475,6 +1476,23 @@ impl StorageClusterRouteAdmission {
             pg_id: self.cluster.bucket_metadata_pg(bucket),
         })
     }
+
+    /// Derive active bucket-metadata authority for a snapshot spanning two
+    /// buckets from this request's admitted runtime-map generation.
+    pub fn active_bucket_route_pair<'admission>(
+        &'admission self,
+        source: &BucketName,
+        destination: &BucketName,
+    ) -> Result<ActiveBucketRoutePair<'admission>, StoreError> {
+        self.require_valid_now()?;
+        Ok(ActiveBucketRoutePair {
+            admission: self,
+            source: source.clone(),
+            source_pg_id: self.cluster.bucket_metadata_pg(source),
+            destination: destination.clone(),
+            destination_pg_id: self.cluster.bucket_metadata_pg(destination),
+        })
+    }
 }
 
 /// Non-cloneable active bucket-metadata authority derived from one admitted
@@ -1521,6 +1539,123 @@ impl ActiveBucketRoute<'_> {
             .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
             .bucket_metadata_client()
             .get_bucket_subresource(self.pg_id, &self.bucket, kind)
+    }
+
+    pub fn load_bucket_snapshot(
+        &self,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        self.admission.require_valid_now()?;
+        let cluster = &self.admission.cluster;
+        cluster
+            .local_map
+            .metadata_pg_primary_node(cluster.operation_epoch(), self.pg_id.pg_id())?
+            .bucket_metadata_client()
+            .load_bucket_snapshot(self.pg_id, &self.bucket, request)
+    }
+}
+
+/// Non-cloneable active authority for a two-bucket metadata snapshot.
+///
+/// Both bucket identities and routed PGs are fixed at construction. Each node
+/// access rechecks the request admission's captured deadline.
+///
+/// ```compile_fail
+/// use storage::ActiveBucketRoutePair;
+///
+/// fn require_clone<T: Clone>(_: &T) {}
+/// fn cache_route(route: &ActiveBucketRoutePair<'_>) {
+///     require_clone(route);
+/// }
+/// ```
+pub struct ActiveBucketRoutePair<'admission> {
+    admission: &'admission StorageClusterRouteAdmission,
+    source: BucketName,
+    source_pg_id: BucketPgId,
+    destination: BucketName,
+    destination_pg_id: BucketPgId,
+}
+
+impl ActiveBucketRoutePair<'_> {
+    pub fn load_bucket_snapshot_pair(
+        &self,
+        source_request: BucketSnapshotRequest,
+        destination_request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
+        if self.source == self.destination {
+            let merged_request = source_request.union(destination_request);
+            self.admission.require_valid_now()?;
+            let cluster = &self.admission.cluster;
+            let bucket = cluster
+                .local_map
+                .metadata_pg_primary_node(cluster.operation_epoch(), self.source_pg_id.pg_id())?
+                .bucket_metadata_client()
+                .load_bucket_snapshot(self.source_pg_id, &self.source, merged_request)?;
+            return Ok(BucketSnapshotPair::Same {
+                bucket: Box::new(bucket),
+            });
+        }
+
+        let cluster = &self.admission.cluster;
+        self.admission.require_valid_now()?;
+        let source_node = cluster
+            .local_map
+            .metadata_pg_primary_node(cluster.operation_epoch(), self.source_pg_id.pg_id())?;
+        self.admission.require_valid_now()?;
+        let destination_node = cluster
+            .local_map
+            .metadata_pg_primary_node(cluster.operation_epoch(), self.destination_pg_id.pg_id())?;
+        if source_node.node_id() == destination_node.node_id() {
+            self.admission.require_valid_now()?;
+            return source_node
+                .bucket_metadata_client()
+                .load_bucket_snapshot_pair(
+                    self.source_pg_id,
+                    (&self.source, source_request),
+                    self.destination_pg_id,
+                    (&self.destination, destination_request),
+                );
+        }
+
+        let (source_snapshot, destination_snapshot) =
+            if self.source_pg_id.pg_id().get() < self.destination_pg_id.pg_id().get() {
+                self.admission.require_valid_now()?;
+                let source_snapshot = source_node.bucket_metadata_client().load_bucket_snapshot(
+                    self.source_pg_id,
+                    &self.source,
+                    source_request,
+                )?;
+                self.admission.require_valid_now()?;
+                let destination_snapshot = destination_node
+                    .bucket_metadata_client()
+                    .load_bucket_snapshot(
+                        self.destination_pg_id,
+                        &self.destination,
+                        destination_request,
+                    )?;
+                (source_snapshot, destination_snapshot)
+            } else {
+                self.admission.require_valid_now()?;
+                let destination_snapshot = destination_node
+                    .bucket_metadata_client()
+                    .load_bucket_snapshot(
+                        self.destination_pg_id,
+                        &self.destination,
+                        destination_request,
+                    )?;
+                self.admission.require_valid_now()?;
+                let source_snapshot = source_node.bucket_metadata_client().load_bucket_snapshot(
+                    self.source_pg_id,
+                    &self.source,
+                    source_request,
+                )?;
+                (source_snapshot, destination_snapshot)
+            };
+
+        Ok(BucketSnapshotPair::Distinct {
+            source: Box::new(source_snapshot),
+            destination: Box::new(destination_snapshot),
+        })
     }
 }
 
@@ -2414,8 +2549,14 @@ mod runtime_map_refresh_invalidation_tests {
         let admission =
             crate::clock::with_time_override(1_000, || handle.admit_current_route().unwrap());
         let bucket = BucketName::try_from("capability-bucket").unwrap();
+        let destination = BucketName::try_from("capability-destination").unwrap();
         let route = crate::clock::with_time_override(1_000, || {
             admission.active_bucket_route(&bucket).unwrap()
+        });
+        let pair_route = crate::clock::with_time_override(1_000, || {
+            admission
+                .active_bucket_route_pair(&bucket, &destination)
+                .unwrap()
         });
 
         crate::clock::with_time_override(1_000, || {
@@ -2425,6 +2566,25 @@ mod runtime_map_refresh_invalidation_tests {
             cluster.require_route_map_valid_now().unwrap();
             assert!(matches!(
                 route.head_bucket_info(),
+                Err(BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
+                    cluster_epoch,
+                    valid_until_ms: 5_000,
+                    now_ms: 6_000,
+                })) if cluster_epoch == ClusterEpoch::INITIAL
+            ));
+            assert!(matches!(
+                route.load_bucket_snapshot(BucketSnapshotRequest::default()),
+                Err(BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
+                    cluster_epoch,
+                    valid_until_ms: 5_000,
+                    now_ms: 6_000,
+                })) if cluster_epoch == ClusterEpoch::INITIAL
+            ));
+            assert!(matches!(
+                pair_route.load_bucket_snapshot_pair(
+                    BucketSnapshotRequest::default(),
+                    BucketSnapshotRequest::default(),
+                ),
                 Err(BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
                     cluster_epoch,
                     valid_until_ms: 5_000,

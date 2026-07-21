@@ -307,8 +307,9 @@ use crate::types::{
 };
 use crate::DataPgId;
 use crate::{
-    BucketInfo, BucketName, BucketSubresourceKind, EcShape, NodeId, ObjectKey, ObjectPgActionError,
-    RouteMapValidity, ShardKey, ShardLocation,
+    BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
+    BucketSubresourceKind, EcShape, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity,
+    ShardKey, ShardLocation,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
@@ -3044,6 +3045,11 @@ struct StorageNodeActiveBucketRoute<'a> {
     bucket: &'a BucketName,
 }
 
+struct StorageNodeActiveBucketRoutePair<'a> {
+    source: StorageNodeActiveBucketRoute<'a>,
+    destination: StorageNodeActiveBucketRoute<'a>,
+}
+
 impl StorageNodeActiveBucketRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageNodeActiveBucketRouteError> {
         self.fence
@@ -3082,6 +3088,47 @@ impl StorageNodeActiveBucketRoute<'_> {
             self.pg_id,
             self.bucket,
             kind,
+        )
+        .map_err(StorageNodeActiveBucketRouteError::Bucket)
+    }
+
+    fn load_snapshot(
+        &self,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, StorageNodeActiveBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketMetadataNodeClient::load_bucket_snapshot(
+            &local_client,
+            self.pg_id,
+            self.bucket,
+            request,
+        )
+        .map_err(StorageNodeActiveBucketRouteError::Bucket)
+    }
+}
+
+impl StorageNodeActiveBucketRoutePair<'_> {
+    fn load_snapshot_pair(
+        &self,
+        source_request: BucketSnapshotRequest,
+        destination_request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshotPair, StorageNodeActiveBucketRouteError> {
+        self.source.require_valid_now()?;
+        self.destination.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.source.handler.config.node_id,
+            Arc::clone(&self.source.handler.node),
+        );
+        BucketMetadataNodeClient::load_bucket_snapshot_pair(
+            &local_client,
+            self.source.pg_id,
+            (self.source.bucket, source_request),
+            self.destination.pg_id,
+            (self.destination.bucket, destination_request),
         )
         .map_err(StorageNodeActiveBucketRouteError::Bucket)
     }
@@ -4675,7 +4722,7 @@ impl StorageNodeConnectionHandler {
             },
             StorageRpcMessageKind::BucketSnapshotLoad => {
                 match decode_bucket_snapshot_request(&frame.payload) {
-                    Ok(request) => self.bucket_snapshot_response(request),
+                    Ok(request) => self.bucket_snapshot_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4684,7 +4731,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketSnapshotPairLoad => {
                 match decode_bucket_snapshot_pair_request(&frame.payload) {
-                    Ok(request) => self.bucket_snapshot_pair_response(request),
+                    Ok(request) => self.bucket_snapshot_pair_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -7950,81 +7997,53 @@ impl StorageNodeConnectionHandler {
 
     fn bucket_snapshot_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.bucket.node_id,
-            request.bucket.cluster_epoch,
-            request.bucket.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.bucket.pg_id,
-            &request.bucket.bucket,
-            "bucket snapshot load",
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketMetadataNodeClient::load_bucket_snapshot(
-            &local_client,
-            bucket_pg_id,
-            &request.bucket.bucket,
-            request.request,
-        ) {
+        let route =
+            match self.active_bucket_route(route_permit, &request.bucket, "bucket snapshot load") {
+                Ok(route) => route,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            };
+        match route.load_snapshot(request.request) {
             Ok(snapshot) => {
                 let payload = encode_bucket_snapshot_response(&StorageRpcBucketSnapshotResponse {
                     outcome: StorageRpcBucketSnapshotOutcome::Loaded(Box::new(snapshot)),
                 });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name })) => {
+            Err(StorageNodeActiveBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketNotFound { name },
+            ))) => {
                 let payload = encode_bucket_snapshot_response(&StorageRpcBucketSnapshotResponse {
                     outcome: StorageRpcBucketSnapshotOutcome::BucketNotFound { name },
                 });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_snapshot_pair_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketSnapshotPairRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        for bucket in [&request.source.bucket, &request.destination.bucket] {
-            if let Err(error) =
-                self.validate_pg_route(bucket.node_id, bucket.cluster_epoch, bucket.pg_id)
-            {
-                return encode_storage_rpc_error_response(&error);
-            }
-            if let Err(error) = self.validate_primary_pg_for_bucket(
-                bucket.pg_id,
-                &bucket.bucket,
-                "bucket snapshot pair load",
-            ) {
-                return encode_storage_rpc_error_response(&error);
-            }
-        }
-        let source_bucket_pg_id = self
-            .node
-            .bucket_metadata_pg_for(&request.source.bucket.bucket);
-        let destination_bucket_pg_id = self
-            .node
-            .bucket_metadata_pg_for(&request.destination.bucket.bucket);
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketMetadataNodeClient::load_bucket_snapshot_pair(
-            &local_client,
-            source_bucket_pg_id,
-            (&request.source.bucket.bucket, request.source.request),
-            destination_bucket_pg_id,
-            (
-                &request.destination.bucket.bucket,
-                request.destination.request,
-            ),
+        let route = match self.active_bucket_route_pair(
+            route_permit,
+            &request.source.bucket,
+            &request.destination.bucket,
+            "bucket snapshot pair load",
         ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.load_snapshot_pair(request.source.request, request.destination.request) {
             Ok(pair) => {
                 let payload =
                     encode_bucket_snapshot_pair_response(&StorageRpcBucketSnapshotPairResponse {
@@ -8032,14 +8051,21 @@ impl StorageNodeConnectionHandler {
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name })) => {
+            Err(StorageNodeActiveBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketNotFound { name },
+            ))) => {
                 let payload =
                     encode_bucket_snapshot_pair_response(&StorageRpcBucketSnapshotPairResponse {
                         outcome: StorageRpcBucketSnapshotPairOutcome::BucketNotFound { name },
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -12209,6 +12235,21 @@ impl StorageNodeConnectionHandler {
         })
     }
 
+    fn active_bucket_route_pair<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        source: &'a StorageRpcBucketRequest,
+        destination: &'a StorageRpcBucketRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeActiveBucketRoutePair<'a>, StorageRpcErrorResponse> {
+        let source = self.active_bucket_route(route_permit, source, operation)?;
+        let destination = self.active_bucket_route(route_permit, destination, operation)?;
+        Ok(StorageNodeActiveBucketRoutePair {
+            source,
+            destination,
+        })
+    }
+
     fn validate_bucket_batch_route(
         &self,
         request: &StorageRpcBucketBatchRequest,
@@ -16204,9 +16245,11 @@ mod tests {
             StorageNodeServer::bind(config.clone()).unwrap()
         }));
         let bucket = crate::tests::bucket_name("active-route-bucket");
+        let destination_bucket = crate::tests::bucket_name("active-route-destination");
         crate::clock::with_time_override(1_000, || {
             let pg = server._node.get_pg(0).unwrap();
             create_probe_bucket_direct(&pg, &bucket);
+            create_probe_bucket_direct(&pg, &destination_bucket);
         });
         let mut handler = server.connection_handler();
         let route_permit = server
@@ -16217,6 +16260,12 @@ mod tests {
             cluster_epoch: config.cluster_epoch,
             pg_id: PgId::new(0),
             bucket: bucket.clone(),
+        };
+        let destination_request = StorageRpcBucketRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: destination_bucket.clone(),
         };
         let foreign_permit = StorageNodeRouteAdmissionGate::default()
             .acquire(StorageNodeRouteAdmissionClass::Active);
@@ -16297,12 +16346,48 @@ mod tests {
                 .active_bucket_route(&route_permit, &request, "test bucket read")
                 .unwrap()
         });
+        let pair_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_bucket_route_pair(
+                    &route_permit,
+                    &request,
+                    &destination_request,
+                    "test bucket pair read",
+                )
+                .unwrap()
+        });
         crate::clock::with_time_override(1_000, || {
             assert_eq!(route.head_bucket(true).unwrap().name, bucket);
             assert_eq!(
                 route.get_subresource(BucketSubresourceKind::Cors).unwrap(),
                 None
             );
+            assert_eq!(
+                route
+                    .load_snapshot(BucketSnapshotRequest::default())
+                    .unwrap()
+                    .bucket
+                    .name,
+                bucket
+            );
+            match pair_route
+                .load_snapshot_pair(
+                    BucketSnapshotRequest::default(),
+                    BucketSnapshotRequest::default(),
+                )
+                .unwrap()
+            {
+                BucketSnapshotPair::Distinct {
+                    source,
+                    destination,
+                } => {
+                    assert_eq!(source.bucket.name, bucket);
+                    assert_eq!(destination.bucket.name, destination_bucket);
+                }
+                BucketSnapshotPair::Same { .. } => {
+                    panic!("distinct active routes returned a same-bucket snapshot")
+                }
+            }
         });
 
         crate::clock::with_time_override(6_000, || match route.head_bucket(true) {
@@ -16314,6 +16399,21 @@ mod tests {
                 panic!("captured route should expire before node access: {error}")
             }
             Ok(info) => panic!("expired captured route unexpectedly loaded {info:?}"),
+        });
+        crate::clock::with_time_override(6_000, || {
+            match pair_route.load_snapshot_pair(
+                BucketSnapshotRequest::default(),
+                BucketSnapshotRequest::default(),
+            ) {
+                Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                    assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+                }
+                Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+                    panic!("captured pair route should expire before node access: {error}")
+                }
+                Ok(pair) => panic!("expired captured pair route unexpectedly loaded {pair:?}"),
+            }
         });
     }
 
