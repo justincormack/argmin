@@ -309,8 +309,8 @@ use crate::DataPgId;
 use crate::{
     BucketDeleteFinalizeClaimRecord, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSubresourceKind, BucketWriteDrainRecord,
-    BucketWriteReservationProof, BucketWriteReservationRecord, EcShape, NodeId, ObjectKey,
-    ObjectPgActionError, RouteMapValidity, ShardKey, ShardLocation,
+    BucketWriteReservationProof, BucketWriteReservationRecord, EcShape, LifecycleSweepClaimRecord,
+    NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey, ShardLocation,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
@@ -3139,6 +3139,16 @@ struct StorageNodeRetainedBucketDeleteFinalizeClaimRoute<'a> {
     claim: &'a BucketDeleteFinalizeClaimRecord,
 }
 
+struct StorageNodeRetainedLifecycleSweepClaimRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    pg_id: BucketPgId,
+    claim: &'a LifecycleSweepClaimRecord,
+}
+
 impl StorageNodeActiveBucketRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
         self.fence
@@ -3445,6 +3455,106 @@ impl StorageNodeActiveBucketRoute<'_> {
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_lifecycle_sweep_claim(
+        &self,
+        bucket_incarnation_generation: u64,
+        claim_id: &str,
+        owner_token: &str,
+        cluster_epoch: ClusterEpoch,
+        claimed_at: u64,
+        lease_deadline: Option<u64>,
+        now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        if cluster_epoch != self.fence.cluster_epoch {
+            return Err(StorageNodeBucketRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "lifecycle sweep claim epoch does not match active route".to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
+            &local_client,
+            self.pg_id,
+            self.bucket,
+            bucket_incarnation_generation,
+            claim_id,
+            owner_token,
+            cluster_epoch,
+            claimed_at,
+            lease_deadline,
+            now,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn validate_lifecycle_sweep_claim_subject(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeBucketRouteError> {
+        if claim.bucket != *self.bucket
+            || claim.cluster_epoch != self.fence.cluster_epoch
+            || claim.pg_id != self.pg_id.get()
+        {
+            return Err(StorageNodeBucketRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!("{operation} claim does not match active route identity"),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn heartbeat_lifecycle_sweep_claim(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
+        heartbeat_at: u64,
+        lease_deadline: Option<u64>,
+    ) -> Result<LifecycleSweepClaimRecord, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        self.validate_lifecycle_sweep_claim_subject(claim, "lifecycle sweep claim heartbeat")?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
+            &local_client,
+            self.pg_id,
+            claim,
+            heartbeat_at,
+            lease_deadline,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn record_lifecycle_sweep_claim_error(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
+        last_error: &str,
+    ) -> Result<LifecycleSweepClaimRecord, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        self.validate_lifecycle_sweep_claim_subject(claim, "lifecycle sweep claim error")?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
+            &local_client,
+            self.pg_id,
+            claim,
+            last_error,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
 }
 
 impl StorageNodeActiveBucketRoutePair<'_> {
@@ -3613,6 +3723,47 @@ impl StorageNodeRetainedBucketDeleteFinalizeClaimRoute<'_> {
     }
 }
 
+impl StorageNodeRetainedLifecycleSweepClaimRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
+        if self.route_cluster_epoch != self.claim.cluster_epoch
+            || self.raw_pg_id.get() != self.claim.pg_id
+        {
+            return Err(StorageNodeBucketRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "lifecycle sweep claim does not match retained route identity"
+                        .to_string(),
+                },
+            ));
+        }
+        self.handler
+            .validate_retained_bucket_write_route(
+                self.route_permit,
+                self.node_id,
+                self.route_cluster_epoch,
+                self.raw_pg_id,
+                &self.claim.bucket,
+                "lifecycle sweep claim release",
+            )
+            .map(|_| ())
+            .map_err(StorageNodeBucketRouteError::Route)
+    }
+
+    fn release(self) -> Result<(), StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
+            &local_client,
+            self.pg_id,
+            self.claim,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+}
+
 macro_rules! metadata_command_pg_guard_or_return {
     ($handler:expr, $session:expr, $pg_id:expr) => {
         match $handler.metadata_command_pg_guard($session, $pg_id) {
@@ -3761,6 +3912,7 @@ impl StorageNodeConnectionHandler {
                     | StorageRpcMessageKind::BucketWriteReservationRelease
                     | StorageRpcMessageKind::BucketWriteDrainClear
                     | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
+                    | StorageRpcMessageKind::LifecycleSweepClaimRelease
                     | StorageRpcMessageKind::ShardDelete
                     | StorageRpcMessageKind::ShardAckDelete
                     | StorageRpcMessageKind::ObjectStreamUploadRetainedAbortPrepare
@@ -4105,7 +4257,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::LifecycleSweepClaimAcquire => {
                 match decode_lifecycle_sweep_claim_acquire_request(&frame.payload) {
-                    Ok(request) => self.lifecycle_sweep_claim_acquire_response(request),
+                    Ok(request) => {
+                        self.lifecycle_sweep_claim_acquire_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4114,7 +4268,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::LifecycleSweepClaimHeartbeat => {
                 match decode_lifecycle_sweep_claim_heartbeat_request(&frame.payload) {
-                    Ok(request) => self.lifecycle_sweep_claim_heartbeat_response(request),
+                    Ok(request) => {
+                        self.lifecycle_sweep_claim_heartbeat_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4123,7 +4279,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::LifecycleSweepClaimError => {
                 match decode_lifecycle_sweep_claim_error_request(&frame.payload) {
-                    Ok(request) => self.lifecycle_sweep_claim_error_response(request),
+                    Ok(request) => self.lifecycle_sweep_claim_error_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4132,7 +4288,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::LifecycleSweepClaimRelease => {
                 match decode_lifecycle_sweep_claim_record_request(&frame.payload) {
-                    Ok(request) => self.lifecycle_sweep_claim_release_response(request),
+                    Ok(request) => {
+                        self.lifecycle_sweep_claim_release_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6184,27 +6342,18 @@ impl StorageNodeConnectionHandler {
 
     fn lifecycle_sweep_claim_acquire_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcLifecycleSweepClaimAcquireRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.bucket.node_id,
-            request.bucket.cluster_epoch,
-            request.bucket.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.bucket.pg_id,
-            &request.bucket.bucket,
+        let route = match self.active_bucket_route(
+            route_permit,
+            &request.bucket,
             "lifecycle sweep claim acquire",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.bucket.pg_id),
-            &request.bucket.bucket,
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.acquire_lifecycle_sweep_claim(
             request.bucket_incarnation_generation,
             &request.claim_id,
             &request.owner_token,
@@ -6219,24 +6368,32 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn lifecycle_sweep_claim_heartbeat_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcLifecycleSweepClaimHeartbeatRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_lifecycle_sweep_claim_route(
-            &request.record,
+        let route = match self.active_bucket_route_for_parts(
+            route_permit,
+            request.record.node_id,
+            request.record.cluster_epoch,
+            request.record.pg_id,
+            &request.record.claim.bucket,
             "lifecycle sweep claim heartbeat",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.record.pg_id),
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.heartbeat_lifecycle_sweep_claim(
             &request.record.claim,
             request.heartbeat_at,
             request.lease_deadline,
@@ -6247,53 +6404,71 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn lifecycle_sweep_claim_error_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcLifecycleSweepClaimErrorRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self
-            .validate_lifecycle_sweep_claim_route(&request.record, "lifecycle sweep claim error")
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.record.pg_id),
-            &request.record.claim,
-            &request.last_error,
+        let route = match self.active_bucket_route_for_parts(
+            route_permit,
+            request.record.node_id,
+            request.record.cluster_epoch,
+            request.record.pg_id,
+            &request.record.claim.bucket,
+            "lifecycle sweep claim error",
         ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.record_lifecycle_sweep_claim_error(&request.record.claim, &request.last_error) {
             Ok(record) => {
                 let payload = encode_lifecycle_sweep_claim_record_response(
                     &StorageRpcLifecycleSweepClaimRecordResponse { record },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn lifecycle_sweep_claim_release_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcLifecycleSweepClaimRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self
-            .validate_lifecycle_sweep_claim_cleanup_route(&request, "lifecycle sweep claim release")
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
+        let route = match self.retained_lifecycle_sweep_claim_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
             &request.claim,
+            "lifecycle sweep claim release",
         ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.release() {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -12765,42 +12940,44 @@ impl StorageNodeConnectionHandler {
         Ok(())
     }
 
-    fn validate_lifecycle_sweep_claim_route(
-        &self,
-        request: &StorageRpcLifecycleSweepClaimRecordRequest,
+    fn retained_lifecycle_sweep_claim_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        claim: &'a LifecycleSweepClaimRecord,
         operation: &'static str,
-    ) -> Result<(), StorageRpcErrorResponse> {
-        self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
-        if request.claim.pg_id != request.pg_id.get() {
+    ) -> Result<StorageNodeRetainedLifecycleSweepClaimRoute<'a>, StorageRpcErrorResponse> {
+        if route_cluster_epoch != claim.cluster_epoch || pg_id.get() != claim.pg_id {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::PayloadDecode,
                 message: format!(
-                    "{operation} request PG {} does not match claim PG {}",
-                    request.pg_id.get(),
-                    request.claim.pg_id
+                    "{operation} route epoch/PG ({}, {}) does not match claim ({}, {})",
+                    route_cluster_epoch.get(),
+                    pg_id.get(),
+                    claim.cluster_epoch.get(),
+                    claim.pg_id
                 ),
             });
         }
-        self.validate_primary_pg_for_bucket(request.pg_id, &request.claim.bucket, operation)
-    }
-
-    fn validate_lifecycle_sweep_claim_cleanup_route(
-        &self,
-        request: &StorageRpcLifecycleSweepClaimRecordRequest,
-        operation: &'static str,
-    ) -> Result<(), StorageRpcErrorResponse> {
-        self.validate_pg_route_for_cleanup(request.node_id, request.cluster_epoch, request.pg_id)?;
-        if request.claim.pg_id != request.pg_id.get() {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::PayloadDecode,
-                message: format!(
-                    "{operation} request PG {} does not match claim PG {}",
-                    request.pg_id.get(),
-                    request.claim.pg_id
-                ),
-            });
-        }
-        self.validate_primary_pg_for_bucket(request.pg_id, &request.claim.bucket, operation)
+        let pg_id = self.validate_retained_bucket_write_route(
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            pg_id,
+            &claim.bucket,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedLifecycleSweepClaimRoute {
+            handler: self,
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            raw_pg_id: pg_id.pg_id(),
+            pg_id,
+            claim,
+        })
     }
 
     fn validate_bucket_metadata_control_route(
@@ -15299,7 +15476,7 @@ mod tests {
                     "captured-route-finalize-owner",
                     config.cluster_epoch,
                     1_000,
-                    Some(4_500),
+                    None,
                     1_000,
                 )
                 .unwrap()
@@ -15416,6 +15593,219 @@ mod tests {
                 .is_none(),
             "retained capability must release the exact claim after active route expiry"
         );
+    }
+
+    #[test]
+    fn lifecycle_sweep_claim_capabilities_separate_active_and_retained_authority() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("lifecycle-sweep-claim-capability");
+        let bucket_incarnation_generation = crate::clock::with_time_override(1_000, || {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            PgMetadataStore::put_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .bucket_incarnation_generation
+        });
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcBucketRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+        };
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_bucket_route(&active_permit, &request, "test lifecycle sweep claim")
+                .unwrap()
+        });
+        let claim = crate::clock::with_time_override(1_000, || {
+            route
+                .acquire_lifecycle_sweep_claim(
+                    bucket_incarnation_generation,
+                    "captured-route-lifecycle-claim",
+                    "captured-route-lifecycle-owner",
+                    config.cluster_epoch,
+                    1_000,
+                    Some(4_500),
+                    1_000,
+                )
+                .unwrap()
+                .expect("active route should acquire a lifecycle claim")
+        });
+        let heartbeat = crate::clock::with_time_override(1_500, || {
+            route
+                .heartbeat_lifecycle_sweep_claim(&claim, 1_500, None)
+                .unwrap()
+        });
+        let error_record = crate::clock::with_time_override(1_500, || {
+            route
+                .record_lifecycle_sweep_claim_error(&heartbeat, "transient lifecycle failure")
+                .unwrap()
+        });
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_500, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        crate::clock::with_time_override(6_000, || {
+            let expired_operations = [
+                (
+                    "acquire",
+                    route
+                        .acquire_lifecycle_sweep_claim(
+                            bucket_incarnation_generation,
+                            "expired-route-lifecycle-claim",
+                            "expired-route-lifecycle-owner",
+                            config.cluster_epoch,
+                            6_000,
+                            Some(9_000),
+                            6_000,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "heartbeat",
+                    route
+                        .heartbeat_lifecycle_sweep_claim(&error_record, 6_000, Some(9_000))
+                        .map(|_| ()),
+                ),
+                (
+                    "record error",
+                    route
+                        .record_lifecycle_sweep_claim_error(&error_record, "must not be recorded")
+                        .map(|_| ()),
+                ),
+            ];
+            for (operation, result) in expired_operations {
+                match result {
+                    Err(StorageNodeBucketRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                        assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+                    }
+                    Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                        panic!("captured route should expire before claim {operation}: {error}")
+                    }
+                    Ok(()) => panic!("expired captured route performed claim {operation}"),
+                }
+            }
+        });
+        let assert_claim_unchanged = || {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::acquire_lifecycle_sweep_claim(
+                    &*pg,
+                    &bucket,
+                    bucket_incarnation_generation,
+                    &error_record.claim_id,
+                    &error_record.owner_token,
+                    error_record.cluster_epoch,
+                    error_record.claimed_at,
+                    error_record.lease_deadline,
+                    6_000,
+                )
+                .unwrap(),
+                Some(error_record.clone())
+            );
+        };
+        assert_claim_unchanged();
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_lifecycle_sweep_claim_route(
+            &active_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &error_record,
+            "test lifecycle sweep claim release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active permit constructed retained lifecycle-claim authority"),
+        }
+        assert_claim_unchanged();
+
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_lifecycle_sweep_claim_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &error_record,
+            "test lifecycle sweep claim release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign permit constructed retained lifecycle-claim authority"),
+        }
+        assert_claim_unchanged();
+
+        crate::clock::with_time_override(6_000, || {
+            handler
+                .retained_lifecycle_sweep_claim_route(
+                    &retained_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    &error_record,
+                    "test lifecycle sweep claim release",
+                )
+                .unwrap()
+                .release()
+                .unwrap();
+        });
+        let pg = server._node.get_pg(0).unwrap();
+        let replacement = PgMetadataStore::acquire_lifecycle_sweep_claim(
+            &*pg,
+            &bucket,
+            bucket_incarnation_generation,
+            "post-release-lifecycle-claim",
+            "post-release-lifecycle-owner",
+            config.cluster_epoch,
+            6_000,
+            None,
+            6_000,
+        )
+        .unwrap()
+        .expect("retained capability must release the exact non-expiring claim");
+        PgMetadataStore::release_lifecycle_sweep_claim(
+            &*pg,
+            &replacement.bucket,
+            replacement.bucket_incarnation_generation,
+            &replacement.claim_id,
+            &replacement.owner_token,
+            replacement.cluster_epoch,
+        )
+        .unwrap();
     }
 
     #[test]

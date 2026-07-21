@@ -1491,6 +1491,44 @@ Twenty-seventh Phase 3 slice:
   node-client traits, and object/data active and retained capabilities remain
   open in Phase 3.
 
+Twenty-eighth Phase 3 slice:
+
+- the lifecycle-sweep claim RPC family now constructs private server-local
+  route capabilities before reaching `LocalStorageNodeClient`. Acquisition,
+  heartbeat, and error recording require active bucket authority and
+  revalidate the frame's captured deadline immediately before mutation.
+  Acquisition binds the new claim epoch to the admitted route; heartbeat and
+  error recording require the complete claim bucket, epoch, and PG identity
+  to match that route.
+- exact lifecycle-claim release is classified separately as
+  `RetainedCleanup` and consumes a private, non-`Clone`
+  `StorageNodeRetainedLifecycleSweepClaimRoute`. It binds the admission
+  domain/class, target node, retained route epoch, raw and trusted bucket PG,
+  and complete claim. Because the claim records their issuing route, both
+  construction and use require its epoch and PG to match exactly. Retained
+  authority cannot acquire, heartbeat, or change claim error state.
+- a deterministic server-local regression acquires, heartbeats, and records
+  an error on a non-expiring claim under a 5,000ms captured route, renews the
+  raw server route to 10,000ms, and proves the original active capability
+  cannot acquire, heartbeat, or record another error at 6,000ms. The complete
+  durable claim remains unchanged; active-class and foreign-domain permits
+  cannot construct retained authority, while exact retained release succeeds.
+- the Unix expired-route regression proves frame dispatch assigns exact
+  lifecycle-claim release to retained cleanup. A dedicated two-PG adversarial
+  matrix seeds equivalent lifecycle buckets and claims on both configured
+  PGs, then requires exact `PayloadDecode` for wrong-PG acquire, heartbeat,
+  error recording, and release. Both complete durable claim records are
+  compared after every rejection, so missing placement checks and
+  mutation-before-rejection bugs cannot hide behind absent or cancelling
+  state.
+- validation passed formatting, the storage boundary checker, all four
+  lifecycle capability, expired-route, wrong-PG, and existing coordination
+  regressions, workspace-wide strict Clippy, and the full parallel workspace
+  suite (7,388 tests).
+- frontend capability migration, capability requirements on node-client
+  traits, and object/data active and retained capabilities remain open in
+  Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

@@ -2383,6 +2383,108 @@ fn unix_bucket_write_reservation_client_releases_finalizer_claim_after_route_exp
 }
 
 #[test]
+fn unix_bucket_write_reservation_client_releases_lifecycle_claim_after_route_expiry() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("lifecycle-claim-release-expired-route-rpc");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let (bucket_incarnation_generation, claim) = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        PgMetadataStore::put_bucket_subresource(
+            &*pg,
+            &bucket,
+            crate::types::PutBucketSubresource {
+                kind: BucketSubresourceKind::Lifecycle,
+                body: "<LifecycleConfiguration/>",
+                aux: crate::types::BucketSubresourceAux::None,
+            },
+        )
+        .unwrap();
+        let generation = PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+            .unwrap()
+            .bucket_incarnation_generation;
+        let claim = PgMetadataStore::acquire_lifecycle_sweep_claim(
+            &*pg,
+            &bucket,
+            generation,
+            "expired-route-lifecycle-claim",
+            "expired-route-lifecycle-owner",
+            config.cluster_epoch,
+            10,
+            None,
+            10,
+        )
+        .unwrap()
+        .expect("lifecycle claim should be acquired");
+        pg.refresh_metadata_command_state_digest().unwrap();
+        (generation, claim)
+    };
+    config.route_map_validity = crate::RouteMapValidity::until_ms(1).unwrap();
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
+        &client,
+        bucket_pg_id_for_test(0),
+        &claim,
+    )
+    .unwrap();
+    server_thread.join().unwrap();
+
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let pg = node.get_pg(0).unwrap();
+    let replacement = PgMetadataStore::acquire_lifecycle_sweep_claim(
+        &*pg,
+        &bucket,
+        bucket_incarnation_generation,
+        "post-release-lifecycle-claim",
+        "post-release-lifecycle-owner",
+        config.cluster_epoch,
+        20,
+        None,
+        20,
+    )
+    .unwrap()
+    .expect("retained lifecycle-claim release must work after active route expiry");
+    PgMetadataStore::release_lifecycle_sweep_claim(
+        &*pg,
+        &replacement.bucket,
+        replacement.bucket_incarnation_generation,
+        &replacement.claim_id,
+        &replacement.owner_token,
+        replacement.cluster_epoch,
+    )
+    .unwrap();
+}
+
+#[test]
 fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
@@ -3176,6 +3278,208 @@ fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_ac
     )
     .unwrap_err();
     assert_payload_decode(error, "finalizer claim release");
+    assert_claims_unchanged();
+
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
+fn unix_lifecycle_sweep_claim_operations_reject_wrong_bucket_pg_before_access() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes = vec![
+        StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: config.cluster_epoch,
+            state: crate::types::PgState::Active,
+            primary_node_id: config.node_id,
+            acting_set: vec![config.node_id],
+        },
+        StorageNodePgRoute {
+            pg_id: 1,
+            cluster_epoch: config.cluster_epoch,
+            state: crate::types::PgState::Active,
+            primary_node_id: config.node_id,
+            acting_set: vec![config.node_id],
+        },
+    ];
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let (bucket, correct_pg_id, wrong_pg_id, generation, correct_claim, wrong_claim) = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let (bucket, correct_pg_id) = (0..100)
+            .map(|index| crate::tests::bucket_name(format!("lifecycle-claim-wrong-pg-{index}")))
+            .map(|bucket| {
+                let pg_id = node.pg_topology().bucket_pg_for(&bucket);
+                (bucket, pg_id)
+            })
+            .find(|(_, pg_id)| *pg_id < 2)
+            .expect("two-PG topology must place a test bucket");
+        let wrong_pg_id = if correct_pg_id == 0 { 1 } else { 0 };
+        let mut generations = Vec::new();
+        let mut claims = Vec::new();
+        for pg_id in [correct_pg_id, wrong_pg_id] {
+            let pg = node.get_pg(pg_id).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::put_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+            let generation = PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .bucket_incarnation_generation;
+            generations.push(generation);
+            claims.push(
+                PgMetadataStore::acquire_lifecycle_sweep_claim(
+                    &*pg,
+                    &bucket,
+                    generation,
+                    "wrong-pg-lifecycle-claim",
+                    "wrong-pg-lifecycle-owner",
+                    config.cluster_epoch,
+                    10,
+                    None,
+                    10,
+                )
+                .unwrap()
+                .expect("lifecycle claim should be acquired"),
+            );
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        assert_eq!(
+            generations[0], generations[1],
+            "wrong-PG lifecycle canaries must use the same bucket generation"
+        );
+        (
+            bucket,
+            correct_pg_id,
+            wrong_pg_id,
+            generations[0],
+            claims.remove(0),
+            claims.remove(0),
+        )
+    };
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..4)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let wrong_pg = bucket_pg_id_for_test(wrong_pg_id);
+    let assert_payload_decode = |error: BucketSnapshotLoadError, operation: &str| {
+        assert!(
+            matches!(
+                &error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                })
+            ),
+            "wrong-PG {operation} must fail with PayloadDecode, got {error:?}"
+        );
+    };
+    let assert_claims_unchanged = || {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        for (pg_id, expected) in [(correct_pg_id, &correct_claim), (wrong_pg_id, &wrong_claim)] {
+            let pg = node.get_pg(pg_id).unwrap();
+            assert_eq!(
+                PgMetadataStore::acquire_lifecycle_sweep_claim(
+                    &*pg,
+                    &bucket,
+                    generation,
+                    &expected.claim_id,
+                    &expected.owner_token,
+                    expected.cluster_epoch,
+                    expected.claimed_at,
+                    expected.lease_deadline,
+                    20,
+                )
+                .unwrap(),
+                Some(expected.clone()),
+                "wrong-PG lifecycle-claim operation must not mutate PG {pg_id}"
+            );
+        }
+    };
+
+    let error = BucketWriteReservationNodeClient::acquire_lifecycle_sweep_claim(
+        &client,
+        wrong_pg,
+        &bucket,
+        generation,
+        &wrong_claim.claim_id,
+        &wrong_claim.owner_token,
+        config.cluster_epoch,
+        wrong_claim.claimed_at,
+        wrong_claim.lease_deadline,
+        20,
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "lifecycle claim acquire");
+    assert_claims_unchanged();
+
+    let error = BucketWriteReservationNodeClient::heartbeat_lifecycle_sweep_claim(
+        &client,
+        wrong_pg,
+        &wrong_claim,
+        20,
+        Some(80),
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "lifecycle claim heartbeat");
+    assert_claims_unchanged();
+
+    let error = BucketWriteReservationNodeClient::record_lifecycle_sweep_claim_error(
+        &client,
+        wrong_pg,
+        &wrong_claim,
+        "must not be recorded",
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "lifecycle claim error");
+    assert_claims_unchanged();
+
+    let error = BucketWriteReservationNodeClient::release_lifecycle_sweep_claim(
+        &client,
+        wrong_pg,
+        &wrong_claim,
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "lifecycle claim release");
     assert_claims_unchanged();
 
     for thread in server_threads {
