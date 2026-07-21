@@ -856,34 +856,20 @@ impl ValidatedStaticClusterManifest {
         protocols
     }
 
-    pub(crate) fn initialize_standalone_storage(&self) -> Result<(), String> {
-        if self.manifest.deployment.mode != DeploymentMode::Standalone {
-            return Err(
-                "initialize-cluster-state currently supports standalone manifests only".to_string(),
-            );
-        }
+    pub(crate) fn initialize_selected_storage(&self) -> Result<(), String> {
         let selected = &self.manifest.processes[self.selected_process_index];
-        if selected.kind != ProcessKind::AllInOne {
-            return Err(
-                "standalone state initialization requires an all-in-one process".to_string(),
-            );
+        if !selected.kind.has_storage_node() {
+            return Err("selected process does not own durable storage-node state".to_string());
         }
         let storage_node = self
             .manifest
             .storage_nodes
             .iter()
             .find(|storage_node| storage_node.process_id == selected.id)
-            .ok_or_else(|| "all-in-one process has no storage node".to_string())?;
-        let identity = ConfiguredStaticClusterIdentity {
-            cluster_id: self.manifest.cluster.id.clone(),
-            topology_generation: self.manifest.cluster.topology_generation,
-            topology_digest: self.topology_digest.clone(),
-            process_id: selected.id.clone(),
-            process_identity_digest: self.process_identity_digest.clone(),
-        };
+            .ok_or_else(|| "selected storage process has no storage node".to_string())?;
         let pg_ids: Vec<u32> = (0..self.manifest.storage.pg_count).collect();
-        crate::static_cluster_state::initialize_standalone_storage(
-            &identity,
+        crate::static_cluster_state::initialize_static_storage(
+            &self.configured_static_identity(),
             storage_node.node_id,
             &storage_node.data_dir,
             &pg_ids,
@@ -898,13 +884,15 @@ impl ValidatedStaticClusterManifest {
 
     pub(crate) fn initialize_selected_process_state(&self) -> Result<(), String> {
         match self.manifest.deployment.mode {
-            DeploymentMode::Standalone => self.initialize_standalone_storage(),
+            DeploymentMode::Standalone => self.initialize_selected_storage(),
             DeploymentMode::Replicated => {
                 let selected = &self.manifest.processes[self.selected_process_index];
+                if selected.kind.has_storage_node() {
+                    return self.initialize_selected_storage();
+                }
                 if selected.kind != ProcessKind::ControlPlane {
                     return Err(
-                        "replicated state initialization currently supports control-plane processes only"
-                            .to_string(),
+                        "selected replicated process does not own durable state".to_string()
                     );
                 }
                 let authority = self
@@ -5463,6 +5451,32 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
     }
 
     #[test]
+    fn static_cluster_replicated_storage_initializes_identity_bound_pg_state() {
+        let temp = test_util::tempdir();
+        let data_mount = temp.path().join("data-1");
+        let data_dir = data_mount.join("node");
+        let manifest_text =
+            replicated_unix_manifest().replace("/srv/argmin/data-1", data_mount.to_str().unwrap());
+        let manifest = parse_static_cluster_manifest(&manifest_text, "storage-1").unwrap();
+        let identity = manifest.configured_static_identity();
+        let pg_ids = (0..4).collect::<Vec<_>>();
+
+        manifest.initialize_selected_process_state().unwrap();
+        manifest.initialize_selected_process_state().unwrap();
+
+        drop(
+            crate::static_cluster_state::lock_and_verify_standalone_storage_startup(
+                &identity, 1, &data_dir, &pg_ids,
+            )
+            .unwrap(),
+        );
+        assert_eq!(identity.process_id, "storage-1");
+        assert!(pg_ids.iter().all(|pg_id| data_dir
+            .join(format!("pg-{pg_id:04}/metadata.db"))
+            .is_file()));
+    }
+
+    #[test]
     fn static_cluster_loader_resolves_replicated_unix_control_plane_secrets() {
         let temp = test_util::tempdir();
         let material_dir = temp.path().join("secrets");
@@ -5530,7 +5544,7 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
             .standalone_legacy_server_config(|key| environment.get(key).cloned())
             .unwrap();
         let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
-        manifest.initialize_standalone_storage().unwrap();
+        manifest.initialize_selected_storage().unwrap();
 
         let cluster = crate::build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
         let handle = storage::StorageClusterRuntimeMapHandle::new(cluster.cluster());
@@ -5558,7 +5572,7 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
             .standalone_legacy_server_config(|key| environment.get(key).cloned())
             .unwrap();
         let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
-        manifest.initialize_standalone_storage().unwrap();
+        manifest.initialize_selected_storage().unwrap();
         let first = crate::build_legacy_local_storage_cluster(&config, &ec_config).unwrap();
         let data_dir = Path::new(config.storage_node_data_dir.as_deref().unwrap());
         let identity_path = data_dir.join(".argmin-static-storage.identity");

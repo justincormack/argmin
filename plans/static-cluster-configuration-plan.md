@@ -142,6 +142,20 @@ identity or PG verification and retains it for the complete local storage
 cluster lifetime. A second process selecting the same process identity and data
 directory therefore fails before opening mutable PG state.
 
+Replicated storage-node and combined processes use the same explicit command.
+It initializes every configured PG through the production storage-node engine
+with the manifest's node id, EC shape, and initial cluster epoch, binds the root
+and each PG database to the selected process identity, and publishes the root
+identity only after the complete PG set is durable. The production storage-node
+data-directory lock is held before marker inspection and through PG recovery,
+identity binding, syncing, and root identity publication, so ordinary startup
+cannot interleave with initialization. Both the production and static
+coordination locks are opened atomically without following symlinks and must be
+regular files before their pathnames are treated as coordination metadata.
+This prepares state only;
+ordinary replicated storage startup remains unavailable until mandatory
+storage-RPC authentication is enforced at the Unix dispatch boundary.
+
 Replicated control-plane process identity is initialized through the same
 command, once per configured authority process id. This creates only the
 integrity-protected, unestablished process/Raft identity sidecar; it does not
@@ -919,6 +933,14 @@ Progress as of 2026-07-21:
   runtime open. Complete path relocation is accepted because paths remain
   outside durable identity, while empty, partial, wrong-cluster,
   wrong-generation, and wrong-process state is rejected.
+- Slice 4's replicated storage initialization sub-slice is implemented:
+  `initialize-cluster-state` prepares `storage-node` and `combined` process
+  roots through the production storage-node engine, using the manifest's exact
+  node id, complete PG set, EC shape, initial epoch, and process identity.
+  Initialization is idempotent and crash-resumable under the same durable
+  marker/root/PG publication protocol. Replicated runtime activation remains
+  blocked on mandatory storage-RPC authentication rather than opening an
+  unauthenticated Unix listener.
 - Slice 5's material-resolution sub-slice is implemented: a selected process
   resolves bounded no-follow files into redacted binary credential material,
   rustls certified keys, and explicit root stores. Resolution is role/listener

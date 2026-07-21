@@ -190,14 +190,15 @@ pub(super) mod client_facade {
 
 pub(super) mod server_facade {
     pub use super::server::{
-        storage_node_control_plane_heartbeat_interval, validate_storage_node_process_configs,
-        PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefresh,
-        StorageNodeControlPlaneRefreshLoop, StorageNodeControlPlaneRefreshLoopStatus,
-        StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts,
-        StorageNodeServer, StorageNodeServerError,
-        STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS,
+        initialize_storage_node_state, storage_node_control_plane_heartbeat_interval,
+        validate_storage_node_process_configs, PreparedStorageNodeServer, StorageNodeBootstrap,
+        StorageNodeControlPlaneRefresh, StorageNodeControlPlaneRefreshLoop,
+        StorageNodeControlPlaneRefreshLoopStatus, StorageNodePgRoute, StorageNodeProcessConfig,
+        StorageNodeProcessConfigParts, StorageNodeServer, StorageNodeServerError,
+        StorageNodeStateInitializationGuard, STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MAX_INTERVAL_MS,
         STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
         STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_USABLE_LEASE_MS,
+        STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME,
     };
 }
 

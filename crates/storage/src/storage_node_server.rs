@@ -3,7 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -316,7 +316,7 @@ use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 #[cfg(test)]
 type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
 
-const DATA_DIR_LOCK_FILE: &str = ".argmin-storage-node.lock";
+pub const STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME: &str = ".argmin-storage-node.lock";
 const STORAGE_NODE_INCARNATION_FILE: &str = "control-plane-node-incarnation";
 const STORAGE_NODE_INCARNATION_TMP_FILE: &str = ".control-plane-node-incarnation.tmp";
 const LOCK_EX: i32 = 2;
@@ -1615,6 +1615,8 @@ pub enum StorageNodeServerError {
     SocketPathExists { path: PathBuf },
     #[error("storage-node data directory {path:?} is already locked")]
     DataDirAlreadyLocked { path: PathBuf },
+    #[error("storage-node data directory lock {path:?} is not a regular file")]
+    DataDirLockNotRegularFile { path: PathBuf },
     #[error(
         "storage-node data directory lock for {locked_path:?} cannot be used with {config_path:?}"
     )]
@@ -1790,6 +1792,52 @@ pub struct StorageNodeBootstrap {
     configured_socket_path: PathBuf,
     startup_runtime_config: Option<StorageNodeProcessConfig>,
     data_dir_guard: StorageNodeDataDirGuard,
+}
+
+/// Exclusive production storage-node ownership retained during initialization.
+///
+/// The caller must keep this guard until every outer identity and durability
+/// marker covering the initialized PG state has been published.
+#[derive(Debug)]
+#[must_use = "storage-node initialization must remain locked through identity publication"]
+pub struct StorageNodeStateInitializationGuard {
+    data_dir_guard: StorageNodeDataDirGuard,
+}
+
+impl StorageNodeStateInitializationGuard {
+    pub fn acquire(data_dir: &Path) -> Result<Self, StorageNodeServerError> {
+        Ok(Self {
+            data_dir_guard: StorageNodeDataDirGuard::acquire(data_dir)?,
+        })
+    }
+
+    fn data_dir(&self) -> &Path {
+        &self.data_dir_guard.data_dir
+    }
+}
+
+/// Initialize the durable PG state owned by one storage-node process.
+///
+/// This is the explicit first-initialization boundary used before publishing
+/// an outer deployment identity. It creates every configured PG with the
+/// production storage-node engine and runs the same metadata-command recovery
+/// checks used by ordinary storage-node startup. `initialization_guard` must be
+/// retained until the caller durably publishes that outer identity.
+pub fn initialize_storage_node_state(
+    initialization_guard: &StorageNodeStateInitializationGuard,
+    node_id: NodeId,
+    pg_ids: &[u32],
+    default_ec_shape: EcShape,
+    initial_cluster_epoch: ClusterEpoch,
+) -> Result<(), StorageNodeServerError> {
+    let node = SharedStorageNode::open_with_default_ec_shape_and_epoch(
+        initialization_guard.data_dir(),
+        pg_ids,
+        default_ec_shape,
+        initial_cluster_epoch,
+    )?;
+    node.recover_pg_metadata_command_state(node_id)
+        .map_err(StorageNodeServerError::from)
 }
 
 impl StorageNodeBootstrap {
@@ -13575,18 +13623,31 @@ impl StorageNodeDataDirLock {
             path: data_dir.to_path_buf(),
             source,
         })?;
-        let path = data_dir.join(DATA_DIR_LOCK_FILE);
-        let file = OpenOptions::new()
+        let path = data_dir.join(STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME);
+        let mut options = OpenOptions::new();
+        options
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let file = options
             .open(&path)
             .map_err(|source| StorageNodeServerError::Io {
                 context: "open storage-node data-dir lock",
                 path: path.clone(),
                 source,
             })?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| StorageNodeServerError::Io {
+                context: "inspect storage-node data-dir lock",
+                path: path.clone(),
+                source,
+            })?;
+        if !metadata.is_file() {
+            return Err(StorageNodeServerError::DataDirLockNotRegularFile { path });
+        }
         // SAFETY: flock operates on a valid file descriptor owned by `file`.
         // The descriptor remains open for the lifetime of StorageNodeDataDirLock.
         let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
@@ -14229,6 +14290,48 @@ mod tests {
             "2\n"
         );
         assert!(!data_dir.join(STORAGE_NODE_INCARNATION_TMP_FILE).exists());
+    }
+
+    #[test]
+    fn storage_node_state_initialization_uses_configured_epoch_and_ec_shape() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        let initial_epoch = ClusterEpoch::new(7).unwrap();
+        let ec_shape = EcShape { k: 4, m: 2 };
+
+        let initialization_guard = StorageNodeStateInitializationGuard::acquire(&data_dir).unwrap();
+        initialize_storage_node_state(
+            &initialization_guard,
+            NodeId::new(11),
+            &[0, 3],
+            ec_shape,
+            initial_epoch,
+        )
+        .unwrap();
+        drop(initialization_guard);
+        let initialization_guard = StorageNodeStateInitializationGuard::acquire(&data_dir).unwrap();
+        initialize_storage_node_state(
+            &initialization_guard,
+            NodeId::new(11),
+            &[0, 3],
+            ec_shape,
+            initial_epoch,
+        )
+        .unwrap();
+
+        for pg_id in [0, 3] {
+            let store = PgStore::open(&data_dir.join(format!("pg-{pg_id:04}")), pg_id).unwrap();
+            assert_eq!(
+                store
+                    .metadata_command_replica_state()
+                    .unwrap()
+                    .cluster_epoch,
+                initial_epoch
+            );
+        }
+        let reopened =
+            SharedStorageNode::open_with_default_ec_shape(&data_dir, &[0, 3], ec_shape).unwrap();
+        assert_eq!(reopened.default_ec_shape(), ec_shape);
     }
 
     #[test]

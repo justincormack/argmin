@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use storage::control_plane::ensure_control_plane_state_parent_directory;
-use storage::{ClusterEpoch, EcShape, LocalClusterMap, LocalNodeStoreConfig, NodeId};
+use storage::{ClusterEpoch, EcShape, NodeId};
 
 const STORAGE_IDENTITY_FILE_NAME: &str = ".argmin-static-storage.identity";
 const STORAGE_INITIALIZING_FILE_NAME: &str = ".argmin-static-storage.initializing";
@@ -539,7 +539,7 @@ impl StaticStorageIdentity {
     }
 }
 
-pub(crate) fn initialize_standalone_storage(
+pub(crate) fn initialize_static_storage(
     identity: &ConfiguredStaticClusterIdentity,
     storage_node_id: u32,
     data_dir: &Path,
@@ -550,6 +550,9 @@ pub(crate) fn initialize_standalone_storage(
     let expected = StaticStorageIdentity::new(identity, storage_node_id);
     let expected_bytes = expected.encode()?;
     ensure_private_data_directory_durable(data_dir)?;
+    let storage_node_initialization_guard =
+        storage::storage_node_server::StorageNodeStateInitializationGuard::acquire(data_dir)
+            .map_err(|error| format!("lock static storage node for initialization: {error}"))?;
     let _initialization_lock = acquire_storage_directory_lock(data_dir)?;
 
     let identity_path = data_dir.join(STORAGE_IDENTITY_FILE_NAME);
@@ -580,15 +583,14 @@ pub(crate) fn initialize_standalone_storage(
     }
 
     let node_id = NodeId::new(storage_node_id);
-    let cluster = LocalClusterMap::open_with_configs_and_epoch(
+    storage::storage_node_server::initialize_storage_node_state(
+        &storage_node_initialization_guard,
         node_id,
-        [LocalNodeStoreConfig::new(node_id, data_dir)],
         pg_ids,
         ec_shape,
         initial_cluster_epoch,
     )
-    .map_err(|error| format!("initialize static standalone storage: {error}"))?;
-    drop(cluster);
+    .map_err(|error| format!("initialize static storage node: {error}"))?;
     for pg_id in pg_ids {
         storage::initialize_pg_durable_identity(
             &data_dir.join(format!("pg-{pg_id:04}")),
@@ -600,6 +602,7 @@ pub(crate) fn initialize_standalone_storage(
     sync_initialized_pg_state(data_dir, pg_ids, &expected_bytes)?;
 
     publish_static_storage_identity(data_dir, &expected)?;
+    drop(storage_node_initialization_guard);
     Ok(())
 }
 
@@ -784,9 +787,15 @@ fn non_lock_directory_entries(path: &Path) -> Result<impl Iterator<Item = fs::Di
                 path.display()
             )
         })?;
-    Ok(entries
-        .into_iter()
-        .filter(|entry| entry.file_name() != STORAGE_INITIALIZATION_LOCK_FILE_NAME))
+    Ok(entries.into_iter().filter(|entry| {
+        let name = entry.file_name();
+        if name == STORAGE_INITIALIZATION_LOCK_FILE_NAME
+            || name == storage::storage_node_server::STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME
+        {
+            return !entry.file_type().is_ok_and(|file_type| file_type.is_file());
+        }
+        true
+    }))
 }
 
 fn verify_static_storage_pg_state(
@@ -805,7 +814,7 @@ fn verify_static_storage_pg_state(
             .map_err(|error| format!("inspect static storage PG {pg_id} inventory: {error}"))?;
         if !inventory.authoritative_inventory_is_complete() {
             return Err(format!(
-                "static standalone storage PG {pg_id} has incomplete authoritative shard \
+                "static storage PG {pg_id} has incomplete authoritative shard \
                  inventory: rows={} files={} missing={} size_mismatches={}",
                 inventory.shard_row_count,
                 inventory.shard_file_count,
@@ -898,6 +907,18 @@ fn acquire_storage_directory_lock(data_dir: &Path) -> Result<StaticStorageDirect
             path.display()
         )
     })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "inspect static storage initialization lock {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "static storage initialization lock {} is not a regular file",
+            path.display()
+        ));
+    }
     // SAFETY: `file` owns a valid descriptor for the lifetime of the lock.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result != 0 {
@@ -1092,7 +1113,9 @@ impl<'a> IdentityDecoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storage::ShardKey;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use storage::{LocalClusterMap, LocalNodeStoreConfig, ShardKey};
 
     fn identity(process_id: &str, process_digest: &str) -> ConfiguredStaticClusterIdentity {
         ConfiguredStaticClusterIdentity {
@@ -1111,7 +1134,7 @@ mod tests {
         pg_ids: &[u32],
         ec_shape: EcShape,
     ) -> Result<(), String> {
-        initialize_standalone_storage(
+        initialize_static_storage(
             identity,
             storage_node_id,
             data_dir,
@@ -1575,5 +1598,69 @@ mod tests {
             initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap_err();
 
         assert!(error.contains("already active"));
+    }
+
+    #[test]
+    fn static_storage_initialization_requires_native_storage_node_lock() {
+        let temp = test_util::tempdir();
+        let data_dir = temp.path().join("storage");
+        let expected = identity("all-1", "b");
+        ensure_private_data_directory_durable(&data_dir).unwrap();
+        let _native_lock =
+            storage::storage_node_server::StorageNodeStateInitializationGuard::acquire(&data_dir)
+                .unwrap();
+
+        let error =
+            initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap_err();
+
+        assert!(error.contains("already locked"));
+        assert!(!data_dir.join(STORAGE_INITIALIZING_FILE_NAME).exists());
+        assert!(!data_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
+        assert!(!data_dir.join("pg-0000").exists());
+    }
+
+    #[test]
+    fn static_storage_initialization_rejects_symlinked_native_lock() {
+        let temp = test_util::tempdir();
+        let data_dir = temp.path().join("storage");
+        let external = temp.path().join("external-lock-target");
+        let expected = identity("all-1", "b");
+        ensure_private_data_directory_durable(&data_dir).unwrap();
+        fs::write(&external, b"external").unwrap();
+        std::os::unix::fs::symlink(
+            &external,
+            data_dir.join(storage::storage_node_server::STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME),
+        )
+        .unwrap();
+
+        let error =
+            initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap_err();
+
+        assert!(error.contains("open storage-node data-dir lock"));
+        assert_eq!(fs::read(&external).unwrap(), b"external");
+        assert!(!data_dir.join(STORAGE_INITIALIZING_FILE_NAME).exists());
+        assert!(!data_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
+        assert!(!data_dir.join("pg-0000").exists());
+    }
+
+    #[test]
+    fn static_storage_initialization_rejects_fifo_static_lock() {
+        let temp = test_util::tempdir();
+        let data_dir = temp.path().join("storage");
+        let expected = identity("all-1", "b");
+        ensure_private_data_directory_durable(&data_dir).unwrap();
+        let lock_path = data_dir.join(STORAGE_INITIALIZATION_LOCK_FILE_NAME);
+        let lock_path_bytes = CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `lock_path_bytes` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(lock_path_bytes.as_ptr(), 0o600) }, 0);
+        assert_eq!(non_lock_directory_entries(&data_dir).unwrap().count(), 1);
+
+        let error =
+            initialize_storage(&expected, 1, &data_dir, &[0], EcShape { k: 1, m: 0 }).unwrap_err();
+
+        assert!(error.contains("not a regular file"));
+        assert!(!data_dir.join(STORAGE_INITIALIZING_FILE_NAME).exists());
+        assert!(!data_dir.join(STORAGE_IDENTITY_FILE_NAME).exists());
+        assert!(!data_dir.join("pg-0000").exists());
     }
 }
