@@ -2153,9 +2153,9 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
 }
 
 #[test]
-fn unix_bucket_metadata_client_releases_bucket_write_proof() {
+fn unix_bucket_metadata_client_releases_bucket_write_proof_after_route_expiry() {
     let tmp = test_util::tempdir();
-    let config = test_config(&tmp);
+    let mut config = test_config(&tmp);
     let bucket = crate::tests::bucket_name("proof-release-rpc-bucket");
     let owner = crate::CanonicalUserId::from_principal("owner");
     let reservation = {
@@ -2193,6 +2193,7 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
         pg.refresh_metadata_command_state_digest().unwrap();
         reservation
     };
+    config.route_map_validity = crate::RouteMapValidity::until_ms(1).unwrap();
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
     let server_thread = thread::spawn(move || server.accept_one().unwrap());
@@ -2620,32 +2621,42 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
                 })
             })
             .expect("two-PG topology must place a test bucket");
-        let pg = node.get_pg(correct_pg_id).unwrap();
-        PgMetadataStore::create_bucket(
-            &*pg,
-            &bucket,
-            "owner",
-            &owner,
-            &crate::AclGrants::default(),
-            false,
-            false,
-        )
-        .unwrap();
-        let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
-            &*pg,
-            crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
-                name: &bucket,
-                reservation_id: "reservation-1",
-                owner_token: "owner-token-1",
-                cluster_epoch: ClusterEpoch::new(1).unwrap(),
-                operation_kind: "put-object",
-                created_at: 10,
-                lease_deadline: 20,
-                target_context: Some("key=a"),
-            },
-        )
-        .unwrap();
-        pg.refresh_metadata_command_state_digest().unwrap();
+        let mut reservations = Vec::new();
+        for pg_id in [correct_pg_id, wrong_pg_id] {
+            let pg = node.get_pg(pg_id).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            reservations.push(
+                PgMetadataStore::acquire_durable_bucket_write_reservation(
+                    &*pg,
+                    crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                        name: &bucket,
+                        reservation_id: "reservation-1",
+                        owner_token: "owner-token-1",
+                        cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                        operation_kind: "put-object",
+                        created_at: 10,
+                        lease_deadline: 20,
+                        target_context: Some("key=a"),
+                    },
+                )
+                .unwrap(),
+            );
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        assert_eq!(
+            reservations[0], reservations[1],
+            "wrong-PG proof-release canary must have equivalent durable state"
+        );
+        let reservation = reservations.remove(0);
         (bucket, correct_pg_id, wrong_pg_id, reservation)
     };
     private_socket_dir(config.socket_path.parent().unwrap());
@@ -2667,6 +2678,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
         err,
         BucketSnapshotLoadError::Store(StoreError::StorageRpc {
             operation: "proof release",
+            code: StorageRpcErrorCode::PayloadDecode,
             ..
         })
     ));
@@ -2678,12 +2690,15 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
         config.default_ec_shape,
     )
     .unwrap();
-    let pg = node.get_pg(correct_pg_id).unwrap();
-    assert!(
-        PgMetadataStore::durable_bucket_write_reservation(&*pg, &bucket, "reservation-1")
-            .unwrap()
-            .is_some()
-    );
+    for pg_id in [correct_pg_id, wrong_pg_id] {
+        let pg = node.get_pg(pg_id).unwrap();
+        assert_eq!(
+            PgMetadataStore::durable_bucket_write_reservation(&*pg, &bucket, "reservation-1")
+                .unwrap(),
+            Some(reservation.clone()),
+            "wrong-PG proof release must reject before mutating either durable canary"
+        );
+    }
 }
 
 #[test]

@@ -3108,6 +3108,16 @@ struct StorageNodeRetainedBucketWriteReservationRoute<'a> {
     record: &'a BucketWriteReservationRecord,
 }
 
+struct StorageNodeRetainedMetadataCommandProofRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    pg_id: BucketPgId,
+    proof: &'a BucketWriteReservationProof,
+}
+
 impl StorageNodeActiveBucketRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
         self.fence
@@ -3303,6 +3313,48 @@ impl StorageNodeRetainedBucketWriteReservationRoute<'_> {
     }
 }
 
+impl StorageNodeRetainedMetadataCommandProofRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
+        if self.route_cluster_epoch != self.proof.cluster_epoch {
+            return Err(StorageNodeBucketRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "metadata command bucket write proof release route epoch {} does not match proof epoch {}",
+                        self.route_cluster_epoch.get(),
+                        self.proof.cluster_epoch.get()
+                    ),
+                },
+            ));
+        }
+        self.handler
+            .validate_retained_bucket_write_route(
+                self.route_permit,
+                self.node_id,
+                self.route_cluster_epoch,
+                self.raw_pg_id,
+                &self.proof.bucket,
+                "metadata command bucket write proof release",
+            )
+            .map(|_| ())
+            .map_err(StorageNodeBucketRouteError::Route)
+    }
+
+    fn release(self) -> Result<(), StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketWriteReservationNodeClient::release_metadata_command_bucket_write_reservation(
+            &local_client,
+            self.pg_id,
+            self.proof,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+}
+
 macro_rules! metadata_command_pg_guard_or_return {
     ($handler:expr, $session:expr, $pg_id:expr) => {
         match $handler.metadata_command_pg_guard($session, $pg_id) {
@@ -3447,6 +3499,7 @@ impl StorageNodeConnectionHandler {
             let admission_class = if matches!(
                 frame.kind,
                 StorageRpcMessageKind::MetadataCommandPgLockRelease
+                    | StorageRpcMessageKind::ProofRelease
                     | StorageRpcMessageKind::BucketWriteReservationRelease
                     | StorageRpcMessageKind::ShardDelete
                     | StorageRpcMessageKind::ShardAckDelete
@@ -3585,7 +3638,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ProofRelease => {
                 match decode_proof_release_request(&frame.payload) {
-                    Ok(request) => self.proof_release_response(request),
+                    Ok(request) => self.proof_release_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5151,47 +5204,28 @@ impl StorageNodeConnectionHandler {
 
     fn proof_release_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcProofReleaseRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.cleanup_pg_route(
+        let route = match self.retained_metadata_command_proof_route(
+            route_permit,
             request.node_id,
             request.route_cluster_epoch,
             request.pg_id,
+            &request.proof,
+            "metadata command bucket write proof release",
         ) {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        if route.primary_node_id != self.config.node_id {
-            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::NonActingSetAccess,
-                message: format!(
-                    "storage node {} is not primary for proof release on PG {}",
-                    self.config.node_id.as_u32(),
-                    request.pg_id.get()
-                ),
-            });
-        }
-        let expected_pg_id =
-            PgId::new(self.node.pg_topology().bucket_pg_for(&request.proof.bucket));
-        if request.pg_id != expected_pg_id {
-            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::PayloadDecode,
-                message: format!(
-                    "proof release PG {} does not match bucket {} PG {}",
-                    request.pg_id.get(),
-                    request.proof.bucket.as_str(),
-                    expected_pg_id.get()
-                ),
-            });
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::release_metadata_command_bucket_write_reservation(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.proof,
-        ) {
+        match route.release() {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -12639,6 +12673,64 @@ impl StorageNodeConnectionHandler {
         record: &BucketWriteReservationRecord,
         operation: &'static str,
     ) -> Result<BucketPgId, StorageRpcErrorResponse> {
+        self.validate_retained_bucket_write_route(
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            pg_id,
+            &record.bucket,
+            operation,
+        )
+    }
+
+    fn retained_metadata_command_proof_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        proof: &'a BucketWriteReservationProof,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedMetadataCommandProofRoute<'a>, StorageRpcErrorResponse> {
+        if route_cluster_epoch != proof.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} route epoch {} does not match proof epoch {}",
+                    route_cluster_epoch.get(),
+                    proof.cluster_epoch.get()
+                ),
+            });
+        }
+        let pg_id = self.validate_retained_bucket_write_route(
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            pg_id,
+            &proof.bucket,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedMetadataCommandProofRoute {
+            handler: self,
+            route_permit,
+            node_id,
+            route_cluster_epoch,
+            raw_pg_id: pg_id.pg_id(),
+            pg_id,
+            proof,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_retained_bucket_write_route(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<BucketPgId, StorageRpcErrorResponse> {
         if !Arc::ptr_eq(&route_permit.gate.inner, &self.route_admission.inner) {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::Internal,
@@ -12667,14 +12759,14 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        let expected_pg_id = self.node.bucket_metadata_pg_for(&record.bucket);
+        let expected_pg_id = self.node.bucket_metadata_pg_for(bucket);
         if pg_id != expected_pg_id.pg_id() {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::PayloadDecode,
                 message: format!(
                     "{operation} PG {} does not match bucket {} PG {}",
                     pg_id.get(),
-                    record.bucket.as_str(),
+                    bucket.as_str(),
                     expected_pg_id.get()
                 ),
             });
@@ -14683,6 +14775,145 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(PgMetadataStore::durable_bucket_write_reservation(
+            &*pg,
+            &bucket,
+            &record.reservation_id,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn metadata_command_proof_release_requires_exact_retained_capability() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("retained-metadata-command-proof-cleanup");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let record = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "retained-metadata-command-proof",
+                    owner_token: "retained-metadata-command-proof-owner",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind: "put-object",
+                    created_at: 10,
+                    lease_deadline: 20,
+                    target_context: Some("key=a"),
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            record
+        };
+        let proof = BucketWriteReservationProof::from(&record);
+
+        config.route_map_validity = RouteMapValidity::until_ms(1).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let retained_permit = handler
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let active_permit = handler
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+
+        let assert_record_unchanged = || {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::durable_bucket_write_reservation(
+                    &*pg,
+                    &bucket,
+                    &record.reservation_id,
+                )
+                .unwrap(),
+                Some(record.clone())
+            );
+        };
+
+        match handler.retained_metadata_command_proof_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &proof,
+            "test metadata command proof release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign permit constructed retained proof authority"),
+        }
+        assert_record_unchanged();
+
+        match handler.retained_metadata_command_proof_route(
+            &active_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &proof,
+            "test metadata command proof release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active permit constructed retained proof authority"),
+        }
+        assert_record_unchanged();
+
+        let mismatched_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
+        match handler.retained_metadata_command_proof_route(
+            &retained_permit,
+            config.node_id,
+            mismatched_epoch,
+            PgId::new(0),
+            &proof,
+            "test metadata command proof release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("does not match proof epoch"));
+            }
+            Ok(_) => panic!("mismatched route epoch constructed retained proof authority"),
+        }
+        assert_record_unchanged();
+
+        let route = handler
+            .retained_metadata_command_proof_route(
+                &retained_permit,
+                config.node_id,
+                config.cluster_epoch,
+                PgId::new(0),
+                &proof,
+                "test metadata command proof release",
+            )
+            .unwrap();
+        route.release().unwrap();
         let pg = server._node.get_pg(0).unwrap();
         assert!(PgMetadataStore::durable_bucket_write_reservation(
             &*pg,

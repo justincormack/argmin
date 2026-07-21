@@ -1382,6 +1382,45 @@ Twenty-fourth Phase 3 slice:
   failure before cancellation; the preceding slice's 7,363-test full run
   remains clean.
 
+Twenty-fifth Phase 3 slice:
+
+- metadata-command bucket-write proof release now enters the storage-node
+  server under `RetainedCleanup` admission rather than ordinary active
+  admission. The handler constructs a private, non-`Clone`, one-shot
+  `StorageNodeRetainedMetadataCommandProofRoute` before reaching
+  `LocalStorageNodeClient`; active authority cannot be promoted into this
+  cleanup path.
+- the capability binds the admission domain and class, target node, retained
+  route epoch, raw and trusted bucket PG, and the complete
+  `BucketWriteReservationProof`. Construction and the consuming release both
+  revalidate the retained route primary, bucket placement, and exact proof
+  epoch. The existing retained durable-record release shares the admission,
+  primary, and placement validator but deliberately does not require its
+  record epoch to equal the route epoch: delete/drain recovery must be able to
+  remove an exact expired older-epoch record through the current retained
+  primary.
+- proof release remains deliberately usable after active route expiry because
+  it can only remove the exact reservation named by the proof; it cannot
+  acquire or renew authority. The Unix positive regression now binds an
+  expired active route and succeeds only because frame dispatch selects the
+  retained-cleanup class. Server-local adversarial coverage rejects foreign
+  admission domains, active-class permits, and a mismatched proof route epoch
+  while comparing the complete durable reservation before and after every
+  rejection. Existing Unix recovery coverage pins older-epoch durable-record
+  release through the current retained route.
+- the wrong-PG Unix regression now seeds byte-for-byte equivalent reservation
+  state on both configured PGs. A missing placement check would therefore
+  delete the wrong-PG canary; exact `PayloadDecode` rejection leaves both
+  durable records unchanged. Existing conflict and non-primary regressions
+  continue to pin proof identity and retained-primary validation.
+- validation passed formatting, the storage boundary checker, all eight
+  focused retained proof/record and Unix adversarial regressions,
+  workspace-wide strict Clippy, and the full parallel workspace suite (7,379
+  tests).
+- drains, lifecycle/delete claims, frontend capability migration,
+  capability requirements on node-client traits, and object/data active and
+  retained capabilities remain open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
