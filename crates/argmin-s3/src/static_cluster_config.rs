@@ -13,8 +13,9 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::RootCertStore;
+use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -40,6 +41,7 @@ use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
 use x509_cert::Certificate;
 
 const CLUSTER_MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const STATIC_RAFT_TLS_ALPN: &[u8] = b"argmin-raft/1";
 const CLUSTER_MANIFEST_MAX_COLLECTION_ITEMS: usize = 4_096;
 const CLUSTER_MANIFEST_MAX_ID_BYTES: usize = 128;
 const CLUSTER_MANIFEST_MAX_CLUSTER_ID_BYTES: usize = 256;
@@ -293,6 +295,13 @@ struct EndpointInput {
     tls_server_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CanonicalRaftPeerEndpoint {
+    endpoint_id: String,
+    owner_process_id: String,
+    advertise: String,
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct TlsIdentityInput {
@@ -327,7 +336,7 @@ pub(crate) struct ValidatedStaticClusterManifest {
     manifest: StaticClusterManifestInput,
     selected_process_index: usize,
     initial_pg_acting_sets: Vec<Vec<u32>>,
-    canonical_raft_peer_endpoints: BTreeMap<u64, String>,
+    canonical_raft_peer_endpoints: BTreeMap<u64, CanonicalRaftPeerEndpoint>,
     topology_digest: String,
     process_identity_digest: String,
     full_config_fingerprint: String,
@@ -392,6 +401,85 @@ pub(crate) struct ResolvedStaticClusterMaterial {
     auth_credentials: Vec<ResolvedStaticAuthCredential>,
     tls_identities: BTreeMap<String, ResolvedStaticTlsIdentity>,
     tls_trust_bundles: BTreeMap<String, ResolvedStaticTlsTrustBundle>,
+}
+
+#[derive(Clone)]
+struct StaticSingleCertificateResolver {
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl fmt::Debug for StaticSingleCertificateResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StaticSingleCertificateResolver")
+            .field("certificate_count", &self.certified_key.cert.len())
+            .field("private_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ResolvesServerCert for StaticSingleCertificateResolver {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.certified_key))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ResolvedStaticRaftPeerAddress {
+    Unix(PathBuf),
+    Tcp {
+        host: String,
+        port: u16,
+        server_name: String,
+    },
+}
+
+#[derive(Clone)]
+struct ResolvedStaticRaftPeerEndpoint {
+    node_id: u64,
+    endpoint_id: String,
+    address: ResolvedStaticRaftPeerAddress,
+    transport_profile_id: String,
+    tls_client_config: Option<Arc<RustlsClientConfig>>,
+}
+
+impl fmt::Debug for ResolvedStaticRaftPeerEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedStaticRaftPeerEndpoint")
+            .field("node_id", &self.node_id)
+            .field("endpoint_id", &self.endpoint_id)
+            .field("address", &self.address)
+            .field("transport_profile_id", &self.transport_profile_id)
+            .field("tls", &self.tls_client_config.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct ResolvedStaticRaftListenerEndpoint {
+    endpoint_id: String,
+    listen: EndpointAddress,
+    advertise: EndpointAddress,
+    transport_profile_id: String,
+    tls_server_config: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl fmt::Debug for ResolvedStaticRaftListenerEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedStaticRaftListenerEndpoint")
+            .field("endpoint_id", &self.endpoint_id)
+            .field("listen", &self.listen)
+            .field("advertise", &self.advertise)
+            .field("transport_profile_id", &self.transport_profile_id)
+            .field("tls", &self.tls_server_config.is_some())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedStaticRaftTransportPlan {
+    local_node_id: u64,
+    listeners: Vec<ResolvedStaticRaftListenerEndpoint>,
+    peers: BTreeMap<u64, ResolvedStaticRaftPeerEndpoint>,
 }
 
 #[derive(Clone, Copy)]
@@ -915,6 +1003,173 @@ impl ValidatedStaticClusterManifest {
         }
     }
 
+    fn resolved_static_raft_transport_plan(
+        &self,
+        material: &ResolvedStaticClusterMaterial,
+    ) -> Result<ResolvedStaticRaftTransportPlan, String> {
+        let selected = &self.manifest.processes[self.selected_process_index];
+        if self.manifest.deployment.mode != DeploymentMode::Replicated
+            || selected.kind != ProcessKind::ControlPlane
+        {
+            return Err(
+                "static Raft transport planning requires a replicated control-plane process"
+                    .to_string(),
+            );
+        }
+        let local_node_id = self
+            .manifest
+            .authorities
+            .iter()
+            .find(|authority| authority.process_id == selected.id)
+            .and_then(|authority| authority.raft_node_id)
+            .ok_or_else(|| "selected replicated authority has no Raft node id".to_string())?;
+        let provider = rustls::crypto::ring::default_provider();
+        let mut peers = BTreeMap::new();
+        for (&node_id, canonical_endpoint) in &self.canonical_raft_peer_endpoints {
+            let endpoint = self
+                .manifest
+                .endpoints
+                .iter()
+                .find(|endpoint| {
+                    endpoint.id == canonical_endpoint.endpoint_id
+                        && endpoint.owner_process_id == canonical_endpoint.owner_process_id
+                        && endpoint.protocol == EndpointProtocol::RaftPeer
+                        && endpoint.advertise == canonical_endpoint.advertise
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "canonical Raft endpoint {} for voter {node_id} no longer matches its validated owner and address",
+                        canonical_endpoint.endpoint_id
+                    )
+                })?;
+            let (address, tls_client_config) =
+                match parse_endpoint_address(&endpoint.advertise, false)? {
+                    EndpointAddress::Unix(path) => {
+                        (ResolvedStaticRaftPeerAddress::Unix(path), None)
+                    }
+                    EndpointAddress::Tcp { host, port } => {
+                        let trust_bundle_id = endpoint
+                            .tls_trust_bundle_id
+                            .as_deref()
+                            .expect("validated TCP endpoint has a TLS trust bundle");
+                        let roots =
+                            material
+                                .tls_trust_bundles
+                                .get(trust_bundle_id)
+                                .ok_or_else(|| {
+                                    format!(
+                                "selected process did not resolve Raft endpoint {} trust bundle",
+                                endpoint.id
+                            )
+                                })?;
+                        let server_name = endpoint
+                            .tls_server_name
+                            .clone()
+                            .expect("validated TCP endpoint has a TLS server name");
+                        let mut client_config =
+                            RustlsClientConfig::builder_with_provider(Arc::new(provider.clone()))
+                                .with_protocol_versions(&[&rustls::version::TLS13])
+                                .map_err(|_| {
+                                    "failed to select the static Raft TLS protocol".to_string()
+                                })?
+                                .with_root_certificates((*roots.roots).clone())
+                                .with_no_client_auth();
+                        client_config.alpn_protocols = vec![STATIC_RAFT_TLS_ALPN.to_vec()];
+                        (
+                            ResolvedStaticRaftPeerAddress::Tcp {
+                                host,
+                                port,
+                                server_name,
+                            },
+                            Some(Arc::new(client_config)),
+                        )
+                    }
+                };
+            let replaced = peers.insert(
+                node_id,
+                ResolvedStaticRaftPeerEndpoint {
+                    node_id,
+                    endpoint_id: endpoint.id.clone(),
+                    address,
+                    transport_profile_id: endpoint.transport_profile_id.clone(),
+                    tls_client_config,
+                },
+            );
+            debug_assert!(replaced.is_none());
+        }
+
+        let local_peer = peers
+            .get(&local_node_id)
+            .expect("validated canonical Raft map contains the local voter");
+        let mut local_endpoints = self
+            .manifest
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.owner_process_id == selected.id
+                    && endpoint.protocol == EndpointProtocol::RaftPeer
+            })
+            .collect::<Vec<_>>();
+        local_endpoints.sort_by_key(|endpoint| (endpoint.priority, endpoint.id.as_str()));
+        let listeners = local_endpoints
+            .into_iter()
+            .map(|endpoint| {
+                let listen = parse_endpoint_address(&endpoint.listen, true)?;
+                let advertise = parse_endpoint_address(&endpoint.advertise, false)?;
+                let tls_server_config = match &advertise {
+                    EndpointAddress::Unix(_) => None,
+                    EndpointAddress::Tcp { .. } => {
+                        let identity_id = endpoint
+                            .tls_identity_id
+                            .as_deref()
+                            .expect("validated TCP endpoint has a TLS identity");
+                        let identity =
+                            material.tls_identities.get(identity_id).ok_or_else(|| {
+                                format!(
+                                "selected process did not resolve Raft endpoint {} TLS identity",
+                                endpoint.id
+                            )
+                            })?;
+                        let resolver = StaticSingleCertificateResolver {
+                            certified_key: Arc::clone(&identity.certified_key),
+                        };
+                        let mut server_config =
+                            rustls::ServerConfig::builder_with_provider(Arc::new(provider.clone()))
+                                .with_protocol_versions(&[&rustls::version::TLS13])
+                                .map_err(|_| {
+                                    "failed to select the static Raft TLS protocol".to_string()
+                                })?
+                                .with_no_client_auth()
+                                .with_cert_resolver(Arc::new(resolver));
+                        server_config.alpn_protocols = vec![STATIC_RAFT_TLS_ALPN.to_vec()];
+                        Some(Arc::new(server_config))
+                    }
+                };
+                Ok(ResolvedStaticRaftListenerEndpoint {
+                    endpoint_id: endpoint.id.clone(),
+                    listen,
+                    advertise,
+                    transport_profile_id: endpoint.transport_profile_id.clone(),
+                    tls_server_config,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if !listeners
+            .iter()
+            .any(|listener| listener.endpoint_id == local_peer.endpoint_id)
+        {
+            return Err(format!(
+                "local voter {local_node_id} canonical Raft endpoint {} is not a configured local listener",
+                local_peer.endpoint_id
+            ));
+        }
+        Ok(ResolvedStaticRaftTransportPlan {
+            local_node_id,
+            listeners,
+            peers,
+        })
+    }
+
     fn replicated_unix_control_plane_server_config<F>(
         &self,
         material: &ResolvedStaticClusterMaterial,
@@ -933,19 +1188,29 @@ impl ValidatedStaticClusterManifest {
                 "replicated control-plane mapping requires internal authentication".to_string(),
             );
         }
-        if !material.tls_identities.is_empty() || !material.tls_trust_bundles.is_empty() {
-            return Err(
-                "TCP static cluster runtime activation is not implemented; replicated Unix mapping cannot consume TLS material"
-                    .to_string(),
-            );
-        }
-
         let selected = &self.manifest.processes[self.selected_process_index];
         if selected.kind != ProcessKind::ControlPlane {
             return Err(
                 "this static runtime slice currently maps replicated control-plane processes only"
                     .to_string(),
             );
+        }
+        for endpoint in self
+            .manifest
+            .endpoints
+            .iter()
+            .filter(|endpoint| endpoint.owner_process_id == selected.id)
+        {
+            let listen = parse_endpoint_address(&endpoint.listen, true)?;
+            let advertise = parse_endpoint_address(&endpoint.advertise, false)?;
+            if !matches!(listen, EndpointAddress::Unix(_))
+                || !matches!(advertise, EndpointAddress::Unix(_))
+            {
+                return Err(format!(
+                    "TCP static cluster runtime activation is not implemented; replicated Unix mapping cannot ignore configured TCP listener {}",
+                    endpoint.id
+                ));
+            }
         }
         let authority = self
             .manifest
@@ -956,6 +1221,27 @@ impl ValidatedStaticClusterManifest {
         let raft_node_id = authority
             .raft_node_id
             .ok_or_else(|| "selected replicated authority has no Raft node id".to_string())?;
+        if self
+            .canonical_raft_peer_endpoints
+            .values()
+            .any(|endpoint| endpoint.advertise.starts_with("tcp://"))
+        {
+            return Err(
+                "TCP static cluster runtime activation is not implemented; replicated Unix mapping cannot activate a TCP Raft peer"
+                    .to_string(),
+            );
+        }
+        let raft_transport_plan = self.resolved_static_raft_transport_plan(material)?;
+        if raft_transport_plan
+            .peers
+            .values()
+            .any(|peer| !matches!(peer.address, ResolvedStaticRaftPeerAddress::Unix(_)))
+        {
+            return Err(
+                "TCP static cluster runtime activation is not implemented; resolved Raft transport contains a TCP peer"
+                    .to_string(),
+            );
+        }
 
         let local_control_path =
             self.preferred_owned_unix_endpoint_path(selected, EndpointProtocol::ControlPlane)?;
@@ -963,10 +1249,30 @@ impl ValidatedStaticClusterManifest {
             selected,
             EndpointProtocol::AuthorityClockRecovery,
         )?;
-        let local_raft_path =
-            self.preferred_owned_unix_endpoint_path(selected, EndpointProtocol::RaftPeer)?;
-        let local_raft_endpoint =
-            self.preferred_owned_endpoint(selected, EndpointProtocol::RaftPeer)?;
+        debug_assert_eq!(raft_transport_plan.local_node_id, raft_node_id);
+        let local_raft_listener = raft_transport_plan
+            .listeners
+            .iter()
+            .find(|listener| {
+                raft_transport_plan
+                    .peers
+                    .get(&raft_node_id)
+                    .is_some_and(|peer| peer.endpoint_id == listener.endpoint_id)
+            })
+            .expect("resolved Raft transport includes the canonical local listener");
+        let EndpointAddress::Unix(local_raft_path) = &local_raft_listener.advertise else {
+            return Err(
+                "TCP static cluster runtime activation is not implemented for the local Raft listener"
+                    .to_string(),
+            );
+        };
+        let local_raft_path = local_raft_path.to_string_lossy().into_owned();
+        let local_raft_endpoint = self
+            .manifest
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == local_raft_listener.endpoint_id)
+            .expect("resolved local Raft listener endpoint exists");
         let local_raft_transport = self
             .manifest
             .transport_profiles
@@ -1005,10 +1311,19 @@ impl ValidatedStaticClusterManifest {
             let peer_node_id = peer_authority
                 .raft_node_id
                 .expect("validated replicated authority has a Raft node id");
+            let peer = raft_transport_plan
+                .peers
+                .get(&peer_node_id)
+                .expect("resolved Raft transport contains every voter");
+            let ResolvedStaticRaftPeerAddress::Unix(socket_path) = &peer.address else {
+                return Err(
+                    "TCP static cluster runtime activation is not implemented for a Raft peer"
+                        .to_string(),
+                );
+            };
             raft_peer_sockets.push(ConfiguredControlPlaneRaftPeerSocket {
                 node_id: peer_node_id,
-                socket_path: self
-                    .preferred_owned_unix_endpoint_path(peer_process, EndpointProtocol::RaftPeer)?,
+                socket_path: socket_path.to_string_lossy().into_owned(),
             });
             control_plane_client_socket_paths.push(self.preferred_owned_unix_endpoint_path(
                 peer_process,
@@ -1371,7 +1686,7 @@ impl ValidatedStaticClusterManifest {
     }
 
     #[cfg(test)]
-    fn canonical_raft_peer_endpoints(&self) -> &BTreeMap<u64, String> {
+    fn canonical_raft_peer_endpoints(&self) -> &BTreeMap<u64, CanonicalRaftPeerEndpoint> {
         &self.canonical_raft_peer_endpoints
     }
 }
@@ -1626,7 +1941,7 @@ impl CanonicalEncoder {
 fn topology_digest(
     manifest: &StaticClusterManifestInput,
     initial_pg_acting_sets: &[Vec<u32>],
-    canonical_raft_peer_endpoints: &BTreeMap<u64, String>,
+    canonical_raft_peer_endpoints: &BTreeMap<u64, CanonicalRaftPeerEndpoint>,
 ) -> String {
     let mut encoder = CanonicalEncoder::default();
     encoder.string(1, TOPOLOGY_IDENTITY_DOMAIN);
@@ -1985,10 +2300,12 @@ fn encode_initial_pg_acting_set(pg_id: usize, acting_set: &[u32]) -> Vec<u8> {
     encoder.finish()
 }
 
-fn encode_raft_peer_endpoint(node_id: u64, endpoint: &str) -> Vec<u8> {
+fn encode_raft_peer_endpoint(node_id: u64, endpoint: &CanonicalRaftPeerEndpoint) -> Vec<u8> {
     let mut encoder = CanonicalEncoder::default();
     encoder.u64(1, node_id);
-    encoder.string(2, endpoint);
+    encoder.string(2, &endpoint.endpoint_id);
+    encoder.string(3, &endpoint.owner_process_id);
+    encoder.string(4, &endpoint.advertise);
     encoder.finish()
 }
 
@@ -2563,7 +2880,7 @@ fn validate_static_cluster_manifest(
 fn validate_initial_bootstrap_replication_size(
     manifest: &StaticClusterManifestInput,
     initial_pg_acting_sets: &[Vec<u32>],
-    canonical_raft_peer_endpoints: &BTreeMap<u64, String>,
+    canonical_raft_peer_endpoints: &BTreeMap<u64, CanonicalRaftPeerEndpoint>,
     topology_digest: &str,
 ) -> Result<(), String> {
     if manifest.deployment.mode != DeploymentMode::Replicated {
@@ -3889,7 +4206,7 @@ fn validate_auth_credentials(
 fn resolve_canonical_raft_peer_endpoints(
     manifest: &StaticClusterManifestInput,
     authorities: &BTreeMap<&str, &AuthorityInput>,
-) -> Result<BTreeMap<u64, String>, String> {
+) -> Result<BTreeMap<u64, CanonicalRaftPeerEndpoint>, String> {
     let process_hosts: BTreeMap<&str, &str> = manifest
         .processes
         .iter()
@@ -3901,6 +4218,7 @@ fn resolve_canonical_raft_peer_endpoints(
         .map(|authority| process_hosts[authority.process_id.as_str()])
         .collect();
     let mut resolved = BTreeMap::new();
+    let mut advertised_voters = BTreeMap::<&str, (u64, &str)>::new();
     for authority in authorities
         .values()
         .filter(|authority| authority.kind == AuthorityKind::RaftVoter)
@@ -3933,7 +4251,22 @@ fn resolve_canonical_raft_peer_endpoints(
         let node_id = authority
             .raft_node_id
             .expect("replicated authority validation requires a Raft node id");
-        resolved.insert(node_id, endpoint.advertise.clone());
+        if let Some((other_node_id, other_endpoint_id)) =
+            advertised_voters.insert(endpoint.advertise.as_str(), (node_id, endpoint.id.as_str()))
+        {
+            return Err(format!(
+                "Raft voters {other_node_id} and {node_id} select the same canonical advertised endpoint through {} and {}; each voter requires a distinct routable endpoint",
+                other_endpoint_id, endpoint.id
+            ));
+        }
+        resolved.insert(
+            node_id,
+            CanonicalRaftPeerEndpoint {
+                endpoint_id: endpoint.id.clone(),
+                owner_process_id: endpoint.owner_process_id.clone(),
+                advertise: endpoint.advertise.clone(),
+            },
+        );
     }
     Ok(resolved)
 }
@@ -3942,7 +4275,7 @@ fn validate_raft_transport_capacity(
     manifest: &StaticClusterManifestInput,
     transport_profiles: &BTreeMap<&str, &TransportProfileInput>,
     authorities: &BTreeMap<&str, &AuthorityInput>,
-    canonical_raft_peer_endpoints: &BTreeMap<u64, String>,
+    canonical_raft_peer_endpoints: &BTreeMap<u64, CanonicalRaftPeerEndpoint>,
 ) -> Result<(), String> {
     let voter_processes: BTreeSet<&str> = authorities
         .values()
@@ -4035,7 +4368,9 @@ fn validate_raft_transport_capacity(
         }
         ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
             manifest.cluster.id.clone(),
-            canonical_raft_peer_endpoints.clone(),
+            canonical_raft_peer_endpoints
+                .iter()
+                .map(|(&node_id, endpoint)| (node_id, endpoint.advertise.clone())),
             limits,
         )
         .validate_replication_compatibility()
@@ -4580,8 +4915,51 @@ mod tests {
     use crate::config::ProcessRole;
     use std::fmt::Write as _;
     use std::fs::File;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
     use std::os::unix::fs::symlink;
+
+    fn complete_test_tls_handshake(
+        client_config: Arc<RustlsClientConfig>,
+        server_config: Arc<rustls::ServerConfig>,
+        server_name: &str,
+    ) {
+        let mut client = rustls::ClientConnection::new(
+            client_config,
+            ServerName::try_from(server_name.to_string()).unwrap(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(server_config).unwrap();
+        for _ in 0..16 {
+            let mut client_tls = Vec::new();
+            client.write_tls(&mut client_tls).unwrap();
+            if !client_tls.is_empty() {
+                server.read_tls(&mut Cursor::new(client_tls)).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            let mut server_tls = Vec::new();
+            server.write_tls(&mut server_tls).unwrap();
+            if !server_tls.is_empty() {
+                client.read_tls(&mut Cursor::new(server_tls)).unwrap();
+                client.process_new_packets().unwrap();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+        assert_eq!(client.alpn_protocol(), Some(STATIC_RAFT_TLS_ALPN));
+        assert_eq!(server.alpn_protocol(), Some(STATIC_RAFT_TLS_ALPN));
+
+        client.writer().write_all(b"raft-frame").unwrap();
+        let mut client_tls = Vec::new();
+        client.write_tls(&mut client_tls).unwrap();
+        server.read_tls(&mut Cursor::new(client_tls)).unwrap();
+        server.process_new_packets().unwrap();
+        let mut plaintext = [0_u8; 10];
+        server.reader().read_exact(&mut plaintext).unwrap();
+        assert_eq!(&plaintext, b"raft-frame");
+    }
 
     fn standalone_runtime_environment() -> BTreeMap<&'static str, String> {
         BTreeMap::from([
@@ -4618,6 +4996,13 @@ mod tests {
     fn materialized_replicated_manifest(
         selected_process_id: &str,
     ) -> (test_util::TempDir, ValidatedStaticClusterManifest) {
+        materialized_replicated_manifest_from(selected_process_id, replicated_manifest())
+    }
+
+    fn materialized_replicated_manifest_from(
+        selected_process_id: &str,
+        manifest: String,
+    ) -> (test_util::TempDir, ValidatedStaticClusterManifest) {
         let dir = test_util::tempdir();
         let material_dir = dir.path().join("material");
         private_dir(&material_dir);
@@ -4650,7 +5035,7 @@ mod tests {
                 );
             }
         }
-        let manifest = replicated_manifest()
+        let manifest = manifest
             .replace("/run/argmin-secrets", material_dir.to_str().unwrap())
             .replace("tcp://control-1.internal:", "tcp://localhost:")
             .replace("tcp://storage-1.internal:", "tcp://localhost:")
@@ -5422,6 +5807,171 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
     }
 
     #[test]
+    fn static_cluster_unix_mapping_rejects_additional_tcp_listeners() {
+        let base_manifest = replicated_unix_manifest().replace(
+            "tls_identities = []\ntls_trust_bundles = []",
+            r#"[[tls_trust_bundles]]
+id = "cluster-ca"
+ca_bundle_ref = "file:/run/argmin-secrets/cluster-ca.pem"
+
+[[tls_identities]]
+id = "host-1-identity"
+certificate_ref = "file:/run/argmin-secrets/host-1.crt"
+private_key_ref = "file:/run/argmin-secrets/host-1.key""#,
+        );
+        for (protocol, endpoint_id, port) in [
+            ("raft-peer", "raft-1-tcp", 8401),
+            ("control-plane", "control-1-tcp", 8501),
+            ("authority-clock-recovery", "clock-recovery-1-tcp", 8601),
+        ] {
+            let manifest = format!(
+                r#"{base_manifest}
+
+[[endpoints]]
+id = "{endpoint_id}"
+owner_process_id = "control-1"
+protocol = "{protocol}"
+priority = 20
+listen = "tcp://0.0.0.0:{port}"
+advertise = "tcp://control-1.internal:{port}"
+transport_profile_id = "internal"
+tls_identity_id = "host-1-identity"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "control-1.internal"
+"#
+            );
+            let (_dir, manifest) = materialized_replicated_manifest_from("control-1", manifest);
+            let material = manifest.resolve_selected_process_material_at(1).unwrap();
+
+            let error = manifest
+                .replicated_unix_control_plane_server_config(&material, |_| None)
+                .unwrap_err();
+
+            assert!(
+                error.contains("cannot ignore configured TCP listener"),
+                "{error}"
+            );
+            assert!(error.contains(endpoint_id), "{error}");
+        }
+    }
+
+    #[test]
+    fn static_cluster_resolves_canonical_tls_raft_transport_plan() {
+        let (_dir, manifest) = materialized_replicated_manifest("control-1");
+        let material = manifest.resolve_selected_process_material_at(1).unwrap();
+
+        let plan = manifest
+            .resolved_static_raft_transport_plan(&material)
+            .unwrap();
+
+        assert_eq!(plan.local_node_id, 101);
+        assert_eq!(plan.listeners.len(), 1);
+        let listener = &plan.listeners[0];
+        assert_eq!(listener.endpoint_id, "raft-1");
+        assert_eq!(
+            listener.listen,
+            EndpointAddress::Tcp {
+                host: "0.0.0.0".to_string(),
+                port: 7401,
+            }
+        );
+        assert_eq!(
+            listener.advertise,
+            EndpointAddress::Tcp {
+                host: "localhost".to_string(),
+                port: 7401,
+            }
+        );
+        assert_eq!(listener.transport_profile_id, "internal");
+        let server_config = listener.tls_server_config.as_ref().unwrap();
+        assert_eq!(server_config.alpn_protocols, &[STATIC_RAFT_TLS_ALPN]);
+        assert_eq!(
+            plan.peers.keys().copied().collect::<Vec<_>>(),
+            [101, 102, 103]
+        );
+        for (&node_id, peer) in &plan.peers {
+            assert_eq!(peer.node_id, node_id);
+            assert_eq!(peer.endpoint_id, format!("raft-{}", node_id - 100));
+            assert_eq!(peer.transport_profile_id, "internal");
+            assert!(matches!(
+                peer.address,
+                ResolvedStaticRaftPeerAddress::Tcp { .. }
+            ));
+            let client_config = peer.tls_client_config.as_ref().unwrap();
+            assert_eq!(client_config.alpn_protocols, &[STATIC_RAFT_TLS_ALPN]);
+        }
+        let local_peer = plan.peers.get(&plan.local_node_id).unwrap();
+        let ResolvedStaticRaftPeerAddress::Tcp { server_name, .. } = &local_peer.address else {
+            panic!("local resolved Raft peer must use TCP");
+        };
+        complete_test_tls_handshake(
+            Arc::clone(local_peer.tls_client_config.as_ref().unwrap()),
+            Arc::clone(server_config),
+            server_name,
+        );
+        let debug = format!("{plan:?}");
+        assert!(debug.contains("tls: true"));
+        assert!(!debug.contains("PRIVATE KEY"));
+    }
+
+    #[test]
+    fn static_cluster_raft_transport_plan_retains_local_unix_listener_with_tcp_peer() {
+        let manifest = format!(
+            "{}\n{}",
+            replicated_manifest(),
+            r#"
+[[endpoints]]
+id = "raft-1-local"
+owner_process_id = "control-1"
+protocol = "raft-peer"
+priority = 1
+listen = "unix:///run/argmin/raft-1-local.sock"
+advertise = "unix:///run/argmin/raft-1-local.sock"
+transport_profile_id = "internal"
+"#
+        );
+        let (_dir, manifest) = materialized_replicated_manifest_from("control-1", manifest);
+        let material = manifest.resolve_selected_process_material_at(1).unwrap();
+
+        let plan = manifest
+            .resolved_static_raft_transport_plan(&material)
+            .unwrap();
+
+        assert_eq!(plan.listeners.len(), 2);
+        assert_eq!(plan.listeners[0].endpoint_id, "raft-1-local");
+        assert_eq!(
+            plan.listeners[0].advertise,
+            EndpointAddress::Unix(PathBuf::from("/run/argmin/raft-1-local.sock"))
+        );
+        assert!(plan.listeners[0].tls_server_config.is_none());
+        assert_eq!(plan.listeners[1].endpoint_id, "raft-1");
+        assert!(plan.listeners[1].tls_server_config.is_some());
+        let local_peer = plan.peers.get(&plan.local_node_id).unwrap();
+        assert_eq!(local_peer.endpoint_id, "raft-1");
+        assert!(matches!(
+            local_peer.address,
+            ResolvedStaticRaftPeerAddress::Tcp { .. }
+        ));
+    }
+
+    #[test]
+    fn static_cluster_tls_raft_transport_plan_requires_resolved_material() {
+        let (_dir, manifest) = materialized_replicated_manifest("control-1");
+        let material = ResolvedStaticClusterMaterial {
+            auth_credentials: Vec::new(),
+            tls_identities: BTreeMap::new(),
+            tls_trust_bundles: BTreeMap::new(),
+        };
+
+        let error = manifest
+            .resolved_static_raft_transport_plan(&material)
+            .unwrap_err();
+
+        assert!(error.contains("did not resolve Raft endpoint"), "{error}");
+        assert!(!error.contains("/material/"), "{error}");
+    }
+
+    #[test]
     fn static_cluster_replicated_control_plane_requires_explicit_state_initialization() {
         let temp = test_util::tempdir();
         let control_dir = temp.path().join("control-1");
@@ -5804,8 +6354,8 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
                 replicated.full_config_fingerprint(),
             ),
             (
-                "7350e19d22bdd52da757cc449d8c68ae38ebdc3118b0141b6a570346a0a0f5fb",
-                "8d6b71bed787aeb1f206d54118c50e81d48f6bbc4176aae7bea7dedcc53f1a3d",
+                "8e9ea44c63b6ffd99aae8226e20f681b95215e3fb82bbfbf376c307b182d1276",
+                "e48c627a2851d36fc7245589ba4a55fb2addb876e80981b9f656167a5e46b750",
                 "14fefe4097e94d42485566c17243f57b175a84dd033905f4f5cd5ebbe09f0c42",
             )
         );
@@ -5987,9 +6537,45 @@ transport_profile_id = "internal"
             validated
                 .canonical_raft_peer_endpoints()
                 .get(&101)
-                .map(String::as_str),
+                .map(|endpoint| endpoint.advertise.as_str()),
             Some("tcp://control-1.internal:7401")
         );
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_shared_canonical_raft_address() {
+        let manifest = replace_once(
+            &replicated_manifest(),
+            r#"id = "raft-2"
+owner_process_id = "control-2"
+protocol = "raft-peer"
+priority = 10
+listen = "tcp://0.0.0.0:7402"
+advertise = "tcp://control-2.internal:7402"
+transport_profile_id = "internal"
+tls_identity_id = "host-2-identity"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "control-2.internal""#,
+            r#"id = "raft-2"
+owner_process_id = "control-2"
+protocol = "raft-peer"
+priority = 10
+listen = "tcp://0.0.0.0:7401"
+advertise = "tcp://control-1.internal:7401"
+transport_profile_id = "internal"
+tls_identity_id = "host-2-identity"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "control-1.internal""#,
+        );
+
+        let error = parse_static_cluster_manifest(&manifest, "control-1").unwrap_err();
+
+        assert!(
+            error.contains("same canonical advertised endpoint"),
+            "{error}"
+        );
+        assert!(error.contains("raft-1"), "{error}");
+        assert!(error.contains("raft-2"), "{error}");
     }
 
     #[test]

@@ -953,6 +953,25 @@ Progress as of 2026-07-21:
   credentials distinct from the manifest-selected signer during rotation, and
   never converts secrets back into legacy env-style strings. Storage/frontend
   activation and TLS/TCP construction remain open.
+- Slice 6's Raft transport-planning sub-slice is implemented: the validated
+  manifest resolves the canonical globally reachable endpoint for every voter
+  into one immutable selected-process plan while preserving its endpoint id,
+  owner, and address. Canonical addresses must be unique between voters and
+  the selected endpoint identity participates in the topology digest. The plan
+  includes every configured local Raft listener while proving the local
+  canonical endpoint is among them, and
+  constructs explicit rustls client/server
+  configurations from the already bounded material resolver. TCP Raft uses
+  TLS 1.3 only, the `argmin-raft/1` ALPN, the configured server name and root
+  store, and no ambient system roots or TLS client identity. An in-memory
+  handshake regression proves certificate trust, name verification, ALPN, and
+  encrypted application-data agreement. The existing Unix authority mapping
+  consumes this common plan but continues to reject any outbound TCP peer or
+  selected-process TCP listener, across Raft, ordinary control-plane, and
+  clock-recovery protocols, rather than silently leaving configured listeners
+  unbound;
+  listener/network activation and deadline-bounded TCP connection handling are
+  the next sub-slice.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state
