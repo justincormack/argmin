@@ -2614,13 +2614,34 @@ use until Phase 3 supplies role authorization.
 ### Phase 3: IAM policy and role core
 
 Phase 3 began by extracting the policy version, effect, normalized condition
-clause, statement-field, evaluation-result, and wildcard/action matching
+clause, statement-core, evaluation-result, and wildcard/action matching
 primitives from the S3 bucket-policy implementation into a shared internal
 policy-language module. `BucketPolicy` remains the typed public S3 resource-
 policy wrapper and retains its existing parser, request adapter, validation,
 and composition behavior. Subsequent Phase 3 slices will build typed trust,
 identity, and session-policy wrappers over these shared primitives; they must
 not introduce a second permissive IAM parser or a universal request context.
+
+The next Phase 3 foundation adds typed, programmatically constructed identity,
+session, and initial AWS-principal role-trust policy documents; named inline
+policy attachments; validated role timestamps and 3,600--43,200 second maximum
+session duration; and distinct role/configured-principal authorization
+records. Identity/session evaluation takes a service-specific request enum
+whose S3 and `sts:AssumeRole` variants supply different typed data. This slice
+does not yet accept JSON policy documents or conditions: the shared parser and
+condition-context work remains mandatory before configuration can attach those
+features, so no unsupported policy member is silently ignored.
+
+Mutable authorization records are exposed through provider capabilities that
+are separate from stable issuer-liveness lookup. The role authorization
+boundary validates the complete immutable role identity and its full S3
+`AccountIdentity` (including canonical-user and display identity), while
+configured-principal lookup validates both its account/principal key and the
+same full account record. Local tests require a
+session to authenticate without reading an injected failing authorization
+provider, after which the explicit authorization lookup returns the typed
+provider failure. Role and principal tags remain deferred until the shared
+validated tag representation and their condition-key inputs are added.
 
 - extend the minimal role identity records with role configuration, trust, and
   permission-policy state

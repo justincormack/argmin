@@ -14,11 +14,13 @@
     clippy::unreadable_literal
 )]
 
+pub mod authorization;
 pub mod bucket_policy;
 pub mod canonical;
 pub mod credential;
 mod encoding;
 pub mod error;
+pub mod iam_policy;
 pub mod identity;
 mod policy;
 pub mod post;
@@ -58,6 +60,11 @@ pub(crate) fn is_lower_hex(value: &str) -> bool {
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+pub use authorization::{
+    AuthorizationRecordError, AuthorizationRecordStore, ConfiguredPrincipalAuthorizationKey,
+    ConfiguredPrincipalAuthorizationRecord, RoleAuthorizationRecord, RoleMaximumSessionDuration,
+    RoleRecordTimestamps,
+};
 pub use bucket_policy::{
     parse_bucket_policy, BucketPolicy, BucketPolicyError, PolicyAction, PolicyConditionClause,
     PolicyEffect, PolicyEvaluation, PolicyPrincipal, PolicyRequest, PolicyStatement, PolicyTag,
@@ -73,6 +80,11 @@ pub use credential::{
     SESSION_SECRET_ACCESS_KEY_LEN,
 };
 pub use error::{AuthError, SignatureMismatchDiagnostics};
+pub use iam_policy::{
+    IamActionPattern, IamPolicyError, IamResourcePattern, IdentityPolicy, IdentityPolicyRequest,
+    IdentityPolicyStatement, InlineIdentityPolicy, InlinePolicyName, RoleTrustPolicy,
+    RoleTrustPolicyStatement, RoleTrustPrincipal, S3IdentityPolicyResource, SessionPolicy,
+};
 pub use identity::{
     AssumedRoleId, AssumedRoleSessionArn, AssumedRoleSessionIdentity, AuthenticatedIdentity,
     AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleArn, IamRoleIdentity, IdentityError,
@@ -85,7 +97,8 @@ pub use post::{
     PostPolicyError, PostSigV4Request, PreparedPostPolicy,
 };
 pub use provider::{
-    IdentityProvider, IdentityProviderBackend, IdentityProviderError, ResolvedRoleIdentity,
+    IdentityProvider, IdentityProviderBackend, IdentityProviderError,
+    ResolvedConfiguredPrincipalAuthorization, ResolvedRoleAuthorization, ResolvedRoleIdentity,
     RoleIdentityStore, RoleIdentityStoreError, SessionCredentialAuthenticationError,
 };
 pub use request::{

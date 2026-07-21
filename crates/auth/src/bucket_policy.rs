@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 #[cfg(test)]
 use crate::policy::wildcard_matches;
 use crate::policy::{
-    action_pattern_matches, policy_value_wildcard_matches, PolicyStatementFields, PolicyValue,
+    action_pattern_matches, policy_value_wildcard_matches, PolicyStatementCore, PolicyValue,
 };
 pub use crate::policy::{PolicyConditionClause, PolicyEffect, PolicyEvaluation, PolicyVersion};
 
@@ -976,18 +976,19 @@ impl<'a> PolicyRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyStatement {
     principal: PolicyPrincipal,
-    fields: PolicyStatementFields,
+    core: PolicyStatementCore,
+    resources: Vec<String>,
 }
 
 impl PolicyStatement {
     #[must_use]
     pub fn sid(&self) -> Option<&str> {
-        self.fields.sid.as_deref()
+        self.core.sid.as_deref()
     }
 
     #[must_use]
     pub fn effect(&self) -> PolicyEffect {
-        self.fields.effect
+        self.core.effect
     }
 
     #[must_use]
@@ -997,21 +998,21 @@ impl PolicyStatement {
 
     #[must_use]
     pub fn actions(&self) -> &[String] {
-        &self.fields.actions
+        &self.core.actions
     }
 
     #[must_use]
     pub fn resources(&self) -> &[String] {
-        &self.fields.resources
+        &self.resources
     }
 
     #[must_use]
     pub fn conditions(&self) -> &[PolicyConditionClause] {
-        &self.fields.conditions
+        &self.core.conditions
     }
 
     fn allows_public_access(&self) -> bool {
-        if self.fields.effect != PolicyEffect::Allow {
+        if self.core.effect != PolicyEffect::Allow {
             return false;
         }
 
@@ -1019,7 +1020,7 @@ impl PolicyStatement {
             return false;
         }
 
-        !conditions_constrain_public_principal(&self.fields.conditions)
+        !conditions_constrain_public_principal(&self.core.conditions)
     }
 
     fn request_effect(
@@ -1037,12 +1038,12 @@ impl PolicyStatement {
         }
 
         match self.condition_match_result(request, variables_enabled) {
-            ConditionMatchResult::Matches => Some(self.fields.effect),
+            ConditionMatchResult::Matches => Some(self.core.effect),
             ConditionMatchResult::NoMatch => None,
             ConditionMatchResult::AcceptedButNotEvaluable => None,
             ConditionMatchResult::InputUnavailable => None,
             ConditionMatchResult::Unsupported => {
-                (self.fields.effect == PolicyEffect::Deny).then_some(PolicyEffect::Deny)
+                (self.core.effect == PolicyEffect::Deny).then_some(PolicyEffect::Deny)
             }
         }
     }
@@ -1052,7 +1053,7 @@ impl PolicyStatement {
     }
 
     fn matches_action(&self, action: &str) -> bool {
-        self.fields
+        self.core
             .actions
             .iter()
             .any(|pattern| action_pattern_matches(pattern, action))
@@ -1064,7 +1065,7 @@ impl PolicyStatement {
         resource: &str,
         variables_enabled: bool,
     ) -> bool {
-        self.fields.resources.iter().any(|pattern| {
+        self.resources.iter().any(|pattern| {
             let pattern = if variables_enabled {
                 let Some(pattern) = expand_policy_template(pattern, request) else {
                     return false;
@@ -1078,7 +1079,7 @@ impl PolicyStatement {
     }
 
     fn references_bucket_tag_condition(&self) -> bool {
-        self.fields.conditions.iter().any(|clause| {
+        self.core.conditions.iter().any(|clause| {
             condition_key::clause_input(clause) == Some(condition_key::ConditionInput::Bucket)
         })
     }
@@ -1088,7 +1089,7 @@ impl PolicyStatement {
         action: PolicyAction,
         input: condition_key::ConditionInput,
     ) -> bool {
-        self.fields
+        self.core
             .conditions
             .iter()
             .any(|clause| condition_key::clause_requires_input_for_action(clause, action, input))
@@ -1100,13 +1101,13 @@ impl PolicyStatement {
             .chain(SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS.iter())
             .copied()
             .filter(|action| {
-                self.fields
+                self.core
                     .actions
                     .iter()
                     .any(|pattern| action_pattern_matches(pattern, action.as_str()))
             })
             .find_map(|action| {
-                self.fields.conditions.iter().find_map(|clause| {
+                self.core.conditions.iter().find_map(|clause| {
                     if !condition_key::is_known_condition_key(clause.key.as_str()) {
                         return Some(BucketPolicyError::malformed_with_detail(
                             "Policy has an invalid condition key",
@@ -1132,7 +1133,7 @@ impl PolicyStatement {
         let mut saw_unsupported = false;
         let mut saw_accepted_but_not_evaluable = false;
         let mut saw_input_unavailable = false;
-        for clause in &self.fields.conditions {
+        for clause in &self.core.conditions {
             match condition_clause_matches_request(clause, request, variables_enabled) {
                 ConditionMatchResult::Matches => {}
                 ConditionMatchResult::NoMatch => return ConditionMatchResult::NoMatch,
@@ -1166,7 +1167,7 @@ impl PolicyStatement {
         }
 
         push_json_field_name(out, "Effect", &mut first_field);
-        push_json_string(out, self.fields.effect.as_str());
+        push_json_string(out, self.core.effect.as_str());
 
         push_json_field_name(out, "Principal", &mut first_field);
         self.principal.push_normalized_json(out);
@@ -1177,7 +1178,7 @@ impl PolicyStatement {
         push_json_field_name(out, "Resource", &mut first_field);
         push_json_string_or_array(out, self.resources());
 
-        if !self.fields.conditions.is_empty() {
+        if !self.core.conditions.is_empty() {
             push_json_field_name(out, "Condition", &mut first_field);
             push_condition_map(out, self.conditions());
         }
@@ -1431,7 +1432,7 @@ impl BucketPolicy {
         let bucket_arn = format!("arn:aws:s3:::{bucket}");
         self.statements
             .iter()
-            .flat_map(|statement| statement.fields.resources.iter())
+            .flat_map(|statement| statement.resources.iter())
             .find(|resource| {
                 resource.as_str() != bucket_arn
                     && !resource
@@ -1558,7 +1559,8 @@ fn parse_statement(value: &Value, index: usize) -> Result<PolicyStatement, Bucke
 
     Ok(PolicyStatement {
         principal,
-        fields: PolicyStatementFields::new(sid, effect, actions, resources, conditions),
+        core: PolicyStatementCore::new(sid, effect, actions, conditions),
+        resources,
     })
 }
 
@@ -1675,6 +1677,13 @@ const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 23] = [
     PolicyAction::DeleteObjectTagging,
     PolicyAction::DeleteObjectVersionTagging,
 ];
+
+pub(crate) fn policy_action_pattern_is_supported(pattern: &str) -> bool {
+    SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS
+        .iter()
+        .chain(SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS.iter())
+        .any(|action| action_pattern_matches(pattern, action.as_str()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResourceScope {

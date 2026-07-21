@@ -801,6 +801,21 @@ mod tests {
             }
         }
 
+        fn lookup_role_authorization(
+            &self,
+            _stable_role_id: &StableRoleId,
+        ) -> Result<Option<Arc<crate::RoleAuthorizationRecord>>, IdentityProviderError> {
+            Ok(None)
+        }
+
+        fn lookup_configured_principal_authorization(
+            &self,
+            _key: &crate::ConfiguredPrincipalAuthorizationKey,
+        ) -> Result<Option<Arc<crate::ConfiguredPrincipalAuthorizationRecord>>, IdentityProviderError>
+        {
+            Ok(None)
+        }
+
         fn find_account_by_canonical_user_id(
             &self,
             _canonical_user_id: &s3_types::CanonicalUserId,

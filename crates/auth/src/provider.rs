@@ -4,10 +4,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::{
-    is_reserved_session_access_key_id, AuthenticatedCredential, CredentialStore,
+    is_reserved_session_access_key_id, AuthenticatedCredential, AuthorizationRecordStore,
+    ConfiguredPrincipalAuthorizationKey, ConfiguredPrincipalAuthorizationRecord, CredentialStore,
     DecodedSessionCredential, GeneratedSessionCredentialMaterial, LiveRoleIdentity,
-    RoleSessionName, SessionLifetime, SessionTokenKeyRingInitError, SessionTokenKeyRingStatus,
-    SessionTokenOpenError, SessionTokenSealError, SourceIdentity, StableRoleId, StoredCredential,
+    RoleAuthorizationRecord, RoleSessionName, SessionLifetime, SessionTokenKeyRingInitError,
+    SessionTokenKeyRingStatus, SessionTokenOpenError, SessionTokenSealError, SourceIdentity,
+    StableRoleId, StoredCredential,
 };
 
 /// Conflicting live-role identity in process-local bootstrap state.
@@ -117,6 +119,11 @@ pub struct ResolvedRoleIdentity(Arc<LiveRoleIdentity>);
 
 impl ResolvedRoleIdentity {
     #[must_use]
+    pub fn identity(&self) -> &LiveRoleIdentity {
+        &self.0
+    }
+
+    #[must_use]
     pub fn account(&self) -> &s3_types::AccountIdentity {
         self.0.account()
     }
@@ -124,6 +131,30 @@ impl ResolvedRoleIdentity {
     #[must_use]
     pub fn role(&self) -> &crate::IamRoleIdentity {
         self.0.role()
+    }
+}
+
+/// Current role authorization record whose lookup binding was checked by the
+/// provider boundary.
+#[derive(Clone, Debug)]
+pub struct ResolvedRoleAuthorization(Arc<RoleAuthorizationRecord>);
+
+impl ResolvedRoleAuthorization {
+    #[must_use]
+    pub fn record(&self) -> &RoleAuthorizationRecord {
+        &self.0
+    }
+}
+
+/// Current configured-principal authorization record whose lookup binding was
+/// checked by the provider boundary.
+#[derive(Clone, Debug)]
+pub struct ResolvedConfiguredPrincipalAuthorization(Arc<ConfiguredPrincipalAuthorizationRecord>);
+
+impl ResolvedConfiguredPrincipalAuthorization {
+    #[must_use]
+    pub fn record(&self) -> &ConfiguredPrincipalAuthorizationRecord {
+        &self.0
     }
 }
 
@@ -144,6 +175,18 @@ pub trait IdentityProviderBackend: Send + Sync + 'static {
         &self,
         stable_role_id: &StableRoleId,
     ) -> Result<Option<Arc<LiveRoleIdentity>>, IdentityProviderError>;
+
+    /// Resolve current mutable authorization state for a role incarnation.
+    fn lookup_role_authorization(
+        &self,
+        stable_role_id: &StableRoleId,
+    ) -> Result<Option<Arc<RoleAuthorizationRecord>>, IdentityProviderError>;
+
+    /// Resolve current identity-policy state for a configured principal.
+    fn lookup_configured_principal_authorization(
+        &self,
+        key: &ConfiguredPrincipalAuthorizationKey,
+    ) -> Result<Option<Arc<ConfiguredPrincipalAuthorizationRecord>>, IdentityProviderError>;
 
     /// Resolve the account associated with a canonical user ID.
     fn find_account_by_canonical_user_id(
@@ -174,7 +217,11 @@ impl IdentityProvider {
 
     /// Build the initial process-local in-memory provider.
     pub fn in_memory(credentials: CredentialStore) -> Result<Self, SessionTokenKeyRingInitError> {
-        Self::in_memory_with_roles(credentials, RoleIdentityStore::new())
+        Self::in_memory_with_authorization(
+            credentials,
+            RoleIdentityStore::new(),
+            AuthorizationRecordStore::new(),
+        )
     }
 
     /// Build the process-local provider with configured credentials and roles.
@@ -182,8 +229,22 @@ impl IdentityProvider {
         credentials: CredentialStore,
         roles: RoleIdentityStore,
     ) -> Result<Self, SessionTokenKeyRingInitError> {
+        Self::in_memory_with_authorization(credentials, roles, AuthorizationRecordStore::new())
+    }
+
+    /// Build the process-local provider with configured credentials, immutable
+    /// role liveness, and independently mutable authorization state.
+    pub fn in_memory_with_authorization(
+        credentials: CredentialStore,
+        roles: RoleIdentityStore,
+        authorization: AuthorizationRecordStore,
+    ) -> Result<Self, SessionTokenKeyRingInitError> {
         Self::new(InMemoryIdentityProvider {
-            state: RwLock::new(InMemoryIdentityState { credentials, roles }),
+            state: RwLock::new(InMemoryIdentityState {
+                credentials,
+                roles,
+                authorization,
+            }),
         })
     }
 
@@ -218,6 +279,44 @@ impl IdentityProvider {
             return Err(IdentityProviderError::InvalidRecord);
         }
         Ok(identity.map(ResolvedRoleIdentity))
+    }
+
+    /// Resolve current mutable authorization state for a role incarnation.
+    pub fn lookup_role_authorization(
+        &self,
+        expected_identity: &LiveRoleIdentity,
+    ) -> Result<Option<ResolvedRoleAuthorization>, IdentityProviderError> {
+        let record = self
+            .backend
+            .lookup_role_authorization(expected_identity.role().stable_id())?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.identity().as_ref() != expected_identity)
+        {
+            return Err(IdentityProviderError::InvalidRecord);
+        }
+        Ok(record.map(ResolvedRoleAuthorization))
+    }
+
+    /// Resolve current identity-policy state for a configured principal.
+    pub fn lookup_configured_principal_authorization(
+        &self,
+        key: &ConfiguredPrincipalAuthorizationKey,
+        expected_account: &s3_types::AccountIdentity,
+    ) -> Result<Option<ResolvedConfiguredPrincipalAuthorization>, IdentityProviderError> {
+        if expected_account.account_id() != Some(key.account_id().as_str()) {
+            return Err(IdentityProviderError::InvalidRecord);
+        }
+        let record = self
+            .backend
+            .lookup_configured_principal_authorization(key)?;
+        if record
+            .as_ref()
+            .is_some_and(|record| record.key() != key || record.account() != expected_account)
+        {
+            return Err(IdentityProviderError::InvalidRecord);
+        }
+        Ok(record.map(ResolvedConfiguredPrincipalAuthorization))
     }
 
     /// Resolve the account associated with a canonical user ID.
@@ -337,6 +436,7 @@ struct InMemoryIdentityProvider {
 struct InMemoryIdentityState {
     credentials: CredentialStore,
     roles: RoleIdentityStore,
+    authorization: AuthorizationRecordStore,
 }
 
 impl IdentityProviderBackend for InMemoryIdentityProvider {
@@ -362,6 +462,28 @@ impl IdentityProviderBackend for InMemoryIdentityProvider {
         Ok(state.roles.get(stable_role_id))
     }
 
+    fn lookup_role_authorization(
+        &self,
+        stable_role_id: &StableRoleId,
+    ) -> Result<Option<Arc<RoleAuthorizationRecord>>, IdentityProviderError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| IdentityProviderError::Unavailable)?;
+        Ok(state.authorization.role(stable_role_id))
+    }
+
+    fn lookup_configured_principal_authorization(
+        &self,
+        key: &ConfiguredPrincipalAuthorizationKey,
+    ) -> Result<Option<Arc<ConfiguredPrincipalAuthorizationRecord>>, IdentityProviderError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| IdentityProviderError::Unavailable)?;
+        Ok(state.authorization.configured_principal(key))
+    }
+
     fn find_account_by_canonical_user_id(
         &self,
         canonical_user_id: &s3_types::CanonicalUserId,
@@ -382,7 +504,8 @@ mod tests {
     use super::*;
     use crate::{
         AuthorizationProfile, AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleIdentity,
-        RoleName, SecretKey,
+        PolicyEffect, PolicyVersion, RoleMaximumSessionDuration, RoleName, RoleRecordTimestamps,
+        RoleTrustPolicy, RoleTrustPolicyStatement, RoleTrustPrincipal, SecretKey,
     };
 
     thread_local! {
@@ -443,6 +566,20 @@ mod tests {
         .unwrap()
     }
 
+    fn trust_policy() -> Arc<RoleTrustPolicy> {
+        Arc::new(
+            RoleTrustPolicy::new(
+                Some(PolicyVersion::V2012_10_17),
+                vec![RoleTrustPolicyStatement::new(
+                    PolicyEffect::Allow,
+                    vec![RoleTrustPrincipal::new("arn:aws:iam::123456789012:root").unwrap()],
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+        )
+    }
+
     struct FixedIdentityProvider {
         credential: Option<Arc<StoredCredential>>,
         role: Option<Arc<LiveRoleIdentity>>,
@@ -465,6 +602,21 @@ mod tests {
             _stable_role_id: &StableRoleId,
         ) -> Result<Option<Arc<LiveRoleIdentity>>, IdentityProviderError> {
             Ok(self.role.clone())
+        }
+
+        fn lookup_role_authorization(
+            &self,
+            _stable_role_id: &StableRoleId,
+        ) -> Result<Option<Arc<RoleAuthorizationRecord>>, IdentityProviderError> {
+            Ok(None)
+        }
+
+        fn lookup_configured_principal_authorization(
+            &self,
+            _key: &ConfiguredPrincipalAuthorizationKey,
+        ) -> Result<Option<Arc<ConfiguredPrincipalAuthorizationRecord>>, IdentityProviderError>
+        {
+            Ok(None)
         }
 
         fn find_account_by_canonical_user_id(
@@ -655,6 +807,248 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_authorization_lookup_is_separate_and_fully_bound() {
+        let identity = role("ARGR0123456789ABCDEFGHIJ", "test-role");
+        let expected_identity = identity.clone();
+        let expected_role = identity.role().clone();
+        let expected_account = identity.account().clone();
+        let configured_key = ConfiguredPrincipalAuthorizationKey::new(
+            AwsAccountId::new("123456789012").unwrap(),
+            ConfiguredPrincipalIdentity::new("arn:aws:iam::123456789012:user/test"),
+        );
+        let mut roles = RoleIdentityStore::new();
+        roles.add(identity.clone()).unwrap();
+        let mut authorization = AuthorizationRecordStore::new();
+        authorization
+            .add_role(
+                RoleAuthorizationRecord::new(
+                    Arc::new(identity),
+                    RoleRecordTimestamps::new(1_700_000_000, 1_700_000_000).unwrap(),
+                    RoleMaximumSessionDuration::new(3_600).unwrap(),
+                    trust_policy(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        authorization
+            .add_configured_principal(
+                ConfiguredPrincipalAuthorizationRecord::new(
+                    configured_key.clone(),
+                    expected_account.clone(),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let provider = IdentityProvider::in_memory_with_authorization(
+            CredentialStore::new(),
+            roles,
+            authorization,
+        )
+        .unwrap();
+
+        let resolved = provider
+            .lookup_role_authorization(&expected_identity)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.record().identity().role(), &expected_role);
+        assert_eq!(
+            resolved.record().maximum_session_duration().seconds(),
+            3_600
+        );
+        let configured = provider
+            .lookup_configured_principal_authorization(&configured_key, &expected_account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(configured.record().key(), &configured_key);
+    }
+
+    struct AuthorizationFailureProvider {
+        role: Arc<LiveRoleIdentity>,
+        authorization_lookups: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl IdentityProviderBackend for AuthorizationFailureProvider {
+        fn lookup_long_lived_credential(
+            &self,
+            _access_key_id: &str,
+        ) -> Result<Option<Arc<StoredCredential>>, IdentityProviderError> {
+            Ok(None)
+        }
+
+        fn lookup_live_role_identity(
+            &self,
+            stable_role_id: &StableRoleId,
+        ) -> Result<Option<Arc<LiveRoleIdentity>>, IdentityProviderError> {
+            Ok((self.role.role().stable_id() == stable_role_id).then(|| Arc::clone(&self.role)))
+        }
+
+        fn lookup_role_authorization(
+            &self,
+            _stable_role_id: &StableRoleId,
+        ) -> Result<Option<Arc<RoleAuthorizationRecord>>, IdentityProviderError> {
+            self.authorization_lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(IdentityProviderError::Unavailable)
+        }
+
+        fn lookup_configured_principal_authorization(
+            &self,
+            _key: &ConfiguredPrincipalAuthorizationKey,
+        ) -> Result<Option<Arc<ConfiguredPrincipalAuthorizationRecord>>, IdentityProviderError>
+        {
+            Err(IdentityProviderError::Unavailable)
+        }
+
+        fn find_account_by_canonical_user_id(
+            &self,
+            _canonical_user_id: &s3_types::CanonicalUserId,
+        ) -> Result<Option<s3_types::AccountIdentity>, IdentityProviderError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn authorization_provider_failure_is_not_read_during_session_authentication() {
+        let live_role = Arc::new(role("ARGR0123456789ABCDEFGHIJ", "test-role"));
+        let authorization_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = IdentityProvider::new(AuthorizationFailureProvider {
+            role: Arc::clone(&live_role),
+            authorization_lookups: Arc::clone(&authorization_lookups),
+        })
+        .unwrap();
+        let issuer = provider
+            .lookup_live_role_identity(live_role.role().stable_id())
+            .unwrap()
+            .unwrap();
+        let access_key_id = "ARGS0123456789ABCDEFGHIJ";
+        let token = provider
+            .seal_session_credential_v1(
+                GeneratedSessionCredentialMaterial::from_parts_for_test(
+                    access_key_id.to_string(),
+                    SecretKey::new("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN".to_string()),
+                ),
+                &issuer,
+                RoleSessionName::new("test-session").unwrap(),
+                SessionLifetime::new(1_700_000_000, 1_700_003_600).unwrap(),
+                None,
+            )
+            .unwrap();
+
+        assert!(provider
+            .authenticate_session_credential(access_key_id, Some(&token), 1_700_000_001)
+            .is_ok());
+        assert_eq!(
+            authorization_lookups.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert!(matches!(
+            provider.lookup_role_authorization(&live_role),
+            Err(IdentityProviderError::Unavailable)
+        ));
+        assert_eq!(
+            authorization_lookups.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    struct FixedAuthorizationProvider {
+        role: Arc<RoleAuthorizationRecord>,
+        principal: Arc<ConfiguredPrincipalAuthorizationRecord>,
+    }
+
+    impl IdentityProviderBackend for FixedAuthorizationProvider {
+        fn lookup_long_lived_credential(
+            &self,
+            _access_key_id: &str,
+        ) -> Result<Option<Arc<StoredCredential>>, IdentityProviderError> {
+            Ok(None)
+        }
+
+        fn lookup_live_role_identity(
+            &self,
+            _stable_role_id: &StableRoleId,
+        ) -> Result<Option<Arc<LiveRoleIdentity>>, IdentityProviderError> {
+            Ok(None)
+        }
+
+        fn lookup_role_authorization(
+            &self,
+            _stable_role_id: &StableRoleId,
+        ) -> Result<Option<Arc<RoleAuthorizationRecord>>, IdentityProviderError> {
+            Ok(Some(Arc::clone(&self.role)))
+        }
+
+        fn lookup_configured_principal_authorization(
+            &self,
+            _key: &ConfiguredPrincipalAuthorizationKey,
+        ) -> Result<Option<Arc<ConfiguredPrincipalAuthorizationRecord>>, IdentityProviderError>
+        {
+            Ok(Some(Arc::clone(&self.principal)))
+        }
+
+        fn find_account_by_canonical_user_id(
+            &self,
+            _canonical_user_id: &s3_types::CanonicalUserId,
+        ) -> Result<Option<s3_types::AccountIdentity>, IdentityProviderError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn provider_boundary_rejects_misbound_authorization_records() {
+        let stored_role = Arc::new(role("ARGR0123456789ABCDEFGHIJ", "stored-role"));
+        let role_record = Arc::new(
+            RoleAuthorizationRecord::new(
+                Arc::clone(&stored_role),
+                RoleRecordTimestamps::new(1, 1).unwrap(),
+                RoleMaximumSessionDuration::new(3_600).unwrap(),
+                trust_policy(),
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let account = stored_role.account().clone();
+        let stored_principal_key = ConfiguredPrincipalAuthorizationKey::new(
+            AwsAccountId::new("123456789012").unwrap(),
+            ConfiguredPrincipalIdentity::new("arn:aws:iam::123456789012:user/stored"),
+        );
+        let principal_record = Arc::new(
+            ConfiguredPrincipalAuthorizationRecord::new(
+                stored_principal_key.clone(),
+                account,
+                Vec::new(),
+            )
+            .unwrap(),
+        );
+        let provider = IdentityProvider::new(FixedAuthorizationProvider {
+            role: role_record,
+            principal: principal_record,
+        })
+        .unwrap();
+        let different_account = s3_types::AccountIdentity::new(
+            "123456789012",
+            s3_types::CanonicalUserId::from_principal("different-canonical-user"),
+            "different display identity",
+        );
+        let expected_role =
+            LiveRoleIdentity::new(different_account.clone(), stored_role.role().clone()).unwrap();
+
+        assert!(matches!(
+            provider.lookup_role_authorization(&expected_role),
+            Err(IdentityProviderError::InvalidRecord)
+        ));
+        assert!(matches!(
+            provider.lookup_configured_principal_authorization(
+                &stored_principal_key,
+                &different_account,
+            ),
+            Err(IdentityProviderError::InvalidRecord)
+        ));
+    }
+
+    #[test]
     fn provider_boundary_rejects_misbound_live_role_record() {
         let provider = IdentityProvider::new(FixedIdentityProvider {
             credential: None,
@@ -677,6 +1071,7 @@ mod tests {
             state: RwLock::new(InMemoryIdentityState {
                 credentials: CredentialStore::new(),
                 roles: RoleIdentityStore::new(),
+                authorization: AuthorizationRecordStore::new(),
             }),
         });
         let poison_target = Arc::clone(&backend);
@@ -700,6 +1095,22 @@ mod tests {
         assert!(matches!(
             provider
                 .lookup_live_role_identity(&StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap()),
+            Err(IdentityProviderError::Unavailable)
+        ));
+        let expected_role = role("ARGR0123456789ABCDEFGHIJ", "test-role");
+        assert!(matches!(
+            provider.lookup_role_authorization(&expected_role),
+            Err(IdentityProviderError::Unavailable)
+        ));
+        let configured_key = ConfiguredPrincipalAuthorizationKey::new(
+            AwsAccountId::new("123456789012").unwrap(),
+            ConfiguredPrincipalIdentity::new("arn:aws:iam::123456789012:user/test"),
+        );
+        assert!(matches!(
+            provider.lookup_configured_principal_authorization(
+                &configured_key,
+                expected_role.account(),
+            ),
             Err(IdentityProviderError::Unavailable)
         ));
     }

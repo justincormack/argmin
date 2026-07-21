@@ -6435,6 +6435,24 @@ mod tests {
             Err(self.0)
         }
 
+        fn lookup_role_authorization(
+            &self,
+            _stable_role_id: &auth::StableRoleId,
+        ) -> Result<Option<Arc<auth::RoleAuthorizationRecord>>, auth::IdentityProviderError>
+        {
+            Err(self.0)
+        }
+
+        fn lookup_configured_principal_authorization(
+            &self,
+            _key: &auth::ConfiguredPrincipalAuthorizationKey,
+        ) -> Result<
+            Option<Arc<auth::ConfiguredPrincipalAuthorizationRecord>>,
+            auth::IdentityProviderError,
+        > {
+            Err(self.0)
+        }
+
         fn find_account_by_canonical_user_id(
             &self,
             _canonical_user_id: &s3_types::CanonicalUserId,

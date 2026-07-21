@@ -590,6 +590,24 @@ mod tests {
             Err(self.0)
         }
 
+        fn lookup_role_authorization(
+            &self,
+            _stable_role_id: &crate::StableRoleId,
+        ) -> Result<Option<Arc<crate::RoleAuthorizationRecord>>, crate::IdentityProviderError>
+        {
+            Err(self.0)
+        }
+
+        fn lookup_configured_principal_authorization(
+            &self,
+            _key: &crate::ConfiguredPrincipalAuthorizationKey,
+        ) -> Result<
+            Option<Arc<crate::ConfiguredPrincipalAuthorizationRecord>>,
+            crate::IdentityProviderError,
+        > {
+            Err(self.0)
+        }
+
         fn find_account_by_canonical_user_id(
             &self,
             _canonical_user_id: &s3_types::CanonicalUserId,
@@ -631,6 +649,24 @@ mod tests {
                 SessionRoleState::Present(_) | SessionRoleState::Missing => Ok(None),
                 SessionRoleState::Failure(error) => Err(*error),
             }
+        }
+
+        fn lookup_role_authorization(
+            &self,
+            _stable_role_id: &crate::StableRoleId,
+        ) -> Result<Option<Arc<crate::RoleAuthorizationRecord>>, crate::IdentityProviderError>
+        {
+            Ok(None)
+        }
+
+        fn lookup_configured_principal_authorization(
+            &self,
+            _key: &crate::ConfiguredPrincipalAuthorizationKey,
+        ) -> Result<
+            Option<Arc<crate::ConfiguredPrincipalAuthorizationRecord>>,
+            crate::IdentityProviderError,
+        > {
+            Ok(None)
         }
 
         fn find_account_by_canonical_user_id(

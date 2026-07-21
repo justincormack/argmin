@@ -113,27 +113,24 @@ pub struct PolicyConditionClause {
 /// resources, and conditions are valid, remain responsibilities of the typed
 /// document that owns these fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PolicyStatementFields {
+pub(crate) struct PolicyStatementCore {
     pub(crate) sid: Option<String>,
     pub(crate) effect: PolicyEffect,
     pub(crate) actions: Vec<String>,
-    pub(crate) resources: Vec<String>,
     pub(crate) conditions: Vec<PolicyConditionClause>,
 }
 
-impl PolicyStatementFields {
+impl PolicyStatementCore {
     pub(crate) fn new(
         sid: Option<String>,
         effect: PolicyEffect,
         actions: Vec<String>,
-        resources: Vec<String>,
         conditions: Vec<PolicyConditionClause>,
     ) -> Self {
         Self {
             sid,
             effect,
             actions,
-            resources,
             conditions,
         }
     }
