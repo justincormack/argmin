@@ -7038,6 +7038,7 @@ Connection: close\r\n\r\n",
 
     fn read_http_response(stream: &mut StdTcpStream, timeout: Duration) -> String {
         read_http_response_inner(stream, timeout, None)
+            .unwrap_or_else(|message| panic!("{message}"))
     }
 
     fn read_http_response_stopping_writer(
@@ -7046,26 +7047,45 @@ Connection: close\r\n\r\n",
         stop_writer: &AtomicBool,
     ) -> String {
         read_http_response_inner(stream, timeout, Some(stop_writer))
+            .unwrap_or_else(|message| panic!("{message}"))
     }
 
     fn read_http_response_inner(
         stream: &mut StdTcpStream,
         timeout: Duration,
         stop_writer: Option<&AtomicBool>,
-    ) -> String {
+    ) -> Result<String, String> {
         let mut buf = Vec::with_capacity(8192);
         let mut tmp = [0u8; 4096];
         stream
             .set_read_timeout(Some(timeout))
             .expect("set read timeout");
+        let mut writer_stopped = false;
 
         loop {
             match stream.read(&mut tmp) {
-                Ok(0) => break,
+                Ok(0) => {
+                    if stop_writer.is_some() {
+                        return Err(format!(
+                            "early HTTP response reached premature EOF before the response body was complete; partial response: {}",
+                            String::from_utf8_lossy(&buf)
+                        ));
+                    }
+                    break;
+                }
                 Ok(n) => {
                     buf.extend_from_slice(&tmp[..n]);
                 }
-                Err(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    if stop_writer.is_some() {
+                        return Err(format!(
+                            "early HTTP response read failed before the response body was complete: {error:?}; partial response: {}",
+                            String::from_utf8_lossy(&buf)
+                        ));
+                    }
+                    break;
+                }
             }
 
             let text = String::from_utf8_lossy(&buf);
@@ -7073,8 +7093,17 @@ Connection: close\r\n\r\n",
                 // Stop uploading as soon as the early response starts
                 // arriving, like a real client; the server's lingering
                 // close then quiesces and delivers the rest of the body.
-                if let Some(stop_writer) = stop_writer {
-                    stop_writer.store(true, Ordering::Relaxed);
+                if !writer_stopped {
+                    if let Some(stop_writer) = stop_writer {
+                        stop_writer.store(true, Ordering::Relaxed);
+                        // Stop the request at the socket boundary as soon as
+                        // the early response is visible. Merely waking the
+                        // paced writer leaves the write half open long enough
+                        // for the server's bounded lingering close to race
+                        // the body.
+                        let _ = stream.shutdown(Shutdown::Write);
+                        writer_stopped = true;
+                    }
                 }
                 let headers = &text[..header_end];
                 if response_body_complete(&buf, header_end, headers) {
@@ -7083,7 +7112,34 @@ Connection: close\r\n\r\n",
             }
         }
 
-        String::from_utf8_lossy(&buf).into_owned()
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    #[test]
+    fn early_http_response_reader_rejects_premature_chunked_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("read test listener address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept test connection");
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\n\
+Transfer-Encoding: chunked\r\n\
+Connection: close\r\n\r\n",
+                )
+                .expect("write truncated response headers");
+        });
+
+        let mut stream = StdTcpStream::connect(addr).expect("connect to test listener");
+        let stop_writer = AtomicBool::new(false);
+        let error =
+            read_http_response_inner(&mut stream, Duration::from_secs(1), Some(&stop_writer))
+                .expect_err("truncated chunked response must fail");
+
+        assert!(error.contains("premature EOF"), "{error}");
+        assert!(error.contains("HTTP/1.1 400 Bad Request"), "{error}");
+        assert!(stop_writer.load(Ordering::Relaxed));
+        server.join().expect("join truncated response server");
     }
 
     fn denied_streaming_request_response(
