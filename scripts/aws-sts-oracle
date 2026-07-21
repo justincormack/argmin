@@ -456,11 +456,7 @@ wait_for_streaming_head_absence_success() {
     error_file="$tmpdir/streaming-head-absence-convergence.err"
     : >"$error_file"
     for ((attempt = 1; attempt <= 15; attempt++)); do
-        if aws_with_session_credentials \
-            "$STS_TEST_RECREATED_ROLE_ACCESS_KEY" \
-            "$STS_TEST_RECREATED_ROLE_SECRET_KEY" \
-            "$STS_TEST_RECREATED_ROLE_SESSION_TOKEN" \
-            s3api head-object \
+        if aws_primary s3api head-object \
             --bucket "$STS_TEST_POST_BUCKET" \
             --key streaming-presigned-head-absence-convergence \
             >/dev/null 2>"$error_file"; then
@@ -1072,7 +1068,7 @@ create_assume_role_fixture() {
     local expiry_liveness_access_key expiry_liveness_secret_key expiry_liveness_session_token
     local other_live_access_key other_live_identity other_live_secret_key other_live_session other_live_session_token
     local recreated_expiration recreated_expiration_epoch recreated_issue_epoch
-    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix source_identity_session streaming_bucket_policy trust_chain_source trust_chain_source_with_set trust_default_max trust_external_id trust_policy trust_recreated_role_revoked trust_source_identity trust_source_identity_condition trust_source_identity_target
+    local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix source_identity_session streaming_bucket_policy trust_chain_source trust_chain_source_with_set trust_default_max trust_external_id trust_policy trust_recreated_role_revoked trust_source_identity trust_source_identity_condition trust_source_identity_target trust_wildcard
     primary_identity="$(aws_primary sts get-caller-identity --output json)"
     primary_account="$(jq -er '.Account' <<<"$primary_identity")"
     primary_arn="$(jq -er '.Arn' <<<"$primary_identity")"
@@ -1112,6 +1108,9 @@ create_assume_role_fixture() {
     export STS_TEST_ROLE_NAME="path-shape-${role_suffix}"
     export STS_TEST_ROLE_SESSION_NAME="path-shape-session"
     export STS_TEST_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_ROLE_NAME}"
+    export STS_TEST_WILDCARD_ROLE_NAME="wildcard-trust-${role_suffix}"
+    export STS_TEST_WILDCARD_ROLE_SESSION_NAME="wildcard-trust-session"
+    export STS_TEST_WILDCARD_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_WILDCARD_ROLE_NAME}"
     export STS_TEST_DEFAULT_MAX_ROLE_NAME="default-max-${role_suffix}"
     export STS_TEST_DEFAULT_MAX_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/same-account/${STS_TEST_DEFAULT_MAX_ROLE_NAME}"
     export STS_TEST_EXTERNAL_ID="argmin-sts-oracle-external-id"
@@ -1191,6 +1190,27 @@ create_assume_role_fixture() {
         "$trust_policy" \
         "$STS_TEST_ROLE_ARN" \
         43200
+
+    assert_identity_decision \
+        same-account-wildcard-trust \
+        aws_primary \
+        "$primary_arn" \
+        "$STS_TEST_WILDCARD_ROLE_ARN" \
+        implicitDeny
+    trust_wildcard="$tmpdir/trust-wildcard.json"
+    jq -n '{
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Principal: {AWS: "*"},
+            Action: "sts:AssumeRole"
+        }]
+    }' >"$trust_wildcard"
+    create_scoped_role \
+        "$STS_TEST_WILDCARD_ROLE_NAME" \
+        /argmin-sts-oracle/same-account/ \
+        "$trust_wildcard" \
+        "$STS_TEST_WILDCARD_ROLE_ARN"
 
     assert_identity_decision \
         same-account-default-max \
@@ -1430,6 +1450,10 @@ create_assume_role_fixture() {
         aws_primary \
         "$STS_TEST_ROLE_ARN"
     wait_for_assume_role_success \
+        same-account-wildcard-trust-role \
+        aws_primary \
+        "$STS_TEST_WILDCARD_ROLE_ARN"
+    wait_for_assume_role_success \
         same-account-default-max-role \
         aws_primary \
         "$STS_TEST_DEFAULT_MAX_ROLE_ARN"
@@ -1631,15 +1655,8 @@ create_assume_role_fixture() {
                     Sid: "AllowRecreatedRoleStreamingOracle",
                     Effect: "Allow",
                     Principal: {AWS: $role_principal},
-                    Action: ["s3:GetObject", "s3:PutObject"],
+                    Action: "s3:PutObject",
                     Resource: ($bucket_arn + "/streaming-*")
-                },
-                {
-                    Sid: "AllowRecreatedRoleStreamingOracleList",
-                    Effect: "Allow",
-                    Principal: {AWS: $role_principal},
-                    Action: "s3:ListBucket",
-                    Resource: $bucket_arn
                 },
                 {
                     Sid: "AllowIamRolePrincipal",
@@ -1860,7 +1877,7 @@ assert_identity_decision() {
 }
 
 create_cross_account_role_fixtures() {
-    local alt_identity alt_arn primary_identity primary_account primary_arn role_suffix trust_alt trust_alt_and_primary trust_primary
+    local alt_identity alt_arn primary_identity primary_account primary_arn role_suffix trust_alt trust_alt_and_primary trust_primary trust_wildcard
     primary_identity="$(aws_primary sts get-caller-identity --output json)"
     primary_account="$(jq -er '.Account' <<<"$primary_identity")"
     primary_arn="$(jq -er '.Arn' <<<"$primary_identity")"
@@ -1885,6 +1902,10 @@ create_cross_account_role_fixtures() {
     export STS_TEST_CROSS_TRUST_DENIED_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/cross-account/${STS_TEST_CROSS_TRUST_DENIED_ROLE_NAME}"
     export STS_TEST_CROSS_CALLER_DENIED_ROLE_NAME="cross-caller-denied-${role_suffix}"
     export STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/caller-denied/${STS_TEST_CROSS_CALLER_DENIED_ROLE_NAME}"
+    export STS_TEST_CROSS_WILDCARD_SUCCESS_ROLE_NAME="cross-wildcard-success-${role_suffix}"
+    export STS_TEST_CROSS_WILDCARD_SUCCESS_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/cross-account/${STS_TEST_CROSS_WILDCARD_SUCCESS_ROLE_NAME}"
+    export STS_TEST_CROSS_WILDCARD_CALLER_DENIED_ROLE_NAME="cross-wildcard-caller-denied-${role_suffix}"
+    export STS_TEST_CROSS_WILDCARD_CALLER_DENIED_ROLE_ARN="arn:aws:iam::${primary_account}:role/argmin-sts-oracle/caller-denied/${STS_TEST_CROSS_WILDCARD_CALLER_DENIED_ROLE_NAME}"
 
     assert_identity_decision \
         cross-success \
@@ -1910,10 +1931,29 @@ create_cross_account_role_fixtures() {
         "$primary_arn" \
         "$STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN" \
         implicitDeny
+    assert_identity_decision \
+        cross-wildcard-success \
+        aws_alt \
+        "$alt_arn" \
+        "$STS_TEST_CROSS_WILDCARD_SUCCESS_ROLE_ARN" \
+        allowed
+    assert_identity_decision \
+        cross-wildcard-caller-denied \
+        aws_alt \
+        "$alt_arn" \
+        "$STS_TEST_CROSS_WILDCARD_CALLER_DENIED_ROLE_ARN" \
+        implicitDeny
+    assert_identity_decision \
+        cross-wildcard-caller-denied-primary-control \
+        aws_primary \
+        "$primary_arn" \
+        "$STS_TEST_CROSS_WILDCARD_CALLER_DENIED_ROLE_ARN" \
+        implicitDeny
 
     trust_alt="$tmpdir/cross-trust-alt.json"
     trust_alt_and_primary="$tmpdir/cross-trust-alt-and-primary.json"
     trust_primary="$tmpdir/cross-trust-primary.json"
+    trust_wildcard="$tmpdir/cross-trust-wildcard.json"
     jq -n --arg principal "$alt_arn" '{
         Version: "2012-10-17",
         Statement: [{Effect: "Allow", Principal: {AWS: $principal}, Action: "sts:AssumeRole"}]
@@ -1930,6 +1970,10 @@ create_cross_account_role_fixtures() {
             Action: "sts:AssumeRole"
         }]
     }' >"$trust_alt_and_primary"
+    jq -n '{
+        Version: "2012-10-17",
+        Statement: [{Effect: "Allow", Principal: {AWS: "*"}, Action: "sts:AssumeRole"}]
+    }' >"$trust_wildcard"
 
     create_scoped_role \
         "$STS_TEST_CROSS_SUCCESS_ROLE_NAME" \
@@ -1946,6 +1990,16 @@ create_cross_account_role_fixtures() {
         /argmin-sts-oracle/caller-denied/ \
         "$trust_alt_and_primary" \
         "$STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN"
+    create_scoped_role \
+        "$STS_TEST_CROSS_WILDCARD_SUCCESS_ROLE_NAME" \
+        /argmin-sts-oracle/cross-account/ \
+        "$trust_wildcard" \
+        "$STS_TEST_CROSS_WILDCARD_SUCCESS_ROLE_ARN"
+    create_scoped_role \
+        "$STS_TEST_CROSS_WILDCARD_CALLER_DENIED_ROLE_NAME" \
+        /argmin-sts-oracle/caller-denied/ \
+        "$trust_wildcard" \
+        "$STS_TEST_CROSS_WILDCARD_CALLER_DENIED_ROLE_ARN"
 
     wait_for_assume_role_success \
         cross-account-success-role \
@@ -1959,6 +2013,14 @@ create_cross_account_role_fixtures() {
         cross-account-caller-denied-positive-control \
         aws_primary \
         "$STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN"
+    wait_for_assume_role_success \
+        cross-account-wildcard-success-role \
+        aws_alt \
+        "$STS_TEST_CROSS_WILDCARD_SUCCESS_ROLE_ARN"
+    wait_for_assume_role_success \
+        cross-account-wildcard-caller-denied-positive-control \
+        aws_primary \
+        "$STS_TEST_CROSS_WILDCARD_CALLER_DENIED_ROLE_ARN"
 
     aws_primary iam update-assume-role-policy \
         --role-name "$STS_TEST_CROSS_TRUST_DENIED_ROLE_NAME" \

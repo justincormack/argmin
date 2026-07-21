@@ -1342,7 +1342,7 @@ The cross-account role-fixture slice completed on 2026-07-13. The alternate
 account's administrator applied the same test-user policy there; the
 primary-account owner credential was not used as a substitute.
 
-`./scripts/aws-sts-oracle --cross-account` creates three unique,
+`./scripts/aws-sts-oracle --cross-account` creates five unique,
 permissionless roles in the primary account and independently proved against
 AWS that:
 
@@ -1350,12 +1350,23 @@ AWS that:
 - caller identity policy `allowed` plus trust omission produces trust denial
 - caller identity policy `implicitDeny` plus trust allow produces caller-policy
   denial
+- wildcard trust plus caller identity policy `allowed` produces cross-account
+  success, while the same wildcard trust plus `implicitDeny` produces
+  caller-policy denial
 
-The success and trust-denial roles use `/argmin-sts-oracle/cross-account/`,
-while the caller-denial role uses `/argmin-sts-oracle/caller-denied/`, outside
-the caller's identity-policy resource grant. Every created role is registered
+The success, wildcard-success, and trust-denial roles use
+`/argmin-sts-oracle/cross-account/`, while both caller-denial roles use
+`/argmin-sts-oracle/caller-denied/`, outside the caller's identity-policy
+resource grant. Every created role is registered
 for cleanup only after `CreateRole` succeeds, and periodic cleanup recognizes
 the new path/name pairs with the same one-hour age floor.
+
+The exact-principal caller-denial role directly trusts both test users. The
+wildcard caller-denial role trusts `*`. IAM simulation proves that the primary
+user also has `implicitDeny` for each denied role ARN, while successful primary
+assumption proves the role and trust policy have reached STS before the
+alternate caller's denial is asserted. This separates caller-policy denial from
+target propagation for both trust-principal forms.
 
 Each negative probe has an exact-target positive STS convergence control. The
 trust-denial role initially trusts the alternate user, is successfully assumed
@@ -1502,9 +1513,9 @@ The exact AWS-backed matrix establishes that:
 - when pattern and length both fail, AWS returns both exact applicable clauses.
   Repeated live runs of the one-character invalid value returned the pattern
   and minimum-length clauses in both orders, so only those two complete
-  messages are accepted. The 1,225-character invalid value has so far remained
-  pinned pattern-first followed by maximum length; no ordering is generalized
-  from one collision shape to the other
+  messages are accepted. Later live runs likewise returned the 1,225-character
+  invalid value's pattern and maximum-length clauses in both orders; only the
+  two complete messages observed for each collision shape are accepted
 - length is counted in decoded Unicode scalar values, not UTF-8 bytes or UTF-16
   units: 613 `é` characters occupy 1,226 bytes but receive only the pattern
   error, and 613 supplementary characters occupy 2,452 bytes and 1,226 UTF-16
@@ -1547,11 +1558,10 @@ establishes that:
 - empty and one-character pattern-valid inputs receive the exact minimum-length
   `ValidationError`, a space-containing value receives the exact pattern error,
   and a 257-character pattern-valid value receives the exact maximum-length
-  error. The one-character pattern-invalid probe has consistently returned its
-  two exact clauses pattern-first and remains pinned in that order. Repeated
-  live observations of the 257-character pattern-invalid probe returned the
-  same two applicable clauses in both pattern-first and length-first order, so
-  only that overlong collision is accepted in either complete ordering
+  error. Live observations of both the one-character and 257-character
+  pattern-invalid probes returned their two applicable clauses in both
+  pattern-first and length-first order, so each collision accepts only its two
+  complete observed messages
 - length is counted in decoded Unicode scalar values rather than UTF-8 bytes or
   UTF-16 units: 129 `é` characters and 129 supplementary characters receive
   only the pattern error despite occupying 258 UTF-8 bytes and, for the
@@ -2707,6 +2717,26 @@ role permissions and cannot add an allow. A complete three-by-three decision
 matrix pins deny precedence and both implicit-deny cases. Trust-policy/caller
 composition and S3 resource-policy composition remain separate later Phase 3
 slices so neither is hidden inside this identity/session boundary.
+
+The configured-caller `AssumeRole` composition slice now evaluates role trust
+and caller identity policy as distinct sources. An exact same-account IAM user
+principal in role trust is a direct grant and does not require a redundant
+identity-policy allow. An AWS oracle role with `Principal: {"AWS": "*"}` and an
+IAM simulation result of `implicitDeny` proves that wildcard trust is likewise
+a direct grant for a same-account IAM user. Account-ID, account-root, and every
+cross-account trust match—including wildcard—are delegation and require the
+caller-side `sts:AssumeRole` allow. Dedicated cross-account wildcard roles pin
+both success with caller allow and denial with caller `implicitDeny`. An
+explicit deny on either side wins, and
+trust omission cannot be repaired by caller permission. The boundary accepts only an
+account-bound IAM user ARN for this first long-lived-caller path; legacy opaque
+configured principals, root, role ARNs, malformed ARNs, and account-mismatched
+ARNs fail closed. Assumed-role callers remain a separate typed role-chaining
+path rather than being disguised as configured long-lived credentials. A
+complete trust/identity composition matrix plus same-account, account-
+delegation, wildcard, cross-account, omission, and invalid-caller tests pin the
+decision. S3 resource-policy composition remains the next independent Phase 3
+boundary.
 
 - extend the minimal role identity records with role configuration, trust, and
   permission-policy state

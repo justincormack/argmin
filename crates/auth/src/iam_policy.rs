@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use crate::policy::{action_pattern_matches, wildcard_matches, PolicyStatementCore};
 use crate::{
-    IamPath, IamRoleIdentity, PolicyAction, PolicyEffect, PolicyEvaluation, PolicyVersion, RoleName,
+    AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleIdentity, PolicyAction,
+    PolicyEffect, PolicyEvaluation, PolicyVersion, RoleName,
 };
 
 const IAM_POLICY_NAME_MAX_LEN: usize = 128;
@@ -123,37 +124,63 @@ impl std::fmt::Debug for IamResourcePattern {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum RoleTrustPrincipalKind {
+    Any,
+    Account(AwsAccountId),
+    AccountRoot(AwsAccountId),
+    ExactIamPrincipal(AwsAccountId),
+}
+
 /// Principal in an initial role trust-policy statement.
 #[derive(Clone, PartialEq, Eq)]
-pub struct RoleTrustPrincipal(String);
+pub struct RoleTrustPrincipal {
+    value: String,
+    kind: RoleTrustPrincipalKind,
+}
 
 impl RoleTrustPrincipal {
     pub fn new(value: impl Into<String>) -> Result<Self, IamPolicyError> {
         let value = value.into();
-        let valid = value == "*"
-            || s3_types::is_valid_aws_account_id(&value)
-            || value
-                .strip_prefix("arn:aws:iam::")
-                .and_then(|suffix| suffix.split_once(':'))
-                .is_some_and(|(account_id, qualifier)| {
-                    s3_types::is_valid_aws_account_id(account_id)
-                        && (qualifier == "root"
-                            || qualifier
-                                .strip_prefix("user/")
-                                .is_some_and(valid_iam_principal_name_and_path)
-                            || qualifier
-                                .strip_prefix("role/")
-                                .is_some_and(valid_iam_principal_name_and_path))
-                });
-        (valid && value.len() <= IAM_RESOURCE_PATTERN_MAX_LEN)
-            .then_some(Self(value))
+        let kind = if value == "*" {
+            Some(RoleTrustPrincipalKind::Any)
+        } else if s3_types::is_valid_aws_account_id(&value) {
+            Some(RoleTrustPrincipalKind::Account(
+                AwsAccountId::new(value.clone()).expect("validated AWS account ID"),
+            ))
+        } else {
+            parse_iam_principal_arn(&value).map(|(account_id, qualifier)| {
+                if qualifier == "root" {
+                    RoleTrustPrincipalKind::AccountRoot(account_id)
+                } else {
+                    RoleTrustPrincipalKind::ExactIamPrincipal(account_id)
+                }
+            })
+        };
+        (value.len() <= IAM_RESOURCE_PATTERN_MAX_LEN)
+            .then_some(kind)
+            .flatten()
+            .map(|kind| Self { value, kind })
             .ok_or(IamPolicyError::InvalidTrustPrincipal)
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.value
     }
+}
+
+fn parse_iam_principal_arn(value: &str) -> Option<(AwsAccountId, &str)> {
+    let (account_id, qualifier) = value.strip_prefix("arn:aws:iam::")?.split_once(':')?;
+    let account_id = AwsAccountId::new(account_id.to_string()).ok()?;
+    let valid_qualifier = qualifier == "root"
+        || qualifier
+            .strip_prefix("user/")
+            .is_some_and(valid_iam_principal_name_and_path)
+        || qualifier
+            .strip_prefix("role/")
+            .is_some_and(valid_iam_principal_name_and_path);
+    valid_qualifier.then_some((account_id, qualifier))
 }
 
 fn valid_iam_principal_name_and_path(value: &str) -> bool {
@@ -173,7 +200,66 @@ fn valid_iam_principal_name_and_path(value: &str) -> bool {
 
 impl std::fmt::Debug for RoleTrustPrincipal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&observability::escaped(&self.0), f)
+        std::fmt::Debug::fmt(&observability::escaped(&self.value), f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoleTrustPolicyEvaluation {
+    ExplicitDeny,
+    SameAccountDirectAllow,
+    DelegatedAllow,
+    NoMatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InvalidRoleTrustCaller;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoleTrustPrincipalMatch {
+    Delegated,
+    SameAccountDirect,
+}
+
+fn strongest_principal_match(
+    left: Option<RoleTrustPrincipalMatch>,
+    right: Option<RoleTrustPrincipalMatch>,
+) -> Option<RoleTrustPrincipalMatch> {
+    if left == Some(RoleTrustPrincipalMatch::SameAccountDirect)
+        || right == Some(RoleTrustPrincipalMatch::SameAccountDirect)
+    {
+        Some(RoleTrustPrincipalMatch::SameAccountDirect)
+    } else {
+        left.or(right)
+    }
+}
+
+impl RoleTrustPrincipal {
+    fn matches_configured_caller(
+        &self,
+        caller_account_id: &AwsAccountId,
+        caller_principal: &ConfiguredPrincipalIdentity,
+        target_role: &IamRoleIdentity,
+    ) -> Option<RoleTrustPrincipalMatch> {
+        match &self.kind {
+            RoleTrustPrincipalKind::Any => Some(if caller_account_id == target_role.account_id() {
+                RoleTrustPrincipalMatch::SameAccountDirect
+            } else {
+                RoleTrustPrincipalMatch::Delegated
+            }),
+            RoleTrustPrincipalKind::Account(account_id)
+            | RoleTrustPrincipalKind::AccountRoot(account_id) => {
+                (account_id == caller_account_id).then_some(RoleTrustPrincipalMatch::Delegated)
+            }
+            RoleTrustPrincipalKind::ExactIamPrincipal(account_id) => {
+                (account_id == caller_account_id && self.value == caller_principal.principal())
+                    .then_some(if caller_account_id == target_role.account_id() {
+                        RoleTrustPrincipalMatch::SameAccountDirect
+                    } else {
+                        RoleTrustPrincipalMatch::Delegated
+                    })
+            }
+        }
     }
 }
 
@@ -420,6 +506,52 @@ impl RoleTrustPolicy {
     #[must_use]
     pub fn statements(&self) -> &[RoleTrustPolicyStatement] {
         &self.statements
+    }
+
+    pub(crate) fn evaluate_configured_caller(
+        &self,
+        caller_account_id: &AwsAccountId,
+        caller_principal: &ConfiguredPrincipalIdentity,
+        target_role: &IamRoleIdentity,
+    ) -> Result<RoleTrustPolicyEvaluation, InvalidRoleTrustCaller> {
+        let (principal_account_id, qualifier) =
+            parse_iam_principal_arn(caller_principal.principal()).ok_or(InvalidRoleTrustCaller)?;
+        if !qualifier.starts_with("user/") || &principal_account_id != caller_account_id {
+            return Err(InvalidRoleTrustCaller);
+        }
+        let mut strongest_allow = None;
+        for statement in &self.statements {
+            let statement_match = statement
+                .principals
+                .iter()
+                .filter_map(|principal| {
+                    principal.matches_configured_caller(
+                        caller_account_id,
+                        caller_principal,
+                        target_role,
+                    )
+                })
+                .fold(None, |current, candidate| {
+                    strongest_principal_match(current, Some(candidate))
+                });
+            let Some(statement_match) = statement_match else {
+                continue;
+            };
+            match statement.core.effect {
+                PolicyEffect::Deny => return Ok(RoleTrustPolicyEvaluation::ExplicitDeny),
+                PolicyEffect::Allow => {
+                    strongest_allow =
+                        strongest_principal_match(strongest_allow, Some(statement_match));
+                }
+            }
+        }
+        Ok(match strongest_allow {
+            Some(RoleTrustPrincipalMatch::SameAccountDirect) => {
+                RoleTrustPolicyEvaluation::SameAccountDirectAllow
+            }
+            Some(RoleTrustPrincipalMatch::Delegated) => RoleTrustPolicyEvaluation::DelegatedAllow,
+            None => RoleTrustPolicyEvaluation::NoMatch,
+        })
     }
 }
 

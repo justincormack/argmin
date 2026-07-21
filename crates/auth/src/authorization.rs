@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::iam_policy::RoleTrustPolicyEvaluation;
 use crate::{
     AwsAccountId, ConfiguredPrincipalIdentity, IdentityPolicyRequest, InlineIdentityPolicy,
     LiveRoleIdentity, PolicyEvaluation, RoleTrustPolicy, SessionPolicy, StableRoleId,
@@ -29,6 +30,13 @@ pub enum AuthorizationRecordError {
     DuplicateStableRoleId,
     #[error("duplicate configured principal authorization record")]
     DuplicateConfiguredPrincipal,
+}
+
+/// Invalid typed input to an IAM authorization decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AuthorizationEvaluationError {
+    #[error("the configured caller is not a valid account-bound IAM user principal")]
+    InvalidConfiguredCaller,
 }
 
 /// Validated maximum duration of sessions issued for a role.
@@ -138,6 +146,28 @@ fn intersect_role_and_session_decisions(
     }
 }
 
+fn compose_assume_role_decisions(
+    trust: RoleTrustPolicyEvaluation,
+    caller_identity: PolicyEvaluation,
+) -> PolicyEvaluation {
+    if trust == RoleTrustPolicyEvaluation::ExplicitDeny
+        || caller_identity == PolicyEvaluation::ExplicitDeny
+    {
+        return PolicyEvaluation::ExplicitDeny;
+    }
+    match trust {
+        RoleTrustPolicyEvaluation::SameAccountDirectAllow => PolicyEvaluation::ExplicitAllow,
+        RoleTrustPolicyEvaluation::DelegatedAllow
+            if caller_identity == PolicyEvaluation::ExplicitAllow =>
+        {
+            PolicyEvaluation::ExplicitAllow
+        }
+        RoleTrustPolicyEvaluation::ExplicitDeny
+        | RoleTrustPolicyEvaluation::DelegatedAllow
+        | RoleTrustPolicyEvaluation::NoMatch => PolicyEvaluation::NoMatch,
+    }
+}
+
 /// Current trust-independent and trust-policy state for one live role.
 ///
 /// The embedded immutable identity binds the mutable record to a role
@@ -221,6 +251,29 @@ impl RoleAuthorizationRecord {
                 intersect_role_and_session_decisions(role_decision, policy.evaluate(request))
             }
         }
+    }
+
+    /// Evaluate whether one configured long-lived IAM user may assume this
+    /// role. Exact-principal and wildcard same-account trust are direct
+    /// resource-policy grants and do not require an identity-policy allow.
+    /// Account delegation and every cross-account grant require both sides.
+    pub fn evaluate_configured_caller_assume_role(
+        &self,
+        caller: &ConfiguredPrincipalAuthorizationRecord,
+    ) -> Result<PolicyEvaluation, AuthorizationEvaluationError> {
+        let trust = self
+            .trust_policy
+            .evaluate_configured_caller(
+                caller.key().account_id(),
+                caller.key().principal(),
+                self.identity.role(),
+            )
+            .map_err(|_| AuthorizationEvaluationError::InvalidConfiguredCaller)?;
+        let identity =
+            caller.evaluate_identity_permissions(&IdentityPolicyRequest::StsAssumeRole {
+                role: self.identity.role(),
+            });
+        Ok(compose_assume_role_decisions(trust, identity))
     }
 }
 
@@ -375,9 +428,13 @@ mod tests {
     };
 
     fn account() -> s3_types::AccountIdentity {
+        account_for("123456789012")
+    }
+
+    fn account_for(account_id: &str) -> s3_types::AccountIdentity {
         s3_types::AccountIdentity::new(
-            "123456789012",
-            s3_types::CanonicalUserId::from_principal("123456789012"),
+            account_id,
+            s3_types::CanonicalUserId::from_principal(account_id),
             "test account",
         )
     }
@@ -450,6 +507,76 @@ mod tests {
             RoleMaximumSessionDuration::new(3_600).unwrap(),
             trust_policy(),
             permission_policies,
+        )
+        .unwrap()
+    }
+
+    fn role_record_with_trust(
+        principals: &[&str],
+        effect: PolicyEffect,
+    ) -> RoleAuthorizationRecord {
+        role_record_with_trust_statements(&[(effect, principals)])
+    }
+
+    fn role_record_with_trust_statements(
+        statements: &[(PolicyEffect, &[&str])],
+    ) -> RoleAuthorizationRecord {
+        RoleAuthorizationRecord::new(
+            live_role(),
+            RoleRecordTimestamps::new(1, 1).unwrap(),
+            RoleMaximumSessionDuration::new(3_600).unwrap(),
+            Arc::new(
+                RoleTrustPolicy::new(
+                    Some(PolicyVersion::V2012_10_17),
+                    statements
+                        .iter()
+                        .map(|(effect, principals)| {
+                            RoleTrustPolicyStatement::new(
+                                *effect,
+                                principals
+                                    .iter()
+                                    .map(|principal| RoleTrustPrincipal::new(*principal).unwrap())
+                                    .collect(),
+                            )
+                            .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            ),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn configured_caller(
+        account_id: &str,
+        principal: &str,
+        decision: PolicyEvaluation,
+        target_role: &IamRoleIdentity,
+    ) -> ConfiguredPrincipalAuthorizationRecord {
+        let policies = match decision {
+            PolicyEvaluation::ExplicitAllow => vec![permission_policy(
+                "assume-allow",
+                PolicyEffect::Allow,
+                "sts:AssumeRole",
+                target_role.arn().as_str(),
+            )],
+            PolicyEvaluation::ExplicitDeny => vec![permission_policy(
+                "assume-deny",
+                PolicyEffect::Deny,
+                "sts:AssumeRole",
+                target_role.arn().as_str(),
+            )],
+            PolicyEvaluation::NoMatch => Vec::new(),
+        };
+        ConfiguredPrincipalAuthorizationRecord::new(
+            ConfiguredPrincipalAuthorizationKey::new(
+                AwsAccountId::new(account_id).unwrap(),
+                ConfiguredPrincipalIdentity::new(principal),
+            ),
+            account_for(account_id),
+            policies,
         )
         .unwrap()
     }
@@ -691,6 +818,244 @@ mod tests {
                 intersect_role_and_session_decisions(role, session),
                 expected,
                 "unexpected role={role:?}, session={session:?} composition"
+            );
+        }
+    }
+
+    #[test]
+    fn assume_role_decision_composition_has_complete_deny_first_matrix() {
+        use PolicyEvaluation::{ExplicitAllow, ExplicitDeny, NoMatch};
+        use RoleTrustPolicyEvaluation::{
+            DelegatedAllow, ExplicitDeny as TrustDeny, NoMatch as TrustNoMatch,
+            SameAccountDirectAllow,
+        };
+
+        for (trust, identity, expected) in [
+            (TrustDeny, ExplicitDeny, ExplicitDeny),
+            (TrustDeny, ExplicitAllow, ExplicitDeny),
+            (TrustDeny, NoMatch, ExplicitDeny),
+            (SameAccountDirectAllow, ExplicitDeny, ExplicitDeny),
+            (SameAccountDirectAllow, ExplicitAllow, ExplicitAllow),
+            (SameAccountDirectAllow, NoMatch, ExplicitAllow),
+            (DelegatedAllow, ExplicitDeny, ExplicitDeny),
+            (DelegatedAllow, ExplicitAllow, ExplicitAllow),
+            (DelegatedAllow, NoMatch, NoMatch),
+            (TrustNoMatch, ExplicitDeny, ExplicitDeny),
+            (TrustNoMatch, ExplicitAllow, NoMatch),
+            (TrustNoMatch, NoMatch, NoMatch),
+        ] {
+            assert_eq!(
+                compose_assume_role_decisions(trust, identity),
+                expected,
+                "unexpected trust={trust:?}, identity={identity:?} composition"
+            );
+        }
+    }
+
+    #[test]
+    fn assume_role_distinguishes_direct_same_account_and_delegated_trust() {
+        let same_account_principal = "arn:aws:iam::123456789012:user/team/test";
+        let cross_account_principal = "arn:aws:iam::210987654321:user/team/test";
+
+        let direct = role_record_with_trust(&[same_account_principal], PolicyEffect::Allow);
+        let same_no_policy = configured_caller(
+            "123456789012",
+            same_account_principal,
+            PolicyEvaluation::NoMatch,
+            direct.identity().role(),
+        );
+        assert_eq!(
+            direct
+                .evaluate_configured_caller_assume_role(&same_no_policy)
+                .unwrap(),
+            PolicyEvaluation::ExplicitAllow,
+            "AWS permits an exactly trusted same-account principal directly"
+        );
+
+        for delegated_principal in ["123456789012", "arn:aws:iam::123456789012:root"] {
+            let delegated = role_record_with_trust(&[delegated_principal], PolicyEffect::Allow);
+            let no_policy = configured_caller(
+                "123456789012",
+                same_account_principal,
+                PolicyEvaluation::NoMatch,
+                delegated.identity().role(),
+            );
+            let allowed = configured_caller(
+                "123456789012",
+                same_account_principal,
+                PolicyEvaluation::ExplicitAllow,
+                delegated.identity().role(),
+            );
+            assert_eq!(
+                delegated
+                    .evaluate_configured_caller_assume_role(&no_policy)
+                    .unwrap(),
+                PolicyEvaluation::NoMatch,
+                "account trust delegates instead of granting directly"
+            );
+            assert_eq!(
+                delegated
+                    .evaluate_configured_caller_assume_role(&allowed)
+                    .unwrap(),
+                PolicyEvaluation::ExplicitAllow
+            );
+        }
+
+        let same_account_wildcard = role_record_with_trust(&["*"], PolicyEffect::Allow);
+        assert_eq!(
+            same_account_wildcard
+                .evaluate_configured_caller_assume_role(&same_no_policy)
+                .unwrap(),
+            PolicyEvaluation::ExplicitAllow,
+            "AWS permits wildcard trust directly for a same-account IAM user"
+        );
+
+        let cross = role_record_with_trust(&[cross_account_principal], PolicyEffect::Allow);
+        let cross_no_policy = configured_caller(
+            "210987654321",
+            cross_account_principal,
+            PolicyEvaluation::NoMatch,
+            cross.identity().role(),
+        );
+        let cross_allowed = configured_caller(
+            "210987654321",
+            cross_account_principal,
+            PolicyEvaluation::ExplicitAllow,
+            cross.identity().role(),
+        );
+        assert_eq!(
+            cross
+                .evaluate_configured_caller_assume_role(&cross_no_policy)
+                .unwrap(),
+            PolicyEvaluation::NoMatch
+        );
+        assert_eq!(
+            cross
+                .evaluate_configured_caller_assume_role(&cross_allowed)
+                .unwrap(),
+            PolicyEvaluation::ExplicitAllow
+        );
+
+        let cross_wildcard = role_record_with_trust(&["*"], PolicyEffect::Allow);
+        assert_eq!(
+            cross_wildcard
+                .evaluate_configured_caller_assume_role(&cross_no_policy)
+                .unwrap(),
+            PolicyEvaluation::NoMatch,
+            "cross-account wildcard trust still requires caller permission"
+        );
+        assert_eq!(
+            cross_wildcard
+                .evaluate_configured_caller_assume_role(&cross_allowed)
+                .unwrap(),
+            PolicyEvaluation::ExplicitAllow
+        );
+    }
+
+    #[test]
+    fn assume_role_denies_when_either_policy_side_denies_or_trust_omits_caller() {
+        let principal = "arn:aws:iam::123456789012:user/test";
+        let direct = role_record_with_trust(&[principal], PolicyEffect::Allow);
+        let identity_deny = configured_caller(
+            "123456789012",
+            principal,
+            PolicyEvaluation::ExplicitDeny,
+            direct.identity().role(),
+        );
+        assert_eq!(
+            direct
+                .evaluate_configured_caller_assume_role(&identity_deny)
+                .unwrap(),
+            PolicyEvaluation::ExplicitDeny
+        );
+
+        let trust_deny = role_record_with_trust(&[principal], PolicyEffect::Deny);
+        let identity_allow = configured_caller(
+            "123456789012",
+            principal,
+            PolicyEvaluation::ExplicitAllow,
+            trust_deny.identity().role(),
+        );
+        assert_eq!(
+            trust_deny
+                .evaluate_configured_caller_assume_role(&identity_allow)
+                .unwrap(),
+            PolicyEvaluation::ExplicitDeny
+        );
+
+        let omitted = role_record_with_trust(
+            &["arn:aws:iam::123456789012:user/someone-else"],
+            PolicyEffect::Allow,
+        );
+        let identity_allow = configured_caller(
+            "123456789012",
+            principal,
+            PolicyEvaluation::ExplicitAllow,
+            omitted.identity().role(),
+        );
+        assert_eq!(
+            omitted
+                .evaluate_configured_caller_assume_role(&identity_allow)
+                .unwrap(),
+            PolicyEvaluation::NoMatch
+        );
+    }
+
+    #[test]
+    fn assume_role_trust_document_combines_statements_deny_first() {
+        let principal = "arn:aws:iam::123456789012:user/test";
+        let no_identity_policy = |role: &RoleAuthorizationRecord| {
+            configured_caller(
+                "123456789012",
+                principal,
+                PolicyEvaluation::NoMatch,
+                role.identity().role(),
+            )
+        };
+
+        let direct_and_delegated = role_record_with_trust_statements(&[
+            (PolicyEffect::Allow, &["arn:aws:iam::123456789012:root"]),
+            (PolicyEffect::Allow, &[principal]),
+        ]);
+        assert_eq!(
+            direct_and_delegated
+                .evaluate_configured_caller_assume_role(&no_identity_policy(&direct_and_delegated,))
+                .unwrap(),
+            PolicyEvaluation::ExplicitAllow,
+            "an exact direct grant is not weakened by a separate delegated grant"
+        );
+
+        let allow_then_deny = role_record_with_trust_statements(&[
+            (PolicyEffect::Allow, &[principal]),
+            (PolicyEffect::Deny, &["arn:aws:iam::123456789012:root"]),
+        ]);
+        assert_eq!(
+            allow_then_deny
+                .evaluate_configured_caller_assume_role(&no_identity_policy(&allow_then_deny))
+                .unwrap(),
+            PolicyEvaluation::ExplicitDeny
+        );
+    }
+
+    #[test]
+    fn assume_role_rejects_untyped_or_account_mismatched_configured_callers() {
+        let role = role_record_with_trust(&["*"], PolicyEffect::Allow);
+        for principal in [
+            "legacy-principal",
+            "arn:aws:iam::210987654321:user/wrong-account",
+            "arn:aws:iam::123456789012:group/not-a-caller",
+            "arn:aws:iam::123456789012:role/not-a-long-lived-caller",
+            "arn:aws:iam::123456789012:root",
+        ] {
+            let caller = configured_caller(
+                "123456789012",
+                principal,
+                PolicyEvaluation::ExplicitAllow,
+                role.identity().role(),
+            );
+            assert_eq!(
+                role.evaluate_configured_caller_assume_role(&caller),
+                Err(AuthorizationEvaluationError::InvalidConfiguredCaller)
             );
         }
     }

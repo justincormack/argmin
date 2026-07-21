@@ -4656,15 +4656,28 @@ fn assert_s3_presigned_streaming_object_absent(
     );
 }
 
+#[derive(Clone, Copy)]
+struct S3PresignedStreamingProbeSet<'a> {
+    credentials: SignedRequestCredentials<'a>,
+    security_token: Option<&'a str>,
+    object_absence_credentials: SignedRequestCredentials<'a>,
+    multipart_key: &'a str,
+    upload_id: &'a str,
+}
+
 fn run_s3_presigned_streaming_probes(
     endpoint: &str,
     bucket: &str,
     credential_label: &str,
-    credentials: SignedRequestCredentials<'_>,
-    security_token: Option<&str>,
-    multipart_key: &str,
-    upload_id: &str,
+    fixture: S3PresignedStreamingProbeSet<'_>,
 ) {
+    let S3PresignedStreamingProbeSet {
+        credentials,
+        security_token,
+        object_absence_credentials,
+        multipart_key,
+        upload_id,
+    } = fixture;
     let cases = [
         (
             "signed-raw-exact-length",
@@ -4821,8 +4834,8 @@ fn run_s3_presigned_streaming_probes(
                         bucket,
                         &label,
                         &label,
-                        credentials,
-                        security_token,
+                        object_absence_credentials,
+                        None,
                     );
                 }
                 S3PresignedStreamingTarget::UploadPart { .. } => {
@@ -6352,6 +6365,9 @@ struct AssumeRoleProbeSet<'a> {
     caller_arn: &'a str,
     role_arn: &'a str,
     role_name: &'a str,
+    wildcard_role_arn: &'a str,
+    wildcard_role_name: &'a str,
+    wildcard_role_session_name: &'a str,
     default_max_role_arn: &'a str,
     default_max_role_name: &'a str,
     external_id: &'a str,
@@ -6370,6 +6386,9 @@ fn run_assume_role_probes(
         caller_arn,
         role_arn,
         role_name,
+        wildcard_role_arn,
+        wildcard_role_name,
+        wildcard_role_session_name,
         default_max_role_arn,
         default_max_role_name,
         external_id,
@@ -6448,8 +6467,11 @@ fn run_assume_role_probes(
     let overlong_external_id_message = format!(
         "1 validation error detected: Value '{overlong_external_id}' at 'externalId' failed to satisfy constraint: Member must have length less than or equal to 1224"
     );
-    let overlong_invalid_external_id_message = format!(
+    let overlong_invalid_external_id_pattern_first_message = format!(
         "2 validation errors detected: Value '{overlong_invalid_external_id}' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: {external_id_pattern}; Value '{overlong_invalid_external_id}' at 'externalId' failed to satisfy constraint: Member must have length less than or equal to 1224"
+    );
+    let overlong_invalid_external_id_length_first_message = format!(
+        "2 validation errors detected: Value '{overlong_invalid_external_id}' at 'externalId' failed to satisfy constraint: Member must have length less than or equal to 1224; Value '{overlong_invalid_external_id}' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: {external_id_pattern}"
     );
     let multibyte_external_id_message = format!(
         "1 validation error detected: Value '{multibyte_external_id}' at 'externalId' failed to satisfy constraint: Member must satisfy regular expression pattern: {external_id_pattern}"
@@ -6694,11 +6716,6 @@ fn run_assume_role_probes(
             overlong_external_id_message.as_str(),
         ),
         (
-            "assume-role-overlong-invalid-external-id",
-            overlong_invalid_external_id.as_str(),
-            overlong_invalid_external_id_message.as_str(),
-        ),
-        (
             "assume-role-multibyte-external-id-length-units",
             multibyte_external_id.as_str(),
             multibyte_external_id_message.as_str(),
@@ -6725,6 +6742,24 @@ fn run_assume_role_probes(
             Some(message),
         );
     }
+    assert_assume_role_error_with_observed_messages(
+        "assume-role-overlong-invalid-external-id",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", role_arn),
+            ("RoleSessionName", role_session_name),
+            ("ExternalId", overlong_invalid_external_id.as_str()),
+        ],
+        400,
+        "ValidationError",
+        &[
+            &overlong_invalid_external_id_pattern_first_message,
+            &overlong_invalid_external_id_length_first_message,
+        ],
+    );
     assert_assume_role_error_with_observed_messages(
         "assume-role-short-invalid-external-id",
         endpoint,
@@ -6837,6 +6872,23 @@ fn run_assume_role_probes(
             account_id,
             role_name,
             role_session_name,
+            duration_seconds: 3600,
+        },
+    );
+    assert_assume_role_request_success(
+        "assume-role-same-account-wildcard-trust-with-implicit-identity-deny",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", wildcard_role_arn),
+            ("RoleSessionName", wildcard_role_session_name),
+        ],
+        AssumeRoleSuccess {
+            account_id,
+            role_name: wildcard_role_name,
+            role_session_name: wildcard_role_session_name,
             duration_seconds: 3600,
         },
     );
@@ -7252,6 +7304,8 @@ fn run_source_identity_probes(
     let multibyte_source_identity = "é".repeat(129);
     let supplementary_source_identity = "😀".repeat(129);
     let source_identity_pattern = r"[\w+=,.@-]*";
+    let short_invalid_source_identity_pattern_first_message = r"2 validation errors detected: Value '!' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*; Value '!' at 'sourceIdentity' failed to satisfy constraint: Member must have length greater than or equal to 2";
+    let short_invalid_source_identity_length_first_message = r"2 validation errors detected: Value '!' at 'sourceIdentity' failed to satisfy constraint: Member must have length greater than or equal to 2; Value '!' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*";
     let overlong_source_identity_message = format!(
         "1 validation error detected: Value '{overlong_source_identity}' at 'sourceIdentity' failed to satisfy constraint: Member must have length less than or equal to 256"
     );
@@ -7294,11 +7348,6 @@ fn run_source_identity_probes(
             r"1 validation error detected: Value 'bad value' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*",
         ),
         (
-            "assume-role-short-invalid-source-identity",
-            "!",
-            r"2 validation errors detected: Value '!' at 'sourceIdentity' failed to satisfy constraint: Member must satisfy regular expression pattern: [\w+=,.@-]*; Value '!' at 'sourceIdentity' failed to satisfy constraint: Member must have length greater than or equal to 2",
-        ),
-        (
             "assume-role-overlong-source-identity",
             overlong_source_identity.as_str(),
             overlong_source_identity_message.as_str(),
@@ -7330,6 +7379,24 @@ fn run_source_identity_probes(
             Some(message),
         );
     }
+    assert_assume_role_error_with_observed_messages(
+        "assume-role-short-invalid-source-identity",
+        endpoint,
+        primary_credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", source_role_arn),
+            ("RoleSessionName", role_session_name),
+            ("SourceIdentity", "!"),
+        ],
+        400,
+        "ValidationError",
+        &[
+            short_invalid_source_identity_pattern_first_message,
+            short_invalid_source_identity_length_first_message,
+        ],
+    );
     assert_assume_role_error_with_observed_messages(
         "assume-role-overlong-invalid-source-identity",
         endpoint,
@@ -10148,6 +10215,9 @@ struct CrossAccountProbeSet<'a> {
     success_role_arn: &'a str,
     trust_denied_role_arn: &'a str,
     caller_denied_role_arn: &'a str,
+    wildcard_success_role_name: &'a str,
+    wildcard_success_role_arn: &'a str,
+    wildcard_caller_denied_role_arn: &'a str,
 }
 
 fn run_cross_account_probes(
@@ -10174,6 +10244,15 @@ fn run_cross_account_probes(
         fixture.caller_denied_role_arn,
         fixture.role_session_name,
     );
+    assert_cross_account_denied(
+        "assume-role-cross-account-wildcard-caller-policy-denied",
+        endpoint,
+        credentials,
+        target_account_id,
+        fixture.caller_arn,
+        fixture.wildcard_caller_denied_role_arn,
+        fixture.role_session_name,
+    );
 
     let body = form_body(&[
         ("Action", "AssumeRole"),
@@ -10196,6 +10275,23 @@ fn run_cross_account_probes(
         None,
     );
     println!("assume-role-cross-account-success: ok");
+    assert_assume_role_request_success(
+        "assume-role-cross-account-wildcard-success",
+        endpoint,
+        credentials,
+        &[
+            ("Action", "AssumeRole"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", fixture.wildcard_success_role_arn),
+            ("RoleSessionName", fixture.role_session_name),
+        ],
+        AssumeRoleSuccess {
+            account_id: target_account_id,
+            role_name: fixture.wildcard_success_role_name,
+            role_session_name: fixture.role_session_name,
+            duration_seconds: 3600,
+        },
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -11878,24 +11974,30 @@ fn main() {
             &format!("https://s3.{region}.amazonaws.com"),
             &bucket,
             "static",
-            credentials,
-            None,
-            &static_multipart_key,
-            &static_upload_id,
+            S3PresignedStreamingProbeSet {
+                credentials,
+                security_token: None,
+                object_absence_credentials: credentials,
+                multipart_key: &static_multipart_key,
+                upload_id: &static_upload_id,
+            },
         );
         run_s3_presigned_streaming_probes(
             &format!("https://s3.{region}.amazonaws.com"),
             &bucket,
             "session",
-            SignedRequestCredentials {
-                access_key: &recreated_access_key,
-                secret_key: &recreated_secret_key,
-                region: &region,
-                tls_ca_pem: None,
+            S3PresignedStreamingProbeSet {
+                credentials: SignedRequestCredentials {
+                    access_key: &recreated_access_key,
+                    secret_key: &recreated_secret_key,
+                    region: &region,
+                    tls_ca_pem: None,
+                },
+                security_token: Some(&recreated_security_token),
+                object_absence_credentials: credentials,
+                multipart_key: &session_multipart_key,
+                upload_id: &session_upload_id,
             },
-            Some(&recreated_security_token),
-            &session_multipart_key,
-            &session_upload_id,
         );
         return;
     }
@@ -12117,6 +12219,9 @@ fn main() {
     if let Ok(role_arn) = env::var("STS_TEST_ROLE_ARN") {
         let caller_arn = required_env("STS_TEST_PRIMARY_ARN");
         let role_name = required_env("STS_TEST_ROLE_NAME");
+        let wildcard_role_arn = required_env("STS_TEST_WILDCARD_ROLE_ARN");
+        let wildcard_role_name = required_env("STS_TEST_WILDCARD_ROLE_NAME");
+        let wildcard_role_session_name = required_env("STS_TEST_WILDCARD_ROLE_SESSION_NAME");
         let default_max_role_arn = required_env("STS_TEST_DEFAULT_MAX_ROLE_ARN");
         let default_max_role_name = required_env("STS_TEST_DEFAULT_MAX_ROLE_NAME");
         let external_id = required_env("STS_TEST_EXTERNAL_ID");
@@ -12131,6 +12236,9 @@ fn main() {
                 caller_arn: &caller_arn,
                 role_arn: &role_arn,
                 role_name: &role_name,
+                wildcard_role_arn: &wildcard_role_arn,
+                wildcard_role_name: &wildcard_role_name,
+                wildcard_role_session_name: &wildcard_role_session_name,
                 default_max_role_arn: &default_max_role_arn,
                 default_max_role_name: &default_max_role_name,
                 external_id: &external_id,
@@ -12197,6 +12305,10 @@ fn main() {
         let success_role_name = required_env("STS_TEST_CROSS_SUCCESS_ROLE_NAME");
         let trust_denied_role_arn = required_env("STS_TEST_CROSS_TRUST_DENIED_ROLE_ARN");
         let caller_denied_role_arn = required_env("STS_TEST_CROSS_CALLER_DENIED_ROLE_ARN");
+        let wildcard_success_role_name = required_env("STS_TEST_CROSS_WILDCARD_SUCCESS_ROLE_NAME");
+        let wildcard_success_role_arn = required_env("STS_TEST_CROSS_WILDCARD_SUCCESS_ROLE_ARN");
+        let wildcard_caller_denied_role_arn =
+            required_env("STS_TEST_CROSS_WILDCARD_CALLER_DENIED_ROLE_ARN");
         run_cross_account_probes(
             &endpoint,
             alt_credentials,
@@ -12208,6 +12320,9 @@ fn main() {
                 success_role_arn: &success_role_arn,
                 trust_denied_role_arn: &trust_denied_role_arn,
                 caller_denied_role_arn: &caller_denied_role_arn,
+                wildcard_success_role_name: &wildcard_success_role_name,
+                wildcard_success_role_arn: &wildcard_success_role_arn,
+                wildcard_caller_denied_role_arn: &wildcard_caller_denied_role_arn,
             },
         );
     }
@@ -12383,19 +12498,25 @@ fn main() {
             &format!("https://s3.{region}.amazonaws.com"),
             &post_bucket,
             "static",
-            credentials,
-            None,
-            &required_env("STS_TEST_PRESIGNED_STREAMING_STATIC_MULTIPART_KEY"),
-            &required_env("STS_TEST_PRESIGNED_STREAMING_STATIC_UPLOAD_ID"),
+            S3PresignedStreamingProbeSet {
+                credentials,
+                security_token: None,
+                object_absence_credentials: credentials,
+                multipart_key: &required_env("STS_TEST_PRESIGNED_STREAMING_STATIC_MULTIPART_KEY"),
+                upload_id: &required_env("STS_TEST_PRESIGNED_STREAMING_STATIC_UPLOAD_ID"),
+            },
         );
         run_s3_presigned_streaming_probes(
             &format!("https://s3.{region}.amazonaws.com"),
             &post_bucket,
             "session",
-            recreated_credentials,
-            Some(&recreated_security_token),
-            &required_env("STS_TEST_PRESIGNED_STREAMING_SESSION_MULTIPART_KEY"),
-            &required_env("STS_TEST_PRESIGNED_STREAMING_SESSION_UPLOAD_ID"),
+            S3PresignedStreamingProbeSet {
+                credentials: recreated_credentials,
+                security_token: Some(&recreated_security_token),
+                object_absence_credentials: credentials,
+                multipart_key: &required_env("STS_TEST_PRESIGNED_STREAMING_SESSION_MULTIPART_KEY"),
+                upload_id: &required_env("STS_TEST_PRESIGNED_STREAMING_SESSION_UPLOAD_ID"),
+            },
         );
         run_s3_streaming_session_authentication_probes(
             &format!("https://s3.{region}.amazonaws.com"),
