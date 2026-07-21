@@ -203,10 +203,10 @@ max_snapshot_bytes = 15728640
 
 [[transport_profiles]]
 id = "control-plane"
-max_frame_bytes = 8388608
+max_frame_bytes = 8388648
 max_connections = 256
 connect_timeout_ms = 1000
-io_timeout_ms = 5000
+io_timeout_ms = 15000
 
 [[transport_profiles]]
 id = "raft"
@@ -644,7 +644,11 @@ authenticated Unix endpoint for same-host clients and an authenticated TCP
 endpoint for remote clients. `priority` is nonzero and unique within
 `(owner_process_id, protocol)`; lower values are preferred. A client filters
 out unusable transports first, then tries candidates by `(priority, endpoint
-id)`. Endpoint-list input order has no semantic effect.
+id)`. Every eligible candidate remains in the resolved client route set;
+resolution must not collapse an authority to only its preferred endpoint.
+Clients try the preferred candidate for each authority before lower-priority
+fallback rounds, and may fail over only before a request may have been sent.
+Endpoint-list input order has no semantic effect.
 
 The canonical Raft membership peer map resolves one endpoint per voter that is
 reachable from every configured voter before applying priority. If any voter is
@@ -663,6 +667,15 @@ model is added.
 
 Transport profiles are uniquely named and bounded by hard-coded protocol
 minimum compatibility requirements and allocation ceilings before allocation.
+Ordinary control-plane and authority-clock-recovery profiles currently must
+equal the control-plane protocol's maximum encoded frame size, including frame
+overhead; runtime mapping uses the validated value exactly and never silently
+clamps it. A smaller dedicated recovery limit may be introduced only with a
+separately proved request/response encoding bound. TCP listen hosts must be
+literal IP addresses, while advertised hosts may use DNS names. TCP listen
+addresses form one host-scoped namespace across processes and protocols. Exact
+duplicate addresses and wildcard binds that overlap another listener on the
+same host are rejected during manifest validation.
 Version 1 accepts only limits supported by the corresponding existing protocol
 implementation; a config value cannot silently raise a compile-time allocation
 ceiling. The first implementation requires the live production replication
@@ -982,10 +995,23 @@ Progress as of 2026-07-21:
   Focused tests cover custom transport dispatch, canonical manifest mapping,
   listener binding, successful TLS framing, omitted ALPN, a stalled handshake,
   absolute trickle deadlines, pre-authentication budget exhaustion, and debug
-  redaction. Ordinary control-plane, authority-clock-recovery, and
-  storage TCP listeners remain rejected rather than silently unbound. Because
-  those RPC families are still Unix-only, this sub-slice intentionally does
-  not claim a deployable cross-host authority or data-plane workload.
+  redaction. The ordinary control-plane and dedicated authority-clock-recovery
+  sub-slice is also implemented: both endpoint families bind every configured
+  local Unix or TLS/TCP listener and enter the same application-authenticated
+  request/dispatch boundary; static clients use one transport-neutral framed
+  exchange with typed pre-request versus ambiguous post-request failures, one
+  absolute connect/handshake/write/read deadline, TLS 1.3, and mandatory
+  `argmin-control-plane/1` ALPN. Static application credentials bind the
+  principal, role, operation, and topology-scoped cluster identity, while TLS
+  authenticates the selected endpoint server name. Ordinary and recovery
+  listeners retain separate worker and pre-authentication byte budgets so
+  ordinary saturation cannot consume recovery capacity. Focused
+  coverage includes source-specific all-Unix/all-TCP endpoint resolution,
+  listener activation, safe pre-request failover, no automatic failover after
+  a request may have been sent, and a composed authenticated TLS recovery RPC.
+  Replicated storage/frontend process mapping and storage RPC authentication
+  and TCP remain open, so this slice still does not claim a complete
+  cross-host data-plane workload.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state
@@ -1075,9 +1101,21 @@ Progress as of 2026-07-21:
    - add TCP Raft peer listeners/clients using the same protocol/auth dispatch
      boundaries as Unix (implemented);
    - add ordinary control-plane and authority-clock-recovery TLS/TCP
-     listeners/clients;
-   - enforce endpoint source/target/cluster/topology identity before dispatch;
-   - reject fresh-manifest peers whose topology generation or digest differs;
+     listeners/clients (implemented for replicated authority runtime and the
+     transport-neutral client used by subsequent process mapping);
+   - retain prioritized fallback endpoints for each authority, resolve
+     transport eligibility per target host, and support local Unix/TCP
+     candidate sets alongside remote TCP candidates without dropping secondary
+     routes (implemented);
+   - make operational authority-clock status and explicit re-establishment
+     commands load static configuration and use the configured recovery route,
+     TLS material, and admin credential rather than deriving Unix paths
+     (implemented);
+   - enforce principal/role/operation/cluster/topology identity before dispatch
+     and authenticate the selected endpoint through TLS (implemented for the
+     activated control-plane families);
+   - reject fresh-manifest peers whose topology generation or digest differs
+     (implemented through topology-bound application-auth scope);
      and
    - run the first three-host authority workload after every control-plane RPC
      needed for startup, routing, diagnostics, and explicit clock recovery has
@@ -1107,6 +1145,12 @@ The schema/parser release gate includes:
 - relative/escaping state and data paths;
 - symlinked manifest rejection at the open boundary;
 - noncanonical Unix and TCP endpoint URI rejection;
+- DNS TCP listener rejection plus exact and wildcard TCP listener collisions
+  on one host across protocols and processes;
+- control-plane frame profiles below or above the exact encoded protocol
+  maximum, with no runtime clamping;
+- retained preferred and secondary ordinary/recovery endpoint candidates in
+  deterministic fallback order;
 - lower-priority-number local Unix Raft candidate plus globally reachable TCP
   fallback resolves to TCP in a multihost peer map;
 - Unix endpoint referenced across hosts;

@@ -6,7 +6,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use storage::control_plane::{InitialClusterTopologyCertificate, MAX_HEARTBEAT_LEASE_MS};
+use storage::control_plane::{
+    ControlPlaneRpcFrameTransport, InitialClusterTopologyCertificate, MAX_HEARTBEAT_LEASE_MS,
+};
 use storage::control_plane_raft::ControlPlaneRaftPeerFrameTransport;
 use storage::control_plane_raft::ControlPlaneRaftPeerTransportLimits;
 use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS;
@@ -99,6 +101,62 @@ impl fmt::Debug for ConfiguredControlPlaneRaftPeerListener {
                 .field("bind_addr", bind_addr)
                 .field("tls", &true)
                 .field("max_connections", max_connections)
+                .field("io_timeout", io_timeout)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum ConfiguredControlPlaneRpcListener {
+    Unix {
+        endpoint_id: String,
+        socket_path: String,
+        max_connections: usize,
+        max_frame_bytes: usize,
+        io_timeout: Duration,
+    },
+    Tcp {
+        endpoint_id: String,
+        bind_addr: String,
+        tls_server_config: Arc<rustls::ServerConfig>,
+        max_connections: usize,
+        max_frame_bytes: usize,
+        io_timeout: Duration,
+    },
+}
+
+impl fmt::Debug for ConfiguredControlPlaneRpcListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unix {
+                endpoint_id,
+                socket_path,
+                max_connections,
+                max_frame_bytes,
+                io_timeout,
+            } => f
+                .debug_struct("ConfiguredControlPlaneRpcListener::Unix")
+                .field("endpoint_id", endpoint_id)
+                .field("socket_path", socket_path)
+                .field("max_connections", max_connections)
+                .field("max_frame_bytes", max_frame_bytes)
+                .field("io_timeout", io_timeout)
+                .finish(),
+            Self::Tcp {
+                endpoint_id,
+                bind_addr,
+                max_connections,
+                max_frame_bytes,
+                io_timeout,
+                ..
+            } => f
+                .debug_struct("ConfiguredControlPlaneRpcListener::Tcp")
+                .field("endpoint_id", endpoint_id)
+                .field("bind_addr", bind_addr)
+                .field("tls", &true)
+                .field("max_connections", max_connections)
+                .field("max_frame_bytes", max_frame_bytes)
                 .field("io_timeout", io_timeout)
                 .finish(),
         }
@@ -387,6 +445,13 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_socket_path: Option<String>,
     pub(crate) control_plane_clock_recovery_socket_path: Option<String>,
     pub(crate) control_plane_client_socket_paths: Vec<String>,
+    pub(crate) control_plane_rpc_listeners: Vec<ConfiguredControlPlaneRpcListener>,
+    pub(crate) control_plane_clock_recovery_rpc_listeners: Vec<ConfiguredControlPlaneRpcListener>,
+    pub(crate) control_plane_rpc_client_endpoints: Vec<String>,
+    pub(crate) control_plane_clock_recovery_rpc_client_endpoints: Vec<String>,
+    pub(crate) control_plane_rpc_frame_transport: Option<Arc<dyn ControlPlaneRpcFrameTransport>>,
+    pub(crate) control_plane_clock_recovery_rpc_frame_transport:
+        Option<Arc<dyn ControlPlaneRpcFrameTransport>>,
     pub(crate) control_plane_auth_cluster_id: Option<String>,
     pub(crate) control_plane_storage_auth_credentials:
         Vec<ConfiguredControlPlaneStorageAuthCredential>,
@@ -1066,6 +1131,12 @@ impl ServerConfig {
             control_plane_socket_path,
             control_plane_clock_recovery_socket_path: None,
             control_plane_client_socket_paths,
+            control_plane_rpc_listeners: Vec::new(),
+            control_plane_clock_recovery_rpc_listeners: Vec::new(),
+            control_plane_rpc_client_endpoints: Vec::new(),
+            control_plane_clock_recovery_rpc_client_endpoints: Vec::new(),
+            control_plane_rpc_frame_transport: None,
+            control_plane_clock_recovery_rpc_frame_transport: None,
             control_plane_auth_cluster_id,
             control_plane_storage_auth_credentials,
             control_plane_storage_auth_signing_credential: None,

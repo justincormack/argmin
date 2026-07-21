@@ -53,7 +53,11 @@ pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOC
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_VERSION: u16 = 8;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
+pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
+    CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
+pub const CONTROL_PLANE_RPC_TLS_ALPN: &[u8] = b"argmin-control-plane/1";
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
+pub const CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -9788,10 +9792,98 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UnixControlPlaneClient {
     socket_paths: Arc<[PathBuf]>,
+    frame_transport_endpoints: Arc<[String]>,
+    frame_transport: Option<Arc<dyn ControlPlaneRpcFrameTransport>>,
     preferred_socket_index: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for UnixControlPlaneClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnixControlPlaneClient")
+            .field("socket_paths", &self.socket_paths)
+            .field("frame_transport_endpoints", &self.frame_transport_endpoints)
+            .field(
+                "frame_transport",
+                &self
+                    .frame_transport
+                    .as_ref()
+                    .map(|transport| transport.name()),
+            )
+            .field(
+                "preferred_endpoint_index",
+                &self.preferred_socket_index.load(Ordering::Acquire),
+            )
+            .finish()
+    }
+}
+
+pub struct ControlPlaneRpcFrameExchange {
+    pub endpoint: String,
+    pub request_frame: Vec<u8>,
+    pub deadline: Instant,
+    pub max_frame_bytes: usize,
+}
+
+impl std::fmt::Debug for ControlPlaneRpcFrameExchange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneRpcFrameExchange")
+            .field("endpoint", &self.endpoint)
+            .field("request_frame_bytes", &self.request_frame.len())
+            .field("deadline", &self.deadline)
+            .field("max_frame_bytes", &self.max_frame_bytes)
+            .finish()
+    }
+}
+
+pub trait ControlPlaneRpcFrameTransport: std::fmt::Debug + Send + Sync + 'static {
+    fn name(&self) -> &'static str;
+
+    /// Exchange one already-framed control-plane request and response.
+    ///
+    /// Implementations must apply `deadline` to the complete connect,
+    /// handshake, write, and read operation and reject responses larger than
+    /// `max_frame_bytes` before allocation.
+    fn exchange(
+        &self,
+        exchange: ControlPlaneRpcFrameExchange,
+    ) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError>;
+}
+
+#[derive(Debug)]
+pub struct ControlPlaneRpcFrameExchangeError {
+    error: Box<ControlPlaneError>,
+    request_may_have_been_sent: bool,
+}
+
+impl ControlPlaneRpcFrameExchangeError {
+    #[must_use]
+    pub fn before_request(error: ControlPlaneError) -> Self {
+        Self {
+            error: Box::new(error),
+            request_may_have_been_sent: false,
+        }
+    }
+
+    #[must_use]
+    pub fn after_request_started(error: ControlPlaneError) -> Self {
+        Self {
+            error: Box::new(error),
+            request_may_have_been_sent: true,
+        }
+    }
+
+    #[must_use]
+    pub fn request_may_have_been_sent(&self) -> bool {
+        self.request_may_have_been_sent
+    }
+
+    #[must_use]
+    pub fn into_error(self) -> ControlPlaneError {
+        *self.error
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -10281,10 +10373,8 @@ fn unix_io_remaining(deadline: Instant) -> Result<Duration, std::io::Error> {
     Ok(remaining)
 }
 
-pub(crate) fn connect_unix_stream_until(
-    path: &Path,
-    deadline: Instant,
-) -> std::io::Result<UnixStream> {
+/// Connects to a control-plane Unix socket within one absolute operation deadline.
+pub fn connect_unix_stream_until(path: &Path, deadline: Instant) -> std::io::Result<UnixStream> {
     unix_io_remaining(deadline)?;
     let path_bytes = path.as_os_str().as_bytes();
     if path_bytes.contains(&0) {
@@ -10520,6 +10610,8 @@ impl UnixControlPlaneClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_paths: Arc::from([socket_path.into()]),
+            frame_transport_endpoints: Arc::from([]),
+            frame_transport: None,
             preferred_socket_index: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -10546,6 +10638,41 @@ impl UnixControlPlaneClient {
         }
         Ok(Self {
             socket_paths: socket_paths.into(),
+            frame_transport_endpoints: Arc::from([]),
+            frame_transport: None,
+            preferred_socket_index: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    pub fn with_frame_transport(
+        endpoints: impl IntoIterator<Item = String>,
+        transport: Arc<dyn ControlPlaneRpcFrameTransport>,
+    ) -> Result<Self, ControlPlaneError> {
+        let endpoints: Vec<String> = endpoints.into_iter().collect();
+        if endpoints.is_empty() {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: "control-plane framed client requires at least one endpoint".to_owned(),
+            });
+        }
+        let mut unique = BTreeSet::new();
+        for endpoint in &endpoints {
+            if endpoint.is_empty() {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: "control-plane framed client endpoint must not be empty".to_owned(),
+                });
+            }
+            if !unique.insert(endpoint.clone()) {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "control-plane framed client contains duplicate endpoint {endpoint}"
+                    ),
+                });
+            }
+        }
+        Ok(Self {
+            socket_paths: Arc::from([]),
+            frame_transport_endpoints: endpoints.into(),
+            frame_transport: Some(transport),
             preferred_socket_index: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -10561,17 +10688,25 @@ impl UnixControlPlaneClient {
     }
 
     fn preferred_socket_index(&self) -> usize {
-        self.preferred_socket_index.load(Ordering::Acquire) % self.socket_paths.len()
+        self.preferred_socket_index.load(Ordering::Acquire) % self.endpoint_count()
     }
 
     fn prefer_socket_index(&self, socket_index: usize) {
         self.preferred_socket_index
-            .store(socket_index % self.socket_paths.len(), Ordering::Release);
+            .store(socket_index % self.endpoint_count(), Ordering::Release);
     }
 
     fn advance_preferred_socket(&self) {
-        let next = (self.preferred_socket_index() + 1) % self.socket_paths.len();
+        let next = (self.preferred_socket_index() + 1) % self.endpoint_count();
         self.prefer_socket_index(next);
+    }
+
+    fn endpoint_count(&self) -> usize {
+        if self.frame_transport.is_some() {
+            self.frame_transport_endpoints.len()
+        } else {
+            self.socket_paths.len()
+        }
     }
 
     fn send_request(
@@ -10598,7 +10733,7 @@ impl UnixControlPlaneClient {
         deadline: Instant,
     ) -> Result<Vec<u8>, ControlPlaneError> {
         let mut last_routing_error = None;
-        for _ in 0..self.socket_paths.len() {
+        for _ in 0..self.endpoint_count() {
             let response_payload = self.send_request_raw_response_until(kind, payload, deadline)?;
             match decode_control_plane_rpc_response(response_payload) {
                 Err(error) if error.is_control_plane_leader_routing_rejection() => {
@@ -10626,6 +10761,63 @@ impl UnixControlPlaneClient {
         payload: &[u8],
         deadline: Instant,
     ) -> Result<Vec<u8>, ControlPlaneError> {
+        if let Some(transport) = &self.frame_transport {
+            let request_frame = encode_control_plane_rpc_frame(kind, payload)?;
+            let start = self.preferred_socket_index();
+            let mut response_frame = None;
+            let mut last_pre_request_error = None;
+            for offset in 0..self.frame_transport_endpoints.len() {
+                let endpoint_index = (start + offset) % self.frame_transport_endpoints.len();
+                match transport.exchange(ControlPlaneRpcFrameExchange {
+                    endpoint: self.frame_transport_endpoints[endpoint_index].clone(),
+                    request_frame: request_frame.clone(),
+                    deadline,
+                    max_frame_bytes: control_plane_rpc_max_frame_bytes(),
+                }) {
+                    Ok(response) => {
+                        self.prefer_socket_index(endpoint_index);
+                        response_frame = Some(response);
+                        break;
+                    }
+                    Err(error) if !error.request_may_have_been_sent() => {
+                        last_pre_request_error = Some(error.into_error());
+                        self.prefer_socket_index(
+                            (endpoint_index + 1) % self.frame_transport_endpoints.len(),
+                        );
+                    }
+                    Err(error) => return Err(error.into_error()),
+                }
+            }
+            let response_frame = response_frame.ok_or_else(|| {
+                last_pre_request_error
+                    .expect("endpoint set is non-empty and every framed connect failed")
+            })?;
+            if response_frame.len() > control_plane_rpc_max_frame_bytes() {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "control-plane framed response size {} bytes exceeds limit {}",
+                        response_frame.len(),
+                        control_plane_rpc_max_frame_bytes()
+                    ),
+                });
+            }
+            let mut response = std::io::Cursor::new(response_frame.as_slice());
+            let (response_kind, response_payload) = read_control_plane_rpc_frame(&mut response)?;
+            if usize::try_from(response.position()).ok() != Some(response_frame.len()) {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: "control-plane framed response contains trailing bytes".to_owned(),
+                });
+            }
+            if response_kind != kind {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "response kind {:?} did not match request kind {:?}",
+                        response_kind, kind
+                    ),
+                });
+            }
+            return Ok(response_payload);
+        }
         let start = self.preferred_socket_index();
         let mut stream = None;
         let mut last_connect_error = None;
@@ -11417,7 +11609,7 @@ impl AuthenticatedUnixControlPlaneClient {
         V: FnMut(&[u8]) -> Result<Vec<u8>, ControlPlaneError>,
     {
         let mut last_routing_error = None;
-        for _ in 0..self.inner.socket_paths.len() {
+        for _ in 0..self.inner.endpoint_count() {
             let payload = build_payload()?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -11530,7 +11722,7 @@ impl AuthenticatedUnixControlPlaneClient {
         F: FnMut() -> Result<u64, ControlPlaneError>,
     {
         let mut last_routing_error = None;
-        for _ in 0..self.inner.socket_paths.len() {
+        for _ in 0..self.inner.endpoint_count() {
             let request =
                 self.sign_admin_control_plane_request(kind, authority_now_ms()?, payload.clone())?;
             let response =
@@ -12213,7 +12405,7 @@ impl AuthenticatedUnixControlPlaneClient {
         deadline: Instant,
         attempt_timeout: Duration,
     ) -> Result<ControlPlaneAuthorityClockStatus, ControlPlaneError> {
-        for attempt in 0..self.inner.socket_paths.len() {
+        for attempt in 0..self.inner.endpoint_count() {
             let attempt_deadline =
                 authority_clock_admin_attempt_deadline(deadline, attempt_timeout)?;
             let payload = self.send_admin_request_until_and_clocks(
@@ -12228,7 +12420,7 @@ impl AuthenticatedUnixControlPlaneClient {
             reader.finish()?;
             if status.current_raft_leadership_term().is_none()
                 || status.local_raft_authority_leader()
-                || attempt + 1 == self.inner.socket_paths.len()
+                || attempt + 1 == self.inner.endpoint_count()
             {
                 return Ok(status);
             }
@@ -12426,7 +12618,7 @@ impl AuthenticatedUnixControlPlaneClient {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
         loop {
             let mut last_retryable_error = None;
-            for _ in 0..self.inner.socket_paths.len() {
+            for _ in 0..self.inner.endpoint_count() {
                 let request =
                     self.sign_read_only_request(kind, authority_now_ms()?, payload.clone())?;
                 let response =
@@ -13900,10 +14092,19 @@ pub struct PreparedControlPlaneHeartbeatResponse {
 }
 
 pub fn read_control_plane_unix_request(
-    stream: &mut UnixStream,
+    stream: &mut impl std::io::Read,
 ) -> Result<ControlPlaneRpcRequest, ControlPlaneError> {
     let (kind, payload) = read_control_plane_rpc_frame(stream)?;
     Ok(ControlPlaneRpcRequest { kind, payload })
+}
+
+pub fn read_control_plane_request_with_reservation<R>(
+    stream: &mut impl std::io::Read,
+    reserve: impl FnOnce(usize) -> Result<R, ControlPlaneError>,
+) -> Result<(ControlPlaneRpcRequest, R), ControlPlaneError> {
+    let ((kind, payload), reservation) =
+        read_control_plane_rpc_frame_with_reservation(stream, reserve)?;
+    Ok((ControlPlaneRpcRequest { kind, payload }, reservation))
 }
 
 pub fn verify_control_plane_unix_request(
@@ -14523,7 +14724,7 @@ where
 }
 
 pub fn write_control_plane_unix_response(
-    stream: &mut UnixStream,
+    stream: &mut impl std::io::Write,
     response: ControlPlaneRpcResponse,
 ) -> Result<(), ControlPlaneError> {
     write_control_plane_rpc_frame(stream, response.kind, &response.payload)
@@ -14531,7 +14732,7 @@ pub fn write_control_plane_unix_response(
 
 pub fn respond_control_plane_unix_request<T>(
     control_plane: &mut T,
-    stream: &mut UnixStream,
+    stream: &mut impl std::io::Write,
     request: ControlPlaneRpcRequest,
     authority_now_ms: u64,
 ) -> Result<(), ControlPlaneError>
@@ -14544,7 +14745,7 @@ where
 
 pub fn respond_control_plane_unix_request_with_auth<T>(
     control_plane: &mut T,
-    stream: &mut UnixStream,
+    stream: &mut impl std::io::Write,
     request: ControlPlaneRpcRequest,
     authority_now_ms: u64,
     auth_verifier: &ControlPlaneUnixAuthVerifier,
@@ -14818,21 +15019,36 @@ fn write_control_plane_rpc_frame(
     kind: ControlPlaneRpcKind,
     payload: &[u8],
 ) -> Result<(), ControlPlaneError> {
-    let payload_len = u32::try_from(payload.len()).map_err(|_| ControlPlaneError::RpcProtocol {
-        message: format!("control-plane RPC payload too large: {}", payload.len()),
-    })?;
+    let frame = encode_control_plane_rpc_frame(kind, payload)?;
+    let magic_len = CONTROL_PLANE_RPC_MAGIC.len();
     stream
-        .write_all(CONTROL_PLANE_RPC_MAGIC)
+        .write_all(&frame[..magic_len])
         .map_err(|source| ControlPlaneError::Io {
             context: "write control-plane RPC magic",
             source,
         })?;
-    let mut header = Vec::with_capacity(8);
-    write_u16(&mut header, CONTROL_PLANE_RPC_VERSION);
-    write_u16(&mut header, kind as u16);
-    write_u32(&mut header, payload_len);
+    stream
+        .write_all(&frame[magic_len..])
+        .map_err(|source| ControlPlaneError::Io {
+            context: "write control-plane RPC frame",
+            source,
+        })
+}
+
+fn encode_control_plane_rpc_frame(
+    kind: ControlPlaneRpcKind,
+    payload: &[u8],
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let payload_len = u32::try_from(payload.len()).map_err(|_| ControlPlaneError::RpcProtocol {
+        message: format!("control-plane RPC payload too large: {}", payload.len()),
+    })?;
+    let mut frame = Vec::with_capacity(control_plane_rpc_frame_overhead() + payload.len());
+    frame.extend_from_slice(CONTROL_PLANE_RPC_MAGIC);
+    write_u16(&mut frame, CONTROL_PLANE_RPC_VERSION);
+    write_u16(&mut frame, kind as u16);
+    write_u32(&mut frame, payload_len);
     write_u64(
-        &mut header,
+        &mut frame,
         control_plane_rpc_frame_checksum(
             CONTROL_PLANE_RPC_VERSION,
             kind as u16,
@@ -14840,18 +15056,28 @@ fn write_control_plane_rpc_frame(
             payload,
         ),
     );
-    stream
-        .write_all(&header)
-        .and_then(|()| stream.write_all(payload))
-        .map_err(|source| ControlPlaneError::Io {
-            context: "write control-plane RPC frame",
-            source,
-        })
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+const fn control_plane_rpc_frame_overhead() -> usize {
+    CONTROL_PLANE_RPC_MAGIC.len() + 16
+}
+
+const fn control_plane_rpc_max_frame_bytes() -> usize {
+    CONTROL_PLANE_RPC_MAX_FRAME_BYTES
 }
 
 fn read_control_plane_rpc_frame(
     stream: &mut impl std::io::Read,
 ) -> Result<(ControlPlaneRpcKind, Vec<u8>), ControlPlaneError> {
+    read_control_plane_rpc_frame_with_reservation(stream, |_| Ok(())).map(|(frame, ())| frame)
+}
+
+fn read_control_plane_rpc_frame_with_reservation<R>(
+    stream: &mut impl std::io::Read,
+    reserve: impl FnOnce(usize) -> Result<R, ControlPlaneError>,
+) -> Result<((ControlPlaneRpcKind, Vec<u8>), R), ControlPlaneError> {
     let mut magic = vec![0; CONTROL_PLANE_RPC_MAGIC.len()];
     stream
         .read_exact(&mut magic)
@@ -14892,6 +15118,7 @@ fn read_control_plane_rpc_frame(
             message: format!("control-plane RPC payload too large: {payload_len}"),
         });
     }
+    let reservation = reserve(control_plane_rpc_frame_overhead() + payload_len)?;
     let mut payload = vec![0; payload_len];
     stream
         .read_exact(&mut payload)
@@ -14906,7 +15133,7 @@ fn read_control_plane_rpc_frame(
             message: "control-plane RPC frame checksum mismatch".to_owned(),
         });
     }
-    Ok((kind, payload))
+    Ok(((kind, payload), reservation))
 }
 
 fn control_plane_rpc_frame_checksum(
@@ -20792,6 +21019,100 @@ mod tests {
         Arc, Mutex,
     };
     use std::time::{Duration, Instant};
+
+    #[derive(Debug)]
+    struct TestControlPlaneFrameTransport {
+        fail_before_request_endpoint: Option<String>,
+        fail_after_request_started: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ControlPlaneRpcFrameTransport for TestControlPlaneFrameTransport {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn exchange(
+            &self,
+            exchange: ControlPlaneRpcFrameExchange,
+        ) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail_after_request_started {
+                return Err(ControlPlaneRpcFrameExchangeError::after_request_started(
+                    ControlPlaneError::Io {
+                        context: "test exchange after request",
+                        source: std::io::Error::new(
+                            ErrorKind::ConnectionReset,
+                            "test response loss",
+                        ),
+                    },
+                ));
+            }
+            if self.fail_before_request_endpoint.as_deref() == Some(&exchange.endpoint) {
+                return Err(ControlPlaneRpcFrameExchangeError::before_request(
+                    ControlPlaneError::Io {
+                        context: "test exchange before request",
+                        source: std::io::Error::new(
+                            ErrorKind::ConnectionRefused,
+                            "test connect failure",
+                        ),
+                    },
+                ));
+            }
+            Ok(exchange.request_frame)
+        }
+    }
+
+    #[test]
+    fn framed_control_plane_client_fails_over_only_before_request_starts() {
+        let failover_transport = Arc::new(TestControlPlaneFrameTransport {
+            fail_before_request_endpoint: Some("endpoint-a".to_string()),
+            fail_after_request_started: false,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = UnixControlPlaneClient::with_frame_transport(
+            ["endpoint-a".to_string(), "endpoint-b".to_string()],
+            failover_transport.clone(),
+        )
+        .unwrap();
+
+        let response = client
+            .send_request_raw_response_until(
+                ControlPlaneRpcKind::RuntimeMapStatus,
+                b"request",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert_eq!(response, b"request");
+        assert_eq!(failover_transport.calls.load(Ordering::Acquire), 2);
+
+        let ambiguous_transport = Arc::new(TestControlPlaneFrameTransport {
+            fail_before_request_endpoint: None,
+            fail_after_request_started: true,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let client = UnixControlPlaneClient::with_frame_transport(
+            ["endpoint-a".to_string(), "endpoint-b".to_string()],
+            ambiguous_transport.clone(),
+        )
+        .unwrap();
+
+        let error = client
+            .send_request_raw_response_until(
+                ControlPlaneRpcKind::RuntimeMapStatus,
+                b"request",
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::Io { source, .. }
+                if source.kind() == ErrorKind::ConnectionReset
+        ));
+        assert_eq!(ambiguous_transport.calls.load(Ordering::Acquire), 1);
+    }
 
     fn assert_snapshot_invariant_error(
         error: ControlPlaneError,
