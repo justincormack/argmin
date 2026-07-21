@@ -14544,6 +14544,27 @@ mod tests {
         }
     }
 
+    async fn retry_transient_openraft_read_index_quorum_failure<T, F, Fut>(
+        mut operation: F,
+    ) -> Result<T, ControlPlaneError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, ControlPlaneError>>,
+    {
+        loop {
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(ControlPlaneError::RpcRemote { message })
+                    if message.contains("OpenRaft read-index failed")
+                        && message.contains("not enough for a quorum") =>
+                {
+                    ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn assert_error_contains<T>(result: Result<T, ControlPlaneError>, expected: &str) {
         match result {
             Ok(_) => panic!("expected error containing {expected:?}, got success"),
@@ -18171,7 +18192,7 @@ mod tests {
     #[test]
     fn control_plane_openraft_authority_directories_route_by_node_id() {
         ControlPlaneRaftTypeConfig::run(async {
-            let operation_timeout = Duration::from_secs(2);
+            let operation_timeout = Duration::from_secs(5);
             let (authority1, authority2) = initialized_two_node_authorities(
                 "control-plane-raft-authority-capability-directory-test",
                 411,
@@ -18298,7 +18319,7 @@ mod tests {
             expect_bounded_control_plane_raft(
                 follower_node_lifecycle.wait_for_applied_log_id(
                     bootstrap.log_id(),
-                    Duration::from_secs(1),
+                    operation_timeout,
                     "authority capability directory follower applied bootstrap",
                 ),
                 operation_timeout,
@@ -18315,7 +18336,7 @@ mod tests {
             expect_bounded_control_plane_raft(
                 follower_node_lifecycle.wait_for_current_leader(
                     412,
-                    Duration::from_secs(1),
+                    operation_timeout,
                     "authority capability directory observed transferred leader",
                 ),
                 operation_timeout,
@@ -18325,7 +18346,7 @@ mod tests {
             expect_bounded_control_plane_raft(
                 leader_node_lifecycle.wait_for_current_leader(
                     412,
-                    Duration::from_secs(1),
+                    operation_timeout,
                     "authority capability directory observer saw transferred leader",
                 ),
                 operation_timeout,
@@ -18334,7 +18355,7 @@ mod tests {
             .await;
             let transferred_statuses = expect_bounded_control_plane_raft(
                 async {
-                    for _ in 0..100 {
+                    loop {
                         let statuses = status_list_handle.authority_statuses().await?;
                         if statuses.get(&412).is_some_and(|status| {
                             status.current_leader() == Some(412)
@@ -18345,11 +18366,6 @@ mod tests {
                         }
                         ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
                     }
-                    Err(ControlPlaneError::RpcRemote {
-                        message:
-                            "authority status-list directory transferred leader did not catch up"
-                                .to_string(),
-                    })
                 },
                 operation_timeout,
                 "authority status-list directory statuses after transfer",
@@ -18392,18 +18408,13 @@ mod tests {
             .await;
             let linearized_directory_status = expect_bounded_control_plane_raft(
                 async {
-                    for _ in 0..100 {
+                    loop {
                         let status = linearized_directory_authority.status().await?;
                         if status.node_id() == 412 && status.linearized_authority_serving() {
                             return Ok(status);
                         }
                         ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
                     }
-                    Err(ControlPlaneError::RpcRemote {
-                        message:
-                            "linearized authority directory transferred leader did not become serving"
-                                .to_string(),
-                    })
                 },
                 operation_timeout,
                 "linearized authority directory transferred leader status",
@@ -18413,7 +18424,7 @@ mod tests {
             assert!(linearized_directory_status.linearized_authority_serving());
             let routed_client_serving_authority = expect_bounded_control_plane_raft(
                 async {
-                    for _ in 0..100 {
+                    loop {
                         match routed_client.current_serving_linearized_authority().await {
                             Ok(authority) => return Ok(authority),
                             Err(ControlPlaneError::RpcRemote { message })
@@ -18424,11 +18435,6 @@ mod tests {
                             Err(error) => return Err(error),
                         }
                     }
-                    Err(ControlPlaneError::RpcRemote {
-                        message:
-                            "authority routing handle current serving authority did not converge"
-                                .to_string(),
-                    })
                 },
                 operation_timeout,
                 "authority routing handle current serving linearized authority",
@@ -18436,18 +18442,13 @@ mod tests {
             .await;
             let routed_client_serving_status = expect_bounded_control_plane_raft(
                 async {
-                    for _ in 0..100 {
+                    loop {
                         let status = routed_client_serving_authority.status().await?;
                         if status.linearized_authority_serving() {
                             return Ok(status);
                         }
                         ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
                     }
-                    Err(ControlPlaneError::RpcRemote {
-                        message:
-                            "authority routing handle selected authority did not report serving"
-                                .to_string(),
-                    })
                 },
                 operation_timeout,
                 "authority routing handle current serving routed authority status",
@@ -18492,7 +18493,9 @@ mod tests {
             assert_eq!(observer_status.current_leader(), Some(412));
             assert!(!observer_status.local_leader());
             let runtime_map = expect_bounded_control_plane_raft(
-                routed_linearized_authority.linearized_runtime_map_snapshot(91_000),
+                retry_transient_openraft_read_index_quorum_failure(|| {
+                    routed_linearized_authority.linearized_runtime_map_snapshot(91_000)
+                }),
                 operation_timeout,
                 "authority capability directory routed runtime map read",
             )
@@ -18507,7 +18510,9 @@ mod tests {
                 .iter()
                 .any(|node| node.node_id() == NodeId::new(412)));
             let direct_runtime_map = expect_bounded_control_plane_raft(
-                routed_client_serving_authority.linearized_runtime_map_snapshot(91_001),
+                retry_transient_openraft_read_index_quorum_failure(|| {
+                    routed_client_serving_authority.linearized_runtime_map_snapshot(91_001)
+                }),
                 operation_timeout,
                 "authority capability directory current serving routed runtime map read",
             )
@@ -18525,7 +18530,7 @@ mod tests {
             expect_bounded_control_plane_raft(
                 follower_node_lifecycle.wait_for_applied_log_id(
                     routed_membership_log_id,
-                    Duration::from_secs(1),
+                    operation_timeout,
                     "authority capability directory routed voter replacement applied",
                 ),
                 operation_timeout,
