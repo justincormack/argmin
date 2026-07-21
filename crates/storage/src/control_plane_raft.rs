@@ -5790,7 +5790,100 @@ pub struct ControlPlaneRaftCapturedRestartCheckpoint {
     authority_instance: Arc<()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneRaftEstablishedPeerPolicyConvergence {
+    Converged,
+    EffectiveMembershipPending {
+        applied: ControlPlaneRaftLogId,
+        effective: ControlPlaneRaftLogId,
+    },
+    AppliedStatePending {
+        applied: Option<ControlPlaneRaftLogId>,
+        committed: Option<ControlPlaneRaftLogId>,
+    },
+}
+
 impl ControlPlaneRaftCapturedRestartCheckpoint {
+    pub fn established_peer_policy_convergence(
+        &self,
+        peer_policy: &ControlPlaneRaftPeerTransportPolicy,
+    ) -> Result<ControlPlaneRaftEstablishedPeerPolicyConvergence, ControlPlaneError> {
+        self.artifact
+            .validate_cluster_identity(peer_policy.cluster_name())?;
+        peer_policy.validate_local_node(self.artifact.local_node_id)?;
+        self.artifact.validate_peer_policy_membership(peer_policy)?;
+        let applied_membership_log_id = (*self.artifact.state_machine.last_membership.log_id())
+            .ok_or_else(|| {
+                raft_artifact_protocol_error(
+                    "captured OpenRaft restart checkpoint has no applied membership",
+                )
+            })?;
+        let effective_membership_log_id = self
+            .artifact
+            .log_store
+            .entries
+            .iter()
+            .filter(|entry| matches!(&entry.payload, EntryPayload::Membership(_)))
+            .map(|entry| entry.log_id)
+            .fold(applied_membership_log_id, |effective, candidate| {
+                if candidate.index > effective.index {
+                    candidate
+                } else {
+                    effective
+                }
+            });
+        if effective_membership_log_id != applied_membership_log_id {
+            return Ok(
+                ControlPlaneRaftEstablishedPeerPolicyConvergence::EffectiveMembershipPending {
+                    applied: applied_membership_log_id,
+                    effective: effective_membership_log_id,
+                },
+            );
+        }
+        let applied = self.artifact.state_machine.last_applied;
+        let committed = self.artifact.log_store.committed;
+        if committed != applied {
+            let committed_is_ahead = match (applied, committed) {
+                (None, Some(_)) => true,
+                (Some(applied), Some(committed)) => committed.index > applied.index,
+                _ => false,
+            };
+            if committed_is_ahead {
+                return Ok(
+                    ControlPlaneRaftEstablishedPeerPolicyConvergence::AppliedStatePending {
+                        applied,
+                        committed,
+                    },
+                );
+            }
+            return Err(raft_artifact_protocol_error(format!(
+                "captured OpenRaft restart checkpoint has non-forward applied/committed mismatch: applied={applied:?} committed={committed:?}"
+            )));
+        }
+        Ok(ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged)
+    }
+
+    pub fn validate_established_peer_policy(
+        &self,
+        peer_policy: &ControlPlaneRaftPeerTransportPolicy,
+    ) -> Result<(), ControlPlaneError> {
+        match self.established_peer_policy_convergence(peer_policy)? {
+            ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged => Ok(()),
+            ControlPlaneRaftEstablishedPeerPolicyConvergence::EffectiveMembershipPending {
+                applied,
+                effective,
+            } => Err(raft_artifact_protocol_error(format!(
+                "captured OpenRaft restart checkpoint effective membership {effective} is not applied membership {applied}"
+            ))),
+            ControlPlaneRaftEstablishedPeerPolicyConvergence::AppliedStatePending {
+                applied,
+                committed,
+            } => Err(raft_artifact_protocol_error(format!(
+                "captured OpenRaft restart checkpoint applied position {applied:?} has not caught up to committed position {committed:?}"
+            ))),
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     fn wal_replay_offset(&self) -> u64 {
@@ -15028,6 +15121,63 @@ mod tests {
                 Some(suffix_vote)
             );
         });
+    }
+
+    #[test]
+    fn control_plane_raft_established_policy_reports_captured_apply_convergence() {
+        let nodes = BTreeMap::from([(1, BasicNode::new("raft-node-1"))]);
+        let membership = Membership::new(vec![BTreeSet::from([1])], nodes.clone()).unwrap();
+        let membership_entry = ControlPlaneRaftEntry {
+            log_id: raft_log_id(0, 1, 0),
+            payload: EntryPayload::Membership(membership),
+        };
+        let applied_entry = blank_entry(1, 1, 1);
+        let committed_entry = blank_entry(1, 1, 2);
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine.apply_entry(membership_entry.clone()).unwrap();
+        state_machine.apply_entry(applied_entry.clone()).unwrap();
+        let mut checkpoint = ControlPlaneRaftCapturedRestartCheckpoint {
+            artifact: ControlPlaneRaftRestartArtifact {
+                cluster_name: "test-cluster".to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1)),
+                    committed: Some(committed_entry.log_id),
+                    last_purged_log_id: None,
+                    entries: vec![membership_entry, applied_entry.clone(), committed_entry],
+                },
+                state_machine: state_machine.export_restart_artifact(),
+            },
+            authority_instance: Arc::new(()),
+        };
+        checkpoint.artifact.validate_restart_pair().unwrap();
+        let policy = ControlPlaneRaftPeerTransportPolicy::new(
+            "test-cluster",
+            nodes,
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+
+        assert_eq!(
+            checkpoint
+                .established_peer_policy_convergence(&policy)
+                .unwrap(),
+            ControlPlaneRaftEstablishedPeerPolicyConvergence::AppliedStatePending {
+                applied: Some(applied_entry.log_id),
+                committed: Some(raft_log_id(1, 1, 2)),
+            }
+        );
+        assert!(checkpoint
+            .validate_established_peer_policy(&policy)
+            .is_err());
+
+        checkpoint.artifact.log_store.committed = Some(applied_entry.log_id);
+        assert_eq!(
+            checkpoint
+                .established_peer_policy_convergence(&policy)
+                .unwrap(),
+            ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged
+        );
     }
 
     #[test]

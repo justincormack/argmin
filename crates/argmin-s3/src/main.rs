@@ -2,6 +2,7 @@ mod config;
 mod static_cluster_config;
 mod static_cluster_state;
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
@@ -63,9 +64,9 @@ use storage::control_plane_raft::{
     handle_control_plane_raft_peer_rpc_frame, handle_control_plane_raft_peer_snapshot_frame,
     read_control_plane_raft_peer_transport_frame, write_control_plane_raft_peer_transport_frame,
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
-    ControlPlaneRaftLogId, ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy,
-    ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerFrameKind,
-    ControlPlaneRaftPeerTransportPolicy,
+    ControlPlaneRaftEstablishedPeerPolicyConvergence, ControlPlaneRaftLogId,
+    ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerFrameIdentity,
+    ControlPlaneRaftPeerFrameKind, ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
@@ -85,7 +86,8 @@ use config::{
     ConfiguredControlPlaneAdminAuthCredential, ConfiguredControlPlaneAdminCommandAuth,
     ConfiguredControlPlaneFrontendAuthCredential, ConfiguredControlPlaneFrontendRuntimeMapAuth,
     ConfiguredControlPlaneRaftAuthCredential, ConfiguredControlPlaneStorageAuthCredential,
-    ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig,
+    ConfiguredCredential, ConfiguredCredentialProfile, ConfiguredStaticClusterIdentity,
+    ProcessRole, ServerConfig,
 };
 use server_http::http::HttpFrontend;
 
@@ -3292,6 +3294,56 @@ fn experimental_raft_startup_initializes_membership(
     }
 }
 
+fn validate_static_initial_raft_membership(
+    policy: &ControlPlaneRaftPeerTransportPolicy,
+    status: &ControlPlaneRaftAuthorityStatus,
+) -> Result<(), String> {
+    if status.applied() != status.committed() {
+        return Err(format!(
+            "static control-plane identity cannot be established before applied state {:?} catches up to committed state {:?}",
+            status.applied(),
+            status.committed()
+        ));
+    }
+    let expected_voters = policy.peers().keys().copied().collect::<BTreeSet<_>>();
+    let effective_log_id = status.effective_membership_log_id().ok_or_else(|| {
+        "static control-plane identity cannot be established before effective Raft membership"
+            .to_string()
+    })?;
+    let applied_log_id = status.applied_membership_log_id().ok_or_else(|| {
+        "static control-plane identity cannot be established before applied Raft membership"
+            .to_string()
+    })?;
+    if status.effective_voters() != &expected_voters
+        || !status.effective_learners().is_empty()
+        || status.applied_voters() != &expected_voters
+        || !status.applied_learners().is_empty()
+        || applied_log_id != effective_log_id
+    {
+        return Err(format!(
+            "static control-plane identity membership does not match configured topology; expected_voters={expected_voters:?} effective_voters={:?} effective_learners={:?} applied_voters={:?} applied_learners={:?} effective_log_id={effective_log_id} applied_log_id={applied_log_id}",
+            status.effective_voters(),
+            status.effective_learners(),
+            status.applied_voters(),
+            status.applied_learners(),
+        ));
+    }
+    Ok(())
+}
+
+async fn wait_for_static_initial_raft_membership(
+    authority: &ControlPlaneRaftAuthority,
+    policy: &ControlPlaneRaftPeerTransportPolicy,
+) -> Result<(), ControlPlaneError> {
+    loop {
+        let status = authority.status().await?;
+        if validate_static_initial_raft_membership(policy, &status).is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn experimental_raft_local_authority_serving_within(
     authority: &ControlPlaneRaftAuthority,
     timeout: Duration,
@@ -3998,6 +4050,75 @@ fn store_experimental_raft_durable_restart_artifact_while_locked(
     Ok(())
 }
 
+fn run_static_raft_control_plane_establishment_loop(
+    mut attempt: impl FnMut() -> Result<
+        ControlPlaneRaftEstablishedPeerPolicyConvergence,
+        ControlPlaneError,
+    >,
+    mut wait_for_convergence: impl FnMut() -> Result<(), ControlPlaneError>,
+) -> Result<(), ControlPlaneError> {
+    loop {
+        let convergence = attempt()?;
+        if convergence == ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged {
+            return Ok(());
+        }
+        process_info!(
+            "static control-plane identity checkpoint is not converged ({convergence:?}); waiting for Raft apply"
+        );
+        wait_for_convergence()?;
+    }
+}
+
+fn establish_static_raft_control_plane_identity(
+    runtime: &Handle,
+    authority: &ControlPlaneRaftAuthority,
+    policy: &ControlPlaneRaftPeerTransportPolicy,
+    identity: &ConfiguredStaticClusterIdentity,
+    node_id: ControlPlaneRaftNodeId,
+    path: &Path,
+    durable_checkpoint_lock: &Arc<Mutex<()>>,
+) -> Result<(), ControlPlaneError> {
+    run_static_raft_control_plane_establishment_loop(
+        || {
+            let _guard = durable_checkpoint_lock
+                .lock()
+                .expect("experimental OpenRaft durable checkpoint mutex poisoned");
+            let checkpoint = block_on_control_plane_raft(
+                runtime,
+                authority.capture_durable_restart_checkpoint(),
+            )?;
+            let convergence = checkpoint.established_peer_policy_convergence(policy)?;
+            if convergence == ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged {
+                let committed_timestamp_high_water_ms =
+                    authority.persist_durable_restart_checkpoint(checkpoint, path)?;
+                let binding = authority.authority_clock_checkpoint_binding();
+                store_authority_clock_restart_checkpoint(
+                    path,
+                    binding,
+                    1,
+                    committed_timestamp_high_water_ms,
+                )?;
+                static_cluster_state::mark_static_control_plane_identity_established(
+                    identity, node_id, path,
+                )
+                .map_err(|message| ControlPlaneError::RpcRemote {
+                    message: format!(
+                        "failed to establish static control-plane identity: {message}"
+                    ),
+                })?;
+            }
+            Ok(convergence)
+        },
+        || {
+            std::thread::sleep(Duration::from_millis(100));
+            block_on_control_plane_raft(
+                runtime,
+                wait_for_static_initial_raft_membership(authority, policy),
+            )
+        },
+    )
+}
+
 fn snapshot_purge_and_checkpoint_experimental_raft_peer_wal(
     runtime: &Handle,
     authority: &ControlPlaneRaftAuthority,
@@ -4036,31 +4157,25 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             std::process::exit(1);
         });
     let node_id: ControlPlaneRaftNodeId = config.control_plane_raft_node_id.unwrap_or(1);
-    if let Some(identity) = &config.static_cluster_identity {
-        static_cluster_state::bind_static_control_plane_identity(
-            identity,
-            node_id,
-            Path::new(state_path),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("failed to bind static control-plane identity: {error}");
-            std::process::exit(1);
-        });
-    }
-    let listener = bind_control_plane_socket(Path::new(socket_path)).unwrap_or_else(|error| {
-        eprintln!("{error}");
-        std::process::exit(1);
-    });
+    let static_cluster_identity_established =
+        if let Some(identity) = &config.static_cluster_identity {
+            static_cluster_state::bind_static_control_plane_identity(
+                identity,
+                node_id,
+                Path::new(state_path),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("failed to bind static control-plane identity: {error}");
+                std::process::exit(1);
+            })
+        } else {
+            false
+        };
     let recovery_socket_path = config
         .control_plane_clock_recovery_socket_path
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| control_plane_clock_recovery_socket_path(Path::new(socket_path)));
-    let recovery_listener = bind_control_plane_clock_recovery_socket(&recovery_socket_path)
-        .unwrap_or_else(|error| {
-            eprintln!("{error}");
-            std::process::exit(1);
-        });
 
     let runtime = Handle::current();
     let cluster_name = config
@@ -4077,14 +4192,6 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let durable_artifact_path = Arc::new(PathBuf::from(state_path));
     let authority_clock_checkpoint_binding =
         ControlPlaneAuthorityClockCheckpointBinding::for_raft(&cluster_name, node_id);
-    let restart_clock_checkpoint = load_process_authority_clock_restart_checkpoint(
-        &durable_artifact_path,
-        authority_clock_checkpoint_binding,
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("failed to load experimental OpenRaft authority clock checkpoint: {error}");
-        std::process::exit(1);
-    });
     let durable_wal_path = durable_artifact_wal_path(&durable_artifact_path);
     let authority = block_on_control_plane_raft(&runtime, async {
         let authority = if let Some(policy) = raft_peer_policy.clone() {
@@ -4118,27 +4225,6 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 eprintln!("{error}");
                 std::process::exit(1);
             });
-    if let Some(identity) = &config.static_cluster_identity {
-        store_experimental_raft_durable_restart_artifact(
-            &runtime,
-            &authority,
-            Path::new(state_path),
-            Some(&durable_checkpoint_lock),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("failed to establish static control-plane state: {error}");
-            std::process::exit(1);
-        });
-        static_cluster_state::mark_static_control_plane_identity_established(
-            identity,
-            node_id,
-            Path::new(state_path),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("failed to establish static control-plane identity: {error}");
-            std::process::exit(1);
-        });
-    }
     let active_raft_peer_rpc_workers = Arc::new(AtomicUsize::new(0));
     let durable_publication = ExperimentalRaftDurabilityPublication::new();
     let multi_node_raft_peer_mode = raft_peer_policy
@@ -4210,7 +4296,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 "experimental single-node control-plane startup",
             )
             .await?;
-        } else {
+        } else if config.static_cluster_identity.is_none() {
             wait_for_experimental_raft_startup_catch_up(
                 &authority,
                 Duration::from_secs(1),
@@ -4224,16 +4310,78 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
-    store_experimental_raft_durable_restart_artifact(
-        &runtime,
-        &authority,
-        Path::new(state_path),
-        Some(&durable_checkpoint_lock),
+    if config.static_cluster_identity.is_some() {
+        let policy = raft_peer_policy.as_ref().unwrap_or_else(|| {
+            eprintln!("static replicated control-plane identity requires a Raft peer policy");
+            std::process::exit(1);
+        });
+        block_on_control_plane_raft(
+            &runtime,
+            wait_for_static_initial_raft_membership(&authority, policy),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to establish static control-plane membership: {error}");
+            std::process::exit(1);
+        });
+    }
+    if let Some(identity) = &config.static_cluster_identity {
+        if static_cluster_identity_established {
+            store_experimental_raft_durable_restart_artifact(
+                &runtime,
+                &authority,
+                Path::new(state_path),
+                Some(&durable_checkpoint_lock),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+                std::process::exit(1);
+            });
+        } else {
+            establish_static_raft_control_plane_identity(
+                &runtime,
+                &authority,
+                raft_peer_policy
+                    .as_ref()
+                    .expect("static replicated control-plane peer policy was validated above"),
+                identity,
+                node_id,
+                Path::new(state_path),
+                &durable_checkpoint_lock,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("failed to establish static control-plane state: {error}");
+                std::process::exit(1);
+            });
+        }
+    } else {
+        store_experimental_raft_durable_restart_artifact(
+            &runtime,
+            &authority,
+            Path::new(state_path),
+            Some(&durable_checkpoint_lock),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+            std::process::exit(1);
+        });
+    }
+    let restart_clock_checkpoint = load_process_authority_clock_restart_checkpoint(
+        &durable_artifact_path,
+        authority_clock_checkpoint_binding,
     )
     .unwrap_or_else(|error| {
-        eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+        eprintln!("failed to load experimental OpenRaft authority clock checkpoint: {error}");
         std::process::exit(1);
     });
+    let listener = bind_control_plane_socket(Path::new(socket_path)).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    let recovery_listener = bind_control_plane_clock_recovery_socket(&recovery_socket_path)
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
     let initial_clock_snapshot =
         block_on_control_plane_raft(&runtime, authority.current_control_plane_snapshot())
             .unwrap_or_else(|error| {
@@ -6779,7 +6927,7 @@ mod tests {
     use auth::SecretKey;
     use config::{
         BinarySecretConfigValue, ConfiguredControlPlaneRaftAuthCredential,
-        ConfiguredControlPlaneRaftPeerSocket, ConfiguredStaticClusterIdentity, SecretConfigValue,
+        ConfiguredControlPlaneRaftPeerSocket, SecretConfigValue,
     };
     use openraft::impls::{BasicNode, Vote};
     use openraft::raft::{TransferLeaderRequest, VoteRequest};
@@ -7454,6 +7602,168 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn static_raft_establishment_retries_a_nonconverged_capture() {
+        let attempts = AtomicUsize::new(0);
+        let waits = AtomicUsize::new(0);
+        let applied = ControlPlaneRaftLogId::new(
+            ControlPlaneRaftLeaderId {
+                term: 1,
+                node_id: 1,
+            },
+            1,
+        );
+        let committed = ControlPlaneRaftLogId::new(
+            ControlPlaneRaftLeaderId {
+                term: 1,
+                node_id: 1,
+            },
+            2,
+        );
+
+        run_static_raft_control_plane_establishment_loop(
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                Ok(if attempt == 0 {
+                    ControlPlaneRaftEstablishedPeerPolicyConvergence::AppliedStatePending {
+                        applied: Some(applied),
+                        committed: Some(committed),
+                    }
+                } else {
+                    ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged
+                })
+            },
+            || {
+                waits.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .expect("a later converged capture should establish static identity");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(waits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn static_raft_membership_establishment_requires_exact_applied_policy() {
+        let harness = experimental_raft_test_harness("static-membership-establishment");
+        let status = harness
+            .runtime
+            .block_on(harness.authority.status())
+            .expect("initialized authority status should read");
+        let mut config = test_server_config();
+        config.control_plane_raft_peer_socket_path = Some("localhost".to_string());
+        config.control_plane_raft_peer_sockets = vec![ConfiguredControlPlaneRaftPeerSocket {
+            node_id: 1,
+            socket_path: "localhost".to_string(),
+        }];
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-static-membership-establishment-{}",
+            std::process::id()
+        );
+        let exact_policy = build_experimental_raft_peer_transport_policy(&config, &cluster_name, 1)
+            .unwrap()
+            .unwrap();
+
+        validate_static_initial_raft_membership(&exact_policy, &status)
+            .expect("applied single-node membership should match exact static policy");
+        harness
+            .runtime
+            .block_on(wait_for_static_initial_raft_membership(
+                &harness.authority,
+                &exact_policy,
+            ))
+            .expect("exact applied membership should complete the convergence wait");
+
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let static_identity = ConfiguredStaticClusterIdentity {
+            cluster_id: cluster_name.clone(),
+            topology_generation: 1,
+            topology_digest: "a".repeat(64),
+            process_id: "control-1".to_string(),
+            process_identity_digest: "b".repeat(64),
+        };
+        static_cluster_state::initialize_static_control_plane_identity(
+            &static_identity,
+            1,
+            &state_path,
+        )
+        .expect("static identity should initialize before durable state exists");
+        let background_checkpoint = harness
+            .runtime
+            .block_on(harness.authority.capture_durable_restart_checkpoint())
+            .expect("background checkpoint should capture");
+        background_checkpoint
+            .validate_established_peer_policy(&exact_policy)
+            .expect("captured membership should match the exact static policy");
+        harness
+            .authority
+            .persist_durable_restart_checkpoint(background_checkpoint, &state_path)
+            .expect("background checkpoint should publish an artifact without a clock sidecar");
+        let checkpoint_binding = harness.authority.authority_clock_checkpoint_binding();
+        assert_eq!(
+            load_authority_clock_restart_checkpoint(&state_path, checkpoint_binding)
+                .expect("absent authority-clock checkpoint should inspect"),
+            None
+        );
+        let checkpoint_lock = Arc::new(Mutex::new(()));
+        establish_static_raft_control_plane_identity(
+            harness.runtime.handle(),
+            &harness.authority,
+            &exact_policy,
+            &static_identity,
+            1,
+            &state_path,
+            &checkpoint_lock,
+        )
+        .expect("static establishment should publish artifact, clock checkpoint, and identity");
+        assert!(
+            load_authority_clock_restart_checkpoint(&state_path, checkpoint_binding)
+                .expect("authority-clock checkpoint should load after establishment")
+                .is_some(),
+            "static establishment must not depend on being the first artifact writer"
+        );
+
+        config
+            .control_plane_raft_peer_sockets
+            .push(ConfiguredControlPlaneRaftPeerSocket {
+                node_id: 2,
+                socket_path: "/tmp/raft-2.sock".to_string(),
+            });
+        let mismatched_policy =
+            build_experimental_raft_peer_transport_policy(&config, &cluster_name, 1)
+                .unwrap()
+                .unwrap();
+        let error = validate_static_initial_raft_membership(&mismatched_policy, &status)
+            .expect_err("a policy with an unapplied voter must not be certified");
+        assert!(error.contains("membership does not match configured topology"));
+        assert!(error.contains("expected_voters={1, 2}"));
+        let mismatched_checkpoint = harness
+            .runtime
+            .block_on(harness.authority.capture_durable_restart_checkpoint())
+            .expect("mismatched checkpoint should capture before validation");
+        assert!(
+            mismatched_checkpoint
+                .validate_established_peer_policy(&mismatched_policy)
+                .is_err(),
+            "captured artifact membership must be validated before static establishment"
+        );
+        let pending = harness.runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                wait_for_static_initial_raft_membership(&harness.authority, &mismatched_policy),
+            )
+            .await
+        });
+        assert!(
+            pending.is_err(),
+            "a node must remain peer-serving while configured membership is still converging"
+        );
+
+        harness.shutdown();
     }
 
     #[test]

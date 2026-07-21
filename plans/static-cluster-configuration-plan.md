@@ -929,17 +929,30 @@ Progress as of 2026-07-19:
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state
   lock used by ordinary startup, checked before listeners open, and marked
-  established only after the first durable Raft artifact and sentinel are
-  published. Existing state without the sidecar, ordinary startup on an empty
-  destination, changed cluster/topology/process/node identity, corrupted
-  lifecycle state, and an established sidecar without its complete restart
-  pair fail closed; complete relocation remains valid. Static peer policies
-  preserve topology generation/digest through authenticated worker request and
-  response identities and reject fresh-manifest mismatches before OpenRaft
-  dispatch. Manifest validation builds one host-scoped runtime path namespace
-  covering authority state and fixed sidecars, temporary filename prefixes,
-  storage data directories, and Unix sockets; exact or ancestor collisions
-  fail before filesystem mutation.
+  established only after the configured voter set is both effective and
+  applied at one exact membership log id, all committed state is applied, and
+  one captured restart artifact independently proves those properties. The
+  artifact, sentinel, and initial authority-clock checkpoint are published
+  under the checkpoint lock before the identity becomes established; normal
+  established restarts preserve later authority-clock generations. A node
+  whose configured membership or committed state has not converged remains
+  alive and serves its authenticated Raft peer endpoint without a startup
+  deadline. If Raft advances between the status proof and checkpoint capture,
+  typed effective-membership/applied or committed/applied convergence results
+  return establishment to the indefinite convergence loop; identity, policy,
+  malformed-artifact, and durability failures remain fatal. Ordinary and
+  clock-recovery endpoints are not published until establishment completes.
+  Existing state without the sidecar,
+  ordinary startup on an empty destination, changed
+  cluster/topology/process/node identity, corrupted lifecycle state, and an
+  established sidecar without its complete restart pair fail closed; complete
+  relocation remains valid. Static peer policies preserve topology
+  generation/digest through authenticated worker request and response
+  identities and reject fresh-manifest mismatches before OpenRaft dispatch.
+  Manifest validation builds one host-scoped runtime path namespace covering
+  authority state and fixed sidecars, temporary filename prefixes, storage
+  data directories, and Unix sockets; exact or ancestor collisions fail before
+  filesystem mutation.
   Explicit bootstrap/snapshot topology certificates, replicated replacement
   lifecycle, storage/frontend process mapping, and TCP transport remain open.
 

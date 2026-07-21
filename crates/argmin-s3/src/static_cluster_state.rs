@@ -210,7 +210,7 @@ pub(crate) fn bind_static_control_plane_identity(
     identity: &ConfiguredStaticClusterIdentity,
     raft_node_id: u64,
     state_path: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let expected = StaticControlPlaneIdentity::new(identity, raft_node_id);
     let identity_path = static_control_plane_identity_path(state_path);
     if identity_path.try_exists().map_err(|error| {
@@ -227,7 +227,7 @@ pub(crate) fn bind_static_control_plane_identity(
                 state_path.display()
             ));
         }
-        return Ok(());
+        return Ok(actual.established);
     }
 
     let existing_state = control_plane_state_evidence_exists(state_path)?;
@@ -1140,7 +1140,7 @@ mod tests {
         let error = bind_static_control_plane_identity(&expected, 101, &state_path).unwrap_err();
         assert!(error.contains("run initialize-cluster-state"));
         initialize_static_control_plane_identity(&expected, 101, &state_path).unwrap();
-        bind_static_control_plane_identity(&expected, 101, &state_path).unwrap();
+        assert!(!bind_static_control_plane_identity(&expected, 101, &state_path).unwrap());
 
         let identity_path = static_control_plane_identity_path(&state_path);
         assert!(identity_path.is_file());
@@ -1263,7 +1263,10 @@ mod tests {
         )
         .unwrap();
 
-        bind_static_control_plane_identity(&expected, 101, &destination_path).unwrap();
+        assert!(
+            bind_static_control_plane_identity(&expected, 101, &destination_path).unwrap(),
+            "relocated established state must retain its lifecycle state"
+        );
     }
 
     #[test]
