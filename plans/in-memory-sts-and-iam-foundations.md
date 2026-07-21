@@ -2698,6 +2698,16 @@ provider, after which the explicit authorization lookup returns the typed
 provider failure. Role and principal tags remain deferred until the shared
 validated tag representation and their condition-key inputs are added.
 
+The first explicit decision-composition slice now treats every named inline
+identity-policy attachment on a role or configured principal as one union with
+document-independent explicit-deny precedence. Role-session evaluation takes a
+typed absent-or-present session-policy restriction: absence leaves the role
+decision unchanged, while a present session policy intersects with current
+role permissions and cannot add an allow. A complete three-by-three decision
+matrix pins deny precedence and both implicit-deny cases. Trust-policy/caller
+composition and S3 resource-policy composition remain separate later Phase 3
+slices so neither is hidden inside this identity/session boundary.
+
 - extend the minimal role identity records with role configuration, trust, and
   permission-policy state
 - add configured long-lived principal records and explicit identity-policy

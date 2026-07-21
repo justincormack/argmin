@@ -63,7 +63,7 @@ pub(crate) fn is_lower_hex(value: &str) -> bool {
 pub use authorization::{
     AuthorizationRecordError, AuthorizationRecordStore, ConfiguredPrincipalAuthorizationKey,
     ConfiguredPrincipalAuthorizationRecord, RoleAuthorizationRecord, RoleMaximumSessionDuration,
-    RoleRecordTimestamps,
+    RoleRecordTimestamps, SessionPolicyRestriction,
 };
 pub use bucket_policy::{
     parse_bucket_policy, BucketPolicy, BucketPolicyError, PolicyAction, PolicyConditionClause,

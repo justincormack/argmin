@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::{
-    AwsAccountId, ConfiguredPrincipalIdentity, InlineIdentityPolicy, LiveRoleIdentity,
-    RoleTrustPolicy, StableRoleId,
+    AwsAccountId, ConfiguredPrincipalIdentity, IdentityPolicyRequest, InlineIdentityPolicy,
+    LiveRoleIdentity, PolicyEvaluation, RoleTrustPolicy, SessionPolicy, StableRoleId,
 };
 
 const MIN_ROLE_SESSION_DURATION_SECS: u32 = 3_600;
@@ -94,6 +94,50 @@ fn validate_unique_policy_names(
     }
 }
 
+fn evaluate_inline_identity_policies(
+    policies: &[InlineIdentityPolicy],
+    request: &IdentityPolicyRequest<'_>,
+) -> PolicyEvaluation {
+    let mut saw_allow = false;
+    for policy in policies {
+        match policy.document().evaluate(request) {
+            PolicyEvaluation::ExplicitDeny => return PolicyEvaluation::ExplicitDeny,
+            PolicyEvaluation::ExplicitAllow => saw_allow = true,
+            PolicyEvaluation::NoMatch => {}
+        }
+    }
+    if saw_allow {
+        PolicyEvaluation::ExplicitAllow
+    } else {
+        PolicyEvaluation::NoMatch
+    }
+}
+
+/// Session-policy input to role-session permission composition.
+///
+/// Absence means no session policy was supplied and therefore imposes no
+/// additional restriction. A present policy intersects with current role
+/// permissions and can never add an allow the role does not already grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPolicyRestriction<'a> {
+    Absent,
+    Policy(&'a SessionPolicy),
+}
+
+fn intersect_role_and_session_decisions(
+    role: PolicyEvaluation,
+    session: PolicyEvaluation,
+) -> PolicyEvaluation {
+    if role == PolicyEvaluation::ExplicitDeny || session == PolicyEvaluation::ExplicitDeny {
+        PolicyEvaluation::ExplicitDeny
+    } else if role == PolicyEvaluation::ExplicitAllow && session == PolicyEvaluation::ExplicitAllow
+    {
+        PolicyEvaluation::ExplicitAllow
+    } else {
+        PolicyEvaluation::NoMatch
+    }
+}
+
 /// Current trust-independent and trust-policy state for one live role.
 ///
 /// The embedded immutable identity binds the mutable record to a role
@@ -148,6 +192,35 @@ impl RoleAuthorizationRecord {
     #[must_use]
     pub fn permission_policies(&self) -> &[InlineIdentityPolicy] {
         &self.permission_policies
+    }
+
+    /// Evaluate the union of the role's current identity-policy attachments.
+    /// An explicit deny in any attachment wins over allows in every other
+    /// attachment.
+    #[must_use]
+    pub fn evaluate_identity_permissions(
+        &self,
+        request: &IdentityPolicyRequest<'_>,
+    ) -> PolicyEvaluation {
+        evaluate_inline_identity_policies(&self.permission_policies, request)
+    }
+
+    /// Evaluate a role session's permissions after applying its session-policy
+    /// restriction. A session policy is an intersection, never another allow
+    /// source.
+    #[must_use]
+    pub fn evaluate_session_permissions(
+        &self,
+        request: &IdentityPolicyRequest<'_>,
+        session_policy: SessionPolicyRestriction<'_>,
+    ) -> PolicyEvaluation {
+        let role_decision = self.evaluate_identity_permissions(request);
+        match session_policy {
+            SessionPolicyRestriction::Absent => role_decision,
+            SessionPolicyRestriction::Policy(policy) => {
+                intersect_role_and_session_decisions(role_decision, policy.evaluate(request))
+            }
+        }
     }
 }
 
@@ -218,6 +291,16 @@ impl ConfiguredPrincipalAuthorizationRecord {
     pub fn identity_policies(&self) -> &[InlineIdentityPolicy] {
         &self.identity_policies
     }
+
+    /// Evaluate the union of this configured principal's current identity
+    /// policies with explicit-deny precedence.
+    #[must_use]
+    pub fn evaluate_identity_permissions(
+        &self,
+        request: &IdentityPolicyRequest<'_>,
+    ) -> PolicyEvaluation {
+        evaluate_inline_identity_policies(&self.identity_policies, request)
+    }
 }
 
 /// Bootstrap collection of current mutable IAM authorization records.
@@ -286,8 +369,9 @@ mod tests {
     use super::*;
     use crate::{
         IamActionPattern, IamPath, IamResourcePattern, IamRoleIdentity, IdentityPolicy,
-        IdentityPolicyStatement, InlinePolicyName, PolicyVersion, RoleName,
-        RoleTrustPolicyStatement, RoleTrustPrincipal,
+        IdentityPolicyStatement, InlinePolicyName, PolicyAction, PolicyEffect, PolicyVersion,
+        RoleName, RoleTrustPolicyStatement, RoleTrustPrincipal, S3IdentityPolicyResource,
+        SessionPolicy,
     };
 
     fn account() -> s3_types::AccountIdentity {
@@ -327,22 +411,47 @@ mod tests {
         )
     }
 
-    fn permission_policy(name: &str) -> InlineIdentityPolicy {
+    fn identity_policy(effect: PolicyEffect, action: &str, resource: &str) -> IdentityPolicy {
+        IdentityPolicy::new(
+            Some(PolicyVersion::V2012_10_17),
+            vec![IdentityPolicyStatement::new(
+                effect,
+                vec![IamActionPattern::new(action).unwrap()],
+                vec![IamResourcePattern::new(resource).unwrap()],
+            )
+            .unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn permission_policy(
+        name: &str,
+        effect: PolicyEffect,
+        action: &str,
+        resource: &str,
+    ) -> InlineIdentityPolicy {
         InlineIdentityPolicy::new(
             InlinePolicyName::new(name).unwrap(),
-            Arc::new(
-                IdentityPolicy::new(
-                    Some(PolicyVersion::V2012_10_17),
-                    vec![IdentityPolicyStatement::new(
-                        crate::PolicyEffect::Allow,
-                        vec![IamActionPattern::new("s3:GetObject").unwrap()],
-                        vec![IamResourcePattern::new("arn:aws:s3:::bucket/*").unwrap()],
-                    )
-                    .unwrap()],
-                )
-                .unwrap(),
-            ),
+            Arc::new(identity_policy(effect, action, resource)),
         )
+    }
+
+    fn get_object_request<'a>(bucket: &'a str, key: &'a str) -> IdentityPolicyRequest<'a> {
+        IdentityPolicyRequest::S3 {
+            action: PolicyAction::GetObject,
+            resource: S3IdentityPolicyResource::Object { bucket, key },
+        }
+    }
+
+    fn role_record(permission_policies: Vec<InlineIdentityPolicy>) -> RoleAuthorizationRecord {
+        RoleAuthorizationRecord::new(
+            live_role(),
+            RoleRecordTimestamps::new(1, 1).unwrap(),
+            RoleMaximumSessionDuration::new(3_600).unwrap(),
+            trust_policy(),
+            permission_policies,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -412,11 +521,177 @@ mod tests {
                 RoleMaximumSessionDuration::new(3_600).unwrap(),
                 trust_policy(),
                 vec![
-                    permission_policy("duplicate"),
-                    permission_policy("duplicate")
+                    permission_policy(
+                        "duplicate",
+                        PolicyEffect::Allow,
+                        "s3:GetObject",
+                        "arn:aws:s3:::bucket/*",
+                    ),
+                    permission_policy(
+                        "duplicate",
+                        PolicyEffect::Allow,
+                        "s3:GetObject",
+                        "arn:aws:s3:::bucket/*",
+                    )
                 ],
             ),
             Err(AuthorizationRecordError::DuplicateInlinePolicyName)
         );
+    }
+
+    #[test]
+    fn attached_identity_policies_form_one_explicit_deny_first_union() {
+        let policies = vec![
+            permission_policy(
+                "allow-reads",
+                PolicyEffect::Allow,
+                "s3:GetObject",
+                "arn:aws:s3:::bucket/*",
+            ),
+            permission_policy(
+                "deny-private",
+                PolicyEffect::Deny,
+                "s3:GetObject",
+                "arn:aws:s3:::bucket/private/*",
+            ),
+        ];
+        let role = role_record(policies.clone());
+        let configured = ConfiguredPrincipalAuthorizationRecord::new(
+            ConfiguredPrincipalAuthorizationKey::new(
+                AwsAccountId::new("123456789012").unwrap(),
+                ConfiguredPrincipalIdentity::new("arn:aws:iam::123456789012:user/test"),
+            ),
+            account(),
+            policies,
+        )
+        .unwrap();
+
+        fn assert_decisions(evaluate: impl Fn(&IdentityPolicyRequest<'_>) -> PolicyEvaluation) {
+            assert_eq!(
+                evaluate(&get_object_request("bucket", "public/key")),
+                PolicyEvaluation::ExplicitAllow
+            );
+            assert_eq!(
+                evaluate(&get_object_request("bucket", "private/key")),
+                PolicyEvaluation::ExplicitDeny
+            );
+            assert_eq!(
+                evaluate(&get_object_request("other-bucket", "public/key")),
+                PolicyEvaluation::NoMatch
+            );
+        }
+        assert_decisions(|request| role.evaluate_identity_permissions(request));
+        assert_decisions(|request| configured.evaluate_identity_permissions(request));
+    }
+
+    #[test]
+    fn session_policy_is_an_intersection_with_role_permissions() {
+        let role_allow = role_record(vec![permission_policy(
+            "allow-reads",
+            PolicyEffect::Allow,
+            "s3:GetObject",
+            "arn:aws:s3:::bucket/*",
+        )]);
+        let role_deny = role_record(vec![permission_policy(
+            "deny-reads",
+            PolicyEffect::Deny,
+            "s3:GetObject",
+            "arn:aws:s3:::bucket/*",
+        )]);
+        let session_allow = SessionPolicy::new(identity_policy(
+            PolicyEffect::Allow,
+            "s3:GetObject",
+            "arn:aws:s3:::bucket/public/*",
+        ));
+        let session_deny = SessionPolicy::new(identity_policy(
+            PolicyEffect::Deny,
+            "s3:GetObject",
+            "arn:aws:s3:::bucket/public/*",
+        ));
+        let session_put_allow = SessionPolicy::new(identity_policy(
+            PolicyEffect::Allow,
+            "s3:PutObject",
+            "arn:aws:s3:::bucket/*",
+        ));
+        let get = get_object_request("bucket", "public/key");
+        let put = IdentityPolicyRequest::S3 {
+            action: PolicyAction::PutObject,
+            resource: S3IdentityPolicyResource::Object {
+                bucket: "bucket",
+                key: "public/key",
+            },
+        };
+
+        assert_eq!(
+            role_allow.evaluate_session_permissions(&get, SessionPolicyRestriction::Absent),
+            PolicyEvaluation::ExplicitAllow
+        );
+        assert_eq!(
+            role_allow.evaluate_session_permissions(&put, SessionPolicyRestriction::Absent),
+            PolicyEvaluation::NoMatch
+        );
+        assert_eq!(
+            role_deny.evaluate_session_permissions(&get, SessionPolicyRestriction::Absent),
+            PolicyEvaluation::ExplicitDeny
+        );
+        assert_eq!(
+            role_allow.evaluate_session_permissions(
+                &get,
+                SessionPolicyRestriction::Policy(&session_allow),
+            ),
+            PolicyEvaluation::ExplicitAllow
+        );
+        assert_eq!(
+            role_allow.evaluate_session_permissions(
+                &get,
+                SessionPolicyRestriction::Policy(&session_put_allow),
+            ),
+            PolicyEvaluation::NoMatch
+        );
+        assert_eq!(
+            role_allow.evaluate_session_permissions(
+                &get,
+                SessionPolicyRestriction::Policy(&session_deny),
+            ),
+            PolicyEvaluation::ExplicitDeny
+        );
+        assert_eq!(
+            role_allow.evaluate_session_permissions(
+                &put,
+                SessionPolicyRestriction::Policy(&session_put_allow),
+            ),
+            PolicyEvaluation::NoMatch,
+            "a session policy cannot add an allow missing from the role"
+        );
+        assert_eq!(
+            role_deny.evaluate_session_permissions(
+                &get,
+                SessionPolicyRestriction::Policy(&session_allow),
+            ),
+            PolicyEvaluation::ExplicitDeny
+        );
+    }
+
+    #[test]
+    fn role_and_session_decision_intersection_has_complete_deny_first_matrix() {
+        use PolicyEvaluation::{ExplicitAllow, ExplicitDeny, NoMatch};
+
+        for (role, session, expected) in [
+            (ExplicitDeny, ExplicitDeny, ExplicitDeny),
+            (ExplicitDeny, ExplicitAllow, ExplicitDeny),
+            (ExplicitDeny, NoMatch, ExplicitDeny),
+            (ExplicitAllow, ExplicitDeny, ExplicitDeny),
+            (ExplicitAllow, ExplicitAllow, ExplicitAllow),
+            (ExplicitAllow, NoMatch, NoMatch),
+            (NoMatch, ExplicitDeny, ExplicitDeny),
+            (NoMatch, ExplicitAllow, NoMatch),
+            (NoMatch, NoMatch, NoMatch),
+        ] {
+            assert_eq!(
+                intersect_role_and_session_decisions(role, session),
+                expected,
+                "unexpected role={role:?}, session={session:?} composition"
+            );
+        }
     }
 }
