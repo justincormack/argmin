@@ -1703,6 +1703,16 @@ goldens establish that:
   a matching allow with the exact resource-policy-deny response; the
   corresponding false deny leaves the allow effective
 
+A separate path-bearing IAM user with a fresh access key and no identity
+policies pins the long-lived caller form of `aws:PrincipalArn`. A matching
+`ArnEquals` resource-policy allow is sufficient for same-account `PutObject`;
+a matching conditional deny overrides an otherwise matching resource-policy
+allow, while the same deny with the primary user's distinct ARN does not
+match. The fixture requires three consecutive allow/control/deny result sets
+before the Rust oracle asserts the complete success and explicit-resource-deny
+response shapes. The temporary user and access key are self-cleaning and are
+also recognized by periodic cleanup.
+
 After positive policy convergence, the fixture changes the recreated role's
 trust policy so the primary user can no longer perform an ordinary assumption
 and requires three consecutive STS `AccessDenied` results. The already-issued
@@ -2727,16 +2737,36 @@ a direct grant for a same-account IAM user. Account-ID, account-root, and every
 cross-account trust match—including wildcard—are delegation and require the
 caller-side `sts:AssumeRole` allow. Dedicated cross-account wildcard roles pin
 both success with caller allow and denial with caller `implicitDeny`. An
-explicit deny on either side wins, and
-trust omission cannot be repaired by caller permission. The boundary accepts only an
-account-bound IAM user ARN for this first long-lived-caller path; legacy opaque
-configured principals, root, role ARNs, malformed ARNs, and account-mismatched
-ARNs fail closed. Assumed-role callers remain a separate typed role-chaining
-path rather than being disguised as configured long-lived credentials. A
-complete trust/identity composition matrix plus same-account, account-
-delegation, wildcard, cross-account, omission, and invalid-caller tests pin the
-decision. S3 resource-policy composition remains the next independent Phase 3
-boundary.
+explicit deny on either side wins, and trust omission cannot be repaired by
+caller permission. The boundary accepts only an account-bound IAM user ARN for
+this first long-lived-caller path; legacy opaque configured principals, root,
+role ARNs, malformed ARNs, and account-mismatched ARNs fail closed.
+Assumed-role callers remain a separate typed role-chaining path rather than
+being disguised as configured long-lived credentials. A complete
+trust/identity composition matrix plus same-account, account-delegation,
+wildcard, cross-account, omission, and invalid-caller tests pin the decision.
+
+The assumed-role S3 resource-policy context slice now constructs its requester
+facts directly from one `AuthenticatedIdentity`; callers cannot independently
+mix the role ARN, session ARN, assumed-role ID, canonical user, or issuance
+time. Bucket-policy `Principal` matching accepts both the path-bearing IAM role
+ARN and the exact path-free assumed-role session ARN, as established by the AWS
+oracle. The condition adapter separately exposes the role ARN as
+`aws:PrincipalArn`, `<stable-role-id>:<session-name>` as `aws:userid`, and the
+sealed session issue instant as `aws:TokenIssueTime`. `ArnEquals` and the
+shared exact matcher reproduce the oracle's principal-ARN condition, while its
+distinct operator kind prevents unpinned ARN comparisons from leaking onto
+tags, list parameters, or other string/numeric keys. Token issue time uses the
+existing date evaluator. Both object- and bucket-resource request adapters
+carry this typed context, and the public request API cannot independently
+supply principal and canonical-user fields. Focused policy and server-core
+tests reproduce the AWS role/session principal and condition matrix on both
+resource scopes. A configured principal is exposed as `aws:PrincipalArn` only
+when it is a syntactically valid IAM user ARN bound to the authenticated
+account; opaque or account-mismatched configured principals remain lossless but
+make a dependent deny fail closed rather than bypassing it. Identity/session
+decisions and the resulting resource-policy decision remain to be composed at
+the S3 authorization boundary in the next Phase 3 slice.
 
 - extend the minimal role identity records with role configuration, trust, and
   permission-policy state

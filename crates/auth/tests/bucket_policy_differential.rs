@@ -1,6 +1,6 @@
 use auth::bucket_policy::{
     clause_supported_for_action_for_tests, parse_bucket_policy, BucketPolicy, ExistingObjectTags,
-    PolicyAction, PolicyEvaluation, PolicyRequest, PolicyTag,
+    PolicyAction, PolicyEvaluation, PolicyRequest, PolicyRequester, PolicyTag,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence};
@@ -390,10 +390,6 @@ impl GeneratedRequester {
             Self::AltUser => Some(ALT_USER),
         }
     }
-
-    fn canonical(self) -> Option<CanonicalUserId> {
-        self.principal().map(CanonicalUserId::from_principal)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -417,11 +413,11 @@ struct GeneratedRequest {
 impl GeneratedRequest {
     fn render_builder(&self) -> String {
         let mut out = format!(
-            "PolicyRequest::for_object(PolicyAction::{}, \"{}\", \"{}\", {:?}, requester_canonical.as_ref(), ExistingObjectTags::{})",
+            "requester={:?}; PolicyRequest::for_object_with_requester(PolicyAction::{}, \"{}\", \"{}\", requester, ExistingObjectTags::{})",
+            self.requester.principal(),
             self.action.variant_name(),
             BUCKET,
             KEY,
-            self.requester.principal(),
             if self.existing_tags.is_empty() {
                 "Unavailable"
             } else {
@@ -430,11 +426,11 @@ impl GeneratedRequest {
         );
         if !self.existing_tags.is_empty() {
             out = format!(
-                "PolicyRequest::for_object(PolicyAction::{}, \"{}\", \"{}\", {:?}, requester_canonical.as_ref(), ExistingObjectTags::Available(&[{}]))",
+                "requester={:?}; PolicyRequest::for_object_with_requester(PolicyAction::{}, \"{}\", \"{}\", requester, ExistingObjectTags::Available(&[{}]))",
+                self.requester.principal(),
                 self.action.variant_name(),
                 BUCKET,
                 KEY,
-                self.requester.principal(),
                 self.existing_tags
                     .iter()
                     .map(|(k, v)| format!("PolicyTag::new({k:?}, {v:?})"))
@@ -719,7 +715,15 @@ fn conditions_to_value(conditions: &[GeneratedConditionClause], style: RenderSty
 }
 
 fn evaluate_generated(policy: &BucketPolicy, generated: &GeneratedRequest) -> PolicyEvaluation {
-    let requester_canonical = generated.requester.canonical();
+    let identity = generated.requester.principal().map(|principal| {
+        auth::AuthenticatedIdentity::configured(
+            s3_types::AccountIdentity::from_principal(principal),
+            auth::ConfiguredPrincipalIdentity::new(principal),
+        )
+    });
+    let requester = identity
+        .as_ref()
+        .map_or_else(PolicyRequester::anonymous, PolicyRequester::authenticated);
     let existing_tags = generated
         .existing_tags
         .iter()
@@ -731,12 +735,11 @@ fn evaluate_generated(policy: &BucketPolicy, generated: &GeneratedRequest) -> Po
         .map(|(key, value)| PolicyTag::new(key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
 
-    let request = PolicyRequest::for_object(
+    let request = PolicyRequest::for_object_with_requester(
         generated.action.policy_action(),
         BUCKET,
         KEY,
-        generated.requester.principal(),
-        requester_canonical.as_ref(),
+        requester,
         ExistingObjectTags::Available(&existing_tags),
     )
     .with_request_object_tags(&request_tags)
@@ -1408,6 +1411,11 @@ fn bucket_policy_differential_phase2_copy_source_and_metadata_directive_matrix()
 
 #[test]
 fn bucket_policy_differential_phase2_bucket_vs_object_resource_applicability_matrix() {
+    let identity = auth::AuthenticatedIdentity::configured(
+        s3_types::AccountIdentity::from_principal(ALT_USER),
+        auth::ConfiguredPrincipalIdentity::new(ALT_USER),
+    );
+    let requester = PolicyRequester::authenticated(&identity);
     let object_actions = [
         PolicyAction::GetObject,
         PolicyAction::PutObject,
@@ -1449,12 +1457,11 @@ fn bucket_policy_differential_phase2_bucket_vs_object_resource_applicability_mat
                 );
             } else {
                 let policy = policy.expect("object action applicability policy parses");
-                let request = PolicyRequest::for_object(
+                let request = PolicyRequest::for_object_with_requester(
                     action,
                     BUCKET,
                     KEY,
-                    Some(ALT_USER),
-                    None,
+                    requester,
                     ExistingObjectTags::Unavailable,
                 );
                 assert_eq!(
@@ -1487,11 +1494,10 @@ fn bucket_policy_differential_phase2_bucket_vs_object_resource_applicability_mat
             );
             if matches!(resource, GeneratedResourcePattern::BucketArn(_)) {
                 let policy = policy.expect("bucket action applicability policy parses");
-                let request = PolicyRequest::for_bucket(
+                let request = PolicyRequest::for_bucket_with_requester(
                     action,
                     BUCKET,
-                    Some(ALT_USER),
-                    None,
+                    requester,
                     auth::bucket_policy::BucketTags::Unavailable,
                 );
                 assert_eq!(
@@ -1514,7 +1520,6 @@ fn bucket_policy_differential_phase2_bucket_vs_object_resource_applicability_mat
 #[test]
 fn bucket_policy_differential_phase2_unsupported_condition_keys_are_rejected() {
     for unsupported_key in [
-        "aws:PrincipalArn",
         "aws:SourceVpc",
         "aws:SourceVpce",
         "aws:SourceIp",

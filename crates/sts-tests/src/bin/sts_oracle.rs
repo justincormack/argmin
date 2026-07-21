@@ -1569,6 +1569,71 @@ fn run_s3_session_context_probes(
     }
 }
 
+struct S3IamUserContextProbeSet<'a> {
+    credentials: SignedRequestCredentials<'a>,
+    principal_arn: &'a str,
+}
+
+fn assert_s3_iam_user_context_put_explicit_deny(
+    label: &str,
+    response: &RawResponse,
+    bucket: &str,
+    fixture: &S3IamUserContextProbeSet<'_>,
+) {
+    let response = s3_response_with_sanitized_body(response, fixture.credentials.access_key, &[]);
+    assert_shape(
+        label,
+        &response,
+        &shape()
+            .status(403)
+            .headers(error_response_headers())
+            .sub("principal_arn", fixture.principal_arn)
+            .sub("bucket", bucket)
+            .sub("key", label)
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>User: {principal_arn} is not authorized to perform: \
+                 s3:PutObject on resource: \"arn:aws:s3:::{bucket}/{key}\" with an \
+                 explicit deny in a resource-based policy</Message>\
+                 <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+    );
+    println!("{label}: ok");
+}
+
+fn run_s3_iam_user_context_probes(
+    endpoint: &str,
+    bucket: &str,
+    fixture: S3IamUserContextProbeSet<'_>,
+) {
+    for label in [
+        "context-iam-user-principal-arn-allow",
+        "context-iam-user-principal-arn-deny-mismatch",
+    ] {
+        let response = send_signed_request_for_service_with_credentials(
+            "PUT",
+            &format!("{endpoint}/{label}"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            "s3",
+            fixture.credentials,
+        );
+        assert_s3_session_context_put_success(label, &response);
+    }
+
+    let label = "context-iam-user-principal-arn-deny";
+    let response = send_signed_request_for_service_with_credentials(
+        "PUT",
+        &format!("{endpoint}/{label}"),
+        b"",
+        std::iter::empty::<(&str, &str)>(),
+        "s3",
+        fixture.credentials,
+    );
+    assert_s3_iam_user_context_put_explicit_deny(label, &response, bucket, &fixture);
+}
+
 struct S3RolePolicyMutationProbeSet<'a> {
     pre_credentials: SignedRequestCredentials<'a>,
     pre_security_token: &'a str,
@@ -12433,6 +12498,22 @@ fn main() {
                 credentials: recreated_credentials,
                 security_token: &recreated_security_token,
                 assumed_role_arn: &recreated_session_arn,
+            },
+        );
+        let iam_user_context_access_key = required_env("STS_TEST_IAM_USER_CONTEXT_ACCESS_KEY");
+        let iam_user_context_secret_key = required_env("STS_TEST_IAM_USER_CONTEXT_SECRET_KEY");
+        let iam_user_context_arn = required_env("STS_TEST_IAM_USER_CONTEXT_ARN");
+        run_s3_iam_user_context_probes(
+            &format!("https://{post_bucket}.s3.{region}.amazonaws.com"),
+            &post_bucket,
+            S3IamUserContextProbeSet {
+                credentials: SignedRequestCredentials {
+                    access_key: &iam_user_context_access_key,
+                    secret_key: &iam_user_context_secret_key,
+                    region: &region,
+                    tls_ca_pem: None,
+                },
+                principal_arn: &iam_user_context_arn,
             },
         );
         let policy_pre_access_key = required_env("STS_TEST_POLICY_MUTATION_PRE_ACCESS_KEY");

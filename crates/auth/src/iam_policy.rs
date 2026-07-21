@@ -6,10 +6,11 @@
 
 use std::sync::Arc;
 
+use crate::identity::{parse_iam_principal_arn, IamPrincipalArnKind};
 use crate::policy::{action_pattern_matches, wildcard_matches, PolicyStatementCore};
 use crate::{
-    AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleIdentity, PolicyAction,
-    PolicyEffect, PolicyEvaluation, PolicyVersion, RoleName,
+    AwsAccountId, ConfiguredPrincipalIdentity, IamRoleIdentity, PolicyAction, PolicyEffect,
+    PolicyEvaluation, PolicyVersion,
 };
 
 const IAM_POLICY_NAME_MAX_LEN: usize = 128;
@@ -149,11 +150,12 @@ impl RoleTrustPrincipal {
                 AwsAccountId::new(value.clone()).expect("validated AWS account ID"),
             ))
         } else {
-            parse_iam_principal_arn(&value).map(|(account_id, qualifier)| {
-                if qualifier == "root" {
-                    RoleTrustPrincipalKind::AccountRoot(account_id)
-                } else {
-                    RoleTrustPrincipalKind::ExactIamPrincipal(account_id)
+            parse_iam_principal_arn(&value).map(|principal| match principal.kind() {
+                IamPrincipalArnKind::Root => {
+                    RoleTrustPrincipalKind::AccountRoot(principal.account_id().clone())
+                }
+                IamPrincipalArnKind::User | IamPrincipalArnKind::Role => {
+                    RoleTrustPrincipalKind::ExactIamPrincipal(principal.account_id().clone())
                 }
             })
         };
@@ -168,34 +170,6 @@ impl RoleTrustPrincipal {
     pub fn as_str(&self) -> &str {
         &self.value
     }
-}
-
-fn parse_iam_principal_arn(value: &str) -> Option<(AwsAccountId, &str)> {
-    let (account_id, qualifier) = value.strip_prefix("arn:aws:iam::")?.split_once(':')?;
-    let account_id = AwsAccountId::new(account_id.to_string()).ok()?;
-    let valid_qualifier = qualifier == "root"
-        || qualifier
-            .strip_prefix("user/")
-            .is_some_and(valid_iam_principal_name_and_path)
-        || qualifier
-            .strip_prefix("role/")
-            .is_some_and(valid_iam_principal_name_and_path);
-    valid_qualifier.then_some((account_id, qualifier))
-}
-
-fn valid_iam_principal_name_and_path(value: &str) -> bool {
-    if value.is_empty()
-        || value.starts_with('/')
-        || value.ends_with('/')
-        || value.bytes().any(|byte| matches!(byte, b'*' | b'?'))
-    {
-        return false;
-    }
-    let (path, name) = value.rsplit_once('/').unwrap_or(("", value));
-    if RoleName::new(name).is_err() {
-        return false;
-    }
-    path.is_empty() || IamPath::new(format!("/{path}/")).is_ok()
 }
 
 impl std::fmt::Debug for RoleTrustPrincipal {
@@ -514,9 +488,11 @@ impl RoleTrustPolicy {
         caller_principal: &ConfiguredPrincipalIdentity,
         target_role: &IamRoleIdentity,
     ) -> Result<RoleTrustPolicyEvaluation, InvalidRoleTrustCaller> {
-        let (principal_account_id, qualifier) =
+        let principal =
             parse_iam_principal_arn(caller_principal.principal()).ok_or(InvalidRoleTrustCaller)?;
-        if !qualifier.starts_with("user/") || &principal_account_id != caller_account_id {
+        if principal.kind() != IamPrincipalArnKind::User
+            || principal.account_id() != caller_account_id
+        {
             return Err(InvalidRoleTrustCaller);
         }
         let mut strongest_allow = None;

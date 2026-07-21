@@ -710,6 +710,10 @@ The committed policy assumes:
   - `s3:PutObjectLegalHold`
   - `s3:GetObjectLegalHold`
   - `s3:BypassGovernanceRetention`
+- the live STS oracle creates and removes temporary roles and path-bearing IAM
+  users below the `argmin-sts-oracle` namespace; the latter pin configured
+  IAM-user `aws:PrincipalArn` resource-policy behavior without relying on an
+  identity policy
 
 If you change `S3_TEST_BUCKET_PREFIX`, update the policy resource ARNs to
 match.

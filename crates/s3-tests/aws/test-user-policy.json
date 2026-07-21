@@ -127,7 +127,7 @@
             "Resource": "*"
         },
         {
-            "Sid": "AllowManageTemporaryStsOracleDisabledCredentialUsers",
+            "Sid": "AllowManageTemporaryStsOracleUsers",
             "Effect": "Allow",
             "Action": [
                 "iam:CreateUser",
@@ -137,7 +137,10 @@
                 "iam:ListAccessKeys",
                 "iam:UpdateAccessKey"
             ],
-            "Resource": "arn:aws:iam::*:user/argmin-sts-oracle/disabled-credential-*"
+            "Resource": [
+                "arn:aws:iam::*:user/argmin-sts-oracle/disabled-credential-*",
+                "arn:aws:iam::*:user/argmin-sts-oracle/iam-user-context-*"
+            ]
         },
         {
             "Sid": "AllowListTemporaryStsOracleUsers",

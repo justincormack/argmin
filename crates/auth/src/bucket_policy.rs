@@ -8,6 +8,7 @@ use crate::policy::{
     action_pattern_matches, policy_value_wildcard_matches, PolicyStatementCore, PolicyValue,
 };
 pub use crate::policy::{PolicyConditionClause, PolicyEffect, PolicyEvaluation, PolicyVersion};
+use crate::{AuthenticatedIdentity, ConfiguredPrincipalIdentity, PrincipalIdentity};
 
 mod condition_key;
 mod condition_op;
@@ -365,14 +366,68 @@ enum RequestBool {
     Available(Option<bool>),
 }
 
+/// Authenticated principal facts supplied to an S3 resource-policy request.
+///
+/// Constructing this from [`AuthenticatedIdentity`] keeps every assumed-role
+/// value bound to one authenticated session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyRequester<'a>(PolicyRequesterKind<'a>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyRequesterKind<'a> {
+    Anonymous,
+    Configured {
+        principal: &'a ConfiguredPrincipalIdentity,
+        canonical_user_id: &'a CanonicalUserId,
+        principal_arn: Option<&'a crate::IamUserArn>,
+    },
+    AssumedRoleSession(&'a crate::AssumedRoleSessionIdentity),
+}
+
+impl<'a> PolicyRequester<'a> {
+    #[must_use]
+    pub const fn anonymous() -> Self {
+        Self(PolicyRequesterKind::Anonymous)
+    }
+
+    #[must_use]
+    pub fn authenticated(identity: &'a AuthenticatedIdentity) -> Self {
+        match identity.kind() {
+            PrincipalIdentity::Configured { principal, .. } => {
+                Self(PolicyRequesterKind::Configured {
+                    principal,
+                    canonical_user_id: identity.account().canonical_user_id(),
+                    principal_arn: identity.configured_iam_user_arn(),
+                })
+            }
+            PrincipalIdentity::AssumedRoleSession(session) => {
+                Self(PolicyRequesterKind::AssumedRoleSession(session))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyPolicyRequester<'a> {
+    principal: Option<&'a str>,
+    canonical_user_id: Option<&'a CanonicalUserId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyRequesterContext<'a> {
+    #[cfg(test)]
+    Legacy(LegacyPolicyRequester<'a>),
+    Typed(PolicyRequester<'a>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyRequest<'a> {
     action: PolicyAction,
     bucket: &'a str,
     key: &'a str,
     bucket_resource: bool,
-    requester_principal: Option<&'a str>,
-    requester_canonical_user_id: Option<&'a CanonicalUserId>,
+    requester: PolicyRequesterContext<'a>,
     bucket_tags: BucketTags<'a>,
     existing_object_tags: ExistingObjectTags<'a>,
     request_object_tags: RequestObjectTags<'a>,
@@ -409,7 +464,25 @@ pub struct PolicyRequest<'a> {
 
 impl<'a> PolicyRequest<'a> {
     #[must_use]
-    pub const fn for_object(
+    pub const fn for_object_with_requester(
+        action: PolicyAction,
+        bucket: &'a str,
+        key: &'a str,
+        requester: PolicyRequester<'a>,
+        existing_object_tags: ExistingObjectTags<'a>,
+    ) -> Self {
+        Self::for_object_context(
+            action,
+            bucket,
+            key,
+            PolicyRequesterContext::Typed(requester),
+            existing_object_tags,
+        )
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    const fn for_object(
         action: PolicyAction,
         bucket: &'a str,
         key: &'a str,
@@ -417,13 +490,31 @@ impl<'a> PolicyRequest<'a> {
         requester_canonical_user_id: Option<&'a CanonicalUserId>,
         existing_object_tags: ExistingObjectTags<'a>,
     ) -> Self {
+        Self::for_object_context(
+            action,
+            bucket,
+            key,
+            PolicyRequesterContext::Legacy(LegacyPolicyRequester {
+                principal: requester_principal,
+                canonical_user_id: requester_canonical_user_id,
+            }),
+            existing_object_tags,
+        )
+    }
+
+    const fn for_object_context(
+        action: PolicyAction,
+        bucket: &'a str,
+        key: &'a str,
+        requester: PolicyRequesterContext<'a>,
+        existing_object_tags: ExistingObjectTags<'a>,
+    ) -> Self {
         Self {
             action,
             bucket,
             key,
             bucket_resource: false,
-            requester_principal,
-            requester_canonical_user_id,
+            requester,
             bucket_tags: BucketTags::Unavailable,
             existing_object_tags,
             request_object_tags: RequestObjectTags::Unavailable,
@@ -460,11 +551,44 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
-    pub const fn for_bucket(
+    pub const fn for_bucket_with_requester(
+        action: PolicyAction,
+        bucket: &'a str,
+        requester: PolicyRequester<'a>,
+        bucket_tags: BucketTags<'a>,
+    ) -> Self {
+        Self::for_bucket_context(
+            action,
+            bucket,
+            PolicyRequesterContext::Typed(requester),
+            bucket_tags,
+        )
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    const fn for_bucket(
         action: PolicyAction,
         bucket: &'a str,
         requester_principal: Option<&'a str>,
         requester_canonical_user_id: Option<&'a CanonicalUserId>,
+        bucket_tags: BucketTags<'a>,
+    ) -> Self {
+        Self::for_bucket_context(
+            action,
+            bucket,
+            PolicyRequesterContext::Legacy(LegacyPolicyRequester {
+                principal: requester_principal,
+                canonical_user_id: requester_canonical_user_id,
+            }),
+            bucket_tags,
+        )
+    }
+
+    const fn for_bucket_context(
+        action: PolicyAction,
+        bucket: &'a str,
+        requester: PolicyRequesterContext<'a>,
         bucket_tags: BucketTags<'a>,
     ) -> Self {
         Self {
@@ -472,8 +596,7 @@ impl<'a> PolicyRequest<'a> {
             bucket,
             key: "",
             bucket_resource: true,
-            requester_principal,
-            requester_canonical_user_id,
+            requester,
             bucket_tags,
             existing_object_tags: ExistingObjectTags::Unavailable,
             request_object_tags: RequestObjectTags::Unavailable,
@@ -515,13 +638,112 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
-    pub const fn requester_principal(&self) -> Option<&'a str> {
-        self.requester_principal
+    pub fn requester_principal(&self) -> Option<&'a str> {
+        match self.requester {
+            #[cfg(test)]
+            PolicyRequesterContext::Legacy(requester) => requester.principal,
+            PolicyRequesterContext::Typed(PolicyRequester(PolicyRequesterKind::Anonymous)) => None,
+            PolicyRequesterContext::Typed(PolicyRequester(PolicyRequesterKind::Configured {
+                principal,
+                ..
+            })) => Some(principal.principal()),
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::AssumedRoleSession(session),
+            )) => Some(session.session_arn().as_str()),
+        }
     }
 
     #[must_use]
     pub const fn requester_canonical_user_id(&self) -> Option<&'a CanonicalUserId> {
-        self.requester_canonical_user_id
+        match self.requester {
+            #[cfg(test)]
+            PolicyRequesterContext::Legacy(requester) => requester.canonical_user_id,
+            PolicyRequesterContext::Typed(PolicyRequester(PolicyRequesterKind::Configured {
+                canonical_user_id,
+                ..
+            })) => Some(canonical_user_id),
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::Anonymous | PolicyRequesterKind::AssumedRoleSession(_),
+            )) => None,
+        }
+    }
+
+    fn principal_matches(&self, policy_value: &str) -> bool {
+        match self.requester {
+            #[cfg(test)]
+            PolicyRequesterContext::Legacy(requester) => requester
+                .principal
+                .is_some_and(|principal| aws_principal_matches_request(principal, policy_value)),
+            PolicyRequesterContext::Typed(PolicyRequester(PolicyRequesterKind::Anonymous)) => false,
+            PolicyRequesterContext::Typed(PolicyRequester(PolicyRequesterKind::Configured {
+                principal,
+                ..
+            })) => aws_principal_matches_request(principal.principal(), policy_value),
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::AssumedRoleSession(session),
+            )) => {
+                aws_principal_matches_request(session.session_arn().as_str(), policy_value)
+                    || aws_principal_matches_request(session.role().arn().as_str(), policy_value)
+            }
+        }
+    }
+
+    fn aws_principal_arn(&self) -> Option<&'a str> {
+        match self.requester {
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::AssumedRoleSession(session),
+            )) => Some(session.role().arn().as_str()),
+            PolicyRequesterContext::Typed(PolicyRequester(PolicyRequesterKind::Configured {
+                principal_arn: Some(principal_arn),
+                ..
+            })) => Some(principal_arn.as_str()),
+            #[cfg(test)]
+            PolicyRequesterContext::Legacy(_) => None,
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::Anonymous
+                | PolicyRequesterKind::Configured {
+                    principal_arn: None,
+                    ..
+                },
+            )) => None,
+        }
+    }
+
+    fn aws_userid(&self) -> Option<&'a str> {
+        match self.requester {
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::AssumedRoleSession(session),
+            )) => Some(session.assumed_role_id().as_str()),
+            #[cfg(test)]
+            PolicyRequesterContext::Legacy(_) => None,
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::Anonymous | PolicyRequesterKind::Configured { .. },
+            )) => None,
+        }
+    }
+
+    fn token_issue_time_epoch_seconds(&self) -> Option<u64> {
+        match self.requester {
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::AssumedRoleSession(session),
+            )) => u64::try_from(session.lifetime().issued_at_epoch_secs()).ok(),
+            #[cfg(test)]
+            PolicyRequesterContext::Legacy(_) => None,
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::Anonymous | PolicyRequesterKind::Configured { .. },
+            )) => None,
+        }
+    }
+
+    const fn requester_is_anonymous(&self) -> bool {
+        match self.requester {
+            #[cfg(test)]
+            PolicyRequesterContext::Legacy(requester) => requester.principal.is_none(),
+            PolicyRequesterContext::Typed(PolicyRequester(PolicyRequesterKind::Anonymous)) => true,
+            PolicyRequesterContext::Typed(PolicyRequester(
+                PolicyRequesterKind::Configured { .. } | PolicyRequesterKind::AssumedRoleSession(_),
+            )) => false,
+        }
     }
 
     #[must_use]
@@ -1274,16 +1496,15 @@ impl PolicyPrincipal {
             return true;
         }
 
-        let requester_principal = request.requester_principal();
         let requester_canonical_user_id = request.requester_canonical_user_id();
 
-        self.aws.iter().any(|value| {
-            requester_principal
-                .is_some_and(|requester| aws_principal_matches_request(requester, value))
-        }) || self
-            .service
+        self.aws
             .iter()
-            .any(|value| requester_principal == Some(value.as_str()))
+            .any(|value| request.principal_matches(value))
+            || self
+                .service
+                .iter()
+                .any(|value| request.requester_principal() == Some(value.as_str()))
             || self.canonical_user.iter().any(|value| {
                 requester_canonical_user_id.is_some_and(|requester| requester.as_str() == value)
             })
@@ -2027,6 +2248,8 @@ fn is_non_public_condition_clause(clause: &PolicyConditionClause) -> bool {
             clause.operator.as_str(),
             "StringEquals" | "StringEqualsIgnoreCase" | "StringLike"
         ) && clause.values.iter().all(|value| is_fixed_value(value))
+    } else if clause.key.eq_ignore_ascii_case("aws:PrincipalArn") {
+        clause.operator == "ArnEquals" && clause.values.iter().all(|value| is_fixed_value(value))
     } else if condition_key_matches_any(&clause.key, &["aws:SourceArn", "s3:DataAccessPointArn"]) {
         matches!(
             clause.operator.as_str(),
@@ -2159,6 +2382,10 @@ fn ipv4_prefix_bits(addr: Ipv4Addr, prefix: u8) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        AwsAccountId, IamPath, IamRoleIdentity, RoleName, RoleSessionName, SessionLifetime,
+        StableRoleId,
+    };
 
     fn request<'a>(
         action: PolicyAction,
@@ -2222,6 +2449,156 @@ mod tests {
             existing_object_tags,
         )
         .with_bucket_tags(BucketTags::Available(bucket_tags))
+    }
+
+    fn assumed_role_identity() -> AuthenticatedIdentity {
+        let session = crate::AssumedRoleSessionIdentity::new(
+            IamRoleIdentity::new(
+                AwsAccountId::new("123456789012").unwrap(),
+                StableRoleId::new("ARGR0123456789ABCDEFGHIJ").unwrap(),
+                RoleName::new("test-role").unwrap(),
+                IamPath::new("/team/").unwrap(),
+            ),
+            RoleSessionName::new("test-session").unwrap(),
+            SessionLifetime::new(1_704_067_200, 1_704_070_800).unwrap(),
+            None,
+        );
+        AuthenticatedIdentity::assumed_role_session(
+            s3_types::AccountIdentity::new(
+                "123456789012",
+                CanonicalUserId::from_principal("123456789012"),
+                "Test account",
+            ),
+            session,
+        )
+        .unwrap()
+    }
+
+    fn assumed_role_request<'a>(
+        identity: &'a AuthenticatedIdentity,
+        key: &'a str,
+    ) -> PolicyRequest<'a> {
+        PolicyRequest::for_object_with_requester(
+            PolicyAction::PutObject,
+            "bucket",
+            key,
+            PolicyRequester::authenticated(identity),
+            ExistingObjectTags::Unavailable,
+        )
+    }
+
+    #[test]
+    fn assumed_role_resource_policy_matches_role_and_session_principal_arns() {
+        let identity = assumed_role_identity();
+        let session = identity.role_session().unwrap();
+        let policy = parse_bucket_policy(&format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/role"}},{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/session"}}]}}"#,
+            session.role().arn().as_str(),
+            session.session_arn().as_str(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            policy.evaluate(&assumed_role_request(&identity, "role")),
+            PolicyEvaluation::ExplicitAllow
+        );
+        assert_eq!(
+            policy.evaluate(&assumed_role_request(&identity, "session")),
+            PolicyEvaluation::ExplicitAllow
+        );
+    }
+
+    #[test]
+    fn assumed_role_global_condition_values_are_distinct_and_immutable() {
+        let identity = assumed_role_identity();
+        let session = identity.role_session().unwrap();
+        let policy = parse_bucket_policy(&format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/principal-role","Condition":{{"ArnEquals":{{"aws:PrincipalArn":"{}"}}}}}},{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/principal-session","Condition":{{"ArnEquals":{{"aws:PrincipalArn":"{}"}}}}}},{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/userid","Condition":{{"StringEquals":{{"aws:userid":"{}"}}}}}},{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/issued-after","Condition":{{"DateGreaterThan":{{"aws:TokenIssueTime":"2023-12-31T23:59:59Z"}}}}}},{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/issued-before","Condition":{{"DateLessThan":{{"aws:TokenIssueTime":"2024-01-01T00:00:01Z"}}}}}}]}}"#,
+            session.role().arn().as_str(),
+            session.role().arn().as_str(),
+            session.role().arn().as_str(),
+            session.session_arn().as_str(),
+            session.role().arn().as_str(),
+            session.assumed_role_id().as_str(),
+            session.role().arn().as_str(),
+            session.role().arn().as_str(),
+        ))
+        .unwrap();
+
+        for key in ["principal-role", "userid", "issued-after", "issued-before"] {
+            assert_eq!(
+                policy.evaluate(&assumed_role_request(&identity, key)),
+                PolicyEvaluation::ExplicitAllow,
+                "{key}"
+            );
+        }
+        assert_eq!(
+            policy.evaluate(&assumed_role_request(&identity, "principal-session")),
+            PolicyEvaluation::NoMatch
+        );
+
+        let deny_policy = parse_bucket_policy(&format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/issue-deny"}},{{"Effect":"Deny","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/issue-deny","Condition":{{"DateLessThan":{{"aws:TokenIssueTime":"2024-01-01T00:00:01Z"}}}}}}]}}"#,
+            session.role().arn().as_str(),
+            session.role().arn().as_str(),
+        ))
+        .unwrap();
+        assert_eq!(
+            deny_policy.evaluate(&assumed_role_request(&identity, "issue-deny")),
+            PolicyEvaluation::ExplicitDeny
+        );
+    }
+
+    #[test]
+    fn account_bound_configured_iam_user_principal_arn_is_evaluated() {
+        let principal = "arn:aws:iam::123456789012:user/test-user";
+        let identity = AuthenticatedIdentity::configured(
+            s3_types::AccountIdentity::new(
+                "123456789012",
+                CanonicalUserId::from_principal("123456789012"),
+                "Test account",
+            ),
+            ConfiguredPrincipalIdentity::new(principal),
+        );
+        let policy = parse_bucket_policy(&format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/key"}},{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/key","Condition":{{"ArnEquals":{{"aws:PrincipalArn":"{principal}"}}}}}}]}}"#,
+        ))
+        .unwrap();
+        let request = PolicyRequest::for_object_with_requester(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            PolicyRequester::authenticated(&identity),
+            ExistingObjectTags::Unavailable,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn untyped_configured_principal_arn_deny_fails_closed() {
+        let principal = "arn:aws:iam::123456789012:user/test-user";
+        let identity = AuthenticatedIdentity::configured(
+            s3_types::AccountIdentity::new(
+                "210987654321",
+                CanonicalUserId::from_principal("210987654321"),
+                "Test account",
+            ),
+            ConfiguredPrincipalIdentity::new(principal),
+        );
+        let policy = parse_bucket_policy(&format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/key"}},{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/key","Condition":{{"ArnEquals":{{"aws:PrincipalArn":"{principal}"}}}}}}]}}"#,
+        ))
+        .unwrap();
+        let request = PolicyRequest::for_object_with_requester(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            PolicyRequester::authenticated(&identity),
+            ExistingObjectTags::Unavailable,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
     }
 
     #[test]
@@ -2512,6 +2889,25 @@ mod tests {
         )
         .unwrap();
         assert!(!policy.is_public());
+    }
+
+    #[test]
+    fn fixed_principal_arn_condition_constrains_wildcard_principal() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"arn:aws:iam::123456789012:role/test"}}}]}"#,
+        )
+        .unwrap();
+        assert!(!policy.is_public());
+    }
+
+    #[test]
+    fn unpinned_principal_arn_operator_does_not_constrain_wildcard_principal() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:PrincipalArn":"arn:aws:iam::123456789012:role/test"}}}]}"#,
+        )
+        .unwrap();
+        assert!(policy.is_public());
+        assert!(policy.validate_evaluable_object_conditions().is_err());
     }
 
     #[test]
@@ -3975,18 +4371,13 @@ mod tests {
     }
 
     #[test]
-    fn principal_arn_condition_is_rejected_for_evaluable_object_actions() {
+    fn principal_arn_condition_is_accepted_for_evaluable_object_actions() {
         let policy = parse_bucket_policy(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"ArnEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#,
         )
         .unwrap();
 
-        assert_eq!(
-            policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::malformed(
-                "unsupported Condition for currently enforced bucket policy action"
-            ))
-        );
+        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
     }
 
     #[test]

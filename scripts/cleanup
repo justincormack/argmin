@@ -211,7 +211,8 @@ cleanup_stale_sts_oracle_users() {
   jq -r \
     '.Users[] | select(
         .Path == "/argmin-sts-oracle/" and
-        (.UserName | startswith("disabled-credential-"))
+        ((.UserName | startswith("disabled-credential-")) or
+         (.UserName | startswith("iam-user-context-")))
     ) | @base64' \
     "$users_file" > "$users_rows"
 
@@ -227,7 +228,8 @@ cleanup_stale_sts_oracle_users() {
     created_at=$(jq -er '.CreateDate' <<<"$user")
 
     case "$user_path:$user_name" in
-      /argmin-sts-oracle/:disabled-credential-*) ;;
+      /argmin-sts-oracle/:disabled-credential-* | \
+        /argmin-sts-oracle/:iam-user-context-*) ;;
       *) continue ;;
     esac
     created_epoch=$(date -d "$created_at" +%s)

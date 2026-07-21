@@ -497,8 +497,8 @@ evaluation is still narrower.
 
 Current runtime-evaluation limits include:
 
-- network/account condition keys such as `aws:PrincipalArn`, `aws:SourceVpc`,
-  `aws:SourceVpce`, `aws:SourceArn`, `aws:SourceAccount`,
+- network/account condition keys such as `aws:SourceVpc`, `aws:SourceVpce`,
+  `aws:SourceArn`, `aws:SourceAccount`,
   `aws:SourceOwner`, `aws:PrincipalOrgID`, `aws:PrincipalAccount`,
   `aws:PrincipalIsAWSService`, `aws:VpcSourceIp`, `aws:ResourceAccount`,
   `s3:DataAccessPointAccount`, and `s3:DataAccessPointArn` still remain
@@ -613,17 +613,25 @@ uses the request `Referer` header with normal absent-key condition semantics.
 AWS exposes `s3:signatureAge` for presigned query and POST authentication;
 header-auth requests treat that key as absent.
 
+`aws:PrincipalArn` is evaluated with the AWS-pinned `ArnEquals` operator. An
+assumed-role request exposes the path-bearing IAM role ARN rather than its STS
+session ARN. A configured principal exposes an IAM user ARN only after its
+syntax and account binding have been validated. Opaque configured principals
+cannot satisfy an allow and make a dependent deny fail closed.
+
 Policy variables are implemented only for request-backed values that Argmin
 can model exactly. Variables are expanded in `Resource` patterns and string
 condition values, but not in numeric, date, boolean, binary, IP, or `Null`
 condition values.
 
-Authenticated identity variable details are a known gap until Argmin has STS
-and authoritative IAM identity context. `aws:userid`, `aws:PrincipalType`,
-`aws:username`, principal tags, and role/session values are not resolved for
-authenticated callers; Argmin leaves those variables unavailable rather than
-guessing from the visible principal string. ABAC policies that depend on richer
-IAM variables remain a compatibility gap.
+Assumed-role identity context now resolves `aws:userid` as the stable role ID
+plus session name, `aws:PrincipalType` as `AssumedRole`, and
+`aws:TokenIssueTime` from the immutable authenticated session lifetime.
+Anonymous principal type/user ID behavior also remains available. IAM-user
+stable IDs, `aws:username`, principal tags, session tags, and other richer IAM
+variables remain unresolved; Argmin leaves those values unavailable rather
+than guessing from a visible principal string. ABAC policies that depend on
+those values remain a compatibility gap.
 
 References:
 

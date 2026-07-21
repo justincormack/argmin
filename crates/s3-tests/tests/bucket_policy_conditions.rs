@@ -11,7 +11,8 @@ use std::thread;
 use std::time::Duration;
 
 use auth::bucket_policy::{
-    parse_bucket_policy, BucketPolicy, PolicyAction, PolicyEvaluation, PolicyRequest, PolicyTag,
+    parse_bucket_policy, BucketPolicy, PolicyAction, PolicyEvaluation, PolicyRequest,
+    PolicyRequester, PolicyTag,
 };
 use s3_tests::{
     aws_sdk_s3::{
@@ -155,6 +156,11 @@ struct LocalRequest {
 
 impl LocalRequest {
     fn evaluate(&self, policy: &BucketPolicy, bucket: &str, principal: &str) -> PolicyEvaluation {
+        let identity = auth::AuthenticatedIdentity::configured(
+            s3_types::AccountIdentity::from_principal(principal),
+            auth::ConfiguredPrincipalIdentity::new(principal),
+        );
+        let requester = PolicyRequester::authenticated(&identity);
         let existing_tags = self
             .existing_tags
             .iter()
@@ -167,20 +173,18 @@ impl LocalRequest {
             .collect::<Vec<_>>();
 
         let request = if self.bucket_resource {
-            PolicyRequest::for_bucket(
+            PolicyRequest::for_bucket_with_requester(
                 self.action,
                 bucket,
-                Some(principal),
-                None,
+                requester,
                 auth::bucket_policy::BucketTags::Unavailable,
             )
         } else {
-            PolicyRequest::for_object(
+            PolicyRequest::for_object_with_requester(
                 self.action,
                 bucket,
                 "key",
-                Some(principal),
-                None,
+                requester,
                 auth::bucket_policy::ExistingObjectTags::Available(&existing_tags),
             )
         }

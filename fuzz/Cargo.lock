@@ -42,6 +42,7 @@ dependencies = [
  "auth",
  "base64",
  "libfuzzer-sys",
+ "s3-types",
  "serde_json",
  "server-http",
 ]

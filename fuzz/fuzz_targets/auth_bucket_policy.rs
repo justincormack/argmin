@@ -2,7 +2,7 @@
 
 use auth::bucket_policy::{
     parse_bucket_policy, BucketPolicy, BucketTags, ExistingObjectTags, PolicyAction,
-    PolicyEvaluation, PolicyRequest, PolicyTag,
+    PolicyEvaluation, PolicyRequest, PolicyRequester, PolicyTag,
 };
 use libfuzzer_sys::fuzz_target;
 use serde_json::{Map, Value};
@@ -72,6 +72,16 @@ impl RequestCase {
     }
 
     fn evaluate(&self, policy: &BucketPolicy) -> PolicyEvaluation {
+        let identity = self.principal.as_ref().map(|principal| {
+            auth::AuthenticatedIdentity::configured(
+                s3_types::AccountIdentity::from_principal(principal),
+                auth::ConfiguredPrincipalIdentity::new(principal),
+            )
+        });
+        let requester = identity.as_ref().map_or_else(
+            PolicyRequester::anonymous,
+            PolicyRequester::authenticated,
+        );
         let existing_tags = self
             .existing_tags
             .iter()
@@ -83,20 +93,18 @@ impl RequestCase {
             .map(|(key, value)| PolicyTag::new(key.as_str(), value.as_str()))
             .collect::<Vec<_>>();
         let request = if self.bucket_resource {
-            PolicyRequest::for_bucket(
+            PolicyRequest::for_bucket_with_requester(
                 self.action,
                 &self.bucket,
-                self.principal.as_deref(),
-                None,
+                requester,
                 BucketTags::Unavailable,
             )
         } else {
-            PolicyRequest::for_object(
+            PolicyRequest::for_object_with_requester(
                 self.action,
                 &self.bucket,
                 &self.key,
-                self.principal.as_deref(),
-                None,
+                requester,
                 ExistingObjectTags::Available(&existing_tags),
             )
         }

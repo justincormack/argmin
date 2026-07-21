@@ -88,8 +88,8 @@ pub use iam_policy::{
 };
 pub use identity::{
     AssumedRoleId, AssumedRoleSessionArn, AssumedRoleSessionIdentity, AuthenticatedIdentity,
-    AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleArn, IamRoleIdentity, IdentityError,
-    LiveRoleIdentity, PrincipalIdentity, RoleName, RoleSessionName, SessionLifetime,
+    AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleArn, IamRoleIdentity, IamUserArn,
+    IdentityError, LiveRoleIdentity, PrincipalIdentity, RoleName, RoleSessionName, SessionLifetime,
     SourceIdentity, StableRoleId,
 };
 pub use post::{

@@ -1518,6 +1518,14 @@ impl Requester {
     }
 
     #[must_use]
+    pub fn bucket_policy_requester(&self) -> auth::bucket_policy::PolicyRequester<'_> {
+        match self.identity.as_ref() {
+            None => auth::bucket_policy::PolicyRequester::anonymous(),
+            Some(identity) => auth::bucket_policy::PolicyRequester::authenticated(identity),
+        }
+    }
+
+    #[must_use]
     pub fn is_anonymous(&self) -> bool {
         self.identity.is_none()
     }

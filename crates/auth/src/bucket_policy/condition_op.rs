@@ -39,6 +39,7 @@ pub(super) enum ActualValue<'a> {
 /// example, filtering supportedness predicates) without string comparisons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConditionOpKind {
+    ArnEquals,
     BinaryEquals,
     Bool,
     DateEquals,
@@ -232,6 +233,13 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         set_qualifier: ConditionSetQualifier::None,
         kind: ConditionOpKind::DateGreaterThanEquals,
         evaluate: eval_date_greater_than_equals_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ArnEquals",
+        set_qualifier: ConditionSetQualifier::None,
+        kind: ConditionOpKind::ArnEquals,
+        evaluate: eval_string_equals,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
@@ -2014,6 +2022,14 @@ mod tests {
     #[test]
     fn lookup_unknown_operator_returns_none() {
         assert!(lookup("DefinitelyNotAnOperator").is_none());
+    }
+
+    #[test]
+    fn arn_equals_has_a_distinct_operator_kind() {
+        let op = lookup("ArnEquals").expect("ArnEquals is in the table");
+        assert_eq!(op.kind, ConditionOpKind::ArnEquals);
+        assert!(!is_string_condition_kind(op.kind));
+        assert!(!is_numeric_condition_kind(op.kind));
     }
 
     #[test]

@@ -32,9 +32,13 @@ Important current bucket-policy note:
   subset for unsupported object-condition keys because that creates a stored
   policy state the evaluator cannot use correctly.
 - In particular, request context does not yet carry values for
-  `aws:PrincipalArn`, `aws:SourceVpc`, `aws:SourceVpce`, `aws:SourceArn`,
-  `aws:SourceAccount`, `aws:SourceOwner`, `aws:userid`, `aws:PrincipalOrgID`,
+  `aws:SourceVpc`, `aws:SourceVpce`, `aws:SourceArn`, `aws:SourceAccount`,
+  `aws:SourceOwner`, `aws:PrincipalOrgID`,
   `s3:DataAccessPointAccount`, or `s3:DataAccessPointArn`.
+- The Phase 3 IAM foundation now supplies AWS-pinned `aws:PrincipalArn` for
+  assumed roles and validated, account-bound configured IAM users, plus
+  assumed-role `aws:userid` and `aws:TokenIssueTime`. Other configured-user and
+  tag-derived IAM context remains deferred.
 - Those keys remain outside the current accepted/evaluable object-condition
   subset; they are future follow-up rather than partially accepted support
   today.
@@ -104,7 +108,7 @@ Explicitly still out of scope for this plan:
 
 Still useful follow-up inside the currently implemented bucket-policy surface:
 - add request-context plumbing and evaluator support for currently unsupported
-  keys such as `aws:PrincipalArn` and `aws:SourceVpc`
+  keys such as `aws:SourceVpc`
 - decide, with AWS-backed evidence, whether any future upload-time acceptance
   mismatch is worth taking on without matching request-time semantics
 
@@ -294,13 +298,11 @@ Deliver:
   - account-policy/IAM-side `CreateBucket` / `ListBuckets`
   - bucket-policy condition keys whose request context is still intentionally
     missing locally:
-    - `aws:PrincipalArn`
     - `aws:SourceVpc`
     - `aws:SourceVpce`
     - `aws:SourceArn`
     - `aws:SourceAccount`
     - `aws:SourceOwner`
-    - `aws:userid`
     - `aws:PrincipalOrgID`
     - `s3:DataAccessPointAccount`
     - `s3:DataAccessPointArn`

@@ -31,6 +31,7 @@ pub(super) enum ResolvedValue<'a> {
     EpochSeconds(u64),
     Absent,
     Unavailable,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,13 +43,14 @@ pub(super) enum PolicyVariableResolution {
 
 /// Which operator families a condition key supports.
 ///
-/// `AnyEvaluable` accepts every operator flagged with
+/// `AnyEvaluable` accepts the string and binary operators flagged with
 /// `evaluable_on_evaluable_object_actions` in the operator table.
 /// `StringEqualsOnly` narrows to the `StringEquals` / `StringEqualsIfExists`
 /// fast path used by `s3:ExistingObjectTag/*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OperatorSupport {
     AnyEvaluable,
+    ArnEqualsOnly,
     BoolOnly,
     DateOnly,
     IpOnly,
@@ -175,6 +177,22 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         operator_support: OperatorSupport::AnyEvaluable,
         input: None,
         resolve: resolve_userid,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:PrincipalArn"),
+        operator_support: OperatorSupport::ArnEqualsOnly,
+        input: None,
+        resolve: resolve_principal_arn,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:TokenIssueTime"),
+        operator_support: OperatorSupport::DateOnly,
+        input: None,
+        resolve: resolve_token_issue_time,
         evaluable_for_action: None,
         supported_for_action: None,
     },
@@ -515,7 +533,6 @@ const KNOWN_DEFERRED_EXACT_CONDITION_KEYS: &[&str] = &[
     "aws:MultiFactorAuthAge",
     "aws:MultiFactorAuthPresent",
     "aws:PrincipalAccount",
-    "aws:PrincipalArn",
     "aws:PrincipalIsAWSService",
     "aws:PrincipalOrgID",
     "aws:PrincipalOrgPaths",
@@ -533,7 +550,6 @@ const KNOWN_DEFERRED_EXACT_CONDITION_KEYS: &[&str] = &[
     "aws:SourceVpc",
     "aws:SourceVpcArn",
     "aws:SourceVpce",
-    "aws:TokenIssueTime",
     "aws:UserAgent",
     "aws:ViaAWSMCPService",
     "aws:ViaAWSService",
@@ -645,16 +661,38 @@ fn resolve_source_ip<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedV
 }
 
 fn resolve_userid<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    match request.requester_principal() {
-        Some(_) => ResolvedValue::Unavailable,
-        None => ResolvedValue::Present("anonymous"),
+    if request.requester_is_anonymous() {
+        ResolvedValue::Present("anonymous")
+    } else {
+        match request.aws_userid() {
+            Some(userid) => ResolvedValue::Present(userid),
+            None => ResolvedValue::Unavailable,
+        }
+    }
+}
+
+fn resolve_principal_arn<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    match request.aws_principal_arn() {
+        Some(principal_arn) => ResolvedValue::Present(principal_arn),
+        None if request.requester_is_anonymous() => ResolvedValue::Absent,
+        None => ResolvedValue::Unsupported,
+    }
+}
+
+fn resolve_token_issue_time<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    match request.token_issue_time_epoch_seconds() {
+        Some(epoch_seconds) => ResolvedValue::EpochSeconds(epoch_seconds),
+        None => ResolvedValue::Absent,
     }
 }
 
 fn resolve_principal_type<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
-    match request.requester_principal() {
-        None => ResolvedValue::Present("Anonymous"),
-        Some(_) => ResolvedValue::Unavailable,
+    if request.requester_is_anonymous() {
+        ResolvedValue::Present("Anonymous")
+    } else if request.aws_userid().is_some() {
+        ResolvedValue::Present("AssumedRole")
+    } else {
+        ResolvedValue::Unavailable
     }
 }
 
@@ -1094,6 +1132,7 @@ pub(super) fn evaluate_clause(
         ResolvedValue::EpochSeconds(epoch_seconds) => ActualValue::EpochSeconds(epoch_seconds),
         ResolvedValue::Absent => ActualValue::Absent,
         ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
+        ResolvedValue::Unsupported => return ConditionMatchResult::Unsupported,
     };
     (op.evaluate)(values, actual)
 }
@@ -1110,7 +1149,8 @@ fn evaluate_scalar_values(
         ConditionSetQualifier::ForAllValues => actuals.iter().all(actual_matches),
         ConditionSetQualifier::ForAnyValue => actuals.iter().any(actual_matches),
         ConditionSetQualifier::None => match op.kind {
-            condition_op::ConditionOpKind::BinaryEquals
+            condition_op::ConditionOpKind::ArnEquals
+            | condition_op::ConditionOpKind::BinaryEquals
             | condition_op::ConditionOpKind::StringEquals
             | condition_op::ConditionOpKind::StringEqualsIgnoreCase
             | condition_op::ConditionOpKind::StringLike => actuals.iter().any(actual_matches),
@@ -1162,7 +1202,9 @@ pub(super) fn resolve_policy_variable(
             PolicyVariableResolution::Unavailable
         }
         ResolvedValue::Absent => PolicyVariableResolution::Absent,
-        ResolvedValue::Unavailable => PolicyVariableResolution::Unavailable,
+        ResolvedValue::Unavailable | ResolvedValue::Unsupported => {
+            PolicyVariableResolution::Unavailable
+        }
     }
 }
 
@@ -1177,6 +1219,7 @@ fn operator_supported_for_key(operator: &str, support: OperatorSupport) -> bool 
                 && (condition_op::is_string_condition_kind(op.kind)
                     || condition_op::is_binary_condition_kind(op.kind))
         }),
+        OperatorSupport::ArnEqualsOnly => operator == "ArnEquals",
         OperatorSupport::StringOrNumeric => condition_op::lookup(operator).is_some_and(|op| {
             op.evaluable_on_evaluable_object_actions
                 && (condition_op::is_string_condition_kind(op.kind)
@@ -1356,6 +1399,19 @@ mod tests {
         assert_eq!(param, "");
         assert_eq!(epoch_time.operator_support, OperatorSupport::NumericOnly);
         assert_eq!(epoch_time.input, Some(ConditionInput::CurrentTime));
+
+        let (token_issue_time, param) = lookup("aws:TokenIssueTime").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(token_issue_time.operator_support, OperatorSupport::DateOnly);
+        assert_eq!(token_issue_time.input, None);
+
+        let (principal_arn, param) = lookup("aws:PrincipalArn").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(
+            principal_arn.operator_support,
+            OperatorSupport::ArnEqualsOnly
+        );
+        assert_eq!(principal_arn.input, None);
     }
 
     #[test]
@@ -1464,6 +1520,46 @@ mod tests {
             &date_clause,
             PolicyAction::GetObject
         ));
+
+        let token_issue_time_clause = PolicyConditionClause {
+            operator: "DateGreaterThan".to_string(),
+            key: "aws:TokenIssueTime".to_string(),
+            values: vec!["2024-01-01T00:00:00Z".to_string()],
+        };
+        assert!(supports_clause_for_action(
+            &token_issue_time_clause,
+            PolicyAction::GetObject
+        ));
+
+        let principal_arn_clause = PolicyConditionClause {
+            operator: "ArnEquals".to_string(),
+            key: "aws:PrincipalArn".to_string(),
+            values: vec!["arn:aws:iam::123456789012:role/test".to_string()],
+        };
+        assert!(supports_clause_for_action(
+            &principal_arn_clause,
+            PolicyAction::GetObject
+        ));
+        let unpinned_principal_arn_clause = PolicyConditionClause {
+            operator: "StringEquals".to_string(),
+            ..principal_arn_clause
+        };
+        assert!(!supports_clause_for_action(
+            &unpinned_principal_arn_clause,
+            PolicyAction::GetObject
+        ));
+
+        for (key, action) in [
+            ("s3:ExistingObjectTag/test", PolicyAction::GetObject),
+            ("s3:max-keys", PolicyAction::ListBucket),
+        ] {
+            let clause = PolicyConditionClause {
+                operator: "ArnEquals".to_string(),
+                key: key.to_string(),
+                values: vec!["value".to_string()],
+            };
+            assert!(!supports_clause_for_action(&clause, action));
+        }
 
         let string_clause = PolicyConditionClause {
             operator: "StringEquals".to_string(),

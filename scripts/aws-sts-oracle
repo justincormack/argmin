@@ -12,8 +12,8 @@ Usage: ./scripts/aws-sts-oracle [options]
 
 Run the AWS STS Query protocol oracle using the primary credentials from
 `.env`. The default probes are read-only. `--assume-role` creates and removes a
-set of temporary path-bearing roles and one prefixed S3 bucket using the primary
-test user.
+set of temporary path-bearing roles, one path-bearing IAM user, and one prefixed
+S3 bucket using the primary test user.
 
 Options:
   --assume-role     Include the self-cleaning same-account role probes
@@ -210,6 +210,14 @@ aws_source_identity_session() {
         "$STS_TEST_SOURCE_IDENTITY_ACCESS_KEY" \
         "$STS_TEST_SOURCE_IDENTITY_SECRET_KEY" \
         "$STS_TEST_SOURCE_IDENTITY_SESSION_TOKEN" \
+        "$@"
+}
+
+aws_iam_user_context() {
+    aws_with_optional_session_credentials \
+        "$STS_TEST_IAM_USER_CONTEXT_ACCESS_KEY" \
+        "$STS_TEST_IAM_USER_CONTEXT_SECRET_KEY" \
+        "" \
         "$@"
 }
 
@@ -530,6 +538,46 @@ wait_for_session_context_bucket_policy_success() {
     echo "session-context-bucket-policy-success: ok"
 }
 
+wait_for_iam_user_context_bucket_policy_success() {
+    local attempt consecutive_results=0 empty_body error_file ready=false
+
+    empty_body="$tmpdir/iam-user-context-empty-body"
+    error_file="$tmpdir/iam-user-context-bucket-policy-convergence.err"
+    : >"$empty_body"
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if aws_iam_user_context s3api put-object \
+            --bucket "$STS_TEST_POST_BUCKET" \
+            --key context-iam-user-principal-arn-allow \
+            --body "$empty_body" >/dev/null 2>"$error_file" && \
+            aws_iam_user_context s3api put-object \
+                --bucket "$STS_TEST_POST_BUCKET" \
+                --key context-iam-user-principal-arn-deny-mismatch \
+                --body "$empty_body" >/dev/null 2>"$error_file" && \
+            ! aws_iam_user_context s3api put-object \
+                --bucket "$STS_TEST_POST_BUCKET" \
+                --key context-iam-user-principal-arn-deny \
+                --body "$empty_body" >/dev/null 2>"$error_file" && \
+            grep -Fq \
+                'An error occurred (AccessDenied) when calling the PutObject operation:' \
+                "$error_file"; then
+            ((consecutive_results += 1))
+            if ((consecutive_results == 3)); then
+                ready=true
+                break
+            fi
+        else
+            consecutive_results=0
+        fi
+        sleep 2
+    done
+    if [[ "$ready" != true ]]; then
+        cat "$error_file" >&2
+        external_s3_test_die \
+            "IAM-user-context bucket policy did not converge to the expected results"
+    fi
+    echo "iam-user-context-bucket-policy-success: ok"
+}
+
 wait_for_list_tags_for_resource_success() {
     local label="$1"
     local account_id="$2"
@@ -605,6 +653,8 @@ declare -a created_multipart_keys=()
 declare -a created_multipart_upload_ids=()
 created_disabled_access_key=""
 created_disabled_user=""
+created_iam_user_context_access_key=""
+created_iam_user_context_user=""
 created_bucket=""
 tmpdir=""
 
@@ -613,6 +663,22 @@ cleanup_assume_role_fixture() {
     trap - EXIT
 
     local inline_policies_file policy_name role_name
+    if [[ -n "$created_iam_user_context_access_key" && -n "$created_iam_user_context_user" ]]; then
+        if ! aws_primary iam delete-access-key \
+            --user-name "$created_iam_user_context_user" \
+            --access-key-id "$created_iam_user_context_access_key"; then
+            echo "error: failed to delete temporary IAM-user-context access key from $created_iam_user_context_user" >&2
+            ((status != 0)) || status=1
+        fi
+        created_iam_user_context_access_key=""
+    fi
+    if [[ -n "$created_iam_user_context_user" ]]; then
+        if ! aws_primary iam delete-user --user-name "$created_iam_user_context_user"; then
+            echo "error: failed to delete temporary IAM-user-context user $created_iam_user_context_user" >&2
+            ((status != 0)) || status=1
+        fi
+        created_iam_user_context_user=""
+    fi
     if [[ -n "$created_disabled_access_key" && -n "$created_disabled_user" ]]; then
         if ! aws_primary iam delete-access-key \
             --user-name "$created_disabled_user" \
@@ -1068,6 +1134,7 @@ create_assume_role_fixture() {
     local expiry_liveness_access_key expiry_liveness_secret_key expiry_liveness_session_token
     local other_live_access_key other_live_identity other_live_secret_key other_live_session other_live_session_token
     local recreated_expiration recreated_expiration_epoch recreated_issue_epoch
+    local iam_user_context_access_key_fixture iam_user_context_expected_arn iam_user_context_user_fixture
     local old_assumed_role_id primary_identity primary_account primary_arn recreated_role_identity recreated_role_session recreated_role_stable_id role_suffix source_identity_session streaming_bucket_policy trust_chain_source trust_chain_source_with_set trust_default_max trust_external_id trust_policy trust_recreated_role_revoked trust_source_identity trust_source_identity_condition trust_source_identity_target trust_wildcard
     primary_identity="$(aws_primary sts get-caller-identity --output json)"
     primary_account="$(jq -er '.Account' <<<"$primary_identity")"
@@ -1083,6 +1150,30 @@ create_assume_role_fixture() {
     role_suffix="${tmpdir##*/}"
     role_suffix="${role_suffix#tmp.}"
     role_suffix="${role_suffix,,}"
+    export STS_TEST_IAM_USER_CONTEXT_USER_NAME="iam-user-context-${role_suffix}"
+    iam_user_context_expected_arn="arn:aws:iam::${primary_account}:user/argmin-sts-oracle/${STS_TEST_IAM_USER_CONTEXT_USER_NAME}"
+    iam_user_context_user_fixture="$tmpdir/iam-user-context-user.json"
+    aws_primary iam create-user \
+        --user-name "$STS_TEST_IAM_USER_CONTEXT_USER_NAME" \
+        --path /argmin-sts-oracle/ \
+        --output json >"$iam_user_context_user_fixture"
+    created_iam_user_context_user="$STS_TEST_IAM_USER_CONTEXT_USER_NAME"
+    export STS_TEST_IAM_USER_CONTEXT_ARN
+    STS_TEST_IAM_USER_CONTEXT_ARN="$(jq -er '.User.Arn' "$iam_user_context_user_fixture")"
+    [[ "$STS_TEST_IAM_USER_CONTEXT_ARN" == "$iam_user_context_expected_arn" ]] || \
+        external_s3_test_die "temporary IAM-user-context user has an unexpected ARN"
+    iam_user_context_access_key_fixture="$tmpdir/iam-user-context-access-key.json"
+    aws_primary iam create-access-key \
+        --user-name "$STS_TEST_IAM_USER_CONTEXT_USER_NAME" \
+        --output json >"$iam_user_context_access_key_fixture"
+    export STS_TEST_IAM_USER_CONTEXT_ACCESS_KEY STS_TEST_IAM_USER_CONTEXT_SECRET_KEY
+    STS_TEST_IAM_USER_CONTEXT_ACCESS_KEY="$(jq -er '.AccessKey.AccessKeyId' "$iam_user_context_access_key_fixture")"
+    STS_TEST_IAM_USER_CONTEXT_SECRET_KEY="$(jq -er '.AccessKey.SecretAccessKey' "$iam_user_context_access_key_fixture")"
+    created_iam_user_context_access_key="$STS_TEST_IAM_USER_CONTEXT_ACCESS_KEY"
+    [[ "$(jq -er '.AccessKey.Status' "$iam_user_context_access_key_fixture")" == Active ]] || \
+        external_s3_test_die "temporary IAM-user-context access key was not created active"
+    echo "iam-user-context-user-fixture: ok"
+
     export STS_TEST_POST_BUCKET="claude-s3-sts-oracle-${role_suffix}"
     local -a create_bucket_args=(
         s3api create-bucket
@@ -1641,6 +1732,7 @@ create_assume_role_fixture() {
         --arg upper_bound "$STS_TEST_TOKEN_ISSUE_UPPER_BOUND" \
         --arg bucket_arn "arn:aws:s3:::${STS_TEST_POST_BUCKET}" \
         --arg primary_principal "$primary_arn" \
+        --arg iam_user_principal "$STS_TEST_IAM_USER_CONTEXT_ARN" \
         '{
             Version: "2012-10-17",
             Statement: [
@@ -1650,6 +1742,40 @@ create_assume_role_fixture() {
                     Principal: {AWS: $primary_principal},
                     Action: "s3:GetBucketTagging",
                     Resource: $bucket_arn
+                },
+                {
+                    Sid: "AllowMatchingIamUserPrincipalArn",
+                    Effect: "Allow",
+                    Principal: {AWS: $iam_user_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-iam-user-principal-arn-allow"),
+                    Condition: {ArnEquals: {"aws:PrincipalArn": $iam_user_principal}}
+                },
+                {
+                    Sid: "AllowIamUserPrincipalArnDenyControls",
+                    Effect: "Allow",
+                    Principal: {AWS: $iam_user_principal},
+                    Action: "s3:PutObject",
+                    Resource: [
+                        ($bucket_arn + "/context-iam-user-principal-arn-deny"),
+                        ($bucket_arn + "/context-iam-user-principal-arn-deny-mismatch")
+                    ]
+                },
+                {
+                    Sid: "DenyMatchingIamUserPrincipalArn",
+                    Effect: "Deny",
+                    Principal: {AWS: $iam_user_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-iam-user-principal-arn-deny"),
+                    Condition: {ArnEquals: {"aws:PrincipalArn": $iam_user_principal}}
+                },
+                {
+                    Sid: "IgnoreMismatchedIamUserPrincipalArnDeny",
+                    Effect: "Deny",
+                    Principal: {AWS: $iam_user_principal},
+                    Action: "s3:PutObject",
+                    Resource: ($bucket_arn + "/context-iam-user-principal-arn-deny-mismatch"),
+                    Condition: {ArnEquals: {"aws:PrincipalArn": $primary_principal}}
                 },
                 {
                     Sid: "AllowRecreatedRoleStreamingOracle",
@@ -1774,6 +1900,7 @@ create_assume_role_fixture() {
     wait_for_streaming_bucket_policy_success
     wait_for_streaming_head_absence_success
     wait_for_session_context_bucket_policy_success
+    wait_for_iam_user_context_bucket_policy_success
 
     export STS_TEST_PRESIGNED_STREAMING_STATIC_MULTIPART_KEY="streaming-presigned-static-multipart"
     export STS_TEST_PRESIGNED_STREAMING_STATIC_UPLOAD_ID

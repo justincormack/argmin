@@ -59,6 +59,7 @@ string_identity!(IamPath);
 string_identity!(RoleSessionName);
 string_identity!(SourceIdentity);
 string_identity!(IamRoleArn);
+string_identity!(IamUserArn);
 string_identity!(AssumedRoleSessionArn);
 string_identity!(AssumedRoleId);
 
@@ -118,6 +119,77 @@ impl IamPath {
             return Err(IdentityError::InvalidIamPath);
         }
         Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IamPrincipalArnKind {
+    Root,
+    User,
+    Role,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedIamPrincipalArn {
+    account_id: AwsAccountId,
+    kind: IamPrincipalArnKind,
+}
+
+impl ParsedIamPrincipalArn {
+    pub(crate) fn account_id(&self) -> &AwsAccountId {
+        &self.account_id
+    }
+
+    pub(crate) const fn kind(&self) -> IamPrincipalArnKind {
+        self.kind
+    }
+}
+
+pub(crate) fn parse_iam_principal_arn(value: &str) -> Option<ParsedIamPrincipalArn> {
+    let (account_id, qualifier) = value.strip_prefix("arn:aws:iam::")?.split_once(':')?;
+    let account_id = AwsAccountId::new(account_id.to_string()).ok()?;
+    let kind = if qualifier == "root" {
+        IamPrincipalArnKind::Root
+    } else if qualifier
+        .strip_prefix("user/")
+        .is_some_and(valid_iam_principal_name_and_path)
+    {
+        IamPrincipalArnKind::User
+    } else if qualifier
+        .strip_prefix("role/")
+        .is_some_and(valid_iam_principal_name_and_path)
+    {
+        IamPrincipalArnKind::Role
+    } else {
+        return None;
+    };
+    Some(ParsedIamPrincipalArn { account_id, kind })
+}
+
+fn valid_iam_principal_name_and_path(value: &str) -> bool {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.bytes().any(|byte| matches!(byte, b'*' | b'?'))
+    {
+        return false;
+    }
+    let (path, name) = value.rsplit_once('/').unwrap_or(("", value));
+    if RoleName::new(name).is_err() {
+        return false;
+    }
+    path.is_empty() || IamPath::new(format!("/{path}/")).is_ok()
+}
+
+impl IamUserArn {
+    fn from_configured_principal(value: &str, expected_account_id: Option<&str>) -> Option<Self> {
+        let parsed = parse_iam_principal_arn(value)?;
+        if parsed.kind() != IamPrincipalArnKind::User
+            || expected_account_id != Some(parsed.account_id().as_str())
+        {
+            return None;
+        }
+        Some(Self(value.to_string()))
     }
 }
 
@@ -370,7 +442,10 @@ impl std::fmt::Debug for ConfiguredPrincipalIdentity {
 /// Typed authenticated request-principal kind.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PrincipalIdentity {
-    Configured(ConfiguredPrincipalIdentity),
+    Configured {
+        principal: ConfiguredPrincipalIdentity,
+        iam_user_arn: Option<IamUserArn>,
+    },
     AssumedRoleSession(Arc<AssumedRoleSessionIdentity>),
 }
 
@@ -387,9 +462,14 @@ pub struct AuthenticatedIdentity {
 impl AuthenticatedIdentity {
     #[must_use]
     pub fn configured(account: AccountIdentity, principal: ConfiguredPrincipalIdentity) -> Self {
+        let iam_user_arn =
+            IamUserArn::from_configured_principal(principal.principal(), account.account_id());
         Self {
             account,
-            principal: PrincipalIdentity::Configured(principal),
+            principal: PrincipalIdentity::Configured {
+                principal,
+                iam_user_arn,
+            },
         }
     }
 
@@ -427,7 +507,16 @@ impl AuthenticatedIdentity {
     #[must_use]
     pub fn configured_principal(&self) -> Option<&ConfiguredPrincipalIdentity> {
         match &self.principal {
-            PrincipalIdentity::Configured(principal) => Some(principal),
+            PrincipalIdentity::Configured { principal, .. } => Some(principal),
+            PrincipalIdentity::AssumedRoleSession(_) => None,
+        }
+    }
+
+    /// Validated, account-bound IAM user ARN for a configured principal.
+    #[must_use]
+    pub fn configured_iam_user_arn(&self) -> Option<&IamUserArn> {
+        match &self.principal {
+            PrincipalIdentity::Configured { iam_user_arn, .. } => iam_user_arn.as_ref(),
             PrincipalIdentity::AssumedRoleSession(_) => None,
         }
     }
@@ -439,7 +528,7 @@ impl AuthenticatedIdentity {
     #[must_use]
     pub fn role_principal_arn(&self) -> Option<&IamRoleArn> {
         match &self.principal {
-            PrincipalIdentity::Configured(_) => None,
+            PrincipalIdentity::Configured { .. } => None,
             PrincipalIdentity::AssumedRoleSession(session) => Some(session.role().arn()),
         }
     }
@@ -448,7 +537,7 @@ impl AuthenticatedIdentity {
     #[must_use]
     pub fn session_principal_arn(&self) -> Option<&AssumedRoleSessionArn> {
         match &self.principal {
-            PrincipalIdentity::Configured(_) => None,
+            PrincipalIdentity::Configured { .. } => None,
             PrincipalIdentity::AssumedRoleSession(session) => Some(session.session_arn()),
         }
     }
@@ -459,7 +548,7 @@ impl AuthenticatedIdentity {
     #[must_use]
     pub fn aws_userid(&self) -> Option<&AssumedRoleId> {
         match &self.principal {
-            PrincipalIdentity::Configured(_) => None,
+            PrincipalIdentity::Configured { .. } => None,
             PrincipalIdentity::AssumedRoleSession(session) => Some(session.assumed_role_id()),
         }
     }
@@ -467,7 +556,7 @@ impl AuthenticatedIdentity {
     #[must_use]
     pub fn role_session(&self) -> Option<&AssumedRoleSessionIdentity> {
         match &self.principal {
-            PrincipalIdentity::Configured(_) => None,
+            PrincipalIdentity::Configured { .. } => None,
             PrincipalIdentity::AssumedRoleSession(session) => Some(session),
         }
     }
@@ -690,9 +779,39 @@ mod tests {
             identity.configured_principal().unwrap().principal(),
             "arn:aws:iam::123456789012:user/test"
         );
+        assert_eq!(
+            identity.configured_iam_user_arn().unwrap().as_str(),
+            "arn:aws:iam::123456789012:user/test"
+        );
         assert!(identity.role_principal_arn().is_none());
         assert_eq!(identity.account().principal(), "123456789012");
         assert!(identity.session_principal_arn().is_none());
         assert!(identity.aws_userid().is_none());
+    }
+
+    #[test]
+    fn configured_iam_user_arn_is_validated_and_bound_to_the_account() {
+        let valid_path = AuthenticatedIdentity::configured(
+            account("123456789012"),
+            ConfiguredPrincipalIdentity::new("arn:aws:iam::123456789012:user/team//nested/test"),
+        );
+        assert_eq!(
+            valid_path.configured_iam_user_arn().unwrap().as_str(),
+            "arn:aws:iam::123456789012:user/team//nested/test"
+        );
+
+        for principal in [
+            "configured",
+            "arn:aws:iam::210987654321:user/test",
+            "arn:aws:iam::123456789012:role/test",
+            "arn:aws:iam::123456789012:user/team/*",
+            "arn:aws:iam::123456789012:user/",
+        ] {
+            let identity = AuthenticatedIdentity::configured(
+                account("123456789012"),
+                ConfiguredPrincipalIdentity::new(principal),
+            );
+            assert!(identity.configured_iam_user_arn().is_none(), "{principal}");
+        }
     }
 }
