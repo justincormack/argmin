@@ -5,10 +5,11 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use storage::control_plane::MAX_HEARTBEAT_LEASE_MS;
+use storage::control_plane::{InitialClusterTopologyCertificate, MAX_HEARTBEAT_LEASE_MS};
 use storage::control_plane_raft::ControlPlaneRaftPeerTransportLimits;
 use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS;
 use storage::LocalUnixStorageNodeClientConfig;
+use storage::{NodeId, PgId};
 
 const LOCAL_DEBUG_ENDPOINT_COMPILED_IN: bool = cfg!(any(test, feature = "local-debug-endpoints"));
 const MAX_LOCAL_NODE_COUNT: u32 = 4_096;
@@ -256,6 +257,12 @@ pub(crate) struct ConfiguredStaticClusterIdentity {
     pub(crate) process_identity_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredStaticInitialClusterMap {
+    pub(crate) topology: InitialClusterTopologyCertificate,
+    pub(crate) pg_acting_sets: Vec<(PgId, Vec<NodeId>)>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SecretConfigValue(String);
 
@@ -318,6 +325,7 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_id: Option<u32>,
     pub(crate) storage_node_data_dir: Option<String>,
     pub(crate) static_cluster_identity: Option<ConfiguredStaticClusterIdentity>,
+    pub(crate) static_initial_cluster_map: Option<ConfiguredStaticInitialClusterMap>,
     pub(crate) storage_node_socket_path: Option<String>,
     pub(crate) storage_node_sockets: Vec<ConfiguredStorageNodeSocket>,
     pub(crate) storage_node_rpc_admission_limit: usize,
@@ -993,6 +1001,7 @@ impl ServerConfig {
             storage_node_id,
             storage_node_data_dir,
             static_cluster_identity: None,
+            static_initial_cluster_map: None,
             storage_node_socket_path,
             storage_node_sockets,
             storage_node_rpc_admission_limit,

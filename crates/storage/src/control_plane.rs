@@ -59,7 +59,11 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 23;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 25;
+pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
+pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
+const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
+    b"argmin-control-plane-initial-bootstrap-map-v1";
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -1234,9 +1238,118 @@ impl NodeControlRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialClusterTopologyCertificate {
+    topology_generation: u64,
+    topology_digest: [u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+    bootstrap_map_digest: [u8; CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN],
+    raft_voters: Vec<u64>,
+}
+
+impl InitialClusterTopologyCertificate {
+    pub fn new(
+        topology_generation: u64,
+        topology_digest: [u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+        bootstrap_map_digest: [u8; CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN],
+        raft_voters: Vec<u64>,
+    ) -> Result<Self, ControlPlaneError> {
+        let certificate = Self {
+            topology_generation,
+            topology_digest,
+            bootstrap_map_digest,
+            raft_voters,
+        };
+        certificate
+            .validate()
+            .map_err(|message| ControlPlaneError::InvalidInitialTopology { message })?;
+        Ok(certificate)
+    }
+
+    pub fn new_for_bootstrap_map(
+        topology_generation: u64,
+        topology_digest: [u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+        raft_voters: Vec<u64>,
+        nodes: &[(NodeId, String)],
+        pg_acting_sets: &[(PgId, Vec<NodeId>)],
+    ) -> Result<Self, ControlPlaneError> {
+        Self::new(
+            topology_generation,
+            topology_digest,
+            initial_cluster_bootstrap_map_digest(nodes, pg_acting_sets),
+            raft_voters,
+        )
+    }
+
+    #[must_use]
+    pub fn topology_generation(&self) -> u64 {
+        self.topology_generation
+    }
+
+    #[must_use]
+    pub fn topology_digest(&self) -> &[u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN] {
+        &self.topology_digest
+    }
+
+    #[must_use]
+    pub fn bootstrap_map_digest(&self) -> &[u8; CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN] {
+        &self.bootstrap_map_digest
+    }
+
+    #[must_use]
+    pub fn raft_voters(&self) -> &[u64] {
+        &self.raft_voters
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.topology_generation == 0 {
+            return Err("initial topology generation must be nonzero".to_string());
+        }
+        if self.raft_voters.is_empty() {
+            return Err("initial topology must contain at least one Raft voter".to_string());
+        }
+        if self.raft_voters.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("initial topology Raft voters must be strictly increasing".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[must_use]
+pub fn initial_cluster_bootstrap_map_digest(
+    nodes: &[(NodeId, String)],
+    pg_acting_sets: &[(PgId, Vec<NodeId>)],
+) -> [u8; CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN] {
+    let mut canonical_nodes = nodes.iter().collect::<Vec<_>>();
+    canonical_nodes.sort_by_key(|(node_id, _)| *node_id);
+    let mut canonical_pgs = pg_acting_sets.iter().collect::<Vec<_>>();
+    canonical_pgs.sort_by_key(|(pg_id, _)| *pg_id);
+
+    let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
+    digest_bytes(&mut hasher, CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN);
+    digest_len(&mut hasher, canonical_nodes.len());
+    for (node_id, endpoint) in canonical_nodes {
+        digest_u32(&mut hasher, node_id.as_u32());
+        digest_bytes(&mut hasher, endpoint.as_bytes());
+    }
+    digest_len(&mut hasher, canonical_pgs.len());
+    for (pg_id, acting_set) in canonical_pgs {
+        digest_u32(&mut hasher, pg_id.get());
+        digest_len(&mut hasher, acting_set.len());
+        for node_id in acting_set {
+            digest_u32(&mut hasher, node_id.as_u32());
+        }
+    }
+    hasher
+        .finalize()
+        .bytes()
+        .try_into()
+        .expect("SHA-256 bootstrap-map digest must contain 32 bytes")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterControlSnapshot {
     authority_incarnation: AuthorityIncarnation,
     cluster_epoch: ClusterEpoch,
+    initial_topology: Option<InitialClusterTopologyCertificate>,
     max_committed_timestamp_ms: Option<u64>,
     lease_grant_horizon: Option<CommittedLeaseGrantHorizon>,
     nodes: BTreeMap<NodeId, NodeControlRecord>,
@@ -1249,6 +1362,7 @@ impl ClusterControlSnapshot {
         Self {
             authority_incarnation: AuthorityIncarnation::INITIAL,
             cluster_epoch: ClusterEpoch::INITIAL,
+            initial_topology: None,
             max_committed_timestamp_ms: None,
             lease_grant_horizon: None,
             nodes: BTreeMap::new(),
@@ -1301,6 +1415,11 @@ impl ClusterControlSnapshot {
     #[must_use]
     pub fn cluster_epoch(&self) -> ClusterEpoch {
         self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn initial_topology(&self) -> Option<&InitialClusterTopologyCertificate> {
+        self.initial_topology.as_ref()
     }
 
     #[must_use]
@@ -2431,6 +2550,14 @@ impl ClusterControlSnapshot {
     }
 
     fn validate_current_state_invariants(&self) -> Result<(), String> {
+        if let Some(certificate) = &self.initial_topology {
+            certificate.validate()?;
+            if self.nodes.is_empty() || self.pgs.is_empty() {
+                return Err(
+                    "certified initial topology requires nonempty node and PG state".to_string(),
+                );
+            }
+        }
         self.validate_lease_grant_horizon_invariant()?;
         for pg in self.pgs.values() {
             if pg.acting_set.is_empty() {
@@ -2975,57 +3102,21 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
     ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
         let applied = (|| match command {
             ControlPlaneCommand::BootstrapInitialClusterMap { nodes, pg_ids } => {
-                if self.nodes().next().is_some() || self.pgs().next().is_some() {
-                    return Err(ControlPlaneError::BootstrapRequiresEmptyState);
-                }
-                if nodes.is_empty() {
-                    return Err(ControlPlaneError::EmptyActingSet { pg_id: 0 });
-                }
-
-                let mut unique_nodes = BTreeSet::new();
-                let mut node_ids = Vec::with_capacity(nodes.len());
-                for (node_id, endpoint) in &nodes {
-                    if !unique_nodes.insert(*node_id) {
-                        return Err(ControlPlaneError::DuplicateActingSetNode {
-                            pg_id: 0,
-                            node_id: node_id.as_u32(),
-                        });
-                    }
-                    if endpoint.is_empty() {
-                        return Err(ControlPlaneError::NodeEndpointMissing {
-                            node_id: node_id.as_u32(),
-                            cluster_epoch: self.cluster_epoch(),
-                        });
-                    }
-                    node_ids.push(*node_id);
-                }
-
-                let mut unique_pgs = BTreeSet::new();
-                for pg_id in &pg_ids {
-                    if !unique_pgs.insert(*pg_id) {
-                        return Err(ControlPlaneError::DuplicateBootstrapPg { pg_id: pg_id.get() });
-                    }
-                }
-
-                let mut next_snapshot = self.clone();
-                for (node_id, endpoint) in nodes {
-                    let mut record = NodeControlRecord::new(node_id, NodeMembershipState::Active);
-                    record.endpoint = endpoint;
-                    next_snapshot.nodes.insert(node_id, record);
-                }
-                for pg_id in pg_ids {
-                    next_snapshot
-                        .pgs
-                        .insert(pg_id, PgControlRecord::new(pg_id, node_ids.clone()));
-                }
-                next_snapshot.bump_epoch()?;
-                Ok(applied_control_plane_command(
-                    self,
-                    next_snapshot,
-                    ControlPlaneCommandResponse::BootstrapInitialClusterMap,
-                    true,
-                ))
+                let node_ids = nodes
+                    .iter()
+                    .map(|(node_id, _)| *node_id)
+                    .collect::<Vec<_>>();
+                let pg_acting_sets = pg_ids
+                    .into_iter()
+                    .map(|pg_id| (pg_id, node_ids.clone()))
+                    .collect();
+                apply_bootstrap_initial_cluster_map(self, nodes, pg_acting_sets, None)
             }
+            ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes,
+                pg_acting_sets,
+                topology,
+            } => apply_bootstrap_initial_cluster_map(self, nodes, pg_acting_sets, Some(topology)),
             ControlPlaneCommand::SetNodeMembership {
                 node_id,
                 membership,
@@ -4354,6 +4445,91 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
         )?;
         Ok(applied)
     }
+}
+
+fn apply_bootstrap_initial_cluster_map(
+    snapshot: &ClusterControlSnapshot,
+    nodes: Vec<(NodeId, String)>,
+    pg_acting_sets: Vec<(PgId, Vec<NodeId>)>,
+    initial_topology: Option<InitialClusterTopologyCertificate>,
+) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+    if snapshot.nodes().next().is_some() || snapshot.pgs().next().is_some() {
+        return Err(ControlPlaneError::BootstrapRequiresEmptyState);
+    }
+    if nodes.is_empty() {
+        return Err(ControlPlaneError::EmptyActingSet { pg_id: 0 });
+    }
+
+    let mut unique_nodes = BTreeSet::new();
+    for (node_id, endpoint) in &nodes {
+        if !unique_nodes.insert(*node_id) {
+            return Err(ControlPlaneError::DuplicateActingSetNode {
+                pg_id: 0,
+                node_id: node_id.as_u32(),
+            });
+        }
+        if endpoint.is_empty() {
+            return Err(ControlPlaneError::NodeEndpointMissing {
+                node_id: node_id.as_u32(),
+                cluster_epoch: snapshot.cluster_epoch(),
+            });
+        }
+    }
+
+    let mut unique_pgs = BTreeSet::new();
+    for (pg_id, acting_set) in &pg_acting_sets {
+        if !unique_pgs.insert(*pg_id) {
+            return Err(ControlPlaneError::DuplicateBootstrapPg { pg_id: pg_id.get() });
+        }
+        if acting_set.is_empty() {
+            return Err(ControlPlaneError::EmptyActingSet { pg_id: pg_id.get() });
+        }
+        let mut unique_acting_set = BTreeSet::new();
+        for node_id in acting_set {
+            if !unique_nodes.contains(node_id) {
+                return Err(ControlPlaneError::UnknownActingSetNode {
+                    pg_id: pg_id.get(),
+                    node_id: node_id.as_u32(),
+                });
+            }
+            if !unique_acting_set.insert(*node_id) {
+                return Err(ControlPlaneError::DuplicateActingSetNode {
+                    pg_id: pg_id.get(),
+                    node_id: node_id.as_u32(),
+                });
+            }
+        }
+    }
+
+    if let Some(certificate) = &initial_topology {
+        let actual_digest = initial_cluster_bootstrap_map_digest(&nodes, &pg_acting_sets);
+        if certificate.bootstrap_map_digest() != &actual_digest {
+            return Err(ControlPlaneError::InvalidInitialTopology {
+                message: "certified initial topology bootstrap-map digest does not match storage-node endpoints and PG acting sets"
+                    .to_string(),
+            });
+        }
+    }
+
+    let mut next_snapshot = snapshot.clone();
+    next_snapshot.initial_topology = initial_topology;
+    for (node_id, endpoint) in nodes {
+        let mut record = NodeControlRecord::new(node_id, NodeMembershipState::Active);
+        record.endpoint = endpoint;
+        next_snapshot.nodes.insert(node_id, record);
+    }
+    for (pg_id, acting_set) in pg_acting_sets {
+        next_snapshot
+            .pgs
+            .insert(pg_id, PgControlRecord::new(pg_id, acting_set));
+    }
+    next_snapshot.bump_epoch()?;
+    Ok(applied_control_plane_command(
+        snapshot,
+        next_snapshot,
+        ControlPlaneCommandResponse::BootstrapInitialClusterMap,
+        true,
+    ))
 }
 
 fn applied_control_plane_command(
@@ -17023,6 +17199,9 @@ pub enum ControlPlaneError {
     #[error("control-plane bootstrap requires empty state")]
     BootstrapRequiresEmptyState,
 
+    #[error("invalid initial cluster topology: {message}")]
+    InvalidInitialTopology { message: String },
+
     #[error("node {node_id} heartbeat repeats PG {pg_id} observation")]
     DuplicatePgObservation { node_id: u32, pg_id: u32 },
 
@@ -17552,6 +17731,10 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     ));
     out.push_str(&format!("cluster_epoch={}\n", snapshot.cluster_epoch.get()));
     out.push_str(&format!(
+        "initial_topology={}\n",
+        format_initial_topology(snapshot.initial_topology.as_ref())
+    ));
+    out.push_str(&format!(
         "max_committed_timestamp_ms={}\n",
         option_u64(snapshot.max_committed_timestamp_ms)
     ));
@@ -17880,6 +18063,8 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     let mut version = None;
     let mut authority_incarnation = None;
     let mut cluster_epoch = None;
+    let mut initial_topology = None;
+    let mut initial_topology_seen = false;
     let mut max_committed_timestamp_ms = None;
     let mut max_committed_timestamp_seen = false;
     let mut lease_grant_horizon = None;
@@ -17916,6 +18101,12 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                 ClusterEpoch::new(parse_u64(line_number, value, "cluster_epoch")?)
                     .ok_or_else(|| parse_error(line_number, "cluster epoch must be nonzero"))?,
             );
+        } else if let Some(value) = line.strip_prefix("initial_topology=") {
+            if initial_topology_seen {
+                return Err(parse_error(line_number, "duplicate initial topology"));
+            }
+            initial_topology_seen = true;
+            initial_topology = parse_initial_topology(line_number, value)?;
         } else if let Some(value) = line.strip_prefix("max_committed_timestamp_ms=") {
             if max_committed_timestamp_seen {
                 return Err(parse_error(
@@ -18060,6 +18251,9 @@ pub(crate) fn parse_snapshot_without_publication_validation(
     if !max_committed_timestamp_seen {
         return Err(parse_error(0, "missing max committed timestamp"));
     }
+    if !initial_topology_seen {
+        return Err(parse_error(0, "missing initial topology"));
+    }
     if !lease_grant_horizon_seen {
         return Err(parse_error(0, "missing lease grant horizon"));
     }
@@ -18088,6 +18282,7 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         authority_incarnation: authority_incarnation
             .ok_or_else(|| parse_error(0, "missing authority incarnation"))?,
         cluster_epoch,
+        initial_topology,
         nodes,
         pgs,
         max_committed_timestamp_ms,
@@ -18101,6 +18296,64 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         ));
     }
     Ok(snapshot)
+}
+
+fn format_initial_topology(certificate: Option<&InitialClusterTopologyCertificate>) -> String {
+    let Some(certificate) = certificate else {
+        return "-".to_string();
+    };
+    let voters = certificate
+        .raft_voters()
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(":");
+    format!(
+        "{},{},{},{}",
+        certificate.topology_generation(),
+        hex_encode(certificate.topology_digest()),
+        hex_encode(certificate.bootstrap_map_digest()),
+        voters
+    )
+}
+
+fn parse_initial_topology(
+    line: usize,
+    value: &str,
+) -> Result<Option<InitialClusterTopologyCertificate>, ControlPlaneError> {
+    if value == "-" {
+        return Ok(None);
+    }
+    let fields = value.split(',').collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return Err(parse_error(line, "invalid initial topology field count"));
+    }
+    let topology_digest: [u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN] = hex_decode(line, fields[1])?
+        .try_into()
+        .map_err(|_| parse_error(line, "initial topology digest must contain 32 bytes"))?;
+    let bootstrap_map_digest: [u8; CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN] =
+        hex_decode(line, fields[2])?.try_into().map_err(|_| {
+            parse_error(
+                line,
+                "initial topology bootstrap-map digest must contain 32 bytes",
+            )
+        })?;
+    let voters = if fields[3].is_empty() {
+        Vec::new()
+    } else {
+        fields[3]
+            .split(':')
+            .map(|value| parse_u64(line, value, "initial topology Raft voter"))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    InitialClusterTopologyCertificate::new(
+        parse_u64(line, fields[0], "initial topology generation")?,
+        topology_digest,
+        bootstrap_map_digest,
+        voters,
+    )
+    .map(Some)
+    .map_err(|error| parse_error(line, &error.to_string()))
 }
 
 struct ParsedHistoryRecord {
@@ -20782,8 +21035,8 @@ mod tests {
         let duplicate_cluster_epoch =
             canonical.replace("cluster_epoch=1\n", "cluster_epoch=1\ncluster_epoch=1\n");
         let reordered_max_timestamp = canonical.replace(
-            "cluster_epoch=1\nmax_committed_timestamp_ms=123\n",
-            "max_committed_timestamp_ms=123\ncluster_epoch=1\n",
+            "cluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=123\n",
+            "max_committed_timestamp_ms=123\ncluster_epoch=1\ninitial_topology=-\n",
         );
 
         for (label, contents) in [
@@ -31952,7 +32205,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=23\nauthority_incarnation=1\ncluster_epoch=1\n",
+            "version=25\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -33303,7 +33556,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=1\n",
@@ -33326,7 +33579,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -33350,7 +33603,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -33375,7 +33628,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -33418,7 +33671,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -33441,7 +33694,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -33466,7 +33719,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -33496,7 +33749,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
@@ -33532,7 +33785,7 @@ mod tests {
             let tmp = test_util::tempdir();
             let path = tmp.path().join(format!("control-plane-{index}.state"));
             let contents = format!(
-                "version=23\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
+                "version=25\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\nhistory=2,1\nhistory_node=2,1\n{history_pg}"
             );
             std::fs::write(&path, contents).unwrap();
 
@@ -33600,7 +33853,7 @@ mod tests {
             let tmp = test_util::tempdir();
             let path = tmp.path().join(format!("control-plane-{name}.state"));
             let contents = format!(
-                "version=23\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}"
+                "version=25\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}"
             );
             std::fs::write(&path, contents).unwrap();
 
@@ -33668,7 +33921,7 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "version=23\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\n{history}{current_node}{current_pg}"
+                    "version=25\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\nauthority_incarnation=1\ncluster_epoch=3\ninitial_topology=-\n{history}{current_node}{current_pg}"
                 ),
             )
             .unwrap();
@@ -33692,7 +33945,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -33744,7 +33997,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -33770,7 +34023,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
@@ -33795,7 +34048,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -33821,9 +34074,10 @@ mod tests {
         let store = FileControlPlaneStore::new(&path);
         let initial = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         let snapshot = parse_snapshot(concat!(
-            "version=23\n",
+            "version=25\n",
             "authority_incarnation=1\n",
             "cluster_epoch=2\n",
+            "initial_topology=-\n",
             "max_committed_timestamp_ms=100\nlease_grant_horizon=-\n",
             "node=1,active,1,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
             "node_pg=1,7,active,2,100,10,20,30,-,-,-\n",
@@ -34928,7 +35182,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=23\n",
+                "version=25\ninitial_topology=-\n",
                 "max_committed_timestamp_ms=-\nlease_grant_horizon=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -35319,6 +35573,125 @@ mod tests {
                 vec![PgId::new(7)]
             ),
             Err(ControlPlaneError::BootstrapRequiresEmptyState)
+        ));
+    }
+
+    #[test]
+    fn certified_bootstrap_persists_exact_topology_and_pg_placements() {
+        let nodes = vec![
+            (NodeId::new(1), "/tmp/node-1.sock".to_owned()),
+            (NodeId::new(2), "/tmp/node-2.sock".to_owned()),
+            (NodeId::new(3), "/tmp/node-3.sock".to_owned()),
+        ];
+        let pg_acting_sets = vec![
+            (PgId::new(0), vec![NodeId::new(1), NodeId::new(2)]),
+            (PgId::new(1), vec![NodeId::new(2), NodeId::new(3)]),
+        ];
+        let topology = InitialClusterTopologyCertificate::new_for_bootstrap_map(
+            9,
+            [0x3c; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+            vec![101, 102, 103],
+            &nodes,
+            &pg_acting_sets,
+        )
+        .unwrap();
+        let snapshot = ClusterControlSnapshot::empty()
+            .apply_control_plane_command(ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes: nodes.clone(),
+                pg_acting_sets: pg_acting_sets.clone(),
+                topology: topology.clone(),
+            })
+            .unwrap()
+            .into_snapshot();
+
+        assert_eq!(snapshot.initial_topology(), Some(&topology));
+        assert_eq!(
+            snapshot.pg(PgId::new(0)).unwrap().acting_set(),
+            &[NodeId::new(1), NodeId::new(2)]
+        );
+        assert_eq!(
+            snapshot.pg(PgId::new(1)).unwrap().acting_set(),
+            &[NodeId::new(2), NodeId::new(3)]
+        );
+        let encoded = format_snapshot(&snapshot);
+        assert_eq!(parse_snapshot(&encoded).unwrap(), snapshot);
+
+        let missing_certificate = encoded
+            .lines()
+            .filter(|line| !line.starts_with("initial_topology="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert!(matches!(
+            parse_snapshot(&missing_certificate),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "missing initial topology"
+        ));
+
+        let uppercase_digest = encoded.replace(
+            &format!("initial_topology=9,{},", "3c".repeat(32)),
+            &format!("initial_topology=9,{},", "3C".repeat(32)),
+        );
+        assert!(matches!(
+            parse_snapshot(&uppercase_digest),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "control-plane state must use canonical snapshot encoding"
+        ));
+
+        let reversed_voters = encoded.replace("101:102:103", "102:101:103");
+        assert!(matches!(
+            parse_snapshot(&reversed_voters),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message.contains("initial topology Raft voters must be strictly increasing")
+        ));
+
+        let error = ClusterControlSnapshot::empty()
+            .apply_control_plane_command(ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes: vec![(NodeId::new(1), "/tmp/node-1.sock".to_owned())],
+                pg_acting_sets: vec![(PgId::new(0), vec![NodeId::new(2)])],
+                topology: topology.clone(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::UnknownActingSetNode {
+                pg_id: 0,
+                node_id: 2
+            }
+        ));
+
+        let mut altered_nodes = nodes;
+        altered_nodes[0].1 = "/tmp/wrong-node-1.sock".to_owned();
+        let altered_endpoint_error = ClusterControlSnapshot::empty()
+            .apply_control_plane_command(ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes: altered_nodes,
+                pg_acting_sets: pg_acting_sets.clone(),
+                topology: topology.clone(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            altered_endpoint_error,
+            ControlPlaneError::InvalidInitialTopology { message }
+                if message.contains("bootstrap-map digest")
+        ));
+
+        let mut altered_pg_acting_sets = pg_acting_sets;
+        altered_pg_acting_sets[0].1 = vec![NodeId::new(2), NodeId::new(1)];
+        let altered_acting_set_error = ClusterControlSnapshot::empty()
+            .apply_control_plane_command(ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes: vec![
+                    (NodeId::new(1), "/tmp/node-1.sock".to_owned()),
+                    (NodeId::new(2), "/tmp/node-2.sock".to_owned()),
+                    (NodeId::new(3), "/tmp/node-3.sock".to_owned()),
+                ],
+                pg_acting_sets: altered_pg_acting_sets,
+                topology,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            altered_acting_set_error,
+            ControlPlaneError::InvalidInitialTopology { message }
+                if message.contains("bootstrap-map digest")
         ));
     }
 

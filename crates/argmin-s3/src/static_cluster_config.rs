@@ -2,7 +2,8 @@ use crate::config::{
     BinarySecretConfigValue, ConfiguredControlPlaneAdminAuthCredential,
     ConfiguredControlPlaneFrontendAuthCredential, ConfiguredControlPlaneRaftAuthCredential,
     ConfiguredControlPlaneRaftPeerSocket, ConfiguredControlPlaneStorageAuthCredential,
-    ConfiguredStaticClusterIdentity, ConfiguredStorageNodeSocket, ServerConfig,
+    ConfiguredStaticClusterIdentity, ConfiguredStaticInitialClusterMap,
+    ConfiguredStorageNodeSocket, ServerConfig,
 };
 use ec::EcConfig;
 use placement::{
@@ -25,9 +26,15 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use storage::control_plane_raft::{
-    ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
+use storage::control_plane::{
+    InitialClusterTopologyCertificate, CONTROL_PLANE_TOPOLOGY_DIGEST_LEN,
 };
+use storage::control_plane_command::ControlPlaneCommand;
+use storage::control_plane_raft::{
+    validate_control_plane_command_replication_size, ControlPlaneRaftPeerTransportLimits,
+    ControlPlaneRaftPeerTransportPolicy,
+};
+use storage::PgId;
 use x509_cert::der::Decode;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
 use x509_cert::Certificate;
@@ -1187,8 +1194,11 @@ impl ValidatedStaticClusterManifest {
             Duration::from_millis(local_raft_transport.io_timeout_ms);
         config.control_plane_raft_auth_credentials = raft_auth_credentials;
         config.control_plane_raft_auth_signing_credential = Some(raft_signer);
+        let static_initial_cluster_map =
+            self.configured_static_initial_cluster_map(&storage_node_sockets)?;
         config.storage_node_sockets = storage_node_sockets;
         config.static_cluster_identity = Some(self.configured_static_identity());
+        config.static_initial_cluster_map = Some(static_initial_cluster_map);
         Ok(config)
     }
 
@@ -1201,6 +1211,41 @@ impl ValidatedStaticClusterManifest {
             process_id: selected.id.clone(),
             process_identity_digest: self.process_identity_digest.clone(),
         }
+    }
+
+    fn configured_static_initial_cluster_map(
+        &self,
+        storage_node_sockets: &[ConfiguredStorageNodeSocket],
+    ) -> Result<ConfiguredStaticInitialClusterMap, String> {
+        let topology_digest = decode_topology_digest(&self.topology_digest)?;
+        let raft_voters = self.canonical_raft_peer_endpoints.keys().copied().collect();
+        let pg_acting_sets = self
+            .initial_pg_acting_sets
+            .iter()
+            .enumerate()
+            .map(|(pg_id, acting_set)| {
+                let pg_id = u32::try_from(pg_id)
+                    .map(PgId::new)
+                    .map_err(|_| "static PG id does not fit u32".to_string())?;
+                Ok((pg_id, acting_set.iter().copied().map(NodeId::new).collect()))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let nodes = storage_node_sockets
+            .iter()
+            .map(|node| (NodeId::new(node.node_id), node.socket_path.clone()))
+            .collect::<Vec<_>>();
+        let topology = InitialClusterTopologyCertificate::new_for_bootstrap_map(
+            self.manifest.cluster.topology_generation,
+            topology_digest,
+            raft_voters,
+            &nodes,
+            &pg_acting_sets,
+        )
+        .map_err(|error| format!("invalid static initial topology certificate: {error}"))?;
+        Ok(ConfiguredStaticInitialClusterMap {
+            topology,
+            pg_acting_sets,
+        })
     }
 
     fn raft_cluster_identity(&self) -> String {
@@ -1340,6 +1385,29 @@ impl ValidatedStaticClusterManifest {
     #[cfg(test)]
     fn canonical_raft_peer_endpoints(&self) -> &BTreeMap<u64, String> {
         &self.canonical_raft_peer_endpoints
+    }
+}
+
+fn decode_topology_digest(digest: &str) -> Result<[u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN], String> {
+    if digest.len() != CONTROL_PLANE_TOPOLOGY_DIGEST_LEN * 2 {
+        return Err("static topology digest must contain 32 bytes".to_string());
+    }
+    let mut decoded = [0_u8; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN];
+    for (output, pair) in decoded.iter_mut().zip(digest.as_bytes().chunks_exact(2)) {
+        let high = decode_hex_nibble(pair[0])
+            .ok_or_else(|| "static topology digest contains invalid hex".to_string())?;
+        let low = decode_hex_nibble(pair[1])
+            .ok_or_else(|| "static topology digest contains invalid hex".to_string())?;
+        *output = (high << 4) | low;
+    }
+    Ok(decoded)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -2483,6 +2551,12 @@ fn validate_static_cluster_manifest(
         &initial_pg_acting_sets,
         &canonical_raft_peer_endpoints,
     );
+    validate_initial_bootstrap_replication_size(
+        &manifest,
+        &initial_pg_acting_sets,
+        &canonical_raft_peer_endpoints,
+        &topology_digest,
+    )?;
     let process_identity_digest =
         process_identity_digest(&manifest, selected_process_index, &topology_digest);
     let full_config_fingerprint = full_config_fingerprint(&manifest);
@@ -2496,6 +2570,71 @@ fn validate_static_cluster_manifest(
         process_identity_digest,
         full_config_fingerprint,
     })
+}
+
+fn validate_initial_bootstrap_replication_size(
+    manifest: &StaticClusterManifestInput,
+    initial_pg_acting_sets: &[Vec<u32>],
+    canonical_raft_peer_endpoints: &BTreeMap<u64, String>,
+    topology_digest: &str,
+) -> Result<(), String> {
+    if manifest.deployment.mode != DeploymentMode::Replicated {
+        return Ok(());
+    }
+    let processes = manifest
+        .processes
+        .iter()
+        .map(|process| (process.id.as_str(), process))
+        .collect::<BTreeMap<_, _>>();
+    let nodes = manifest
+        .storage_nodes
+        .iter()
+        .map(|storage_node| {
+            let process = processes[storage_node.process_id.as_str()];
+            let endpoint = manifest
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.owner_process_id == process.id)
+                .filter(|endpoint| endpoint.protocol == EndpointProtocol::StorageRpc)
+                .min_by_key(|endpoint| (endpoint.priority, endpoint.id.as_str()))
+                .expect("validated storage-node process has a storage RPC endpoint");
+            let address = match parse_endpoint_address(&endpoint.advertise, true)
+                .expect("validated endpoint has a canonical address")
+            {
+                EndpointAddress::Unix(path) => path.to_string_lossy().into_owned(),
+                EndpointAddress::Tcp { .. } => endpoint.advertise.clone(),
+            };
+            (NodeId::new(storage_node.node_id), address)
+        })
+        .collect::<Vec<_>>();
+    let pg_acting_sets = initial_pg_acting_sets
+        .iter()
+        .enumerate()
+        .map(|(pg_id, acting_set)| {
+            (
+                PgId::new(
+                    u32::try_from(pg_id).expect("validated manifest PG collection length fits u32"),
+                ),
+                acting_set.iter().copied().map(NodeId::new).collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let topology = InitialClusterTopologyCertificate::new_for_bootstrap_map(
+        manifest.cluster.topology_generation,
+        decode_topology_digest(topology_digest)?,
+        canonical_raft_peer_endpoints.keys().copied().collect(),
+        &nodes,
+        &pg_acting_sets,
+    )
+    .map_err(|error| format!("invalid static initial topology certificate: {error}"))?;
+    validate_control_plane_command_replication_size(
+        &ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes,
+            pg_acting_sets,
+            topology,
+        },
+    )
+    .map_err(|error| format!("static initial bootstrap is not replication-safe: {error}"))
 }
 
 fn toml_error_category(message: &str) -> &'static str {
@@ -4574,7 +4713,17 @@ mod tests {
     }
 
     fn replicated_unix_manifest() -> String {
-        let mut manifest = r#"
+        replicated_unix_manifest_with_shape(3, 4, 2, 1)
+    }
+
+    fn replicated_unix_manifest_with_shape(
+        node_count: u32,
+        pg_count: u32,
+        ec_data_shards: u8,
+        ec_parity_shards: u8,
+    ) -> String {
+        let mut manifest = format!(
+            r#"
 schema_version = 1
 tls_identities = []
 tls_trust_bundles = []
@@ -4591,9 +4740,9 @@ failure_tolerance = 1
 internal_auth = "required"
 
 [storage]
-pg_count = 4
-ec_data_shards = 2
-ec_parity_shards = 1
+pg_count = {pg_count}
+ec_data_shards = {ec_data_shards}
+ec_parity_shards = {ec_parity_shards}
 initial_cluster_epoch = 3
 
 [raft]
@@ -4613,8 +4762,8 @@ id = "host-1"
 zone = "zone-a"
 rack = "rack-1"
 "#
-        .to_string();
-        for number in 1..=3 {
+        );
+        for number in 1..=node_count {
             writeln!(
                 manifest,
                 r#"
@@ -5226,6 +5375,33 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
             .find(|credential| credential.node_id == 101)
             .unwrap();
         assert_eq!(local_raft_credential.secret.as_bytes(), &[0, 0xff, 7]);
+        let initial = config.static_initial_cluster_map.as_ref().unwrap();
+        assert_eq!(initial.topology.topology_generation(), 9);
+        assert_eq!(initial.topology.raft_voters(), &[101, 102, 103]);
+        let bootstrap_nodes = config
+            .storage_node_sockets
+            .iter()
+            .map(|node| (NodeId::new(node.node_id), node.socket_path.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            initial.topology.bootstrap_map_digest(),
+            &storage::control_plane::initial_cluster_bootstrap_map_digest(
+                &bootstrap_nodes,
+                &initial.pg_acting_sets,
+            )
+        );
+        assert_eq!(
+            initial.pg_acting_sets,
+            manifest
+                .initial_pg_acting_sets()
+                .iter()
+                .enumerate()
+                .map(|(pg_id, acting_set)| (
+                    PgId::new(u32::try_from(pg_id).unwrap()),
+                    acting_set.iter().copied().map(NodeId::new).collect()
+                ))
+                .collect::<Vec<_>>()
+        );
         let raft_cluster_name = config.control_plane_raft_cluster_name.unwrap();
         assert!(raft_cluster_name.starts_with("replicated-unix:topology:9:"));
         assert!(raft_cluster_name.ends_with(manifest.topology_digest()));
@@ -5234,6 +5410,26 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
         assert_eq!(
             identity.process_identity_digest,
             manifest.process_identity_digest()
+        );
+
+        let reordered_authorities = replicated_unix_manifest()
+            .replace("id = \"authority-1\"", "id = \"z-authority\"")
+            .replace("id = \"authority-2\"", "id = \"y-authority\"")
+            .replace("id = \"authority-3\"", "id = \"x-authority\"");
+        let reordered = parse_static_cluster_manifest(&reordered_authorities, "control-1").unwrap();
+        let reordered_material = resolved_test_material(&reordered);
+        let reordered_config = reordered
+            .replicated_unix_control_plane_server_config(&reordered_material, |key| {
+                environment.get(key).cloned()
+            })
+            .unwrap();
+        assert_eq!(
+            reordered_config
+                .static_initial_cluster_map
+                .unwrap()
+                .topology
+                .raft_voters(),
+            &[101, 102, 103]
         );
     }
 
@@ -6207,6 +6403,16 @@ transport_profile_id = "internal"
                 .unwrap_err()
                 .contains("max_snapshot_bytes must be")
         );
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_unreplicable_initial_bootstrap() {
+        let oversized = replicated_unix_manifest_with_shape(6, 4_096, 5, 1);
+
+        let error = parse_static_cluster_manifest(&oversized, "control-1").unwrap_err();
+
+        assert!(error.contains("static initial bootstrap is not replication-safe"));
+        assert!(error.contains("replication-safe per-entry limit"));
     }
 
     #[test]

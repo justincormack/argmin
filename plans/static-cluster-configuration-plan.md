@@ -715,12 +715,18 @@ peers have fresh empty state paths. Endpoint selection does not downgrade this
 check.
 
 The initial bootstrap command and its resulting snapshot membership identity
-carry the same topology generation/digest and exact canonical `raft-voter` set.
-Bootstrap preflight and deterministic apply reject a mismatched digest,
-generation, or voter set before publishing membership. Version 1 does not
-configure learners. Later topology activation must replace this initial
-binding through the separately planned committed topology-generation protocol;
-editing a manifest is never topology activation.
+carry the same topology generation/digest, exact canonical `raft-voter` set,
+and a domain-separated canonical digest of the complete day-zero storage map:
+sorted `(storage-node ID, endpoint)` records plus sorted `(PG ID, ordered acting
+set)` records. Bootstrap preflight and deterministic apply recompute that map
+digest and reject a mismatched endpoint or placement, as well as a mismatched
+topology digest, generation, or voter set, before publishing state. Version 1
+does not configure learners. The certificate is immutable bootstrap proof;
+current storage-node state and PG acting sets remain replicated mutable state
+and are not compared with day-zero placement during restart. Later topology
+activation must replace the initial certificate through the separately planned
+committed topology-generation protocol; editing a manifest is never topology
+activation.
 
 ## Canonical Digests And Durable Binding
 
@@ -849,7 +855,7 @@ loaded.
 
 ## Implementation Slices
 
-Progress as of 2026-07-19:
+Progress as of 2026-07-21:
 
 - Slice 1 is implemented: the manifest has strict version-1 TOML input types,
   a 4 MiB bounded atomic no-follow regular-file loader, closed enums and
@@ -949,12 +955,31 @@ Progress as of 2026-07-19:
   relocation remains valid. Static peer policies preserve topology
   generation/digest through authenticated worker request and response
   identities and reject fresh-manifest mismatches before OpenRaft dispatch.
+  The manifest's exact deterministic PG placement and storage-node endpoints
+  are carried by a certified initial bootstrap command together with the
+  topology generation, topology digest, exact Raft voter set, and canonical
+  bootstrap-map digest. Apply recomputes the map digest before publication. The
+  certificate is durable replicated state in canonical snapshot version 25.
+  Every static authority waits indefinitely for that exact command to apply
+  before publishing ordinary control-plane endpoints, and the restart artifact
+  used to mark process identity established independently proves that its
+  applied certificate matches the static peer policy. Missing, malformed,
+  noncanonical, wrong-generation, wrong-digest, and wrong-voter certificates
+  fail closed before `Raft::new` and before the peer listener is published. An
+  explicit unestablished-initialization restore mode permits an empty applied
+  state only when every retained normal entry is the exact configured
+  certified bootstrap command. An established identity cannot implicitly
+  recreate an empty certified control plane. Later committed node and acting-set
+  changes do not invalidate the immutable bootstrap certificate. Manifest
+  validation encodes the complete certified bootstrap through the production
+  Raft entry codec and rejects it when it exceeds the replication-safe
+  per-entry limit.
   Manifest validation builds one host-scoped runtime path namespace covering
   authority state and fixed sidecars, temporary filename prefixes, storage
   data directories, and Unix sockets; exact or ancestor collisions fail before
   filesystem mutation.
-  Explicit bootstrap/snapshot topology certificates, replicated replacement
-  lifecycle, storage/frontend process mapping, and TCP transport remain open.
+  Replicated replacement and dynamic topology lifecycle, storage/frontend
+  process mapping, and TCP transport remain open.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;
@@ -974,9 +999,10 @@ Progress as of 2026-07-19:
    - run existing Unix process tests from shared manifest helpers.
 4. **Durable binding**
    - bind cluster topology digest to Raft artifacts/peer policy and standalone
-     state identity;
+     state identity (initial replicated binding implemented);
    - bind topology generation/digest to authenticated peer frames and the
-     initial bootstrap command/membership;
+     initial bootstrap command/membership (implemented for static initial
+     establishment);
    - bind durable process-identity digest to local state/data sidecars;
    - implement explicit initialization/relocation/replacement state lifecycle;
      and
@@ -1045,6 +1071,12 @@ The schema/parser release gate includes:
 - wrong cluster/process/generation/digest restart rejection;
 - matching cluster id with mismatched fresh-peer topology digest/generation in
   request, response, and bootstrap frames, rejected before OpenRaft dispatch;
+- certified initial bootstrap round-trip with exact deterministic PG acting
+  sets, plus missing, malformed, noncanonical, wrong-generation, wrong-digest,
+  wrong-voter, altered-endpoint, and altered-acting-set rejection;
+- established restart after a committed acting-set change, pre-`Raft::new`
+  certificate rejection, narrowly validated pending-initialization replay, and
+  maximum-shape bootstrap entry-size rejection;
 - unsupported `pg_ids` or other static per-node PG ownership rejected as an
   unknown field;
 - complete offline state relocation accepted, but empty destination,

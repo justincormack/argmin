@@ -1,7 +1,8 @@
 use crate::control_plane::{
-    format_snapshot, parse_snapshot, parse_snapshot_without_publication_validation,
-    validate_control_plane_snapshot, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneError, NodeAvailabilityState, NodeHeartbeat, NodeMembershipState,
+    format_snapshot, initial_cluster_bootstrap_map_digest, parse_snapshot,
+    parse_snapshot_without_publication_validation, validate_control_plane_snapshot,
+    ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneError,
+    InitialClusterTopologyCertificate, NodeAvailabilityState, NodeHeartbeat, NodeMembershipState,
     NodePgHeartbeatObservation, PendingMetadataCommandObservation, PgMetadataProof,
     PgMetadataTransferProof, RuntimeMapFreshnessProof,
 };
@@ -15,7 +16,7 @@ use placement::NodeId;
 use std::num::NonZeroU64;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 10;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 12;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -47,6 +48,11 @@ pub enum ControlPlaneCommand {
     BootstrapInitialClusterMap {
         nodes: Vec<(NodeId, String)>,
         pg_ids: Vec<PgId>,
+    },
+    BootstrapCertifiedInitialClusterMap {
+        nodes: Vec<(NodeId, String)>,
+        pg_acting_sets: Vec<(PgId, Vec<NodeId>)>,
+        topology: InitialClusterTopologyCertificate,
     },
     SetNodeMembership {
         node_id: NodeId,
@@ -117,6 +123,18 @@ impl std::fmt::Display for ControlPlaneCommand {
                 "bootstrap-initial-cluster-map(nodes={},pgs={})",
                 nodes.len(),
                 pg_ids.len()
+            ),
+            ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes,
+                pg_acting_sets,
+                topology,
+            } => write!(
+                f,
+                "bootstrap-certified-initial-cluster-map(nodes={},pgs={},topology_generation={},raft_voters={})",
+                nodes.len(),
+                pg_acting_sets.len(),
+                topology.topology_generation(),
+                topology.raft_voters().len()
             ),
             ControlPlaneCommand::SetNodeMembership {
                 node_id,
@@ -459,6 +477,36 @@ pub fn encode_control_plane_command(
                 write_u64(&mut out, lease.lease_deadline_ms);
             }
         }
+        ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes,
+            pg_acting_sets,
+            topology,
+        } => {
+            validate_certified_bootstrap_encoding(nodes, pg_acting_sets, topology)?;
+            write_u16(&mut out, 15);
+            write_u64(&mut out, topology.topology_generation());
+            out.extend_from_slice(topology.topology_digest());
+            out.extend_from_slice(topology.bootstrap_map_digest());
+            write_u32(
+                &mut out,
+                len_as_u32(topology.raft_voters().len(), "initial topology Raft voters")?,
+            );
+            for voter in topology.raft_voters() {
+                write_u64(&mut out, *voter);
+            }
+            write_u32(&mut out, len_as_u32(nodes.len(), "bootstrap nodes")?);
+            for (node_id, endpoint) in nodes {
+                write_u32(&mut out, node_id.as_u32());
+                write_string(&mut out, endpoint)?;
+            }
+            write_u32(
+                &mut out,
+                len_as_u32(pg_acting_sets.len(), "bootstrap PG acting sets")?,
+            );
+            for (pg_id, acting_set) in pg_acting_sets {
+                write_pg_acting_set(&mut out, *pg_id, acting_set)?;
+            }
+        }
     }
     append_control_plane_command_checksum(&mut out);
     Ok(out)
@@ -686,6 +734,55 @@ pub fn decode_control_plane_command(
                 promoted,
             }
         }
+        15 => {
+            let topology_generation = reader.read_u64()?;
+            let topology_digest = reader
+                .read_exact(crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN)?
+                .try_into()
+                .expect("topology digest read length is fixed");
+            let bootstrap_map_digest = reader
+                .read_exact(crate::control_plane::CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN)?
+                .try_into()
+                .expect("bootstrap-map digest read length is fixed");
+            let voter_count = reader
+                .read_collection_len("initial topology Raft voters", std::mem::size_of::<u64>())?;
+            let mut raft_voters = Vec::with_capacity(voter_count);
+            for _ in 0..voter_count {
+                raft_voters.push(reader.read_u64()?);
+            }
+            let topology = InitialClusterTopologyCertificate::new(
+                topology_generation,
+                topology_digest,
+                bootstrap_map_digest,
+                raft_voters,
+            )
+            .map_err(|error| command_protocol_error(error.to_string()))?;
+            let node_count = reader.read_collection_len(
+                "bootstrap nodes",
+                CONTROL_PLANE_COMMAND_BOOTSTRAP_NODE_MIN_LEN,
+            )?;
+            let mut nodes = Vec::with_capacity(node_count);
+            for _ in 0..node_count {
+                nodes.push((
+                    NodeId::new(reader.read_u32()?),
+                    reader.read_string()?.to_owned(),
+                ));
+            }
+            let pg_count = reader.read_collection_len(
+                "bootstrap PG acting sets",
+                CONTROL_PLANE_COMMAND_PG_MIN_LEN + CONTROL_PLANE_COMMAND_ACTING_SET_NODE_MIN_LEN,
+            )?;
+            let mut pg_acting_sets = Vec::with_capacity(pg_count);
+            for _ in 0..pg_count {
+                pg_acting_sets.push(read_pg_acting_set(&mut reader)?);
+            }
+            validate_certified_bootstrap_encoding(&nodes, &pg_acting_sets, &topology)?;
+            ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes,
+                pg_acting_sets,
+                topology,
+            }
+        }
         tag => {
             return Err(command_protocol_error(format!(
                 "unknown control-plane command tag {tag}"
@@ -694,6 +791,46 @@ pub fn decode_control_plane_command(
     };
     reader.finish()?;
     Ok(command)
+}
+
+fn validate_certified_bootstrap_encoding(
+    nodes: &[(NodeId, String)],
+    pg_acting_sets: &[(PgId, Vec<NodeId>)],
+    topology: &InitialClusterTopologyCertificate,
+) -> Result<(), ControlPlaneError> {
+    if topology.raft_voters().is_empty() {
+        return Err(command_protocol_error(
+            "certified bootstrap requires at least one Raft voter",
+        ));
+    }
+    if pg_acting_sets.is_empty() {
+        return Err(command_protocol_error(
+            "certified bootstrap requires at least one PG acting set",
+        ));
+    }
+    if nodes.is_empty() {
+        return Err(command_protocol_error(
+            "certified bootstrap requires at least one storage node",
+        ));
+    }
+    if nodes.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(command_protocol_error(
+            "certified bootstrap storage nodes must be strictly increasing",
+        ));
+    }
+    if pg_acting_sets.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return Err(command_protocol_error(
+            "certified bootstrap PGs must be strictly increasing",
+        ));
+    }
+    if topology.bootstrap_map_digest()
+        != &initial_cluster_bootstrap_map_digest(nodes, pg_acting_sets)
+    {
+        return Err(command_protocol_error(
+            "certified bootstrap map does not match its bootstrap-map digest",
+        ));
+    }
+    Ok(())
 }
 
 pub fn encode_control_plane_snapshot(
@@ -1789,6 +1926,22 @@ mod tests {
                 state_digest: 6,
             },
         );
+        let certified_nodes = vec![
+            (NodeId::new(1), "/tmp/node-1.sock".to_owned()),
+            (NodeId::new(2), "/tmp/node-2.sock".to_owned()),
+        ];
+        let certified_pgs = vec![
+            (PgId::new(3), vec![NodeId::new(1)]),
+            (PgId::new(4), vec![NodeId::new(2)]),
+        ];
+        let certified_topology = InitialClusterTopologyCertificate::new_for_bootstrap_map(
+            7,
+            [0x5a; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+            vec![101, 102, 103],
+            &certified_nodes,
+            &certified_pgs,
+        )
+        .unwrap();
         vec![
             ControlPlaneCommand::BootstrapInitialClusterMap {
                 nodes: vec![
@@ -1796,6 +1949,11 @@ mod tests {
                     (NodeId::new(2), "/tmp/node-2.sock".to_owned()),
                 ],
                 pg_ids: vec![PgId::new(3), PgId::new(4)],
+            },
+            ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes: certified_nodes,
+                pg_acting_sets: certified_pgs,
+                topology: certified_topology,
             },
             ControlPlaneCommand::SetNodeMembership {
                 node_id: NodeId::new(1),
@@ -2154,8 +2312,38 @@ mod tests {
 
     #[test]
     fn control_plane_command_codec_rejects_semantic_decode_errors() {
-        let unknown_tag = command_frame(15, |_| {});
-        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 15");
+        let unknown_tag = command_frame(16, |_| {});
+        assert_decode_error_contains(&unknown_tag, "unknown control-plane command tag 16");
+
+        let reversed_certified_pgs = ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes: vec![(NodeId::new(1), "/tmp/node-1.sock".to_owned())],
+            pg_acting_sets: vec![
+                (PgId::new(2), vec![NodeId::new(1)]),
+                (PgId::new(1), vec![NodeId::new(1)]),
+            ],
+            topology: InitialClusterTopologyCertificate::new(1, [7; 32], [8; 32], vec![101])
+                .unwrap(),
+        };
+        assert!(matches!(
+            encode_control_plane_command(&reversed_certified_pgs),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message.contains("PGs must be strictly increasing")
+        ));
+
+        let reversed_certified_nodes = ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes: vec![
+                (NodeId::new(2), "/tmp/node-2.sock".to_owned()),
+                (NodeId::new(1), "/tmp/node-1.sock".to_owned()),
+            ],
+            pg_acting_sets: vec![(PgId::new(1), vec![NodeId::new(1)])],
+            topology: InitialClusterTopologyCertificate::new(1, [7; 32], [8; 32], vec![101])
+                .unwrap(),
+        };
+        assert!(matches!(
+            encode_control_plane_command(&reversed_certified_nodes),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message.contains("storage nodes must be strictly increasing")
+        ));
 
         let zero_horizon_generation = command_frame(12, |body| {
             write_u64(body, 0);

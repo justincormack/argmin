@@ -839,6 +839,7 @@ fn peer_auth_replay_policy(
 pub struct ControlPlaneRaftPeerTransportPolicy {
     cluster_name: String,
     topology: Option<ControlPlaneRaftTopologyIdentity>,
+    initial_topology_certificate: Option<crate::control_plane::InitialClusterTopologyCertificate>,
     peers: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
     limits: ControlPlaneRaftPeerTransportLimits,
     connect_timeout: Duration,
@@ -856,6 +857,7 @@ impl ControlPlaneRaftPeerTransportPolicy {
         Self {
             cluster_name: cluster_name.into(),
             topology: None,
+            initial_topology_certificate: None,
             peers,
             limits,
             connect_timeout: Duration::from_secs(1),
@@ -891,6 +893,13 @@ impl ControlPlaneRaftPeerTransportPolicy {
     }
 
     #[must_use]
+    pub fn initial_topology_certificate(
+        &self,
+    ) -> Option<&crate::control_plane::InitialClusterTopologyCertificate> {
+        self.initial_topology_certificate.as_ref()
+    }
+
+    #[must_use]
     pub fn with_auth_policy(mut self, auth_policy: ControlPlaneRaftPeerAuthPolicy) -> Self {
         self.auth_policy = Some(Arc::new(auth_policy));
         self
@@ -902,6 +911,15 @@ impl ControlPlaneRaftPeerTransportPolicy {
             generation,
             digest: digest.into(),
         });
+        self
+    }
+
+    #[must_use]
+    pub fn with_initial_topology_certificate(
+        mut self,
+        certificate: crate::control_plane::InitialClusterTopologyCertificate,
+    ) -> Self {
+        self.initial_topology_certificate = Some(certificate);
         self
     }
 
@@ -972,6 +990,27 @@ impl ControlPlaneRaftPeerTransportPolicy {
     }
 
     pub fn validate_replication_compatibility(&self) -> Result<(), ControlPlaneError> {
+        if let Some(certificate) = &self.initial_topology_certificate {
+            let topology = self.topology.as_ref().ok_or_else(|| {
+                raft_artifact_protocol_error(
+                    "initial topology certificate requires a peer-policy topology identity",
+                )
+            })?;
+            let certificate_digest = certificate
+                .topology_digest()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let voters = self.peers.keys().copied().collect::<Vec<_>>();
+            if certificate.topology_generation() != topology.generation
+                || certificate_digest != topology.digest
+                || certificate.raft_voters() != voters
+            {
+                return Err(raft_artifact_protocol_error(
+                    "initial topology certificate does not match peer-policy topology identity and voters",
+                ));
+            }
+        }
         if self.limits.max_append_entries
             < ControlPlaneRaftPeerTransportLimits::REPLICATION_REQUIRED_APPEND_ENTRIES
         {
@@ -3919,6 +3958,7 @@ impl ControlPlaneRaftAuthority {
             None,
             peer_policy,
             rpc_timeout,
+            None,
         )
         .await
     }
@@ -3938,6 +3978,28 @@ impl ControlPlaneRaftAuthority {
             Some(wal_path),
             peer_policy,
             rpc_timeout,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
+        cluster_name: impl Into<String>,
+        node_id: ControlPlaneRaftNodeId,
+        artifact_path: &Path,
+        wal_path: &Path,
+        peer_policy: ControlPlaneRaftPeerTransportPolicy,
+        expected_bootstrap: ControlPlaneCommand,
+        rpc_timeout: Duration,
+    ) -> Result<Self, ControlPlaneError> {
+        Self::new_experimental_unix_peer_durable_inner(
+            cluster_name,
+            node_id,
+            artifact_path,
+            Some(wal_path),
+            peer_policy,
+            rpc_timeout,
+            Some(expected_bootstrap),
         )
         .await
     }
@@ -3949,11 +4011,23 @@ impl ControlPlaneRaftAuthority {
         wal_path: Option<&Path>,
         peer_policy: ControlPlaneRaftPeerTransportPolicy,
         rpc_timeout: Duration,
+        pending_static_bootstrap: Option<ControlPlaneCommand>,
     ) -> Result<Self, ControlPlaneError> {
         let cluster_name = cluster_name.into();
         peer_policy.validate_cluster_name(&cluster_name)?;
         peer_policy.validate_local_node(node_id)?;
         peer_policy.validate_replication_compatibility()?;
+        if let Some(expected_bootstrap) = pending_static_bootstrap.as_ref() {
+            if peer_policy.topology_identity().is_none() {
+                return Err(raft_artifact_protocol_error(
+                    "pending static initialization requires a peer-policy topology identity",
+                ));
+            }
+            let expected_snapshot = ClusterControlSnapshot::empty()
+                .apply_control_plane_command(expected_bootstrap.clone())?
+                .into_snapshot();
+            validate_captured_static_initial_topology(&expected_snapshot, &peer_policy)?;
+        }
         let config =
             experimental_raft_config(cluster_name.clone(), ExperimentalRaftTimerMode::Automatic)?;
         let policy_for_restore = peer_policy.clone();
@@ -3962,7 +4036,13 @@ impl ControlPlaneRaftAuthority {
             node_id,
             artifact_path,
             wal_path,
-            |artifact| artifact.validate_peer_policy_membership(&policy_for_restore),
+            |artifact| {
+                artifact.validate_peer_policy_membership(&policy_for_restore)?;
+                artifact.validate_static_initial_topology_restore(
+                    &policy_for_restore,
+                    pending_static_bootstrap.as_ref(),
+                )
+            },
         )?;
         let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node_id,
@@ -5563,7 +5643,7 @@ pub async fn submit_control_plane_command_via_openraft(
     })
 }
 
-fn validate_control_plane_command_replication_size(
+pub fn validate_control_plane_command_replication_size(
     command: &ControlPlaneCommand,
 ) -> Result<(), ControlPlaneError> {
     let entry = ControlPlaneRaftEntry {
@@ -5812,6 +5892,10 @@ impl ControlPlaneRaftCapturedRestartCheckpoint {
             .validate_cluster_identity(peer_policy.cluster_name())?;
         peer_policy.validate_local_node(self.artifact.local_node_id)?;
         self.artifact.validate_peer_policy_membership(peer_policy)?;
+        validate_captured_static_initial_topology(
+            self.artifact.state_machine.inner.snapshot(),
+            peer_policy,
+        )?;
         let applied_membership_log_id = (*self.artifact.state_machine.last_membership.log_id())
             .ok_or_else(|| {
                 raft_artifact_protocol_error(
@@ -5889,6 +5973,47 @@ impl ControlPlaneRaftCapturedRestartCheckpoint {
     fn wal_replay_offset(&self) -> u64 {
         self.artifact.wal_replay_offset
     }
+}
+
+fn validate_captured_static_initial_topology(
+    snapshot: &ClusterControlSnapshot,
+    peer_policy: &ControlPlaneRaftPeerTransportPolicy,
+) -> Result<(), ControlPlaneError> {
+    let Some(expected_topology) = peer_policy.topology_identity() else {
+        return Ok(());
+    };
+    let actual = snapshot.initial_topology().ok_or_else(|| {
+        raft_artifact_protocol_error(
+            "captured static OpenRaft restart checkpoint has no initial topology certificate",
+        )
+    })?;
+    if let Some(expected_certificate) = peer_policy.initial_topology_certificate() {
+        if actual != expected_certificate {
+            return Err(raft_artifact_protocol_error(
+                "captured static OpenRaft restart checkpoint initial topology certificate does not match the configured certificate",
+            ));
+        }
+    }
+    let actual_digest = actual
+        .topology_digest()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let expected_voters = peer_policy.peers.keys().copied().collect::<Vec<_>>();
+    if actual.topology_generation() != expected_topology.generation
+        || actual_digest != expected_topology.digest
+        || actual.raft_voters() != expected_voters
+    {
+        return Err(raft_artifact_protocol_error(format!(
+            "captured static OpenRaft restart checkpoint initial topology does not match peer policy; expected_generation={} actual_generation={} expected_digest={} actual_digest={} expected_voters={expected_voters:?} actual_voters={:?}",
+            expected_topology.generation,
+            actual.topology_generation(),
+            expected_topology.digest,
+            actual_digest,
+            actual.raft_voters()
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7473,6 +7598,48 @@ impl ControlPlaneRaftRestartArtifact {
                     "cached snapshot membership",
                     snapshot.meta.last_membership.membership(),
                 )?,
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_static_initial_topology_restore(
+        &self,
+        peer_policy: &ControlPlaneRaftPeerTransportPolicy,
+        pending_static_bootstrap: Option<&ControlPlaneCommand>,
+    ) -> Result<(), ControlPlaneError> {
+        if peer_policy.topology_identity().is_none() {
+            if pending_static_bootstrap.is_some() {
+                return Err(raft_artifact_protocol_error(
+                    "pending static initialization requires a peer-policy topology identity",
+                ));
+            }
+            return Ok(());
+        }
+        let snapshot = self.state_machine.inner.snapshot();
+        if snapshot.initial_topology().is_some() {
+            return validate_captured_static_initial_topology(snapshot, peer_policy);
+        }
+
+        let Some(expected_bootstrap) = pending_static_bootstrap else {
+            return validate_captured_static_initial_topology(snapshot, peer_policy);
+        };
+        if snapshot.nodes().next().is_some() || snapshot.pgs().next().is_some() {
+            return Err(raft_artifact_protocol_error(
+                "pending static OpenRaft restart artifact has control-plane state without an initial topology certificate",
+            ));
+        }
+        let expected_snapshot = ClusterControlSnapshot::empty()
+            .apply_control_plane_command(expected_bootstrap.clone())?
+            .into_snapshot();
+        validate_captured_static_initial_topology(&expected_snapshot, peer_policy)?;
+        for entry in &self.log_store.entries {
+            if let EntryPayload::Normal(command) = &entry.payload {
+                if command != expected_bootstrap {
+                    return Err(raft_artifact_protocol_error(
+                        "pending static OpenRaft restart artifact contains a normal entry other than the configured certified bootstrap",
+                    ));
+                }
             }
         }
         Ok(())
@@ -15181,6 +15348,97 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_established_static_policy_requires_matching_topology_certificate() {
+        let nodes = BTreeMap::from([(1, BasicNode::default()), (2, BasicNode::default())]);
+        let membership_entry = membership_entry(0, 1, 0);
+        let bootstrap_nodes = vec![(NodeId::new(11), "node-11".to_string())];
+        let bootstrap_pgs = vec![(crate::PgId::new(0), vec![NodeId::new(11)])];
+        let topology =
+            crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                7,
+                [0xab; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                vec![1, 2],
+                &bootstrap_nodes,
+                &bootstrap_pgs,
+            )
+            .unwrap();
+        let bootstrap_entry = normal_entry(
+            1,
+            1,
+            1,
+            ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes: bootstrap_nodes,
+                pg_acting_sets: bootstrap_pgs,
+                topology: topology.clone(),
+            },
+        );
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine.apply_entry(membership_entry.clone()).unwrap();
+        state_machine.apply_entry(bootstrap_entry.clone()).unwrap();
+        let checkpoint = ControlPlaneRaftCapturedRestartCheckpoint {
+            artifact: ControlPlaneRaftRestartArtifact {
+                cluster_name: "test-cluster".to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1)),
+                    committed: Some(bootstrap_entry.log_id),
+                    last_purged_log_id: None,
+                    entries: vec![membership_entry, bootstrap_entry],
+                },
+                state_machine: state_machine.export_restart_artifact(),
+            },
+            authority_instance: Arc::new(()),
+        };
+        let policy = ControlPlaneRaftPeerTransportPolicy::new(
+            "test-cluster",
+            nodes.clone(),
+            ControlPlaneRaftPeerTransportLimits::default(),
+        )
+        .with_topology_identity(7, "ab".repeat(32))
+        .with_initial_topology_certificate(topology);
+        assert!(validate_captured_static_initial_topology(
+            &ClusterControlSnapshot::empty(),
+            &policy,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("has no initial topology certificate"));
+        assert_eq!(
+            checkpoint
+                .established_peer_policy_convergence(&policy)
+                .unwrap(),
+            ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged
+        );
+
+        let wrong_voters = ControlPlaneRaftPeerTransportPolicy::new(
+            "test-cluster",
+            BTreeMap::from([(1, BasicNode::default()), (3, BasicNode::default())]),
+            ControlPlaneRaftPeerTransportLimits::default(),
+        )
+        .with_topology_identity(7, "ab".repeat(32));
+        assert!(validate_captured_static_initial_topology(
+            checkpoint.artifact.state_machine.inner.snapshot(),
+            &wrong_voters,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("initial topology does not match"));
+
+        let wrong_digest = ControlPlaneRaftPeerTransportPolicy::new(
+            "test-cluster",
+            nodes,
+            ControlPlaneRaftPeerTransportLimits::default(),
+        )
+        .with_topology_identity(7, "cd".repeat(32));
+        assert!(checkpoint
+            .established_peer_policy_convergence(&wrong_digest)
+            .unwrap_err()
+            .to_string()
+            .contains("initial topology does not match"));
+    }
+
+    #[test]
     fn control_plane_raft_checkpoint_refreshes_snapshot_after_state_machine_export() {
         ControlPlaneRaftTypeConfig::run(async {
             let bootstrap = single_node_bootstrap_membership_entry(1);
@@ -22396,6 +22654,345 @@ mod tests {
                 )
                 .await,
                 "is missing but sentinel",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_static_restore_requires_certificate_before_raft_start() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let cluster_name = "control-plane-raft-static-certificate-restore-test";
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            )
+            .with_topology_identity(7, "ab".repeat(32));
+            let bootstrap_nodes = vec![
+                (NodeId::new(11), "node-11".to_string()),
+                (NodeId::new(12), "node-12".to_string()),
+            ];
+            let bootstrap_pgs = vec![(crate::PgId::new(0), vec![NodeId::new(11)])];
+            let topology =
+                crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                    7,
+                    [0xab; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                    vec![1, 2],
+                    &bootstrap_nodes,
+                    &bootstrap_pgs,
+                )
+                .unwrap();
+            let policy = policy.with_initial_topology_certificate(topology.clone());
+            let certified_bootstrap = ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                nodes: bootstrap_nodes,
+                pg_acting_sets: bootstrap_pgs,
+                topology,
+            };
+
+            let membership = policy_bootstrap_membership_entry(1, &policy);
+            let bootstrap_entry = normal_entry(1, 1, 1, certified_bootstrap.clone());
+            let acting_set_entry = normal_entry(
+                1,
+                1,
+                2,
+                ControlPlaneCommand::SetPgActingSet {
+                    pg_id: crate::PgId::new(0),
+                    acting_set: vec![NodeId::new(12)],
+                },
+            );
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            for entry in [
+                membership.clone(),
+                bootstrap_entry.clone(),
+                acting_set_entry.clone(),
+            ] {
+                state_machine.apply_entry(entry).unwrap();
+            }
+            let changed_path = tmp.path().join("changed.state");
+            ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1)),
+                    committed: Some(acting_set_entry.log_id),
+                    last_purged_log_id: None,
+                    entries: vec![membership.clone(), bootstrap_entry, acting_set_entry],
+                },
+                state_machine: state_machine.export_restart_artifact(),
+            }
+            .store_durable_artifact(&changed_path)
+            .unwrap();
+
+            let authority = ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                cluster_name,
+                1,
+                &changed_path,
+                policy.clone(),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                authority
+                    .current_control_plane_snapshot()
+                    .await
+                    .unwrap()
+                    .pg(crate::PgId::new(0))
+                    .unwrap()
+                    .acting_set(),
+                &[NodeId::new(12)]
+            );
+            authority.shutdown().await.unwrap();
+
+            let wrong_entry = normal_entry(
+                1,
+                1,
+                1,
+                ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(11), "wrong-node-11".to_string()),
+                        (NodeId::new(12), "node-12".to_string()),
+                    ],
+                    pg_acting_sets: vec![(crate::PgId::new(0), vec![NodeId::new(11)])],
+                    topology: crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                            7,
+                            [0xab; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                            vec![1, 2],
+                            &[
+                                (NodeId::new(11), "wrong-node-11".to_string()),
+                                (NodeId::new(12), "node-12".to_string()),
+                            ],
+                            &[(crate::PgId::new(0), vec![NodeId::new(11)])],
+                        )
+                        .unwrap(),
+                },
+            );
+            let mut wrong_state_machine = ControlPlaneRaftStateMachine::empty();
+            wrong_state_machine.apply_entry(membership.clone()).unwrap();
+            wrong_state_machine
+                .apply_entry(wrong_entry.clone())
+                .unwrap();
+            let wrong_path = tmp.path().join("wrong-certificate.state");
+            ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1)),
+                    committed: Some(wrong_entry.log_id),
+                    last_purged_log_id: None,
+                    entries: vec![membership.clone(), wrong_entry],
+                },
+                state_machine: wrong_state_machine.export_restart_artifact(),
+            }
+            .store_durable_artifact(&wrong_path)
+            .unwrap();
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                    cluster_name,
+                    1,
+                    &wrong_path,
+                    policy.clone(),
+                    Duration::from_millis(50),
+                )
+                .await,
+                "initial topology certificate does not match the configured certificate",
+            );
+
+            let missing_entry = normal_entry(
+                1,
+                1,
+                1,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(11), "node-11".to_string())],
+                    pg_ids: vec![crate::PgId::new(0)],
+                },
+            );
+            let mut missing_state_machine = ControlPlaneRaftStateMachine::empty();
+            missing_state_machine
+                .apply_entry(membership.clone())
+                .unwrap();
+            missing_state_machine
+                .apply_entry(missing_entry.clone())
+                .unwrap();
+            let missing_path = tmp.path().join("missing-certificate.state");
+            ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1)),
+                    committed: Some(missing_entry.log_id),
+                    last_purged_log_id: None,
+                    entries: vec![membership, missing_entry],
+                },
+                state_machine: missing_state_machine.export_restart_artifact(),
+            }
+            .store_durable_artifact(&missing_path)
+            .unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                    cluster_name,
+                    1,
+                    &missing_path,
+                    policy,
+                    Duration::from_millis(50),
+                )
+                .await,
+                "has no initial topology certificate",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_static_pending_restore_accepts_only_expected_bootstrap() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("pending.state");
+            let wal_path = tmp.path().join("pending.wal");
+            let cluster_name = "control-plane-raft-static-pending-restore-test";
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            )
+            .with_topology_identity(7, "ab".repeat(32));
+            let expected_nodes = vec![(NodeId::new(11), "node-11".to_string())];
+            let expected_pgs = vec![(crate::PgId::new(0), vec![NodeId::new(11)])];
+            let expected_topology =
+                crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                    7,
+                    [0xab; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                    vec![1, 2],
+                    &expected_nodes,
+                    &expected_pgs,
+                )
+                .unwrap();
+            let policy = policy.with_initial_topology_certificate(expected_topology.clone());
+            let expected = ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                topology: expected_topology,
+                nodes: expected_nodes,
+                pg_acting_sets: expected_pgs,
+            };
+            let membership = policy_bootstrap_membership_entry(1, &policy);
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine.apply_entry(membership.clone()).unwrap();
+            ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1)),
+                    committed: Some(membership.log_id),
+                    last_purged_log_id: None,
+                    entries: vec![membership.clone()],
+                },
+                state_machine: state_machine.export_restart_artifact(),
+            }
+            .store_durable_artifact(&path)
+            .unwrap();
+
+            let authority = ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
+                cluster_name,
+                1,
+                &path,
+                &wal_path,
+                policy.clone(),
+                expected.clone(),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+            assert!(authority
+                .current_control_plane_snapshot()
+                .await
+                .unwrap()
+                .initial_topology()
+                .is_none());
+            authority.shutdown().await.unwrap();
+
+            let unexpected_entry = normal_entry(
+                1,
+                1,
+                1,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(11), "node-11".to_string())],
+                    pg_ids: vec![crate::PgId::new(0)],
+                },
+            );
+            let mut unexpected_state_machine = ControlPlaneRaftStateMachine::empty();
+            unexpected_state_machine
+                .apply_entry(membership.clone())
+                .unwrap();
+            let unexpected_path = tmp.path().join("unexpected.state");
+            ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1)),
+                    committed: Some(membership.log_id),
+                    last_purged_log_id: None,
+                    entries: vec![membership, unexpected_entry],
+                },
+                state_machine: unexpected_state_machine.export_restart_artifact(),
+            }
+            .store_durable_artifact(&unexpected_path)
+            .unwrap();
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
+                    cluster_name,
+                    1,
+                    &unexpected_path,
+                    &tmp.path().join("unexpected.wal"),
+                    policy,
+                    expected,
+                    Duration::from_millis(50),
+                )
+                .await,
+                "normal entry other than the configured certified bootstrap",
+            );
+
+            let policy_without_topology = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            );
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal_pending_static_initialization(
+                    cluster_name,
+                    1,
+                    &tmp.path().join("fresh.state"),
+                    &tmp.path().join("fresh.wal"),
+                    policy_without_topology,
+                    ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+                        nodes: vec![(NodeId::new(11), "node-11".to_string())],
+                        pg_acting_sets: vec![(crate::PgId::new(0), vec![NodeId::new(11)])],
+                        topology: crate::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
+                            7,
+                            [0xab; crate::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+                            vec![1, 2],
+                            &[(NodeId::new(11), "node-11".to_string())],
+                            &[(crate::PgId::new(0), vec![NodeId::new(11)])],
+                        )
+                        .unwrap(),
+                    },
+                    Duration::from_millis(50),
+                )
+                .await,
+                "pending static initialization requires a peer-policy topology identity",
             );
         });
     }
