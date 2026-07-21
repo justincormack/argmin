@@ -870,18 +870,20 @@ async fn handle(
         Err(err) => {
             // Routing has rejected a request whose body has not been
             // consumed. The connection cannot be reused safely: a client may
-            // still be sending the declared body, and an EOF after the early
-            // response would otherwise make Hyper report an incomplete
-            // request before the lingering-close path can retain the socket.
+            // still be sending the declared body. Keep the unread Incoming
+            // alive until Hyper has delivered the response body; dropping it
+            // first can close the connection after only the response headers.
             let resp = close_response_connection(S3Response::error_with_ids(&err, "", &wire_ids));
-            return Ok(s3_response_to_hyper(
+            let mut resp = s3_response_to_hyper(
                 resp,
                 Some(req_permit),
                 state.config.stream_read_chunk_size,
                 state.config.panic_on_500,
                 state.config.abort_on_500,
                 response_trace,
-            ));
+            );
+            resp.body_mut().retain_unread_request_body(body);
+            return Ok(resp);
         }
     };
     if let Some(op) = streaming_op {

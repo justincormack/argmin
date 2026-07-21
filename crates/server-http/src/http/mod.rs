@@ -17,7 +17,7 @@ use std::{
 
 use auth::{authenticate_request, AuthContext, AuthMode, IdentityProvider};
 use bytes::Bytes;
-use hyper::body::{Body, Frame, SizeHint};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 
 use crate::coordinator::BeginStreamPartRequest;
 use crate::coordinator::BucketRequest;
@@ -817,6 +817,10 @@ pub struct S3HyperBody {
     trace: Option<ResponseBodyTrace>,
     _inflight_requests_guard: Option<observability::InflightRequestsGuard>,
     _permit: Option<OwnedSemaphorePermit>,
+    // An early response can be produced before Hyper has consumed the request
+    // body. Keep that body alive through response delivery: dropping it first
+    // can make Hyper finish the connection after sending only the headers.
+    _unread_request_body: Option<Incoming>,
 }
 
 impl S3HyperBody {
@@ -831,6 +835,7 @@ impl S3HyperBody {
             trace: Some(trace),
             _inflight_requests_guard: inflight_requests_guard,
             _permit: permit,
+            _unread_request_body: None,
         }
     }
 
@@ -873,7 +878,13 @@ impl S3HyperBody {
             trace: Some(trace),
             _inflight_requests_guard: inflight_requests_guard,
             _permit: permit,
+            _unread_request_body: None,
         }
+    }
+
+    pub(crate) fn retain_unread_request_body(&mut self, body: Incoming) {
+        debug_assert!(self._unread_request_body.is_none());
+        self._unread_request_body = Some(body);
     }
 }
 
