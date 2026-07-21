@@ -7,7 +7,8 @@ use base64::Engine as _;
 
 use crate::{
     AssumedRoleSessionIdentity, AuthenticatedIdentity, ConfiguredPrincipalIdentity, IdentityError,
-    ResolvedRoleIdentity, RoleSessionName, SessionLifetime, SourceIdentity,
+    ResolvedRoleIdentity, RoleSessionName, SessionAuthorizationContext, SessionLifetime,
+    SourceIdentity,
 };
 
 /// Prefix reserved for Argmin-issued temporary access keys.
@@ -267,16 +268,6 @@ pub enum SessionCredentialError {
     Identity(#[from] IdentityError),
 }
 
-/// Session-specific authorization data authenticated by a token format.
-///
-/// Version 1 deliberately carries no session policy, tags, or provided
-/// contexts. Adding any of those fields requires a new token format and a new
-/// typed variant rather than an ignored extension map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SessionAuthorizationContext {
-    Version1NoSessionPolicy,
-}
-
 /// Temporary credential decoded from and authenticated by a sealed token.
 ///
 /// This type is constructed only after stable issuer-role liveness has been
@@ -288,7 +279,6 @@ pub struct DecodedSessionCredential {
     secret_key: SecretKey,
     session: Arc<AssumedRoleSessionIdentity>,
     identity: AuthenticatedIdentity,
-    authorization_context: SessionAuthorizationContext,
 }
 
 impl DecodedSessionCredential {
@@ -322,7 +312,6 @@ impl DecodedSessionCredential {
             secret_key,
             session,
             identity,
-            authorization_context: SessionAuthorizationContext::Version1NoSessionPolicy,
         })
     }
 
@@ -342,8 +331,8 @@ impl DecodedSessionCredential {
     }
 
     #[must_use]
-    pub const fn authorization_context(&self) -> SessionAuthorizationContext {
-        self.authorization_context
+    pub fn authorization_context(&self) -> SessionAuthorizationContext {
+        self.session.authorization_context()
     }
 
     #[must_use]
@@ -361,7 +350,7 @@ impl std::fmt::Debug for DecodedSessionCredential {
             )
             .field("secret_key", &self.secret_key)
             .field("identity", &self.identity)
-            .field("authorization_context", &self.authorization_context)
+            .field("authorization_context", &self.authorization_context())
             .finish()
     }
 }

@@ -76,9 +76,8 @@ pub use credential::{
     generate_session_credential_material, is_reserved_session_access_key_id,
     AuthenticatedCredential, AuthorizationProfile, CredentialScope, CredentialStore,
     CredentialStoreError, DecodedSessionCredential, GeneratedSessionCredentialMaterial, SecretKey,
-    SessionAuthorizationContext, SessionCredentialError, SessionCredentialGenerationError,
-    StoredCredential, SESSION_ACCESS_KEY_ID_LEN, SESSION_ACCESS_KEY_ID_PREFIX,
-    SESSION_SECRET_ACCESS_KEY_LEN,
+    SessionCredentialError, SessionCredentialGenerationError, StoredCredential,
+    SESSION_ACCESS_KEY_ID_LEN, SESSION_ACCESS_KEY_ID_PREFIX, SESSION_SECRET_ACCESS_KEY_LEN,
 };
 pub use error::{AuthError, SignatureMismatchDiagnostics};
 pub use iam_policy::{
@@ -89,8 +88,8 @@ pub use iam_policy::{
 pub use identity::{
     AssumedRoleId, AssumedRoleSessionArn, AssumedRoleSessionIdentity, AuthenticatedIdentity,
     AwsAccountId, ConfiguredPrincipalIdentity, IamPath, IamRoleArn, IamRoleIdentity, IamUserArn,
-    IdentityError, LiveRoleIdentity, PrincipalIdentity, RoleName, RoleSessionName, SessionLifetime,
-    SourceIdentity, StableRoleId,
+    IdentityError, LiveRoleIdentity, PrincipalIdentity, RoleName, RoleSessionName,
+    SessionAuthorizationContext, SessionLifetime, SourceIdentity, StableRoleId,
 };
 pub use post::{
     authenticate_post_sigv4, prepare_post_policy, validate_post_policy,
@@ -99,8 +98,9 @@ pub use post::{
 };
 pub use provider::{
     IdentityProvider, IdentityProviderBackend, IdentityProviderError,
-    ResolvedConfiguredPrincipalAuthorization, ResolvedRoleAuthorization, ResolvedRoleIdentity,
-    RoleIdentityStore, RoleIdentityStoreError, SessionCredentialAuthenticationError,
+    ResolvedConfiguredPrincipalAuthorization, ResolvedPrincipalAuthorization,
+    ResolvedRoleAuthorization, ResolvedRoleIdentity, RoleIdentityStore, RoleIdentityStoreError,
+    SessionCredentialAuthenticationError,
 };
 pub use request::{
     authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion, HeaderSource,

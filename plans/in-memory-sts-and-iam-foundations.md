@@ -2683,8 +2683,9 @@ Exit condition: directly sealed session credentials authenticate with
 AWS-pinned token/signature/expiry precedence on every SigV4 mode and produce a
 typed authenticated session; injected credential and issuer-liveness provider
 failures remain distinct from invalid credentials and deleted issuers.
-Temporary role credentials remain documented as unsupported for end-to-end S3
-use until Phase 3 supplies role authorization.
+Phase 2 did not by itself make a role session usable through an S3
+authorization path; the first such path is supplied by the Phase 3 PutObject
+composition slice below.
 
 ### Phase 3: IAM policy and role core
 
@@ -2765,8 +2766,43 @@ resource scopes. A configured principal is exposed as `aws:PrincipalArn` only
 when it is a syntactically valid IAM user ARN bound to the authenticated
 account; opaque or account-mismatched configured principals remain lossless but
 make a dependent deny fail closed rather than bypassing it. Identity/session
-decisions and the resulting resource-policy decision remain to be composed at
-the S3 authorization boundary in the next Phase 3 slice.
+decisions and the resulting resource-policy decision were still separate at
+the end of that context-only slice.
+
+The first S3 authorization-boundary slice now carries the token-versioned
+session authorization context as part of the assumed-role identity so it
+cannot be discarded between authentication and authorization. Only after
+signature verification has produced an authenticated identity does the HTTP
+adapter resolve the current mutable authorization record for that exact role
+incarnation. A provider failure is retained as a typed result and is consumed
+at the policy boundary, where it fails closed without being relabeled as an
+authentication failure. Missing or identity-mismatched role authorization
+state is an invalid provider record rather than an implicit-deny substitute.
+
+The first operation slice is intentionally limited to an ordinary, untagged
+PutObject against a same-account BucketOwnerEnforced bucket. It composes the
+current role identity policy, the version-1 absent session-policy restriction,
+and the S3 bucket resource-policy decision. The Phase 0 same-account AWS matrix
+pins their union semantics and explicit-deny precedence: an allow on either
+side is sufficient and a deny on either side wins. RestrictPublicBuckets
+continues to filter resource-policy allows before composition. Cross-account
+role sessions fail closed even when both policy sides allow; exact role/session
+principal behavior remains deliberately unresolved until its AWS matrix is
+added. Within this new BucketOwnerEnforced identity-policy composition path,
+role-based PutObjectTagging, CreateMultipartUpload, UploadPart, UploadPartCopy,
+CompleteMultipartUpload, CopyObject, explicit PutObject ACLs, PutObject
+retention, PutObject legal holds, and `If-Match` conditional overwrites also
+remain closed until their operation-specific AWS probes establish the
+additional `s3:PutObjectAcl`, `s3:PutObjectRetention`,
+`s3:PutObjectLegalHold`, and conditional `s3:GetObject` composition. Configured-
+principal authorization behavior is unchanged by this slice. Focused decision
+tests cover the complete
+same-account allow/deny composition and every deliberately closed adjacent
+branch, while end-to-end HTTP tests prove both successful temporary-credential
+PutObject and authentication-before-current-role-provider-failure ordering.
+ACL-enabled object authorization and all other S3 action families remain
+subsequent Phase 3 integration slices rather than inheriting untested generic
+composition.
 
 - extend the minimal role identity records with role configuration, trust, and
   permission-policy state

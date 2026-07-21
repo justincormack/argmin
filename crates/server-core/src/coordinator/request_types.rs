@@ -425,6 +425,8 @@ pub(super) enum AuthorizedWriteTags<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requester {
     pub(super) identity: Option<auth::AuthenticatedIdentity>,
+    pub(super) principal_authorization:
+        Result<Option<auth::ResolvedPrincipalAuthorization>, auth::IdentityProviderError>,
     pub(super) authorization_profile: auth::AuthorizationProfile,
     pub(super) source_ip: Option<std::net::IpAddr>,
     pub(super) request_epoch_seconds: Option<u64>,
@@ -1211,9 +1213,29 @@ pub struct FinalizeStreamPartRequest<'a> {
 
 impl Requester {
     #[must_use]
-    pub fn from_auth(auth: &auth::AuthContext) -> Self {
+    pub fn from_auth(
+        auth: &auth::AuthContext,
+        principal_authorization: Result<
+            Option<auth::ResolvedPrincipalAuthorization>,
+            auth::IdentityProviderError,
+        >,
+    ) -> Self {
+        let principal_authorization = match (&auth.identity, principal_authorization) {
+            (None, Ok(None)) => Ok(None),
+            (Some(identity), Ok(Some(authorization)))
+                if authorization.matches_authenticated_identity(identity) =>
+            {
+                Ok(Some(authorization))
+            }
+            (Some(_), Err(error)) => Err(error),
+            (None, Err(error)) => Err(error),
+            (None, Ok(Some(_))) | (Some(_), Ok(None | Some(_))) => {
+                Err(auth::IdentityProviderError::InvalidRecord)
+            }
+        };
         Self {
             identity: auth.identity.clone(),
+            principal_authorization,
             authorization_profile: auth.authorization_profile,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1233,6 +1255,7 @@ impl Requester {
     pub const fn anonymous() -> Self {
         Self {
             identity: None,
+            principal_authorization: Ok(None),
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1252,6 +1275,7 @@ impl Requester {
     pub fn authenticated(account: AccountIdentity) -> Self {
         Self {
             identity: Some(Self::configured_identity_from_account(account)),
+            principal_authorization: Ok(None),
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1271,6 +1295,7 @@ impl Requester {
     pub fn from_account(account: Option<&AccountIdentity>) -> Self {
         Self {
             identity: account.cloned().map(Self::configured_identity_from_account),
+            principal_authorization: Ok(None),
             authorization_profile: auth::AuthorizationProfile::Standard,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1290,6 +1315,7 @@ impl Requester {
     pub fn authenticated_owner_account_admin(account: AccountIdentity) -> Self {
         Self {
             identity: Some(Self::configured_identity_from_account(account)),
+            principal_authorization: Ok(None),
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1411,6 +1437,23 @@ impl Requester {
         self
     }
 
+    pub(super) fn evaluate_identity_permissions(
+        &self,
+        request: &auth::IdentityPolicyRequest<'_>,
+    ) -> Result<auth::PolicyEvaluation, auth::IdentityProviderError> {
+        match self
+            .principal_authorization
+            .as_ref()
+            .map_err(|error| *error)?
+        {
+            Some(authorization) => Ok(authorization.evaluate_permissions(request)),
+            None if self.is_assumed_role_session() => {
+                Err(auth::IdentityProviderError::InvalidRecord)
+            }
+            None => Ok(auth::PolicyEvaluation::NoMatch),
+        }
+    }
+
     #[must_use]
     pub fn content_sha256(&self) -> Option<Option<&str>> {
         self.content_sha256
@@ -1423,6 +1466,7 @@ impl Requester {
     pub fn from_account_owner_account_admin(account: Option<&AccountIdentity>) -> Self {
         Self {
             identity: account.cloned().map(Self::configured_identity_from_account),
+            principal_authorization: Ok(None),
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1445,6 +1489,7 @@ impl Requester {
     ) -> Self {
         Self {
             identity: Some(Self::configured_identity_from_account(account)),
+            principal_authorization: Ok(None),
             authorization_profile,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1467,6 +1512,7 @@ impl Requester {
     ) -> Self {
         Self {
             identity: account.cloned().map(Self::configured_identity_from_account),
+            principal_authorization: Ok(None),
             authorization_profile,
             source_ip: None,
             request_epoch_seconds: None,
@@ -1504,6 +1550,11 @@ impl Requester {
     #[must_use]
     pub fn role_principal_arn(&self) -> Option<&auth::IamRoleArn> {
         self.identity.as_ref()?.role_principal_arn()
+    }
+
+    #[must_use]
+    pub fn is_assumed_role_session(&self) -> bool {
+        self.role_principal_arn().is_some()
     }
 
     #[must_use]
@@ -2053,7 +2104,7 @@ mod identity_tests {
             streaming: None,
         };
 
-        let requester = Requester::from_auth(&context);
+        let requester = Requester::from_auth(&context, Ok(None));
         assert!(!requester.is_anonymous());
         assert!(requester.account().is_some());
         assert!(requester.configured_principal().is_none());

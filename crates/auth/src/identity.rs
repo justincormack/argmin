@@ -316,6 +316,16 @@ pub struct SessionLifetime {
     expires_at_epoch_secs: i64,
 }
 
+/// Session-specific authorization data authenticated by a token format.
+///
+/// Version 1 deliberately carries no session policy, tags, or provided
+/// contexts. Adding any of those fields requires a new token format and a new
+/// typed variant rather than an ignored extension map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionAuthorizationContext {
+    Version1NoSessionPolicy,
+}
+
 impl SessionLifetime {
     pub fn new(
         issued_at_epoch_secs: i64,
@@ -350,6 +360,7 @@ pub struct AssumedRoleSessionIdentity {
     source_identity: Option<SourceIdentity>,
     session_arn: AssumedRoleSessionArn,
     assumed_role_id: AssumedRoleId,
+    authorization_context: SessionAuthorizationContext,
 }
 
 impl AssumedRoleSessionIdentity {
@@ -378,6 +389,7 @@ impl AssumedRoleSessionIdentity {
             source_identity,
             session_arn,
             assumed_role_id,
+            authorization_context: SessionAuthorizationContext::Version1NoSessionPolicy,
         }
     }
 
@@ -409,6 +421,11 @@ impl AssumedRoleSessionIdentity {
     #[must_use]
     pub fn assumed_role_id(&self) -> &AssumedRoleId {
         &self.assumed_role_id
+    }
+
+    #[must_use]
+    pub const fn authorization_context(&self) -> SessionAuthorizationContext {
+        self.authorization_context
     }
 }
 

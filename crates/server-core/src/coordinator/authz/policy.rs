@@ -947,15 +947,18 @@ mod tests {
             None,
         );
         let identity = auth::AuthenticatedIdentity::assumed_role_session(account, session).unwrap();
-        Requester::from_auth(&auth::AuthContext {
-            mode: auth::AuthMode::HeaderSigV4,
-            access_key_id: Some("ARGS0123456789ABCDEFGHIJ".to_string()),
-            identity: Some(identity),
-            authorization_profile: auth::AuthorizationProfile::Standard,
-            request_epoch_secs: Some(1_700_000_000),
-            signing_region: Some("us-east-1".to_string()),
-            streaming: None,
-        })
+        Requester::from_auth(
+            &auth::AuthContext {
+                mode: auth::AuthMode::HeaderSigV4,
+                access_key_id: Some("ARGS0123456789ABCDEFGHIJ".to_string()),
+                identity: Some(identity),
+                authorization_profile: auth::AuthorizationProfile::Standard,
+                request_epoch_secs: Some(1_700_000_000),
+                signing_region: Some("us-east-1".to_string()),
+                streaming: None,
+            },
+            Ok(None),
+        )
     }
 
     fn parse_policy(body: &str) -> auth::BucketPolicy {

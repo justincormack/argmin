@@ -4,10 +4,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::{
-    is_reserved_session_access_key_id, AuthenticatedCredential, AuthorizationRecordStore,
-    ConfiguredPrincipalAuthorizationKey, ConfiguredPrincipalAuthorizationRecord, CredentialStore,
-    DecodedSessionCredential, GeneratedSessionCredentialMaterial, LiveRoleIdentity,
-    RoleAuthorizationRecord, RoleSessionName, SessionLifetime, SessionTokenKeyRingInitError,
+    is_reserved_session_access_key_id, AuthenticatedCredential, AuthenticatedIdentity,
+    AuthorizationRecordStore, AwsAccountId, ConfiguredPrincipalAuthorizationKey,
+    ConfiguredPrincipalAuthorizationRecord, CredentialStore, DecodedSessionCredential,
+    GeneratedSessionCredentialMaterial, IdentityPolicyRequest, LiveRoleIdentity, PolicyEvaluation,
+    PrincipalIdentity, RoleAuthorizationRecord, RoleSessionName, SessionAuthorizationContext,
+    SessionLifetime, SessionPolicyRestriction, SessionTokenKeyRingInitError,
     SessionTokenKeyRingStatus, SessionTokenOpenError, SessionTokenSealError, SourceIdentity,
     StableRoleId, StoredCredential,
 };
@@ -136,7 +138,7 @@ impl ResolvedRoleIdentity {
 
 /// Current role authorization record whose lookup binding was checked by the
 /// provider boundary.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedRoleAuthorization(Arc<RoleAuthorizationRecord>);
 
 impl ResolvedRoleAuthorization {
@@ -148,13 +150,72 @@ impl ResolvedRoleAuthorization {
 
 /// Current configured-principal authorization record whose lookup binding was
 /// checked by the provider boundary.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedConfiguredPrincipalAuthorization(Arc<ConfiguredPrincipalAuthorizationRecord>);
 
 impl ResolvedConfiguredPrincipalAuthorization {
     #[must_use]
     pub fn record(&self) -> &ConfiguredPrincipalAuthorizationRecord {
         &self.0
+    }
+}
+
+/// Current mutable authorization state bound to one authenticated identity.
+///
+/// The role-session variant retains the versioned authorization context that
+/// was authenticated by the sealed token. Configured principals may have no
+/// IAM policy record while the legacy bootstrap profile remains in use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedPrincipalAuthorization {
+    Configured(Option<ResolvedConfiguredPrincipalAuthorization>),
+    RoleSession {
+        role: ResolvedRoleAuthorization,
+        session_context: SessionAuthorizationContext,
+    },
+}
+
+impl ResolvedPrincipalAuthorization {
+    /// Return whether this authorization state belongs to the complete
+    /// authenticated identity presented at the consuming boundary.
+    #[must_use]
+    pub fn matches_authenticated_identity(&self, identity: &AuthenticatedIdentity) -> bool {
+        match (self, identity.kind()) {
+            (Self::Configured(authorization), PrincipalIdentity::Configured { principal, .. }) => {
+                authorization.as_ref().is_none_or(|authorization| {
+                    authorization.record().account() == identity.account()
+                        && authorization.record().key().principal() == principal
+                })
+            }
+            (
+                Self::RoleSession {
+                    role,
+                    session_context,
+                },
+                PrincipalIdentity::AssumedRoleSession(session),
+            ) => {
+                role.record().identity().account() == identity.account()
+                    && role.record().identity().role() == session.role()
+                    && *session_context == session.authorization_context()
+            }
+            (Self::Configured(_), PrincipalIdentity::AssumedRoleSession(_))
+            | (Self::RoleSession { .. }, PrincipalIdentity::Configured { .. }) => false,
+        }
+    }
+
+    #[must_use]
+    pub fn evaluate_permissions(&self, request: &IdentityPolicyRequest<'_>) -> PolicyEvaluation {
+        match self {
+            Self::Configured(Some(principal)) => {
+                principal.record().evaluate_identity_permissions(request)
+            }
+            Self::Configured(None) => PolicyEvaluation::NoMatch,
+            Self::RoleSession {
+                role,
+                session_context: SessionAuthorizationContext::Version1NoSessionPolicy,
+            } => role
+                .record()
+                .evaluate_session_permissions(request, SessionPolicyRestriction::Absent),
+        }
     }
 }
 
@@ -317,6 +378,43 @@ impl IdentityProvider {
             return Err(IdentityProviderError::InvalidRecord);
         }
         Ok(record.map(ResolvedConfiguredPrincipalAuthorization))
+    }
+
+    /// Resolve current mutable authorization state after authentication.
+    ///
+    /// A role-session identity must have a matching authorization record for
+    /// the same immutable role incarnation. Configured principals may still
+    /// use the legacy bootstrap profile without an IAM policy record.
+    pub fn resolve_principal_authorization(
+        &self,
+        identity: &AuthenticatedIdentity,
+    ) -> Result<ResolvedPrincipalAuthorization, IdentityProviderError> {
+        match identity.kind() {
+            PrincipalIdentity::Configured { principal, .. } => {
+                let Some(account_id) = identity.account().account_id() else {
+                    return Ok(ResolvedPrincipalAuthorization::Configured(None));
+                };
+                let key = ConfiguredPrincipalAuthorizationKey::new(
+                    AwsAccountId::new(account_id.to_string())
+                        .map_err(|_| IdentityProviderError::InvalidRecord)?,
+                    principal.clone(),
+                );
+                self.lookup_configured_principal_authorization(&key, identity.account())
+                    .map(ResolvedPrincipalAuthorization::Configured)
+            }
+            PrincipalIdentity::AssumedRoleSession(session) => {
+                let expected_identity =
+                    LiveRoleIdentity::new(identity.account().clone(), session.role().clone())
+                        .map_err(|_| IdentityProviderError::InvalidRecord)?;
+                let role = self
+                    .lookup_role_authorization(&expected_identity)?
+                    .ok_or(IdentityProviderError::InvalidRecord)?;
+                Ok(ResolvedPrincipalAuthorization::RoleSession {
+                    role,
+                    session_context: session.authorization_context(),
+                })
+            }
+        }
     }
 
     /// Resolve the account associated with a canonical user ID.
@@ -936,15 +1034,15 @@ mod tests {
             )
             .unwrap();
 
-        assert!(provider
+        let authenticated = provider
             .authenticate_session_credential(access_key_id, Some(&token), 1_700_000_001)
-            .is_ok());
+            .unwrap();
         assert_eq!(
             authorization_lookups.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
         assert!(matches!(
-            provider.lookup_role_authorization(&live_role),
+            provider.resolve_principal_authorization(authenticated.identity()),
             Err(IdentityProviderError::Unavailable)
         ));
         assert_eq!(
