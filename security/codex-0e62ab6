@@ -1,0 +1,291 @@
+Presigned session streaming uploads skip chunk signatures
+Link: https://chatgpt.com/codex/cloud/security/findings/3069c4b89a6c81919343979c30466381?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 0e62ab6
+Author: justin@specialbusservice.com
+Created: 20/07/2026, 22:13:07
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: presigned session credentials are now accepted, but the presigned path still returns streaming: None and lacks the header path's reserved-session STREAMING-* rejection. This can bypass aws-chunked per-chunk integrity checks for session presigned streaming uploads. A robust fix would either reject reserved session credentials with STREAMING-* payload hashes in authenticate_presigned until streaming session support is implemented, or build the appropriate StreamingSigningContext for presigned requests and require the decoder to verify signed chunk modes.
+This commit enables presigned authentication for reserved session access keys, but unlike the existing header-auth session path it does not reject STREAMING-AWS4-HMAC-SHA256 payload modes or construct an AuthContext.streaming value. The streaming PUT path classifies x-amz-content-sha256=STREAMING-AWS4-HMAC-SHA256-* as a signed aws-chunked upload, but it passes auth.streaming into the chunk decoder. For presigned requests that value is always None, and the decoder only requires and verifies per-chunk signatures when its streaming context is Some. As a result, a presigned session request for a signed streaming upload can reach the decoder with no chunk-signature enforcement, allowing body chunks to be omitted, altered, or supplied without valid chunk signatures after the seed presigned request authenticates. The header session path has an explicit guard for this unsupported mode; the presigned session path added by this commit lacks the equivalent guard.
+
+# Resolution
+
+Fixed in `32564884`.
+
+The integrity issue was valid, but the proposed alternatives and part of the
+attribution were not AWS-compatible. The parent of `0e62ab6` already allowed
+long-lived presigned credentials to reach the same missing-context decoder
+path; `0e62ab6` expanded its reach to temporary credentials. The reported
+header-session rejection was also removed by later Phase 2 work after proper
+header aws-chunked session support was implemented.
+
+Live AWS probes were added before choosing the fix. They establish that
+presigned SigV4 does not activate aws-chunked decoding for long-lived or
+temporary credentials, even when `x-amz-content-sha256` is a supported
+`STREAMING-*` marker and every streaming-related header is signed. AWS treats
+the request body as raw bytes:
+
+- signed wire bodies return the exact `IncompleteBody` response based on the
+  declared decoded length and raw wire length, regardless of whether chunk
+  signatures are valid, invalid, or absent;
+- exact-length raw PutObject bodies return `XAmzContentSHA256Mismatch`, treating
+  the marker as the literal claimed hash;
+- trailer-marker PutObject bodies return `IncompleteBody` when short, the hash
+  mismatch when exact, and generic `InternalError` when overlong or framed;
+- UploadPart was probed separately against live multipart uploads. Trailer
+  bodies are `IncompleteBody` when short and `MalformedTrailerError` when
+  exact, overlong, or framed. ListParts after every failure confirmed that no
+  part was stored.
+- signed HeadObject checks after every failed PutObject confirmed that no
+  object was stored, including after each generic AWS `InternalError`.
+
+The production fix carries the authenticated mode into PutObject and
+UploadPart body handling. Header SigV4 continues through the production
+incremental aws-chunked decoder. Presigned SigV4 instead takes the AWS-pinned
+raw count/hash path and never decodes or accepts the framed bytes. PutObject
+does not start a write session and UploadPart aborts its prepared session, so
+none of these errors can commit an object or part.
+
+Argmin intentionally maps the client-triggerable PutObject trailer overrun to
+`400 MalformedTrailerError`, rather than AWS's `500 InternalError`. This follows
+the repository-wide rule that malformed client input must not activate the
+panic/abort-on-500 operational policy; the explicit exception is recorded in
+the AWS compatibility guide. UploadPart already uses that 400 response on AWS.
+
+As a defense-in-depth invariant, constructing either signed decoder mode now
+requires `StreamingSigningContext`; absence is an internal
+authentication/adapter invariant failure, preserving fail-on-500 diagnostics
+instead of hiding a regression as a client signature error. The duplicate
+test-only batch decoder was removed. Decoder tests now feed and finish the same
+incremental decoder used by production.
+
+Deterministic verification:
+
+- `env STS_TEST_PRESIGNED_STREAMING_ONLY=1 ./scripts/aws-sts-oracle --assume-role`
+- `cargo nextest run -p server-http presigned_streaming`
+- `cargo nextest run -p server-http signed_streaming_modes_without_context_are_internal_invariant_failures`
+
+# Validation
+## Rubric
+- [x] Confirm the existing header-auth session path rejects reserved session credentials with STREAMING-* payload hashes.
+- [x] Confirm the presigned path accepts/resolves reserved session access keys and lacks an equivalent STREAMING-* rejection.
+- [x] Dynamically demonstrate a valid presigned session request with `x-amz-content-sha256=STREAMING-AWS4-HMAC-SHA256-PAYLOAD` authenticates and returns `streaming: None`.
+- [x] Dynamically demonstrate the aws-chunked decoder accepts chunks without `chunk-signature` when `StreamingSigningContext` is absent, while rejecting the same body when it is present.
+- [x] Tie the authenticated context to the server streaming path that passes `ctx.streaming_signing.as_ref()` into the decoder for signed chunked modes.
+## Report
+Validated the finding as a logic/integrity vulnerability. Crash reproduction was not applicable because this is not a memory-safety bug; targeted Rust tests completed without crashing. Valgrind/gdb were unavailable in the container (`valgrind not installed`, `gdb not installed`), but lldb was available and used non-interactively.
+
+Evidence:
+1. Header-auth session path rejects reserved session access keys with STREAMING-* payload hashes at `crates/auth/src/request.rs:368-373`.
+2. Presigned path resolves reserved session credentials at `crates/auth/src/request.rs:680-687` and `785-792`, uses the `x-amz-content-sha256` header as the presigned payload hash at `701-704`, but returns `AuthContext { streaming: None }` at `751-762`.
+3. Added targeted auth PoC tests. Command: `cargo test -p auth poc_ -- --nocapture`. Output showed the asymmetry:
+   - `POC header session STREAMING result: UnknownAccessKey { access_key_id: "ARGS0123456789ABCDEFGHIJ" }`
+   - `POC presigned session STREAMING authenticated: mode=PresignedSigV4 access_key=Some("ARGS0123456789ABCDEFGHIJ") streaming_present=false`
+   Both tests passed.
+4. Added targeted decoder PoC test. Command: `cargo test -p server-http poc_signed_upload_with_missing_streaming_context_accepts_unsigned_chunks -- --nocapture`. Output showed unsigned aws-chunked data is accepted when the streaming signing context is absent, and rejected when present:
+   - `POC decoder without StreamingSigningContext accepted 5 bytes: "PWNED"; done=true`
+   - `POC decoder with StreamingSigningContext rejected same wire: MalformedChunkedBody { reason: "missing chunk-signature in signed chunked upload" }`
+5. lldb trace: breakpoint at `request.rs:751` in `authenticate_presigned` was hit for the presigned session STREAMING PoC. Backtrace showed `authenticate_presigned -> authenticate_request -> poc_presigned_session_streaming_payload_hash_is_accepted_without_streaming_context`; source context at the breakpoint was the `Ok(AuthContext { ... })` construction, and after continuing the test printed `streaming_present=false`.
+
+The server streaming path classifies `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` as signed aws-chunked at `crates/server-http/src/http/serve.rs:1996-2024` and creates the decoder with `ctx.streaming_signing.as_ref()` at `serve.rs:3104-3107`. The decoder only requires chunk-signature fields if `self.streaming.is_some()` at `crates/server-http/src/http/chunked.rs:500-505`, and only verifies HMACs inside `if let Some(ref ctx) = self.streaming` at `591-607`. Therefore the presigned session path can authenticate a signed streaming upload while supplying no streaming signing context to downstream chunk verification.
+
+# Evidence
+crates/auth/src/request.rs (L368 to 373)
+  Note: The header-auth session path explicitly rejects reserved session credentials with STREAMING-* payload hashes because aws-chunked session handling is not wired.
+```
+    if crate::is_reserved_session_access_key_id(&parsed.credential.access_key_id)
+        && body_hash.starts_with("STREAMING-")
+    {
+        // The aws-chunked adapter has additional token/seed/chunk precedence
+        // that will be wired and tested as its own Phase 2 slice.
+        return Err(unknown_access_key(&parsed.credential.access_key_id));
+```
+
+crates/auth/src/request.rs (L680 to 687)
+  Note: The presigned path now resolves and accepts session credentials for reserved session access keys.
+```
+    let authenticated_credential = resolve_presigned_credential(
+        credential.access_key_id,
+        query_string,
+        &signed_headers,
+        headers,
+        provider,
+        now_epoch_secs,
+    )?;
+```
+
+crates/auth/src/request.rs (L701 to 704)
+  Note: Presigned authentication accepts x-amz-content-sha256 values, including STREAMING-AWS4-HMAC-SHA256-* payload modes, without an equivalent reserved-session rejection.
+```
+    let body_hash = match headers.first_value("x-amz-content-sha256") {
+        Some(hash) => Cow::Borrowed(hash),
+        None => Cow::Borrowed("UNSIGNED-PAYLOAD"),
+    };
+```
+
+crates/auth/src/request.rs (L751 to 762)
+  Note: Presigned authentication always returns AuthContext with streaming: None, so no chunk signing context is available to downstream aws-chunked verification.
+```
+    Ok(AuthContext {
+        mode: AuthMode::PresignedSigV4,
+        access_key_id: Some(credential.access_key_id.to_owned()),
+        identity: Some(authenticated_credential.identity().clone()),
+        authorization_profile: authenticated_credential.long_lived().map_or(
+            crate::AuthorizationProfile::Standard,
+            crate::StoredCredential::authorization_profile,
+        ),
+        request_epoch_secs: Some(request_epoch),
+        signing_region: Some(credential.region.to_owned()),
+        streaming: None,
+    })
+```
+
+crates/auth/src/request.rs (L785 to 792)
+  Note: Reserved presigned access keys are authenticated as session credentials, enabling the unsupported streaming session case to proceed.
+```
+    let token_selection =
+        select_presigned_session_token(query_string, signed_headers, headers, access_key_id)?;
+    provider
+        .authenticate_session_credential(
+            access_key_id,
+            token_selection.selected.as_deref(),
+            now_epoch_secs,
+        )
+```
+
+crates/server-http/src/http/chunked.rs (L500 to 505)
+  Note: The decoder only requires chunk-signature fields when a streaming signing context is present.
+```
+                    // Signed mode requires chunk-signature on every chunk.
+                    if self.streaming.is_some() && chunk_sig.is_none() {
+                        return Err(ServerError::MalformedChunkedBody {
+                            reason: "missing chunk-signature in signed chunked upload".to_string(),
+                        });
+                    }
+```
+
+crates/server-http/src/http/chunked.rs (L591 to 607)
+  Note: Per-chunk HMAC verification is skipped entirely when the streaming context is None.
+```
+                    // Verify chunk signature.
+                    if let Some(ref ctx) = self.streaming {
+                        let s = sig.as_deref().unwrap();
+                        let chunk_hash = self
+                            .current_chunk_hash
+                            .take()
+                            .expect("signed chunks must have hash context")
+                            .finish();
+                        let chunk_hash_hex = hex_encode(chunk_hash.as_ref());
+                        verify_chunk_signature_hash(
+                            ctx,
+                            self.prev_sig.as_deref().unwrap(),
+                            &chunk_hash_hex,
+                            s,
+                        )?;
+                        self.prev_sig = Some(s.to_string());
+                    }
+```
+
+crates/server-http/src/http/serve.rs (L1996 to 2024)
+  Note: The streaming path treats STREAMING-AWS4-HMAC-SHA256-* payload hashes as signed aws-chunked uploads.
+```
+    match content_sha256 {
+        "UNSIGNED-PAYLOAD" => Ok(ChunkedMode::None),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+        | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {
+            // x-amz-decoded-content-length must be present and valid.
+            let expected_len_str = req
+                .header("x-amz-decoded-content-length")
+                .ok_or(ServerError::MissingContentLength)?;
+            let expected_len =
+                expected_len_str
+                    .parse::<u64>()
+                    .map_err(|_| ServerError::InvalidRequest {
+                        reason: format!("invalid x-amz-decoded-content-length: {expected_len_str}"),
+                    })?;
+            if expected_len > MAX_OBJECT_SIZE {
+                return Err(ServerError::ObjectTooLarge {
+                    size: expected_len,
+                    max: MAX_OBJECT_SIZE,
+                });
+            }
+
+            match content_sha256 {
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Ok(ChunkedMode::Signed { expected_len }),
+                "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => {
+                    Ok(ChunkedMode::SignedTrailer { expected_len })
+                }
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {
+                    Ok(ChunkedMode::UnsignedTrailer { expected_len })
+```
+
+crates/server-http/src/http/serve.rs (L3104 to 3107)
+  Note: The streaming decoder is created with ctx.streaming_signing, which comes from AuthContext.streaming and is None for presigned requests.
+```
+    };
+    // Build chunked decoder if needed.
+    let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
+    let mut payload_sha256_hasher = claimed_payload_sha256
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Medium is appropriate. The finding is validated by code and executable targeted tests: presigned session auth can return streaming=None while signed aws-chunked decoding only verifies chunk signatures when the context is present. The attack is remotely reachable through the S3 HTTP frontend where session credentials/presigned URLs are supported, but it requires possession or observation of a valid presigned session streaming upload and affects the integrity of that delegated object write only. It is not high/critical because it is not an unauthenticated S3 auth bypass, does not let the attacker select arbitrary unauthorized buckets/keys, and does not leak credentials or object data. Reachability in the current default binary is further limited by the absence of a discovered production STS issuance endpoint, but the affected code is in the in-scope product auth/upload path.
+## Likelihood
+high - The vulnerable code is on the network-facing S3 upload path and requires no session secret once a valid presigned session streaming request is available. However, exploitation depends on a specialized presigned temporary-credential aws-chunked upload; static review did not find a production STS AssumeRole endpoint or role configuration in the current argmin-s3 binary, so default-deployment reachability is narrower than a general S3 auth bypass. | Remote network vector
+## Impact
+medium - A successful exploit compromises integrity of the uploaded object body for a specific authorized presigned session upload. It does not disclose object data, forge arbitrary credentials, bypass bucket/key authorization outside the presigned request, or provide code execution.
+## Assumptions
+- The argmin-s3 frontend is deployed with its S3 HTTP listener reachable by clients or intermediaries.
+- A valid Argmin temporary/session credential and presigned PUT or UploadPart request exists for an object write.
+- The presigned request uses x-amz-content-sha256=STREAMING-AWS4-HMAC-SHA256-PAYLOAD or related signed aws-chunked streaming mode.
+- The attacker possesses or observes the presigned session upload request but does not possess the session secret key needed to compute per-chunk signatures.
+- The object write authorized by the presigned URL is security-relevant to the bucket owner or downstream consumers.
+- reachable S3 HTTP frontend
+- valid presigned session URL/request for a streaming signed upload
+- session token/temporary credential accepted by the identity provider
+- attacker can supply or modify the aws-chunked request body
+## Path
+attacker/presigned URL -> argmin-s3 HTTP -> authenticate_presigned(session OK, streaming=None) -> signed aws-chunked PUT -> decoder skips chunk HMACs -> tampered object bytes stored
+## Path evidence
+- `crates/auth/src/request.rs:368-373` - Header-auth session credentials explicitly reject STREAMING-* payload hashes, showing the unsupported session streaming mode is known and guarded in one path.
+- `crates/auth/src/request.rs:680-687` - Presigned authentication resolves the credential, including the reserved session credential path.
+- `crates/auth/src/request.rs:701-704` - Presigned authentication accepts x-amz-content-sha256 as the payload hash without a reserved-session STREAMING-* rejection.
+- `crates/auth/src/request.rs:751-762` - Presigned authentication returns AuthContext with streaming: None, so downstream chunk verification has no signing context.
+- `crates/auth/src/request.rs:785-792` - Reserved presigned access keys are authenticated as session credentials.
+- `crates/server-http/src/http/serve.rs:1996-2024` - The HTTP streaming path classifies STREAMING-AWS4-HMAC-SHA256-PAYLOAD and related values as signed aws-chunked uploads.
+- `crates/server-http/src/http/serve.rs:3105-3107` - The decoder is created with ctx.streaming_signing.as_ref(), propagating None from presigned auth.
+- `crates/server-http/src/http/chunked.rs:500-505` - Missing chunk-signature is rejected only when a streaming signing context exists.
+- `crates/server-http/src/http/chunked.rs:591-607` - Per-chunk HMAC verification is skipped entirely when self.streaming is None.
+- `crates/server-http/src/http/mod.rs:4123-4144` - Streaming PutObject preparation authenticates the HTTP request before handing body processing to the streaming path.
+- `crates/server-http/src/http/mod.rs:4274-4289` - The StreamingPutContext stores auth.streaming as streaming_signing, preserving the None value for presigned requests.
+- `crates/argmin-s3/src/main.rs:6663-6671` - The product binds a TCP listener from configuration for the S3 HTTP frontend.
+- `crates/argmin-s3/src/config.rs:378-383` - Configuration documents required credentials and the default ARGMIN_LISTEN_ADDR of 127.0.0.1:9000 with TLS unset by default.
+- `plans/in-memory-sts-and-iam-foundations.md:4-7` - Repository plan states the STS/session implementation is in progress and initially targets a test-enablement vertical slice, limiting default production reachability.
+## Narrative
+The finding is a real integrity vulnerability in product authentication and streaming-upload code. Header-auth session requests explicitly reject reserved session credentials with STREAMING-* payload hashes, but the presigned path resolves reserved session credentials, accepts x-amz-content-sha256 values including STREAMING-*, and returns AuthContext.streaming=None. The HTTP streaming path then treats STREAMING-AWS4-HMAC-SHA256-PAYLOAD as signed aws-chunked and builds the chunk decoder from ctx.streaming_signing. In chunked.rs, missing chunk-signature fields and HMAC verification are conditional on a non-None streaming context, so the presigned session path can authenticate the seed request while skipping per-chunk integrity checks. The practical impact is integrity compromise of the object body within the scope of a valid delegated presigned session upload, not a general authentication bypass or arbitrary bucket/key write.
+## Controls
+- SigV4 authentication
+- presigned URL expiry and scope validation
+- bucket/object authorization after authentication
+- header-auth session STREAMING-* rejection
+- per-chunk HMAC verification when StreamingSigningContext is present
+- MAX_OBJECT_SIZE checks
+- connection and in-flight request limits
+- optional TLS
+- non-root process startup check
+## Blindspots
+- Static-only review; no live deployment, runtime configuration, or ingress/LB manifests were present.
+- No repository IaC was found to determine whether argmin-s3 is normally exposed publicly or only on localhost/internal networks.
+- Validation PoC was executable at the Rust test/API level; it was not an end-to-end running-server HTTP exploit in the provided evidence.
+- Static review did not find a production STS AssumeRole HTTP endpoint or configured role store in the current argmin-s3 binary, so real-world reachability depends on session credential issuance/embedding not fully visible here.
+- No cloud APIs were called; exposure and identity conclusions are limited to repository artifacts.
