@@ -25,6 +25,10 @@ use crate::data_dir::prepare_private_data_dir;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    PutObjectMetadataMutation, DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
+    DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
+    INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node_client::{
     complete_multipart_expected_object_parts, BucketMetadataNodeClient,
@@ -36,9 +40,10 @@ use crate::node_client::{
     BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
-    MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
-    ObjectMutationMetadataNodeClient, ObjectReadMetadataNodeClient,
-    ObjectVersionMetadataNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
+    MetadataCommandNodeClient, ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
+    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
+    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, ShardAckNodeClient,
+    ShardScavengerNodeClient,
 };
 use crate::node_runtime::pg_store::{MetadataCommandCheckpoint, PgStore};
 use crate::node_runtime::traits::DurableBucketWriteReservationAcquire;
@@ -3626,6 +3631,30 @@ impl StorageNodeActiveObjectRoute<'_> {
 }
 
 impl StorageNodeActivePrimaryObjectRoute<'_> {
+    fn require_object_mutation_proof(
+        &self,
+        bucket_write_reservation: &BucketWriteReservationProof,
+        expected_operation_kind: &'static str,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        if bucket_write_reservation.bucket != *self.route.bucket
+            || bucket_write_reservation.cluster_epoch != self.route.fence.cluster_epoch
+            || bucket_write_reservation.operation_kind != expected_operation_kind
+            || bucket_write_reservation.target_context.as_deref() != Some(self.route.key.as_str())
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} bucket write reservation proof does not match the active object route, epoch, or operation"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
     fn next_generation_id(&self) -> Result<GenerationId, StorageNodeObjectRouteError> {
         self.route.require_valid_now()?;
         let local_client = LocalStorageNodeClient::new(
@@ -3721,6 +3750,227 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             version_id,
             expected_identity,
             authorized_version_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_put_object_metadata_snapshot(
+        &self,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<crate::StoredObject, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            version_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_current_object_delete_snapshot(
+        &self,
+    ) -> Result<ObjectDeleteStorageSnapshot, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_specific_object_delete_snapshot(
+        &self,
+        version_id: s3_types::VersionId,
+    ) -> Result<ObjectDeleteStorageSnapshot, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_specific_object_delete_snapshot(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            version_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn build_put_object_metadata_command(
+        &self,
+        requested_version_id: Option<s3_types::VersionId>,
+        expected_stored: &crate::StoredObject,
+        version_id: s3_types::VersionId,
+        mutation: PutObjectMetadataMutation,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+            "object metadata PUT command build",
+        )?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
+            &local_client,
+            BuildPutObjectMetadataCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                bucket: self.route.bucket,
+                key: self.route.key,
+                requested_version_id,
+                expected_stored,
+                version_id,
+                mutation,
+                bucket_write_reservation,
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn build_delete_specific_object_version_command(
+        &self,
+        version_id: s3_types::VersionId,
+        expected_stored: Option<&crate::StoredObject>,
+        expected_target: Option<&crate::metadata_command::DeleteObjectVersionTarget>,
+        expected_version_list: Option<&[crate::StoredObject]>,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<Option<MetadataCommandEnvelope>, StorageNodeObjectRouteError> {
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
+            "delete-specific object command build",
+        )?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_delete_specific_object_version_command(
+            &local_client,
+            BuildDeleteSpecificObjectVersionCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                bucket: self.route.bucket,
+                key: self.route.key,
+                version_id,
+                expected_stored,
+                expected_target,
+                expected_version_list,
+                bucket_write_reservation,
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn build_delete_current_object_command(
+        &self,
+        expected_current: Option<&crate::StoredObject>,
+        expected_target: Option<&crate::metadata_command::DeleteObjectVersionTarget>,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<Option<MetadataCommandEnvelope>, StorageNodeObjectRouteError> {
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
+            "delete-current object command build",
+        )?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_delete_current_object_command(
+            &local_client,
+            BuildDeleteCurrentObjectCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                bucket: self.route.bucket,
+                key: self.route.key,
+                expected_current,
+                expected_target,
+                bucket_write_reservation,
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_insert_delete_marker_command(
+        &self,
+        expected_current: Option<&crate::StoredObject>,
+        version_id: s3_types::VersionId,
+        owner: &crate::OwnerIdentity,
+        stale_payload: InsertDeleteMarkerStalePayload,
+        expected_stale_payload_source: Option<&crate::StoredObject>,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+            "insert-delete-marker command build",
+        )?;
+        let stale_payload_matches_marker_version = match (&stale_payload, version_id) {
+            (
+                InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { .. },
+                s3_types::VersionId::Null,
+            ) => match expected_stale_payload_source {
+                None => true,
+                Some(crate::StoredObject::Live(record)) => {
+                    record.bucket == *self.route.bucket
+                        && record.key == *self.route.key
+                        && record.version_id.is_null()
+                }
+                Some(crate::StoredObject::DeleteMarker(_)) => false,
+            },
+            (InsertDeleteMarkerStalePayload::Explicit(None), s3_types::VersionId::Versioned(_)) => {
+                expected_stale_payload_source.is_none()
+            }
+            (InsertDeleteMarkerStalePayload::Explicit(Some(_)), _)
+            | (InsertDeleteMarkerStalePayload::Explicit(None), s3_types::VersionId::Null)
+            | (
+                InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { .. },
+                s3_types::VersionId::Versioned(_),
+            ) => false,
+        };
+        if !stale_payload_matches_marker_version {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "insert-delete-marker stale payload mode does not match the marker version or expected null live-object source".to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
+            &local_client,
+            BuildInsertDeleteMarkerCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                bucket: self.route.bucket,
+                key: self.route.key,
+                expected_current,
+                version_id,
+                owner,
+                stale_payload,
+                expected_stale_payload_source,
+                bucket_write_reservation,
+            },
         )
         .map_err(StorageNodeObjectRouteError::Object)
     }
@@ -4597,7 +4847,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad => {
                 match decode_put_object_metadata_snapshot_request(&frame.payload) {
-                    Ok(request) => self.put_object_metadata_snapshot_response(request),
+                    Ok(request) => {
+                        self.put_object_metadata_snapshot_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4606,7 +4858,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMetadataPutCommandBuild => {
                 match decode_put_object_metadata_command_build_request(&frame.payload) {
-                    Ok(request) => self.put_object_metadata_command_build_response(request),
+                    Ok(request) => {
+                        self.put_object_metadata_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4621,7 +4875,9 @@ impl StorageNodeConnectionHandler {
                         StorageRpcMessageKind::ObjectLifecycleVersionListLoad => {
                             self.object_lifecycle_version_list_response(request)
                         }
-                        _ => self.object_delete_snapshot_response(frame.kind, request),
+                        _ => {
+                            self.object_delete_snapshot_response(route_permit, frame.kind, request)
+                        }
                     },
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -4631,7 +4887,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectDeleteSpecificCommandBuild => {
                 match decode_delete_specific_object_command_build_request(&frame.payload) {
-                    Ok(request) => self.delete_specific_object_command_build_response(request),
+                    Ok(request) => {
+                        self.delete_specific_object_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4640,7 +4898,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectDeleteCurrentCommandBuild => {
                 match decode_delete_current_object_command_build_request(&frame.payload) {
-                    Ok(request) => self.delete_current_object_command_build_response(request),
+                    Ok(request) => {
+                        self.delete_current_object_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4649,7 +4909,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectInsertDeleteMarkerCommandBuild => {
                 match decode_insert_delete_marker_command_build_request(&frame.payload) {
-                    Ok(request) => self.insert_delete_marker_command_build_response(request),
+                    Ok(request) => {
+                        self.insert_delete_marker_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6945,36 +7207,26 @@ impl StorageNodeConnectionHandler {
 
     fn put_object_metadata_snapshot_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcPutObjectMetadataSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object metadata PUT snapshot load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let outcome = match ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            request.version_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let outcome = match route.load_put_object_metadata_snapshot(request.version_id) {
             Ok(stored) => StorageRpcPutObjectMetadataSnapshotOutcome::Loaded(Box::new(stored)),
-            Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound)) => {
-                StorageRpcPutObjectMetadataSnapshotOutcome::ObjectNotFound
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::ObjectNotFound,
+            ))) => StorageRpcPutObjectMetadataSnapshotOutcome::ObjectNotFound,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
         };
@@ -6986,36 +7238,33 @@ impl StorageNodeConnectionHandler {
 
     fn put_object_metadata_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcPutObjectMetadataCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "object metadata PUT command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response = match ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
-            &local_client,
-            BuildPutObjectMetadataCommandReq {
-                pg_id: self
-                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                cluster_epoch: request.object.cluster_epoch,
-                bucket: &request.object.bucket,
-                key: &request.object.key,
-                requested_version_id: request.requested_version_id,
-                expected_stored: &request.expected_stored,
-                version_id: request.version_id,
-                mutation: request.mutation,
-                bucket_write_reservation: &request.bucket_write_reservation,
-            },
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.build_put_object_metadata_command(
+            request.requested_version_id,
+            &request.expected_stored,
+            request.version_id,
+            request.mutation,
+            &request.bucket_write_reservation,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
-            Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 match object_metadata_command_build_error_outcome(error, Some("PutObjectMetadata"))
                 {
                     Ok(outcome) => outcome,
@@ -7031,33 +7280,21 @@ impl StorageNodeConnectionHandler {
 
     fn object_delete_snapshot_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         kind: StorageRpcMessageKind,
         request: StorageRpcObjectDeleteSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object delete snapshot load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let stored = match kind {
             StorageRpcMessageKind::ObjectDeleteCurrentSnapshotLoad => {
-                ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
-                    &local_client,
-                    self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                    &request.object.bucket,
-                    &request.object.key,
-                )
+                route.load_current_object_delete_snapshot()
             }
             StorageRpcMessageKind::ObjectDeleteSpecificSnapshotLoad => {
                 let Some(version_id) = request.version_id else {
@@ -7066,19 +7303,16 @@ impl StorageNodeConnectionHandler {
                         message: "specific delete snapshot requires version id".to_string(),
                     });
                 };
-                ObjectMutationMetadataNodeClient::load_specific_object_delete_snapshot(
-                    &local_client,
-                    self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                    &request.object.bucket,
-                    &request.object.key,
-                    version_id,
-                )
+                route.load_specific_object_delete_snapshot(version_id)
             }
             _ => unreachable!("object delete snapshot response called with non-delete kind"),
         };
         let snapshot = match stored {
             Ok(snapshot) => snapshot,
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
             }
         };
@@ -7135,47 +7369,45 @@ impl StorageNodeConnectionHandler {
 
     fn delete_specific_object_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcDeleteSpecificObjectCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "delete-specific object command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response =
-            match ObjectMutationMetadataNodeClient::build_delete_specific_object_version_command(
-                &local_client,
-                BuildDeleteSpecificObjectVersionCommandReq {
-                    pg_id: self
-                        .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                    cluster_epoch: request.object.cluster_epoch,
-                    bucket: &request.object.bucket,
-                    key: &request.object.key,
-                    version_id: request.version_id,
-                    expected_stored: request.expected_stored.as_ref(),
-                    expected_target: request.expected_target.as_ref(),
-                    expected_version_list: request.expected_version_list.as_deref(),
-                    bucket_write_reservation: &request.bucket_write_reservation,
-                },
-            ) {
-                Ok(Some(command)) => {
-                    StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
-                }
-                Ok(None) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
-                Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                    StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
-                }
-                Err(error) => match object_metadata_command_build_error_outcome(
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.build_delete_specific_object_version_command(
+            request.version_id,
+            request.expected_stored.as_ref(),
+            request.expected_target.as_ref(),
+            request.expected_version_list.as_deref(),
+            &request.bucket_write_reservation,
+        ) {
+            Ok(Some(command)) => {
+                StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
+            }
+            Ok(None) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                match object_metadata_command_build_error_outcome(
                     error,
                     Some("DeleteObjectVersion"),
                 ) {
                     Ok(outcome) => outcome,
                     Err(error) => return encode_storage_rpc_error_response(&error),
-                },
-            };
+                }
+            }
+        };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
         );
@@ -7184,43 +7416,42 @@ impl StorageNodeConnectionHandler {
 
     fn delete_current_object_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcDeleteCurrentObjectCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "delete-current object command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response = match ObjectMutationMetadataNodeClient::build_delete_current_object_command(
-            &local_client,
-            BuildDeleteCurrentObjectCommandReq {
-                pg_id: self
-                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                cluster_epoch: request.object.cluster_epoch,
-                bucket: &request.object.bucket,
-                key: &request.object.key,
-                expected_current: request.expected_current.as_ref(),
-                expected_target: request.expected_target.as_ref(),
-                bucket_write_reservation: &request.bucket_write_reservation,
-            },
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.build_delete_current_object_command(
+            request.expected_current.as_ref(),
+            request.expected_target.as_ref(),
+            &request.bucket_write_reservation,
         ) {
             Ok(Some(command)) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
             }
             Ok(None) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
-            Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(error) => match object_metadata_command_build_error_outcome(
-                error,
-                Some("DeleteObjectVersion"),
-            ) {
-                Ok(outcome) => outcome,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            },
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                match object_metadata_command_build_error_outcome(
+                    error,
+                    Some("DeleteObjectVersion"),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -7230,15 +7461,18 @@ impl StorageNodeConnectionHandler {
 
     fn insert_delete_marker_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcInsertDeleteMarkerCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "insert-delete-marker command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let stale_payload = match request.stale_payload {
             crate::storage_rpc::StorageRpcInsertDeleteMarkerStalePayload::Explicit(reclaim) => {
                 InsertDeleteMarkerStalePayload::Explicit(reclaim)
@@ -7247,28 +7481,22 @@ impl StorageNodeConnectionHandler {
                 created_at,
             } => InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive { created_at },
         };
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response = match ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
-            &local_client,
-            BuildInsertDeleteMarkerCommandReq {
-                pg_id: self
-                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                cluster_epoch: request.object.cluster_epoch,
-                bucket: &request.object.bucket,
-                key: &request.object.key,
-                expected_current: request.expected_current.as_ref(),
-                version_id: request.version_id,
-                owner: &request.owner,
-                stale_payload,
-                expected_stale_payload_source: request.expected_stale_payload_source.as_ref(),
-                bucket_write_reservation: &request.bucket_write_reservation,
-            },
+        let response = match route.build_insert_delete_marker_command(
+            request.expected_current.as_ref(),
+            request.version_id,
+            &request.owner,
+            stale_payload,
+            request.expected_stale_payload_source.as_ref(),
+            &request.bucket_write_reservation,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
-            Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 match object_metadata_command_build_error_outcome(error, Some("InsertDeleteMarker"))
                 {
                     Ok(outcome) => outcome,
@@ -13302,6 +13530,24 @@ impl StorageNodeConnectionHandler {
         Ok(StorageNodeActivePrimaryObjectRoute { route })
     }
 
+    fn active_primary_object_mutation_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcObjectRequest,
+        bucket_write_reservation: &BucketWriteReservationProof,
+        operation: &'static str,
+    ) -> Result<StorageNodeActivePrimaryObjectRoute<'a>, StorageRpcErrorResponse> {
+        if request.bucket != bucket_write_reservation.bucket {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} bucket write reservation proof does not match object bucket"
+                ),
+            });
+        }
+        self.active_primary_object_route(route_permit, request, operation)
+    }
+
     fn retained_bucket_write_reservation_route<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -18458,6 +18704,14 @@ mod tests {
             lease_deadline: 4_000,
             target_context: Some(key.as_str().to_string()),
         };
+        let mut metadata_proof = proof.clone();
+        metadata_proof.operation_kind = "put-object-metadata".to_string();
+        let mut delete_current_proof = proof.clone();
+        delete_current_proof.operation_kind = "delete-current-object".to_string();
+        let mut delete_specific_proof = proof.clone();
+        delete_specific_proof.operation_kind = "delete-object-version".to_string();
+        let mut marker_proof = proof.clone();
+        marker_proof.operation_kind = "insert-delete-marker".to_string();
         let direct_put_request = crate::CommitDirectPutObjectReq {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -18654,6 +18908,103 @@ mod tests {
             subject
         });
 
+        let (metadata_stored, current_delete_snapshot, specific_delete_snapshot) =
+            crate::clock::with_time_override(1_000, || {
+                let metadata_stored = primary_route
+                    .load_put_object_metadata_snapshot(None)
+                    .unwrap();
+                let current = primary_route.load_current_object_delete_snapshot().unwrap();
+                let specific = primary_route
+                    .load_specific_object_delete_snapshot(VersionId::Null)
+                    .unwrap();
+                assert_eq!(current.stored.as_ref(), Some(&metadata_stored));
+                assert_eq!(specific, current);
+                (metadata_stored, current, specific)
+            });
+
+        let mut mismatched_mutation_proof = metadata_proof.clone();
+        mismatched_mutation_proof.bucket =
+            crate::tests::bucket_name("different-mutation-proof-bucket");
+        let mutation_proof_mismatch = crate::clock::with_time_override(1_000, || {
+            primary_route.build_put_object_metadata_command(
+                None,
+                &metadata_stored,
+                VersionId::Null,
+                PutObjectMetadataMutation::PutTags(serialized_tags.to_string()),
+                &mismatched_mutation_proof,
+            )
+        });
+        match mutation_proof_mismatch {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => {
+                panic!("mismatched mutation proof must fail at the route capability: {other:?}")
+            }
+        }
+
+        let mut wrong_operation_proof = metadata_proof.clone();
+        wrong_operation_proof.operation_kind = "delete-object-version".to_string();
+        let mut wrong_target_proof = metadata_proof.clone();
+        wrong_target_proof.target_context = Some("different-object-key".to_string());
+        let mut wrong_epoch_proof = metadata_proof.clone();
+        wrong_epoch_proof.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        for (mismatch, mismatched_proof) in [
+            ("operation", wrong_operation_proof),
+            ("target", wrong_target_proof),
+            ("epoch", wrong_epoch_proof),
+        ] {
+            let result = crate::clock::with_time_override(1_000, || {
+                primary_route.build_put_object_metadata_command(
+                    None,
+                    &metadata_stored,
+                    VersionId::Null,
+                    PutObjectMetadataMutation::PutTags(serialized_tags.to_string()),
+                    &mismatched_proof,
+                )
+            });
+            match result {
+                Err(StorageNodeObjectRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                    assert!(error.message.contains("proof does not match"));
+                }
+                other => panic!(
+                    "same-bucket mutation proof with mismatched {mismatch} must fail: {other:?}"
+                ),
+            }
+        }
+
+        let stale_payload_mismatch = crate::clock::with_time_override(1_000, || {
+            primary_route.build_insert_delete_marker_command(
+                current_delete_snapshot.stored.as_ref(),
+                VersionId::from_u64(2),
+                &crate::OwnerIdentity::from_principal("active-object-route-owner"),
+                InsertDeleteMarkerStalePayload::Explicit(Some(
+                    crate::metadata_command::ObjectPayloadReclaimCommand::Segments(
+                        crate::ObjectSegmentsReclaimRecord {
+                            bucket: crate::tests::bucket_name("different-stale-payload-bucket"),
+                            key: key.clone(),
+                            generation_id: GenerationId::new(9).unwrap(),
+                            created_at: 1_000,
+                            segments: Vec::new(),
+                        },
+                    ),
+                )),
+                None,
+                &marker_proof,
+            )
+        });
+        match stale_payload_mismatch {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("stale payload mode does not match"));
+            }
+            other => {
+                panic!("mismatched stale payload must fail at the route capability: {other:?}")
+            }
+        }
+
         let mut extended = config.clone();
         extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
         crate::clock::with_time_override(1_000, || {
@@ -18718,6 +19069,71 @@ mod tests {
                     "object tags load",
                     primary_route
                         .get_object_tags_for_subject(None, &read_subject.identity, VersionId::Null)
+                        .map(|_| ()),
+                ),
+                (
+                    "object metadata PUT snapshot load",
+                    primary_route
+                        .load_put_object_metadata_snapshot(None)
+                        .map(|_| ()),
+                ),
+                (
+                    "current object delete snapshot load",
+                    primary_route
+                        .load_current_object_delete_snapshot()
+                        .map(|_| ()),
+                ),
+                (
+                    "specific object delete snapshot load",
+                    primary_route
+                        .load_specific_object_delete_snapshot(VersionId::Null)
+                        .map(|_| ()),
+                ),
+                (
+                    "object metadata PUT command build",
+                    primary_route
+                        .build_put_object_metadata_command(
+                            None,
+                            &metadata_stored,
+                            VersionId::Null,
+                            PutObjectMetadataMutation::PutTags(serialized_tags.to_string()),
+                            &metadata_proof,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "current object delete command build",
+                    primary_route
+                        .build_delete_current_object_command(
+                            current_delete_snapshot.stored.as_ref(),
+                            current_delete_snapshot.target.as_ref(),
+                            &delete_current_proof,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "specific object delete command build",
+                    primary_route
+                        .build_delete_specific_object_version_command(
+                            VersionId::Null,
+                            specific_delete_snapshot.stored.as_ref(),
+                            specific_delete_snapshot.target.as_ref(),
+                            None,
+                            &delete_specific_proof,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "insert delete marker command build",
+                    primary_route
+                        .build_insert_delete_marker_command(
+                            current_delete_snapshot.stored.as_ref(),
+                            VersionId::from_u64(2),
+                            &crate::OwnerIdentity::from_principal("active-object-route-owner"),
+                            InsertDeleteMarkerStalePayload::Explicit(None),
+                            None,
+                            &marker_proof,
+                        )
                         .map(|_| ()),
                 ),
             ];

@@ -21,6 +21,10 @@ use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
     ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
     PutObjectMetadataMutation, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
+    DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
+    INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node::ReclaimQueueInsert;
 use crate::node_client::{
@@ -8364,7 +8368,7 @@ impl super::StorageCluster {
 
             let reservation = match self.acquire_durable_bucket_write_reservation(
                 bucket,
-                "put-object-metadata",
+                PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
                 Some(key.as_str()),
             ) {
                 Ok(reservation) => reservation,
@@ -8915,7 +8919,7 @@ impl super::StorageCluster {
                 .acquire_bucket_write_proof_for_object_metadata_command(
                     bucket,
                     key,
-                    "delete-object-version",
+                    DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
                 )? {
                 Some(proof) => proof,
                 None => continue,
@@ -9079,7 +9083,7 @@ impl super::StorageCluster {
                 .acquire_bucket_write_proof_for_object_metadata_command(
                     bucket,
                     key,
-                    "delete-current-object",
+                    DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
                 )? {
                 Some(proof) => proof,
                 None => continue,
@@ -9247,7 +9251,7 @@ impl super::StorageCluster {
                 .acquire_bucket_write_proof_for_object_metadata_command(
                     bucket,
                     key,
-                    "insert-delete-marker",
+                    INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
                 )? {
                 Some(proof) => proof,
                 None => continue,

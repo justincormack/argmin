@@ -525,7 +525,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..27)
+    let server_threads: Vec<_> = (0..35)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -678,6 +678,12 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         lease_deadline: 20,
         target_context: Some(key.as_str().to_string()),
     };
+    let mut delete_current_proof = metadata_proof.clone();
+    delete_current_proof.operation_kind = "delete-current-object".to_string();
+    let mut delete_specific_proof = metadata_proof.clone();
+    delete_specific_proof.operation_kind = "delete-object-version".to_string();
+    let mut marker_proof = metadata_proof.clone();
+    marker_proof.operation_kind = "insert-delete-marker".to_string();
     let current_delete_snapshot =
         ObjectMutationMetadataNodeClient::load_current_object_delete_snapshot(
             &client,
@@ -896,7 +902,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
                 key: &key,
                 expected_current: current_delete_snapshot.stored.as_ref(),
                 expected_target: current_delete_snapshot.target.as_ref(),
-                bucket_write_reservation: &metadata_proof,
+                bucket_write_reservation: &delete_current_proof,
             },
         )
         .unwrap_err();
@@ -920,7 +926,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
                 expected_stored: specific_delete_snapshot.stored.as_ref(),
                 expected_target: specific_delete_snapshot.target.as_ref(),
                 expected_version_list: None,
-                bucket_write_reservation: &metadata_proof,
+                bucket_write_reservation: &delete_specific_proof,
             },
         )
         .unwrap_err();
@@ -946,7 +952,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
                 owner: &owner,
                 stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
                 expected_stale_payload_source: None,
-                bucket_write_reservation: &metadata_proof,
+                bucket_write_reservation: &marker_proof,
             },
         )
         .unwrap_err();
@@ -957,6 +963,186 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             ..
         })
     ));
+
+    let mismatched_stale_payload_error =
+        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
+            &client,
+            BuildInsertDeleteMarkerCommandReq {
+                pg_id: correct_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                expected_current: current_delete_snapshot.stored.as_ref(),
+                version_id: VersionId::from_u64(2),
+                owner: &owner,
+                stale_payload: InsertDeleteMarkerStalePayload::Explicit(Some(
+                    ObjectPayloadReclaimCommand::Segments(ObjectSegmentsReclaimRecord {
+                        bucket: crate::tests::bucket_name("wrong-stale-payload-bucket"),
+                        key: key.clone(),
+                        generation_id: GenerationId::new(9).unwrap(),
+                        created_at: 1_000,
+                        segments: Vec::new(),
+                    }),
+                )),
+                expected_stale_payload_source: None,
+                bucket_write_reservation: &marker_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        mismatched_stale_payload_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let null_marker_without_snapshot_error =
+        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
+            &client,
+            BuildInsertDeleteMarkerCommandReq {
+                pg_id: correct_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                expected_current: current_delete_snapshot.stored.as_ref(),
+                version_id: VersionId::Null,
+                owner: &owner,
+                stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
+                expected_stale_payload_source: None,
+                bucket_write_reservation: &marker_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        null_marker_without_snapshot_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let numbered_marker_with_snapshot_error =
+        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
+            &client,
+            BuildInsertDeleteMarkerCommandReq {
+                pg_id: correct_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                expected_current: current_delete_snapshot.stored.as_ref(),
+                version_id: VersionId::from_u64(2),
+                owner: &owner,
+                stale_payload: InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
+                    created_at: 10,
+                },
+                expected_stale_payload_source: current_delete_snapshot.stored.as_ref(),
+                bucket_write_reservation: &marker_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        numbered_marker_with_snapshot_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let numbered_marker_with_source_error =
+        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
+            &client,
+            BuildInsertDeleteMarkerCommandReq {
+                pg_id: correct_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                expected_current: current_delete_snapshot.stored.as_ref(),
+                version_id: VersionId::from_u64(2),
+                owner: &owner,
+                stale_payload: InsertDeleteMarkerStalePayload::Explicit(None),
+                expected_stale_payload_source: current_delete_snapshot.stored.as_ref(),
+                bucket_write_reservation: &marker_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        numbered_marker_with_source_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let mut versioned_stale_source = metadata_stored.clone();
+    let StoredObject::Live(versioned_stale_record) = &mut versioned_stale_source else {
+        panic!("seeded metadata object must be live");
+    };
+    versioned_stale_record.version_id = VersionId::from_u64(3);
+    let null_marker_with_versioned_source_error =
+        ObjectMutationMetadataNodeClient::build_insert_delete_marker_command(
+            &client,
+            BuildInsertDeleteMarkerCommandReq {
+                pg_id: correct_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                expected_current: current_delete_snapshot.stored.as_ref(),
+                version_id: VersionId::Null,
+                owner: &owner,
+                stale_payload: InsertDeleteMarkerStalePayload::SnapshotCurrentNullLive {
+                    created_at: 10,
+                },
+                expected_stale_payload_source: Some(&versioned_stale_source),
+                bucket_write_reservation: &marker_proof,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        null_marker_with_versioned_source_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let mut wrong_operation_proof = metadata_proof.clone();
+    wrong_operation_proof.operation_kind = "delete-object-version".to_string();
+    let mut wrong_target_proof = metadata_proof.clone();
+    wrong_target_proof.target_context = Some("same-bucket-other-key".to_string());
+    let mut wrong_epoch_proof = metadata_proof.clone();
+    wrong_epoch_proof.cluster_epoch = ClusterEpoch::new(2).unwrap();
+    for (mismatch, proof) in [
+        ("operation", wrong_operation_proof),
+        ("target", wrong_target_proof),
+        ("epoch", wrong_epoch_proof),
+    ] {
+        let error = ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
+            &client,
+            BuildPutObjectMetadataCommandReq {
+                pg_id: correct_object_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                requested_version_id: None,
+                expected_stored: &metadata_stored,
+                version_id: VersionId::Null,
+                mutation: PutObjectMetadataMutation::PutTags("<Tagging/>".to_string()),
+                bucket_write_reservation: &proof,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                })
+            ),
+            "same-bucket proof with mismatched {mismatch} must fail as PayloadDecode: {error:?}"
+        );
+    }
 
     let metadata_command_error =
         ObjectMutationMetadataNodeClient::build_put_object_metadata_command(
@@ -2089,6 +2275,10 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         lease_deadline: 20,
         target_context: Some(key.as_str().to_string()),
     };
+    let mut metadata_proof = proof.clone();
+    metadata_proof.operation_kind = "put-object-metadata".to_string();
+    let mut delete_current_proof = proof.clone();
+    delete_current_proof.operation_kind = "delete-current-object".to_string();
 
     let stored = ObjectMutationMetadataNodeClient::load_put_object_metadata_snapshot(
         &client,
@@ -2112,7 +2302,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             expected_stored: &stored,
             version_id: VersionId::Null,
             mutation: PutObjectMetadataMutation::PutTags("<Tagging/>".to_string()),
-            bucket_write_reservation: &proof,
+            bucket_write_reservation: &metadata_proof,
         },
     )
     .unwrap();
@@ -2245,7 +2435,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
             key: &key,
             expected_current: current.stored.as_ref(),
             expected_target: current.target.as_ref(),
-            bucket_write_reservation: &proof,
+            bucket_write_reservation: &delete_current_proof,
         },
     )
     .unwrap()

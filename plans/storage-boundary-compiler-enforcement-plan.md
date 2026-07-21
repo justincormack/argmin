@@ -1628,6 +1628,50 @@ Thirty-first Phase 3 slice:
   workspace-wide strict Clippy, and the full parallel workspace suite (7,422
   tests).
 
+Thirty-second Phase 3 slice:
+
+- object-metadata PUT and current/specific object-delete snapshot loading now
+  consume the exact `StorageNodeActivePrimaryObjectRoute` established from
+  the frame. Metadata PUT, current/specific delete, and delete-marker command
+  construction use the same capability and derive their trusted
+  `ObjectMetadataPgId`, command epoch, bucket, and key from it rather than
+  decoded request fields.
+- command capability construction preserves the existing fail-closed
+  precedence by rejecting a reservation proof for another bucket before route
+  validation. Each command effect revalidates the immutable captured deadline
+  and binds the proof's epoch, operation kind, bucket, and exact object-key
+  target immediately before reaching the local node client, so a same-bucket
+  proof from another operation, object, or epoch cannot be substituted after
+  capability construction.
+- capability migration exposed an additional identity gap: the explicit
+  stale-payload form of an insert-delete-marker request could supply an
+  arbitrary reclaim record, including another bucket/key or another retained
+  generation of the same object. Storage-node capability paths now reject
+  every explicit payload record as exact `PayloadDecode` before command
+  allocation. They additionally bind reclaim mode to marker identity: a null
+  marker must derive reclaim from the current null live-object snapshot, while
+  a numbered marker must carry no reclaim or expected source. Any supplied
+  snapshot source must itself be a null live object for the exact routed
+  subject.
+- the deterministic active-object regression positively loads all three
+  mutation snapshots, rejects substituted proof and stale-payload subjects,
+  renews the raw same-epoch route, and proves all seven snapshot/command
+  effects fail at the capability's original deadline. The Unix wire
+  regression independently pins stale-payload substitution, crossed null and
+  numbered marker reclaim modes, and same-bucket operation/key/epoch proof
+  substitution, while existing positive and equivalent-state wrong-PG
+  coverage exercises the complete converted handler family before node
+  access.
+- lifecycle object-version scans, stream and multipart mutations, payload
+  reclaim, remaining object mutations, listing scans, data operations,
+  frontend capability migration, and capability requirements on node-client
+  traits remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  active-object mutation deadline/substitution regression, both Unix mutation
+  positive and equivalent-state wrong-PG regressions, all 2,199 storage tests,
+  workspace-wide strict Clippy, and the full parallel workspace suite (7,422
+  tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
