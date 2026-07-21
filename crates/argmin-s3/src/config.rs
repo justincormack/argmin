@@ -4,8 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use storage::control_plane::{InitialClusterTopologyCertificate, MAX_HEARTBEAT_LEASE_MS};
+use storage::control_plane_raft::ControlPlaneRaftPeerFrameTransport;
 use storage::control_plane_raft::ControlPlaneRaftPeerTransportLimits;
 use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS;
 use storage::LocalUnixStorageNodeClientConfig;
@@ -51,6 +53,56 @@ pub(crate) struct ConfiguredStorageNodeSocket {
 pub(crate) struct ConfiguredControlPlaneRaftPeerSocket {
     pub(crate) node_id: u64,
     pub(crate) socket_path: String,
+}
+
+#[derive(Clone)]
+pub(crate) enum ConfiguredControlPlaneRaftPeerListener {
+    Unix {
+        endpoint_id: String,
+        socket_path: String,
+        max_connections: usize,
+        io_timeout: Duration,
+    },
+    Tcp {
+        endpoint_id: String,
+        bind_addr: String,
+        tls_server_config: Arc<rustls::ServerConfig>,
+        max_connections: usize,
+        io_timeout: Duration,
+    },
+}
+
+impl fmt::Debug for ConfiguredControlPlaneRaftPeerListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unix {
+                endpoint_id,
+                socket_path,
+                max_connections,
+                io_timeout,
+            } => f
+                .debug_struct("ConfiguredControlPlaneRaftPeerListener::Unix")
+                .field("endpoint_id", endpoint_id)
+                .field("socket_path", socket_path)
+                .field("max_connections", max_connections)
+                .field("io_timeout", io_timeout)
+                .finish(),
+            Self::Tcp {
+                endpoint_id,
+                bind_addr,
+                max_connections,
+                io_timeout,
+                ..
+            } => f
+                .debug_struct("ConfiguredControlPlaneRaftPeerListener::Tcp")
+                .field("endpoint_id", endpoint_id)
+                .field("bind_addr", bind_addr)
+                .field("tls", &true)
+                .field("max_connections", max_connections)
+                .field("io_timeout", io_timeout)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -350,6 +402,9 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_raft_node_id: Option<u64>,
     pub(crate) control_plane_raft_peer_socket_path: Option<String>,
     pub(crate) control_plane_raft_peer_sockets: Vec<ConfiguredControlPlaneRaftPeerSocket>,
+    pub(crate) control_plane_raft_peer_listeners: Vec<ConfiguredControlPlaneRaftPeerListener>,
+    pub(crate) control_plane_raft_peer_frame_transport:
+        Option<Arc<dyn ControlPlaneRaftPeerFrameTransport>>,
     pub(crate) control_plane_raft_peer_transport_limits: ControlPlaneRaftPeerTransportLimits,
     pub(crate) control_plane_raft_peer_max_connections: usize,
     pub(crate) control_plane_raft_peer_connect_timeout: Duration,
@@ -1024,6 +1079,8 @@ impl ServerConfig {
             control_plane_raft_node_id,
             control_plane_raft_peer_socket_path,
             control_plane_raft_peer_sockets,
+            control_plane_raft_peer_listeners: Vec::new(),
+            control_plane_raft_peer_frame_transport: None,
             control_plane_raft_peer_transport_limits: ControlPlaneRaftPeerTransportLimits::default(
             ),
             control_plane_raft_peer_max_connections: 64,

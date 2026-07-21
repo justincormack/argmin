@@ -952,8 +952,9 @@ Progress as of 2026-07-21:
   mapping consumes resolved binary credential bytes directly, keeps verifier
   credentials distinct from the manifest-selected signer during rotation, and
   never converts secrets back into legacy env-style strings. Storage/frontend
-  activation and TLS/TCP construction remain open.
-- Slice 6's Raft transport-planning sub-slice is implemented: the validated
+  activation and non-Raft TLS/TCP construction remain open.
+- Slice 6's Raft transport-planning and activation sub-slices are implemented:
+  the validated
   manifest resolves the canonical globally reachable endpoint for every voter
   into one immutable selected-process plan while preserving its endpoint id,
   owner, and address. Canonical addresses must be unique between voters and
@@ -965,13 +966,26 @@ Progress as of 2026-07-21:
   TLS 1.3 only, the `argmin-raft/1` ALPN, the configured server name and root
   store, and no ambient system roots or TLS client identity. An in-memory
   handshake regression proves certificate trust, name verification, ALPN, and
-  encrypted application-data agreement. The existing Unix authority mapping
-  consumes this common plan but continues to reject any outbound TCP peer or
-  selected-process TCP listener, across Raft, ordinary control-plane, and
-  clock-recovery protocols, rather than silently leaving configured listeners
-  unbound;
-  listener/network activation and deadline-bounded TCP connection handling are
-  the next sub-slice.
+  encrypted application-data agreement. OpenRaft now uses a transport-neutral
+  authenticated frame-exchange boundary. Static replicated authorities can
+  bind every configured local Raft Unix or TLS/TCP listener and can select one
+  canonical all-Unix or all-TCP peer map. TLS/TCP client exchange uses one
+  absolute OpenRaft deadline across DNS/connect, TLS handshake, complete frame
+  write, and complete bounded frame read. Inbound connections use one absolute
+  accept-to-response deadline across handshake, frame I/O, and Raft dispatch;
+  both sides require successful `argmin-raft/1` ALPN negotiation. A shared
+  process-wide encoded-frame byte budget is reserved from the authenticated
+  frame length before allocation and held through authentication, bounding
+  unauthenticated memory independently of listener count. Each listener also
+  enforces its configured connection limit, and frame-exchange diagnostics
+  expose lengths and routing metadata without payload or authenticator bytes.
+  Focused tests cover custom transport dispatch, canonical manifest mapping,
+  listener binding, successful TLS framing, omitted ALPN, a stalled handshake,
+  absolute trickle deadlines, pre-authentication budget exhaustion, and debug
+  redaction. Ordinary control-plane, authority-clock-recovery, and
+  storage TCP listeners remain rejected rather than silently unbound. Because
+  those RPC families are still Unix-only, this sub-slice intentionally does
+  not claim a deployable cross-host authority or data-plane workload.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state
@@ -1058,12 +1072,16 @@ Progress as of 2026-07-21:
    - enforce replicated and TCP mandatory-auth policy; and
    - prove diagnostics and errors remain redacted.
 6. **Authenticated TCP control-plane transport**
-   - add TCP Raft peer and control-plane listeners/clients using the same
-     protocol/auth dispatch boundaries as Unix;
+   - add TCP Raft peer listeners/clients using the same protocol/auth dispatch
+     boundaries as Unix (implemented);
+   - add ordinary control-plane and authority-clock-recovery TLS/TCP
+     listeners/clients;
    - enforce endpoint source/target/cluster/topology identity before dispatch;
    - reject fresh-manifest peers whose topology generation or digest differs;
      and
-   - run the first three-host authority workload.
+   - run the first three-host authority workload after every control-plane RPC
+     needed for startup, routing, diagnostics, and explicit clock recovery has
+     a routable authenticated transport.
 7. **Storage RPC auth and TCP**
    - implement the transport-independent storage authorization slice over Unix;
    - reuse it unchanged over TCP; and
