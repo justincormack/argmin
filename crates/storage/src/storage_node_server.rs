@@ -3660,6 +3660,71 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
+    fn load_object_read_auth_subject(
+        &self,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<crate::ObjectReadAuthSubject, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectReadMetadataNodeClient::load_object_read_auth_subject(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            version_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_object_read_snapshot_for_subject(
+        &self,
+        version_id: Option<s3_types::VersionId>,
+        expected_identity: &crate::ObjectReadAuthSubjectIdentity,
+        snapshot_mode: crate::ObjectReadSnapshotMode,
+    ) -> Result<crate::ObjectReadSnapshot, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            version_id,
+            expected_identity,
+            snapshot_mode,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn get_object_tags_for_subject(
+        &self,
+        version_id: Option<s3_types::VersionId>,
+        expected_identity: &crate::ObjectReadAuthSubjectIdentity,
+        authorized_version_id: s3_types::VersionId,
+    ) -> Result<Option<String>, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectReadMetadataNodeClient::get_object_tags_for_subject(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            version_id,
+            expected_identity,
+            authorized_version_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn load_direct_put_commit_snapshot(
         &self,
         reservation_id: &SessionId,
@@ -4505,7 +4570,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectReadAuthSubjectLoad => {
                 match decode_object_read_auth_subject_request(&frame.payload) {
-                    Ok(request) => self.object_read_auth_subject_response(request),
+                    Ok(request) => self.object_read_auth_subject_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4514,7 +4579,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectReadSnapshotLoad => {
                 match decode_object_read_snapshot_request(&frame.payload) {
-                    Ok(request) => self.object_read_snapshot_response(request),
+                    Ok(request) => self.object_read_snapshot_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -4523,7 +4588,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectTagsForSubjectLoad => {
                 match decode_object_tags_for_subject_request(&frame.payload) {
-                    Ok(request) => self.object_tags_for_subject_response(request),
+                    Ok(request) => self.object_tags_for_subject_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8641,31 +8706,18 @@ impl StorageNodeConnectionHandler {
 
     fn object_read_auth_subject_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectReadAuthSubjectRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object read auth subject load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match ObjectReadMetadataNodeClient::load_object_read_auth_subject(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            request.version_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.load_object_read_auth_subject(request.version_id) {
             Ok(subject) => {
                 let payload = encode_object_read_auth_subject_response(
                     &StorageRpcObjectReadAuthSubjectResponse {
@@ -8674,7 +8726,9 @@ impl StorageNodeConnectionHandler {
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound)) => {
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::ObjectNotFound,
+            ))) => {
                 let payload = encode_object_read_auth_subject_response(
                     &StorageRpcObjectReadAuthSubjectResponse {
                         outcome: StorageRpcObjectReadAuthSubjectOutcome::ObjectNotFound,
@@ -8682,35 +8736,29 @@ impl StorageNodeConnectionHandler {
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
         }
     }
 
     fn object_read_snapshot_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectReadSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object read snapshot load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match ObjectReadMetadataNodeClient::load_object_read_snapshot_for_subject(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.load_object_read_snapshot_for_subject(
             request.version_id,
             &request.expected_identity,
             request.snapshot_mode,
@@ -8722,42 +8770,38 @@ impl StorageNodeConnectionHandler {
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(ObjectPgActionError::StaleObjectReadSubject) => {
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => {
                 let payload =
                     encode_object_read_snapshot_response(&StorageRpcObjectReadSnapshotResponse {
                         outcome: StorageRpcObjectReadSnapshotOutcome::StaleSubject,
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
         }
     }
 
     fn object_tags_for_subject_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectTagsForSubjectRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object tags for subject load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match ObjectReadMetadataNodeClient::get_object_tags_for_subject(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.get_object_tags_for_subject(
             request.version_id,
             &request.expected_identity,
             request.authorized_version_id,
@@ -8770,7 +8814,9 @@ impl StorageNodeConnectionHandler {
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(ObjectPgActionError::StaleObjectReadSubject) => {
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => {
                 let payload = encode_object_tags_for_subject_response(
                     &StorageRpcObjectTagsForSubjectResponse {
                         outcome: StorageRpcObjectTagsForSubjectOutcome::StaleSubject,
@@ -8778,7 +8824,12 @@ impl StorageNodeConnectionHandler {
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
         }
     }
 
@@ -18431,6 +18482,35 @@ mod tests {
             data_pg_id: 0,
             bucket_write_reservation: proof.clone(),
         };
+        let serialized_tags =
+            "<Tagging><TagSet><Tag><Key>route</Key><Value>active</Value></Tag></TagSet></Tagging>";
+        crate::clock::with_time_override(1_000, || {
+            let pg = server._node.get_pg(0).unwrap();
+            PgMetadataStore::put_object_with_segments(
+                &*pg,
+                &crate::PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::new(9).unwrap(),
+                    size: 0,
+                    etag: crate::ObjectEtag::single_part(99),
+                    ec: EcShape { k: 4, m: 2 },
+                    layout: crate::ObjectLayout::Standard,
+                    tags: Some(crate::SerializedTagSet::new(serialized_tags.to_string())),
+                    metadata_blob: None,
+                    system_metadata_blob: None,
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::ObjectEncryption::None,
+                },
+                &[],
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        });
 
         let foreign_permit = StorageNodeRouteAdmissionGate::default()
             .acquire(StorageNodeRouteAdmissionClass::Active);
@@ -18472,7 +18552,7 @@ mod tests {
             );
             assert_eq!(
                 primary_route.next_generation_id().unwrap(),
-                GenerationId::new(reserved_generation.get() + 1).unwrap()
+                GenerationId::new(10).unwrap()
             );
             assert_eq!(
                 acting_set_route.next_version_id().unwrap(),
@@ -18481,8 +18561,11 @@ mod tests {
             let snapshot = primary_route
                 .load_direct_put_commit_snapshot(&reservation_id, reserved_generation)
                 .unwrap();
-            assert_eq!(snapshot.auth_snapshot.existing_etag, None);
-            assert_eq!(snapshot.current, None);
+            assert_eq!(
+                snapshot.auth_snapshot.existing_etag.as_deref(),
+                Some("\"0000000000000063\"")
+            );
+            assert!(snapshot.current.is_some());
             let command = primary_route
                 .build_direct_put_commit_command(&direct_put_request, VersionId::Null, &snapshot)
                 .unwrap();
@@ -18550,6 +18633,27 @@ mod tests {
         assert_eq!(mismatch_error.code, StorageRpcErrorCode::PayloadDecode);
         assert!(mismatch_error.message.contains("key does not match"));
 
+        let read_subject = crate::clock::with_time_override(1_000, || {
+            let subject = primary_route.load_object_read_auth_subject(None).unwrap();
+            let snapshot = primary_route
+                .load_object_read_snapshot_for_subject(
+                    None,
+                    &subject.identity,
+                    crate::ObjectReadSnapshotMode::StandardSegments,
+                )
+                .unwrap();
+            assert_eq!(snapshot.stored, subject.stored);
+            assert!(snapshot.object_segments.is_empty());
+            assert_eq!(
+                primary_route
+                    .get_object_tags_for_subject(None, &subject.identity, VersionId::Null,)
+                    .unwrap()
+                    .as_deref(),
+                Some(serialized_tags)
+            );
+            subject
+        });
+
         let mut extended = config.clone();
         extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
         crate::clock::with_time_override(1_000, || {
@@ -18592,6 +18696,28 @@ mod tests {
                             VersionId::Null,
                             &direct_put_snapshot,
                         )
+                        .map(|_| ()),
+                ),
+                (
+                    "object read authorization subject load",
+                    primary_route
+                        .load_object_read_auth_subject(None)
+                        .map(|_| ()),
+                ),
+                (
+                    "object read snapshot load",
+                    primary_route
+                        .load_object_read_snapshot_for_subject(
+                            None,
+                            &read_subject.identity,
+                            crate::ObjectReadSnapshotMode::StandardSegments,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "object tags load",
+                    primary_route
+                        .get_object_tags_for_subject(None, &read_subject.identity, VersionId::Null)
                         .map(|_| ()),
                 ),
             ];

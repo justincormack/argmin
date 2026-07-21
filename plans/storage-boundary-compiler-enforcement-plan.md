@@ -1595,6 +1595,39 @@ Thirtieth Phase 3 slice:
   workspace-wide strict Clippy, and the full parallel workspace suite (7,399
   tests).
 
+Thirty-first Phase 3 slice:
+
+- object-read authorization-subject loading, coherent snapshot loading, and
+  subject-bound tag loading now consume the exact
+  `StorageNodeActivePrimaryObjectRoute` established from the frame. The
+  capability fixes the object subject and trusted `ObjectMetadataPgId`, and
+  revalidates the frame's immutable captured deadline immediately before each
+  local node-client access.
+- the RPC handlers preserve the existing `ObjectNotFound` and stale-subject
+  protocol outcomes while route failures remain distinct storage RPC errors.
+  Decoded node, epoch, PG, bucket, and key fields therefore cannot reach any
+  of the three object-read effects without active admission, primary
+  validation, and exact object placement.
+- the deterministic active-object regression now seeds a tagged live object,
+  reads its authorization subject, coherent standard-segment snapshot, and
+  tags through the capability, then extends the raw same-epoch route and
+  proves all three reads fail at the original captured deadline. Fixture
+  creation precedes direct-PUT command construction so it does not bypass or
+  contend with the PG pending-command protocol.
+- existing Unix positive coverage exercises the full subject/snapshot/tag
+  sequence. The two-PG adversarial matrix stores byte-identical objects and
+  tags on both configured PGs, proves the identities are equal, and requires
+  exact `PayloadDecode` for all three wrong-PG reads, so missing placement
+  validation cannot hide behind absent or stale state.
+- object mutations, listing scans, data operations, frontend capability
+  migration, and capability requirements on node-client traits remain open in
+  Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  active-object read deadline regression, all three Unix object-read positive
+  and equivalent-state wrong-PG regressions, all 2,199 storage tests,
+  workspace-wide strict Clippy, and the full parallel workspace suite (7,422
+  tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
