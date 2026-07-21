@@ -2306,6 +2306,83 @@ fn unix_bucket_write_reservation_client_clears_exact_drain_after_route_expiry() 
 }
 
 #[test]
+fn unix_bucket_write_reservation_client_releases_finalizer_claim_after_route_expiry() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("finalizer-claim-release-expired-route-rpc");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let claim = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        PgMetadataStore::mark_bucket_deleting(&*pg, &bucket).unwrap();
+        let generation = PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+            .unwrap()
+            .bucket_incarnation_generation;
+        let claim = PgMetadataStore::acquire_bucket_delete_finalize_claim(
+            &*pg,
+            &bucket,
+            generation,
+            "expired-route-finalizer-claim",
+            "expired-route-finalizer-owner",
+            config.cluster_epoch,
+            10,
+            Some(20),
+            10,
+        )
+        .unwrap()
+        .expect("finalizer claim should be acquired");
+        pg.refresh_metadata_command_state_digest().unwrap();
+        claim
+    };
+    config.route_map_validity = crate::RouteMapValidity::until_ms(1).unwrap();
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+        &client,
+        bucket_pg_id_for_test(0),
+        &claim,
+    )
+    .unwrap();
+    server_thread.join().unwrap();
+
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let pg = node.get_pg(0).unwrap();
+    assert!(
+        PgMetadataStore::bucket_delete_finalize_claim(&*pg)
+            .unwrap()
+            .is_none(),
+        "retained finalizer-claim release must work after active route expiry"
+    );
+}
+
+#[test]
 fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
@@ -2933,6 +3010,173 @@ fn unix_bucket_write_drain_operations_reject_wrong_bucket_pg_before_access() {
     .unwrap_err();
     assert_payload_decode(error, "exact drain clear");
     assert_drains_unchanged();
+
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
+fn unix_bucket_delete_finalize_claim_operations_reject_wrong_bucket_pg_before_access() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes = vec![
+        StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: config.cluster_epoch,
+            state: crate::types::PgState::Active,
+            primary_node_id: config.node_id,
+            acting_set: vec![config.node_id],
+        },
+        StorageNodePgRoute {
+            pg_id: 1,
+            cluster_epoch: config.cluster_epoch,
+            state: crate::types::PgState::Active,
+            primary_node_id: config.node_id,
+            acting_set: vec![config.node_id],
+        },
+    ];
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let (bucket, correct_pg_id, wrong_pg_id, generation, correct_claim, wrong_claim) = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let (bucket, correct_pg_id) = (0..100)
+            .map(|index| crate::tests::bucket_name(format!("finalize-claim-wrong-pg-{index}")))
+            .map(|bucket| {
+                let pg_id = node.pg_topology().bucket_pg_for(&bucket);
+                (bucket, pg_id)
+            })
+            .find(|(_, pg_id)| *pg_id < 2)
+            .expect("two-PG topology must place a test bucket");
+        let wrong_pg_id = if correct_pg_id == 0 { 1 } else { 0 };
+        let mut generations = Vec::new();
+        let mut claims = Vec::new();
+        for pg_id in [correct_pg_id, wrong_pg_id] {
+            let pg = node.get_pg(pg_id).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            PgMetadataStore::mark_bucket_deleting(&*pg, &bucket).unwrap();
+            let generation = PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .bucket_incarnation_generation;
+            generations.push(generation);
+            claims.push(
+                PgMetadataStore::acquire_bucket_delete_finalize_claim(
+                    &*pg,
+                    &bucket,
+                    generation,
+                    "wrong-pg-finalize-claim",
+                    "wrong-pg-finalize-owner",
+                    config.cluster_epoch,
+                    10,
+                    Some(80),
+                    10,
+                )
+                .unwrap()
+                .expect("finalizer claim should be acquired"),
+            );
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        assert_eq!(
+            generations[0], generations[1],
+            "wrong-PG finalizer canaries must use the same bucket generation"
+        );
+        (
+            bucket,
+            correct_pg_id,
+            wrong_pg_id,
+            generations[0],
+            claims.remove(0),
+            claims.remove(0),
+        )
+    };
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..3)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let wrong_pg = bucket_pg_id_for_test(wrong_pg_id);
+    let assert_payload_decode = |error: BucketSnapshotLoadError, operation: &str| {
+        assert!(
+            matches!(
+                &error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                })
+            ),
+            "wrong-PG {operation} must fail with PayloadDecode, got {error:?}"
+        );
+    };
+    let assert_claims_unchanged = || {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        for (pg_id, expected) in [(correct_pg_id, &correct_claim), (wrong_pg_id, &wrong_claim)] {
+            let pg = node.get_pg(pg_id).unwrap();
+            assert_eq!(
+                PgMetadataStore::bucket_delete_finalize_claim(&*pg).unwrap(),
+                Some(expected.clone()),
+                "wrong-PG finalizer-claim operation must not mutate PG {pg_id}"
+            );
+        }
+    };
+
+    let error = BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
+        &client,
+        wrong_pg,
+        &bucket,
+        generation,
+        &wrong_claim.claim_id,
+        &wrong_claim.owner_token,
+        config.cluster_epoch,
+        wrong_claim.claimed_at,
+        wrong_claim.lease_deadline,
+        wrong_claim.claimed_at,
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "finalizer claim acquire");
+    assert_claims_unchanged();
+
+    let error =
+        BucketWriteReservationNodeClient::bucket_delete_finalize_claim(&client, wrong_pg, &bucket)
+            .unwrap_err();
+    assert_payload_decode(error, "finalizer claim get");
+    assert_claims_unchanged();
+
+    let error = BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
+        &client,
+        wrong_pg,
+        &wrong_claim,
+    )
+    .unwrap_err();
+    assert_payload_decode(error, "finalizer claim release");
+    assert_claims_unchanged();
 
     for thread in server_threads {
         thread.join().unwrap();

@@ -1455,6 +1455,42 @@ Twenty-sixth Phase 3 slice:
   requirements on node-client traits, and object/data active and retained
   capabilities remain open in Phase 3.
 
+Twenty-seventh Phase 3 slice:
+
+- the bucket-delete finalizer claim RPC family now constructs private
+  server-local route capabilities before reaching `LocalStorageNodeClient`.
+  Claim acquisition and lookup require a bucket-bound
+  `StorageNodeActiveBucketRoute` and revalidate the frame's captured deadline
+  immediately before the local operation. Acquisition additionally requires
+  the requested claim epoch to equal the admitted route epoch.
+- exact finalizer-claim release is classified as `RetainedCleanup` and
+  consumes a private, non-`Clone`
+  `StorageNodeRetainedBucketDeleteFinalizeClaimRoute`. The capability binds
+  the admission domain/class, target node, retained route epoch, raw and
+  trusted bucket PG, and complete claim record. Unlike older-epoch drain and
+  reservation-record cleanup, the claim itself names the route epoch and PG,
+  so construction and use require both identities to match exactly.
+- a deterministic server-local regression acquires and reads a claim under a
+  5,000ms captured route, renews the raw server route to 10,000ms, and proves
+  the original active capability cannot acquire or read at 6,000ms. The
+  complete durable claim remains unchanged; active-class and foreign-domain
+  permits cannot construct retained authority, while the exact retained
+  capability then releases the claim.
+- the Unix expired-route regression proves frame dispatch assigns exact
+  finalizer-claim release to retained cleanup. A dedicated two-PG adversarial
+  matrix seeds equivalent deleting buckets and claims on both configured PGs,
+  then requires exact `PayloadDecode` for wrong-PG acquire, lookup, and
+  release. Both complete durable claim records are compared after every
+  rejection, so missing placement checks and mutation-before-rejection bugs
+  cannot hide behind absent or cancelling state.
+- validation passed formatting, the storage boundary checker, all four
+  finalizer-claim and existing finalize-coordination regressions,
+  workspace-wide strict Clippy, and the full parallel workspace suite (7,385
+  tests).
+- lifecycle claims, frontend capability migration, capability requirements on
+  node-client traits, and object/data active and retained capabilities remain
+  open in Phase 3.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
