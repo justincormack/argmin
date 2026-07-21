@@ -887,6 +887,7 @@ async fn handle(
         }
     };
     if let Some(op) = streaming_op {
+        let mut body = body;
         let s3req = match S3Request::from_hyper_headers_with_source_ip(
             parts,
             transport_security,
@@ -927,7 +928,7 @@ async fn handle(
                 let mut resp = handle_streaming_put(
                     Arc::clone(&state),
                     s3req,
-                    body,
+                    &mut body,
                     bucket.clone(),
                     key,
                     chunked,
@@ -955,7 +956,7 @@ async fn handle(
                 let mut resp = handle_streaming_part(
                     Arc::clone(&state),
                     s3req,
-                    body,
+                    &mut body,
                     bucket.clone(),
                     key,
                     upload_id,
@@ -977,17 +978,23 @@ async fn handle(
                 resp
             }
         };
-        return Ok(s3_response_to_hyper(
+        let retain_unread_request_body = response_requests_connection_close(&resp);
+        let mut resp = s3_response_to_hyper(
             resp,
             Some(req_permit),
             state.config.stream_read_chunk_size,
             state.config.panic_on_500,
             state.config.abort_on_500,
             response_trace,
-        ));
+        );
+        if retain_unread_request_body {
+            resp.body_mut().retain_unread_request_body(body);
+        }
+        return Ok(resp);
     }
 
     if let Some(bucket) = post_object_bucket(&parts) {
+        let mut body = body;
         let s3req = match S3Request::from_hyper_headers_with_source_ip(
             parts,
             transport_security,
@@ -1013,7 +1020,7 @@ async fn handle(
         let mut resp = handle_streaming_post_object(
             Arc::clone(&state),
             s3req,
-            body,
+            &mut body,
             bucket.clone(),
             trace.clone(),
             wire_ids.clone(),
@@ -1028,14 +1035,19 @@ async fn handle(
             &trace,
         )
         .await;
-        return Ok(s3_response_to_hyper(
+        let retain_unread_request_body = response_requests_connection_close(&resp);
+        let mut resp = s3_response_to_hyper(
             resp,
             Some(req_permit),
             state.config.stream_read_chunk_size,
             state.config.panic_on_500,
             state.config.abort_on_500,
             response_trace,
-        ));
+        );
+        if retain_unread_request_body {
+            resp.body_mut().retain_unread_request_body(body);
+        }
+        return Ok(resp);
     }
 
     if parts.method == http::Method::OPTIONS {
@@ -2698,7 +2710,7 @@ fn route_bounded_body_timeout_error(
 async fn handle_streaming_post_object(
     state: Arc<ServerState>,
     s3req: S3Request,
-    body: Incoming,
+    body: &mut Incoming,
     bucket: BucketName,
     trace: observability::TraceContext,
     wire_ids: WireResponseIds,
@@ -2760,7 +2772,6 @@ async fn handle_streaming_post_object(
     let mut segment_index: u32 = 0;
     let mut upload_buf = PooledSegmentBuffer::new(&state);
 
-    let mut body = body;
     loop {
         let frame_timeout = match route_bounded_body_frame_timeout(
             ctx.as_ref().map(|ctx| ctx.storage_route_admission()),
@@ -2853,7 +2864,7 @@ async fn handle_streaming_post_object(
                                     Ok(Err(err)) => {
                                         return finish_streaming_post_rejection(
                                             error_response(&err, &wire_ids),
-                                            &mut body,
+                                            body,
                                             idle_timeout,
                                         )
                                         .await;
@@ -2886,7 +2897,7 @@ async fn handle_streaming_post_object(
                                             },
                                             &wire_ids,
                                         ),
-                                        &mut body,
+                                        body,
                                         idle_timeout,
                                     )
                                     .await;
@@ -2908,7 +2919,7 @@ async fn handle_streaming_post_object(
                                             },
                                             &wire_ids,
                                         ),
-                                        &mut body,
+                                        body,
                                         idle_timeout,
                                     )
                                     .await;
@@ -3181,7 +3192,7 @@ async fn presigned_streaming_body_error(
 async fn handle_streaming_put(
     state: Arc<ServerState>,
     s3req: S3Request,
-    body: Incoming,
+    body: &mut Incoming,
     bucket: BucketName,
     key: String,
     chunked: ChunkedMode,
@@ -3189,8 +3200,6 @@ async fn handle_streaming_put(
     wire_ids: WireResponseIds,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
-    let mut body = body;
-
     let state2 = Arc::clone(&state);
     let bucket_clone = bucket.clone();
     let key_clone = key.clone();
@@ -3223,7 +3232,7 @@ async fn handle_streaming_put(
                 error_response(&err, &wire_ids),
                 &err,
                 has_auth_attempt,
-                &mut body,
+                body,
                 idle_timeout,
             )
             .await
@@ -3234,7 +3243,7 @@ async fn handle_streaming_put(
                 internal_error_response(&wire_ids),
                 &err,
                 has_auth_attempt,
-                &mut body,
+                body,
                 idle_timeout,
             )
             .await;
@@ -3242,7 +3251,7 @@ async fn handle_streaming_put(
     };
     if ctx.auth_mode == auth::AuthMode::PresignedSigV4 && chunked != ChunkedMode::None {
         let err = presigned_streaming_body_error(
-            &mut body,
+            body,
             &chunked,
             PresignedStreamingOperation::PutObject,
             idle_timeout,
@@ -3949,6 +3958,15 @@ fn close_response_connection(mut resp: S3Response) -> S3Response {
     resp
 }
 
+fn response_requests_connection_close(resp: &S3Response) -> bool {
+    resp.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("connection")
+            && value
+                .split(',')
+                .any(|directive| directive.trim().eq_ignore_ascii_case("close"))
+    })
+}
+
 async fn finish_streaming_prepare_failure(
     resp: S3Response,
     err: &ServerError,
@@ -4062,7 +4080,7 @@ async fn drain_request_body_bounded(
 async fn handle_streaming_part(
     state: Arc<ServerState>,
     s3req: S3Request,
-    body: Incoming,
+    body: &mut Incoming,
     bucket: BucketName,
     key: String,
     upload_id: String,
@@ -4072,7 +4090,6 @@ async fn handle_streaming_part(
     wire_ids: WireResponseIds,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
-    let mut body = body;
     let abort_guard = StreamingAbortGuard::new(&state);
 
     let state2 = Arc::clone(&state);
@@ -4114,7 +4131,7 @@ async fn handle_streaming_part(
                 error_response(&err, &wire_ids),
                 &err,
                 has_auth_attempt,
-                &mut body,
+                body,
                 idle_timeout,
             )
             .await
@@ -4125,7 +4142,7 @@ async fn handle_streaming_part(
                 internal_error_response(&wire_ids),
                 &err,
                 has_auth_attempt,
-                &mut body,
+                body,
                 idle_timeout,
             )
             .await;
@@ -4133,7 +4150,7 @@ async fn handle_streaming_part(
     };
     if ctx.auth_mode == auth::AuthMode::PresignedSigV4 && chunked != ChunkedMode::None {
         let err = presigned_streaming_body_error(
-            &mut body,
+            body,
             &chunked,
             PresignedStreamingOperation::UploadPart,
             idle_timeout,
@@ -7062,7 +7079,7 @@ Connection: close\r\n\r\n",
         stream
             .set_read_timeout(Some(timeout))
             .expect("set read timeout");
-        let mut writer_stopped = false;
+        let mut writer_signaled = false;
 
         loop {
             match stream.read(&mut tmp) {
@@ -7095,16 +7112,15 @@ Connection: close\r\n\r\n",
                 // Stop uploading as soon as the early response starts
                 // arriving, like a real client; the server's lingering
                 // close then quiesces and delivers the rest of the body.
-                if !writer_stopped {
+                if !writer_signaled {
                     if let Some(stop_writer) = stop_writer {
                         stop_writer.store(true, Ordering::Relaxed);
-                        // Stop the request at the socket boundary as soon as
-                        // the early response is visible. Merely waking the
-                        // paced writer leaves the write half open long enough
-                        // for the server's bounded lingering close to race
-                        // the body.
-                        let _ = stream.shutdown(Shutdown::Write);
-                        writer_stopped = true;
+                        // Stop producing request bytes, but keep the socket's
+                        // write half open until the complete response has
+                        // arrived. Half-closing an incomplete Content-Length
+                        // request can make Hyper terminate the connection
+                        // while it is still delivering the response body.
+                        writer_signaled = true;
                     }
                 }
                 let headers = &text[..header_end];
