@@ -307,8 +307,8 @@ use crate::types::{
 };
 use crate::DataPgId;
 use crate::{
-    BucketName, EcShape, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey,
-    ShardLocation,
+    BucketInfo, BucketName, BucketSubresourceKind, EcShape, NodeId, ObjectKey, ObjectPgActionError,
+    RouteMapValidity, ShardKey, ShardLocation,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
@@ -1717,10 +1717,15 @@ fn validate_runtime_config_install(
     Ok(())
 }
 
+#[derive(Clone)]
+struct StorageNodeRuntimeRouteState {
+    config: Arc<StorageNodeProcessConfig>,
+    route_map_lease: Option<BoundRouteMapLease>,
+}
+
 pub struct StorageNodeServer {
-    config: Arc<RwLock<Arc<StorageNodeProcessConfig>>>,
+    runtime_route_state: Arc<RwLock<StorageNodeRuntimeRouteState>>,
     runtime_config_install_lock: Mutex<()>,
-    route_map_lease: Arc<RwLock<Option<BoundRouteMapLease>>>,
     route_admission: StorageNodeRouteAdmissionGate,
     _data_dir_lock: StorageNodeDataDirLock,
     control_plane_incarnation_lock: Mutex<()>,
@@ -1731,6 +1736,10 @@ pub struct StorageNodeServer {
     metadata_command_locks: StorageNodeMetadataCommandLocks,
     #[cfg(test)]
     runtime_config_stage_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
+    #[cfg(test)]
+    runtime_route_capture_test_hook: Arc<Mutex<Option<RuntimeConfigStageTestHook>>>,
+    #[cfg(test)]
+    runtime_route_before_publish_lock_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
 }
 
 #[cfg(test)]
@@ -2107,9 +2116,11 @@ impl StorageNodeServer {
         })?;
         let route_map_lease = bind_storage_node_route_map_lease(config.route_map_validity)?;
         Ok(Self {
-            config: Arc::new(RwLock::new(Arc::new(config))),
+            runtime_route_state: Arc::new(RwLock::new(StorageNodeRuntimeRouteState {
+                config: Arc::new(config),
+                route_map_lease,
+            })),
             runtime_config_install_lock: Mutex::new(()),
-            route_map_lease: Arc::new(RwLock::new(route_map_lease)),
             route_admission: StorageNodeRouteAdmissionGate::default(),
             _data_dir_lock: data_dir_lock,
             control_plane_incarnation_lock: Mutex::new(()),
@@ -2120,6 +2131,10 @@ impl StorageNodeServer {
             metadata_command_locks: StorageNodeMetadataCommandLocks::default(),
             #[cfg(test)]
             runtime_config_stage_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            runtime_route_capture_test_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            runtime_route_before_publish_lock_test_hook: Mutex::new(None),
         })
     }
 
@@ -2376,28 +2391,50 @@ impl StorageNodeServer {
         let staged_config = next_config.stage_control_plane_runtime_config()?;
 
         if next_config.only_extends_route_map_validity_from(&current_config) {
-            let mut current_config = self.config.write().unwrap_or_else(|e| e.into_inner());
-            validate_runtime_config_install(&current_config, &next_config)?;
-            if next_config.only_extends_route_map_validity_from(&current_config) {
+            #[cfg(test)]
+            if let Some(hook) = self
+                .runtime_route_before_publish_lock_test_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                hook();
+            }
+            let mut current_state = self
+                .runtime_route_state
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            validate_runtime_config_install(&current_state.config, &next_config)?;
+            if next_config.only_extends_route_map_validity_from(&current_state.config) {
                 staged_config.publish()?;
-                *current_config = Arc::new(next_config);
-                *self
-                    .route_map_lease
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_route_map_lease;
+                *current_state = StorageNodeRuntimeRouteState {
+                    config: Arc::new(next_config),
+                    route_map_lease: next_route_map_lease,
+                };
                 return Ok(());
             }
         }
 
         let _transition = self.route_admission.begin_transition();
-        let mut current_config = self.config.write().unwrap_or_else(|e| e.into_inner());
-        validate_runtime_config_install(&current_config, &next_config)?;
-        staged_config.publish()?;
-        *current_config = Arc::new(next_config);
-        *self
-            .route_map_lease
+        #[cfg(test)]
+        if let Some(hook) = self
+            .runtime_route_before_publish_lock_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook();
+        }
+        let mut current_state = self
+            .runtime_route_state
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next_route_map_lease;
+            .unwrap_or_else(|e| e.into_inner());
+        validate_runtime_config_install(&current_state.config, &next_config)?;
+        staged_config.publish()?;
+        *current_state = StorageNodeRuntimeRouteState {
+            config: Arc::new(next_config),
+            route_map_lease: next_route_map_lease,
+        };
         Ok(())
     }
 
@@ -2428,14 +2465,17 @@ impl StorageNodeServer {
     }
 
     fn connection_handler(&self) -> StorageNodeConnectionHandler {
+        let runtime_route = self.runtime_route_snapshot();
         StorageNodeConnectionHandler {
-            config: self.config_snapshot_arc(),
-            config_source: Arc::clone(&self.config),
-            route_map_lease: Arc::clone(&self.route_map_lease),
+            config: runtime_route.config,
+            route_map_lease: runtime_route.route_map_lease,
+            runtime_route_source: Arc::clone(&self.runtime_route_state),
             route_admission: self.route_admission.clone(),
             node: Arc::clone(&self._node),
             read_handles: Arc::clone(&self.read_handles),
             metadata_command_locks: self.metadata_command_locks.clone(),
+            #[cfg(test)]
+            runtime_route_capture_test_hook: Arc::clone(&self.runtime_route_capture_test_hook),
         }
     }
 
@@ -2444,7 +2484,15 @@ impl StorageNodeServer {
     }
 
     fn config_snapshot_arc(&self) -> Arc<StorageNodeProcessConfig> {
-        self.config
+        self.runtime_route_state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .config
+            .clone()
+    }
+
+    fn runtime_route_snapshot(&self) -> StorageNodeRuntimeRouteState {
+        self.runtime_route_state
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -2787,15 +2835,21 @@ struct StorageNodeRouteAdmissionState {
     transition: StorageNodeRouteTransitionState,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageNodeRouteAdmissionClass {
+    Active,
+    RetainedCleanup,
+}
+
 impl StorageNodeRouteAdmissionGate {
-    fn acquire(&self, allow_during_drain: bool) -> StorageNodeRouteMutationPermit {
+    fn acquire(&self, class: StorageNodeRouteAdmissionClass) -> StorageNodeRouteAdmissionPermit {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         while state.transition != StorageNodeRouteTransitionState::Open
-            && !(allow_during_drain
+            && !(class == StorageNodeRouteAdmissionClass::RetainedCleanup
                 && state.transition == StorageNodeRouteTransitionState::Draining)
         {
             state = self
@@ -2805,7 +2859,10 @@ impl StorageNodeRouteAdmissionGate {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
         state.active_frames += 1;
-        StorageNodeRouteMutationPermit { gate: self.clone() }
+        StorageNodeRouteAdmissionPermit {
+            gate: self.clone(),
+            class,
+        }
     }
 
     fn begin_transition(&self) -> StorageNodeRouteTransitionGuard {
@@ -2835,11 +2892,12 @@ impl StorageNodeRouteAdmissionGate {
     }
 }
 
-struct StorageNodeRouteMutationPermit {
+struct StorageNodeRouteAdmissionPermit {
     gate: StorageNodeRouteAdmissionGate,
+    class: StorageNodeRouteAdmissionClass,
 }
 
-impl Drop for StorageNodeRouteMutationPermit {
+impl Drop for StorageNodeRouteAdmissionPermit {
     fn drop(&mut self) {
         let mut state = self
             .gate
@@ -2860,13 +2918,13 @@ struct StorageNodeRouteTransitionGuard {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MetadataMutationRouteFence {
+struct StorageNodeRouteFence {
     cluster_epoch: ClusterEpoch,
     valid_until_ms: Option<u64>,
     local_valid_until_monotonic_ms: Option<u64>,
 }
 
-impl MetadataMutationRouteFence {
+impl StorageNodeRouteFence {
     fn current(
         config: &StorageNodeProcessConfig,
         route_map_lease: Option<BoundRouteMapLease>,
@@ -2915,7 +2973,7 @@ impl MetadataMutationRouteFence {
         Err(StorageRpcErrorResponse {
             code: StorageRpcErrorCode::StaleShardLocation,
             message: format!(
-                "metadata mutation route for cluster epoch {} expired at {valid_until_ms}ms, now {now_ms}ms",
+                "storage-node route for cluster epoch {} expired at {valid_until_ms}ms, now {now_ms}ms",
                 self.cluster_epoch.get()
             ),
         })
@@ -2962,12 +3020,71 @@ impl Drop for StorageNodeRouteTransitionGuard {
 #[derive(Clone)]
 struct StorageNodeConnectionHandler {
     config: Arc<StorageNodeProcessConfig>,
-    config_source: Arc<RwLock<Arc<StorageNodeProcessConfig>>>,
-    route_map_lease: Arc<RwLock<Option<BoundRouteMapLease>>>,
+    route_map_lease: Option<BoundRouteMapLease>,
+    runtime_route_source: Arc<RwLock<StorageNodeRuntimeRouteState>>,
     route_admission: StorageNodeRouteAdmissionGate,
     node: Arc<SharedStorageNode>,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
+    #[cfg(test)]
+    runtime_route_capture_test_hook: Arc<Mutex<Option<RuntimeConfigStageTestHook>>>,
+}
+
+#[derive(Debug)]
+enum StorageNodeActiveBucketRouteError {
+    Route(StorageRpcErrorResponse),
+    Bucket(BucketSnapshotLoadError),
+}
+
+struct StorageNodeActiveBucketRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    pg_id: BucketPgId,
+    bucket: &'a BucketName,
+}
+
+impl StorageNodeActiveBucketRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeActiveBucketRouteError> {
+        self.fence
+            .validate_rpc_at(
+                crate::clock::current_time_millis(),
+                crate::clock::monotonic_time_millis(),
+            )
+            .map_err(StorageNodeActiveBucketRouteError::Route)
+    }
+
+    fn head_bucket(&self, filtered: bool) -> Result<BucketInfo, StorageNodeActiveBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        let result = if filtered {
+            BucketMetadataNodeClient::head_bucket_info(&local_client, self.pg_id, self.bucket)
+        } else {
+            BucketMetadataNodeClient::head_bucket_raw(&local_client, self.pg_id, self.bucket)
+        };
+        result.map_err(StorageNodeActiveBucketRouteError::Bucket)
+    }
+
+    fn get_subresource(
+        &self,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, StorageNodeActiveBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        BucketMetadataNodeClient::get_bucket_subresource(
+            &local_client,
+            self.pg_id,
+            self.bucket,
+            kind,
+        )
+        .map_err(StorageNodeActiveBucketRouteError::Bucket)
+    }
 }
 
 macro_rules! metadata_command_pg_guard_or_return {
@@ -2989,11 +3106,21 @@ macro_rules! metadata_mutation_route_guard_or_return {
 
 impl StorageNodeConnectionHandler {
     fn refresh_config_snapshot(&mut self) {
-        self.config = self
-            .config_source
+        let runtime_route = self
+            .runtime_route_source
             .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .unwrap_or_else(|e| e.into_inner());
+        #[cfg(test)]
+        if let Some(hook) = self
+            .runtime_route_capture_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook();
+        }
+        self.config = Arc::clone(&runtime_route.config);
+        self.route_map_lease = runtime_route.route_map_lease;
     }
 
     fn metadata_command_pg_guard(
@@ -3028,10 +3155,7 @@ impl StorageNodeConnectionHandler {
     }
 
     fn current_route_map_lease(&self) -> Option<BoundRouteMapLease> {
-        *self
-            .route_map_lease
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.route_map_lease
     }
 
     fn current_route_map_lease_is_valid(&self) -> bool {
@@ -3046,10 +3170,10 @@ impl StorageNodeConnectionHandler {
         )
         .is_err()
         {
-            *self
-                .route_map_lease
+            self.runtime_route_source
                 .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .route_map_lease = None;
             return false;
         }
         self.current_route_map_lease()
@@ -3104,10 +3228,15 @@ impl StorageNodeConnectionHandler {
                 }
                 Err(error) => return Err(rpc_stream_error(error)),
             };
-            let _route_permit = self.route_admission.acquire(matches!(
+            let admission_class = if matches!(
                 frame.kind,
                 StorageRpcMessageKind::MetadataCommandPgLockRelease
-            ));
+            ) {
+                StorageNodeRouteAdmissionClass::RetainedCleanup
+            } else {
+                StorageNodeRouteAdmissionClass::Active
+            };
+            let route_permit = self.route_admission.acquire(admission_class);
             self.refresh_config_snapshot();
             let _rpc_trace = observability::AttachedTrace::new(storage_node_rpc_trace_context(
                 self.config.node_id,
@@ -3132,7 +3261,7 @@ impl StorageNodeConnectionHandler {
                 &self.metadata_command_locks,
                 session.current_rpc_context(),
             );
-            let response = match self.dispatch_frame(&mut session, &frame) {
+            let response = match self.dispatch_frame(&mut session, &route_permit, &frame) {
                 Ok(response) => response,
                 Err(error) => {
                     session.clear_metadata_command_lock_context(&self.metadata_command_locks);
@@ -3176,6 +3305,7 @@ impl StorageNodeConnectionHandler {
     fn dispatch_frame(
         &self,
         session: &mut StorageNodeSession,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         frame: &StorageRpcFrame,
     ) -> Result<StorageRpcFrame, StorageNodeServerError> {
         let payload = match frame.kind {
@@ -4530,14 +4660,14 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::BucketHeadRaw => match decode_bucket_request(&frame.payload) {
-                Ok(request) => self.bucket_head_response(request, false),
+                Ok(request) => self.bucket_head_response(route_permit, request, false),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::PayloadDecode,
                     message: error.to_string(),
                 }),
             },
             StorageRpcMessageKind::BucketHeadInfo => match decode_bucket_request(&frame.payload) {
-                Ok(request) => self.bucket_head_response(request, true),
+                Ok(request) => self.bucket_head_response(route_permit, request, true),
                 Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::PayloadDecode,
                     message: error.to_string(),
@@ -4599,7 +4729,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketSubresourceGet => {
                 match decode_bucket_subresource_get_request(&frame.payload) {
-                    Ok(request) => self.bucket_subresource_get_response(request),
+                    Ok(request) => self.bucket_subresource_get_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -7784,27 +7914,15 @@ impl StorageNodeConnectionHandler {
 
     fn bucket_head_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketRequest,
         filtered: bool,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) =
-            self.validate_primary_pg_for_bucket(request.pg_id, &request.bucket, "bucket head")
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket);
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let result = if filtered {
-            BucketMetadataNodeClient::head_bucket_info(&local_client, bucket_pg_id, &request.bucket)
-        } else {
-            BucketMetadataNodeClient::head_bucket_raw(&local_client, bucket_pg_id, &request.bucket)
+        let route = match self.active_bucket_route(route_permit, &request, "bucket head") {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        match result {
+        match route.head_bucket(filtered) {
             Ok(info) => {
                 let payload =
                     encode_bucket_info_outcome_response(&StorageRpcBucketInfoOutcomeResponse {
@@ -7812,14 +7930,21 @@ impl StorageNodeConnectionHandler {
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name })) => {
+            Err(StorageNodeActiveBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketNotFound { name },
+            ))) => {
                 let payload =
                     encode_bucket_info_outcome_response(&StorageRpcBucketInfoOutcomeResponse {
                         outcome: StorageRpcBucketInfoOutcome::BucketNotFound { name },
                     });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -8214,28 +8339,28 @@ impl StorageNodeConnectionHandler {
 
     fn bucket_subresource_get_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketSubresourceGetRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_bucket_metadata_control_route(&request.bucket, "bucket subresource get")
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let bucket_pg_id = self.node.bucket_metadata_pg_for(&request.bucket.bucket);
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketMetadataNodeClient::get_bucket_subresource(
-            &local_client,
-            bucket_pg_id,
-            &request.bucket.bucket,
-            request.kind,
-        ) {
+        let route =
+            match self.active_bucket_route(route_permit, &request.bucket, "bucket subresource get")
+            {
+                Ok(route) => route,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            };
+        match route.get_subresource(request.kind) {
             Ok(body) => {
                 let payload = encode_bucket_subresource_get_response(
                     &StorageRpcBucketSubresourceGetResponse { body },
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -10307,7 +10432,7 @@ impl StorageNodeConnectionHandler {
             ) {
                 return encode_storage_rpc_error_response(&error);
             }
-            MetadataMutationRouteFence::current(&self.config, self.current_route_map_lease())
+            StorageNodeRouteFence::current(&self.config, self.current_route_map_lease())
         };
         self.metadata_command_apply_and_record_response_with_mutation_fence(
             session,
@@ -10320,7 +10445,7 @@ impl StorageNodeConnectionHandler {
         &self,
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
-        mutation_fence: MetadataMutationRouteFence,
+        mutation_fence: StorageNodeRouteFence,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         if let Err(error) = mutation_fence.validate_rpc_at(
@@ -11262,10 +11387,10 @@ impl StorageNodeConnectionHandler {
         node_id: NodeId,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataMutationRouteFence, StorageRpcErrorResponse> {
+    ) -> Result<StorageNodeRouteFence, StorageRpcErrorResponse> {
         let cluster_epoch = command.id().cluster_epoch();
         match self.validate_pg_route(node_id, cluster_epoch, pg_id) {
-            Ok(()) => Ok(MetadataMutationRouteFence::current(
+            Ok(()) => Ok(StorageNodeRouteFence::current(
                 &self.config,
                 self.current_route_map_lease(),
             )),
@@ -11283,7 +11408,7 @@ impl StorageNodeConnectionHandler {
         authorized_source: &MetadataCommandEnvelope,
         abandoned_source: Option<&MetadataCommandEnvelope>,
         command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataMutationRouteFence, StorageRpcErrorResponse> {
+    ) -> Result<StorageNodeRouteFence, StorageRpcErrorResponse> {
         if command != authorized_source
             && (command.id().cluster_epoch() != authorized_source.id().cluster_epoch()
                 || command.id().pg_id() != authorized_source.id().pg_id()
@@ -11358,7 +11483,7 @@ impl StorageNodeConnectionHandler {
         node_id: NodeId,
         pg_id: PgId,
         authorized_source: &MetadataCommandEnvelope,
-    ) -> Result<MetadataMutationRouteFence, StorageRpcErrorResponse> {
+    ) -> Result<StorageNodeRouteFence, StorageRpcErrorResponse> {
         if authorized_source.id().pg_id() != pg_id {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::PayloadDecode,
@@ -11410,7 +11535,7 @@ impl StorageNodeConnectionHandler {
                     cluster_epoch.get()
                 ),
             })?;
-        let fence = MetadataMutationRouteFence::historical(
+        let fence = StorageNodeRouteFence::historical(
             cluster_epoch,
             valid_until_ms,
             local_valid_until_monotonic_ms,
@@ -12044,6 +12169,44 @@ impl StorageNodeConnectionHandler {
     ) -> Result<(), StorageRpcErrorResponse> {
         self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)?;
         self.validate_primary_pg_for_bucket(request.pg_id, &request.bucket, operation)
+    }
+
+    fn active_bucket_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcBucketRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeActiveBucketRoute<'a>, StorageRpcErrorResponse> {
+        if !Arc::ptr_eq(&route_permit.gate.inner, &self.route_admission.inner) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} route permit belongs to a different admission domain"
+                ),
+            });
+        }
+        if route_permit.class != StorageNodeRouteAdmissionClass::Active {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "{operation} requires active route admission, got {:?}",
+                    route_permit.class
+                ),
+            });
+        }
+        self.validate_bucket_metadata_control_route(request, operation)?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        Ok(StorageNodeActiveBucketRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id: self.node.bucket_metadata_pg_for(&request.bucket),
+            bucket: &request.bucket,
+        })
     }
 
     fn validate_bucket_batch_route(
@@ -15897,7 +16060,9 @@ mod tests {
         let config = test_config(&tmp);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let admitted = server.route_admission.acquire(false);
+        let admitted = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
         let mut next_config = bounded_runtime_refresh_config(config);
         next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
         next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
@@ -15984,7 +16149,9 @@ mod tests {
             StorageNodeRouteTransitionState::Open,
             "runtime-config staging must not close route admission"
         );
-        let admitted = server.route_admission.acquire(false);
+        let admitted = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
         drop(admitted);
         stage_barrier.wait();
         installer.join().unwrap();
@@ -16001,7 +16168,9 @@ mod tests {
         config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let admitted = server.route_admission.acquire(false);
+        let admitted = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
         let mut extended = config;
         extended.route_map_validity = RouteMapValidity::until_ms(6_000).unwrap();
 
@@ -16026,13 +16195,138 @@ mod tests {
     }
 
     #[test]
+    fn active_bucket_route_atomically_captures_deadline_during_validity_extension() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        }));
+        let bucket = crate::tests::bucket_name("active-route-bucket");
+        crate::clock::with_time_override(1_000, || {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+        });
+        let mut handler = server.connection_handler();
+        let route_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcBucketRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+        };
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        match handler.active_bucket_route(&foreign_permit, &request, "test bucket read") {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign admission permit created an active bucket route"),
+        }
+        let cleanup_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.active_bucket_route(&cleanup_permit, &request, "test bucket read") {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires active route admission"));
+            }
+            Ok(_) => panic!("retained-cleanup admission created an active bucket route"),
+        }
+        drop(cleanup_permit);
+
+        let capture_barrier = Arc::new(Barrier::new(2));
+        let capture_hook_barrier = Arc::clone(&capture_barrier);
+        *server
+            .runtime_route_capture_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            capture_hook_barrier.wait();
+            capture_hook_barrier.wait();
+        }));
+        let (publish_attempt_tx, publish_attempt_rx) = mpsc::channel();
+        let runtime_route_state = Arc::clone(&server.runtime_route_state);
+        *server
+            .runtime_route_before_publish_lock_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            assert!(
+                runtime_route_state.try_write().is_err(),
+                "validity renewal must contend with the in-progress coherent route capture"
+            );
+            publish_attempt_tx.send(()).unwrap();
+        }));
+
+        let (captured_handler_tx, captured_handler_rx) = mpsc::channel();
+        let capture = thread::spawn(move || {
+            handler.refresh_config_snapshot();
+            captured_handler_tx.send(handler).unwrap();
+        });
+        capture_barrier.wait();
+
+        let mut extended = config;
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        let installing_server = Arc::clone(&server);
+        let installer = thread::spawn(move || {
+            crate::clock::with_time_override(1_000, || {
+                installing_server
+                    .install_control_plane_runtime_config(extended)
+                    .unwrap();
+            });
+        });
+        publish_attempt_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("validity renewal did not reach the coherent route-state write boundary");
+        capture_barrier.wait();
+        let handler = captured_handler_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("route capture did not finish after releasing its read lock hook");
+        capture.join().unwrap();
+        installer.join().unwrap();
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(10_000)
+        );
+
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_bucket_route(&route_permit, &request, "test bucket read")
+                .unwrap()
+        });
+        crate::clock::with_time_override(1_000, || {
+            assert_eq!(route.head_bucket(true).unwrap().name, bucket);
+            assert_eq!(
+                route.get_subresource(BucketSubresourceKind::Cors).unwrap(),
+                None
+            );
+        });
+
+        crate::clock::with_time_override(6_000, || match route.head_bucket(true) {
+            Err(StorageNodeActiveBucketRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+            }
+            Err(StorageNodeActiveBucketRouteError::Bucket(error)) => {
+                panic!("captured route should expire before node access: {error}")
+            }
+            Ok(info) => panic!("expired captured route unexpectedly loaded {info:?}"),
+        });
+    }
+
+    #[test]
     fn storage_node_runtime_config_validity_shrink_drains_frames() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
         config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-        let admitted = server.route_admission.acquire(false);
+        let admitted = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
         let mut shortened = config;
         shortened.route_map_validity = RouteMapValidity::until_ms(4_000).unwrap();
 
@@ -16302,7 +16596,7 @@ mod tests {
     #[test]
     fn storage_node_route_transition_allows_lock_release_during_drain() {
         let gate = StorageNodeRouteAdmissionGate::default();
-        let admitted = gate.acquire(false);
+        let admitted = gate.acquire(StorageNodeRouteAdmissionClass::Active);
         let transition_gate = gate.clone();
         let (publishing_tx, publishing_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -16331,7 +16625,7 @@ mod tests {
             thread::yield_now();
         }
 
-        drop(gate.acquire(true));
+        drop(gate.acquire(StorageNodeRouteAdmissionClass::RetainedCleanup));
         assert!(matches!(
             publishing_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -16344,7 +16638,7 @@ mod tests {
         let (regular_tx, regular_rx) = mpsc::channel();
         let regular = thread::spawn(move || {
             attempted_tx.send(()).unwrap();
-            let _permit = regular_gate.acquire(false);
+            let _permit = regular_gate.acquire(StorageNodeRouteAdmissionClass::Active);
             regular_tx.send(()).unwrap();
         });
         attempted_rx.recv_timeout(Duration::from_secs(2)).unwrap();

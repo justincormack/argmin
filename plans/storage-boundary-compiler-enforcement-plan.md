@@ -1164,6 +1164,48 @@ Twentieth Phase 3 slice:
   fixed-clock request path, keeping its authentication assertion deterministic
   under scheduler delay.
 
+Twenty-first Phase 3 slice:
+
+- storage-node RPC frames now carry an explicit private admission class:
+  ordinary operations receive `Active`, while the metadata-command PG-lock
+  release path receives the narrower `RetainedCleanup` class that may enter
+  during transition drain. The permit is passed into frame dispatch instead
+  of existing only as an unnameable local guard.
+- bucket head and bucket-subresource read handlers derive a private,
+  non-`Clone` `StorageNodeActiveBucketRoute` before reaching the local node
+  client. Its construction requires a permit from the same admission domain
+  and the `Active` class, validates the decoded node, epoch, PG, primary, and
+  bucket placement, then fixes the bucket and trusted `BucketPgId` for the
+  capability lifetime. A retained-cleanup permit cannot be promoted into
+  active authority.
+- the server runtime config and its bound process-monotonic lease now form one
+  lock-protected `StorageNodeRuntimeRouteState`. Per-frame refresh clones that
+  coherent pair while holding one read guard; validity-only renewal replaces
+  the pair under one write guard. The server-local capability captures both
+  deadlines from the frame snapshot and revalidates that fence immediately
+  before each local head or subresource read. A same-generation validity
+  extension can continue without draining admitted frames, but cannot extend
+  an already admitted request. The existing metadata-command mutation fence
+  was renamed to the more accurate shared `StorageNodeRouteFence`; its durable
+  commit-guard behavior is unchanged.
+- a deterministic storage-node regression reads a seeded bucket and missing
+  CORS subresource through the capability and rejects construction from both a
+  foreign admission domain and a retained-cleanup permit. It then pauses frame
+  snapshot capture while holding the coherent-state read guard, proves a
+  5,000ms-to-10,000ms renewal is blocked at that exact write boundary, and
+  completes capability construction after renewal publication. The capability
+  still fails at 6,000ms with the frame's captured 5,000ms deadline. Existing
+  Unix positive and wrong-bucket-PG regressions continue to cover wire
+  decoding, primary/placement validation, and both migrated operations.
+- this is the first server-local active capability and intentionally covers
+  only the two read RPCs exposed by `ActiveBucketRoute`. Bucket snapshots,
+  mutations, object/data operations, and retained cleanup/recovery still use
+  their existing validation paths and remain open for capability migration.
+- validation passed formatting, the storage boundary checker, all 161
+  storage-node server tests, the focused Unix bucket-head and subresource
+  integration regressions, workspace-wide strict Clippy, and the full
+  parallel workspace suite (7,326 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
