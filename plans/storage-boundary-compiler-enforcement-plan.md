@@ -1941,6 +1941,53 @@ Thirty-seventh Phase 3 slice:
   workspace-wide strict Clippy, and the full parallel workspace suite (7,452
   tests).
 
+Thirty-eighth Phase 3 slice:
+
+- PutObject and UploadPart stream-session creation command construction now
+  consumes the exact `StorageNodeActivePrimaryObjectRoute` established from
+  the admitted frame. The capability derives the trusted object PG and
+  placement epoch from the route and revalidates its immutable captured
+  deadline immediately before local command construction.
+- the capability binds the decoded create request to the active bucket/key,
+  requires its precondition variant to match the stream target, and binds any
+  current-object or multipart-upload precondition to that same subject. An
+  UploadPart precondition must also name the upload ID carried by the target.
+  The reservation proof must match the route epoch and key plus the exact
+  target-specific operation: `put-object-stream-create` or
+  `upload-part-stream-create`.
+- the storage-node handler preserves the existing stale-snapshot,
+  missing-upload, and command-build error mappings, but no longer reconstructs
+  authority from raw decoded PG/epoch fields before calling the local client.
+  Proof bucket mismatch retains its established pre-route precedence; all
+  other subject, precondition, and proof evidence is checked by the
+  post-auth server-local capability.
+- the deterministic active-route regression positively constructs commands
+  for PutObject with both current-snapshot modes and for UploadPart. It rejects
+  a foreign create subject, a foreign current-object snapshot, a crossed
+  target/precondition, crossed PutObject/UploadPart proof authority, and an
+  UploadPart snapshot for another upload ID. Both target paths fail at the
+  capability's original deadline after same-epoch route renewal.
+- the equivalent-state two-PG Unix regression now constructs a successful
+  UploadPart stream command on the routed PG, requires exact `PayloadDecode`
+  for the same durable upload on a forged PG, and independently rejects a
+  same-route PutObject proof substituted into UploadPart creation. Existing
+  PutObject, missing-upload, wrong-PG, and stale-epoch command tests now use
+  their canonical target-specific proof operations so another rejection
+  cannot mask the behavior under test.
+- review correction: Unix response validation now also requires the returned
+  command's `cleanup_after` value to equal the request exactly. An adversarial
+  validator regression mutates only that deadline and rejects the response,
+  preventing a faulty node from shortening, removing, or extending durable
+  abandoned-session cleanup.
+- stream finalization and remaining multipart mutations, retained stream
+  cleanup, payload reclaim, PG-wide listing scans, data operations, frontend
+  capability migration, and capability requirements on node-client traits
+  remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  capability and Unix positive/wrong-PG regressions, all 2,209 storage tests,
+  workspace-wide strict Clippy, and the full parallel workspace suite (7,463
+  tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

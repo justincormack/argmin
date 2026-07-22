@@ -3731,6 +3731,87 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
+    fn build_create_stream_upload_command(
+        &self,
+        request: &CreateStreamUploadReq,
+        cleanup_after: Option<u64>,
+        precondition: CreateStreamUploadPrecondition<'_>,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.require_create_stream_upload_subject(request, "stream upload command build")?;
+        let expected_operation_kind = match (&request.target, &precondition) {
+            (
+                StreamUploadTarget::PutObject,
+                CreateStreamUploadPrecondition::PutObjectNoCurrentCheck { .. },
+            ) => PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            (
+                StreamUploadTarget::PutObject,
+                CreateStreamUploadPrecondition::PutObject {
+                    expected_current, ..
+                },
+            ) => {
+                if expected_current.is_some_and(|stored| {
+                    stored.bucket() != self.route.bucket || stored.key() != self.route.key
+                }) {
+                    return Err(StorageNodeObjectRouteError::Route(
+                        StorageRpcErrorResponse {
+                            code: StorageRpcErrorCode::PayloadDecode,
+                            message: "stream upload command expected object does not match active object route".to_string(),
+                        },
+                    ));
+                }
+                PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            }
+            (
+                StreamUploadTarget::UploadPart { upload_id, .. },
+                CreateStreamUploadPrecondition::UploadPart { expected_upload },
+            ) => {
+                if expected_upload.bucket != *self.route.bucket
+                    || expected_upload.key != *self.route.key
+                    || expected_upload.upload_id != *upload_id
+                {
+                    return Err(StorageNodeObjectRouteError::Route(
+                        StorageRpcErrorResponse {
+                            code: StorageRpcErrorCode::PayloadDecode,
+                            message: "stream upload command expected multipart upload does not match active object route or target".to_string(),
+                        },
+                    ));
+                }
+                UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            }
+            _ => {
+                return Err(StorageNodeObjectRouteError::Route(
+                    StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: "stream upload command precondition does not match target"
+                            .to_string(),
+                    },
+                ));
+            }
+        };
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            expected_operation_kind,
+            "stream upload command build",
+        )?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
+            &local_client,
+            BuildCreateStreamUploadCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                request,
+                cleanup_after,
+                precondition,
+                bucket_write_reservation,
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn update_stream_upload_bucket_write_reservation(
         &self,
         session_id: &SessionId,
@@ -5627,7 +5708,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamUploadCommandBuild => {
                 match decode_create_stream_upload_command_build_request(&frame.payload) {
-                    Ok(request) => self.create_stream_upload_command_build_response(request),
+                    Ok(request) => {
+                        self.create_stream_upload_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8834,15 +8917,18 @@ impl StorageNodeConnectionHandler {
 
     fn create_stream_upload_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcCreateStreamUploadCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "stream upload command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let precondition = match &request.precondition {
             StorageRpcCreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
                 require_generation_reservation,
@@ -8860,27 +8946,23 @@ impl StorageNodeConnectionHandler {
                 CreateStreamUploadPrecondition::UploadPart { expected_upload }
             }
         };
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response = match ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
-            &local_client,
-            BuildCreateStreamUploadCommandReq {
-                pg_id: self
-                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                cluster_epoch: request.object.cluster_epoch,
-                request: &request.request,
-                cleanup_after: request.cleanup_after,
-                precondition,
-                bucket_write_reservation: &request.bucket_write_reservation,
-            },
+        let response = match route.build_create_stream_upload_command(
+            &request.request,
+            request.cleanup_after,
+            precondition,
+            &request.bucket_write_reservation,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
-            Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::NoSuchUpload { .. },
+            ))) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::Missing
-            }
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 match object_metadata_command_build_error_outcome(error, Some("CreateStreamUpload"))
                 {
                     Ok(outcome) => outcome,
@@ -19150,6 +19232,10 @@ mod tests {
                 Some(4_000),
                 stream_proof.clone(),
             );
+        let new_stream_create_request = CreateStreamUploadReq {
+            session_id: crate::tests::stream_session_id("active-new"),
+            ..stream_create_request.clone()
+        };
         let upload_part_stream_session_id = crate::tests::stream_session_id("active-part");
         let mut upload_part_stream_proof = proof.clone();
         upload_part_stream_proof.operation_kind =
@@ -19168,8 +19254,12 @@ mod tests {
             CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
                 upload_part_stream_create_request.clone(),
                 1_000,
-                upload_part_stream_proof,
+                upload_part_stream_proof.clone(),
             );
+        let new_upload_part_stream_create_request = CreateStreamUploadReq {
+            session_id: crate::tests::stream_session_id("active-part-new"),
+            ..upload_part_stream_create_request.clone()
+        };
         crate::clock::with_time_override(1_000, || {
             let pg = server._node.get_pg(0).unwrap();
             PgMetadataStore::put_object_with_segments(
@@ -19538,6 +19628,135 @@ mod tests {
             upload
         });
         assert_eq!(multipart_upload.upload_id, upload_id);
+        let put_stream_command = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .build_create_stream_upload_command(
+                    &new_stream_create_request,
+                    Some(4_000),
+                    CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                        require_generation_reservation: false,
+                    },
+                    &stream_proof,
+                )
+                .unwrap()
+        });
+        let MetadataCommandPayload::CreateStreamUpload(put_stream_create) =
+            put_stream_command.payload()
+        else {
+            panic!("active object route must build a PutObject stream command");
+        };
+        assert_eq!(put_stream_create.session.bucket, bucket);
+        assert_eq!(put_stream_create.session.key, key);
+        assert_eq!(put_stream_create.cleanup_after, Some(4_000));
+        assert_eq!(put_stream_create.bucket_write_reservation, stream_proof);
+
+        let upload_part_stream_command = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .build_create_stream_upload_command(
+                    &new_upload_part_stream_create_request,
+                    None,
+                    CreateStreamUploadPrecondition::UploadPart {
+                        expected_upload: &multipart_upload,
+                    },
+                    &upload_part_stream_proof,
+                )
+                .unwrap()
+        });
+        let MetadataCommandPayload::CreateStreamUpload(upload_part_stream_create) =
+            upload_part_stream_command.payload()
+        else {
+            panic!("active object route must build an UploadPart stream command");
+        };
+        assert_eq!(upload_part_stream_create.session.bucket, bucket);
+        assert_eq!(upload_part_stream_create.session.key, key);
+        assert_eq!(upload_part_stream_create.cleanup_after, None);
+        assert_eq!(
+            upload_part_stream_create.bucket_write_reservation,
+            upload_part_stream_proof
+        );
+
+        let mut mismatched_stream_build_request = new_stream_create_request.clone();
+        mismatched_stream_build_request.key =
+            crate::tests::object_key("different-stream-build-key");
+        let mismatched_stream_build = crate::clock::with_time_override(1_000, || {
+            primary_route.build_create_stream_upload_command(
+                &mismatched_stream_build_request,
+                None,
+                CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                    require_generation_reservation: false,
+                },
+                &stream_proof,
+            )
+        });
+        match mismatched_stream_build {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("subject does not match"));
+            }
+            other => panic!("mismatched stream build subject must fail: {other:?}"),
+        }
+
+        let mismatched_stream_precondition = crate::clock::with_time_override(1_000, || {
+            primary_route.build_create_stream_upload_command(
+                &new_stream_create_request,
+                None,
+                CreateStreamUploadPrecondition::UploadPart {
+                    expected_upload: &multipart_upload,
+                },
+                &stream_proof,
+            )
+        });
+        match mismatched_stream_precondition {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("precondition does not match target"));
+            }
+            other => panic!("crossed stream build precondition must fail: {other:?}"),
+        }
+
+        let mut mismatched_stream_build_proof = stream_proof.clone();
+        mismatched_stream_build_proof.operation_kind =
+            UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let mismatched_stream_build = crate::clock::with_time_override(1_000, || {
+            primary_route.build_create_stream_upload_command(
+                &new_stream_create_request,
+                None,
+                CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                    require_generation_reservation: false,
+                },
+                &mismatched_stream_build_proof,
+            )
+        });
+        match mismatched_stream_build {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => panic!("crossed stream build proof must fail: {other:?}"),
+        }
+
+        let mut mismatched_expected_upload = multipart_upload.clone();
+        mismatched_expected_upload.upload_id =
+            crate::tests::multipart_upload_id("different-expected-upload");
+        let mismatched_upload_part_precondition = crate::clock::with_time_override(1_000, || {
+            primary_route.build_create_stream_upload_command(
+                &new_upload_part_stream_create_request,
+                None,
+                CreateStreamUploadPrecondition::UploadPart {
+                    expected_upload: &mismatched_expected_upload,
+                },
+                &upload_part_stream_proof,
+            )
+        });
+        match mismatched_upload_part_precondition {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error
+                    .message
+                    .contains("does not match active object route or target"));
+            }
+            other => panic!("mismatched expected upload must fail: {other:?}"),
+        }
         let expected_multipart_command = crate::metadata_command::CreateMultipartUploadCommand {
             upload: multipart_upload.clone(),
             bucket_write_reservation: create_multipart_proof.clone(),
@@ -19689,6 +19908,46 @@ mod tests {
                 assert_eq!(lifecycle_versions, vec![metadata_stored.clone()]);
                 (metadata_stored, current, specific)
             });
+        crate::clock::with_time_override(1_000, || {
+            primary_route
+                .build_create_stream_upload_command(
+                    &new_stream_create_request,
+                    Some(4_000),
+                    CreateStreamUploadPrecondition::PutObject {
+                        expected_current: Some(&metadata_stored),
+                        require_generation_reservation: false,
+                    },
+                    &stream_proof,
+                )
+                .unwrap();
+        });
+        let mut mismatched_stream_expected_current = metadata_stored.clone();
+        match &mut mismatched_stream_expected_current {
+            crate::StoredObject::Live(object) => {
+                object.key = crate::tests::object_key("different-stream-expected-key");
+            }
+            crate::StoredObject::DeleteMarker(_) => {
+                panic!("active object route fixture must contain a live object");
+            }
+        }
+        let mismatched_stream_expected = crate::clock::with_time_override(1_000, || {
+            primary_route.build_create_stream_upload_command(
+                &new_stream_create_request,
+                Some(4_000),
+                CreateStreamUploadPrecondition::PutObject {
+                    expected_current: Some(&mismatched_stream_expected_current),
+                    require_generation_reservation: false,
+                },
+                &stream_proof,
+            )
+        });
+        match mismatched_stream_expected {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("expected object does not match"));
+            }
+            other => panic!("mismatched expected stream object must fail: {other:?}"),
+        }
         let create_multipart_command = crate::clock::with_time_override(1_000, || {
             primary_route
                 .build_create_multipart_upload_command(
@@ -19940,6 +20199,32 @@ mod tests {
                         .matching_stream_upload_exists(
                             &upload_part_stream_create_request,
                             Some(&expected_upload_part_stream_command),
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "PutObject stream command build",
+                    primary_route
+                        .build_create_stream_upload_command(
+                            &new_stream_create_request,
+                            Some(4_000),
+                            CreateStreamUploadPrecondition::PutObjectNoCurrentCheck {
+                                require_generation_reservation: false,
+                            },
+                            &stream_proof,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "UploadPart stream command build",
+                    primary_route
+                        .build_create_stream_upload_command(
+                            &new_upload_part_stream_create_request,
+                            None,
+                            CreateStreamUploadPrecondition::UploadPart {
+                                expected_upload: &multipart_upload,
+                            },
+                            &upload_part_stream_proof,
                         )
                         .map(|_| ()),
                 ),

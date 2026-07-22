@@ -805,6 +805,7 @@ impl UnixStorageNodeClient {
             || create.session.state != StreamUploadState::InProgress
             || create.session.encryption != request.request.encryption
             || create.initial_next_segment_vid != GenerationId::MIN
+            || create.cleanup_after != request.cleanup_after
             || create.bucket_write_reservation != *request.bucket_write_reservation
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
