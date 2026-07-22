@@ -315,7 +315,8 @@ use crate::{
     BucketDeleteFinalizeClaimRecord, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSubresourceKind, BucketWriteDrainRecord,
     BucketWriteReservationProof, BucketWriteReservationRecord, EcShape, LifecycleSweepClaimRecord,
-    NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey, ShardLocation,
+    MultipartUploadRecord, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey,
+    ShardLocation, UploadId,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
@@ -3097,6 +3098,12 @@ enum StorageNodeObjectRouteError {
     Object(ObjectPgActionError),
 }
 
+#[derive(Debug)]
+enum StorageNodeMultipartUploadRouteError {
+    Route(StorageRpcErrorResponse),
+    Upload(BucketSnapshotLoadError),
+}
+
 struct StorageNodeActiveBucketRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     _route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -3605,12 +3612,15 @@ impl StorageNodeActiveBucketRoutePair<'_> {
 }
 
 impl StorageNodeActiveObjectRoute<'_> {
+    fn require_valid_now_response(&self) -> Result<(), StorageRpcErrorResponse> {
+        self.fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )
+    }
+
     fn require_valid_now(&self) -> Result<(), StorageNodeObjectRouteError> {
-        self.fence
-            .validate_rpc_at(
-                crate::clock::current_time_millis(),
-                crate::clock::monotonic_time_millis(),
-            )
+        self.require_valid_now_response()
             .map_err(StorageNodeObjectRouteError::Route)
     }
 
@@ -3631,6 +3641,65 @@ impl StorageNodeActiveObjectRoute<'_> {
 }
 
 impl StorageNodeActivePrimaryObjectRoute<'_> {
+    fn load_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, StorageNodeMultipartUploadRouteError> {
+        self.route
+            .require_valid_now_response()
+            .map_err(StorageNodeMultipartUploadRouteError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_multipart_upload(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            upload_id,
+        )
+        .map_err(StorageNodeMultipartUploadRouteError::Upload)
+    }
+
+    fn load_in_progress_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            upload_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_in_progress_multipart_upload_for_listing(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            upload_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn require_object_mutation_proof(
         &self,
         bucket_write_reservation: &BucketWriteReservationProof,
@@ -5089,7 +5158,9 @@ impl StorageNodeConnectionHandler {
             | StorageRpcMessageKind::ObjectMultipartInProgressUploadLoad
             | StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad => {
                 match decode_multipart_upload_load_request(&frame.payload) {
-                    Ok(request) => self.multipart_upload_load_response(frame.kind, request),
+                    Ok(request) => {
+                        self.multipart_upload_load_response(route_permit, frame.kind, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8165,95 +8236,66 @@ impl StorageNodeConnectionHandler {
 
     fn multipart_upload_load_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         kind: StorageRpcMessageKind,
         request: StorageRpcMultipartUploadLoadRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "multipart upload load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let outcome = match kind {
             StorageRpcMessageKind::ObjectMultipartUploadLoad => {
-                match ObjectMutationMetadataNodeClient::load_multipart_upload(
-                    &local_client,
-                    self.validated_object_metadata_pg(
-                        &request.object.bucket,
-                        &request.object.key,
-                    ),
-                    &request.object.bucket,
-                    &request.object.key,
-                    &request.upload_id,
-                ) {
+                match route.load_multipart_upload(&request.upload_id) {
                     Ok(upload) => StorageRpcMultipartUploadLoadOutcome::Loaded(Box::new(upload)),
-                    Err(BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload {
-                        ..
-                    })) => StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
+                    Err(StorageNodeMultipartUploadRouteError::Upload(
+                        BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload { .. }),
+                    )) => StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
                         upload_id: request.upload_id,
                     },
-                    Err(error) => {
-                        return encode_storage_rpc_error_response(
-                            &bucket_snapshot_error_response(error),
-                        );
+                    Err(StorageNodeMultipartUploadRouteError::Route(error)) => {
+                        return encode_storage_rpc_error_response(&error);
+                    }
+                    Err(StorageNodeMultipartUploadRouteError::Upload(error)) => {
+                        return encode_storage_rpc_error_response(&bucket_snapshot_error_response(
+                            error,
+                        ));
                     }
                 }
             }
             StorageRpcMessageKind::ObjectMultipartInProgressUploadLoad => {
-                match ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload(
-                    &local_client,
-                    self.validated_object_metadata_pg(
-                        &request.object.bucket,
-                        &request.object.key,
-                    ),
-                    &request.object.bucket,
-                    &request.object.key,
-                    &request.upload_id,
-                ) {
+                match route.load_in_progress_multipart_upload(&request.upload_id) {
                     Ok(upload) => StorageRpcMultipartUploadLoadOutcome::Loaded(Box::new(upload)),
-                    Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
-                        StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
-                            upload_id: request.upload_id,
-                        }
+                    Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                        MetadataError::NoSuchUpload { .. },
+                    ))) => StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
+                        upload_id: request.upload_id,
+                    },
+                    Err(StorageNodeObjectRouteError::Route(error)) => {
+                        return encode_storage_rpc_error_response(&error);
                     }
-                    Err(error) => {
-                        return encode_storage_rpc_error_response(
-                            &object_pg_error_response(error),
-                        );
+                    Err(StorageNodeObjectRouteError::Object(error)) => {
+                        return encode_storage_rpc_error_response(&object_pg_error_response(error));
                     }
                 }
             }
             StorageRpcMessageKind::ObjectMultipartInProgressUploadForListingLoad => {
-                match ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
-                    &local_client,
-                    self.validated_object_metadata_pg(
-                        &request.object.bucket,
-                        &request.object.key,
-                    ),
-                    &request.object.bucket,
-                    &request.object.key,
-                    &request.upload_id,
-                ) {
+                match route.load_in_progress_multipart_upload_for_listing(&request.upload_id) {
                     Ok(upload) => StorageRpcMultipartUploadLoadOutcome::Loaded(Box::new(upload)),
-                    Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
-                        StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
-                            upload_id: request.upload_id,
-                        }
+                    Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                        MetadataError::NoSuchUpload { .. },
+                    ))) => StorageRpcMultipartUploadLoadOutcome::NoSuchUpload {
+                        upload_id: request.upload_id,
+                    },
+                    Err(StorageNodeObjectRouteError::Route(error)) => {
+                        return encode_storage_rpc_error_response(&error);
                     }
-                    Err(error) => {
-                        return encode_storage_rpc_error_response(
-                            &object_pg_error_response(error),
-                        );
+                    Err(StorageNodeObjectRouteError::Object(error)) => {
+                        return encode_storage_rpc_error_response(&object_pg_error_response(error));
                     }
                 }
             }
@@ -14999,7 +15041,7 @@ fn canonicalize_existing_or_parent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BucketAclSummary;
+    use crate::{BucketAclSummary, CreateMultipartUploadReq};
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -18681,6 +18723,7 @@ mod tests {
         let bucket = crate::tests::bucket_name("active-object-route-bucket");
         let key = crate::tests::object_key("active-object-route-key");
         let reservation_id = crate::tests::stream_session_id("active-object");
+        let upload_id = crate::tests::multipart_upload_id("active-object-route-upload");
         let reserved_generation = crate::clock::with_time_override(1_000, || {
             let pg = server._node.get_pg(0).unwrap();
             let generation =
@@ -18771,6 +18814,25 @@ mod tests {
                 &[],
             )
             .unwrap();
+            PgMetadataStore::create_multipart_upload(
+                &*pg,
+                &CreateMultipartUploadReq {
+                    upload_id: upload_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    tags: None,
+                    metadata_blob: crate::SerializedMetadataBlob::default(),
+                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                    initiator: crate::OwnerIdentity::from_principal("active-object-route-owner"),
+                    owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    object_lock: crate::ObjectLockState::default(),
+                    checksum: None,
+                    encryption: crate::ObjectEncryption::None,
+                },
+            )
+            .unwrap();
             pg.refresh_metadata_command_state_digest().unwrap();
         });
 
@@ -18814,7 +18876,7 @@ mod tests {
             );
             assert_eq!(
                 primary_route.next_generation_id().unwrap(),
-                GenerationId::new(10).unwrap()
+                GenerationId::new(11).unwrap()
             );
             assert_eq!(
                 acting_set_route.next_version_id().unwrap(),
@@ -18915,6 +18977,24 @@ mod tests {
             );
             subject
         });
+
+        let multipart_upload = crate::clock::with_time_override(1_000, || {
+            let upload = primary_route.load_multipart_upload(&upload_id).unwrap();
+            assert_eq!(
+                primary_route
+                    .load_in_progress_multipart_upload(&upload_id)
+                    .unwrap(),
+                upload
+            );
+            assert_eq!(
+                primary_route
+                    .load_in_progress_multipart_upload_for_listing(&upload_id)
+                    .unwrap(),
+                upload
+            );
+            upload
+        });
+        assert_eq!(multipart_upload.upload_id, upload_id);
 
         let (metadata_stored, current_delete_snapshot, specific_delete_snapshot) =
             crate::clock::with_time_override(1_000, || {
@@ -19029,6 +19109,16 @@ mod tests {
         );
 
         crate::clock::with_time_override(6_000, || {
+            match primary_route.load_multipart_upload(&upload_id) {
+                Err(StorageNodeMultipartUploadRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                    assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+                }
+                Err(StorageNodeMultipartUploadRouteError::Upload(error)) => {
+                    panic!("captured route should expire before multipart upload load: {error}")
+                }
+                Ok(_) => panic!("expired captured route performed multipart upload load"),
+            }
             let expired_operations = [
                 (
                     "generation reservation",
@@ -19104,6 +19194,18 @@ mod tests {
                     "lifecycle object version list load",
                     primary_route
                         .list_object_versions_for_lifecycle()
+                        .map(|_| ()),
+                ),
+                (
+                    "in-progress multipart upload load",
+                    primary_route
+                        .load_in_progress_multipart_upload(&upload_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "listing in-progress multipart upload load",
+                    primary_route
+                        .load_in_progress_multipart_upload_for_listing(&upload_id)
                         .map(|_| ()),
                 ),
                 (
