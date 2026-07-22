@@ -1902,6 +1902,45 @@ Thirty-sixth Phase 3 slice:
   workspace-wide strict Clippy, and the full parallel workspace suite (7,446
   tests).
 
+Thirty-seventh Phase 3 slice:
+
+- stream-upload retry matching, session loading, segment listing, PutObject
+  reservation-proof renewal, and segment-append preparation now consume the
+  exact `StorageNodeActivePrimaryObjectRoute` established from the admitted
+  frame. Each effect derives its trusted object PG, bucket, key, and placement
+  epoch from that capability and revalidates the immutable captured deadline
+  immediately before local node access.
+- retry matching binds both the decoded create request and any expected
+  `CreateStreamUploadCommand` to the active object subject. The command's
+  bucket-write proof must match the route epoch and key plus the operation
+  implied by its target: `put-object-stream-create` or
+  `upload-part-stream-create`.
+- PutObject stream proof renewal now independently binds both the current and
+  renewed proofs to `put-object-stream-create`, the active route, and one
+  stable reservation identity before mutation. Only the lease deadline may
+  differ. Append preparation stamps the segment with the capability's trusted
+  epoch rather than the decoded wire epoch.
+- the deterministic active-object regression creates a durable PutObject
+  stream and an UploadPart stream and positively exercises both retry-proof
+  branches plus the other four operations. It rejects a foreign command
+  subject, PutObject/UploadPart crossed operation proofs in both directions,
+  and a mismatched renewal identity, then extends raw same-epoch route validity
+  and proves every effect fails at the capability's original deadline while
+  the durable renewed proof remains exact. The two stream-create operation
+  names are canonical metadata-command constants shared by acquisition and
+  validation. Existing Unix regressions retain correct-route canaries and
+  equivalent-state wrong-PG rejection for session load, segment load, proof
+  renewal, and append preparation; the absent-session matrix independently
+  pins wrong-PG retry matching.
+- stream creation/finalization and remaining multipart mutations, retained
+  stream cleanup, payload reclaim, PG-wide listing scans, data operations,
+  frontend capability migration, and capability requirements on node-client
+  traits remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  capability and Unix positive/wrong-PG regressions, all 2,209 storage tests,
+  workspace-wide strict Clippy, and the full parallel workspace suite (7,452
+  tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

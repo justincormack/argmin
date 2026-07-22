@@ -30,6 +30,8 @@ use crate::metadata_command::{
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node_client::{
     complete_multipart_expected_object_parts, BucketMetadataNodeClient,
@@ -315,9 +317,11 @@ use crate::DataPgId;
 use crate::{
     BucketDeleteFinalizeClaimRecord, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSubresourceKind, BucketWriteDrainRecord,
-    BucketWriteReservationProof, BucketWriteReservationRecord, CreateMultipartUploadReq, EcShape,
-    LifecycleSweepClaimRecord, MultipartUploadRecord, NodeId, ObjectKey, ObjectPgActionError,
-    RouteMapValidity, ShardKey, ShardLocation, UploadId,
+    BucketWriteReservationProof, BucketWriteReservationRecord, CreateMultipartUploadReq,
+    CreateStreamUploadReq, EcShape, LifecycleSweepClaimRecord, MultipartUploadRecord, NodeId,
+    ObjectKey, ObjectPgActionError, PrepareStreamUploadSegmentAppendReq, RouteMapValidity,
+    ShardKey, ShardLocation, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget,
+    UploadId,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
@@ -3642,6 +3646,181 @@ impl StorageNodeActiveObjectRoute<'_> {
 }
 
 impl StorageNodeActivePrimaryObjectRoute<'_> {
+    fn require_create_stream_upload_subject(
+        &self,
+        request: &CreateStreamUploadReq,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        if request.bucket != *self.route.bucket || request.key != *self.route.key {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} create request subject does not match active object route"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn matching_stream_upload_exists(
+        &self,
+        request: &CreateStreamUploadReq,
+        expected_command: Option<&crate::metadata_command::CreateStreamUploadCommand>,
+    ) -> Result<bool, StorageNodeObjectRouteError> {
+        self.require_create_stream_upload_subject(request, "stream upload match")?;
+        if let Some(command) = expected_command {
+            if command.session.bucket != *self.route.bucket
+                || command.session.key != *self.route.key
+                || command.session.session_id != request.session_id
+                || command.session.target != request.target
+                || command.session.encryption != request.encryption
+            {
+                return Err(StorageNodeObjectRouteError::Route(
+                    StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: "stream upload match expected command subject does not match active object route or request".to_string(),
+                    },
+                ));
+            }
+            let expected_operation_kind = match request.target {
+                StreamUploadTarget::PutObject => {
+                    PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                }
+                StreamUploadTarget::UploadPart { .. } => {
+                    UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                }
+            };
+            self.require_object_mutation_proof(
+                &command.bucket_write_reservation,
+                expected_operation_kind,
+                "stream upload match",
+            )?;
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
+            &local_client,
+            self.route.pg_id,
+            request,
+            expected_command,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_stream_upload_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_stream_upload_session(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            session_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn update_stream_upload_bucket_write_reservation(
+        &self,
+        session_id: &SessionId,
+        current: &BucketWriteReservationProof,
+        renewed: &BucketWriteReservationProof,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        self.require_object_mutation_proof(
+            current,
+            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            "stream upload bucket write reservation update",
+        )?;
+        self.require_object_mutation_proof(
+            renewed,
+            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            "stream upload bucket write reservation update",
+        )?;
+        if current.bucket != renewed.bucket
+            || current.reservation_id != renewed.reservation_id
+            || current.owner_token != renewed.owner_token
+            || current.cluster_epoch != renewed.cluster_epoch
+            || current.bucket_execution_generation != renewed.bucket_execution_generation
+            || current.bucket_incarnation_generation != renewed.bucket_incarnation_generation
+            || current.operation_kind != renewed.operation_kind
+            || current.created_at != renewed.created_at
+            || current.target_context != renewed.target_context
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "stream upload bucket write reservation update proofs do not have the same stable identity".to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            session_id,
+            current,
+            renewed,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_stream_upload_segments(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<StreamUploadSegmentRecord>, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_stream_upload_segments(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            session_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn prepare_stream_segment_append(
+        &self,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        let (target, mut segment) =
+            ObjectMutationMetadataNodeClient::prepare_stream_segment_append(
+                &local_client,
+                self.route.pg_id,
+                self.route.bucket,
+                self.route.key,
+                request,
+            )
+            .map_err(StorageNodeObjectRouteError::Object)?;
+        segment.placement_cluster_epoch = self.route.fence.cluster_epoch;
+        Ok((target, segment))
+    }
+
     fn require_create_multipart_upload_subject(
         &self,
         request: &CreateMultipartUploadReq,
@@ -5242,7 +5421,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamUploadMatch => {
                 match decode_stream_upload_match_request(&frame.payload) {
-                    Ok(request) => self.stream_upload_match_response(request),
+                    Ok(request) => self.stream_upload_match_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5251,7 +5430,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamUploadSessionLoad => {
                 match decode_stream_upload_session_request(&frame.payload) {
-                    Ok(request) => self.stream_upload_session_response(request),
+                    Ok(request) => self.stream_upload_session_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5273,9 +5452,10 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate => {
                 match decode_stream_upload_bucket_write_reservation_update_request(&frame.payload) {
-                    Ok(request) => {
-                        self.stream_upload_bucket_write_reservation_update_response(request)
-                    }
+                    Ok(request) => self.stream_upload_bucket_write_reservation_update_response(
+                        route_permit,
+                        request,
+                    ),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5284,7 +5464,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamUploadSegmentsLoad => {
                 match decode_stream_upload_session_request(&frame.payload) {
-                    Ok(request) => self.stream_upload_segments_response(request),
+                    Ok(request) => self.stream_upload_segments_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5374,7 +5554,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamSegmentAppendPrepare => {
                 match decode_stream_segment_append_prepare_request(&frame.payload) {
-                    Ok(request) => self.stream_segment_append_prepare_response(request),
+                    Ok(request) => {
+                        self.stream_segment_append_prepare_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -7835,32 +8017,25 @@ impl StorageNodeConnectionHandler {
 
     fn stream_upload_match_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamUploadMatchRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "stream upload match",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let exists = match ObjectMutationMetadataNodeClient::matching_stream_upload_exists(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.request,
-            request.expected_command.as_ref(),
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let exists = match route
+            .matching_stream_upload_exists(&request.request, request.expected_command.as_ref())
+        {
             Ok(exists) => exists,
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
             }
         };
@@ -7871,38 +8046,28 @@ impl StorageNodeConnectionHandler {
 
     fn stream_upload_session_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamUploadSessionRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "stream upload session load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let outcome = match ObjectMutationMetadataNodeClient::load_stream_upload_session(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            &request.session_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let outcome = match route.load_stream_upload_session(&request.session_id) {
             Ok(session) => StorageRpcStreamUploadSessionOutcome::Loaded(Box::new(session)),
-            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
-                StorageRpcStreamUploadSessionOutcome::NotFound {
-                    session_id: request.session_id,
-                }
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::StreamSessionNotFound { .. },
+            ))) => StorageRpcStreamUploadSessionOutcome::NotFound {
+                session_id: request.session_id,
+            },
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
             }
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
             }
         };
@@ -7957,72 +8122,56 @@ impl StorageNodeConnectionHandler {
 
     fn stream_upload_bucket_write_reservation_update_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamUploadBucketWriteReservationUpdateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "stream upload bucket write reservation update",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.update_stream_upload_bucket_write_reservation(
             &request.session_id,
             &request.current,
             &request.renewed,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
-            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
         }
     }
 
     fn stream_upload_segments_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamUploadSessionRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "stream upload segments load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let outcome = match ObjectMutationMetadataNodeClient::load_stream_upload_segments(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            &request.session_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let outcome = match route.load_stream_upload_segments(&request.session_id) {
             Ok(segments) => StorageRpcStreamUploadSegmentsOutcome::Loaded(segments),
-            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
-                StorageRpcStreamUploadSegmentsOutcome::NotFound {
-                    session_id: request.session_id,
-                }
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::StreamSessionNotFound { .. },
+            ))) => StorageRpcStreamUploadSegmentsOutcome::NotFound {
+                session_id: request.session_id,
+            },
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
             }
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
             }
         };
@@ -8392,44 +8541,31 @@ impl StorageNodeConnectionHandler {
 
     fn stream_segment_append_prepare_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamSegmentAppendPrepareRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "stream segment append prepare",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let outcome = match ObjectMutationMetadataNodeClient::prepare_stream_segment_append(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            &request.request,
-        ) {
-            Ok((target, mut segment)) => {
-                segment.placement_cluster_epoch = request.object.cluster_epoch;
-                StorageRpcStreamSegmentAppendPrepareOutcome::Prepared {
-                    target,
-                    segment: Box::new(segment),
-                }
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let outcome = match route.prepare_stream_segment_append(&request.request) {
+            Ok((target, segment)) => StorageRpcStreamSegmentAppendPrepareOutcome::Prepared {
+                target,
+                segment: Box::new(segment),
+            },
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::StreamSessionNotFound { .. },
+            ))) => StorageRpcStreamSegmentAppendPrepareOutcome::NotFound {
+                session_id: request.request.session_id,
+            },
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
             }
-            Err(ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. })) => {
-                StorageRpcStreamSegmentAppendPrepareOutcome::NotFound {
-                    session_id: request.request.session_id,
-                }
-            }
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
             }
         };
@@ -18948,6 +19084,11 @@ mod tests {
         let mut create_multipart_proof = proof.clone();
         create_multipart_proof.operation_kind =
             CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let mut stream_proof = proof.clone();
+        stream_proof.operation_kind =
+            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let mut renewed_stream_proof = stream_proof.clone();
+        renewed_stream_proof.lease_deadline = 4_500;
         let mut delete_current_proof = proof.clone();
         delete_current_proof.operation_kind = "delete-current-object".to_string();
         let mut delete_specific_proof = proof.clone();
@@ -18995,6 +19136,40 @@ mod tests {
             checksum: None,
             encryption: crate::ObjectEncryption::None,
         };
+        let stream_create_request = CreateStreamUploadReq {
+            session_id: reservation_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let expected_stream_command =
+            CreateStreamUploadCommand::from_request_with_bucket_write_reservation_and_cleanup_deadline(
+                stream_create_request.clone(),
+                1_000,
+                Some(4_000),
+                stream_proof.clone(),
+            );
+        let upload_part_stream_session_id = crate::tests::stream_session_id("active-part");
+        let mut upload_part_stream_proof = proof.clone();
+        upload_part_stream_proof.operation_kind =
+            UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let upload_part_stream_create_request = CreateStreamUploadReq {
+            session_id: upload_part_stream_session_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
+                part_number: 1,
+            },
+            encryption: crate::ObjectEncryption::None,
+        };
+        let expected_upload_part_stream_command =
+            CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                upload_part_stream_create_request.clone(),
+                1_000,
+                upload_part_stream_proof,
+            );
         crate::clock::with_time_override(1_000, || {
             let pg = server._node.get_pg(0).unwrap();
             PgMetadataStore::put_object_with_segments(
@@ -19021,6 +19196,28 @@ mod tests {
             )
             .unwrap();
             PgMetadataStore::create_multipart_upload(&*pg, &existing_multipart_request).unwrap();
+            pg.apply_metadata_command(&MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    MetadataCommandLogIndex::new(1).unwrap(),
+                ),
+                MetadataCommandPayload::CreateStreamUpload(Box::new(
+                    expected_stream_command.clone(),
+                )),
+            ))
+            .unwrap();
+            pg.apply_metadata_command(&MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    MetadataCommandLogIndex::new(2).unwrap(),
+                ),
+                MetadataCommandPayload::CreateStreamUpload(Box::new(
+                    expected_upload_part_stream_command.clone(),
+                )),
+            ))
+            .unwrap();
             pg.refresh_metadata_command_state_digest().unwrap();
         });
 
@@ -19165,6 +19362,164 @@ mod tests {
             );
             subject
         });
+
+        let stream_append_request = PrepareStreamUploadSegmentAppendReq {
+            session_id: reservation_id.clone(),
+            segment_index: 0,
+            size: 12,
+            segment_crc64: 99,
+            payload_crc64: 99,
+            segment_okh: [7; 16],
+        };
+        crate::clock::with_time_override(1_000, || {
+            assert!(primary_route
+                .matching_stream_upload_exists(
+                    &stream_create_request,
+                    Some(&expected_stream_command),
+                )
+                .unwrap());
+            assert!(primary_route
+                .matching_stream_upload_exists(
+                    &upload_part_stream_create_request,
+                    Some(&expected_upload_part_stream_command),
+                )
+                .unwrap());
+            let session = primary_route
+                .load_stream_upload_session(&reservation_id)
+                .unwrap();
+            assert_eq!(session.session_id, reservation_id);
+            assert_eq!(
+                session.bucket_write_reservation.as_ref(),
+                Some(&stream_proof)
+            );
+            assert!(primary_route
+                .load_stream_upload_segments(&reservation_id)
+                .unwrap()
+                .is_empty());
+            let (target, segment) = primary_route
+                .prepare_stream_segment_append(&stream_append_request)
+                .unwrap();
+            assert_eq!(target, StreamUploadTarget::PutObject);
+            assert_eq!(segment.session_id, reservation_id);
+            assert_eq!(segment.placement_cluster_epoch, config.cluster_epoch);
+            primary_route
+                .update_stream_upload_bucket_write_reservation(
+                    &reservation_id,
+                    &stream_proof,
+                    &renewed_stream_proof,
+                )
+                .unwrap();
+            assert_eq!(
+                primary_route
+                    .load_stream_upload_session(&reservation_id)
+                    .unwrap()
+                    .bucket_write_reservation
+                    .as_ref(),
+                Some(&renewed_stream_proof)
+            );
+        });
+
+        let mut mismatched_stream_request = stream_create_request.clone();
+        mismatched_stream_request.key = crate::tests::object_key("different-stream-request-key");
+        let mismatched_stream_match = crate::clock::with_time_override(1_000, || {
+            primary_route.matching_stream_upload_exists(&mismatched_stream_request, None)
+        });
+        match mismatched_stream_match {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("subject does not match"));
+            }
+            other => panic!("mismatched stream create request must fail: {other:?}"),
+        }
+        let mut mismatched_stream_command = expected_stream_command.clone();
+        mismatched_stream_command.session.key =
+            crate::tests::object_key("different-stream-command-key");
+        let mismatched_stream_match = crate::clock::with_time_override(1_000, || {
+            primary_route.matching_stream_upload_exists(
+                &stream_create_request,
+                Some(&mismatched_stream_command),
+            )
+        });
+        match mismatched_stream_match {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error
+                    .message
+                    .contains("expected command subject does not match"));
+            }
+            other => panic!("mismatched stream command subject must fail: {other:?}"),
+        }
+        let mut mismatched_stream_target_command = expected_stream_command.clone();
+        mismatched_stream_target_command.session.target = StreamUploadTarget::UploadPart {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+        };
+        let mismatched_stream_match = crate::clock::with_time_override(1_000, || {
+            primary_route.matching_stream_upload_exists(
+                &stream_create_request,
+                Some(&mismatched_stream_target_command),
+            )
+        });
+        match mismatched_stream_match {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error
+                    .message
+                    .contains("expected command subject does not match"));
+            }
+            other => panic!("mismatched stream command target must fail: {other:?}"),
+        }
+        let mut mismatched_stream_proof_command = expected_stream_command.clone();
+        mismatched_stream_proof_command
+            .bucket_write_reservation
+            .operation_kind = UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let mismatched_stream_match = crate::clock::with_time_override(1_000, || {
+            primary_route.matching_stream_upload_exists(
+                &stream_create_request,
+                Some(&mismatched_stream_proof_command),
+            )
+        });
+        match mismatched_stream_match {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => panic!("mismatched stream command proof must fail: {other:?}"),
+        }
+        let mut mismatched_upload_part_stream_proof_command =
+            expected_upload_part_stream_command.clone();
+        mismatched_upload_part_stream_proof_command
+            .bucket_write_reservation
+            .operation_kind = PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let mismatched_stream_match = crate::clock::with_time_override(1_000, || {
+            primary_route.matching_stream_upload_exists(
+                &upload_part_stream_create_request,
+                Some(&mismatched_upload_part_stream_proof_command),
+            )
+        });
+        match mismatched_stream_match {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => panic!("mismatched UploadPart stream command proof must fail: {other:?}"),
+        }
+        let mut mismatched_renewed_stream_proof = renewed_stream_proof.clone();
+        mismatched_renewed_stream_proof.owner_token = "different-owner".to_string();
+        let mismatched_stream_update = crate::clock::with_time_override(1_000, || {
+            primary_route.update_stream_upload_bucket_write_reservation(
+                &reservation_id,
+                &renewed_stream_proof,
+                &mismatched_renewed_stream_proof,
+            )
+        });
+        match mismatched_stream_update {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("same stable identity"));
+            }
+            other => panic!("mismatched stream reservation renewal must fail: {other:?}"),
+        }
 
         let multipart_upload = crate::clock::with_time_override(1_000, || {
             let upload = primary_route.load_multipart_upload(&upload_id).unwrap();
@@ -19571,6 +19926,52 @@ mod tests {
                         .map(|_| ()),
                 ),
                 (
+                    "stream upload retry match",
+                    primary_route
+                        .matching_stream_upload_exists(
+                            &stream_create_request,
+                            Some(&expected_stream_command),
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "UploadPart stream retry match",
+                    primary_route
+                        .matching_stream_upload_exists(
+                            &upload_part_stream_create_request,
+                            Some(&expected_upload_part_stream_command),
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "stream upload session load",
+                    primary_route
+                        .load_stream_upload_session(&reservation_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "stream upload segment list",
+                    primary_route
+                        .load_stream_upload_segments(&reservation_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "stream segment append preparation",
+                    primary_route
+                        .prepare_stream_segment_append(&stream_append_request)
+                        .map(|_| ()),
+                ),
+                (
+                    "stream upload reservation update",
+                    primary_route
+                        .update_stream_upload_bucket_write_reservation(
+                            &reservation_id,
+                            &renewed_stream_proof,
+                            &renewed_stream_proof,
+                        )
+                        .map(|_| ()),
+                ),
+                (
                     "object metadata PUT snapshot load",
                     primary_route
                         .load_put_object_metadata_snapshot(None)
@@ -19734,6 +20135,14 @@ mod tests {
             .unwrap(),
             reserved_generation,
             "expired active object routes must leave durable reservation state exact"
+        );
+        assert_eq!(
+            PgMetadataStore::get_stream_upload(&*pg, &reservation_id)
+                .unwrap()
+                .bucket_write_reservation
+                .as_ref(),
+            Some(&renewed_stream_proof),
+            "expired active stream mutation must leave the durable proof exact"
         );
     }
 

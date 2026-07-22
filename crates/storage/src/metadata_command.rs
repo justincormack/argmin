@@ -1214,6 +1214,10 @@ pub(crate) const COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND: &str =
     "complete-multipart-upload";
 pub(crate) const CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND: &str =
     "create-multipart-upload";
+pub(crate) const PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND: &str =
+    "put-object-stream-create";
+pub(crate) const UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND: &str =
+    "upload-part-stream-create";
 pub(crate) const PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND: &str = "put-object-metadata";
 pub(crate) const DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND: &str = "delete-current-object";
 pub(crate) const DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND: &str = "delete-object-version";
@@ -4515,7 +4519,7 @@ mod tests {
             cluster_epoch: ClusterEpoch::INITIAL,
             bucket_execution_generation: 7,
             bucket_incarnation_generation: 7,
-            operation_kind: "put-object-stream-create".to_string(),
+            operation_kind: PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string(),
             created_at: 10,
             lease_deadline: 20,
             target_context: Some(key.as_str().to_string()),

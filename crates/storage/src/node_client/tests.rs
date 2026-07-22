@@ -139,7 +139,9 @@ fn upload_part_stream_upload_match_accepts_existing_row_without_create_proof() {
         cluster_epoch: ClusterEpoch::INITIAL,
         bucket_execution_generation: 1,
         bucket_incarnation_generation: 1,
-        operation_kind: "upload-part-stream-create".to_string(),
+        operation_kind:
+            crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                .to_string(),
         created_at: 10,
         lease_deadline: 20,
         target_context: Some(key.as_str().to_string()),

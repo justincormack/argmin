@@ -1318,7 +1318,9 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         target: StreamUploadTarget::PutObject,
         encryption: ObjectEncryption::None,
     };
-    let current_proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    let mut current_proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    current_proof.operation_kind =
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
     let mut renewed_proof = current_proof.clone();
     renewed_proof.lease_deadline += 1;
     let upload_id = crate::tests::multipart_upload_id("wrong-pg-stream-part-upload");

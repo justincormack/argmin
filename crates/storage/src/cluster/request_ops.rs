@@ -26,6 +26,8 @@ use crate::metadata_command::{
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
+    PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node::ReclaimQueueInsert;
 use crate::node_client::{
@@ -3239,7 +3241,7 @@ impl super::StorageCluster {
                     reservation_id: &reservation_id,
                     owner_token: &owner_token,
                     cluster_epoch: self.operation_epoch(),
-                    operation_kind: "put-object-stream-create",
+                    operation_kind: PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
                     created_at: crate::clock::current_time_millis(),
                     lease_deadline: self.put_object_stream_create_lease_deadline(),
                     target_context: Some(key.as_str()),
@@ -12015,7 +12017,7 @@ impl super::StorageCluster {
         loop {
             let reservation = match self.acquire_durable_bucket_write_reservation(
                 bucket,
-                "upload-part-stream-create",
+                UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
                 Some(key.as_str()),
             ) {
                 Ok(reservation) => reservation,
