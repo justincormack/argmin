@@ -2063,6 +2063,43 @@ Thirty-ninth Phase 3 slice:
   workspace-wide strict Clippy. The full parallel workspace suite remains a
   pre-commit check for this slice.
 
+Fortieth Phase 3 slice:
+
+- CompleteMultipartUpload and both ordinary and authorization-bound
+  AbortMultipartUpload metadata-command builders now consume the admitted
+  `StorageNodeActivePrimaryObjectRoute`. The server-local capability derives
+  the trusted object PG and placement epoch from that route and revalidates
+  its immutable captured deadline immediately before command construction.
+- completion binds the bucket, key, upload ID, selected and omitted part
+  records, selected and omitted streaming segments, terminal stream cleanup,
+  and any null-version stale-payload source to one routed object and upload.
+  The capability derives the committed object-part layout from the installed
+  topology instead of accepting it as caller authority and requires the exact
+  `complete-multipart-upload` reservation operation for the routed key.
+- both abort variants require the canonical `abort-multipart-upload`
+  reservation operation and bind every cleanup row to the routed upload. The
+  authorization-bound variant additionally requires the authorized upload and
+  cleanup upload snapshot to be identical. The cluster acquisition paths now
+  share the same canonical operation constant rather than repeating string
+  literals.
+- the storage-node handlers retain missing, stale-snapshot, and command-build
+  error mappings, but no longer reconstruct command authority from decoded
+  raw PG/epoch fields. The equivalent-state two-PG Unix matrix adds successful
+  completion and abort canaries, exact wrong-PG rejection, and crossed
+  completion/abort proof rejection for all three builders.
+- the deterministic active-route regression seeds a real multipart part and
+  positively constructs all three terminal commands. It rejects a foreign
+  completion subject, a foreign abort-cleanup snapshot, and crossed operation
+  proofs, then proves all three effects fail at the capability's original
+  deadline after a same-epoch route renewal.
+- retained stream cleanup, payload reclaim, PG-wide listing scans, data
+  operations, frontend capability migration, and capability requirements on
+  node-client traits remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  capability and Unix RPC regressions, all 2,222 storage tests, and
+  workspace-wide strict Clippy, plus the full parallel workspace suite (7,483
+  tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

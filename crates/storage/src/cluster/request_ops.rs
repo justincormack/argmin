@@ -20,7 +20,8 @@ use crate::metadata_command::{
     DeleteObjectPayloadReclaimCommand, DeleteObjectVersionTarget, MetadataCommandAcceptance,
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
     ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    PutObjectMetadataMutation, ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
@@ -13251,13 +13252,13 @@ impl super::StorageCluster {
                     .try_acquire_lifecycle_bucket_write_proof_for_object_metadata_command(
                         bucket,
                         key,
-                        "abort-multipart-upload",
+                        ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
                         expected,
                     )?,
                 None => self.try_acquire_bucket_write_proof_for_object_metadata_command(
                     bucket,
                     key,
-                    "abort-multipart-upload",
+                    ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
                     drain_mode == AbortMultipartUploadDrainMode::Wait,
                 )?,
             } {
@@ -13388,7 +13389,7 @@ impl super::StorageCluster {
             let proof = match self.try_acquire_bucket_write_proof_for_object_metadata_command(
                 bucket,
                 key,
-                "abort-multipart-upload",
+                ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
                 true,
             )? {
                 Some(proof) => proof,

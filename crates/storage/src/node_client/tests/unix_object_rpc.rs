@@ -1970,7 +1970,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..24)
+    let server_threads: Vec<_> = (0..27)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2141,7 +2141,11 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
         VersionId::Null,
         &topology,
     );
-    let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    let mut complete_proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    complete_proof.operation_kind =
+        COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
+    let mut abort_proof = complete_proof.clone();
+    abort_proof.operation_kind = ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
     let complete_command =
         ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
             &client,
@@ -2151,7 +2155,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                 request: &complete_request,
                 version_id: VersionId::Null,
                 expected_object_parts: &expected_object_parts,
-                bucket_write_reservation: &proof,
+                bucket_write_reservation: &complete_proof,
             },
         )
         .unwrap();
@@ -2169,7 +2173,20 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                 request: &complete_request,
                 version_id: VersionId::Null,
                 expected_object_parts: &expected_object_parts,
-                bucket_write_reservation: &proof,
+                bucket_write_reservation: &complete_proof,
+            },
+        )
+    );
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
+            &client,
+            BuildCompleteMultipartObjectCommandReq {
+                pg_id: correct_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                request: &complete_request,
+                version_id: VersionId::Null,
+                expected_object_parts: &expected_object_parts,
+                bucket_write_reservation: &abort_proof,
             },
         )
     );
@@ -2183,7 +2200,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             key: &key,
             upload_id: &upload_id,
             expected_cleanup: Some(&cleanup),
-            bucket_write_reservation: proof.clone(),
+            bucket_write_reservation: abort_proof.clone(),
         },
     )
     .unwrap()
@@ -2203,7 +2220,21 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                 key: &key,
                 upload_id: &upload_id,
                 expected_cleanup: Some(&cleanup),
-                bucket_write_reservation: proof.clone(),
+                bucket_write_reservation: abort_proof.clone(),
+            },
+        )
+    );
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
+            &client,
+            BuildAbortMultipartUploadCommandReq {
+                pg_id: correct_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                bucket: &bucket,
+                key: &key,
+                upload_id: &upload_id,
+                expected_cleanup: Some(&cleanup),
+                bucket_write_reservation: complete_proof.clone(),
             },
         )
     );
@@ -2215,7 +2246,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             authorized_upload: &authorized_upload,
             expected_cleanup: Some(&cleanup),
-            bucket_write_reservation: proof.clone(),
+            bucket_write_reservation: abort_proof.clone(),
         },
     )
     .unwrap()
@@ -2228,7 +2259,19 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 authorized_upload: &authorized_upload,
                 expected_cleanup: Some(&cleanup),
-                bucket_write_reservation: proof,
+                bucket_write_reservation: abort_proof,
+            },
+        )
+    );
+    assert_object_payload_decode!(
+        ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
+            &client,
+            BuildAuthorizedAbortMultipartUploadCommandReq {
+                pg_id: correct_pg,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                authorized_upload: &authorized_upload,
+                expected_cleanup: Some(&cleanup),
+                bucket_write_reservation: complete_proof,
             },
         )
     );
@@ -4823,7 +4866,8 @@ fn unix_complete_multipart_uses_durable_initiation_identity() {
         selected_streaming_segments: Vec::new(),
         expected_cleanup: CompleteMultipartCommitCleanup::default(),
     };
-    let proof = test_bucket_write_reservation_proof(bucket, &key);
+    let mut proof = test_bucket_write_reservation_proof(bucket, &key);
+    proof.operation_kind = COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
     let error = ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
         &client,
         BuildCompleteMultipartObjectCommandReq {

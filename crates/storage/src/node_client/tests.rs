@@ -5,6 +5,7 @@ use std::os::unix::net::UnixListener;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::metadata_command::ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND;
 use crate::storage_node_server::{StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer};
 use crate::storage_rpc::{
     encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,

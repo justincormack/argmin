@@ -1211,6 +1211,8 @@ pub struct BucketWriteReservationProof {
 
 pub(crate) const COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND: &str =
     "complete-multipart-upload";
+pub(crate) const ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND: &str =
+    "abort-multipart-upload";
 pub(crate) const CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND: &str =
     "create-multipart-upload";
 pub(crate) const PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND: &str =

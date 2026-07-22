@@ -25,7 +25,9 @@ use crate::data_dir::prepare_private_data_dir;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
-    PutObjectMetadataMutation, CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    PutObjectMetadataMutation, ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
@@ -4499,6 +4501,258 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
+    fn require_terminal_stream_cleanup_subject(
+        &self,
+        upload_id: &UploadId,
+        stream_uploads: &[crate::TerminalStreamCleanupRecord],
+        stream_upload_segments: &[StreamUploadSegmentRecord],
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        for stream in stream_uploads {
+            let matches_upload = matches!(
+                &stream.target,
+                StreamUploadTarget::UploadPart {
+                    upload_id: stream_upload_id,
+                    ..
+                } if stream_upload_id == upload_id
+            );
+            if stream.bucket != *self.route.bucket
+                || stream.key != *self.route.key
+                || !matches_upload
+            {
+                return Err(StorageNodeObjectRouteError::Route(
+                    StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: format!(
+                            "{operation} stream cleanup does not match active object route or upload"
+                        ),
+                    },
+                ));
+            }
+        }
+        if stream_upload_segments.iter().any(|segment| {
+            !stream_uploads
+                .iter()
+                .any(|stream| stream.session_id == segment.session_id)
+        }) {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} stream segment cleanup does not match a routed stream session"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_abort_multipart_cleanup_subject(
+        &self,
+        upload_id: &UploadId,
+        cleanup: &crate::AbortMultipartUploadCleanup,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        if cleanup.upload.bucket != *self.route.bucket
+            || cleanup.upload.key != *self.route.key
+            || cleanup.upload.upload_id != *upload_id
+            || cleanup
+                .parts
+                .iter()
+                .any(|part| part.upload_id != *upload_id)
+            || cleanup.streaming_segments.iter().any(|segment| {
+                segment.bucket != *self.route.bucket
+                    || segment.key != *self.route.key
+                    || segment.upload_id != *upload_id
+            })
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} cleanup does not match active object route or upload"
+                    ),
+                },
+            ));
+        }
+        self.require_terminal_stream_cleanup_subject(
+            upload_id,
+            &cleanup.stream_uploads,
+            &cleanup.stream_upload_segments,
+            operation,
+        )
+    }
+
+    fn require_complete_multipart_subject(
+        &self,
+        request: &crate::CompleteMultipartCommitRequest,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        if request.bucket != *self.route.bucket
+            || request.key != *self.route.key
+            || request
+                .part_records
+                .iter()
+                .chain(request.expected_cleanup.omitted_parts.iter())
+                .any(|part| part.upload_id != request.upload_id)
+            || request
+                .selected_streaming_segments
+                .iter()
+                .chain(request.expected_cleanup.omitted_streaming_segments.iter())
+                .any(|segment| {
+                    segment.bucket != *self.route.bucket
+                        || segment.key != *self.route.key
+                        || segment.upload_id != request.upload_id
+                })
+            || request
+                .expected_stale_payload_source
+                .as_ref()
+                .is_some_and(|stored| {
+                    !stored.version_id().is_null()
+                        || stored.as_live().is_none()
+                        || stored.bucket() != self.route.bucket
+                        || stored.key() != self.route.key
+                })
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} request does not match active object route or upload"
+                    ),
+                },
+            ));
+        }
+        self.require_terminal_stream_cleanup_subject(
+            &request.upload_id,
+            &request.expected_cleanup.stream_uploads,
+            &request.expected_cleanup.stream_upload_segments,
+            operation,
+        )
+    }
+
+    fn build_complete_multipart_object_command(
+        &self,
+        request: &crate::CompleteMultipartCommitRequest,
+        version_id: s3_types::VersionId,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.require_complete_multipart_subject(request, "complete multipart command build")?;
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+            "complete multipart command build",
+        )?;
+        let expected_object_parts = complete_multipart_expected_object_parts(
+            request,
+            version_id,
+            self.route.handler.node.pg_topology(),
+        );
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
+            &local_client,
+            BuildCompleteMultipartObjectCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                request,
+                version_id,
+                expected_object_parts: &expected_object_parts,
+                bucket_write_reservation,
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn build_abort_multipart_upload_command(
+        &self,
+        upload_id: &UploadId,
+        expected_cleanup: Option<&crate::AbortMultipartUploadCleanup>,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<Option<MetadataCommandEnvelope>, StorageNodeObjectRouteError> {
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+            "abort multipart command build",
+        )?;
+        if let Some(cleanup) = expected_cleanup {
+            self.require_abort_multipart_cleanup_subject(
+                upload_id,
+                cleanup,
+                "abort multipart command build",
+            )?;
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
+            &local_client,
+            BuildAbortMultipartUploadCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                bucket: self.route.bucket,
+                key: self.route.key,
+                upload_id,
+                expected_cleanup,
+                bucket_write_reservation: bucket_write_reservation.clone(),
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn build_authorized_abort_multipart_upload_command(
+        &self,
+        authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
+        expected_cleanup: Option<&crate::AbortMultipartUploadCleanup>,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<Option<MetadataCommandEnvelope>, StorageNodeObjectRouteError> {
+        self.require_authorized_multipart_upload_subject(
+            authorized_upload,
+            "authorized abort multipart command build",
+        )?;
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+            "authorized abort multipart command build",
+        )?;
+        if let Some(cleanup) = expected_cleanup {
+            if cleanup.upload != *authorized_upload.record() {
+                return Err(StorageNodeObjectRouteError::Route(
+                    StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message:
+                            "authorized abort multipart cleanup does not match authorized upload"
+                                .to_string(),
+                    },
+                ));
+            }
+            self.require_abort_multipart_cleanup_subject(
+                &authorized_upload.record().upload_id,
+                cleanup,
+                "authorized abort multipart command build",
+            )?;
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
+            &local_client,
+            BuildAuthorizedAbortMultipartUploadCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                authorized_upload,
+                expected_cleanup,
+                bucket_write_reservation: bucket_write_reservation.clone(),
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn require_object_mutation_proof(
         &self,
         bucket_write_reservation: &BucketWriteReservationProof,
@@ -6148,7 +6402,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartCompleteCommandBuild => {
                 match decode_complete_multipart_command_build_request(&frame.payload) {
-                    Ok(request) => self.complete_multipart_command_build_response(request),
+                    Ok(request) => {
+                        self.complete_multipart_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6157,7 +6413,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartAbortCommandBuild => {
                 match decode_abort_multipart_command_build_request(&frame.payload) {
-                    Ok(request) => self.abort_multipart_command_build_response(request),
+                    Ok(request) => {
+                        self.abort_multipart_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -6175,7 +6433,8 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartAuthorizedAbortCommandBuild => {
                 match decode_authorized_abort_multipart_command_build_request(&frame.payload) {
-                    Ok(request) => self.authorized_abort_multipart_command_build_response(request),
+                    Ok(request) => self
+                        .authorized_abort_multipart_command_build_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -9549,48 +9808,40 @@ impl StorageNodeConnectionHandler {
 
     fn complete_multipart_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcCompleteMultipartCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "complete multipart command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let expected_object_parts = complete_multipart_expected_object_parts(
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.build_complete_multipart_object_command(
             &request.request,
             request.version_id,
-            self.node.pg_topology(),
-        );
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response =
-            match ObjectMutationMetadataNodeClient::build_complete_multipart_object_command(
-                &local_client,
-                BuildCompleteMultipartObjectCommandReq {
-                    pg_id: self
-                        .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                    cluster_epoch: request.object.cluster_epoch,
-                    request: &request.request,
-                    version_id: request.version_id,
-                    expected_object_parts: &expected_object_parts,
-                    bucket_write_reservation: &request.bucket_write_reservation,
-                },
-            ) {
-                Ok(command) => {
-                    StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
-                }
-                Err(ObjectPgActionError::StaleMultipartCompletionSnapshot) => {
-                    StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
-                }
-                Err(error) => match object_metadata_command_build_error_outcome(
+            &request.bucket_write_reservation,
+        ) {
+            Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleMultipartCompletionSnapshot,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                match object_metadata_command_build_error_outcome(
                     error,
                     Some("CommitMultipartObject"),
                 ) {
                     Ok(outcome) => outcome,
                     Err(error) => return encode_storage_rpc_error_response(&error),
-                },
-            };
+                }
+            }
+        };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
         );
@@ -9627,43 +9878,42 @@ impl StorageNodeConnectionHandler {
 
     fn abort_multipart_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcAbortMultipartCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "abort multipart command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response = match ObjectMutationMetadataNodeClient::build_abort_multipart_upload_command(
-            &local_client,
-            BuildAbortMultipartUploadCommandReq {
-                pg_id: self
-                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                cluster_epoch: request.object.cluster_epoch,
-                bucket: &request.object.bucket,
-                key: &request.object.key,
-                upload_id: &request.upload_id,
-                expected_cleanup: request.expected_cleanup.as_ref(),
-                bucket_write_reservation: request.bucket_write_reservation,
-            },
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.build_abort_multipart_upload_command(
+            &request.upload_id,
+            request.expected_cleanup.as_ref(),
+            &request.bucket_write_reservation,
         ) {
             Ok(Some(command)) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
             }
             Ok(None) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
-            Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(error) => match object_metadata_command_build_error_outcome(
-                error,
-                Some("AbortMultipartUpload"),
-            ) {
-                Ok(outcome) => outcome,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            },
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                match object_metadata_command_build_error_outcome(
+                    error,
+                    Some("AbortMultipartUpload"),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -9702,46 +9952,46 @@ impl StorageNodeConnectionHandler {
 
     fn authorized_abort_multipart_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcAuthorizedAbortMultipartCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "authorized abort multipart command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
             request.authorized_upload,
         );
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response =
-            match ObjectMutationMetadataNodeClient::build_authorized_abort_multipart_upload_command(
-                &local_client,
-                BuildAuthorizedAbortMultipartUploadCommandReq {
-                    pg_id: self
-                        .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                    cluster_epoch: request.object.cluster_epoch,
-                    authorized_upload: &authorized_upload,
-                    expected_cleanup: request.expected_cleanup.as_ref(),
-                    bucket_write_reservation: request.bucket_write_reservation,
-                },
-            ) {
-                Ok(Some(command)) => {
-                    StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
-                }
-                Ok(None) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
-                Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                    StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
-                }
-                Err(error) => match object_metadata_command_build_error_outcome(
+        let response = match route.build_authorized_abort_multipart_upload_command(
+            &authorized_upload,
+            request.expected_cleanup.as_ref(),
+            &request.bucket_write_reservation,
+        ) {
+            Ok(Some(command)) => {
+                StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
+            }
+            Ok(None) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                match object_metadata_command_build_error_outcome(
                     error,
                     Some("AbortMultipartUpload"),
                 ) {
                     Ok(outcome) => outcome,
                     Err(error) => return encode_storage_rpc_error_response(&error),
-                },
-            };
+                }
+            }
+        };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
         );
@@ -13998,24 +14248,6 @@ impl StorageNodeConnectionHandler {
             });
         }
         self.validate_pg_for_object(pg_id, bucket, key, operation)
-    }
-
-    fn validate_object_mutation_command_request(
-        &self,
-        object: &StorageRpcObjectRequest,
-        bucket_write_reservation: &crate::metadata_command::BucketWriteReservationProof,
-        operation: &'static str,
-    ) -> Result<(), StorageRpcErrorResponse> {
-        if object.bucket != bucket_write_reservation.bucket {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::PayloadDecode,
-                message: format!(
-                    "{operation} bucket write reservation proof does not match object bucket"
-                ),
-            });
-        }
-        self.validate_pg_route(object.node_id, object.cluster_epoch, object.pg_id)?;
-        self.validate_primary_pg_for_object(object.pg_id, &object.bucket, &object.key, operation)
     }
 
     fn validate_pg_for_object(
@@ -19670,6 +19902,12 @@ mod tests {
         let mut create_multipart_proof = proof.clone();
         create_multipart_proof.operation_kind =
             CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let mut complete_multipart_proof = proof.clone();
+        complete_multipart_proof.operation_kind =
+            COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let mut abort_multipart_proof = proof.clone();
+        abort_multipart_proof.operation_kind =
+            ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
         let mut stream_proof = proof.clone();
         stream_proof.operation_kind =
             PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
@@ -19721,6 +19959,22 @@ mod tests {
             object_lock: crate::ObjectLockState::default(),
             checksum: None,
             encryption: crate::ObjectEncryption::None,
+        };
+        let terminal_multipart_part = crate::MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 2,
+            generation: 1,
+            size: 8,
+            payload_crc64: 55,
+            etag: vec![5; 8],
+            etag_kind: crate::EtagKind::Crc64,
+            part_okh: [6; 16],
+            part_vid: GenerationId::new(20).unwrap(),
+            placement_cluster_epoch: config.cluster_epoch,
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 1_000,
+            checksum: None,
         };
         let stream_create_request = CreateStreamUploadReq {
             session_id: reservation_id.clone(),
@@ -19793,6 +20047,7 @@ mod tests {
             )
             .unwrap();
             PgMetadataStore::create_multipart_upload(&*pg, &existing_multipart_request).unwrap();
+            PgMetadataStore::upsert_multipart_part(&*pg, &terminal_multipart_part).unwrap();
             pg.apply_metadata_command(&MetadataCommandEnvelope::new(
                 MetadataCommandId::new(
                     config.cluster_epoch,
@@ -20516,11 +20771,14 @@ mod tests {
         let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
             multipart_upload.clone(),
         );
-        crate::clock::with_time_override(1_000, || {
+        let (completion_snapshot, abort_cleanup) = crate::clock::with_time_override(1_000, || {
             let completion_snapshot = primary_route
-                .load_multipart_completion_snapshot(&authorized_upload, &[])
+                .load_multipart_completion_snapshot(&authorized_upload, &[2])
                 .unwrap();
-            assert!(completion_snapshot.part_records.is_empty());
+            assert_eq!(
+                completion_snapshot.part_records,
+                vec![terminal_multipart_part.clone()]
+            );
             assert_eq!(
                 primary_route
                     .load_multipart_completion_preflight(&authorized_upload)
@@ -20533,7 +20791,7 @@ mod tests {
                 .list_multipart_parts_for_authorized_upload(&authorized_upload, None, 10)
                 .unwrap();
             assert_eq!(listed.upload, multipart_upload);
-            assert!(listed.response.parts.is_empty());
+            assert_eq!(listed.response.parts, vec![terminal_multipart_part.clone()]);
             assert!(matches!(
                 primary_route
                     .lookup_multipart_upload_management(&upload_id)
@@ -20550,7 +20808,142 @@ mod tests {
                 .unwrap()
                 .expect("in-progress upload must have abort cleanup");
             assert_eq!(cleanup.upload, multipart_upload);
+            (completion_snapshot, cleanup)
         });
+        let completion_request = crate::CompleteMultipartCommitRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            completion_fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0x71; 32]),
+            versioning: BucketVersioningState::Disabled,
+            owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: multipart_upload.object_generation_id,
+            size: terminal_multipart_part.size,
+            etag_crc64: [0x72; 8],
+            tags: None,
+            metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+            system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+            expected_stale_payload_source: completion_snapshot.stale_payload_source,
+            expected_current_object_identity: completion_snapshot.current_object_identity,
+            conditional_completion: false,
+            part_records: completion_snapshot.part_records,
+            selected_streaming_segments: completion_snapshot.selected_streaming_segments,
+            expected_cleanup: completion_snapshot.cleanup,
+        };
+        let complete_multipart_command = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .build_complete_multipart_object_command(
+                    &completion_request,
+                    VersionId::Null,
+                    &complete_multipart_proof,
+                )
+                .unwrap()
+        });
+        assert!(matches!(
+            complete_multipart_command.payload(),
+            MetadataCommandPayload::CommitMultipartObject(command)
+                if command.upload_id == upload_id
+                    && command.bucket_write_reservation == complete_multipart_proof
+        ));
+        let abort_multipart_command = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .build_abort_multipart_upload_command(
+                    &upload_id,
+                    Some(&abort_cleanup),
+                    &abort_multipart_proof,
+                )
+                .unwrap()
+                .expect("active upload must produce an abort command")
+        });
+        assert!(matches!(
+            abort_multipart_command.payload(),
+            MetadataCommandPayload::AbortMultipartUpload(command)
+                if command.upload_id == upload_id
+                    && command.bucket_write_reservation == abort_multipart_proof
+        ));
+        let authorized_abort_command = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .build_authorized_abort_multipart_upload_command(
+                    &authorized_upload,
+                    Some(&abort_cleanup),
+                    &abort_multipart_proof,
+                )
+                .unwrap()
+                .expect("authorized active upload must produce an abort command")
+        });
+        assert!(matches!(
+            authorized_abort_command.payload(),
+            MetadataCommandPayload::AbortMultipartUpload(command)
+                if command.upload_id == upload_id
+                    && command.bucket_write_reservation == abort_multipart_proof
+        ));
+
+        let mut mismatched_completion_request = completion_request.clone();
+        mismatched_completion_request.key =
+            crate::tests::object_key("different-complete-multipart-key");
+        let mismatched_completion = crate::clock::with_time_override(1_000, || {
+            primary_route.build_complete_multipart_object_command(
+                &mismatched_completion_request,
+                VersionId::Null,
+                &complete_multipart_proof,
+            )
+        });
+        match mismatched_completion {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("request does not match"));
+            }
+            other => panic!("mismatched multipart completion subject must fail: {other:?}"),
+        }
+        let crossed_completion_proof = crate::clock::with_time_override(1_000, || {
+            primary_route.build_complete_multipart_object_command(
+                &completion_request,
+                VersionId::Null,
+                &abort_multipart_proof,
+            )
+        });
+        match crossed_completion_proof {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => panic!("crossed multipart completion proof must fail: {other:?}"),
+        }
+        let mut mismatched_abort_cleanup = abort_cleanup.clone();
+        mismatched_abort_cleanup.upload.key =
+            crate::tests::object_key("different-abort-multipart-key");
+        let mismatched_abort = crate::clock::with_time_override(1_000, || {
+            primary_route.build_abort_multipart_upload_command(
+                &upload_id,
+                Some(&mismatched_abort_cleanup),
+                &abort_multipart_proof,
+            )
+        });
+        match mismatched_abort {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("cleanup does not match"));
+            }
+            other => panic!("mismatched multipart abort cleanup must fail: {other:?}"),
+        }
+        let crossed_abort_proof = crate::clock::with_time_override(1_000, || {
+            primary_route.build_authorized_abort_multipart_upload_command(
+                &authorized_upload,
+                Some(&abort_cleanup),
+                &complete_multipart_proof,
+            )
+        });
+        match crossed_abort_proof {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => panic!("crossed authorized multipart abort proof must fail: {other:?}"),
+        }
 
         let mismatched_subject_request = StorageRpcObjectRequest {
             key: crate::tests::object_key("different-multipart-route-key"),
@@ -21100,6 +21493,36 @@ mod tests {
                     "abort multipart cleanup load",
                     primary_route
                         .load_abort_multipart_upload_cleanup(&upload_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "complete multipart command build",
+                    primary_route
+                        .build_complete_multipart_object_command(
+                            &completion_request,
+                            VersionId::Null,
+                            &complete_multipart_proof,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "abort multipart command build",
+                    primary_route
+                        .build_abort_multipart_upload_command(
+                            &upload_id,
+                            Some(&abort_cleanup),
+                            &abort_multipart_proof,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "authorized abort multipart command build",
+                    primary_route
+                        .build_authorized_abort_multipart_upload_command(
+                            &authorized_upload,
+                            Some(&abort_cleanup),
+                            &abort_multipart_proof,
+                        )
                         .map(|_| ()),
                 ),
                 (
