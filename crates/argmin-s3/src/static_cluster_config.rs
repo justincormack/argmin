@@ -314,6 +314,13 @@ struct CanonicalRaftPeerEndpoint {
     advertise: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CanonicalStorageNodeEndpoint {
+    endpoint_id: String,
+    owner_process_id: String,
+    advertise: String,
+}
+
 #[derive(Clone, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct TlsIdentityInput {
@@ -349,6 +356,7 @@ pub(crate) struct ValidatedStaticClusterManifest {
     selected_process_index: usize,
     initial_pg_acting_sets: Vec<Vec<u32>>,
     canonical_raft_peer_endpoints: BTreeMap<u64, CanonicalRaftPeerEndpoint>,
+    canonical_storage_node_endpoints: BTreeMap<u32, CanonicalStorageNodeEndpoint>,
     topology_digest: String,
     process_identity_digest: String,
     full_config_fingerprint: String,
@@ -2269,12 +2277,6 @@ impl ValidatedStaticClusterManifest {
                 None
             };
 
-        let process_by_id = self
-            .manifest
-            .processes
-            .iter()
-            .map(|process| (process.id.as_str(), process))
-            .collect::<BTreeMap<_, _>>();
         let mut raft_peer_sockets = Vec::new();
         for peer_authority in &self.manifest.authorities {
             let peer_node_id = peer_authority
@@ -2296,35 +2298,22 @@ impl ValidatedStaticClusterManifest {
         }
         raft_peer_sockets.sort_by_key(|peer| peer.node_id);
 
-        let storage_process_by_node = self
-            .manifest
-            .storage_nodes
-            .iter()
-            .map(|storage_node| {
-                (
-                    storage_node.node_id,
-                    process_by_id
-                        .get(storage_node.process_id.as_str())
-                        .expect("validated storage-node process exists"),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
         let mut storage_node_sockets = Vec::new();
-        for (node_id, storage_process) in storage_process_by_node {
-            if storage_process.host_id != selected.host_id {
-                return Err(
-                    "TCP static cluster runtime activation is not implemented; a replicated Unix authority cannot bootstrap a storage node on another host"
-                        .to_string(),
-                );
-            }
+        for storage_node in &self.manifest.storage_nodes {
+            let endpoint = self
+                .canonical_storage_node_endpoints
+                .get(&storage_node.node_id)
+                .expect("validated storage-node endpoint map contains every storage node");
+            let address = match parse_endpoint_address(&endpoint.advertise, false)? {
+                EndpointAddress::Unix(path) => path.to_string_lossy().into_owned(),
+                EndpointAddress::Tcp { .. } => endpoint.advertise.clone(),
+            };
             storage_node_sockets.push(ConfiguredStorageNodeSocket {
-                node_id,
-                socket_path: self.preferred_owned_unix_endpoint_path(
-                    storage_process,
-                    EndpointProtocol::StorageRpc,
-                )?,
+                node_id: storage_node.node_id,
+                socket_path: address,
             });
         }
+        storage_node_sockets.sort_by_key(|node| node.node_id);
 
         let mut raft_auth_credentials = Vec::new();
         let mut storage_auth_credentials = Vec::new();
@@ -2536,21 +2525,6 @@ impl ValidatedStaticClusterManifest {
             self.manifest.cluster.topology_generation,
             self.topology_digest
         )
-    }
-
-    fn preferred_owned_unix_endpoint_path(
-        &self,
-        owner: &ProcessInput,
-        protocol: EndpointProtocol,
-    ) -> Result<String, String> {
-        let endpoint = self.preferred_owned_endpoint(owner, protocol)?;
-        match parse_endpoint_address(&endpoint.advertise, false)? {
-            EndpointAddress::Unix(path) => Ok(path.to_string_lossy().into_owned()),
-            EndpointAddress::Tcp { .. } => Err(format!(
-                "TCP static cluster runtime activation is not implemented for endpoint {}",
-                endpoint.id
-            )),
-        }
     }
 
     fn preferred_owned_endpoint(
@@ -2786,6 +2760,10 @@ impl fmt::Debug for ValidatedStaticClusterManifest {
             .field(
                 "canonical_raft_peer_endpoints",
                 &self.canonical_raft_peer_endpoints.len(),
+            )
+            .field(
+                "canonical_storage_node_endpoints",
+                &self.canonical_storage_node_endpoints.len(),
             )
             .field("topology_digest", &self.topology_digest)
             .field("process_identity_digest", &self.process_identity_digest)
@@ -3823,6 +3801,8 @@ fn validate_static_cluster_manifest(
     )?;
     let canonical_raft_peer_endpoints =
         resolve_canonical_raft_peer_endpoints(&manifest, &authorities)?;
+    let canonical_storage_node_endpoints =
+        resolve_canonical_storage_node_endpoints(&manifest, &storage_nodes)?;
     validate_raft_transport_capacity(
         &manifest,
         &transport_profiles,
@@ -3838,6 +3818,7 @@ fn validate_static_cluster_manifest(
         &manifest,
         &initial_pg_acting_sets,
         &canonical_raft_peer_endpoints,
+        &canonical_storage_node_endpoints,
         &topology_digest,
     )?;
     let process_identity_digest =
@@ -3849,6 +3830,7 @@ fn validate_static_cluster_manifest(
         selected_process_index,
         initial_pg_acting_sets,
         canonical_raft_peer_endpoints,
+        canonical_storage_node_endpoints,
         topology_digest,
         process_identity_digest,
         full_config_fingerprint,
@@ -3859,28 +3841,19 @@ fn validate_initial_bootstrap_replication_size(
     manifest: &StaticClusterManifestInput,
     initial_pg_acting_sets: &[Vec<u32>],
     canonical_raft_peer_endpoints: &BTreeMap<u64, CanonicalRaftPeerEndpoint>,
+    canonical_storage_node_endpoints: &BTreeMap<u32, CanonicalStorageNodeEndpoint>,
     topology_digest: &str,
 ) -> Result<(), String> {
     if manifest.deployment.mode != DeploymentMode::Replicated {
         return Ok(());
     }
-    let processes = manifest
-        .processes
-        .iter()
-        .map(|process| (process.id.as_str(), process))
-        .collect::<BTreeMap<_, _>>();
     let nodes = manifest
         .storage_nodes
         .iter()
         .map(|storage_node| {
-            let process = processes[storage_node.process_id.as_str()];
-            let endpoint = manifest
-                .endpoints
-                .iter()
-                .filter(|endpoint| endpoint.owner_process_id == process.id)
-                .filter(|endpoint| endpoint.protocol == EndpointProtocol::StorageRpc)
-                .min_by_key(|endpoint| (endpoint.priority, endpoint.id.as_str()))
-                .expect("validated storage-node process has a storage RPC endpoint");
+            let endpoint = canonical_storage_node_endpoints
+                .get(&storage_node.node_id)
+                .expect("validated storage endpoint map contains every storage node");
             let address = match parse_endpoint_address(&endpoint.advertise, false)
                 .expect("validated endpoint has a canonical address")
             {
@@ -5296,6 +5269,70 @@ fn resolve_canonical_raft_peer_endpoints(
         resolved.insert(
             node_id,
             CanonicalRaftPeerEndpoint {
+                endpoint_id: endpoint.id.clone(),
+                owner_process_id: endpoint.owner_process_id.clone(),
+                advertise: endpoint.advertise.clone(),
+            },
+        );
+    }
+    Ok(resolved)
+}
+
+fn resolve_canonical_storage_node_endpoints(
+    manifest: &StaticClusterManifestInput,
+    storage_nodes: &BTreeMap<u32, &StorageNodeInput>,
+) -> Result<BTreeMap<u32, CanonicalStorageNodeEndpoint>, String> {
+    let processes = manifest
+        .processes
+        .iter()
+        .map(|process| (process.id.as_str(), process))
+        .collect::<BTreeMap<_, _>>();
+    let storage_client_hosts = manifest
+        .processes
+        .iter()
+        .filter(|process| process.kind.has_frontend() || process.kind.has_storage_node())
+        .map(|process| process.host_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut resolved = BTreeMap::new();
+    let mut advertised_storage_nodes = BTreeMap::<&str, (u32, &str)>::new();
+    for storage_node in storage_nodes.values() {
+        let target = processes[storage_node.process_id.as_str()];
+        let requires_tcp = storage_client_hosts
+            .iter()
+            .any(|source_host| *source_host != target.host_id);
+        let endpoint = manifest
+            .endpoints
+            .iter()
+            .filter(|endpoint| {
+                endpoint.protocol == EndpointProtocol::StorageRpc
+                    && endpoint.owner_process_id == storage_node.process_id
+            })
+            .filter(|endpoint| {
+                !requires_tcp
+                    || matches!(
+                        parse_endpoint_address(&endpoint.advertise, false),
+                        Ok(EndpointAddress::Tcp { .. })
+                    )
+            })
+            .min_by_key(|endpoint| (endpoint.priority, endpoint.id.as_str()))
+            .ok_or_else(|| {
+                format!(
+                    "storage node {} has no storage-rpc endpoint reachable from every configured storage client",
+                    storage_node.node_id
+                )
+            })?;
+        if let Some((other_node_id, other_endpoint_id)) = advertised_storage_nodes.insert(
+            endpoint.advertise.as_str(),
+            (storage_node.node_id, endpoint.id.as_str()),
+        ) {
+            return Err(format!(
+                "storage nodes {other_node_id} and {} select the same canonical advertised endpoint through {} and {}; each storage node requires a distinct routable endpoint",
+                storage_node.node_id, other_endpoint_id, endpoint.id
+            ));
+        }
+        resolved.insert(
+            storage_node.node_id,
+            CanonicalStorageNodeEndpoint {
                 endpoint_id: endpoint.id.clone(),
                 owner_process_id: endpoint.owner_process_id.clone(),
                 advertise: endpoint.advertise.clone(),
@@ -8065,16 +8102,97 @@ transport_profile_id = "internal"
     }
 
     #[test]
-    fn static_cluster_runtime_loader_rejects_profiles_not_yet_runtime_mapped() {
+    fn static_cluster_runtime_maps_remote_storage_addresses_for_authority_bootstrap() {
         let environment = standalone_runtime_environment();
         let (_dir, replicated) = materialized_replicated_manifest("control-1");
         let material = replicated.resolve_selected_process_material_at(1).unwrap();
-        let error = replicated
+        let config = replicated
             .replicated_unix_control_plane_server_config(&material, |key| {
                 environment.get(key).cloned()
             })
-            .unwrap_err();
-        assert!(error.contains("TCP static cluster runtime activation is not implemented"));
+            .unwrap();
+        assert_eq!(
+            config
+                .storage_node_sockets
+                .iter()
+                .map(|node| (node.node_id, node.socket_path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "tcp://localhost:7701"),
+                (2, "tcp://storage-2.internal:7702"),
+                (3, "tcp://storage-3.internal:7703"),
+            ]
+        );
+    }
+
+    #[test]
+    fn static_cluster_storage_bootstrap_uses_globally_reachable_tcp_fallback() {
+        let environment = standalone_runtime_environment();
+        let manifest = format!(
+            "{}{}",
+            replicated_manifest(),
+            r#"
+[[endpoints]]
+id = "storage-1-local"
+owner_process_id = "storage-1"
+protocol = "storage-rpc"
+priority = 1
+listen = "unix:///run/argmin/storage-1.sock"
+advertise = "unix:///run/argmin/storage-1.sock"
+transport_profile_id = "internal"
+"#
+        );
+        let validated = parse_static_cluster_manifest(&manifest, "control-1").unwrap();
+        assert_eq!(
+            validated.canonical_storage_node_endpoints[&1].advertise,
+            "tcp://storage-1.internal:7701"
+        );
+        let (_dir, replicated) = materialized_replicated_manifest_from("control-1", manifest);
+        let material = replicated.resolve_selected_process_material_at(1).unwrap();
+        let config = replicated
+            .replicated_unix_control_plane_server_config(&material, |key| {
+                environment.get(key).cloned()
+            })
+            .unwrap();
+
+        assert_eq!(
+            config.storage_node_sockets[0].socket_path,
+            "tcp://localhost:7701"
+        );
+    }
+
+    #[test]
+    fn static_cluster_manifest_rejects_shared_canonical_storage_address() {
+        let manifest = replace_once(
+            &replicated_manifest(),
+            "listen = \"tcp://0.0.0.0:7702\"",
+            "listen = \"tcp://0.0.0.0:7701\"",
+        );
+        let manifest = replace_once(
+            &manifest,
+            "advertise = \"tcp://storage-2.internal:7702\"",
+            "advertise = \"tcp://storage-1.internal:7701\"",
+        );
+        let manifest = replace_once(
+            &manifest,
+            "tls_server_name = \"storage-2.internal\"",
+            "tls_server_name = \"storage-1.internal\"",
+        );
+
+        let error = parse_static_cluster_manifest(&manifest, "control-1").unwrap_err();
+
+        assert!(
+            error.contains("same canonical advertised endpoint"),
+            "{error}"
+        );
+        assert!(error.contains("storage nodes 1 and 2"), "{error}");
+        assert!(error.contains("storage-1"), "{error}");
+        assert!(error.contains("storage-2"), "{error}");
+    }
+
+    #[test]
+    fn static_cluster_runtime_loader_rejects_standalone_unresolved_credentials() {
+        let environment = standalone_runtime_environment();
 
         let credentialed = format!(
             "{}{}",

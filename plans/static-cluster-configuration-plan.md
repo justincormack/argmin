@@ -982,14 +982,21 @@ Progress as of 2026-07-21:
   and runtime regressions cover mixed-mode rejection, unchanged env-only
   behavior, nonzero storage-node identity, exact data-directory use, and the
   absence of an unserved control-plane refresh path.
-- Slice 3 now also maps same-host replicated Unix control-plane processes. The
+- Slice 3 now also maps replicated control-plane processes. The
   mapping uses the exact manifest authority state, control-plane,
-  clock-recovery, Raft-peer, storage bootstrap, and routed client socket paths.
+  clock-recovery, Raft-peer, storage-bootstrap, and routed client endpoints.
   Raft listener admission uses the selected endpoint profile's exact
   `max_connections` bound, while frame limits and connect/I/O timeouts use that
-  same profile.
-  Cross-host/TCP endpoints remain rejected until that transport exists.
-  Storage-node/frontend replicated process mapping and migration of existing
+  same profile. Validation resolves one canonical storage endpoint per node
+  after filtering for reachability from every configured storage client;
+  authority bootstrap and replication-size validation reuse that exact map.
+  Canonical advertised addresses are unique per storage node so endpoint
+  identity cannot disagree with target-bound storage authentication.
+  A local Unix endpoint may remain preferred for host-local callers, but a
+  mixed-host topology certifies its globally reachable TCP fallback. This is
+  control-plane map construction only and does not activate the storage TCP
+  data plane.
+  Storage-node/frontend replicated process mapping and migration of remaining
   process fixtures to shared manifest builders remain open.
 - Slice 4's standalone storage sub-slice is implemented: file-mode
   `all-in-one` configuration carries the process identity into runtime,
@@ -1025,7 +1032,7 @@ Progress as of 2026-07-21:
   mapping consumes resolved binary credential bytes directly, keeps verifier
   credentials distinct from the manifest-selected signer during rotation, and
   never converts secrets back into legacy env-style strings. Storage/frontend
-  activation and non-Raft TLS/TCP construction remain open.
+  activation and storage RPC TLS/TCP construction remain open.
 - Slice 6's Raft transport-planning and activation sub-slices are implemented:
   the validated
   manifest resolves the canonical globally reachable endpoint for every voter
@@ -1069,6 +1076,22 @@ Progress as of 2026-07-21:
   coverage includes source-specific all-Unix/all-TCP endpoint resolution,
   listener activation, safe pre-request failover, no automatic failover after
   a request may have been sent, and a composed authenticated TLS recovery RPC.
+  Operational admin command builders now load static configuration and use its
+  routed frame transport and scoped credential, matching the already
+  static-aware clock-recovery commands. Frontend-read command mapping remains
+  part of the explicit replicated frontend-process slice. A Linux process
+  smoke performs the explicit state initialization ceremony, starts three
+  authenticated TLS/TCP Raft authorities, exercises ordinary admin and
+  dedicated recovery routing, restarts a voter, transfers leadership to the
+  restarted voter, re-establishes its clock, and confirms further admin work.
+  Only read-only status readiness is retried by the harness; each mutating
+  admin command is launched once so ambiguous outcomes remain governed by the
+  operation-specific production confirmation contract.
+  The smoke requires a private writable mount boundary because it deliberately
+  retains production filesystem validation; an explicit test-mount override is
+  supported where the per-user runtime mount is unavailable. Restart artifact
+  and sentinel publication now creates private `0600` files so later static
+  command preflight can revalidate established state.
   The transport-independent storage RPC auth codec and role-policy foundation
   is now implemented and tested, but replicated storage/frontend process
   mapping, Unix enforcement, and storage RPC TCP remain open. This slice still
@@ -1172,15 +1195,20 @@ Progress as of 2026-07-21:
      commands load static configuration and use the configured recovery route,
      TLS material, and admin credential rather than deriving Unix paths
      (implemented);
+   - make ordinary admin commands load the same static routed client endpoints,
+     TLS material, and role credential (implemented), then map frontend-read
+     commands from an explicit replicated frontend process rather than using
+     control-plane verifier credentials as a signing identity;
    - enforce principal/role/operation/cluster/topology identity before dispatch
      and authenticate the selected endpoint through TLS (implemented for the
      activated control-plane families);
    - reject fresh-manifest peers whose topology generation or digest differs
      (implemented through topology-bound application-auth scope);
      and
-   - run the first three-host authority workload after every control-plane RPC
-     needed for startup, routing, diagnostics, and explicit clock recovery has
-     a routable authenticated transport.
+   - run a three-authority loopback process smoke for startup, routed admin,
+     restart, leadership transfer, and explicit clock recovery (implemented),
+     then run the production-shaped workload on three physical hosts with
+     independent durability devices before release-gate closure.
 7. **Storage RPC auth and TCP**
    - implement the transport-independent storage authorization slice over Unix.
      The bounded auth codec and authorization-policy foundation is implemented:

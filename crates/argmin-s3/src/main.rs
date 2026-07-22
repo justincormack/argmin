@@ -6795,16 +6795,28 @@ fn build_command_unix_control_plane_client(
 fn build_admin_control_plane_client_from_command_auth_env(
     control_plane_socket_path: &Path,
 ) -> Result<AdminControlPlaneClient, String> {
+    if static_cluster_command_configured() {
+        let config = static_cluster_config::load_server_config_from_environment()
+            .map_err(|error| format!("configuration error: {error}"))?;
+        let fallback = control_plane_socket_path.to_str().ok_or_else(|| {
+            "control-plane command socket path must contain valid UTF-8".to_string()
+        })?;
+        let client = build_configured_unix_control_plane_client(&config, fallback)?;
+        return build_admin_control_plane_client_from_config(&config, client);
+    }
     let client = build_command_unix_control_plane_client(control_plane_socket_path)?;
     build_admin_control_plane_client_with_command_auth_env(client)
+}
+
+fn static_cluster_command_configured() -> bool {
+    std::env::var_os("ARGMIN_CLUSTER_CONFIG_PATH").is_some()
+        || std::env::var_os("ARGMIN_PROCESS_ID").is_some()
 }
 
 fn build_admin_clock_recovery_client_from_command_auth_env(
     control_plane_socket_path: &Path,
 ) -> Result<AdminControlPlaneClient, String> {
-    if std::env::var_os("ARGMIN_CLUSTER_CONFIG_PATH").is_some()
-        || std::env::var_os("ARGMIN_PROCESS_ID").is_some()
-    {
+    if static_cluster_command_configured() {
         let config = static_cluster_config::load_server_config_from_environment()
             .map_err(|error| format!("configuration error: {error}"))?;
         return build_admin_clock_recovery_client_from_config(&config, control_plane_socket_path);

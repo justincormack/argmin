@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-#[cfg(test)]
-use std::fs::OpenOptions;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Cursor, Read, Write};
 use std::ops::{Bound, RangeBounds};
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -7527,10 +7526,16 @@ impl ControlPlaneRaftRestartArtifact {
         }
         let tmp_path = durable_artifact_tmp_path(path);
         {
-            let mut file = File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
-                context: "create control-plane OpenRaft durable restart artifact temp file",
-                source,
-            })?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .map_err(|source| ControlPlaneError::Io {
+                    context: "create control-plane OpenRaft durable restart artifact temp file",
+                    source,
+                })?;
             file.write_all(&bytes)
                 .map_err(|source| ControlPlaneError::Io {
                     context: "write control-plane OpenRaft durable restart artifact temp file",
@@ -8250,10 +8255,16 @@ impl ControlPlaneRaftRestartSentinel {
         }
         let tmp_path = durable_artifact_tmp_path(path);
         {
-            let mut file = File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
-                context: "create control-plane OpenRaft durable restart sentinel temp file",
-                source,
-            })?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .map_err(|source| ControlPlaneError::Io {
+                    context: "create control-plane OpenRaft durable restart sentinel temp file",
+                    source,
+                })?;
             file.write_all(&bytes)
                 .map_err(|source| ControlPlaneError::Io {
                     context: "write control-plane OpenRaft durable restart sentinel temp file",
@@ -10682,6 +10693,7 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::future::Future;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -22059,6 +22071,18 @@ mod tests {
 
         artifact.store_durable_artifact(&path).unwrap();
         assert!(!durable_artifact_tmp_path(&path).exists());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(durable_artifact_sentinel_path(&path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
 
         let loaded = ControlPlaneRaftRestartArtifact::load_durable_artifact(&path)
             .expect("stored durable restart artifact should load");

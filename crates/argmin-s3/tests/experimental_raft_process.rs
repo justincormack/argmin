@@ -1,5 +1,11 @@
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
+use std::fmt::Write as _;
 use std::fs::{self, File};
+#[cfg(target_os = "linux")]
+use std::net::TcpListener;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -37,13 +43,17 @@ struct TestDir {
 
 impl TestDir {
     fn new(_name: &str) -> Self {
+        Self::new_under(&std::env::temp_dir())
+    }
+
+    fn new_under(parent: &Path) -> Self {
         static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after Unix epoch")
             .as_nanos();
         let id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("a3rt-{}-{id}-{now:x}", std::process::id()));
+        let path = parent.join(format!("a3rt-{}-{id}-{now:x}", std::process::id()));
         fs::create_dir_all(&path).expect("test directory should be created");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
             .expect("test directory should be private");
@@ -330,6 +340,36 @@ impl ChildGuard {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn spawn_static(
+        bin: &Path,
+        test_dir: &Path,
+        manifest_path: &Path,
+        process_id: &str,
+        raft_node_id: u64,
+    ) -> Self {
+        let stdout = File::create(test_dir.join(format!("node-{raft_node_id}.stdout.log")))
+            .expect("stdout log should be created");
+        let stderr = File::create(test_dir.join(format!("node-{raft_node_id}.stderr.log")))
+            .expect("stderr log should be created");
+        let child = Command::new(bin)
+            .env("ARGMIN_CLUSTER_CONFIG_PATH", manifest_path)
+            .env("ARGMIN_PROCESS_ID", process_id)
+            .env("ARGMIN_ACCOUNT_ID", "123456789012")
+            .env("ARGMIN_ACCESS_KEY_ID", "process-test-access")
+            .env("ARGMIN_SECRET_ACCESS_KEY", "process-test-secret")
+            .env("ARGMIN_SSE_S3_WRAPPING_KEY", "dGVzdC13cmFwcGluZy1rZXk=")
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("static argmin-s3 control-plane process should start");
+        Self {
+            node_id: raft_node_id,
+            test_dir: test_dir.to_path_buf(),
+            child: Some(child),
+        }
+    }
+
     fn assert_running(&mut self) {
         let child = self
             .child
@@ -378,6 +418,27 @@ fn argmin_s3_bin() -> PathBuf {
                 .expect("integration test should run from target/*/deps")
                 .join("argmin-s3")
         })
+}
+
+#[cfg(target_os = "linux")]
+fn run_static_control_plane_command(
+    bin: &Path,
+    manifest_path: &Path,
+    process_id: &str,
+    command_name: &str,
+    args: &[&str],
+) -> Output {
+    Command::new(bin)
+        .arg(command_name)
+        .args(args)
+        .env("ARGMIN_CLUSTER_CONFIG_PATH", manifest_path)
+        .env("ARGMIN_PROCESS_ID", process_id)
+        .env("ARGMIN_ACCOUNT_ID", "123456789012")
+        .env("ARGMIN_ACCESS_KEY_ID", "process-test-access")
+        .env("ARGMIN_SECRET_ACCESS_KEY", "process-test-secret")
+        .env("ARGMIN_SSE_S3_WRAPPING_KEY", "dGVzdC13cmFwcGluZy1rZXk=")
+        .output()
+        .expect("static control-plane command should run")
 }
 
 fn run_runtime_map_ready(bin: &Path, socket_path: &Path) -> Output {
@@ -1243,6 +1304,503 @@ fn wait_for_process_exit(child: &mut ChildGuard, timeout: Duration) -> ExitStatu
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn static_tcp_process_test_mount() -> Option<PathBuf> {
+    // SAFETY: geteuid has no preconditions and does not mutate memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    let candidates = std::env::var_os("ARGMIN_STATIC_TCP_PROCESS_TEST_MOUNT")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([
+            PathBuf::from(format!("/run/user/{effective_uid}")),
+            PathBuf::from("/dev/shm"),
+        ]);
+    candidates.into_iter().find(|path| {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let Ok(parent_metadata) = fs::symlink_metadata(parent) else {
+            return false;
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == effective_uid
+            && mode & 0o022 == 0
+            && metadata.dev() != parent_metadata.dev()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_loopback_ports(count: usize) -> (Vec<u16>, Vec<TcpListener>) {
+    let listeners = (0..count)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("test TCP port should reserve"))
+        .collect::<Vec<_>>();
+    let ports = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect();
+    (ports, listeners)
+}
+
+#[cfg(target_os = "linux")]
+fn write_static_tcp_process_manifest(test_dir: &Path, ports: &[u16]) -> PathBuf {
+    assert_eq!(ports.len(), 12);
+    let mount_path = test_dir
+        .parent()
+        .expect("static TCP test directory should be beneath its mount");
+    let material_dir = test_dir.join("material");
+    fs::create_dir(&material_dir).unwrap();
+    fs::set_permissions(&material_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let testdata = Path::new(env!("CARGO_MANIFEST_DIR")).join("../s3-tests/testdata");
+    for (source, target, mode) in [
+        ("ca-cert.pem", "cluster-ca.pem", 0o644),
+        ("localhost-cert.pem", "localhost.crt", 0o644),
+        ("localhost-key.pem", "localhost.key", 0o600),
+    ] {
+        let target = material_dir.join(target);
+        fs::copy(testdata.join(source), &target).unwrap();
+        fs::set_permissions(target, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    for role in ["raft", "storage", "admin"] {
+        for number in 1..=3 {
+            let path = material_dir.join(format!("{role}-{number}.key"));
+            fs::write(&path, format!("static-tcp-{role}-{number}-secret")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    let cluster_id = format!(
+        "static-tcp-process-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let mut manifest = format!(
+        r#"schema_version = 1
+
+[cluster]
+id = "{cluster_id}"
+topology_generation = 1
+region = "us-east-1"
+
+[deployment]
+mode = "replicated"
+failure_domain = "host"
+failure_tolerance = 1
+internal_auth = "required"
+
+[storage]
+pg_count = 1
+ec_data_shards = 2
+ec_parity_shards = 1
+initial_cluster_epoch = 1
+
+[raft]
+max_append_entries = 64
+max_append_bytes = 8388608
+max_snapshot_bytes = 15728640
+
+[[transport_profiles]]
+id = "internal"
+max_frame_bytes = 16777216
+max_connections = 64
+connect_timeout_ms = 1000
+io_timeout_ms = 15000
+
+[[transport_profiles]]
+id = "control"
+max_frame_bytes = 8388648
+max_connections = 64
+connect_timeout_ms = 1000
+io_timeout_ms = 15000
+
+[[tls_trust_bundles]]
+id = "cluster-ca"
+ca_bundle_ref = "file:{ca}"
+
+[[tls_identities]]
+id = "cluster-server"
+certificate_ref = "file:{cert}"
+private_key_ref = "file:{key}"
+"#,
+        ca = material_dir.join("cluster-ca.pem").display(),
+        cert = material_dir.join("localhost.crt").display(),
+        key = material_dir.join("localhost.key").display(),
+    );
+
+    for number in 1..=3_u16 {
+        let index = usize::from(number - 1);
+        let state_path = test_dir.join(format!("state-{number}/control.state"));
+        writeln!(
+            manifest,
+            r#"
+[[hosts]]
+id = "control-host-{number}"
+zone = "zone-a"
+rack = "control-rack-{number}"
+
+[[hosts]]
+id = "storage-host-{number}"
+zone = "zone-a"
+rack = "storage-rack-{number}"
+
+[[disks]]
+id = "control-disk-{number}"
+host_id = "control-host-{number}"
+mount_path = "{mount_path}"
+
+[[disks]]
+id = "storage-disk-{number}"
+host_id = "storage-host-{number}"
+mount_path = "/srv/argmin-static-storage-{number}"
+
+[[processes]]
+id = "control-{number}"
+host_id = "control-host-{number}"
+kind = "control-plane"
+admin_instance_id = "control-{number}-admin"
+
+[[processes]]
+id = "storage-{number}"
+host_id = "storage-host-{number}"
+kind = "storage-node"
+
+[[authorities]]
+id = "authority-{number}"
+kind = "raft-voter"
+raft_node_id = {raft_node_id}
+process_id = "control-{number}"
+disk_id = "control-disk-{number}"
+state_path = "{state_path}"
+
+[[storage_nodes]]
+node_id = {number}
+process_id = "storage-{number}"
+disk_id = "storage-disk-{number}"
+data_dir = "/srv/argmin-static-storage-{number}/node"
+"#,
+            raft_node_id = 100 + u64::from(number),
+            mount_path = mount_path.display(),
+            state_path = state_path.display(),
+        )
+        .unwrap();
+
+        for (protocol, name, port, profile) in [
+            ("raft-peer", "raft", ports[index], "internal"),
+            ("control-plane", "control", ports[index + 3], "control"),
+            (
+                "authority-clock-recovery",
+                "clock",
+                ports[index + 6],
+                "control",
+            ),
+        ] {
+            writeln!(
+                manifest,
+                r#"
+[[endpoints]]
+id = "{name}-{number}"
+owner_process_id = "control-{number}"
+protocol = "{protocol}"
+priority = 10
+listen = "tcp://127.0.0.1:{port}"
+advertise = "tcp://localhost:{port}"
+transport_profile_id = "{profile}"
+tls_identity_id = "cluster-server"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "localhost"
+"#
+            )
+            .unwrap();
+        }
+        writeln!(
+            manifest,
+            r#"
+[[endpoints]]
+id = "storage-{number}"
+owner_process_id = "storage-{number}"
+protocol = "storage-rpc"
+priority = 10
+listen = "tcp://127.0.0.1:{storage_port}"
+advertise = "tcp://localhost:{storage_port}"
+transport_profile_id = "internal"
+tls_identity_id = "cluster-server"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "localhost"
+"#,
+            storage_port = ports[index + 9],
+        )
+        .unwrap();
+
+        for (principal, id_field, id_value, credential_id) in [
+            (
+                "raft-peer",
+                "node_id",
+                (100 + u64::from(number)).to_string(),
+                format!("raft-{number}"),
+            ),
+            (
+                "storage-node",
+                "node_id",
+                number.to_string(),
+                format!("storage-{number}"),
+            ),
+            (
+                "admin",
+                "instance_id",
+                format!("\"control-{number}-admin\""),
+                format!("admin-{number}"),
+            ),
+        ] {
+            writeln!(
+                manifest,
+                r#"
+[[auth_credentials]]
+principal = "{principal}"
+{id_field} = {id_value}
+credential_id = "{credential_id}"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:{secret}"
+"#,
+                secret = material_dir.join(format!("{credential_id}.key")).display(),
+            )
+            .unwrap();
+        }
+    }
+
+    let manifest_path = test_dir.join("cluster.toml");
+    fs::write(&manifest_path, manifest).unwrap();
+    manifest_path
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_static_read_only_command_success(
+    bin: &Path,
+    manifest_path: &Path,
+    process_id: &str,
+    command_name: &str,
+    args: &[&str],
+    test_dir: &Path,
+    children: &mut [&mut ChildGuard],
+) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_success_stdout = None;
+    let mut consecutive_successes = 0_u8;
+    loop {
+        for child in children.iter_mut() {
+            child.assert_running();
+        }
+        let output =
+            run_static_control_plane_command(bin, manifest_path, process_id, command_name, args);
+        if output.status.success() {
+            if last_success_stdout
+                .as_ref()
+                .is_some_and(|previous: &Vec<u8>| *previous == output.stdout)
+            {
+                consecutive_successes += 1;
+            } else {
+                consecutive_successes = 1;
+            }
+            last_success_stdout = Some(output.stdout.clone());
+            if consecutive_successes == 3 {
+                return output;
+            }
+        } else {
+            last_success_stdout = None;
+            consecutive_successes = 0;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "static TCP read-only command {command_name} did not converge: {}\n{}",
+                format_admin_failure(output.status, &output),
+                process_logs(test_dir)
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_static_mutating_command_once(
+    bin: &Path,
+    manifest_path: &Path,
+    process_id: &str,
+    command_name: &str,
+    args: &[&str],
+    test_dir: &Path,
+    children: &mut [&mut ChildGuard],
+) -> Output {
+    for child in children {
+        child.assert_running();
+    }
+    let output =
+        run_static_control_plane_command(bin, manifest_path, process_id, command_name, args);
+    assert!(
+        output.status.success(),
+        "single-attempt static TCP mutation {command_name} failed: {}\n{}",
+        format_admin_failure(output.status, &output),
+        process_logs(test_dir)
+    );
+    output
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn static_manifest_tcp_three_authorities_bootstrap_route_admin_and_restart() {
+    let Some(mount) = static_tcp_process_test_mount() else {
+        eprintln!(
+            "skipping static TCP process smoke: set ARGMIN_STATIC_TCP_PROCESS_TEST_MOUNT to a private writable mount boundary"
+        );
+        return;
+    };
+    let test_dir = TestDir::new_under(&mount);
+    let bin = argmin_s3_bin();
+    let (ports, reservations) = reserve_loopback_ports(12);
+    let manifest_path = write_static_tcp_process_manifest(test_dir.path(), &ports);
+    for number in 1..=3_u64 {
+        let output = Command::new(&bin)
+            .arg("initialize-cluster-state")
+            .arg(&manifest_path)
+            .arg(format!("control-{number}"))
+            .output()
+            .expect("static control-plane state initializer should run");
+        assert!(
+            output.status.success(),
+            "static control-{number} initialization failed: {}",
+            format_admin_failure(output.status, &output)
+        );
+    }
+    drop(reservations);
+
+    let mut node102 =
+        ChildGuard::spawn_static(&bin, test_dir.path(), &manifest_path, "control-2", 102);
+    let mut node103 =
+        ChildGuard::spawn_static(&bin, test_dir.path(), &manifest_path, "control-3", 103);
+    let mut node101 =
+        ChildGuard::spawn_static(&bin, test_dir.path(), &manifest_path, "control-1", 101);
+    let unused_socket = test_dir.path().join("unused.sock");
+    let unused_socket_arg = unused_socket.to_str().unwrap();
+
+    let clock_status = wait_for_static_read_only_command_success(
+        &bin,
+        &manifest_path,
+        "control-1",
+        "control-plane-authority-clock-status",
+        &[unused_socket_arg],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+    assert!(
+        String::from_utf8_lossy(&clock_status.stdout).contains("established=true"),
+        "initial static TCP authority clock should be established"
+    );
+    run_static_mutating_command_once(
+        &bin,
+        &manifest_path,
+        "control-1",
+        "control-plane-trigger-raft-snapshot-purge",
+        &[unused_socket_arg],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+
+    node103.stop();
+    wait_for_static_read_only_command_success(
+        &bin,
+        &manifest_path,
+        "control-1",
+        "control-plane-authority-clock-status",
+        &[unused_socket_arg],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102],
+    );
+    run_static_mutating_command_once(
+        &bin,
+        &manifest_path,
+        "control-1",
+        "control-plane-trigger-raft-snapshot-purge",
+        &[unused_socket_arg],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102],
+    );
+    let mut restarted103 =
+        ChildGuard::spawn_static(&bin, test_dir.path(), &manifest_path, "control-3", 103);
+    wait_for_static_read_only_command_success(
+        &bin,
+        &manifest_path,
+        "control-3",
+        "control-plane-authority-clock-status",
+        &[unused_socket_arg],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut restarted103],
+    );
+    run_static_mutating_command_once(
+        &bin,
+        &manifest_path,
+        "control-1",
+        "control-plane-transfer-raft-leadership",
+        &[unused_socket_arg, "103"],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut restarted103],
+    );
+    wait_for_static_read_only_command_success(
+        &bin,
+        &manifest_path,
+        "control-3",
+        "control-plane-authority-clock-status",
+        &[unused_socket_arg],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut restarted103],
+    );
+    run_static_mutating_command_once(
+        &bin,
+        &manifest_path,
+        "control-3",
+        "control-plane-reestablish-authority-clock",
+        &[unused_socket_arg],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut restarted103],
+    );
+    let recovered_clock_status = wait_for_static_read_only_command_success(
+        &bin,
+        &manifest_path,
+        "control-3",
+        "control-plane-authority-clock-status",
+        &[unused_socket_arg],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut restarted103],
+    );
+    assert!(
+        String::from_utf8_lossy(&recovered_clock_status.stdout).contains("established=true"),
+        "transferred static TCP authority clock should be re-established"
+    );
+    run_static_mutating_command_once(
+        &bin,
+        &manifest_path,
+        "control-3",
+        "control-plane-trigger-raft-snapshot-purge",
+        &[unused_socket_arg],
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut restarted103],
+    );
+
+    assert!(
+        (1..=3_u64).all(|number| test_dir
+            .path()
+            .join(format!("state-{number}/control.state"))
+            .is_file()),
+        "all static TCP authorities should publish durable restart artifacts"
+    );
 }
 
 #[test]
