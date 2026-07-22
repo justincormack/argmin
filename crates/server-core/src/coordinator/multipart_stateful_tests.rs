@@ -2079,8 +2079,8 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
                 "{invariant}: initial reclaim item targeted the wrong generation"
             );
         }
-        Some(ReclaimWorkItem::BucketDelete(bucket)) => {
-            panic!("{invariant}: expected object reclaim work, got bucket delete for {bucket}")
+        Some(ReclaimWorkItem::BucketDelete(root)) => {
+            panic!("{invariant}: expected object reclaim work, got {root:?}")
         }
         Some(ReclaimWorkItem::BucketDeleteBegin(root)) => {
             panic!(

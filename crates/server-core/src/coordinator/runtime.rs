@@ -8,10 +8,11 @@ use s3_types::BucketLifecycleConfiguration;
 #[cfg(test)]
 use storage::PgTopology;
 use storage::{
-    AuthorizedMultipartUploadRecord, BucketDeleteBeginRoot, BucketInfo, BucketName, EcShape,
-    GenerationId, ObjectEncryption, ObjectKey, PlacedSegmentShardBackfillClaimAcquireParams,
-    PlacedSegmentShardRepairClaimAcquireParams, ReclaimWorkItem, SegmentStoredBytesRequest,
-    StorageCluster, StorageClusterRuntimeMapHandle, StoreError, UploadId, UploadState, VersionId,
+    AuthorizedMultipartUploadRecord, BucketDeleteBeginRoot, BucketDeleteFinalizeRoot, BucketInfo,
+    BucketName, EcShape, GenerationId, ObjectEncryption, ObjectKey,
+    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardRepairClaimAcquireParams,
+    ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster, StorageClusterRuntimeMapHandle,
+    StoreError, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -55,6 +56,7 @@ static SHARD_BACKFILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const BUCKET_DELETE_BEGIN_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const BUCKET_DELETE_FINALIZE_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
+const BUCKET_DELETE_FINALIZE_ERROR_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
 const RECLAIM_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const RECLAIM_DURABLE_SCAN_ROUTE_REFRESH_BACKOFF: Duration = Duration::from_secs(1);
 const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
@@ -506,13 +508,13 @@ fn defer_bucket_delete_begin(
 }
 
 fn earliest_bucket_delete_finalize_retry_sleep(
-    deferred_work: &VecDeque<BucketName>,
-    retry_after_by_bucket: &HashMap<BucketName, Instant>,
+    deferred_work: &VecDeque<BucketDeleteFinalizeRoot>,
+    retry_after_by_root: &HashMap<BucketDeleteFinalizeRoot, Instant>,
 ) -> Option<Duration> {
     let now = Instant::now();
     let mut earliest_retry: Option<Instant> = None;
-    for bucket in deferred_work {
-        let retry_after = retry_after_by_bucket.get(bucket)?;
+    for root in deferred_work {
+        let retry_after = retry_after_by_root.get(root)?;
         if *retry_after <= now {
             return None;
         }
@@ -529,12 +531,34 @@ fn earliest_bucket_delete_finalize_retry_sleep(
 }
 
 fn defer_bucket_delete_finalize(
-    deferred_work: &mut VecDeque<BucketName>,
-    deferred_roots: &mut HashSet<BucketName>,
-    bucket: BucketName,
+    deferred_work: &mut VecDeque<BucketDeleteFinalizeRoot>,
+    deferred_roots: &mut HashSet<BucketDeleteFinalizeRoot>,
+    root: BucketDeleteFinalizeRoot,
 ) {
-    if deferred_roots.insert(bucket.clone()) {
-        deferred_work.push_back(bucket);
+    if deferred_roots.insert(root.clone()) {
+        deferred_work.push_back(root);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketDeleteFinalizeWorkerDisposition {
+    Finish,
+    RetryAfter(Duration),
+}
+
+fn bucket_delete_finalize_worker_disposition(
+    result: &Result<storage::BucketDeleteFinalizeOutcome, ServerError>,
+) -> BucketDeleteFinalizeWorkerDisposition {
+    match result {
+        Ok(outcome) if outcome.is_terminal() => BucketDeleteFinalizeWorkerDisposition::Finish,
+        Ok(storage::BucketDeleteFinalizeOutcome::Pending)
+        | Err(ServerError::OperationAborted | ServerError::SlowDown) => {
+            BucketDeleteFinalizeWorkerDisposition::RetryAfter(BUCKET_DELETE_FINALIZE_RETRY_COOLDOWN)
+        }
+        Err(_) => BucketDeleteFinalizeWorkerDisposition::RetryAfter(
+            BUCKET_DELETE_FINALIZE_ERROR_RETRY_COOLDOWN,
+        ),
+        Ok(_) => unreachable!("all nonterminal bucket finalizer outcomes must retry"),
     }
 }
 
@@ -567,16 +591,20 @@ fn enqueue_durable_reclaim_work_if_due(
     storage_node: &StorageCluster,
     excluded_object_payload_roots: &HashSet<ObjectPayloadReclaimRoot>,
     excluded_bucket_delete_begin_roots: &HashSet<BucketDeleteBeginRoot>,
-    excluded_bucket_delete_finalize_roots: &HashSet<BucketName>,
+    excluded_bucket_delete_finalize_roots: &HashSet<BucketDeleteFinalizeRoot>,
     next_scan_at: &mut Instant,
 ) {
     if Instant::now() < *next_scan_at {
         return;
     }
+    let excluded_bucket_names = excluded_bucket_delete_finalize_roots
+        .iter()
+        .map(|root| root.bucket.clone())
+        .collect();
     let outcome = storage_node.enqueue_durable_reclaim_work_excluding(
         excluded_object_payload_roots,
         excluded_bucket_delete_begin_roots,
-        excluded_bucket_delete_finalize_roots,
+        &excluded_bucket_names,
     );
     let scan_completed_at = Instant::now();
     #[cfg(not(test))]
@@ -717,10 +745,14 @@ impl ReclaimSweeper {
                     VecDeque::new();
                 let mut deferred_bucket_delete_begin_roots: HashSet<BucketDeleteBeginRoot> =
                     HashSet::new();
-                let mut bucket_delete_finalize_retry_after: HashMap<BucketName, Instant> =
-                    HashMap::new();
-                let mut deferred_bucket_delete_finalize: VecDeque<BucketName> = VecDeque::new();
-                let mut deferred_bucket_delete_finalize_roots: HashSet<BucketName> = HashSet::new();
+                let mut bucket_delete_finalize_retry_after: HashMap<
+                    BucketDeleteFinalizeRoot,
+                    Instant,
+                > = HashMap::new();
+                let mut deferred_bucket_delete_finalize: VecDeque<BucketDeleteFinalizeRoot> =
+                    VecDeque::new();
+                let mut deferred_bucket_delete_finalize_roots: HashSet<BucketDeleteFinalizeRoot> =
+                    HashSet::new();
                 let mut next_durable_scan_at = Instant::now();
                 let mut pending_work: Option<(Arc<StorageCluster>, ReclaimWorkItem)> = None;
                 while !worker_stop.load(Ordering::SeqCst) {
@@ -776,12 +808,12 @@ impl ReclaimSweeper {
                                         })
                                         .or_else(|| {
                                             deferred_bucket_delete_finalize.pop_front().map(
-                                                |bucket| {
+                                                |root| {
                                                     deferred_bucket_delete_finalize_roots
-                                                        .remove(&bucket);
+                                                        .remove(&root);
                                                     (
                                                         Arc::clone(&worker_node),
-                                                        ReclaimWorkItem::BucketDelete(bucket),
+                                                        ReclaimWorkItem::BucketDelete(root),
                                                     )
                                                 },
                                             )
@@ -869,59 +901,55 @@ impl ReclaimSweeper {
                                 }
                             }
                         }
-                        ReclaimWorkItem::BucketDelete(bucket) => {
-                            if deferred_bucket_delete_finalize_roots.contains(&bucket) {
+                        ReclaimWorkItem::BucketDelete(root) => {
+                            if deferred_bucket_delete_finalize_roots.contains(&root) {
                                 continue;
                             }
                             let is_cooled = bucket_delete_finalize_retry_after
-                                .get(&bucket)
+                                .get(&root)
                                 .is_some_and(|retry_after| *retry_after > Instant::now());
                             if is_cooled {
                                 defer_bucket_delete_finalize(
                                     &mut deferred_bucket_delete_finalize,
                                     &mut deferred_bucket_delete_finalize_roots,
-                                    bucket,
+                                    root,
                                 );
                             } else {
                                 let result = current_runtime
-                                    .try_finalize_bucket_delete_for_with_outcome(&bucket);
+                                    .try_finalize_bucket_delete_for_with_outcome(&root);
                                 let _ = observability::event(
                                     TRACE_TARGET,
                                     "bucket_delete_finalize_worker_result",
-                                    Some(format_args!("bucket={bucket:?} result={result:?}")),
+                                    Some(format_args!("root={root:?} result={result:?}")),
                                 );
-                                match result {
-                                    Ok(
-                                        outcome @ (storage::BucketDeleteFinalizeOutcome::NotFound
-                                        | storage::BucketDeleteFinalizeOutcome::NotDeleting
-                                        | storage::BucketDeleteFinalizeOutcome::Finalized),
-                                    ) => {
-                                        debug_assert!(outcome.is_terminal());
-                                        worker_node.finish_bucket_delete_finalize_work(&bucket);
-                                        bucket_delete_finalize_retry_after.remove(&bucket);
-                                        bucket_delete_begin_retry_after
-                                            .retain(|root, _| root.bucket != bucket);
-                                        deferred_bucket_delete_begin_roots
-                                            .retain(|root| root.bucket != bucket);
-                                        deferred_bucket_delete_begin
-                                            .retain(|root| root.bucket != bucket);
+                                match bucket_delete_finalize_worker_disposition(&result) {
+                                    BucketDeleteFinalizeWorkerDisposition::Finish => {
+                                        worker_node.finish_bucket_delete_finalize_work(&root);
+                                        bucket_delete_finalize_retry_after.remove(&root);
+                                        bucket_delete_begin_retry_after.retain(|begin, _| {
+                                            begin.bucket != root.bucket
+                                                || begin.bucket_incarnation_generation
+                                                    != root.bucket_incarnation_generation
+                                        });
+                                        deferred_bucket_delete_begin_roots.retain(|begin| {
+                                            begin.bucket != root.bucket
+                                                || begin.bucket_incarnation_generation
+                                                    != root.bucket_incarnation_generation
+                                        });
+                                        deferred_bucket_delete_begin.retain(|begin| {
+                                            begin.bucket != root.bucket
+                                                || begin.bucket_incarnation_generation
+                                                    != root.bucket_incarnation_generation
+                                        });
                                     }
-                                    Ok(storage::BucketDeleteFinalizeOutcome::Pending)
-                                    | Err(
-                                        ServerError::OperationAborted | ServerError::SlowDown,
-                                    ) => {
-                                        bucket_delete_finalize_retry_after.insert(
-                                            bucket.clone(),
-                                            Instant::now() + BUCKET_DELETE_FINALIZE_RETRY_COOLDOWN,
-                                        );
+                                    BucketDeleteFinalizeWorkerDisposition::RetryAfter(delay) => {
+                                        bucket_delete_finalize_retry_after
+                                            .insert(root.clone(), Instant::now() + delay);
                                         defer_bucket_delete_finalize(
                                             &mut deferred_bucket_delete_finalize,
                                             &mut deferred_bucket_delete_finalize_roots,
-                                            bucket,
+                                            root,
                                         );
-                                    }
-                                    Err(_) => {
-                                        bucket_delete_finalize_retry_after.remove(&bucket);
                                     }
                                 }
                             }
@@ -955,7 +983,13 @@ impl ReclaimSweeper {
                                 ) {
                                     Ok(()) => {
                                         bucket_delete_begin_retry_after.remove(&root);
-                                        worker_node.enqueue_bucket_delete_finalize(&root.bucket);
+                                        worker_node.enqueue_bucket_delete_finalize(
+                                            BucketDeleteFinalizeRoot {
+                                                bucket: root.bucket.clone(),
+                                                bucket_incarnation_generation: root
+                                                    .bucket_incarnation_generation,
+                                            },
+                                        );
                                     }
                                     Err(error) => {
                                         if bucket_delete_begin_root_is_stale(
@@ -2217,8 +2251,8 @@ impl ReadRuntime {
         );
     }
 
-    pub(super) fn enqueue_bucket_delete_finalize_for(&self, bucket: &BucketName) {
-        self.storage_node.enqueue_bucket_delete_finalize(bucket);
+    pub(super) fn enqueue_bucket_delete_finalize_for(&self, root: BucketDeleteFinalizeRoot) {
+        self.storage_node.enqueue_bucket_delete_finalize(root);
     }
 
     fn lifecycle_config_for_bucket_info(
@@ -3008,9 +3042,14 @@ impl ReadRuntime {
         &self,
         bucket: &BucketName,
     ) -> Result<(), ServerError> {
-        match self.try_finalize_bucket_delete_for_with_outcome(bucket)? {
+        match self
+            .storage_node
+            .try_finalize_bucket_delete(bucket)
+            .map_err(super::bucket::map_bucket_write_drain_error)?
+        {
             storage::BucketDeleteFinalizeOutcome::NotFound
             | storage::BucketDeleteFinalizeOutcome::NotDeleting
+            | storage::BucketDeleteFinalizeOutcome::StaleIncarnation
             | storage::BucketDeleteFinalizeOutcome::Pending
             | storage::BucketDeleteFinalizeOutcome::Finalized => Ok(()),
         }
@@ -3018,14 +3057,14 @@ impl ReadRuntime {
 
     pub(super) fn try_finalize_bucket_delete_for_with_outcome(
         &self,
-        bucket: &BucketName,
+        root: &BucketDeleteFinalizeRoot,
     ) -> Result<storage::BucketDeleteFinalizeOutcome, ServerError> {
-        let result = self.storage_node.try_finalize_bucket_delete(bucket);
+        let result = self.storage_node.try_finalize_bucket_delete_root(root);
         if let Err(error) = &result {
             let _ = observability::event(
                 TRACE_TARGET,
                 "bucket_delete_finalize_storage_error",
-                Some(format_args!("bucket={bucket:?} error={error:?}")),
+                Some(format_args!("root={root:?} error={error:?}")),
             );
         }
         result.map_err(super::bucket::map_bucket_write_drain_error)
@@ -3175,28 +3214,46 @@ mod tests {
 
     #[test]
     fn bucket_delete_finalize_retry_sleep_waits_for_cooled_deferred_root() {
-        let bucket = trusted_bucket_name("cooled-finalizer");
+        let root = BucketDeleteFinalizeRoot {
+            bucket: trusted_bucket_name("cooled-finalizer"),
+            bucket_incarnation_generation: 1,
+        };
         let mut deferred_work = VecDeque::new();
-        deferred_work.push_back(bucket.clone());
-        let mut retry_after_by_bucket = HashMap::new();
-        retry_after_by_bucket.insert(
-            bucket.clone(),
+        deferred_work.push_back(root.clone());
+        let mut retry_after_by_root = HashMap::new();
+        retry_after_by_root.insert(
+            root.clone(),
             Instant::now() + BUCKET_DELETE_FINALIZE_RETRY_COOLDOWN,
         );
 
         let sleep_for =
-            earliest_bucket_delete_finalize_retry_sleep(&deferred_work, &retry_after_by_bucket)
+            earliest_bucket_delete_finalize_retry_sleep(&deferred_work, &retry_after_by_root)
                 .expect("cooled finalizer root should produce a retry sleep");
         assert!(
             sleep_for <= BUCKET_DELETE_FINALIZE_RETRY_COOLDOWN,
             "retry sleep should be capped by the finalizer cooldown, got {sleep_for:?}"
         );
 
-        retry_after_by_bucket.insert(bucket, Instant::now() - Duration::from_millis(1));
+        retry_after_by_root.insert(root, Instant::now() - Duration::from_millis(1));
         assert_eq!(
-            earliest_bucket_delete_finalize_retry_sleep(&deferred_work, &retry_after_by_bucket),
+            earliest_bucket_delete_finalize_retry_sleep(&deferred_work, &retry_after_by_root),
             None,
             "ready finalizer root should not sleep"
+        );
+    }
+
+    #[test]
+    fn bucket_delete_finalize_worker_retries_unexpected_errors() {
+        let result = Err(ServerError::InternalError {
+            reason: "post-delete claim release failed".to_string(),
+        });
+
+        assert_eq!(
+            bucket_delete_finalize_worker_disposition(&result),
+            BucketDeleteFinalizeWorkerDisposition::RetryAfter(
+                BUCKET_DELETE_FINALIZE_ERROR_RETRY_COOLDOWN
+            ),
+            "an error after durable bucket deletion must remain retryable so NotFound can clear the exact outstanding root"
         );
     }
 

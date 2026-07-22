@@ -39721,7 +39721,15 @@ mod tests {
         )
         .unwrap();
         let bucket = crate::BucketName::try_from("refresh-queue-bucket").unwrap();
-        cluster.enqueue_bucket_delete_finalize(&bucket);
+        let root = crate::BucketDeleteFinalizeRoot {
+            bucket: bucket.clone(),
+            bucket_incarnation_generation: 1,
+        };
+        cluster.enqueue_bucket_delete_finalize(root.clone());
+        assert_eq!(
+            cluster.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::BucketDelete(root.clone()))
+        );
 
         authority
             .complete_pg_peering(
@@ -39736,11 +39744,17 @@ mod tests {
         let refreshed = cluster
             .refresh_from_control_plane_runtime_map(&authority, 2_004)
             .unwrap();
+        let recreated_root = crate::BucketDeleteFinalizeRoot {
+            bucket,
+            bucket_incarnation_generation: 2,
+        };
+        refreshed.enqueue_bucket_delete_finalize(recreated_root.clone());
+        cluster.finish_bucket_delete_finalize_work(&root);
         assert_eq!(
             refreshed.try_take_reclaim_work(),
-            Some(crate::ReclaimWorkItem::BucketDelete(bucket.clone()))
+            Some(crate::ReclaimWorkItem::BucketDelete(recreated_root.clone()))
         );
-        refreshed.finish_bucket_delete_finalize_work(&bucket);
+        refreshed.finish_bucket_delete_finalize_work(&recreated_root);
         assert!(refreshed.try_take_reclaim_work().is_none());
     }
 
@@ -39867,7 +39881,11 @@ mod tests {
         .unwrap();
         let registry_key = cluster.process_local_registry_key();
         let bucket = crate::BucketName::try_from("unix-refresh-queue-bucket").unwrap();
-        cluster.enqueue_bucket_delete_finalize(&bucket);
+        let root = crate::BucketDeleteFinalizeRoot {
+            bucket: bucket.clone(),
+            bucket_incarnation_generation: 1,
+        };
+        cluster.enqueue_bucket_delete_finalize(root.clone());
         let repair = placed_segment_shard_repair_work_item_for_runtime_refresh(2);
         assert!(cluster.test_enqueue_placed_segment_shard_repair(repair));
 
@@ -39891,9 +39909,9 @@ mod tests {
         assert_eq!(refreshed.process_local_registry_key(), registry_key);
         assert_eq!(
             refreshed.try_take_reclaim_work(),
-            Some(crate::ReclaimWorkItem::BucketDelete(bucket.clone()))
+            Some(crate::ReclaimWorkItem::BucketDelete(root.clone()))
         );
-        refreshed.finish_bucket_delete_finalize_work(&bucket);
+        refreshed.finish_bucket_delete_finalize_work(&root);
         assert_eq!(
             refreshed.try_take_placed_segment_shard_repair_work(),
             Some(repair)

@@ -42,10 +42,10 @@ use crate::node_client::{
 use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
 use crate::{
-    BucketName, BucketPgId, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError,
-    ObjectKey, ObjectMetadataPgId, ObjectMetadataScanPgId, PgId, PgState,
-    PlacedSegmentShardRepairWorkItem, ReclaimWorkItem, RouteMapValidity, ShardIndex, ShardKey,
-    WriteAck, WrittenShardAck,
+    BucketDeleteFinalizeRoot, BucketName, BucketPgId, ClusterEpoch, DataPgId, EcShape,
+    GenerationId, MetadataError, ObjectKey, ObjectMetadataPgId, ObjectMetadataScanPgId, PgId,
+    PgState, PlacedSegmentShardRepairWorkItem, ReclaimWorkItem, RouteMapValidity, ShardIndex,
+    ShardKey, WriteAck, WrittenShardAck,
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
@@ -933,8 +933,8 @@ struct LocalReclaimQueueState {
     outstanding_objects: HashMap<LocalReclaimRoot, u32>,
     object_payload_outstanding_by_pg: HashMap<u32, usize>,
     queued_bucket_delete_begins: HashSet<LocalBucketDeleteBeginRoot>,
-    queued_bucket_deletes: HashSet<BucketName>,
-    outstanding_bucket_deletes: HashSet<BucketName>,
+    queued_bucket_deletes: HashSet<BucketDeleteFinalizeRoot>,
+    outstanding_bucket_deletes: HashSet<BucketDeleteFinalizeRoot>,
 }
 
 #[derive(Debug)]
@@ -1112,15 +1112,14 @@ impl LocalClusterRuntimeState {
         Self::emit_reclaim_queue_action(&state, "object_payload", "finish");
     }
 
-    pub(crate) fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) -> bool {
+    pub(crate) fn enqueue_bucket_delete_finalize(&self, root: BucketDeleteFinalizeRoot) -> bool {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let bucket = bucket.clone();
-        state.outstanding_bucket_deletes.insert(bucket.clone());
-        if state.queued_bucket_deletes.insert(bucket.clone()) {
+        state.outstanding_bucket_deletes.insert(root.clone());
+        if state.queued_bucket_deletes.insert(root.clone()) {
             state
                 .work_queue
-                .push_back(ReclaimWorkItem::BucketDelete(bucket));
+                .push_back(ReclaimWorkItem::BucketDelete(root));
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "enqueue");
             cv.notify_one();
             true
@@ -1146,22 +1145,26 @@ impl LocalClusterRuntimeState {
         }
     }
 
-    pub(crate) fn finish_bucket_delete_finalize_work(&self, bucket: &BucketName) {
+    pub(crate) fn finish_bucket_delete_finalize_work(&self, root: &BucketDeleteFinalizeRoot) {
         let mut state = self
             .reclaim_queue
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        state.queued_bucket_deletes.remove(bucket);
-        state
-            .queued_bucket_delete_begins
-            .retain(|root| root.bucket != *bucket);
+        state.queued_bucket_deletes.remove(root);
+        state.queued_bucket_delete_begins.retain(|begin| {
+            begin.bucket != root.bucket
+                || begin.bucket_incarnation_generation != root.bucket_incarnation_generation
+        });
         state.work_queue.retain(|work| match work {
-            ReclaimWorkItem::BucketDelete(queued_bucket) => queued_bucket != bucket,
-            ReclaimWorkItem::BucketDeleteBegin(root) => root.bucket != *bucket,
+            ReclaimWorkItem::BucketDelete(queued_root) => queued_root != root,
+            ReclaimWorkItem::BucketDeleteBegin(begin) => {
+                begin.bucket != root.bucket
+                    || begin.bucket_incarnation_generation != root.bucket_incarnation_generation
+            }
             ReclaimWorkItem::ObjectPayload(_) => true,
         });
-        if state.outstanding_bucket_deletes.remove(bucket) {
+        if state.outstanding_bucket_deletes.remove(root) {
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "finish");
         }
     }
@@ -1281,8 +1284,8 @@ impl LocalClusterRuntimeState {
                 state.queued_bucket_delete_begins.remove(root);
                 Self::emit_reclaim_queue_action(state, "bucket_delete_begin", "dequeue");
             }
-            ReclaimWorkItem::BucketDelete(bucket) => {
-                state.queued_bucket_deletes.remove(bucket);
+            ReclaimWorkItem::BucketDelete(root) => {
+                state.queued_bucket_deletes.remove(root);
                 Self::emit_reclaim_queue_action(state, "bucket_delete", "dequeue");
             }
         }

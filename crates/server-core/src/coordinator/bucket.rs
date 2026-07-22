@@ -296,7 +296,10 @@ impl Coordinator {
                                 );
                                 continue;
                             }
-                            Ok(storage::BucketDeleteFinalizeOutcome::NotDeleting) => {
+                            Ok(
+                                storage::BucketDeleteFinalizeOutcome::NotDeleting
+                                | storage::BucketDeleteFinalizeOutcome::StaleIncarnation,
+                            ) => {
                                 let _ = observability::event(
                                     TRACE_TARGET,
                                     "bucket_create_finalize_deleting_changed",
@@ -471,7 +474,10 @@ impl Coordinator {
         );
         self.remove_bucket_fast_path(&name);
         self.read_runtime_for_storage_node(storage_node)
-            .enqueue_bucket_delete_finalize_for(&name);
+            .enqueue_bucket_delete_finalize_for(storage::BucketDeleteFinalizeRoot {
+                bucket: name.clone(),
+                bucket_incarnation_generation,
+            });
         let _ = observability::emit_flight_event(
             TRACE_TARGET,
             "bucket_delete_finalize_enqueued",

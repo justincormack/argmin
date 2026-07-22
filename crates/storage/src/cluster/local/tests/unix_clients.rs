@@ -2030,8 +2030,8 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
     assert_eq!(finalize_scan.queued, 1);
     assert!(matches!(
         reopened_cluster.try_take_reclaim_work(),
-        Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
-            if queued_bucket == bucket
+        Some(crate::ReclaimWorkItem::BucketDelete(queued_root))
+            if queued_root.bucket == bucket
     ));
     assert_eq!(
         reopened_cluster

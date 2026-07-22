@@ -1002,8 +1002,8 @@ impl ReclaimTraceHarness {
             WorkerBucketDeleteStep => {
                 let work = self.take_next_work()?;
                 match work {
-                    Some(ReclaimWorkItem::BucketDelete(bucket))
-                        if bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+                    Some(ReclaimWorkItem::BucketDelete(root))
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
                     Some(ReclaimWorkItem::ObjectPayload(_)) => {
                         return Err(TestCaseError::fail(
                             "expected bucket delete finalize work item, got object reclaim",
@@ -1166,8 +1166,8 @@ impl ReclaimKindTraceHarness {
             WorkerBucketDeleteStep => {
                 let work = self.take_next_work()?;
                 match work {
-                    Some(ReclaimWorkItem::BucketDelete(bucket))
-                        if bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+                    Some(ReclaimWorkItem::BucketDelete(root))
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
                     Some(ReclaimWorkItem::ObjectPayload(_)) => {
                         return Err(TestCaseError::fail(
                             "expected bucket delete finalize work item, got object reclaim",
@@ -1334,9 +1334,12 @@ impl TwoGenerationReclaimTraceHarness {
         match op {
             SeedBucketDelete => {
                 seed_deleting_bucket(&self.runtime);
-                self.runtime
-                    .storage_node
-                    .enqueue_bucket_delete_finalize(&trusted_bucket_name(TRACE_BUCKET));
+                self.runtime.storage_node.enqueue_bucket_delete_finalize(
+                    storage::BucketDeleteFinalizeRoot {
+                        bucket: trusted_bucket_name(TRACE_BUCKET),
+                        bucket_incarnation_generation: 1,
+                    },
+                );
             }
             SeedOldMetadata => self.seed_metadata_for(TraceGeneration::Old)?,
             SeedNewMetadata => self.seed_metadata_for(TraceGeneration::New)?,
@@ -1370,8 +1373,8 @@ impl TwoGenerationReclaimTraceHarness {
             WorkerBucketDeleteStep => {
                 let work = self.take_next_work()?;
                 match work {
-                    Some(ReclaimWorkItem::BucketDelete(bucket))
-                        if bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+                    Some(ReclaimWorkItem::BucketDelete(root))
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
                     Some(ReclaimWorkItem::ObjectPayload(_)) => {
                         return Err(TestCaseError::fail(
                             "expected bucket delete finalize work item, got object reclaim",
@@ -1561,9 +1564,12 @@ impl TwoKeyReclaimTraceHarness {
         match op {
             SeedBucketDelete => {
                 seed_deleting_bucket(&self.runtime);
-                self.runtime
-                    .storage_node
-                    .enqueue_bucket_delete_finalize(&trusted_bucket_name(TRACE_BUCKET));
+                self.runtime.storage_node.enqueue_bucket_delete_finalize(
+                    storage::BucketDeleteFinalizeRoot {
+                        bucket: trusted_bucket_name(TRACE_BUCKET),
+                        bucket_incarnation_generation: 1,
+                    },
+                );
             }
             SeedKeyAMetadata => self.seed_metadata_for(TraceKey::A)?,
             SeedKeyBMetadata => self.seed_metadata_for(TraceKey::B)?,
@@ -1597,8 +1603,8 @@ impl TwoKeyReclaimTraceHarness {
             WorkerBucketDeleteStep => {
                 let work = self.take_next_work()?;
                 match work {
-                    Some(ReclaimWorkItem::BucketDelete(bucket))
-                        if bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+                    Some(ReclaimWorkItem::BucketDelete(root))
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
                     Some(ReclaimWorkItem::ObjectPayload(_)) => {
                         return Err(TestCaseError::fail(
                             "expected bucket delete finalize work item, got object reclaim",
@@ -2021,11 +2027,11 @@ fn stale_bucket_delete_follow_on_does_not_skip_new_object_reclaim() {
         .unwrap();
 
     match harness.take_next_work().unwrap() {
-        Some(ReclaimWorkItem::BucketDelete(bucket))
-            if bucket == trusted_bucket_name(TRACE_BUCKET) => {}
-        Some(ReclaimWorkItem::BucketDelete(bucket)) => panic!(
-            "expected bucket-delete follow-on for the trace bucket, got bucket delete for {bucket}"
-        ),
+        Some(ReclaimWorkItem::BucketDelete(root))
+            if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+        Some(ReclaimWorkItem::BucketDelete(root)) => {
+            panic!("expected bucket-delete follow-on for the trace bucket, got {root:?}")
+        }
         Some(ReclaimWorkItem::BucketDeleteBegin(root)) => panic!(
             "expected bucket-delete follow-on for the trace bucket, got bucket delete begin for {}",
             root.bucket
@@ -2045,8 +2051,8 @@ fn stale_bucket_delete_follow_on_does_not_skip_new_object_reclaim() {
             if bucket == trusted_bucket_name(TRACE_BUCKET)
                 && key == trusted_object_key(TRACE_KEY)
                 && generation_id == trace_generation_id() => {}
-        Some(ReclaimWorkItem::BucketDelete(bucket)) => panic!(
-            "bucket-delete follow-on must leave queued object reclaim visible, got bucket delete for {bucket}"
+        Some(ReclaimWorkItem::BucketDelete(root)) => panic!(
+            "bucket-delete follow-on must leave queued object reclaim visible, got {root:?}"
         ),
         Some(ReclaimWorkItem::BucketDeleteBegin(root)) => panic!(
             "bucket-delete follow-on must leave queued object reclaim visible, got bucket delete begin for {}",
@@ -2098,8 +2104,8 @@ fn deleting_bucket_finalize_advances_from_old_generation_to_new_generation_root(
         Some(ReclaimWorkItem::ObjectPayload((_bucket, _key, generation_id))) => panic!(
             "expected stale old-generation object hint after inline bucket-delete finalization, got generation {generation_id:?}"
         ),
-        Some(ReclaimWorkItem::BucketDelete(bucket)) => panic!(
-            "expected stale object reclaim hint after inline bucket-delete finalization, got bucket delete for {bucket}"
+        Some(ReclaimWorkItem::BucketDelete(root)) => panic!(
+            "expected stale object reclaim hint after inline bucket-delete finalization, got {root:?}"
         ),
         Some(ReclaimWorkItem::BucketDeleteBegin(root)) => panic!(
             "expected stale object reclaim hint after inline bucket-delete finalization, got bucket delete begin for {}",

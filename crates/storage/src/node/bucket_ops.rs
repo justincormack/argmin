@@ -260,21 +260,25 @@ impl SharedStorageNode {
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
         let bucket_pg_id = self.pg_topology.bucket_pg_for(bucket);
-        {
+        let root = {
             let bucket_pg = self.get_pg(bucket_pg_id)?;
             let info = match PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket) {
                 Ok(info) => info,
                 Err(crate::error::MetadataError::BucketNotFound { .. }) => {
-                    self.finish_bucket_delete_finalize_work(bucket);
                     return Ok(BucketDeleteFinalizeOutcome::NotFound);
                 }
                 Err(other) => return Err(other.into()),
             };
+            let root = crate::BucketDeleteFinalizeRoot {
+                bucket: bucket.clone(),
+                bucket_incarnation_generation: info.bucket_incarnation_generation,
+            };
             if info.state != BucketState::Deleting {
-                self.finish_bucket_delete_finalize_work(bucket);
+                self.finish_bucket_delete_finalize_work(&root);
                 return Ok(BucketDeleteFinalizeOutcome::NotDeleting);
             }
-        }
+            root
+        };
 
         let mut found_visible_data = false;
         let mut found_reclaim_root = false;
@@ -328,13 +332,13 @@ impl SharedStorageNode {
 
         match self.delete_bucket_metadata(bucket) {
             Ok(()) => {
-                self.finish_bucket_delete_finalize_work(bucket);
+                self.finish_bucket_delete_finalize_work(&root);
                 Ok(BucketDeleteFinalizeOutcome::Finalized)
             }
             Err(crate::error::BucketWriteDrainError::Metadata(
                 crate::error::MetadataError::BucketNotFound { .. },
             )) => {
-                self.finish_bucket_delete_finalize_work(bucket);
+                self.finish_bucket_delete_finalize_work(&root);
                 Ok(BucketDeleteFinalizeOutcome::NotFound)
             }
             Err(other) => Err(other),

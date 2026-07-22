@@ -55,9 +55,10 @@ use crate::types::{
     ObjectReadSnapshotOutcome,
 };
 use crate::types::{
-    BucketInfo, BucketName, BucketSnapshot, BucketSnapshotRequest, BucketSubresourceKind, EcShape,
-    GenerationId, LoadedBucketSubresource, ObjectKey, ObjectReadAuthSubject,
-    ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ShardKey, StoredObject, WriteAck,
+    BucketDeleteFinalizeRoot, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotRequest,
+    BucketSubresourceKind, EcShape, GenerationId, LoadedBucketSubresource, ObjectKey,
+    ObjectReadAuthSubject, ObjectReadAuthSubjectIdentity, ObjectReadSnapshot, ShardKey,
+    StoredObject, WriteAck,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
@@ -555,7 +556,7 @@ struct ObjectPayloadLeaseState {
 pub enum ReclaimWorkItem {
     ObjectPayload(ReclaimRoot),
     BucketDeleteBegin(BucketDeleteBeginRoot),
-    BucketDelete(BucketName),
+    BucketDelete(BucketDeleteFinalizeRoot),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,13 +570,17 @@ pub(crate) enum ReclaimQueueInsert {
 pub enum BucketDeleteFinalizeOutcome {
     NotFound,
     NotDeleting,
+    StaleIncarnation,
     Pending,
     Finalized,
 }
 
 impl BucketDeleteFinalizeOutcome {
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::NotFound | Self::NotDeleting | Self::Finalized)
+        matches!(
+            self,
+            Self::NotFound | Self::NotDeleting | Self::StaleIncarnation | Self::Finalized
+        )
     }
 }
 
@@ -589,8 +594,8 @@ struct ReclaimQueueState {
     work_queue: VecDeque<ReclaimWorkItem>,
     queued_objects: HashSet<ReclaimRoot>,
     queued_bucket_delete_begins: HashSet<BucketDeleteBeginRoot>,
-    queued_bucket_deletes: HashSet<BucketName>,
-    outstanding_bucket_deletes: HashSet<BucketName>,
+    queued_bucket_deletes: HashSet<BucketDeleteFinalizeRoot>,
+    outstanding_bucket_deletes: HashSet<BucketDeleteFinalizeRoot>,
 }
 
 impl SharedStorageNode {
@@ -1793,15 +1798,14 @@ impl SharedStorageNode {
     }
 
     /// Queue a bucket for deferred final deletion once reclaim is drained.
-    pub fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) -> bool {
+    pub fn enqueue_bucket_delete_finalize(&self, root: BucketDeleteFinalizeRoot) -> bool {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let bucket = bucket.clone();
-        state.outstanding_bucket_deletes.insert(bucket.clone());
-        if state.queued_bucket_deletes.insert(bucket.clone()) {
+        state.outstanding_bucket_deletes.insert(root.clone());
+        if state.queued_bucket_deletes.insert(root.clone()) {
             state
                 .work_queue
-                .push_back(ReclaimWorkItem::BucketDelete(bucket));
+                .push_back(ReclaimWorkItem::BucketDelete(root));
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "enqueue");
             cv.notify_one();
             true
@@ -1828,22 +1832,26 @@ impl SharedStorageNode {
         }
     }
 
-    pub fn finish_bucket_delete_finalize_work(&self, bucket: &BucketName) {
+    pub fn finish_bucket_delete_finalize_work(&self, root: &BucketDeleteFinalizeRoot) {
         let mut state = self
             .reclaim_queue
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        state.queued_bucket_deletes.remove(bucket);
-        state
-            .queued_bucket_delete_begins
-            .retain(|root| root.bucket != *bucket);
+        state.queued_bucket_deletes.remove(root);
+        state.queued_bucket_delete_begins.retain(|begin| {
+            begin.bucket != root.bucket
+                || begin.bucket_incarnation_generation != root.bucket_incarnation_generation
+        });
         state.work_queue.retain(|work| match work {
-            ReclaimWorkItem::BucketDelete(queued_bucket) => queued_bucket != bucket,
-            ReclaimWorkItem::BucketDeleteBegin(root) => root.bucket != *bucket,
+            ReclaimWorkItem::BucketDelete(queued_root) => queued_root != root,
+            ReclaimWorkItem::BucketDeleteBegin(begin) => {
+                begin.bucket != root.bucket
+                    || begin.bucket_incarnation_generation != root.bucket_incarnation_generation
+            }
             ReclaimWorkItem::ObjectPayload(_) => true,
         });
-        if state.outstanding_bucket_deletes.remove(bucket) {
+        if state.outstanding_bucket_deletes.remove(root) {
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "finish");
         }
     }
@@ -1893,8 +1901,8 @@ impl SharedStorageNode {
                 state.queued_bucket_delete_begins.remove(root);
                 Self::emit_reclaim_queue_action(state, "bucket_delete_begin", "dequeue");
             }
-            ReclaimWorkItem::BucketDelete(bucket) => {
-                state.queued_bucket_deletes.remove(bucket);
+            ReclaimWorkItem::BucketDelete(root) => {
+                state.queued_bucket_deletes.remove(root);
                 Self::emit_reclaim_queue_action(state, "bucket_delete", "dequeue");
             }
         }
@@ -2866,8 +2874,12 @@ mod tests {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
         let bucket = bucket_name("bucket");
+        let root = BucketDeleteFinalizeRoot {
+            bucket: bucket.clone(),
+            bucket_incarnation_generation: 1,
+        };
 
-        assert!(node.enqueue_bucket_delete_finalize(&bucket));
+        assert!(node.enqueue_bucket_delete_finalize(root.clone()));
         {
             let state = node.reclaim_queue.0.lock().unwrap();
             assert_eq!(state.queued_bucket_deletes.len(), 1);
@@ -2876,7 +2888,7 @@ mod tests {
 
         assert_eq!(
             node.try_take_reclaim_work(),
-            Some(ReclaimWorkItem::BucketDelete(bucket.clone()))
+            Some(ReclaimWorkItem::BucketDelete(root.clone()))
         );
         {
             let state = node.reclaim_queue.0.lock().unwrap();
@@ -2884,7 +2896,7 @@ mod tests {
             assert_eq!(state.outstanding_bucket_deletes.len(), 1);
         }
 
-        node.finish_bucket_delete_finalize_work(&bucket);
+        node.finish_bucket_delete_finalize_work(&root);
         let state = node.reclaim_queue.0.lock().unwrap();
         assert!(state.queued_bucket_deletes.is_empty());
         assert!(state.outstanding_bucket_deletes.is_empty());
@@ -2906,18 +2918,26 @@ mod tests {
             bucket_execution_generation: 11,
             bucket_incarnation_generation: 21,
         };
+        let root = BucketDeleteFinalizeRoot {
+            bucket: bucket.clone(),
+            bucket_incarnation_generation: 20,
+        };
+        let other_root = BucketDeleteFinalizeRoot {
+            bucket: other_bucket.clone(),
+            bucket_incarnation_generation: 21,
+        };
 
-        assert!(node.enqueue_bucket_delete_finalize(&bucket));
+        assert!(node.enqueue_bucket_delete_finalize(root.clone()));
         assert_eq!(
             node.try_take_reclaim_work(),
-            Some(ReclaimWorkItem::BucketDelete(bucket.clone()))
+            Some(ReclaimWorkItem::BucketDelete(root.clone()))
         );
-        assert!(node.enqueue_bucket_delete_finalize(&bucket));
+        assert!(node.enqueue_bucket_delete_finalize(root.clone()));
         assert!(node.enqueue_bucket_delete_begin(stale_begin));
         assert!(node.enqueue_bucket_delete_begin(other_begin.clone()));
-        assert!(node.enqueue_bucket_delete_finalize(&other_bucket));
+        assert!(node.enqueue_bucket_delete_finalize(other_root.clone()));
 
-        node.finish_bucket_delete_finalize_work(&bucket);
+        node.finish_bucket_delete_finalize_work(&root);
 
         assert_eq!(
             node.try_take_reclaim_work(),
@@ -2925,9 +2945,47 @@ mod tests {
         );
         assert_eq!(
             node.try_take_reclaim_work(),
-            Some(ReclaimWorkItem::BucketDelete(other_bucket))
+            Some(ReclaimWorkItem::BucketDelete(other_root))
         );
         assert_eq!(node.try_take_reclaim_work(), None);
+    }
+
+    #[test]
+    fn old_bucket_delete_completion_does_not_clear_recreated_incarnation() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = bucket_name("bucket");
+        let old_root = BucketDeleteFinalizeRoot {
+            bucket: bucket.clone(),
+            bucket_incarnation_generation: 20,
+        };
+        let recreated_root = BucketDeleteFinalizeRoot {
+            bucket,
+            bucket_incarnation_generation: 21,
+        };
+
+        assert!(node.enqueue_bucket_delete_finalize(old_root.clone()));
+        assert_eq!(
+            node.try_take_reclaim_work(),
+            Some(ReclaimWorkItem::BucketDelete(old_root.clone()))
+        );
+        assert!(node.enqueue_bucket_delete_finalize(recreated_root.clone()));
+
+        node.finish_bucket_delete_finalize_work(&old_root);
+
+        assert_eq!(
+            node.try_take_reclaim_work(),
+            Some(ReclaimWorkItem::BucketDelete(recreated_root))
+        );
+        assert_eq!(
+            node.reclaim_queue
+                .0
+                .lock()
+                .unwrap()
+                .outstanding_bucket_deletes
+                .len(),
+            1
+        );
     }
 
     #[test]

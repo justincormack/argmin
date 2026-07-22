@@ -9178,7 +9178,12 @@ impl StorageCluster {
                 self.delete_abort_multipart_cleanup_best_effort(&abort.cleanup);
             }
             MetadataCommandPayload::DeleteObjectPayloadReclaim(delete) => {
-                self.enqueue_bucket_delete_finalize(&delete.bucket);
+                self.enqueue_bucket_delete_finalize(crate::BucketDeleteFinalizeRoot {
+                    bucket: delete.bucket.clone(),
+                    bucket_incarnation_generation: delete
+                        .reclaim_claim
+                        .bucket_incarnation_generation,
+                });
             }
             _ => {}
         }

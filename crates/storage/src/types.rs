@@ -2284,7 +2284,7 @@ pub struct BucketDeleteFinalizeClaimRecord {
 }
 
 /// Durable bucket delete finalization root.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BucketDeleteFinalizeRoot {
     pub bucket: BucketName,
     pub bucket_incarnation_generation: u64,

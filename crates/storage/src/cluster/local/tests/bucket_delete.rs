@@ -352,8 +352,8 @@ fn durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen() {
     );
     assert!(matches!(
         reopened_cluster.try_take_reclaim_work(),
-        Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
-            if queued_bucket == bucket
+        Some(crate::ReclaimWorkItem::BucketDelete(queued_root))
+            if queued_root.bucket == bucket
     ));
     assert_eq!(
         reopened_cluster
@@ -399,8 +399,8 @@ fn durable_bucket_finalize_scan_skips_excluded_bucket() {
     assert_eq!(scan.queued, 1);
     assert!(matches!(
         cluster.try_take_reclaim_work(),
-        Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
-            if queued_bucket == bucket
+        Some(crate::ReclaimWorkItem::BucketDelete(queued_root))
+            if queued_root.bucket == bucket
     ));
 }
 
@@ -472,8 +472,8 @@ fn durable_bucket_finalize_scan_prioritizes_expired_claimed_bucket() {
     );
     assert!(matches!(
         cluster.try_take_reclaim_work(),
-        Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
-            if queued_bucket == bucket_b
+        Some(crate::ReclaimWorkItem::BucketDelete(queued_root))
+            if queued_root.bucket == bucket_b
     ));
     assert_eq!(
         crate::clock::with_time_override(21, || { cluster.try_finalize_bucket_delete(&bucket_b) })
@@ -483,8 +483,8 @@ fn durable_bucket_finalize_scan_prioritizes_expired_claimed_bucket() {
     );
     assert!(matches!(
         cluster.try_take_reclaim_work(),
-        Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
-            if queued_bucket == bucket_a
+        Some(crate::ReclaimWorkItem::BucketDelete(queued_root))
+            if queued_root.bucket == bucket_a
     ));
     assert_eq!(
         crate::clock::with_time_override(22, || { cluster.try_finalize_bucket_delete(&bucket_a) })
@@ -534,8 +534,8 @@ fn durable_bucket_finalize_scan_continues_after_unavailable_pg() {
     );
     assert!(matches!(
         cluster.try_take_reclaim_work(),
-        Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
-            if queued_bucket == bucket
+        Some(crate::ReclaimWorkItem::BucketDelete(queued_root))
+            if queued_root.bucket == bucket
     ));
 }
 
@@ -677,6 +677,21 @@ fn stale_bucket_finalize_claim_for_deleted_generation_does_not_block_recreated_b
     assert!(
         recreated.bucket_incarnation_generation > old_deleting.bucket_incarnation_generation,
         "recreated bucket must have a distinct incarnation"
+    );
+    let stale_root = crate::BucketDeleteFinalizeRoot {
+        bucket: bucket.clone(),
+        bucket_incarnation_generation: old_deleting.bucket_incarnation_generation,
+    };
+    assert_eq!(
+        cluster
+            .try_finalize_bucket_delete_root(&stale_root)
+            .unwrap(),
+        crate::BucketDeleteFinalizeOutcome::StaleIncarnation,
+        "old finalizer work must not target the recreated bucket"
+    );
+    assert_eq!(
+        cluster.test_head_bucket_raw(&bucket).unwrap().state,
+        crate::BucketState::Active
     );
 
     cluster
