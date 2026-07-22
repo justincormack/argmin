@@ -1,0 +1,248 @@
+Unauthenticated TCP control-plane runtime map reads
+Link: https://chatgpt.com/codex/cloud/security/findings/94fa9f4e1b788191a95d395963c0f7e6?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 86a7a26
+Author: justin@specialbusservice.com
+Created: 21/07/2026, 22:39:26
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the commit makes previously local Unix-socket control-plane RPCs reachable over TCP while not enforcing a mandatory authentication layer for all TCP RPCs. Existing optional auth semantics for runtime-map reads become a network information disclosure because the new TLS listener uses no client auth and accepts requests before application auth rejects only credential-required operation classes.
+The commit adds TLS/TCP control-plane listeners, but the TLS server is configured with no client certificate authentication and relies on the existing application-level control-plane auth verifier. That verifier only requires runtime-map/read-only RPC authentication when frontend credentials are configured. In supported replicated static configurations that have control-plane/admin and storage-node credentials but no frontend credentials, unauthenticated network clients can complete TLS with the required ALPN and send unsigned read-only control-plane frames. Those requests are accepted with response_auth = None and can return RuntimeMapSnapshot, RuntimeMapStatus/Diagnostics, PgRuntimeMapSnapshot, and PendingMetadataCommandRecoveries. This exposes internal cluster topology and recovery metadata over the newly network-reachable TCP endpoint. Mutating admin operations and storage heartbeats still require their configured credentials, so the impact is primarily confidentiality of control-plane metadata rather than object data or integrity.
+
+# Resolution
+Fixed in commit [`ffa06960`](https://github.com/justincormack/argmin/commit/ffa06960) (`Require application auth on control-plane TCP`).
+
+TCP control-plane listeners now derive mandatory application authentication from the bound transport in `BoundControlPlaneRpcListener::apply_limits()`. This requirement is independent of which credential roles happen to be configured, so an unsigned TCP request is rejected before Raft admission or authority dispatch and no response is published. Unix listeners retain the existing local compatibility behavior instead of inheriting the network-listener requirement.
+
+The verifier also accepts an admin-scoped credential for read-only runtime-map operations when mandatory TCP authentication is active. This keeps admin-only control-plane deployments operable without weakening role authorization: the authenticated principal must still be authorized for the concrete operation, and response signing uses the verified request context. Static manifest validation rejects ordinary TCP control-plane listeners with neither a frontend nor admin credential and rejects TCP clock-recovery listeners without an admin credential.
+
+The regression `tcp_control_plane_listener_requires_auth_when_role_is_unconfigured` exercises a real bound TLS/TCP listener with the production ALPN and an admin-only verifier. It sends an unsigned runtime-map request and proves that the request receives no response and reaches neither Raft admission nor authority dispatch. Focused verifier coverage proves that mandatory authentication rejects an unsigned read and accepts an admin-signed read. Static configuration regressions cover both ordinary and recovery listener credential requirements. Workspace formatting, strict clippy, the storage-cluster boundary check, and the full 7,488-test nextest suite passed for the fixing commit.
+
+# Validation
+## Rubric
+- [x] Confirm the new TCP control-plane transport permits TLS handshakes without client certificates and relies only on ALPN before reading RPC frames.
+- [x] Confirm a supported auth verifier with storage-node and admin credentials but no frontend credentials reports `requires_frontend_runtime_map_auth() == false` while other credential classes are configured.
+- [x] Confirm unsigned read-only runtime-map RPCs are accepted with `response_auth = None` in that configuration.
+- [x] Confirm an unauthenticated TLS/TCP client can retrieve a `RuntimeMapSnapshot` containing internal node endpoint metadata.
+- [x] Confirm the opposite case still rejects unsigned runtime-map reads when frontend credentials are configured, limiting the bug to the no-frontend-credential configuration.
+## Report
+Validated the finding. I added targeted temporary PoC tests and built with debug symbols. The strongest reproduction is a TLS/TCP PoC in `crates/argmin-s3/src/static_cluster_config.rs:7345`: it configures the server with `.with_no_client_auth()`, an ALPN-capable client with no client certificate, an auth verifier containing storage-node and admin credentials but no frontend credentials, then performs an unsigned `RuntimeMapSnapshot` over the TCP frame transport. Command output: `POC unsigned TLS/TCP RuntimeMapSnapshot leaked 10.0.0.8:19001/tcp-control; frontend_auth_required=false` and the test passed. A storage-layer PoC in `crates/storage/src/control_plane.rs:25512` independently shows the same verifier accepts an unsigned `RuntimeMapSnapshot` and returns a plain decodable response containing `10.0.0.7:19001/internal-control`. The original code supports the causal chain: TCP server config disables TLS client auth at `crates/argmin-s3/src/static_cluster_config.rs:1847-1856`; the TCP worker only completes TLS and checks ALPN before reading control-plane frames at `crates/argmin-s3/src/main.rs:5817-5839`; runtime-map auth is required only when frontend credentials exist at `crates/storage/src/control_plane.rs:13105-13116`; read-only RPCs fall through to `(payload, None)` when frontend auth is not required at `crates/storage/src/control_plane.rs:14218-14235`; and `RuntimeMapSnapshot` builds a response using that `response_auth`, which is unsigned when `None`, at `crates/storage/src/control_plane.rs:14319-14336` and `14571-14588`. I also ran the existing contrast test `authenticated_control_plane_rejects_missing_frontend_runtime_map_auth`, which passed, confirming unsigned reads are rejected when frontend credentials are configured. Valgrind and gdb were unavailable (`command not found`). I used lldb non-interactively; the captured backtrace stops in `verify_control_plane_unix_request` with `kind = RuntimeMapSnapshot`, called from `build_control_plane_unix_response_with_auth`, then the PoC completes successfully.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L5817 to 5839)
+  Note: The TCP worker only performs the TLS handshake and checks ALPN before accepting a framed control-plane request, so authentication is entirely delegated to the application verifier.
+```
+        move |stream, deadline| {
+            let mut stream = ExperimentalRaftPeerDeadlineStream::new(stream, deadline);
+            let mut connection =
+                rustls::ServerConnection::new(tls_server_config).map_err(|source| {
+                    ControlPlaneError::RpcProtocol {
+                        message: format!("create control-plane TLS server connection: {source}"),
+                    }
+                })?;
+            while connection.is_handshaking() {
+                connection
+                    .complete_io(&mut stream)
+                    .map_err(|source| ControlPlaneError::Io {
+                        context: "complete control-plane TLS server handshake",
+                        source,
+                    })?;
+            }
+            if connection.alpn_protocol() != Some(CONTROL_PLANE_RPC_TLS_ALPN) {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message:
+                        "control-plane TLS peer did not negotiate required argmin-control-plane/1 ALPN"
+                            .to_string(),
+                });
+            }
+```
+
+crates/argmin-s3/src/static_cluster_config.rs (L1847 to 1856)
+  Note: The new control-plane TCP listener's rustls server config explicitly disables TLS client authentication; ALPN/TLS alone does not authenticate the caller.
+```
+                        let mut server_config = rustls::ServerConfig::builder_with_provider(
+                            Arc::new(provider.clone()),
+                        )
+                        .with_protocol_versions(&[&rustls::version::TLS13])
+                        .map_err(|_| {
+                            "failed to select the static control-plane TLS protocol".to_string()
+                        })?
+                        .with_no_client_auth()
+                        .with_cert_resolver(Arc::new(resolver));
+                        server_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
+```
+
+crates/storage/src/control_plane.rs (L13105 to 13116)
+  Note: Runtime-map authentication is considered required only when frontend credentials exist; admin or storage credentials alone do not make read-only runtime-map RPCs require authentication.
+```
+    pub fn requires_frontend_runtime_map_auth(&self) -> bool {
+        !self.frontend_credentials.is_empty()
+    }
+
+    #[must_use]
+    pub fn requires_storage_node_heartbeat_auth(&self) -> bool {
+        !self.storage_node_credentials.is_empty()
+    }
+
+    #[must_use]
+    pub fn requires_admin_control_plane_auth(&self) -> bool {
+        !self.admin_credentials.is_empty()
+```
+
+crates/storage/src/control_plane.rs (L14145 to 14178)
+  Note: PgRuntimeMapSnapshot falls through to accepting the payload without authentication when no frontend auth is required and no admin-auth envelope is supplied.
+```
+                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
+                    let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    (
+                        verified.payload,
+                        Some(ControlPlaneUnixResponseAuth {
+                            credential: verified.response_credential,
+                            target: verified.response_target,
+                            operation: ControlPlaneAuthOperation::RuntimeMapResponse,
+                        }),
+                    )
+                }
+                Some(auth_verifier)
+                    if auth_verifier.requires_admin_control_plane_auth()
+                        && control_plane_auth_payload_has_magic(&payload) =>
+                {
+                    let verified = auth_verifier.verify_admin_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    (
+                        verified.payload,
+                        Some(ControlPlaneUnixResponseAuth {
+                            credential: verified.response_credential,
+                            target: verified.response_target,
+                            operation: ControlPlaneAuthOperation::AdminControlPlaneResponse,
+                        }),
+                    )
+                }
+                _ => (payload, None),
+```
+
+crates/storage/src/control_plane.rs (L14218 to 14235)
+  Note: Other read-only runtime-map RPCs are accepted unauthenticated when requires_frontend_runtime_map_auth() is false.
+```
+        _ => match auth_verifier.filter(|verifier| verifier.requires_frontend_runtime_map_auth()) {
+            Some(auth_verifier) => {
+                let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
+                    kind,
+                    &payload,
+                    authority_now_ms,
+                )?;
+                (
+                    verified.payload,
+                    Some(ControlPlaneUnixResponseAuth {
+                        credential: verified.response_credential,
+                        target: verified.response_target,
+                        operation: ControlPlaneAuthOperation::RuntimeMapResponse,
+                    }),
+                )
+            }
+            None => (payload, None),
+        },
+```
+
+crates/storage/src/control_plane.rs (L14319 to 14336)
+  Note: An accepted unsigned RuntimeMapSnapshot request returns the cluster runtime map with no response authentication when response_auth is None.
+```
+        ControlPlaneRpcKind::RuntimeMapSnapshot => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            let response = match control_plane.runtime_map_snapshot(authority_now_ms) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            };
+            let response_authority_now_ms = response_authority_now_ms()?;
+            return build_control_plane_verified_response(
+                kind,
+                response,
+                response_auth,
+                response_authority_now_ms,
+            );
+```
+
+crates/storage/src/control_plane.rs (L14376 to 14392)
+  Note: PendingMetadataCommandRecoveries is another read-only control-plane response reachable through the same unauthenticated path.
+```
+        ControlPlaneRpcKind::PendingMetadataCommandRecoveries => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            let response = control_plane
+                .pending_metadata_command_recoveries(authority_now_ms)
+                .and_then(|listing| {
+                    let mut response = Vec::new();
+                    write_pending_metadata_command_recovery_listing(&mut response, &listing)?;
+                    Ok(response)
+                });
+            let response_authority_now_ms = response_authority_now_ms()?;
+            return build_control_plane_verified_response(
+                kind,
+                response,
+                response_auth,
+                response_authority_now_ms,
+            );
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: low | Policy adjusted: low
+## Rationale
+Kept at medium. Evidence supports a real unauthenticated network information disclosure: the TCP listener is part of the main product, rustls is configured with no client auth, ALPN is the only transport gate, and runtime-map reads are accepted unsigned when frontend credentials are absent. Reachability is plausible in static replicated deployments with TCP control-plane endpoints, including endpoints bound to 0.0.0.0 in repository tests. The impact does not justify high or critical because the verified leak is control-plane topology/status/diagnostic/recovery metadata only; mutating admin operations and storage heartbeats still require configured credentials, and there is no demonstrated object-data, credential, integrity, or code-execution compromise. Likelihood is also moderated by deployment prerequisites and lack of repo evidence for public internet exposure.
+## Likelihood
+medium - The code path is direct and an executable PoC was reported to work over the normal TLS/TCP frame transport. However, exploitation depends on optional static replicated TCP control-plane deployment, no frontend runtime-map credentials, and network reachability to a likely internal control-plane port.
+## Impact
+medium - The attacker can disclose internal cluster topology/runtime-map data and pending recovery metadata. This is meaningful operational metadata leakage over an unauthenticated control-plane surface, but the evidenced operations are read-only and do not expose object contents, signing secrets, or control-plane mutation capability.
+## Assumptions
+- A static replicated Argmin deployment enables a TCP control-plane endpoint in the cluster manifest.
+- The control-plane TCP listener is reachable from an attacker-controlled network location, at least on an internal/cluster network.
+- The deployment has control-plane/admin and/or storage-node credentials configured, but no frontend runtime-map credentials, which the code permits when there is no frontend principal requiring them.
+- The attacker can negotiate TLS 1.3 with the required argmin-control-plane/1 ALPN but does not possess any Argmin control-plane credential or client certificate.
+- static replicated control-plane configuration
+- TCP control-plane endpoint configured and routable
+- no frontend runtime-map auth credentials configured
+- attacker can send a framed RuntimeMapSnapshot/Status/Diagnostics/PgRuntimeMapSnapshot/PendingMetadataCommandRecoveries request with the required ALPN
+## Path
+attacker -> TCP control-plane listener -> TLS(no client auth)+ALPN -> unsigned RuntimeMapSnapshot -> verifier sees no frontend creds -> runtime-map metadata response
+## Path evidence
+- `crates/argmin-s3/src/static_cluster_config.rs:1791-1860` - Static control-plane endpoint configuration maps manifest TCP endpoints into ConfiguredControlPlaneRpcListener::Tcp, binds the manifest host/port, and builds the rustls ServerConfig with with_no_client_auth().
+- `crates/argmin-s3/src/main.rs:5517-5570` - The bound TCP control-plane listener accepts network connections and spawns a TCP RPC worker for each accepted stream.
+- `crates/argmin-s3/src/main.rs:5795-5839` - The TCP worker performs TLS handshake and ALPN validation only; no client certificate or credential is checked at the transport layer.
+- `crates/argmin-s3/src/main.rs:5693-5725` - After reading the framed request, authentication is delegated to verify_control_plane_unix_request and endpoint admission only distinguishes ordinary versus clock-recovery RPCs.
+- `crates/storage/src/control_plane.rs:13105-13116` - The verifier treats frontend runtime-map authentication as required only when frontend_credentials is non-empty; admin or storage credentials do not trigger runtime-map read authentication.
+- `crates/storage/src/control_plane.rs:14145-14235` - Read-only runtime-map requests, including PgRuntimeMapSnapshot and the default runtime-map read path, can fall through to accepting the payload with response_auth=None when frontend auth is not required.
+- `crates/storage/src/control_plane.rs:14319-14392` - RuntimeMapSnapshot, RuntimeMapStatus, RuntimeMapDiagnostics, and PendingMetadataCommandRecoveries build responses using the response_auth value inherited from verification.
+- `crates/storage/src/control_plane.rs:14571-14588` - Response signing is conditional; when response_auth is None, the response payload is returned without authentication.
+- `crates/argmin-s3/src/config.rs:993-1050` - Configuration validation requires admin credentials when any control-plane auth is configured for a control-plane role, but frontend credentials are optional unless frontend credentials themselves are supplied.
+- `crates/argmin-s3/src/static_cluster_config.rs:6868-6935` - Repository tests demonstrate the static cluster mapper accepts TCP control-plane endpoints such as listen="tcp://0.0.0.0:8501" and activates them as TCP listeners.
+## Narrative
+The finding is valid. Static cluster mapping creates TCP control-plane listeners from manifest endpoints and configures rustls with with_no_client_auth(). The TCP worker only completes TLS and checks the required ALPN before passing attacker-controlled framed requests to the application verifier. In storage control-plane verification, read-only runtime-map RPCs are classified as FrontendRuntimeMapRead, but authentication is required only when frontend credentials exist. If a supported deployment has admin/storage credentials but no frontend credentials, the verifier falls through to (payload, None), and response construction returns unsigned RuntimeMapSnapshot/Status/Diagnostics/PgRuntimeMapSnapshot/PendingMetadataCommandRecoveries data. The validated PoC described by the earlier stage exercised this over the normal TLS/TCP frame transport and leaked an internal endpoint string. Severity remains medium: exploitation is unauthenticated and low complexity once the control-plane TCP port is reachable, but impact is limited to internal control-plane metadata disclosure, not object data, credentials, code execution, or mutating admin/storage operations.
+## Controls
+- TLS 1.3 server certificate is used for the TCP control-plane listener, but client authentication is explicitly disabled.
+- Required ALPN value argmin-control-plane/1 is checked before accepting control-plane frames.
+- Application-layer admin commands and storage heartbeats are credential-gated when corresponding credentials exist.
+- Runtime-map read authentication is gated only by presence of frontend credentials.
+- Listener max_connections, max_frame_bytes, I/O timeout, and pre-auth byte budget limit resource usage but do not authenticate callers.
+- No repository IaC or network policy was found that proves the control-plane TCP port is private-only.
+## Blindspots
+- No Kubernetes, Terraform, Docker Compose, or load-balancer manifests were present to confirm whether real deployments expose the control-plane TCP listener publicly or only on private networks.
+- Static analysis cannot determine how often operators configure replicated TCP control-plane endpoints without frontend credentials.
+- The repository evidence does not enumerate all possible metadata fields in runtime-map diagnostics, so sensitivity assessment is based on the demonstrated topology/recovery metadata class.
+- The prior PoC was provided by validation evidence; this attack-path review used repository source for static corroboration and did not modify or rerun the checkout.
