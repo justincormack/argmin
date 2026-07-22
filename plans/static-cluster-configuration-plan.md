@@ -1084,6 +1084,15 @@ Progress as of 2026-07-21:
   coverage includes source-specific all-Unix/all-TCP endpoint resolution,
   listener activation, safe pre-request failover, no automatic failover after
   a request may have been sent, and a composed authenticated TLS recovery RPC.
+  TCP control-plane listeners now carry an explicit mandatory-application-auth
+  policy into the shared pre-admission verifier, independent of whether a
+  particular credential class is populated. Unsigned requests therefore fail
+  before Raft admission or dispatch even in backend-only clusters. Admin
+  credentials are explicitly authorized for read-only runtime-map RPCs as well
+  as the existing PG confirmation read, and static TCP authority mapping
+  rejects resolved material with neither an active frontend nor admin
+  runtime-map credential. Unix listeners retain their documented
+  compatibility policy.
   Operational admin command builders now load static configuration and use its
   routed frame transport and scoped credential, matching the already
   static-aware clock-recovery commands. Frontend-read command mapping remains

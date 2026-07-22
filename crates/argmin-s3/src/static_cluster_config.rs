@@ -2384,6 +2384,27 @@ impl ValidatedStaticClusterManifest {
                 }
             }
         }
+        let has_tcp_control_plane_listener = control_plane_rpc_listeners
+            .iter()
+            .any(|listener| matches!(listener, ConfiguredControlPlaneRpcListener::Tcp { .. }));
+        if has_tcp_control_plane_listener
+            && frontend_auth_credentials.is_empty()
+            && admin_auth_credentials.is_empty()
+        {
+            return Err(
+                "TCP control-plane listeners require an active frontend or admin runtime-map credential"
+                    .to_string(),
+            );
+        }
+        let has_tcp_recovery_listener = control_plane_clock_recovery_rpc_listeners
+            .iter()
+            .any(|listener| matches!(listener, ConfiguredControlPlaneRpcListener::Tcp { .. }));
+        if has_tcp_recovery_listener && admin_auth_credentials.is_empty() {
+            return Err(
+                "TCP authority-clock recovery listeners require an active admin credential"
+                    .to_string(),
+            );
+        }
         let raft_signer = raft_signer.ok_or_else(|| {
             "selected replicated authority has no active Raft signing credential".to_string()
         })?;
@@ -7660,6 +7681,47 @@ tls_server_name = "localhost""#,
     }
 
     #[test]
+    fn static_tcp_control_plane_requires_active_runtime_map_auth_credential() {
+        let (_dir, manifest) = materialized_replicated_manifest("control-1");
+        let mut material = manifest.resolve_selected_process_material_at(1).unwrap();
+        material.auth_credentials.retain(|credential| {
+            credential.principal.principal != AuthPrincipal::Admin
+                && credential.principal.principal != AuthPrincipal::Frontend
+        });
+
+        let error = manifest
+            .replicated_unix_control_plane_server_config(&material, |_| None)
+            .unwrap_err();
+
+        assert!(
+            error.contains("TCP control-plane listeners require an active frontend or admin"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn static_tcp_clock_recovery_requires_active_admin_credential() {
+        let (_dir, manifest) =
+            materialized_replicated_manifest_from("control-1", replicated_unix_data_manifest());
+        let mut material = manifest.resolve_selected_process_material_at(1).unwrap();
+        material.auth_credentials.retain(|credential| {
+            !matches!(
+                credential.principal.principal,
+                AuthPrincipal::Admin | AuthPrincipal::Maintenance
+            )
+        });
+
+        let error = manifest
+            .replicated_unix_control_plane_server_config(&material, |_| None)
+            .unwrap_err();
+
+        assert!(
+            error.contains("TCP authority-clock recovery listeners require an active admin"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn static_cluster_control_plane_clients_retain_prioritized_fallback_endpoints() {
         let mut manifest = replicated_manifest();
         for host_number in 1..=3 {
@@ -8040,6 +8102,7 @@ tls_server_name = "control-1-alt.internal"
                 None,
                 crate::ControlPlaneRpcWorkerPolicy {
                     gate_request_time_with_authority_clock: false,
+                    require_authentication: true,
                     active_rpc_workers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     worker_limit: 1,
                     max_frame_bytes: CONTROL_PLANE_RPC_MAX_FRAME_BYTES,

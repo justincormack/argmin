@@ -14112,9 +14112,63 @@ pub fn verify_control_plane_unix_request(
     auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
     authority_now_ms: u64,
 ) -> Result<VerifiedControlPlaneRpcRequest, ControlPlaneError> {
+    verify_control_plane_request(request, auth_verifier, authority_now_ms, false)
+}
+
+pub fn verify_control_plane_authenticated_request(
+    request: ControlPlaneRpcRequest,
+    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
+    authority_now_ms: u64,
+) -> Result<VerifiedControlPlaneRpcRequest, ControlPlaneError> {
+    verify_control_plane_request(request, auth_verifier, authority_now_ms, true)
+}
+
+fn verify_control_plane_request(
+    request: ControlPlaneRpcRequest,
+    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
+    authority_now_ms: u64,
+    require_authentication: bool,
+) -> Result<VerifiedControlPlaneRpcRequest, ControlPlaneError> {
     let ControlPlaneRpcRequest { kind, payload } = request;
     let (payload, response_auth) = match kind {
-        ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
+        _ if kind.auth_operation() == ControlPlaneAuthOperation::AdminControlPlaneCommand => {
+            match auth_verifier.filter(|verifier| verifier.requires_admin_control_plane_auth()) {
+                Some(auth_verifier) => {
+                    let verified = auth_verifier.verify_admin_control_plane_command_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    (
+                        verified.payload,
+                        Some(ControlPlaneUnixResponseAuth {
+                            credential: verified.response_credential,
+                            target: verified.response_target,
+                            operation: ControlPlaneAuthOperation::AdminControlPlaneResponse,
+                        }),
+                    )
+                }
+                None => (payload, None),
+            }
+        }
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            match auth_verifier.filter(|verifier| verifier.requires_storage_node_heartbeat_auth()) {
+                Some(auth_verifier) => {
+                    let verified = auth_verifier
+                        .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?;
+                    (
+                        verified.payload,
+                        Some(ControlPlaneUnixResponseAuth {
+                            credential: verified.response_credential,
+                            target: verified.response_target,
+                            operation: ControlPlaneAuthOperation::RuntimeMapResponse,
+                        }),
+                    )
+                }
+                None => (payload, None),
+            }
+        }
+        _ => {
             let auth_payload_operation = if control_plane_auth_payload_has_magic(&payload) {
                 ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
                     .ok()
@@ -14178,62 +14232,18 @@ pub fn verify_control_plane_unix_request(
                 _ => (payload, None),
             }
         }
-        _ if kind.auth_operation() == ControlPlaneAuthOperation::AdminControlPlaneCommand => {
-            match auth_verifier.filter(|verifier| verifier.requires_admin_control_plane_auth()) {
-                Some(auth_verifier) => {
-                    let verified = auth_verifier.verify_admin_control_plane_command_payload(
-                        kind,
-                        &payload,
-                        authority_now_ms,
-                    )?;
-                    (
-                        verified.payload,
-                        Some(ControlPlaneUnixResponseAuth {
-                            credential: verified.response_credential,
-                            target: verified.response_target,
-                            operation: ControlPlaneAuthOperation::AdminControlPlaneResponse,
-                        }),
-                    )
-                }
-                None => (payload, None),
-            }
-        }
-        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
-            match auth_verifier.filter(|verifier| verifier.requires_storage_node_heartbeat_auth()) {
-                Some(auth_verifier) => {
-                    let verified = auth_verifier
-                        .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?;
-                    (
-                        verified.payload,
-                        Some(ControlPlaneUnixResponseAuth {
-                            credential: verified.response_credential,
-                            target: verified.response_target,
-                            operation: ControlPlaneAuthOperation::RuntimeMapResponse,
-                        }),
-                    )
-                }
-                None => (payload, None),
-            }
-        }
-        _ => match auth_verifier.filter(|verifier| verifier.requires_frontend_runtime_map_auth()) {
-            Some(auth_verifier) => {
-                let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
-                    kind,
-                    &payload,
-                    authority_now_ms,
-                )?;
-                (
-                    verified.payload,
-                    Some(ControlPlaneUnixResponseAuth {
-                        credential: verified.response_credential,
-                        target: verified.response_target,
-                        operation: ControlPlaneAuthOperation::RuntimeMapResponse,
-                    }),
-                )
-            }
-            None => (payload, None),
-        },
     };
+    if require_authentication && response_auth.is_none() {
+        if let Some(auth_verifier) = auth_verifier {
+            auth_verifier.metrics.record_rejected(
+                kind.auth_operation(),
+                ControlPlaneAuthRejectionReason::Missing,
+            );
+        }
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "control-plane RPC endpoint requires authenticated requests".to_owned(),
+        });
+    }
     if matches!(
         kind,
         ControlPlaneRpcKind::AuthorityClockStatus | ControlPlaneRpcKind::ReestablishAuthorityClock
@@ -25506,6 +25516,60 @@ mod tests {
             metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Missing),
             1
         );
+    }
+
+    #[test]
+    fn mandatory_control_plane_auth_rejects_unsigned_read_with_admin_only_verifier() {
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let request = || ControlPlaneRpcRequest {
+            kind: ControlPlaneRpcKind::RuntimeMapStatus,
+            payload: Vec::new(),
+        };
+
+        let compatible = verify_control_plane_unix_request(request(), Some(&verifier), 2_000)
+            .expect("Unix compatibility mode should retain configured-role auth policy");
+        assert!(compatible.response_auth.is_none());
+
+        let error = verify_control_plane_authenticated_request(request(), Some(&verifier), 2_000)
+            .err()
+            .expect("mandatory-auth endpoints must reject unsigned runtime-map reads");
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+                if message.contains("requires authenticated requests")),
+            "unexpected error: {error}"
+        );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Missing),
+            1
+        );
+    }
+
+    #[test]
+    fn mandatory_control_plane_auth_accepts_admin_signed_runtime_map_read() {
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let signer = admin_auth_credential("auth-cluster", "admin-1");
+        let request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::RuntimeMapStatus,
+            &signer,
+            Vec::new(),
+            Some(1_999),
+            Some(2_999),
+        );
+
+        let verified = verify_control_plane_authenticated_request(request, Some(&verifier), 2_000)
+            .expect("admin-signed runtime-map read should authenticate");
+
+        assert!(verified.response_auth.is_some());
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
     }
 
     #[test]
