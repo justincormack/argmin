@@ -3641,6 +3641,27 @@ impl StorageNodeActiveObjectRoute<'_> {
 }
 
 impl StorageNodeActivePrimaryObjectRoute<'_> {
+    fn require_authorized_multipart_upload_subject(
+        &self,
+        authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        if authorized_upload.bucket != *self.route.bucket
+            || authorized_upload.key != *self.route.key
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} authorized multipart upload subject does not match active object route"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
     fn load_multipart_upload(
         &self,
         upload_id: &UploadId,
@@ -3691,6 +3712,127 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             Arc::clone(&self.route.handler.node),
         );
         ObjectMutationMetadataNodeClient::load_in_progress_multipart_upload_for_listing(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            upload_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_multipart_completion_snapshot(
+        &self,
+        authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
+        requested_part_numbers: &[u32],
+    ) -> Result<crate::MultipartCompletionSnapshot, StorageNodeObjectRouteError> {
+        self.require_authorized_multipart_upload_subject(
+            authorized_upload,
+            "multipart completion snapshot load",
+        )?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_multipart_completion_snapshot(
+            &local_client,
+            self.route.pg_id,
+            authorized_upload,
+            requested_part_numbers,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_multipart_completion_preflight(
+        &self,
+        authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
+    ) -> Result<crate::MultipartCompletionPreflight, StorageNodeObjectRouteError> {
+        self.require_authorized_multipart_upload_subject(
+            authorized_upload,
+            "multipart completion preflight load",
+        )?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_multipart_completion_preflight(
+            &local_client,
+            self.route.pg_id,
+            authorized_upload,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn list_multipart_parts_for_authorized_upload(
+        &self,
+        authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<crate::ListedMultipartParts, StorageNodeObjectRouteError> {
+        self.require_authorized_multipart_upload_subject(
+            authorized_upload,
+            "multipart parts list",
+        )?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::list_multipart_parts_for_authorized_upload(
+            &local_client,
+            self.route.pg_id,
+            authorized_upload,
+            part_number_marker,
+            max_parts,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn lookup_multipart_upload_management(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<crate::MultipartUploadManagementLookup, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::lookup_multipart_upload_management(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            upload_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_multipart_completion_stale_payload_source(
+        &self,
+    ) -> Result<Option<crate::StoredObject>, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_multipart_completion_stale_payload_source(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_abort_multipart_upload_cleanup(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<Option<crate::AbortMultipartUploadCleanup>, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_abort_multipart_upload_cleanup(
             &local_client,
             self.route.pg_id,
             self.route.bucket,
@@ -5169,7 +5311,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartCompletionSnapshotLoad => {
                 match decode_multipart_completion_snapshot_request(&frame.payload) {
-                    Ok(request) => self.multipart_completion_snapshot_response(request),
+                    Ok(request) => {
+                        self.multipart_completion_snapshot_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5178,7 +5322,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartCompletionPreflightLoad => {
                 match decode_multipart_completion_preflight_request(&frame.payload) {
-                    Ok(request) => self.multipart_completion_preflight_response(request),
+                    Ok(request) => {
+                        self.multipart_completion_preflight_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5187,7 +5333,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartPartsList => {
                 match decode_multipart_parts_list_request(&frame.payload) {
-                    Ok(request) => self.multipart_parts_list_response(request),
+                    Ok(request) => self.multipart_parts_list_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5196,7 +5342,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartManagementLookup => {
                 match decode_multipart_upload_load_request(&frame.payload) {
-                    Ok(request) => self.multipart_management_lookup_response(request),
+                    Ok(request) => self.multipart_management_lookup_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5277,7 +5423,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartAbortCleanupLoad => {
                 match decode_abort_multipart_cleanup_request(&frame.payload) {
-                    Ok(request) => self.abort_multipart_cleanup_response(request),
+                    Ok(request) => self.abort_multipart_cleanup_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5295,7 +5441,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartCompletionStaleSourceLoad => {
                 match decode_object_request(&frame.payload) {
-                    Ok(request) => self.multipart_completion_stale_source_response(request),
+                    Ok(request) => {
+                        self.multipart_completion_stale_source_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8310,48 +8458,41 @@ impl StorageNodeConnectionHandler {
 
     fn multipart_completion_snapshot_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcMultipartCompletionSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "multipart completion snapshot load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
             request.authorized_upload,
         );
-        let outcome = match ObjectMutationMetadataNodeClient::load_multipart_completion_snapshot(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &authorized_upload,
-            &request.requested_part_numbers,
-        ) {
+        let outcome = match route
+            .load_multipart_completion_snapshot(&authorized_upload, &request.requested_part_numbers)
+        {
             Ok(snapshot) => {
                 StorageRpcMultipartCompletionSnapshotOutcome::Loaded(Box::new(snapshot))
             }
-            Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
-                StorageRpcMultipartCompletionSnapshotOutcome::NoSuchUpload {
-                    upload_id: authorized_upload.upload_id.clone(),
-                }
-            }
-            Err(ObjectPgActionError::Metadata(MetadataError::PartNotFound {
-                part_number, ..
-            })) => StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::NoSuchUpload { .. },
+            ))) => StorageRpcMultipartCompletionSnapshotOutcome::NoSuchUpload {
+                upload_id: authorized_upload.upload_id.clone(),
+            },
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::PartNotFound { part_number, .. },
+            ))) => StorageRpcMultipartCompletionSnapshotOutcome::PartNotFound {
                 upload_id: authorized_upload.upload_id.clone(),
                 part_number,
             },
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
         };
@@ -8363,39 +8504,31 @@ impl StorageNodeConnectionHandler {
 
     fn multipart_completion_preflight_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcMultipartCompletionPreflightRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "multipart completion preflight load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
             request.authorized_upload,
         );
-        let outcome = match ObjectMutationMetadataNodeClient::load_multipart_completion_preflight(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &authorized_upload,
-        ) {
+        let outcome = match route.load_multipart_completion_preflight(&authorized_upload) {
             Ok(preflight) => StorageRpcMultipartCompletionPreflightOutcome::Loaded(preflight),
-            Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
-                StorageRpcMultipartCompletionPreflightOutcome::NoSuchUpload {
-                    upload_id: authorized_upload.upload_id.clone(),
-                }
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::NoSuchUpload { .. },
+            ))) => StorageRpcMultipartCompletionPreflightOutcome::NoSuchUpload {
+                upload_id: authorized_upload.upload_id.clone(),
+            },
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
         };
@@ -8407,45 +8540,38 @@ impl StorageNodeConnectionHandler {
 
     fn multipart_parts_list_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcMultipartPartsListRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "multipart parts list",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
             request.authorized_upload,
         );
-        let outcome =
-            match ObjectMutationMetadataNodeClient::list_multipart_parts_for_authorized_upload(
-                &local_client,
-                self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                &authorized_upload,
-                request.part_number_marker,
-                request.max_parts,
-            ) {
-                Ok(listed) => StorageRpcMultipartPartsListOutcome::Loaded(Box::new(listed)),
-                Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
-                    StorageRpcMultipartPartsListOutcome::NoSuchUpload {
-                        upload_id: authorized_upload.upload_id.clone(),
-                    }
-                }
-                Err(error) => {
-                    return encode_storage_rpc_error_response(&object_pg_error_response(error));
-                }
-            };
+        let outcome = match route.list_multipart_parts_for_authorized_upload(
+            &authorized_upload,
+            request.part_number_marker,
+            request.max_parts,
+        ) {
+            Ok(listed) => StorageRpcMultipartPartsListOutcome::Loaded(Box::new(listed)),
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::NoSuchUpload { .. },
+            ))) => StorageRpcMultipartPartsListOutcome::NoSuchUpload {
+                upload_id: authorized_upload.upload_id.clone(),
+            },
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
         let payload =
             encode_multipart_parts_list_response(&StorageRpcMultipartPartsListResponse {
                 outcome,
@@ -8455,33 +8581,23 @@ impl StorageNodeConnectionHandler {
 
     fn multipart_management_lookup_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcMultipartUploadLoadRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "multipart management lookup",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let lookup = match ObjectMutationMetadataNodeClient::lookup_multipart_upload_management(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            &request.upload_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let lookup = match route.lookup_multipart_upload_management(&request.upload_id) {
             Ok(lookup) => lookup,
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
         };
@@ -8815,34 +8931,26 @@ impl StorageNodeConnectionHandler {
 
     fn multipart_completion_stale_source_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.pg_id,
-            &request.bucket,
-            &request.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request,
             "multipart completion stale source load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let source =
-            match ObjectMutationMetadataNodeClient::load_multipart_completion_stale_payload_source(
-                &local_client,
-                self.validated_object_metadata_pg(&request.bucket, &request.key),
-                &request.bucket,
-                &request.key,
-            ) {
-                Ok(source) => source,
-                Err(error) => {
-                    return encode_storage_rpc_error_response(&object_pg_error_response(error))
-                }
-            };
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let source = match route.load_multipart_completion_stale_payload_source() {
+            Ok(source) => source,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
         let payload = encode_multipart_completion_stale_source_response(
             &StorageRpcMultipartCompletionStaleSourceResponse { source },
         );
@@ -8897,33 +9005,23 @@ impl StorageNodeConnectionHandler {
 
     fn abort_multipart_cleanup_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: crate::storage_rpc::StorageRpcAbortMultipartCleanupRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "abort multipart cleanup load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let cleanup = match ObjectMutationMetadataNodeClient::load_abort_multipart_upload_cleanup(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            &request.upload_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let cleanup = match route.load_abort_multipart_upload_cleanup(&request.upload_id) {
             Ok(cleanup) => cleanup,
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
         };
@@ -18995,6 +19093,68 @@ mod tests {
             upload
         });
         assert_eq!(multipart_upload.upload_id, upload_id);
+        let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
+            multipart_upload.clone(),
+        );
+        crate::clock::with_time_override(1_000, || {
+            let completion_snapshot = primary_route
+                .load_multipart_completion_snapshot(&authorized_upload, &[])
+                .unwrap();
+            assert!(completion_snapshot.part_records.is_empty());
+            assert_eq!(
+                primary_route
+                    .load_multipart_completion_preflight(&authorized_upload)
+                    .unwrap()
+                    .existing_etag
+                    .as_deref(),
+                Some("\"0000000000000063\"")
+            );
+            let listed = primary_route
+                .list_multipart_parts_for_authorized_upload(&authorized_upload, None, 10)
+                .unwrap();
+            assert_eq!(listed.upload, multipart_upload);
+            assert!(listed.response.parts.is_empty());
+            assert!(matches!(
+                primary_route
+                    .lookup_multipart_upload_management(&upload_id)
+                    .unwrap(),
+                crate::MultipartUploadManagementLookup::InProgress(upload)
+                    if *upload == multipart_upload
+            ));
+            assert!(primary_route
+                .load_multipart_completion_stale_payload_source()
+                .unwrap()
+                .is_some());
+            let cleanup = primary_route
+                .load_abort_multipart_upload_cleanup(&upload_id)
+                .unwrap()
+                .expect("in-progress upload must have abort cleanup");
+            assert_eq!(cleanup.upload, multipart_upload);
+        });
+
+        let mismatched_subject_request = StorageRpcObjectRequest {
+            key: crate::tests::object_key("different-multipart-route-key"),
+            ..request.clone()
+        };
+        let mismatched_subject_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_primary_object_route(
+                    &active_permit,
+                    &mismatched_subject_request,
+                    "mismatched multipart subject route",
+                )
+                .unwrap()
+        });
+        let mismatched_subject = crate::clock::with_time_override(1_000, || {
+            mismatched_subject_route.load_multipart_completion_snapshot(&authorized_upload, &[])
+        });
+        match mismatched_subject {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("subject does not match"));
+            }
+            other => panic!("mismatched authorized upload must fail at capability: {other:?}"),
+        }
 
         let (metadata_stored, current_delete_snapshot, specific_delete_snapshot) =
             crate::clock::with_time_override(1_000, || {
@@ -19206,6 +19366,42 @@ mod tests {
                     "listing in-progress multipart upload load",
                     primary_route
                         .load_in_progress_multipart_upload_for_listing(&upload_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "multipart completion snapshot load",
+                    primary_route
+                        .load_multipart_completion_snapshot(&authorized_upload, &[])
+                        .map(|_| ()),
+                ),
+                (
+                    "multipart completion preflight load",
+                    primary_route
+                        .load_multipart_completion_preflight(&authorized_upload)
+                        .map(|_| ()),
+                ),
+                (
+                    "multipart parts list",
+                    primary_route
+                        .list_multipart_parts_for_authorized_upload(&authorized_upload, None, 10)
+                        .map(|_| ()),
+                ),
+                (
+                    "multipart management lookup",
+                    primary_route
+                        .lookup_multipart_upload_management(&upload_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "multipart completion stale source load",
+                    primary_route
+                        .load_multipart_completion_stale_payload_source()
+                        .map(|_| ()),
+                ),
+                (
+                    "abort multipart cleanup load",
+                    primary_route
+                        .load_abort_multipart_upload_cleanup(&upload_id)
                         .map(|_| ()),
                 ),
                 (

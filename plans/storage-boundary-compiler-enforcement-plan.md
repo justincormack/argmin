@@ -1834,6 +1834,41 @@ Thirty-fourth Phase 3 slice:
   storage tests, workspace-wide strict Clippy, and the full parallel workspace
   suite (7,446 tests).
 
+Thirty-fifth Phase 3 slice:
+
+- multipart completion snapshot and preflight loading, authorized part
+  listing, management lookup, completion stale-payload-source loading, and
+  abort-cleanup loading now consume the exact
+  `StorageNodeActivePrimaryObjectRoute` established from the frame. Each
+  capability method derives its trusted `ObjectMetadataPgId`, bucket, and key
+  from that route and revalidates the frame's immutable captured deadline
+  immediately before its local metadata read.
+- the three operations carrying an `AuthorizedMultipartUploadRecord` now bind
+  that record's bucket and key to the active route inside the capability. A
+  decoded record for another object is rejected as exact `PayloadDecode`
+  before node access instead of using the caller-controlled record subject
+  with the route's trusted PG.
+- the handlers retain their existing `NoSuchUpload`, `PartNotFound`, missing,
+  and stale-snapshot protocol outcomes. The outer RPC authorization registry
+  remains frontend-only for completion snapshot/preflight, part listing, and
+  management lookup, and frontend/maintenance for stale-source and abort
+  cleanup.
+- the deterministic active-object regression positively exercises all six
+  methods, uses a second same-PG object route to prove an otherwise readable
+  authorized upload is rejected at the capability subject boundary, extends
+  raw same-epoch validity, and proves every method fails at the original
+  captured deadline. The existing Unix multipart matrix seeds identical
+  upload and part state on two PGs, proves all correct-PG paths succeed, and
+  requires exact `PayloadDecode` for all equivalent-state wrong-PG paths.
+- stream and multipart mutations, payload reclaim, remaining object
+  mutations and lookups, PG-wide listing scans, data operations, frontend
+  capability migration, and capability requirements on node-client traits
+  remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  captured-deadline/subject-binding and equivalent-state Unix wrong-PG
+  regressions, all 2,209 storage tests, workspace-wide strict Clippy, and the
+  full parallel workspace suite (7,446 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
