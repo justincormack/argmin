@@ -769,12 +769,11 @@ impl Coordinator {
         let tags = req.tags;
         let cond = req.cond;
         let request = BucketHandleRequest::new().requiring_lifecycle_view();
-        self.with_bucket_write_handle_for_command_with_storage_node(
+        self.with_bucket_write_handle_for_storage_node(
             storage_node,
             &req.object,
             request,
-            |bucket_handle, proof| {
-            let mut proof_transferred_to_command = false;
+            |bucket_handle| {
             let bucket_info = bucket_handle.bucket().clone();
             let result = (|| {
                 Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
@@ -796,14 +795,12 @@ impl Coordinator {
                         });
                     }
                 }
-                proof_transferred_to_command = true;
                 let outcome = storage_node
                     .finalize_put_object_stream(
                         req.object.bucket_name_typed(),
                         req.object.key_typed(),
                         session_id,
                         total_size,
-                        proof.clone(),
                         |snapshot: StreamPutFinalizeSnapshot| {
                             let write_encryption = ActiveWriteEncryption::from_stored_and_active(
                                 &snapshot.session.encryption,
@@ -887,11 +884,7 @@ impl Coordinator {
                     lifecycle_expiration,
                 })
             })();
-            if proof_transferred_to_command {
-                storage::BucketWriteSnapshotAction::transferred_to_command(result)
-            } else {
-                storage::BucketWriteSnapshotAction::release(result)
-            }
+            result
             },
         )
     }

@@ -6804,18 +6804,10 @@ impl StorageCluster {
         if !preserve_command_reservation {
             self.release_metadata_command_bucket_write_reservation(command)?;
         }
-        match command.payload() {
-            MetadataCommandPayload::CommitDirectPutObject(commit) => {
-                if let Some(proof) = &commit.stream_create_bucket_write_reservation {
-                    self.release_stream_create_bucket_write_reservation_proof(proof)?;
-                }
+        if let MetadataCommandPayload::AbortStreamUpload(abort) = command.payload() {
+            if let Some(proof) = &abort.stream_create_bucket_write_reservation {
+                self.release_stream_create_bucket_write_reservation_proof(proof)?;
             }
-            MetadataCommandPayload::AbortStreamUpload(abort) => {
-                if let Some(proof) = &abort.stream_create_bucket_write_reservation {
-                    self.release_stream_create_bucket_write_reservation_proof(proof)?;
-                }
-            }
-            _ => {}
         }
         Ok(())
     }
@@ -10129,7 +10121,6 @@ impl StorageCluster {
             last_modified_millis,
             stale_payload,
             bucket_write_reservation,
-            stream_create_bucket_write_reservation: None,
         };
         Ok(MetadataCommandEnvelope::new(
             command_id,

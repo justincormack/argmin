@@ -5173,7 +5173,6 @@ fn pending_metadata_command_slot_rejects_huge_repeated_count_before_allocation()
             last_modified_millis: 2,
             stale_payload: None,
             bucket_write_reservation: proof,
-            stream_create_bucket_write_reservation: None,
         })),
     );
     let mut malformed_bytes = command.command_bytes();
@@ -7132,12 +7131,7 @@ fn stale_delete_marker_delete_command_cannot_delete_newer_null_marker() {
             write_sequence: 2,
             last_modified_millis: 20,
             stale_payload: None,
-            bucket_write_reservation: test_bucket_write_reservation_proof(
-                &bucket,
-                &key,
-                "replacement-live",
-            ),
-            stream_create_bucket_write_reservation: None,
+            bucket_write_reservation: direct_put_terminal_cleanup_proof(&bucket, &key),
         })),
     );
     insert_direct_put_terminal_staging(&store, &bucket, &key, &replacement_reservation_id);
@@ -7210,51 +7204,7 @@ fn already_applied_direct_put_command_cleans_terminal_staging_on_apply() {
     let bucket = trusted_bucket_name("direct-put-terminal-cleanup");
     let key = trusted_object_key("object");
     let reservation_id = SessionId::try_from("73".repeat(16)).unwrap();
-    let command = MetadataCommandEnvelope::new(
-        MetadataCommandId::new(
-            ClusterEpoch::INITIAL,
-            PgId::new(1),
-            MetadataCommandLogIndex::new(1).unwrap(),
-        ),
-        MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
-            object: PutLiveObjectReq {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id: VersionId::Null,
-                owner: test_owner(),
-                acl_grants: AclGrants::default(),
-                public_read: false,
-                generation_id: GenerationId::MIN,
-                size: 0,
-                etag: ObjectEtag::single_part(0),
-                ec: EcShape { k: 2, m: 1 },
-                layout: ObjectLayout::Standard,
-                tags: None,
-                metadata_blob: Some(SerializedMetadataBlob::default()),
-                system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
-                object_lock: ObjectLockState::default(),
-                encryption: ObjectEncryption::None,
-            },
-            segments: Vec::new(),
-            generation_reservation_id: reservation_id.clone(),
-            write_sequence: 1,
-            last_modified_millis: 2,
-            stale_payload: None,
-            bucket_write_reservation: BucketWriteReservationProof {
-                bucket: bucket.clone(),
-                reservation_id: "direct-put-proof".to_string(),
-                owner_token: "direct-put-proof-owner".to_string(),
-                cluster_epoch: ClusterEpoch::INITIAL,
-                bucket_execution_generation: 1,
-                bucket_incarnation_generation: 1,
-                operation_kind: "direct-put-commit".to_string(),
-                created_at: 1,
-                lease_deadline: 2,
-                target_context: Some(key.as_str().to_string()),
-            },
-            stream_create_bucket_write_reservation: None,
-        })),
-    );
+    let command = direct_put_terminal_cleanup_command(&bucket, &key, &reservation_id);
 
     insert_direct_put_terminal_staging(&store, &bucket, &key, &reservation_id);
     store.apply_metadata_command(&command).unwrap();
@@ -7479,21 +7429,29 @@ fn direct_put_terminal_cleanup_command_with_write_sequence(
             write_sequence,
             last_modified_millis: 2,
             stale_payload: None,
-            bucket_write_reservation: BucketWriteReservationProof {
-                bucket: bucket.clone(),
-                reservation_id: "direct-put-proof".to_string(),
-                owner_token: "direct-put-proof-owner".to_string(),
-                cluster_epoch: ClusterEpoch::INITIAL,
-                bucket_execution_generation: 1,
-                bucket_incarnation_generation: 1,
-                operation_kind: "direct-put-commit".to_string(),
-                created_at: 1,
-                lease_deadline: 2,
-                target_context: Some(key.as_str().to_string()),
-            },
-            stream_create_bucket_write_reservation: None,
+            bucket_write_reservation: direct_put_terminal_cleanup_proof(bucket, key),
         })),
     )
+}
+
+fn direct_put_terminal_cleanup_proof(
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> BucketWriteReservationProof {
+    BucketWriteReservationProof {
+        bucket: bucket.clone(),
+        reservation_id: "direct-put-proof".to_string(),
+        owner_token: "direct-put-proof-owner".to_string(),
+        cluster_epoch: ClusterEpoch::INITIAL,
+        bucket_execution_generation: 1,
+        bucket_incarnation_generation: 1,
+        operation_kind:
+            crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+                .to_string(),
+        created_at: 1,
+        lease_deadline: 2,
+        target_context: Some(key.as_str().to_string()),
+    }
 }
 
 fn insert_direct_put_terminal_staging(
@@ -7502,6 +7460,7 @@ fn insert_direct_put_terminal_staging(
     key: &ObjectKey,
     reservation_id: &SessionId,
 ) {
+    let proof = direct_put_terminal_cleanup_proof(bucket, key);
     store
         .conn
         .execute(
@@ -7522,8 +7481,13 @@ fn insert_direct_put_terminal_staging(
         .execute(
             "INSERT INTO stream_uploads \
              (session_id, bucket, key, op_kind, upload_id, part_number, state, \
-              created_at, encryption_type, encryption_state) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              created_at, encryption_type, encryption_state, bucket_write_reservation_id, \
+              bucket_write_owner_token, bucket_write_cluster_epoch, \
+              bucket_write_execution_generation, bucket_write_incarnation_generation, \
+              bucket_write_operation_kind, bucket_write_created_at, \
+              bucket_write_lease_deadline, bucket_write_target_context) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                     ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 reservation_id.as_str(),
                 bucket.as_str(),
@@ -7535,6 +7499,15 @@ fn insert_direct_put_terminal_staging(
                 1_i64,
                 ObjectEncryption::None.encryption_type() as u8,
                 Option::<&[u8]>::None,
+                proof.reservation_id,
+                proof.owner_token,
+                proof.cluster_epoch.get() as i64,
+                proof.bucket_execution_generation as i64,
+                proof.bucket_incarnation_generation as i64,
+                proof.operation_kind,
+                proof.created_at as i64,
+                proof.lease_deadline as i64,
+                proof.target_context,
             ],
         )
         .unwrap();

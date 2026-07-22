@@ -25,7 +25,7 @@ use crate::types::{
 };
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 3;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 4;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
@@ -950,7 +950,6 @@ pub(crate) struct CommitDirectPutObjectCommand {
     pub(crate) last_modified_millis: u64,
     pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
-    pub(crate) stream_create_bucket_write_reservation: Option<BucketWriteReservationProof>,
 }
 
 impl CommitDirectPutObjectCommand {
@@ -1218,6 +1217,8 @@ pub(crate) const PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND: &str =
     "put-object-stream-create";
 pub(crate) const UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND: &str =
     "upload-part-stream-create";
+pub(crate) const UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND: &str =
+    "upload-part-stream-finalize";
 pub(crate) const PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND: &str = "put-object-metadata";
 pub(crate) const DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND: &str = "delete-current-object";
 pub(crate) const DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND: &str = "delete-object-version";
@@ -1241,6 +1242,20 @@ impl From<&BucketWriteReservationRecord> for BucketWriteReservationProof {
 }
 
 impl BucketWriteReservationProof {
+    pub(crate) fn has_same_stable_identity(&self, other: &Self) -> bool {
+        // lease_deadline is renewable state. Every other field identifies the
+        // reservation and its authorized mutation target.
+        self.bucket == other.bucket
+            && self.reservation_id == other.reservation_id
+            && self.owner_token == other.owner_token
+            && self.cluster_epoch == other.cluster_epoch
+            && self.bucket_execution_generation == other.bucket_execution_generation
+            && self.bucket_incarnation_generation == other.bucket_incarnation_generation
+            && self.operation_kind == other.operation_kind
+            && self.created_at == other.created_at
+            && self.target_context == other.target_context
+    }
+
     pub(crate) fn matches_record(&self, record: &BucketWriteReservationRecord) -> bool {
         // The lease deadline is mutable heartbeat state, not stable proof
         // identity. Callers that need freshness validate the deadline
@@ -1761,8 +1776,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.read_u64()?;
                 self.read_u64()?;
                 self.skip_optional_stale_payload()?;
-                self.skip_required_bucket_write_reservation_proof()?;
-                self.skip_optional(Self::skip_required_bucket_write_reservation_proof)
+                self.skip_required_bucket_write_reservation_proof()
             }
             METADATA_COMMAND_COMMIT_MULTIPART_OBJECT => {
                 self.skip_str()?;
@@ -1949,8 +1963,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         last_modified_millis: self.read_u64()?,
                         stale_payload: self.read_optional_stale_payload()?,
                         bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
-                        stream_create_bucket_write_reservation: self
-                            .read_optional_bucket_write_reservation_proof()?,
                     },
                 )))
             }
@@ -3462,10 +3474,6 @@ fn encode_commit_direct_put_object(out: &mut Vec<u8>, command: &CommitDirectPutO
         }
     }
     encode_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
-    encode_optional_bucket_write_reservation_proof(
-        out,
-        command.stream_create_bucket_write_reservation.as_ref(),
-    );
 }
 
 fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartObjectCommand) {
@@ -4366,7 +4374,12 @@ mod tests {
 
     fn assert_applied_log_decoder_accepts(envelope: &MetadataCommandEnvelope) {
         let header = decode_metadata_command_log_entry_header(&envelope.command_bytes())
-            .expect("applied command bytes must decode");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "applied {} command bytes must decode: {error}",
+                    envelope.payload().kind_name()
+                )
+            });
         assert_eq!(header.id(), envelope.id());
         assert_eq!(header.kind(), MetadataCommandLogEntryKind::Applied);
 
@@ -4379,8 +4392,13 @@ mod tests {
     }
 
     fn assert_full_envelope_decoder_round_trips(envelope: &MetadataCommandEnvelope) {
-        let decoded = decode_metadata_command_envelope(&envelope.command_bytes())
-            .expect("full metadata command envelope must decode");
+        let decoded =
+            decode_metadata_command_envelope(&envelope.command_bytes()).unwrap_or_else(|error| {
+                panic!(
+                    "full {} metadata command envelope must decode: {error}",
+                    envelope.payload().kind_name()
+                )
+            });
         assert_eq!(decoded, *envelope);
     }
 
@@ -4431,18 +4449,15 @@ mod tests {
                 last_modified_millis: 2,
                 stale_payload: None,
                 bucket_write_reservation: proof.clone(),
-                stream_create_bucket_write_reservation: None,
             })),
         );
 
         let mut proof_bytes = Vec::new();
         encode_bucket_write_reservation_proof(&mut proof_bytes, &proof);
-        let mut required_proof_suffix = proof_bytes;
-        encode_optional_bucket_write_reservation_proof(&mut required_proof_suffix, None);
+        let required_proof_suffix = proof_bytes;
         let mut proofless_bytes = command.command_bytes();
         assert!(proofless_bytes.ends_with(&required_proof_suffix));
         proofless_bytes.truncate(proofless_bytes.len() - required_proof_suffix.len());
-        encode_optional_bucket_write_reservation_proof(&mut proofless_bytes, None);
 
         assert!(
             decode_metadata_command_envelope(&proofless_bytes).is_err(),
@@ -4497,7 +4512,6 @@ mod tests {
             last_modified_millis: 2,
             stale_payload: None,
             bucket_write_reservation: proof,
-            stream_create_bucket_write_reservation: None,
         };
         let other_generation_id = GenerationId::new(generation_id.get() + 1).unwrap();
 
@@ -4836,7 +4850,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0x2cedbbcee0471b9b);
+        assert_eq!(envelope.checksum_crc64(), 0xd1a22a0be38facfd);
     }
 
     #[test]
@@ -4877,14 +4891,14 @@ mod tests {
 
         let mut old_version = envelope.command_bytes();
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        old_version[version_offset..version_offset + 2].copy_from_slice(&2_u16.to_le_bytes());
+        old_version[version_offset..version_offset + 2].copy_from_slice(&3_u16.to_le_bytes());
         assert_eq!(
             decode_metadata_command_envelope(&old_version),
-            Err("unsupported metadata command encoding version 2".to_string())
+            Err("unsupported metadata command encoding version 3".to_string())
         );
         assert_eq!(
             decode_metadata_command_log_entry_header(&old_version),
-            Err("unsupported metadata command encoding version 2".to_string())
+            Err("unsupported metadata command encoding version 3".to_string())
         );
 
         let mut applied_with_trailing_bytes = envelope.command_bytes();
@@ -4936,7 +4950,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x8446520ed42c3d88);
+        assert_eq!(envelope.checksum_crc64(), 0x7909c3cbd7e48aee);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -4964,7 +4978,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x5c50b35b6304f2b8);
+        assert_eq!(envelope.checksum_crc64(), 0xa11f229e60cc45de);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5029,7 +5043,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x7a29254cb98b0524);
+        assert_eq!(envelope.checksum_crc64(), 0x8766b489ba43b242);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5110,13 +5124,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x537adf8b82d9135f,
-                0x45ff77e0c8cc61a9,
-                0xc65c92e76ec7fbe8,
-                0x0824921168abb866,
-                0x2f7ba8409d241015,
-                0xc0291ee304b2614d,
-                0x442fa8c4035209ee,
+                0xdcbba49b1f6edab2,
+                0x669237fa05b26184,
+                0xc26a15efa8011034,
+                0x19fdfda93e9026c1,
+                0x3ea2c7f8cb1f8eb2,
+                0x3d668f26077ad62b,
+                0x55f6c77c55699749,
             ]
         );
     }
@@ -5192,14 +5206,14 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xb7028dc9bfb93a15,
-                0x196ecf9957476ee5,
-                0x26261303b62b1b6b,
-                0x45f5b379ee8a4b2a,
-                0x87c9f7a875db9eab,
-                0xd63212372a4682b4,
-                0x3b498d8e0d93ecf6,
-                0x28548fb8c7fa7d4a,
+                0xf99a23e7c7dbf1c1,
+                0x8d385918b38eb90d,
+                0x5f714340121e9bea,
+                0xd1a325f80a439cc2,
+                0x1ecce4060d9f9c01,
+                0x426484b6ce8f555c,
+                0xbebf29527ff5742e,
+                0xbc0219392333aaa2,
             ]
         );
     }
@@ -5465,7 +5479,6 @@ mod tests {
                 last_modified_millis: 555,
                 stale_payload: Some(segment_reclaim.clone()),
                 bucket_write_reservation: bucket_write_reservation.clone(),
-                stream_create_bucket_write_reservation: None,
             })),
             MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
                 object: object.clone(),
@@ -5475,7 +5488,6 @@ mod tests {
                 last_modified_millis: 556,
                 stale_payload: Some(multipart_reclaim.clone()),
                 bucket_write_reservation: bucket_write_reservation.clone(),
-                stream_create_bucket_write_reservation: None,
             })),
             MetadataCommandPayload::CommitMultipartObject(Box::new(CommitMultipartObjectCommand {
                 upload_id: upload_id.clone(),
@@ -5784,36 +5796,36 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x1087afd0e772e3a8,
-                0x88cbac7c0d884c05,
-                0x87435164ef0de24d,
-                0x9908c90ebbc963c4,
-                0xa65809408410f284,
-                0xc7fe769314d311f6,
-                0xcdb8063c71f77a87,
-                0x89d57a224be2889f,
-                0x5006a5b5a0e7875e,
-                0x9ea415cbb76e40be,
-                0x4a2ff51f9109ee96,
-                0xd95781f9811379c8,
-                0xb0b60531c41ee2f9,
-                0xb82de8eecae45bd5,
-                0x5dcc900ca73e109a,
-                0xa02ff24912c56128,
-                0x1c41b88aae227bc5,
-                0xc958d56436086f37,
-                0xed7e1f505dc81b70,
-                0x3dad446be3c7eda9,
-                0xfe5da85ccf37e787,
-                0xc3946172712f54d6,
-                0x103df6891007e566,
-                0xc97c5b3ad6c0790d,
-                0x7d558aeddff5541f,
-                0xa9c2769bb42c02b4,
-                0x1e0ecf106b8e732b,
-                0x841ea24d3f426cb5,
-                0x3b27324471373c87,
-                0xabd73b670db95f1b,
+                0xe6e9702e798439d7,
+                0x2b473262c236c93c,
+                0xb1a4c18f99321674,
+                0xd0ac1dee93867277,
+                0x9cc3f0ab4b6567b0,
+                0x9e548d67965d9412,
+                0x8bf3eb212f25c644,
+                0xa20752aaa6934862,
+                0x01db3c4fc9f3f0e0,
+                0xde6097cf102c5bc7,
+                0x355c40debbaeab86,
+                0x5b00fefb00b15186,
+                0x5dd34bf2a7b009ee,
+                0x13be8ab4ceb534f9,
+                0x701320a932b2ee85,
+                0x0bbc901316940e04,
+                0xb0aae20d8a032766,
+                0x928ca850986716fc,
+                0x10ed5a7db79ade46,
+                0x6701cd8445cfe8e3,
+                0x94fdcd9d6617eb8c,
+                0x6957ed2f4f7ef220,
+                0xf0eca11e9ad7f739,
+                0x57bea7e100ee87af,
+                0x2b7ea60c11738900,
+                0xb1ec8810700ac401,
+                0xceb57ea44698d642,
+                0x2f8dc0173b130399,
+                0x6b42c8e45ba2c4fc,
+                0x11f512cc986933c0,
             ]
         );
     }

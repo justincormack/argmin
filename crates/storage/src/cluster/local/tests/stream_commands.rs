@@ -2302,39 +2302,23 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
         },
     ));
 
-    let command_reservation = cluster
-        .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "stream-put-finalize-test",
-            Some(key.as_str()),
-        )
-        .unwrap();
-    let command_proof =
-        crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record);
     let err = cluster
-        .finalize_put_object_stream(
-            &bucket,
-            &key,
-            &session_id,
-            payload.len() as u64,
-            command_proof,
-            |_| {
-                Ok::<_, ()>(crate::PreparedStreamPutCommit {
-                    value: (),
-                    versioning: crate::BucketVersioningState::Disabled,
-                    owner: crate::OwnerIdentity::from_principal("owner"),
-                    acl_grants: crate::AclGrants::default(),
-                    public_read: false,
-                    size: payload.len() as u64,
-                    etag_crc64: payload_crc64,
-                    tags: None,
-                    metadata_blob: crate::SerializedMetadataBlob::default(),
-                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                    object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
-                })
-            },
-        )
+        .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                size: payload.len() as u64,
+                etag_crc64: payload_crc64,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
         .unwrap_err();
     assert!(
         matches!(
@@ -2360,7 +2344,7 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
             crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg_store, &bucket,)
                 .unwrap()
                 .len(),
-            2
+            1
         );
     }
     assert_stream_next_segment_vid(&map, NodeId::new(2), object_pg, &session_id, 2);
@@ -2521,15 +2505,12 @@ fn control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preser
     let before_object_pg_proof = source_cluster
         .test_object_pg_metadata_proof(&bucket, &key)
         .unwrap();
-    let reservation = source_cluster
-        .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "control-plane-peering-stale-stream-put-finalize",
-            Some(key.as_str()),
-        )
-        .unwrap();
-    let proof = crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
-    let finalize_reservation_id = proof.reservation_id.clone();
+    let stream_reservation_id = source_cluster
+        .load_stream_upload_session(&bucket, &key, &session_id)
+        .unwrap()
+        .bucket_write_reservation
+        .unwrap()
+        .reservation_id;
     drop(source_cluster);
     drop(source_map);
 
@@ -2591,30 +2572,23 @@ fn control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preser
     let action_called = Arc::new(AtomicBool::new(false));
     let action_called_for_closure = Arc::clone(&action_called);
     let err = old_primary_cluster
-        .finalize_put_object_stream(
-            &bucket,
-            &key,
-            &session_id,
-            payload.len() as u64,
-            proof,
-            |_| {
-                action_called_for_closure.store(true, Ordering::SeqCst);
-                Ok::<_, ()>(crate::PreparedStreamPutCommit {
-                    value: (),
-                    versioning: crate::BucketVersioningState::Disabled,
-                    owner: crate::OwnerIdentity::from_principal("owner"),
-                    acl_grants: crate::AclGrants::default(),
-                    public_read: false,
-                    size: payload.len() as u64,
-                    etag_crc64: payload_crc64,
-                    tags: None,
-                    metadata_blob: crate::SerializedMetadataBlob::default(),
-                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                    object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
-                })
-            },
-        )
+        .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+            action_called_for_closure.store(true, Ordering::SeqCst);
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                size: payload.len() as u64,
+                etag_crc64: payload_crc64,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
         .unwrap_err();
     assert!(
         matches!(
@@ -2686,25 +2660,21 @@ fn control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preser
         .storage_node()
         .pg_topology()
         .bucket_pg_for(&bucket);
-    for node_id in node_ids {
-        let pg = current_map
-            .node(node_id)
+    let bucket_primary = current_map
+        .metadata_pg_primary_node(current_epoch, PgId::new(bucket_pg))
+        .unwrap();
+    let bucket_pg_store = bucket_primary.storage_node().get_pg(bucket_pg).unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg_store, &bucket)
             .unwrap()
-            .storage_node()
-            .get_pg(bucket_pg)
-            .unwrap();
-        assert!(
-            !crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket)
-                .unwrap()
-                .iter()
-                .any(|reservation| reservation.reservation_id == finalize_reservation_id),
-            "old-primary stream PUT finalize must release its finalize bucket write reservation on node {node_id:?}"
-        );
-    }
+            .iter()
+            .any(|reservation| reservation.reservation_id == stream_reservation_id),
+        "old-primary stream PUT finalize must preserve its durable stream reservation"
+    );
 }
 
 #[test]
-fn stream_put_finalize_missing_session_same_pg_releases_bucket_write_proof() {
+fn stream_put_finalize_missing_session_same_pg_does_not_call_action() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -2723,20 +2693,12 @@ fn stream_put_finalize_missing_session_same_pg_releases_bucket_write_proof() {
     assert_eq!(cluster.bucket_metadata_pg_id(&bucket), 1);
     assert_eq!(cluster.object_metadata_pg_id(&bucket, &key), 1);
 
-    let reservation = cluster
-        .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "stream-put-finalize-missing-session-test",
-            Some(key.as_str()),
-        )
-        .unwrap();
-    let proof = crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
     let session_id = crate::SessionId::try_from("7d".repeat(16)).unwrap();
     let action_called = Arc::new(AtomicBool::new(false));
     let action_called_for_closure = Arc::clone(&action_called);
 
     let err = cluster
-        .finalize_put_object_stream(&bucket, &key, &session_id, 0, proof, move |_| {
+        .finalize_put_object_stream(&bucket, &key, &session_id, 0, move |_| {
             action_called_for_closure.store(true, Ordering::SeqCst);
             Ok::<_, ()>(crate::PreparedStreamPutCommit {
                 value: (),
@@ -2777,7 +2739,7 @@ fn stream_put_finalize_missing_session_same_pg_releases_bucket_write_proof() {
 }
 
 #[test]
-fn stream_put_finalize_action_failure_same_pg_releases_bucket_write_proof() {
+fn stream_put_finalize_action_failure_preserves_stream_write_proof() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -2805,19 +2767,8 @@ fn stream_put_finalize_action_failure_same_pg_releases_bucket_write_proof() {
             crate::ObjectEncryption::None,
         )
         .unwrap();
-    let reservation = cluster
-        .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "stream-put-finalize-action-failure-test",
-            Some(key.as_str()),
-        )
-        .unwrap();
-    let proof = crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
-
     let result: Result<crate::FinalizeStreamPutOutcome<()>, &str> = cluster
-        .finalize_put_object_stream(&bucket, &key, &session_id, 0, proof, |_| {
-            Err("condition failed")
-        })
+        .finalize_put_object_stream(&bucket, &key, &session_id, 0, |_| Err("condition failed"))
         .unwrap();
     assert!(matches!(result, Err("condition failed")));
 
@@ -2834,8 +2785,295 @@ fn stream_put_finalize_action_failure_same_pg_releases_bucket_write_proof() {
         Some(&crate::metadata_command::BucketWriteReservationProof::from(
             &reservations[0]
         )),
-        "failed finalize should release its caller proof but keep the live stream-create proof"
+        "failed finalize must preserve the live stream-create proof"
     );
+}
+
+#[test]
+fn stream_put_finalize_releases_only_its_session_write_proof() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "stream-finalize-proof-binding-");
+    let key = key_for_object_pg(topology, &bucket, 1, "object-");
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let first_session = crate::SessionId::try_from("7f".repeat(16)).unwrap();
+    let second_session = crate::SessionId::try_from("80".repeat(16)).unwrap();
+    for session_id in [&first_session, &second_session] {
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+    }
+
+    let first_proof = cluster
+        .load_stream_upload_session(&bucket, &key, &first_session)
+        .unwrap()
+        .bucket_write_reservation
+        .expect("first stream session must retain its durable write proof");
+    let second_proof = cluster
+        .load_stream_upload_session(&bucket, &key, &second_session)
+        .unwrap()
+        .bucket_write_reservation
+        .expect("second stream session must retain its durable write proof");
+    assert_ne!(first_proof.reservation_id, second_proof.reservation_id);
+
+    let bucket_primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+        .unwrap();
+    let bucket_pg = bucket_primary.storage_node().get_pg(1).unwrap();
+    let reservations =
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(reservations.len(), 2);
+    assert!(reservations.iter().any(|record| {
+        crate::metadata_command::BucketWriteReservationProof::from(record) == first_proof
+    }));
+    assert!(reservations.iter().any(|record| {
+        crate::metadata_command::BucketWriteReservationProof::from(record) == second_proof
+    }));
+    drop(bucket_pg);
+
+    cluster
+        .finalize_put_object_stream(&bucket, &key, &first_session, 0, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                size: 0,
+                etag_crc64: checksum::crc64::checksum(&[]),
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
+        .unwrap()
+        .unwrap();
+
+    let remaining_session = cluster
+        .load_stream_upload_session(&bucket, &key, &second_session)
+        .expect("finalizing one stream must preserve the other same-key session");
+    assert_eq!(
+        remaining_session.bucket_write_reservation.as_ref(),
+        Some(&second_proof)
+    );
+    assert!(matches!(
+        cluster.load_stream_upload_session(&bucket, &key, &first_session),
+        Err(crate::ObjectPgActionError::Metadata(
+            crate::MetadataError::StreamSessionNotFound { .. }
+        ))
+    ));
+    let bucket_pg = bucket_primary.storage_node().get_pg(1).unwrap();
+    let reservations =
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(
+        crate::metadata_command::BucketWriteReservationProof::from(&reservations[0]),
+        second_proof,
+        "successful finalize must release only the proof persisted in its own stream session"
+    );
+}
+
+#[test]
+fn generic_pending_drain_rejects_stream_put_with_substituted_proof() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "substituted-stream-proof-drain-");
+    let key = key_for_object_pg(topology, &bucket, 1, "object-");
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let first_session = crate::SessionId::try_from("81".repeat(16)).unwrap();
+    let second_session = crate::SessionId::try_from("82".repeat(16)).unwrap();
+    for session_id in [&first_session, &second_session] {
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+    }
+    let first_proof = cluster
+        .load_stream_upload_session(&bucket, &key, &first_session)
+        .unwrap()
+        .bucket_write_reservation
+        .unwrap();
+    let second_proof = cluster
+        .load_stream_upload_session(&bucket, &key, &second_session)
+        .unwrap()
+        .bucket_write_reservation
+        .unwrap();
+    assert_ne!(first_proof.reservation_id, second_proof.reservation_id);
+
+    let pg_id = PgId::new(1);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let (generation_id, write_sequence) = {
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        (
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &first_session,
+            )
+            .unwrap(),
+            pg.next_object_write_sequence(bucket.as_str(), key.as_str())
+                .unwrap(),
+        )
+    };
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+            object: crate::PutLiveObjectReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: crate::VersionId::Null,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                generation_id,
+                size: 0,
+                etag: crate::ObjectEtag::single_part(checksum::crc64::checksum(&[])),
+                ec: ec_shape,
+                layout: crate::ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+                system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            },
+            segments: Vec::new(),
+            generation_reservation_id: first_session.clone(),
+            write_sequence,
+            last_modified_millis: 1,
+            stale_payload: None,
+            bucket_write_reservation: second_proof.clone(),
+        })),
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            pg.metadata_command_acceptance(node_id.as_u32(), &command)
+                .unwrap(),
+            crate::metadata_command::MetadataCommandAcceptance::Apply,
+            "the substituted proof must be the command's only invalid field"
+        );
+    }
+    cluster
+        .validate_metadata_command_bucket_write_reservation(&command)
+        .expect("the substituted proof must itself be a live valid reservation");
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let central_error = primary
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .apply_metadata_command(&command)
+        .unwrap_err();
+    assert!(matches!(
+        central_error,
+        crate::MetadataError::Db {
+            context: "commit direct put command stream reservation mismatch",
+            ..
+        }
+    ));
+    let states_before = node_ids.map(|node_id| {
+        map.node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap()
+    });
+
+    let error = cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::ObjectPgActionError::Metadata(crate::MetadataError::Db {
+                context: "commit direct put command stream reservation mismatch",
+                ..
+            })
+        ),
+        "substituted stream proof must fail generic recovery, got {error:?}"
+    );
+
+    let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let retained = primary_pg
+        .pending_metadata_command_envelope(primary.node_id().as_u32(), ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(retained.as_ref(), Some(&command));
+    drop(primary_pg);
+    for (index, node_id) in node_ids.into_iter().enumerate() {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            pg.metadata_command_replica_state().unwrap(),
+            states_before[index]
+        );
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+        assert!(crate::PgMetadataStore::get_stream_upload(&*pg, &first_session).is_ok());
+        assert!(crate::PgMetadataStore::get_stream_upload(&*pg, &second_session).is_ok());
+    }
+    let bucket_primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let bucket_pg = bucket_primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let reservations =
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(reservations.len(), 2);
+    assert!(reservations.iter().any(|record| {
+        crate::metadata_command::BucketWriteReservationProof::from(record) == first_proof
+    }));
+    assert!(reservations.iter().any(|record| {
+        crate::metadata_command::BucketWriteReservationProof::from(record) == second_proof
+    }));
 }
 
 #[test]
@@ -2912,34 +3150,22 @@ fn stream_put_finalize_rejects_unencrypted_etag_crc64_mismatch() {
     }
 
     let err = cluster
-        .finalize_put_object_stream(
-            &bucket,
-            &key,
-            &session_id,
-            total_size,
-            acquire_test_bucket_write_proof(
-                &cluster,
-                &bucket,
-                "stream-put-finalize-crc-test",
-                Some(key.as_str()),
-            ),
-            |_| {
-                Ok::<_, ()>(crate::PreparedStreamPutCommit {
-                    value: (),
-                    versioning: crate::BucketVersioningState::Disabled,
-                    owner: crate::OwnerIdentity::from_principal("owner"),
-                    acl_grants: crate::AclGrants::default(),
-                    public_read: false,
-                    size: total_size,
-                    etag_crc64: expected_crc64 ^ 1,
-                    tags: None,
-                    metadata_blob: crate::SerializedMetadataBlob::default(),
-                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                    object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
-                })
-            },
-        )
+        .finalize_put_object_stream(&bucket, &key, &session_id, total_size, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                size: total_size,
+                etag_crc64: expected_crc64 ^ 1,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
         .unwrap_err();
     assert!(
         matches!(
@@ -3024,34 +3250,22 @@ fn stream_put_finalize_rejects_encrypted_payload_crc64_mismatch() {
         .unwrap();
 
     let err = cluster
-        .finalize_put_object_stream(
-            &bucket,
-            &key,
-            &session_id,
-            payload.len() as u64,
-            acquire_test_bucket_write_proof(
-                &cluster,
-                &bucket,
-                "stream-put-finalize-encrypted-crc-test",
-                Some(key.as_str()),
-            ),
-            |_| {
-                Ok::<_, ()>(crate::PreparedStreamPutCommit {
-                    value: (),
-                    versioning: crate::BucketVersioningState::Disabled,
-                    owner: crate::OwnerIdentity::from_principal("owner"),
-                    acl_grants: crate::AclGrants::default(),
-                    public_read: false,
-                    size: payload.len() as u64,
-                    etag_crc64: payload_crc64 ^ 1,
-                    tags: None,
-                    metadata_blob: crate::SerializedMetadataBlob::default(),
-                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                    object_lock: crate::ObjectLockState::default(),
-                    encryption: encryption.clone(),
-                })
-            },
-        )
+        .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                size: payload.len() as u64,
+                etag_crc64: payload_crc64 ^ 1,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: encryption.clone(),
+            })
+        })
         .unwrap_err();
     assert!(
         matches!(
@@ -3327,16 +3541,11 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     }];
-    let command_reservation = cluster
-        .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "stream-put-finalize-test",
-            Some(key.as_str()),
-        )
+    let command_proof = cluster
+        .load_stream_upload_session(&bucket, &key, &session_id)
+        .unwrap()
+        .bucket_write_reservation
         .unwrap();
-    let command_proof =
-        crate::metadata_command::BucketWriteReservationProof::from(&command_reservation.record);
-    let request_proof = command_proof.clone();
     let command = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -3351,7 +3560,6 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
             last_modified_millis: 123_460,
             stale_payload: None,
             bucket_write_reservation: command_proof,
-            stream_create_bucket_write_reservation: None,
         })),
     );
     let inserted = Arc::new(AtomicBool::new(false));
@@ -3368,29 +3576,22 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
         }));
 
     let outcome = cluster
-        .finalize_put_object_stream(
-            &bucket,
-            &key,
-            &session_id,
-            payload.len() as u64,
-            request_proof,
-            |_| {
-                Ok::<_, ()>(crate::PreparedStreamPutCommit {
-                    value: "ok",
-                    versioning: crate::BucketVersioningState::Disabled,
-                    owner: crate::OwnerIdentity::from_principal("owner"),
-                    acl_grants: crate::AclGrants::default(),
-                    public_read: false,
-                    size: payload.len() as u64,
-                    etag_crc64: payload_crc64,
-                    tags: None,
-                    metadata_blob: crate::SerializedMetadataBlob::default(),
-                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                    object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
-                })
-            },
-        )
+        .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: "ok",
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                size: payload.len() as u64,
+                etag_crc64: payload_crc64,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
         .unwrap()
         .unwrap();
 
@@ -3493,34 +3694,22 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
     ));
 
     let outcome = cluster
-        .finalize_put_object_stream(
-            &bucket,
-            &key,
-            &session_id,
-            payload.len() as u64,
-            acquire_test_bucket_write_proof(
-                &cluster,
-                &bucket,
-                "stream-put-finalize-test",
-                Some(key.as_str()),
-            ),
-            |_| {
-                Ok::<_, ()>(crate::PreparedStreamPutCommit {
-                    value: (),
-                    versioning: crate::BucketVersioningState::Enabled,
-                    owner: crate::OwnerIdentity::from_principal("owner"),
-                    acl_grants: crate::AclGrants::default(),
-                    public_read: false,
-                    size: payload.len() as u64,
-                    etag_crc64: payload_crc64,
-                    tags: None,
-                    metadata_blob: crate::SerializedMetadataBlob::default(),
-                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                    object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
-                })
-            },
-        )
+        .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Enabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                size: payload.len() as u64,
+                etag_crc64: payload_crc64,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
         .unwrap()
         .unwrap();
     drop(hook_guard);

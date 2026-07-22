@@ -1988,6 +1988,76 @@ Thirty-eighth Phase 3 slice:
   workspace-wide strict Clippy, and the full parallel workspace suite (7,463
   tests).
 
+Thirty-ninth Phase 3 slice:
+
+- PutObject and UploadPart streaming-finalization snapshot loads and metadata
+  command construction now consume the exact
+  `StorageNodeActivePrimaryObjectRoute` established from the admitted frame.
+  The capability derives the object PG and placement epoch from the route and
+  revalidates its immutable captured deadline immediately before each load or
+  command build.
+- PutObject finalization binds the session, in-progress state, staged segment
+  identities, current-object stale-payload source, and reclaim description to
+  the active bucket/key. Its commit command must carry the exact
+  `put-object-stream-create` proof used by the durable session. UploadPart
+  finalization independently binds the session target, multipart upload,
+  existing part, displaced segments, committed part, and committed segments
+  to one upload/part and requires the distinct
+  `upload-part-stream-finalize` proof.
+- the finalize proof operation is now a canonical metadata-command constant
+  shared by acquisition and server-local validation. The storage-node
+  handlers preserve stale-snapshot and public error mappings, but no longer
+  pass decoded PG/epoch authority directly to the local command builder.
+- the deterministic active-route regression positively loads both snapshots
+  and constructs both command kinds. It rejects foreign snapshot subjects,
+  a foreign committed-part identity, and crossed PutObject/UploadPart finalize
+  proofs, then proves all four effects fail at the capability's original
+  deadline after a same-epoch route renewal. The equivalent-state two-PG Unix
+  matrix adds correct-route command canaries, exact wrong-PG rejection, and
+  crossed-operation proof rejection for both finalizers; the stale-epoch
+  UploadPart regression now uses a semantically valid finalize proof.
+- review correction: PutObject finalization no longer accepts a caller-chosen
+  command proof. It derives the sole command proof from the snapshotted durable
+  stream session, while the current bucket snapshot uses a temporary
+  reservation that is never transferred to the object command. The redundant
+  second stream-create proof was removed from `CommitDirectPutObjectCommand`,
+  so successful publication can release exactly one proof. This incompatible
+  command-layout change advances the fail-closed metadata-command encoding to
+  version 4 and rejects version 3.
+- the active-route capability and local command builder independently require
+  the RPC proof to equal the persisted session proof, and Unix response
+  validation binds the returned command proof to that snapshot. Direct
+  active-route, direct local, and Unix RPC regressions substitute a second
+  otherwise-valid proof, while an adversarial response regression mutates only
+  the returned proof. A cluster regression creates two simultaneously valid
+  PutObject stream reservations for the same key, finalizes one session, and
+  proves the other session and its exact durable reservation remain intact.
+- proof binding is also enforced centrally by `PgMetadataStore` before any new
+  direct-PUT command application, including generic pending-command recovery.
+  Binding compares the reservation's stable identity rather than its renewable
+  lease deadline: heartbeat renewal persists the newer deadline on the object
+  PG primary, while replicas may retain the create-time deadline until the
+  terminal command removes the session. A three-replica regression proves this
+  divergence exists, then heartbeats and finalizes the stream and requires all
+  object replicas, command-log states, and bucket-reservation replicas to
+  converge.
+  A current-format recovery regression installs a commit for one stream session
+  carrying a second live same-key session's proof. It proves the command and
+  proof are independently admissible, then verifies direct application and the
+  generic drain both reject the substitution without advancing any replica,
+  publishing an object, clearing the pending slot, deleting either session, or
+  releasing either reservation. Exact already-recorded command replay retains
+  its separate terminal-cleanup path. Failure and stale-route regressions prove
+  the live session reservation remains owned by the stream until abort or
+  successful publication.
+- remaining multipart mutations, retained stream cleanup, payload reclaim,
+  PG-wide listing scans, data operations, frontend capability migration, and
+  capability requirements on node-client traits remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  active-route and Unix RPC regressions, all 2,211 storage tests, and
+  workspace-wide strict Clippy. The full parallel workspace suite remains a
+  pre-commit check for this slice.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

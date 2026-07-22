@@ -1149,6 +1149,7 @@ impl PgStore {
         &self,
         command: &CommitDirectPutObjectCommand,
     ) -> Result<(), MetadataError> {
+        self.validate_direct_put_stream_session_proof(command)?;
         if self.direct_put_command_already_applied(command)? {
             return self.cleanup_direct_put_terminal_staging(command);
         }
@@ -1192,6 +1193,37 @@ impl PgStore {
                 Ok(())
             },
         )
+    }
+
+    fn validate_direct_put_stream_session_proof(
+        &self,
+        command: &CommitDirectPutObjectCommand,
+    ) -> Result<(), MetadataError> {
+        let requires_stream_session = command.bucket_write_reservation.operation_kind
+            == crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND;
+        match self.get_stream_upload(&command.generation_reservation_id) {
+            Ok(session)
+                if requires_stream_session
+                    && session.bucket == command.object.bucket
+                    && session.key == command.object.key
+                    && session.target == StreamUploadTarget::PutObject
+                    && session.state == StreamUploadState::InProgress
+                    && session
+                        .bucket_write_reservation
+                        .as_ref()
+                        .is_some_and(|proof| {
+                            proof.has_same_stable_identity(&command.bucket_write_reservation)
+                        }) =>
+            {
+                Ok(())
+            }
+            Err(MetadataError::StreamSessionNotFound { .. }) if !requires_stream_session => Ok(()),
+            Ok(_) | Err(MetadataError::StreamSessionNotFound { .. }) => Err(MetadataError::Db {
+                context: "commit direct put command stream reservation mismatch",
+                source: rusqlite::Error::InvalidQuery,
+            }),
+            Err(error) => Err(error),
+        }
     }
 
     fn cleanup_already_applied_metadata_command_terminal_staging(
@@ -10908,16 +10940,7 @@ impl PgMetadataStore for PgStore {
         current: &BucketWriteReservationProof,
         renewed: &BucketWriteReservationProof,
     ) -> Result<(), MetadataError> {
-        if current.bucket != renewed.bucket
-            || current.reservation_id != renewed.reservation_id
-            || current.owner_token != renewed.owner_token
-            || current.cluster_epoch != renewed.cluster_epoch
-            || current.bucket_execution_generation != renewed.bucket_execution_generation
-            || current.bucket_incarnation_generation != renewed.bucket_incarnation_generation
-            || current.operation_kind != renewed.operation_kind
-            || current.created_at != renewed.created_at
-            || current.target_context != renewed.target_context
-        {
+        if !current.has_same_stable_identity(renewed) {
             return Err(MetadataError::BucketWriteReservationConflict {
                 reservation_id: current.reservation_id.clone(),
             });

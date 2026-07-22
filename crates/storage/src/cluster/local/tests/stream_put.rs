@@ -161,12 +161,6 @@ fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
             &key,
             &session_id,
             loser_payload.len() as u64,
-            acquire_test_bucket_write_proof(
-                &first_cluster,
-                &bucket,
-                "stream-put-finalize-test",
-                Some(key.as_str()),
-            ),
             move |snapshot| {
                 calls_for_action.fetch_add(1, Ordering::SeqCst);
                 if snapshot.existing_etag.is_some() {
@@ -708,12 +702,6 @@ fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
             &key,
             &session_id,
             stream_payload.len() as u64,
-            acquire_test_bucket_write_proof(
-                &first_cluster,
-                &bucket,
-                "stream-put-finalize-test",
-                Some(key.as_str()),
-            ),
             move |snapshot| {
                 calls_for_action.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, ()>(crate::PreparedStreamPutCommit {
@@ -854,34 +842,22 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
             )
             .unwrap();
         cluster
-            .finalize_put_object_stream(
-                &bucket,
-                &key,
-                session_id,
-                payload.len() as u64,
-                acquire_test_bucket_write_proof(
-                    &cluster,
-                    &bucket,
-                    "streamed-overwrite-cleanup-test",
-                    Some(key.as_str()),
-                ),
-                |_| {
-                    Ok::<_, ()>(crate::PreparedStreamPutCommit {
-                        value: (),
-                        versioning: crate::BucketVersioningState::Disabled,
-                        owner: crate::OwnerIdentity::from_principal("owner"),
-                        acl_grants: crate::AclGrants::default(),
-                        public_read: false,
-                        size: payload.len() as u64,
-                        etag_crc64: crc64,
-                        tags: None,
-                        metadata_blob: crate::SerializedMetadataBlob::default(),
-                        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                        object_lock: crate::ObjectLockState::default(),
-                        encryption: crate::ObjectEncryption::None,
-                    })
-                },
-            )
+            .finalize_put_object_stream(&bucket, &key, session_id, payload.len() as u64, |_| {
+                Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                    value: (),
+                    versioning: crate::BucketVersioningState::Disabled,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: crate::AclGrants::default(),
+                    public_read: false,
+                    size: payload.len() as u64,
+                    etag_crc64: crc64,
+                    tags: None,
+                    metadata_blob: crate::SerializedMetadataBlob::default(),
+                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::ObjectEncryption::None,
+                })
+            })
             .unwrap()
             .unwrap();
     }
@@ -1154,7 +1130,7 @@ fn old_empty_put_object_stream_with_live_proof_blocks_bucket_delete() {
 }
 
 #[test]
-fn stream_put_heartbeat_updates_persisted_bucket_write_proof() {
+fn stream_put_heartbeat_then_finalize_converges_across_stale_replica_deadlines() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
@@ -1258,6 +1234,76 @@ fn stream_put_heartbeat_updates_persisted_bucket_write_proof() {
             .unwrap(),
         "stream create idempotency should ignore the mutable proof lease deadline"
     );
+
+    let mut observed_stale_replica_deadline = false;
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+        let replica_proof = crate::PgMetadataStore::get_stream_upload(&*pg, &session_id)
+            .unwrap()
+            .bucket_write_reservation
+            .expect("every object-PG replica must retain the stream proof");
+        assert!(
+            replica_proof.has_same_stable_identity(&second_renewed),
+            "heartbeat must not change stable reservation identity on node {node_id:?}"
+        );
+        if replica_proof.lease_deadline != second_renewed.lease_deadline {
+            observed_stale_replica_deadline = true;
+            assert_eq!(replica_proof.lease_deadline, initial_proof.lease_deadline);
+        }
+    }
+    assert!(
+        observed_stale_replica_deadline,
+        "the regression must finalize while at least one replica retains the pre-heartbeat deadline"
+    );
+
+    crate::clock::with_time_override(7_000, || {
+        cluster
+            .finalize_put_object_stream(&bucket, &key, &session_id, 0, |_| {
+                Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                    value: (),
+                    versioning: crate::BucketVersioningState::Disabled,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: crate::AclGrants::default(),
+                    public_read: false,
+                    size: 0,
+                    etag_crc64: checksum::crc64::checksum(&[]),
+                    tags: None,
+                    metadata_blob: crate::SerializedMetadataBlob::default(),
+                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption: crate::ObjectEncryption::None,
+                })
+            })
+            .unwrap()
+            .unwrap();
+    });
+
+    let mut converged_state = None;
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+            Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ));
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_version(&*pg, &bucket, &key, crate::VersionId::Null,),
+            Ok(crate::StoredObject::Live(_))
+        ));
+        let state = pg.metadata_command_replica_state().unwrap();
+        if let Some(expected) = &converged_state {
+            assert_eq!(&state, expected);
+        } else {
+            converged_state = Some(state);
+        }
+
+        let bucket_pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+                .unwrap()
+                .is_empty(),
+            "finalization must release the renewed reservation on node {node_id:?}"
+        );
+    }
 }
 
 #[test]

@@ -537,34 +537,12 @@ fn stream_upload_bucket_write_reservation_matches_command(
     create: &CreateStreamUploadCommand,
 ) -> bool {
     match create.session.target {
-        StreamUploadTarget::PutObject => {
-            existing
-                .bucket_write_reservation
-                .as_ref()
-                .is_some_and(|proof| {
-                    bucket_write_reservation_stable_identity_matches(
-                        proof,
-                        &create.bucket_write_reservation,
-                    )
-                })
-        }
+        StreamUploadTarget::PutObject => existing
+            .bucket_write_reservation
+            .as_ref()
+            .is_some_and(|proof| proof.has_same_stable_identity(&create.bucket_write_reservation)),
         StreamUploadTarget::UploadPart { .. } => existing.bucket_write_reservation.is_none(),
     }
-}
-
-fn bucket_write_reservation_stable_identity_matches(
-    left: &BucketWriteReservationProof,
-    right: &BucketWriteReservationProof,
-) -> bool {
-    left.bucket == right.bucket
-        && left.reservation_id == right.reservation_id
-        && left.owner_token == right.owner_token
-        && left.cluster_epoch == right.cluster_epoch
-        && left.bucket_execution_generation == right.bucket_execution_generation
-        && left.bucket_incarnation_generation == right.bucket_incarnation_generation
-        && left.operation_kind == right.operation_kind
-        && left.created_at == right.created_at
-        && left.target_context == right.target_context
 }
 
 fn multipart_upload_matches_command(

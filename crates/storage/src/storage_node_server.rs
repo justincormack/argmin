@@ -32,6 +32,7 @@ use crate::metadata_command::{
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node_client::{
     complete_multipart_expected_object_parts, BucketMetadataNodeClient,
@@ -3731,6 +3732,287 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
+    fn require_stream_put_finalize_snapshot_subject(
+        &self,
+        session_id: &SessionId,
+        snapshot: &crate::StreamPutFinalizeStorageSnapshot,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        if snapshot.session.session_id != *session_id
+            || snapshot.session.bucket != *self.route.bucket
+            || snapshot.session.key != *self.route.key
+            || snapshot.session.target != StreamUploadTarget::PutObject
+            || snapshot.session.state != crate::StreamUploadState::InProgress
+            || snapshot
+                .staging_segments
+                .iter()
+                .any(|segment| segment.session_id != *session_id)
+            || snapshot
+                .stale_payload_source
+                .as_ref()
+                .is_some_and(|stored| {
+                    stored.bucket() != self.route.bucket || stored.key() != self.route.key
+                })
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} snapshot subject does not match active object route"
+                    ),
+                },
+            ));
+        }
+        let reclaim_matches_route = match snapshot.stale_payload.as_ref() {
+            Some(crate::metadata_command::ObjectPayloadReclaimCommand::Segments(reclaim)) => {
+                reclaim.bucket == *self.route.bucket && reclaim.key == *self.route.key
+            }
+            Some(crate::metadata_command::ObjectPayloadReclaimCommand::Multipart(reclaim)) => {
+                reclaim.bucket == *self.route.bucket && reclaim.key == *self.route.key
+            }
+            None => true,
+        };
+        let reclaim_matches_source = match (
+            snapshot.stale_payload.as_ref(),
+            snapshot.stale_payload_source.as_ref(),
+        ) {
+            (None, None) => true,
+            (
+                Some(crate::metadata_command::ObjectPayloadReclaimCommand::Segments(reclaim)),
+                Some(crate::StoredObject::Live(live)),
+            ) => {
+                live.version_id.is_null()
+                    && live.layout == crate::ObjectLayout::Standard
+                    && reclaim.generation_id == live.generation_id
+            }
+            (
+                Some(crate::metadata_command::ObjectPayloadReclaimCommand::Multipart(reclaim)),
+                Some(crate::StoredObject::Live(live)),
+            ) => {
+                live.version_id.is_null()
+                    && matches!(live.layout, crate::ObjectLayout::MultipartManifest { .. })
+                    && reclaim.generation_id == live.generation_id
+            }
+            _ => false,
+        };
+        if !reclaim_matches_route || !reclaim_matches_source {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} stale payload does not match active object route or snapshot"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_stream_put_finalize_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<crate::StreamPutFinalizeStorageSnapshot, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_stream_put_finalize_snapshot(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            session_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn build_stream_put_commit_command(
+        &self,
+        session_id: &SessionId,
+        total_size: u64,
+        expected_snapshot: &crate::StreamPutFinalizeStorageSnapshot,
+        commit: &crate::StreamPutCommitInput,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.require_stream_put_finalize_snapshot_subject(
+            session_id,
+            expected_snapshot,
+            "stream PUT commit command build",
+        )?;
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+            "stream PUT commit command build",
+        )?;
+        if expected_snapshot.session.bucket_write_reservation.as_ref()
+            != Some(bucket_write_reservation)
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "stream PUT commit reservation proof does not match the durable stream session"
+                        .to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
+            &local_client,
+            BuildStreamPutCommitCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                bucket: self.route.bucket,
+                key: self.route.key,
+                session_id,
+                total_size,
+                expected_snapshot,
+                commit,
+                bucket_write_reservation,
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn require_stream_part_finalize_snapshot_subject(
+        &self,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+        snapshot: &crate::StreamUploadPartStorageSnapshot,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let auth = &snapshot.auth_snapshot;
+        if auth.session.session_id != *session_id
+            || auth.session.bucket != *self.route.bucket
+            || auth.session.key != *self.route.key
+            || auth.session.target
+                != (StreamUploadTarget::UploadPart {
+                    upload_id: upload_id.clone(),
+                    part_number,
+                })
+            || auth.session.state != crate::StreamUploadState::InProgress
+            || auth.upload.upload_id != *upload_id
+            || auth.upload.bucket != *self.route.bucket
+            || auth.upload.key != *self.route.key
+            || auth.upload.state != crate::UploadState::InProgress
+            || auth
+                .staging_segments
+                .iter()
+                .any(|segment| segment.session_id != *session_id)
+            || snapshot
+                .existing_part
+                .as_ref()
+                .is_some_and(|part| part.upload_id != *upload_id || part.part_number != part_number)
+            || snapshot.displaced_segments.iter().any(|segment| {
+                segment.bucket != *self.route.bucket
+                    || segment.key != *self.route.key
+                    || segment.upload_id != *upload_id
+                    || segment.part_number != part_number
+            })
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} snapshot subject does not match active object route or part target"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_stream_part_finalize_snapshot(
+        &self,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+    ) -> Result<crate::StreamUploadPartStorageSnapshot, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::load_stream_part_finalize_snapshot(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            upload_id,
+            session_id,
+            part_number,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_stream_part_commit_command(
+        &self,
+        upload_id: &UploadId,
+        session_id: &SessionId,
+        part_number: u32,
+        expected_snapshot: &crate::StreamUploadPartStorageSnapshot,
+        part: &crate::MultipartPartRecord,
+        segments: &[crate::MultipartPartSegmentRecord],
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.require_stream_part_finalize_snapshot_subject(
+            upload_id,
+            session_id,
+            part_number,
+            expected_snapshot,
+            "stream part commit command build",
+        )?;
+        if part.upload_id != *upload_id
+            || part.part_number != part_number
+            || segments.iter().any(|segment| {
+                segment.bucket != *self.route.bucket
+                    || segment.key != *self.route.key
+                    || segment.upload_id != *upload_id
+                    || segment.part_number != part_number
+            })
+        {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "stream part commit payload does not match active object route or part target".to_string(),
+                },
+            ));
+        }
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+            "stream part commit command build",
+        )?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
+            &local_client,
+            BuildStreamPartCommitCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                bucket: self.route.bucket,
+                key: self.route.key,
+                upload_id,
+                session_id,
+                part_number,
+                expected_snapshot,
+                part,
+                segments,
+                bucket_write_reservation,
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn build_create_stream_upload_command(
         &self,
         request: &CreateStreamUploadReq,
@@ -3828,16 +4110,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
             "stream upload bucket write reservation update",
         )?;
-        if current.bucket != renewed.bucket
-            || current.reservation_id != renewed.reservation_id
-            || current.owner_token != renewed.owner_token
-            || current.cluster_epoch != renewed.cluster_epoch
-            || current.bucket_execution_generation != renewed.bucket_execution_generation
-            || current.bucket_incarnation_generation != renewed.bucket_incarnation_generation
-            || current.operation_kind != renewed.operation_kind
-            || current.created_at != renewed.created_at
-            || current.target_context != renewed.target_context
-        {
+        if !current.has_same_stable_identity(renewed) {
             return Err(StorageNodeObjectRouteError::Route(
                 StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::PayloadDecode,
@@ -5730,7 +6003,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad => {
                 match decode_stream_put_finalize_snapshot_request(&frame.payload) {
-                    Ok(request) => self.stream_put_finalize_snapshot_response(request),
+                    Ok(request) => {
+                        self.stream_put_finalize_snapshot_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5739,7 +6014,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamPutCommitCommandBuild => {
                 match decode_stream_put_commit_command_build_request(&frame.payload) {
-                    Ok(request) => self.stream_put_commit_command_build_response(request),
+                    Ok(request) => {
+                        self.stream_put_commit_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5748,7 +6025,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamPartFinalizeSnapshotLoad => {
                 match decode_stream_part_finalize_snapshot_request(&frame.payload) {
-                    Ok(request) => self.stream_part_finalize_snapshot_response(request),
+                    Ok(request) => {
+                        self.stream_part_finalize_snapshot_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5757,7 +6036,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectStreamPartCommitCommandBuild => {
                 match decode_stream_part_commit_command_build_request(&frame.payload) {
-                    Ok(request) => self.stream_part_commit_command_build_response(request),
+                    Ok(request) => {
+                        self.stream_part_commit_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -9020,33 +9301,23 @@ impl StorageNodeConnectionHandler {
 
     fn stream_put_finalize_snapshot_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamPutFinalizeSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "stream PUT finalize snapshot",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let snapshot = match ObjectMutationMetadataNodeClient::load_stream_put_finalize_snapshot(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-            &request.session_id,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let snapshot = match route.load_stream_put_finalize_snapshot(&request.session_id) {
             Ok(snapshot) => snapshot,
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
         };
@@ -9058,42 +9329,41 @@ impl StorageNodeConnectionHandler {
 
     fn stream_put_commit_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamPutCommitCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "stream PUT commit command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response = match ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
-            &local_client,
-            BuildStreamPutCommitCommandReq {
-                pg_id: self
-                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                cluster_epoch: request.object.cluster_epoch,
-                bucket: &request.object.bucket,
-                key: &request.object.key,
-                session_id: &request.session_id,
-                total_size: request.total_size,
-                expected_snapshot: &request.expected_snapshot,
-                commit: &request.commit,
-                bucket_write_reservation: &request.bucket_write_reservation,
-            },
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.build_stream_put_commit_command(
+            &request.session_id,
+            request.total_size,
+            &request.expected_snapshot,
+            &request.commit,
+            &request.bucket_write_reservation,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
-            Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleStreamFinalizeSnapshot,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(error) => match object_metadata_command_build_error_outcome(
-                error,
-                Some("CommitDirectPutObject"),
-            ) {
-                Ok(outcome) => outcome,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            },
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                match object_metadata_command_build_error_outcome(
+                    error,
+                    Some("CommitDirectPutObject"),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -9103,35 +9373,27 @@ impl StorageNodeConnectionHandler {
 
     fn stream_part_finalize_snapshot_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamPartFinalizeSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "stream part finalize snapshot",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let snapshot = match ObjectMutationMetadataNodeClient::load_stream_part_finalize_snapshot(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let snapshot = match route.load_stream_part_finalize_snapshot(
             &request.upload_id,
             &request.session_id,
             request.part_number,
         ) {
             Ok(snapshot) => snapshot,
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error));
             }
         };
@@ -9143,38 +9405,35 @@ impl StorageNodeConnectionHandler {
 
     fn stream_part_commit_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamPartCommitCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "stream part commit command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response = match ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
-            &local_client,
-            BuildStreamPartCommitCommandReq {
-                pg_id: self
-                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                cluster_epoch: request.object.cluster_epoch,
-                bucket: &request.object.bucket,
-                key: &request.object.key,
-                upload_id: &request.upload_id,
-                session_id: &request.session_id,
-                part_number: request.part_number,
-                expected_snapshot: &request.expected_snapshot,
-                part: &request.part,
-                segments: &request.segments,
-                bucket_write_reservation: &request.bucket_write_reservation,
-            },
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.build_stream_part_commit_command(
+            &request.upload_id,
+            &request.session_id,
+            request.part_number,
+            &request.expected_snapshot,
+            &request.part,
+            &request.segments,
+            &request.bucket_write_reservation,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
-            Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleStreamFinalizeSnapshot,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 match object_metadata_command_build_error_outcome(error, Some("CommitStreamPart")) {
                     Ok(outcome) => outcome,
                     Err(error) => return encode_storage_rpc_error_response(&error),
@@ -19240,8 +19499,11 @@ mod tests {
         let mut upload_part_stream_proof = proof.clone();
         upload_part_stream_proof.operation_kind =
             UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+        let mut upload_part_finalize_proof = proof.clone();
+        upload_part_finalize_proof.operation_kind =
+            UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND.to_string();
         let upload_part_stream_create_request = CreateStreamUploadReq {
-            session_id: upload_part_stream_session_id,
+            session_id: upload_part_stream_session_id.clone(),
             bucket: bucket.clone(),
             key: key.clone(),
             target: StreamUploadTarget::UploadPart {
@@ -19628,6 +19890,231 @@ mod tests {
             upload
         });
         assert_eq!(multipart_upload.upload_id, upload_id);
+
+        let put_finalize_snapshot = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .load_stream_put_finalize_snapshot(&reservation_id)
+                .unwrap()
+        });
+        let put_commit = crate::StreamPutCommitInput {
+            versioning: BucketVersioningState::Suspended,
+            version_id: VersionId::Null,
+            owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            size: 0,
+            etag_crc64: 0,
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+        };
+        let put_finalize_command = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .build_stream_put_commit_command(
+                    &reservation_id,
+                    0,
+                    &put_finalize_snapshot,
+                    &put_commit,
+                    &renewed_stream_proof,
+                )
+                .unwrap()
+        });
+        let MetadataCommandPayload::CommitDirectPutObject(put_finalize) =
+            put_finalize_command.payload()
+        else {
+            panic!("active object route must build a stream PUT commit command");
+        };
+        assert!(put_finalize.matches_stream_session(&bucket, &key, &reservation_id));
+        assert_eq!(put_finalize.bucket_write_reservation, renewed_stream_proof);
+
+        let part_finalize_snapshot = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .load_stream_part_finalize_snapshot(&upload_id, &upload_part_stream_session_id, 1)
+                .unwrap()
+        });
+        let finalized_part = crate::MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            generation: 0,
+            size: 0,
+            payload_crc64: 0,
+            etag: Vec::new(),
+            etag_kind: crate::EtagKind::Crc64,
+            part_okh: [0; 16],
+            part_vid: GenerationId::MIN,
+            placement_cluster_epoch: config.cluster_epoch,
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 1_000,
+            checksum: None,
+        };
+        let part_finalize_command = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .build_stream_part_commit_command(
+                    &upload_id,
+                    &upload_part_stream_session_id,
+                    1,
+                    &part_finalize_snapshot,
+                    &finalized_part,
+                    &[],
+                    &upload_part_finalize_proof,
+                )
+                .unwrap()
+        });
+        let MetadataCommandPayload::CommitStreamPart(part_finalize) =
+            part_finalize_command.payload()
+        else {
+            panic!("active object route must build a stream part commit command");
+        };
+        assert_eq!(part_finalize.bucket, bucket);
+        assert_eq!(part_finalize.key, key);
+        assert_eq!(part_finalize.upload.upload_id, upload_id);
+        assert_eq!(part_finalize.session_id, upload_part_stream_session_id);
+        assert_eq!(
+            part_finalize.bucket_write_reservation,
+            upload_part_finalize_proof
+        );
+
+        let mut mismatched_put_finalize_snapshot = put_finalize_snapshot.clone();
+        mismatched_put_finalize_snapshot.session.key =
+            crate::tests::object_key("different-put-finalize-snapshot-key");
+        let mismatched_put_finalize = crate::clock::with_time_override(1_000, || {
+            primary_route.build_stream_put_commit_command(
+                &reservation_id,
+                0,
+                &mismatched_put_finalize_snapshot,
+                &put_commit,
+                &renewed_stream_proof,
+            )
+        });
+        match mismatched_put_finalize {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("snapshot subject does not match"));
+            }
+            other => panic!("mismatched stream PUT snapshot must fail: {other:?}"),
+        }
+        let crossed_put_finalize_proof = crate::clock::with_time_override(1_000, || {
+            primary_route.build_stream_put_commit_command(
+                &reservation_id,
+                0,
+                &put_finalize_snapshot,
+                &put_commit,
+                &upload_part_finalize_proof,
+            )
+        });
+        match crossed_put_finalize_proof {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => panic!("crossed stream PUT finalize proof must fail: {other:?}"),
+        }
+        let mut substituted_put_finalize_proof = renewed_stream_proof.clone();
+        substituted_put_finalize_proof.reservation_id =
+            "different-active-object-route-proof".to_string();
+        let substituted_put_finalize = crate::clock::with_time_override(1_000, || {
+            primary_route.build_stream_put_commit_command(
+                &reservation_id,
+                0,
+                &put_finalize_snapshot,
+                &put_commit,
+                &substituted_put_finalize_proof,
+            )
+        });
+        match substituted_put_finalize {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("durable stream session"));
+            }
+            other => panic!("substituted stream PUT finalize proof must fail: {other:?}"),
+        }
+        let local_client = LocalStorageNodeClient::new(config.node_id, Arc::clone(&server._node));
+        let substituted_local_put_finalize = crate::clock::with_time_override(1_000, || {
+            ObjectMutationMetadataNodeClient::build_stream_put_commit_command(
+                &local_client,
+                BuildStreamPutCommitCommandReq {
+                    pg_id: primary_route.route.pg_id,
+                    cluster_epoch: config.cluster_epoch,
+                    bucket: &bucket,
+                    key: &key,
+                    session_id: &reservation_id,
+                    total_size: 0,
+                    expected_snapshot: &put_finalize_snapshot,
+                    commit: &put_commit,
+                    bucket_write_reservation: &substituted_put_finalize_proof,
+                },
+            )
+        });
+        assert!(matches!(
+            substituted_local_put_finalize,
+            Err(ObjectPgActionError::InvalidRequest { reason })
+                if reason.contains("durable stream session")
+        ));
+
+        let mut mismatched_part_finalize_snapshot = part_finalize_snapshot.clone();
+        mismatched_part_finalize_snapshot.auth_snapshot.upload.key =
+            crate::tests::object_key("different-part-finalize-snapshot-key");
+        let mismatched_part_finalize = crate::clock::with_time_override(1_000, || {
+            primary_route.build_stream_part_commit_command(
+                &upload_id,
+                &upload_part_stream_session_id,
+                1,
+                &mismatched_part_finalize_snapshot,
+                &finalized_part,
+                &[],
+                &upload_part_finalize_proof,
+            )
+        });
+        match mismatched_part_finalize {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("snapshot subject does not match"));
+            }
+            other => panic!("mismatched stream part snapshot must fail: {other:?}"),
+        }
+        let mut mismatched_finalized_part = finalized_part.clone();
+        mismatched_finalized_part.upload_id =
+            crate::tests::multipart_upload_id("different-finalized-part-upload");
+        let mismatched_part_payload = crate::clock::with_time_override(1_000, || {
+            primary_route.build_stream_part_commit_command(
+                &upload_id,
+                &upload_part_stream_session_id,
+                1,
+                &part_finalize_snapshot,
+                &mismatched_finalized_part,
+                &[],
+                &upload_part_finalize_proof,
+            )
+        });
+        match mismatched_part_payload {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("payload does not match"));
+            }
+            other => panic!("mismatched stream part payload must fail: {other:?}"),
+        }
+        let crossed_part_finalize_proof = crate::clock::with_time_override(1_000, || {
+            primary_route.build_stream_part_commit_command(
+                &upload_id,
+                &upload_part_stream_session_id,
+                1,
+                &part_finalize_snapshot,
+                &finalized_part,
+                &[],
+                &renewed_stream_proof,
+            )
+        });
+        match crossed_part_finalize_proof {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => panic!("crossed stream part finalize proof must fail: {other:?}"),
+        }
+
         let put_stream_command = crate::clock::with_time_override(1_000, || {
             primary_route
                 .build_create_stream_upload_command(
@@ -20238,6 +20725,48 @@ mod tests {
                     "stream upload segment list",
                     primary_route
                         .load_stream_upload_segments(&reservation_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "stream PUT finalize snapshot load",
+                    primary_route
+                        .load_stream_put_finalize_snapshot(&reservation_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "stream PUT commit command build",
+                    primary_route
+                        .build_stream_put_commit_command(
+                            &reservation_id,
+                            0,
+                            &put_finalize_snapshot,
+                            &put_commit,
+                            &renewed_stream_proof,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "stream part finalize snapshot load",
+                    primary_route
+                        .load_stream_part_finalize_snapshot(
+                            &upload_id,
+                            &upload_part_stream_session_id,
+                            1,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "stream part commit command build",
+                    primary_route
+                        .build_stream_part_commit_command(
+                            &upload_id,
+                            &upload_part_stream_session_id,
+                            1,
+                            &part_finalize_snapshot,
+                            &finalized_part,
+                            &[],
+                            &upload_part_finalize_proof,
+                        )
                         .map(|_| ()),
                 ),
                 (
@@ -25447,7 +25976,6 @@ mod tests {
                 last_modified_millis: 124,
                 stale_payload: None,
                 bucket_write_reservation: test_bucket_write_reservation_proof(bucket.clone(), &key),
-                stream_create_bucket_write_reservation: None,
             })),
         );
         pg.apply_metadata_command_and_record(7, &replacement_live)

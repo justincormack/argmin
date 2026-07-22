@@ -7695,15 +7695,12 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
     let before_object_pg_proof = source_cluster
         .test_object_pg_metadata_proof(&bucket, &key)
         .unwrap();
-    let reservation = source_cluster
-        .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "control-plane-peering-stale-unix-stream-put-finalize",
-            Some(key.as_str()),
-        )
-        .unwrap();
-    let proof = crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
-    let finalize_reservation_id = proof.reservation_id.clone();
+    let stream_reservation_id = source_cluster
+        .load_stream_upload_session(&bucket, &key, &session_id)
+        .unwrap()
+        .bucket_write_reservation
+        .unwrap()
+        .reservation_id;
     drop(source_cluster);
     drop(source_map);
 
@@ -7833,7 +7830,6 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             &key,
             &session_id,
             payload.len() as u64,
-            proof,
             |_| -> Result<crate::PreparedStreamPutCommit<()>, ()> {
                 panic!("old-primary stream PUT finalization should fail before preparing commit metadata")
             },
@@ -7859,6 +7855,10 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
         .storage_node()
         .pg_topology()
         .bucket_pg_for(&bucket);
+    let bucket_primary_node_id = current_map
+        .metadata_pg_primary_node(current_epoch, PgId::new(bucket_pg))
+        .unwrap()
+        .node_id();
     for config in &server_configs {
         let remote = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
@@ -7915,18 +7915,19 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             config.node_id
         );
 
-        let bucket_pg_store = remote.get_pg(bucket_pg).unwrap();
-        assert!(
-            !crate::PgMetadataStore::durable_bucket_write_reservations(
-                &*bucket_pg_store,
-                &bucket,
-            )
-            .unwrap()
-            .iter()
-            .any(|reservation| reservation.reservation_id == finalize_reservation_id),
-            "old-primary Unix stream PUT finalization must release its finalize bucket write reservation on node {:?}",
-            config.node_id
-        );
+        if config.node_id == bucket_primary_node_id {
+            let bucket_pg_store = remote.get_pg(bucket_pg).unwrap();
+            assert!(
+                crate::PgMetadataStore::durable_bucket_write_reservations(
+                    &*bucket_pg_store,
+                    &bucket,
+                )
+                .unwrap()
+                .iter()
+                .any(|reservation| reservation.reservation_id == stream_reservation_id),
+                "old-primary Unix stream PUT finalization must preserve its stream bucket write reservation on the bucket primary"
+            );
+        }
     }
 
     for (written_shard, location) in written.iter().zip(written_locations) {

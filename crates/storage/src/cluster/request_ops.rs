@@ -28,6 +28,7 @@ use crate::metadata_command::{
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node::ReclaimQueueInsert;
 use crate::node_client::{
@@ -4011,10 +4012,10 @@ impl super::StorageCluster {
                 &proof.bucket,
             )
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-        let Some(current) = reservations.into_iter().find(|record| {
-            Self::bucket_write_reservation_stable_identity_matches(proof, record)
-                && record.lease_deadline > now
-        }) else {
+        let Some(current) = reservations
+            .into_iter()
+            .find(|record| proof.matches_record(record) && record.lease_deadline > now)
+        else {
             return Ok(false);
         };
         let renewed = BucketWriteReservationProof::from(&current);
@@ -4054,10 +4055,10 @@ impl super::StorageCluster {
                 &proof.bucket,
             )
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-        let Some(current) = reservations.into_iter().find(|record| {
-            Self::bucket_write_reservation_stable_identity_matches(proof, record)
-                && record.lease_deadline > now
-        }) else {
+        let Some(current) = reservations
+            .into_iter()
+            .find(|record| proof.matches_record(record) && record.lease_deadline > now)
+        else {
             return Ok(None);
         };
         let renewed = BucketWriteReservationProof::from(&current);
@@ -4071,21 +4072,6 @@ impl super::StorageCluster {
                 &renewed,
             )?;
         Ok(Some(renewed))
-    }
-
-    fn bucket_write_reservation_stable_identity_matches(
-        proof: &BucketWriteReservationProof,
-        record: &BucketWriteReservationRecord,
-    ) -> bool {
-        proof.bucket == record.bucket
-            && proof.reservation_id == record.reservation_id
-            && proof.owner_token == record.owner_token
-            && proof.cluster_epoch == record.cluster_epoch
-            && proof.bucket_execution_generation == record.bucket_execution_generation
-            && proof.bucket_incarnation_generation == record.bucket_incarnation_generation
-            && proof.operation_kind == record.operation_kind
-            && proof.created_at == record.created_at
-            && proof.target_context == record.target_context
     }
 
     fn active_put_object_stream_upload_source(
@@ -11376,89 +11362,39 @@ impl super::StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
         total_size: u64,
-        bucket_write_reservation: BucketWriteReservationProof,
         mut action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
         crate::metadata_command::metadata_command_publisher!(FinalizePutObjectStream);
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
-        let effective_bucket_write_reservation = bucket_write_reservation;
-        let mut bucket_write_proof_command_owned = false;
-        macro_rules! release_caller_bucket_write_proof_if_unowned {
-            () => {{
-                if !bucket_write_proof_command_owned {
-                    self.release_bucket_write_reservation_proof(&effective_bucket_write_reservation)
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
-                } else {
-                    Ok(())
-                }
-            }};
-        }
-        let mutation_client = match self.object_mutation_metadata_primary_client(bucket, key) {
-            Ok(client) => client,
-            Err(error) => {
-                release_caller_bucket_write_proof_if_unowned!()?;
-                return Err(error.into());
-            }
-        };
+        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let mut stale_snapshot_work_budget =
             super::RequestWorkBudget::new(super::STREAM_PUT_STALE_COMMIT_RETRY_BUDGET, None)
                 .for_operation("finalize_stream_put")
                 .for_pg(pg_id);
 
         let (command, new_pending_command, prepared) = loop {
-            while let Some(command) = match self.pending_metadata_command_for_bucket(pg_id, bucket)
-            {
-                Ok(command) => command,
-                Err(error) => {
-                    release_caller_bucket_write_proof_if_unowned!()?;
-                    return Err(error.into());
-                }
-            } {
+            while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                 let is_matching_stream_commit = matches!(
                     command.payload(),
                     MetadataCommandPayload::CommitDirectPutObject(commit)
-                        if commit.matches_request(
-                            bucket,
-                            key,
-                            session_id,
-                            commit.object.generation_id,
-                        )
-                        && commit.bucket_write_reservation == effective_bucket_write_reservation
+                        if commit.matches_stream_session(bucket, key, session_id)
                 );
                 if is_matching_stream_commit {
-                    bucket_write_proof_command_owned = true;
                     break;
                 }
-                if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command) {
-                    release_caller_bucket_write_proof_if_unowned!()?;
-                    return Err(error);
-                }
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
             }
 
-            let pending_command = match self.pending_metadata_command_for_bucket(pg_id, bucket) {
-                Ok(command) => command,
-                Err(error) => {
-                    release_caller_bucket_write_proof_if_unowned!()?;
-                    return Err(error.into());
-                }
-            }
-            .filter(|command| {
-                matches!(
-                    command.payload(),
-                    MetadataCommandPayload::CommitDirectPutObject(commit)
-                        if commit.matches_request(
-                            bucket,
-                            key,
-                            session_id,
-                            commit.object.generation_id,
-                        )
-                        && commit.bucket_write_reservation == effective_bucket_write_reservation
-                )
-            });
-            if pending_command.is_some() {
-                bucket_write_proof_command_owned = true;
-            }
+            let pending_command = self
+                .pending_metadata_command_for_bucket(pg_id, bucket)?
+                .filter(|command| {
+                    matches!(
+                        command.payload(),
+                        MetadataCommandPayload::CommitDirectPutObject(commit)
+                            if commit.matches_stream_session(bucket, key, session_id)
+                    )
+                });
 
             let storage_snapshot = match mutation_client.load_stream_put_finalize_snapshot(
                 object_pg_id,
@@ -11473,45 +11409,48 @@ impl super::StorageCluster {
                     }),
                 ) => {
                     if let Some(command) = pending_command.clone() {
-                        if let Err(error) = self.apply_exact_pending_object_metadata_command(
+                        self.apply_exact_pending_object_metadata_command(
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
-                        ) {
-                            release_caller_bucket_write_proof_if_unowned!()?;
-                            return Err(error);
-                        }
+                        )?;
                         continue;
                     }
-                    release_caller_bucket_write_proof_if_unowned!()?;
                     return Err(error);
                 }
-                Err(error) => {
-                    release_caller_bucket_write_proof_if_unowned!()?;
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
+            let Some(effective_bucket_write_reservation) =
+                storage_snapshot.session.bucket_write_reservation.as_ref()
+            else {
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "PutObject stream session is missing bucket write proof".to_string(),
+                });
+            };
+            if pending_command.as_ref().is_some_and(|command| {
+                matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.bucket_write_reservation != *effective_bucket_write_reservation
+                )
+            }) {
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "pending stream PUT commit reservation proof does not match the durable stream session"
+                        .to_string(),
+                });
+            }
             let prepared = match action(StreamPutFinalizeSnapshot {
                 session: storage_snapshot.session.clone(),
                 existing_etag: storage_snapshot.existing_etag.clone(),
             }) {
                 Ok(prepared) => prepared,
-                Err(error) => {
-                    release_caller_bucket_write_proof_if_unowned!()?;
-                    return Ok(Err(error));
-                }
+                Err(error) => return Ok(Err(error)),
             };
 
             let (command, new_pending_command) = match pending_command {
                 Some(command) => (command, false),
                 None => {
                     let version_id = if prepared.versioning == BucketVersioningState::Enabled {
-                        match self.reserve_next_object_version_for_completion(pg_id, bucket, key) {
-                            Ok(version_id) => version_id,
-                            Err(error) => {
-                                release_caller_bucket_write_proof_if_unowned!()?;
-                                return Err(error);
-                            }
-                        }
+                        self.reserve_next_object_version_for_completion(pg_id, bucket, key)?
                     } else {
                         VersionId::Null
                     };
@@ -11543,7 +11482,7 @@ impl super::StorageCluster {
                             total_size,
                             expected_snapshot: &storage_snapshot,
                             commit: &commit,
-                            bucket_write_reservation: &effective_bucket_write_reservation,
+                            bucket_write_reservation: effective_bucket_write_reservation,
                         },
                     ) {
                         Ok(command) => command,
@@ -11551,7 +11490,6 @@ impl super::StorageCluster {
                             if let Err(error) = stale_snapshot_work_budget.sleep_after_contention(
                                 "stream PUT stale commit snapshot retry budget exhausted",
                             ) {
-                                release_caller_bucket_write_proof_if_unowned!()?;
                                 return Err(ObjectPgActionError::Store(error));
                             }
                             continue;
@@ -11559,18 +11497,10 @@ impl super::StorageCluster {
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            if let Err(error) = self
-                                .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                            {
-                                release_caller_bucket_write_proof_if_unowned!()?;
-                                return Err(error);
-                            }
+                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                             continue;
                         }
-                        Err(error) => {
-                            release_caller_bucket_write_proof_if_unowned!()?;
-                            return Err(error);
-                        }
+                        Err(error) => return Err(error),
                     };
                     let installed = match self
                         .try_install_pending_metadata_command_for_bucket(pg_id, bucket, &command)
@@ -11579,18 +11509,10 @@ impl super::StorageCluster {
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            if let Err(error) = self
-                                .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                            {
-                                release_caller_bucket_write_proof_if_unowned!()?;
-                                return Err(error);
-                            }
+                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
                             continue;
                         }
-                        Err(error) => {
-                            release_caller_bucket_write_proof_if_unowned!()?;
-                            return Err(error);
-                        }
+                        Err(error) => return Err(error),
                     };
                     if !installed {
                         continue;
@@ -12769,7 +12691,7 @@ impl super::StorageCluster {
             if pending_command.is_none() {
                 let reservation = match self.acquire_durable_bucket_write_reservation(
                     bucket,
-                    "upload-part-stream-finalize",
+                    UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
                     Some(key.as_str()),
                 ) {
                     Ok(reservation) => reservation,

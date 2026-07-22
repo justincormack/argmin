@@ -3346,7 +3346,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 last_modified_millis,
                 stale_payload,
                 bucket_write_reservation: request.bucket_write_reservation.clone(),
-                stream_create_bucket_write_reservation: None,
             })),
         ))
     }
@@ -3399,6 +3398,15 @@ impl StorageNodeClient for LocalStorageNodeClient {
         )?;
         if &current != request.expected_snapshot {
             return Err(ObjectPgActionError::StaleStreamFinalizeSnapshot);
+        }
+        if current.session.bucket_write_reservation.as_ref()
+            != Some(request.bucket_write_reservation)
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason:
+                    "stream PUT commit reservation proof does not match the durable stream session"
+                        .to_string(),
+            });
         }
         let segments_total: u64 = current
             .staging_segments
@@ -3505,10 +3513,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 last_modified_millis,
                 stale_payload,
                 bucket_write_reservation: request.bucket_write_reservation.clone(),
-                stream_create_bucket_write_reservation: current
-                    .session
-                    .bucket_write_reservation
-                    .clone(),
             })),
         ))
     }
