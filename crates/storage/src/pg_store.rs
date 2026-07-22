@@ -123,7 +123,8 @@ pub const MAX_PG_DURABLE_IDENTITY_BYTES: usize = 1024;
 ///
 /// Identity validation and inventory completeness are intentionally separate:
 /// every deployment mode must reject a foreign/unbound PG database, while a
-/// replicated node may start fenced and repair an incomplete local inventory.
+/// replicated node may keep the PG active and repair an incomplete local
+/// payload inventory through EC reconstruction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PgShardInventoryInspection {
     pub shard_row_count: usize,

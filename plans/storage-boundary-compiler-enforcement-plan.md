@@ -157,7 +157,12 @@ Implementation may continue incrementally, but the sequence is explicit:
    the outer policy foundation;
 2. activate manifest credentials and enforce that policy at the Unix boundary,
    retaining all existing route/subject checks while capability migration is
-   incomplete;
+   incomplete; this is complete for split-role replicated frontend and
+   storage-node processes, including operation-scoped frontend/maintenance
+   signer selection, auth retention across map refresh/recovery, durable static
+   storage identity verification under a lifetime lock, and a process-wide
+   pre-authentication allocation budget. `combined` remains fail-closed pending
+   equivalent workflow-specific credential composition;
 3. continue converting handlers and node-client APIs by complete workflow,
    adding a composed test that crosses both auth and local capability layers
    for each converted workflow;
@@ -2148,6 +2153,9 @@ Boundary-changing phases also require:
   and subject-mismatched route capabilities
 - composed authenticated RPC tests that independently cover a valid credential
   with the wrong role and a valid role with invalid route/subject evidence
+- workflow-to-transport tests proving frontend and maintenance code receive
+  distinct role-typed signing capabilities, with no generic client-side
+  credential set or operation-driven signer selection
 - deterministic contention/recovery tests for affected command publishers
 - review of public exports and enabled Cargo features
 
@@ -2194,12 +2202,15 @@ This plan is complete when:
    transport-neutral RPC client interfaces, with every enabled RPC transport
    entering the same capability-construction adapter after mandatory auth or
    the explicit standalone-local auth opt-out
-4. PG role and route authority are represented by non-forgeable types with
+4. authenticated workflows receive one role-typed signer capability and the
+   transport retains that exact signer for response verification; credentials
+   are never ambient authority selected by an RPC kind
+5. PG role and route authority are represented by non-forgeable types with
    private trusted construction; route capabilities are request-scoped,
    non-cloneable, deadline-bound, and revalidated at durable effects
-5. raw pending-command installation is inaccessible to operation publishers
-6. publisher retry/convergence classes are explicit and exhaustively handled
+6. raw pending-command installation is inaccessible to operation publishers
+7. publisher retry/convergence classes are explicit and exhaustively handled
    in Rust
-7. test-only mutation APIs are absent from production dependency surfaces
-8. the remaining boundary script contains only justified semantic checks that
+8. test-only mutation APIs are absent from production dependency surfaces
+9. the remaining boundary script contains only justified semantic checks that
    cannot reasonably be enforced by Rust or Cargo

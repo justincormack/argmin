@@ -133,8 +133,13 @@ profile policy. Inventory validation is non-mutating and delegates cleanup of
 safe crash residue, such as unindexed published files or missing files for
 `Deleting` rows, to the normal PG recovery/scavenger boundary. Standalone has
 no repair source and therefore rejects missing or truncated live shards;
-replicated mode will admit such a node only as fenced/non-serving until repair
-completes. Initialization is idempotent for the same complete state and can
+replicated mode reports the node-local payload damage without changing the
+cluster-wide PG route state. Reads remain available when at least `k` valid EC
+shards can be reached, and read-time recovery, scrub, and the durable repair
+queue restore the missing local payload. Identity or metadata-integrity failure
+still fails startup; payload inventory loss alone does not fence unrelated
+objects or disable the repair path. Initialization is idempotent for the same
+complete state and can
 resume a matching interrupted first initialization. A nonempty unbound
 directory, marker-only normal startup, wrong process/cluster/generation, or
 identity-only relocation fails closed.
@@ -270,6 +275,7 @@ host_id = "host-1"
 kind = "frontend"
 frontend_instance_id = "frontend-1"
 admin_instance_id = "frontend-1-admin"
+maintenance_instance_id = "frontend-1-maintenance"
 
 [[authorities]]
 id = "authority-101"
@@ -864,8 +870,9 @@ inspects the authoritative shard-row/file inventory independently. The shared
 inspection rejects symlinked/cross-device shard roots, distinguishes safe
 crash residue from missing or truncated live shards, and does not perform
 recovery itself. Standalone rejects authoritative inventory loss because it
-has no repair source; replicated mode starts
-the affected node fenced and repairs from surviving failure domains. An
+has no repair source; replicated mode records node-local payload damage while
+keeping the cluster-wide PG route state available for EC reconstruction and
+repair from surviving failure domains. An
 explicit relocation command nevertheless requires a complete authoritative
 inventory before it
 publishes destination completion. An empty or partially copied destination is
@@ -1004,8 +1011,9 @@ Progress as of 2026-07-21:
   initialization, each PG database is bound to that identity, and ordinary
   startup uses the shared durable-identity and shard-inventory verifier.
   Standalone requires a complete authoritative inventory; replicated startup
-  will reuse the report to remain fenced while recoverable live-shard loss is
-  repaired. Safe crash residue remains owned by PG recovery/scavenging. The
+  retains the report as node-local payload-damage diagnostics while preserving
+  the replicated PG route state so EC reads and repair remain available. Safe
+  crash residue remains owned by PG recovery/scavenging. The
   configured initial cluster epoch is used by both initialization and normal
   runtime open. Complete path relocation is accepted because paths remain
   outside durable identity, while empty, partial, wrong-cluster,
@@ -1093,9 +1101,47 @@ Progress as of 2026-07-21:
   and sentinel publication now creates private `0600` files so later static
   command preflight can revalidate established state.
   The transport-independent storage RPC auth codec and role-policy foundation
-  is now implemented and tested, but replicated storage/frontend process
-  mapping, Unix enforcement, and storage RPC TCP remain open. This slice still
-  does not claim a complete cross-host data-plane workload.
+  is implemented and the first runtime activation slice is complete for
+  split-role replicated Unix processes. Static frontend and storage-node
+  process mapping now resolves stable storage-process, frontend, admin, and
+  maintenance principals from the manifest. Credentials are converted once
+  into role-typed client capabilities; the generic transport auth context is
+  crate-private and never selects from ambient credentials by operation kind.
+  Foreground coordinators retain only a frontend-authenticated runtime-map
+  handle, while reclaim, lifecycle, scavenger, repair, backfill, and session
+  workers receive a separately refreshed maintenance-authenticated handle.
+  Each handle preserves its exact signer across content-changing runtime-map
+  refresh and historical recovery, including response verification. Every
+  maintenance worker samples that handle for each sweep or work item rather
+  than retaining the startup map; work already admitted remains pinned to one
+  map while the next item observes a published epoch. When no distinct
+  maintenance signer is configured, maintenance workflows share the exact
+  foreground runtime-map handle and refresh owner rather than constructing an
+  unrefreshed duplicate. Storage
+  startup verifies the bound static and per-PG identities before opening
+  mutable state or contacting the control plane and retains the static runtime
+  lock for the server lifetime. Standalone startup requires a complete
+  authoritative shard inventory. Replicated startup instead reports incomplete
+  node-local payload inventory as damage diagnostics without publishing a
+  different PG state: `PgState` remains the cluster-wide routing and
+  metadata-authority lifecycle, while individual missing/corrupt payload shards
+  remain segment-level repair state. This keeps EC-reconstructible reads and
+  the repair worker available. Storage
+  listeners install every active accepted credential and
+  share one process-wide pre-authentication byte budget, held from frame
+  allocation through verification. The selected storage transport profile's
+  frame, connection, and I/O-timeout limits are enforced by both Unix clients
+  and listeners; client admission uses the strictest selected endpoint limit.
+  Request identity, topology, target,
+  freshness, operation, role, payload limits, and response binding are checked
+  before route admission or local capability construction. Legacy unframed
+  traffic cannot interoperate with an authenticated listener. Focused coverage
+  crosses the real Unix client/server boundary and rejects missing framing,
+  wrong target, and wrong topology before dispatch. Replicated `combined`
+  processes remain fail-closed until their embedded workflows receive the same
+  operation-scoped credential composition. Storage RPC TCP activation and its
+  composed cross-host workload also remain open, so this slice does not yet
+  claim a complete cross-host data plane.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state

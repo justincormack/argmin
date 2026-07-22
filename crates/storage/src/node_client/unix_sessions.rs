@@ -4,6 +4,7 @@ pub(crate) struct UnixStorageNodeReadHandleSession {
     node_id: NodeId,
     stream: UnixStream,
     next_request_id: u64,
+    rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
     _rpc_permit: Option<UnixStorageNodeRpcAdmissionPermit>,
     _object_payload_lease_permit: Option<UnixStorageNodeObjectPayloadLeaseAdmissionPermit>,
 }
@@ -11,6 +12,7 @@ pub(crate) struct UnixStorageNodeReadHandleSession {
 pub(crate) struct UnixStorageNodeMetadataCommandSession {
     node_id: NodeId,
     cluster_epoch: ClusterEpoch,
+    rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
     _rpc_permit: UnixStorageNodeRpcAdmissionPermit,
     inner: Mutex<UnixStorageNodeMetadataCommandSessionInner>,
 }
@@ -53,11 +55,13 @@ impl UnixStorageNodeClient {
         configure_storage_rpc_stream_timeout(
             &stream,
             "configure storage-node read-handle RPC socket timeout",
+            self.rpc_auth.as_deref(),
         )?;
         Ok(UnixStorageNodeReadHandleSession {
             node_id: self.node_id,
             stream,
             next_request_id: 1,
+            rpc_auth: self.rpc_auth.clone(),
             _rpc_permit: Some(rpc_permit),
             _object_payload_lease_permit: None,
         })
@@ -75,11 +79,13 @@ impl UnixStorageNodeClient {
         configure_storage_rpc_stream_timeout(
             &stream,
             "configure storage-node object-payload lease RPC socket timeout",
+            self.rpc_auth.as_deref(),
         )?;
         Ok(UnixStorageNodeReadHandleSession {
             node_id: self.node_id,
             stream,
             next_request_id: 1,
+            rpc_auth: self.rpc_auth.clone(),
             _rpc_permit: None,
             _object_payload_lease_permit: Some(lease_permit),
         })
@@ -156,10 +162,12 @@ impl UnixStorageNodeClient {
         configure_storage_rpc_stream_timeout(
             &stream,
             "configure storage-node metadata command RPC socket timeout",
+            self.rpc_auth.as_deref(),
         )?;
         let session = UnixStorageNodeMetadataCommandSession {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
+            rpc_auth: self.rpc_auth.clone(),
             _rpc_permit: rpc_permit,
             inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
                 stream,
@@ -267,12 +275,20 @@ impl UnixStorageNodeReadHandleSession {
             kind,
             payload,
         };
-        write_storage_rpc_frame_to(&mut self.stream, &request).map_err(|error| {
-            storage_rpc_stream_error(self.node_id, "write read-handle RPC request", error)
-        })?;
-        let response = read_storage_rpc_frame_from(&mut self.stream).map_err(|error| {
-            storage_rpc_stream_error(self.node_id, "read read-handle RPC response", error)
-        })?;
+        write_unix_storage_rpc_request(
+            &mut self.stream,
+            self.node_id,
+            self.rpc_auth.as_deref(),
+            &request,
+            "write read-handle RPC request",
+        )?;
+        let response = read_unix_storage_rpc_response(
+            &mut self.stream,
+            self.node_id,
+            self.rpc_auth.as_deref(),
+            &request,
+            "read read-handle RPC response",
+        )?;
         if response.request_id != request_id || response.kind != kind {
             return Err(self.rpc_payload_error(
                 "validate read-handle RPC response",
@@ -362,20 +378,20 @@ impl UnixStorageNodeMetadataCommandSession {
             kind,
             payload,
         };
-        write_storage_rpc_frame_to(&mut inner.stream, &request).map_err(|error| {
-            storage_rpc_stream_error(
-                self.node_id,
-                "write metadata command session RPC request",
-                error,
-            )
-        })?;
-        let response = read_storage_rpc_frame_from(&mut inner.stream).map_err(|error| {
-            storage_rpc_stream_error(
-                self.node_id,
-                "read metadata command session RPC response",
-                error,
-            )
-        })?;
+        write_unix_storage_rpc_request(
+            &mut inner.stream,
+            self.node_id,
+            self.rpc_auth.as_deref(),
+            &request,
+            "write metadata command session RPC request",
+        )?;
+        let response = read_unix_storage_rpc_response(
+            &mut inner.stream,
+            self.node_id,
+            self.rpc_auth.as_deref(),
+            &request,
+            "read metadata command session RPC response",
+        )?;
         if response.request_id != request_id || response.kind != kind {
             return Err(self.rpc_payload_error(
                 "validate metadata command session RPC response",
@@ -1906,6 +1922,7 @@ mod tests {
             node_id: NodeId::new(8),
             stream: read_stream,
             next_request_id: 1,
+            rpc_auth: None,
             _rpc_permit: Some(test_rpc_admission_permit()),
             _object_payload_lease_permit: None,
         };
@@ -1926,6 +1943,7 @@ mod tests {
         let metadata_session = UnixStorageNodeMetadataCommandSession {
             node_id: NodeId::new(9),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            rpc_auth: None,
             _rpc_permit: test_rpc_admission_permit(),
             inner: Mutex::new(UnixStorageNodeMetadataCommandSessionInner {
                 stream: metadata_stream,

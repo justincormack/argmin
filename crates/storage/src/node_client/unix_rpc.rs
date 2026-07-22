@@ -1282,7 +1282,7 @@ impl UnixStorageNodeClient {
             &socket_path,
             UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
         );
-        Self::with_rpc_admission(node_id, cluster_epoch, socket_path, rpc_admission)
+        Self::with_rpc_admission(node_id, cluster_epoch, socket_path, rpc_admission, None)
     }
 
     pub(crate) fn with_rpc_admission(
@@ -1290,6 +1290,7 @@ impl UnixStorageNodeClient {
         cluster_epoch: ClusterEpoch,
         socket_path: PathBuf,
         rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
+        rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
     ) -> Self {
         Self {
             node_id,
@@ -1297,6 +1298,7 @@ impl UnixStorageNodeClient {
             socket_path,
             next_request_id: AtomicU64::new(1),
             rpc_admission,
+            rpc_auth,
         }
     }
 
@@ -1306,6 +1308,22 @@ impl UnixStorageNodeClient {
         socket_path: impl Into<PathBuf>,
         settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Self {
+        Self::with_rpc_admission_settings_and_auth(
+            node_id,
+            cluster_epoch,
+            socket_path.into(),
+            settings,
+            None,
+        )
+    }
+
+    pub(crate) fn with_rpc_admission_settings_and_auth(
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        socket_path: impl Into<PathBuf>,
+        settings: LocalUnixStorageNodeClientAdmissionSettings,
+        rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
+    ) -> Self {
         Self::with_rpc_admission(
             node_id,
             cluster_epoch,
@@ -1313,6 +1331,7 @@ impl UnixStorageNodeClient {
             Arc::new(UnixStorageNodeRpcAdmission::new_with_settings(
                 settings.into(),
             )),
+            rpc_auth,
         )
     }
 
@@ -1444,13 +1463,23 @@ impl UnixStorageNodeClient {
                 });
             }
         };
-        configure_storage_rpc_stream_timeout(&stream, "configure storage-node RPC socket timeout")?;
+        configure_storage_rpc_stream_timeout(
+            &stream,
+            "configure storage-node RPC socket timeout",
+            self.rpc_auth.as_deref(),
+        )?;
         let request = StorageRpcFrame {
             request_id,
             kind,
             payload,
         };
-        if let Err(error) = write_storage_rpc_frame_to(&mut stream, &request) {
+        if let Err(error) = write_unix_storage_rpc_request(
+            &mut stream,
+            self.node_id,
+            self.rpc_auth.as_deref(),
+            &request,
+            "write storage RPC request",
+        ) {
             if trace_rpc_lifecycle {
                 let _ = observability::emit_flight_event(
                     "storage_rpc_client",
@@ -1465,11 +1494,7 @@ impl UnixStorageNodeClient {
                     ),
                 );
             }
-            return Err(storage_rpc_stream_error(
-                self.node_id,
-                "write storage RPC request",
-                error,
-            ));
+            return Err(error);
         }
         if trace_rpc_lifecycle {
             let _ = observability::emit_flight_event(
@@ -1484,7 +1509,13 @@ impl UnixStorageNodeClient {
                 ),
             );
         }
-        let response = match read_storage_rpc_frame_from(&mut stream) {
+        let response = match read_unix_storage_rpc_response(
+            &mut stream,
+            self.node_id,
+            self.rpc_auth.as_deref(),
+            &request,
+            "read storage RPC response",
+        ) {
             Ok(response) => {
                 if trace_rpc_lifecycle {
                     let _ = observability::emit_flight_event(
@@ -1516,11 +1547,7 @@ impl UnixStorageNodeClient {
                         ),
                     );
                 }
-                return Err(storage_rpc_stream_error(
-                    self.node_id,
-                    "read storage RPC response",
-                    error,
-                ));
+                return Err(error);
             }
         };
         if response.request_id != request_id || response.kind != kind {

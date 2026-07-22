@@ -1320,6 +1320,7 @@ pub struct StorageCluster {
     local_map: Arc<LocalClusterMap>,
     operation_epoch: ClusterEpoch,
     runtime_map_content_digest: Option<RuntimeMapContentDigest>,
+    rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
     #[cfg(any(test, feature = "test-hooks"))]
     test_hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
@@ -2241,6 +2242,7 @@ impl StorageClusterRuntimeMapHandle {
             refresh_interval,
             authority_now_ms,
             None,
+            true,
         )
     }
 
@@ -2260,6 +2262,27 @@ impl StorageClusterRuntimeMapHandle {
             refresh_interval,
             authority_now_ms,
             Some(admission_settings),
+            true,
+        )
+    }
+
+    pub fn spawn_control_plane_refresh_only_loop_with_unix_storage_node_clients<S, F>(
+        self,
+        control_plane: S,
+        refresh_interval: Duration,
+        authority_now_ms: F,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+    ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
+    where
+        S: ControlPlaneRuntimeMapSource + Send + 'static,
+        F: Fn() -> u64 + Send + 'static,
+    {
+        self.spawn_control_plane_refresh_loop_inner(
+            control_plane,
+            refresh_interval,
+            authority_now_ms,
+            Some(admission_settings),
+            false,
         )
     }
 
@@ -2269,6 +2292,7 @@ impl StorageClusterRuntimeMapHandle {
         refresh_interval: Duration,
         authority_now_ms: F,
         admission_settings: Option<LocalUnixStorageNodeClientAdmissionSettings>,
+        recover_pending_commands: bool,
     ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
     where
         S: ControlPlaneRuntimeMapSource + Send + 'static,
@@ -2288,9 +2312,10 @@ impl StorageClusterRuntimeMapHandle {
             .name("argmin-storage-cluster-control-plane-refresh".to_string())
             .spawn(move || loop {
                 let discovery_now_ms = authority_now_ms();
-                let discovered_recovery_result = match control_plane
-                    .pending_metadata_command_recoveries(discovery_now_ms)
-                {
+                let discovered_recovery_result = if !recover_pending_commands {
+                    None
+                } else {
+                    match control_plane.pending_metadata_command_recoveries(discovery_now_ms) {
                     Ok(listing)
                         if !listing.tasks().is_empty() || !listing.failures().is_empty() => Some(
                         self.recover_authorized_pending_metadata_commands(
@@ -2304,6 +2329,7 @@ impl StorageClusterRuntimeMapHandle {
                     Err(error) => Some(Err(
                         PendingMetadataCommandRefreshRecoveryError::ControlPlane(error),
                     )),
+                    }
                 };
                 let refresh_now_ms = authority_now_ms();
                 let result = match admission_settings {
@@ -2319,6 +2345,7 @@ impl StorageClusterRuntimeMapHandle {
                 };
                 let recovery_result = match discovered_recovery_result {
                     Some(result) => Some(result),
+                    None if !recover_pending_commands => None,
                     None => match &result {
                         Ok(_) => None,
                         Err(error) => {
@@ -2484,11 +2511,12 @@ impl StorageClusterRuntimeMapHandle {
         let current = self.current();
         let recovery_cluster = match admission_settings {
             Some(admission_settings) => {
-                StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings(
+                StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
                     current.metadata_node_id(),
                     &historical_runtime_map,
                     current.default_payload_ec_shape(),
                     admission_settings,
+                    current.rpc_auth.clone(),
                 )?
             }
             None => {
@@ -2593,6 +2621,36 @@ fn runtime_map_refresh_error_requires_current_map_invalidation(
 mod runtime_map_refresh_invalidation_tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct FixedRuntimeMapSource(ClusterRuntimeMapSnapshot);
+
+    impl ControlPlaneRuntimeMapSource for FixedRuntimeMapSource {
+        fn runtime_map_snapshot(
+            &self,
+            _authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn frontend_storage_rpc_auth() -> crate::StorageRpcClientAuthConfig {
+        let credential = crate::control_plane_auth::ControlPlaneScopedCredential::new(
+            crate::control_plane_auth::ControlPlaneScopedCredentialInput {
+                cluster_id: "refresh-auth-cluster".to_string(),
+                credential_id: "frontend-key".to_string(),
+                credential_version: 1,
+                principal: crate::control_plane_auth::ControlPlaneAuthPrincipal::Frontend {
+                    instance_id: "frontend-1".to_string(),
+                },
+                secret: b"refresh-auth-secret".to_vec(),
+            },
+        )
+        .unwrap();
+        crate::FrontendStorageRpcClientCapability::new(credential, 7, "a".repeat(64))
+            .unwrap()
+            .into()
+    }
+
     fn active_test_cluster(validity: RouteMapValidity) -> Arc<StorageCluster> {
         let route = PgRouteSnapshot::reconstructed(
             ClusterEpoch::INITIAL,
@@ -2634,6 +2692,54 @@ mod runtime_map_refresh_invalidation_tests {
                 now_ms: 5_000,
             }) if cluster_epoch == ClusterEpoch::INITIAL
         ));
+    }
+
+    #[test]
+    fn content_changing_unix_runtime_map_refresh_retains_storage_rpc_auth() {
+        let tmp = test_util::tempdir();
+        let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+            crate::control_plane::FileControlPlaneStore::new(
+                tmp.path().join("control-plane.state"),
+            ),
+        )
+        .unwrap();
+        authority
+            .bootstrap_initial_cluster_map(
+                vec![
+                    (NodeId::new(1), "/tmp/refresh-node-1.sock".to_string()),
+                    (NodeId::new(2), "/tmp/refresh-node-2.sock".to_string()),
+                ],
+                vec![PgId::new(31)],
+            )
+            .unwrap();
+        let initial_runtime_map = authority.snapshot().runtime_map(1_000).unwrap();
+        let cluster = StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
+            NodeId::new(1),
+            &initial_runtime_map,
+            EcShape { k: 1, m: 0 },
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(frontend_storage_rpc_auth()),
+        )
+        .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(2)])
+            .unwrap();
+        let changed_runtime_map = authority.snapshot().runtime_map(1_001).unwrap();
+        assert_ne!(
+            initial_runtime_map.content_digest(),
+            changed_runtime_map.content_digest()
+        );
+
+        let refreshed = cluster
+            .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+                &FixedRuntimeMapSource(changed_runtime_map),
+                1_001,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            )
+            .unwrap();
+
+        assert!(refreshed.rpc_auth.is_some());
+        assert_eq!(refreshed.local_node_count(), 2);
     }
 
     #[test]
@@ -5786,6 +5892,22 @@ impl StorageCluster {
         default_ec_shape: EcShape,
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+            admission_settings,
+            None,
+        )
+    }
+
+    fn from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
         let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
             metadata_primary_node_id,
             runtime_map,
@@ -5794,12 +5916,63 @@ impl StorageCluster {
         let storage_node_configs = Self::unix_storage_node_client_configs_from_runtime_map(
             runtime_map,
             admission_settings,
-        );
+        )
+        .into_iter()
+        .map(|config| config.with_optional_rpc_auth(rpc_auth.clone()));
         local_map.install_unix_storage_node_clients(storage_node_configs)?;
-        Self::from_local_map_with_epoch_and_digest(
+        Self::from_local_map_with_epoch_and_digest_and_auth(
             Arc::new(local_map),
             runtime_map.cluster_epoch(),
             Some(runtime_map.content_digest()),
+            rpc_auth,
+        )
+    }
+
+    pub fn from_runtime_map_with_unix_storage_node_client_admission_settings_and_frontend_auth(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        capability: crate::FrontendStorageRpcClientCapability,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+            admission_settings,
+            Some(capability.into()),
+        )
+    }
+
+    pub fn from_runtime_map_with_unix_storage_node_client_admission_settings_and_maintenance_auth(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        capability: crate::MaintenanceStorageRpcClientCapability,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+            admission_settings,
+            Some(capability.into()),
+        )
+    }
+
+    pub fn from_runtime_map_with_unix_storage_node_client_admission_settings_and_storage_node_auth(
+        metadata_primary_node_id: NodeId,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+        default_ec_shape: EcShape,
+        admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
+        capability: crate::StorageNodeStorageRpcClientCapability,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_runtime_map_with_unix_storage_node_client_admission_settings_and_auth(
+            metadata_primary_node_id,
+            runtime_map,
+            default_ec_shape,
+            admission_settings,
+            Some(capability.into()),
         )
     }
 
@@ -5813,10 +5986,11 @@ impl StorageCluster {
             &self.local_map,
             &runtime_map,
         )?;
-        Ok(Self::from_local_map_with_epoch_and_digest(
+        Ok(Self::from_local_map_with_epoch_and_digest_and_auth(
             Arc::new(local_map),
             runtime_map.cluster_epoch(),
             Some(runtime_map.content_digest()),
+            self.rpc_auth.clone(),
         )?)
     }
 
@@ -5836,12 +6010,15 @@ impl StorageCluster {
         let storage_node_configs = Self::unix_storage_node_client_configs_from_runtime_map(
             &runtime_map,
             admission_settings,
-        );
+        )
+        .into_iter()
+        .map(|config| config.with_optional_rpc_auth(self.rpc_auth.clone()));
         local_map.install_unix_storage_node_clients(storage_node_configs)?;
-        Ok(Self::from_local_map_with_epoch_and_digest(
+        Ok(Self::from_local_map_with_epoch_and_digest_and_auth(
             Arc::new(local_map),
             runtime_map.cluster_epoch(),
             Some(runtime_map.content_digest()),
+            self.rpc_auth.clone(),
         )?)
     }
 
@@ -5865,10 +6042,25 @@ impl StorageCluster {
         operation_epoch: ClusterEpoch,
         runtime_map_content_digest: Option<RuntimeMapContentDigest>,
     ) -> Result<Arc<Self>, ClusterBuildError> {
+        Self::from_local_map_with_epoch_and_digest_and_auth(
+            local_map,
+            operation_epoch,
+            runtime_map_content_digest,
+            None,
+        )
+    }
+
+    fn from_local_map_with_epoch_and_digest_and_auth(
+        local_map: Arc<LocalClusterMap>,
+        operation_epoch: ClusterEpoch,
+        runtime_map_content_digest: Option<RuntimeMapContentDigest>,
+        rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
         Ok(Arc::new(Self {
             local_map,
             operation_epoch,
             runtime_map_content_digest,
+            rpc_auth,
             #[cfg(any(test, feature = "test-hooks"))]
             test_hooks: Arc::new(Mutex::new(StorageClusterTestHooks::default())),
         }))

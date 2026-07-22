@@ -108,13 +108,14 @@ pub struct LocalUnixShardNodeClientConfig {
     socket_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LocalUnixStorageNodeClientConfig {
     node_id: NodeId,
     socket_path: PathBuf,
     rpc_admission_limit: usize,
     rpc_admission_wait_timeout: Duration,
     rpc_control_admission_wait_timeout: Duration,
+    rpc_auth: Option<Arc<crate::StorageRpcClientAuthConfig>>,
 }
 
 impl LocalUnixShardNodeClientConfig {
@@ -149,6 +150,7 @@ impl LocalUnixStorageNodeClientConfig {
             rpc_admission_limit: Self::DEFAULT_RPC_ADMISSION_LIMIT,
             rpc_admission_wait_timeout: Self::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
             rpc_control_admission_wait_timeout: Self::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+            rpc_auth: None,
         }
     }
 
@@ -167,6 +169,7 @@ impl LocalUnixStorageNodeClientConfig {
             rpc_admission_limit,
             rpc_admission_wait_timeout: Self::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
             rpc_control_admission_wait_timeout: Self::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+            rpc_auth: None,
         }
     }
 
@@ -181,7 +184,54 @@ impl LocalUnixStorageNodeClientConfig {
             rpc_admission_limit: settings.rpc_admission_limit(),
             rpc_admission_wait_timeout: settings.rpc_admission_wait_timeout(),
             rpc_control_admission_wait_timeout: settings.rpc_control_admission_wait_timeout(),
+            rpc_auth: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_rpc_auth(mut self, rpc_auth: crate::StorageRpcClientAuthConfig) -> Self {
+        self.rpc_auth = Some(Arc::new(rpc_auth));
+        self
+    }
+
+    pub(crate) fn with_optional_rpc_auth(
+        mut self,
+        rpc_auth: Option<crate::StorageRpcClientAuthConfig>,
+    ) -> Self {
+        self.rpc_auth = rpc_auth.map(Arc::new);
+        self
+    }
+
+    #[must_use]
+    pub fn with_frontend_rpc_auth(
+        self,
+        capability: crate::FrontendStorageRpcClientCapability,
+    ) -> Self {
+        self.with_rpc_auth(capability.into())
+    }
+
+    #[must_use]
+    pub fn with_optional_frontend_rpc_auth(
+        self,
+        capability: Option<crate::FrontendStorageRpcClientCapability>,
+    ) -> Self {
+        self.with_optional_rpc_auth(capability.map(Into::into))
+    }
+
+    #[must_use]
+    pub fn with_maintenance_rpc_auth(
+        self,
+        capability: crate::MaintenanceStorageRpcClientCapability,
+    ) -> Self {
+        self.with_rpc_auth(capability.into())
+    }
+
+    #[must_use]
+    pub fn with_storage_node_rpc_auth(
+        self,
+        capability: crate::StorageNodeStorageRpcClientCapability,
+    ) -> Self {
+        self.with_rpc_auth(capability.into())
     }
 
     pub fn with_rpc_admission_settings_from_runtime_node_route(
@@ -2193,7 +2243,7 @@ impl LocalClusterMap {
                 .nodes
                 .get_mut(&config.node_id)
                 .expect("validated remote storage-node client node must exist");
-            let client = Arc::new(UnixStorageNodeClient::with_rpc_admission_settings(
+            let client = Arc::new(UnixStorageNodeClient::with_rpc_admission_settings_and_auth(
                 config.node_id,
                 self.epoch,
                 config.socket_path.clone(),
@@ -2202,6 +2252,7 @@ impl LocalClusterMap {
                     rpc_admission_wait_timeout: config.rpc_admission_wait_timeout,
                     rpc_control_admission_wait_timeout: config.rpc_control_admission_wait_timeout,
                 },
+                config.rpc_auth,
             ));
             let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client.clone();
             let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =

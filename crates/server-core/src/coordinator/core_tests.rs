@@ -93,7 +93,7 @@ fn setup_coordinator_with_only_shard_backfill_worker(
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
-            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             ShardBackfillSweeper::acquire_shared,
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
@@ -116,7 +116,7 @@ fn setup_coordinator_with_only_reclaim_worker(
             true,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
-            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
@@ -139,7 +139,7 @@ fn setup_coordinator_with_only_stream_session_worker(
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
-            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
             StreamSessionSweeper::acquire_shared,
         ),
@@ -210,6 +210,34 @@ fn coordinator_storage_node_tracks_runtime_map_handle_install() {
     handle.install(Arc::clone(&candidate)).unwrap();
 
     assert!(Arc::ptr_eq(&coord.storage_node(), &candidate));
+}
+
+#[test]
+fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    let stale_lifecycle_runtime = coord.read_runtime();
+
+    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    let refreshed = handle.current();
+    assert!(refreshed.cluster_epoch() > initial.cluster_epoch());
+
+    let lifecycle_runtime =
+        super::runtime::lifecycle_runtime_for_sweep(&handle, &stale_lifecycle_runtime);
+    assert!(Arc::ptr_eq(&lifecycle_runtime.storage_node, &refreshed));
+
+    let repair_cluster = super::runtime::shard_repair_cluster_for_work(&handle);
+    assert!(Arc::ptr_eq(&repair_cluster, &refreshed));
 }
 
 #[test]
@@ -13401,7 +13429,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
-            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
@@ -13535,7 +13563,7 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
             false,
             |_, _| Ok(LifecycleSweeper::disabled()),
             |_| Ok(ShardScavengerSweeper::disabled()),
-            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |storage_handle| Ok(ShardRepairSweeper::disabled(storage_handle.clone())),
             |_| Ok(ShardBackfillSweeper::disabled()),
             |_| Ok(StreamSessionSweeper::disabled()),
         ),

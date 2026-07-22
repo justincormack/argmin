@@ -656,7 +656,7 @@ pub(super) struct ShardScavengerSweeper {
 }
 
 pub(super) struct ShardRepairSweeper {
-    pub(super) storage_node: Arc<StorageCluster>,
+    pub(super) storage_handle: StorageClusterRuntimeMapHandle,
     pub(super) stop: Arc<AtomicBool>,
     pub(super) handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1111,7 +1111,9 @@ impl Drop for ShardScavengerSweeper {
 impl Drop for ShardRepairSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.storage_node.wake_placed_segment_shard_repair_workers();
+        self.storage_handle
+            .current()
+            .wake_placed_segment_shard_repair_workers();
         if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
             let _ = handle.join();
         }
@@ -1142,7 +1144,7 @@ impl Drop for StreamSessionSweeper {
 
 impl LifecycleSweeper {
     pub(super) fn acquire_shared(
-        storage_cluster: &Arc<StorageCluster>,
+        storage_handle: &StorageClusterRuntimeMapHandle,
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = LIFECYCLE_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1150,18 +1152,20 @@ impl LifecycleSweeper {
             lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
+        let storage_cluster = storage_handle.current();
         let key = storage_cluster.process_local_registry_key();
         if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
             return Ok(existing);
         }
 
-        let admission = background_work_admission_for(storage_cluster);
-        let sweeper = Self::spawn(runtime, admission)?;
+        let admission = background_work_admission_for(&storage_cluster);
+        let sweeper = Self::spawn(storage_handle.clone(), runtime, admission)?;
         registry.insert(key, Arc::downgrade(&sweeper));
         Ok(sweeper)
     }
 
     fn spawn(
+        storage_handle: StorageClusterRuntimeMapHandle,
         runtime: ReadRuntime,
         admission: Arc<BackgroundWorkAdmission>,
     ) -> Result<Arc<Self>, ServerError> {
@@ -1179,7 +1183,9 @@ impl LifecycleSweeper {
                     if let Some(_permit) =
                         admission.try_acquire(BackgroundWorkClass::LifecycleCleanup)
                     {
-                        let _ = runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
+                        let current_runtime =
+                            lifecycle_runtime_for_sweep(&storage_handle, &runtime);
+                        let _ = current_runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
                     }
                     if stop.load(Ordering::SeqCst) {
                         break;
@@ -1212,6 +1218,13 @@ impl LifecycleSweeper {
             handle: Mutex::new(None),
         })
     }
+}
+
+pub(super) fn lifecycle_runtime_for_sweep(
+    storage_handle: &StorageClusterRuntimeMapHandle,
+    runtime: &ReadRuntime,
+) -> ReadRuntime {
+    runtime.with_storage_node(storage_handle.current())
 }
 
 impl ShardScavengerSweeper {
@@ -1381,40 +1394,43 @@ fn shard_scavenger_sweep_interval() -> Duration {
 
 impl ShardRepairSweeper {
     pub(super) fn acquire_shared(
-        storage_cluster: &Arc<StorageCluster>,
+        storage_handle: &StorageClusterRuntimeMapHandle,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = SHARD_REPAIR_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
         let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<ShardRepairSweeper>>> =
             lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
+        let storage_cluster = storage_handle.current();
         let key = storage_cluster.process_local_registry_key();
         if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
             return Ok(existing);
         }
 
-        let sweeper = Self::spawn(Arc::clone(storage_cluster))?;
+        let admission = background_work_admission_for(&storage_cluster);
+        let sweeper = Self::spawn(storage_handle.clone(), key, admission)?;
         registry.insert(key, Arc::downgrade(&sweeper));
         Ok(sweeper)
     }
 
-    fn spawn(storage_cluster: Arc<StorageCluster>) -> Result<Arc<Self>, ServerError> {
+    fn spawn(
+        storage_handle: StorageClusterRuntimeMapHandle,
+        registry_key: usize,
+        admission: Arc<BackgroundWorkAdmission>,
+    ) -> Result<Arc<Self>, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
-        let admission = background_work_admission_for(&storage_cluster);
         let sweeper = Arc::new(Self {
-            storage_node: Arc::clone(&storage_cluster),
+            storage_handle: storage_handle.clone(),
             stop: Arc::clone(&stop),
             handle: Mutex::new(None),
         });
         let handle = std::thread::Builder::new()
             .name("argmin-shard-repair".to_string())
             .spawn(move || {
-                let owner_token = format!(
-                    "shard-repair-worker-{}",
-                    storage_cluster.process_local_registry_key()
-                );
+                let owner_token = format!("shard-repair-worker-{}", registry_key);
                 let mut next_durable_scan_at = Instant::now();
                 while !stop.load(Ordering::SeqCst) {
+                    let storage_cluster = shard_repair_cluster_for_work(&storage_handle);
                     let now = Instant::now();
                     if now >= next_durable_scan_at {
                         match storage_cluster.enqueue_durable_placed_segment_shard_repair_work() {
@@ -1486,9 +1502,7 @@ impl ShardRepairSweeper {
                             break;
                         }
                         #[cfg(test)]
-                        maybe_run_shard_repair_worker_idle_timeout_hook(
-                            storage_cluster.process_local_registry_key(),
-                        );
+                        maybe_run_shard_repair_worker_idle_timeout_hook(registry_key);
                         continue;
                     };
                     if stop.load(Ordering::SeqCst) {
@@ -1498,7 +1512,7 @@ impl ShardRepairSweeper {
                     let now_ms = Coordinator::now_millis();
                     let claim_id = format!(
                         "shard-repair-{}-{}-{}-{}",
-                        storage_cluster.process_local_registry_key(),
+                        registry_key,
                         work_item.request.data_pg_id,
                         work_item.shard_index.get(),
                         SHARD_REPAIR_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -1743,13 +1757,19 @@ impl ShardRepairSweeper {
         Ok(sweeper)
     }
 
-    pub(super) fn disabled(storage_cluster: Arc<StorageCluster>) -> Arc<Self> {
+    pub(super) fn disabled(storage_handle: StorageClusterRuntimeMapHandle) -> Arc<Self> {
         Arc::new(Self {
-            storage_node: storage_cluster,
+            storage_handle,
             stop: Arc::new(AtomicBool::new(true)),
             handle: Mutex::new(None),
         })
     }
+}
+
+pub(super) fn shard_repair_cluster_for_work(
+    storage_handle: &StorageClusterRuntimeMapHandle,
+) -> Arc<StorageCluster> {
+    storage_handle.current()
 }
 
 impl ShardBackfillSweeper {

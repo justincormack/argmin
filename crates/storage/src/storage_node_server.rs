@@ -305,9 +305,12 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadSegmentsResponse, StorageRpcStreamUploadSessionOutcome,
     StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadSessionResponse,
     StorageRpcStreamUploadsListRequest, StorageRpcStreamUploadsListResponse,
-    StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_CLIENT_WRITE_TIMEOUT,
-    STORAGE_RPC_FRAME_ENCODING_VERSION, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
-    STORAGE_RPC_MAX_PAYLOAD_LEN, STORAGE_RPC_SERVER_IDLE_TIMEOUT,
+    StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_FRAME_ENCODING_VERSION,
+    STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES, STORAGE_RPC_MAX_PAYLOAD_LEN,
+    STORAGE_RPC_SERVER_IDLE_TIMEOUT,
+};
+use crate::storage_rpc_auth::{
+    write_storage_rpc_auth_transport_frame_with_limit, StorageRpcServerAuthConfig,
 };
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
 use crate::types::{
@@ -1750,6 +1753,7 @@ pub struct StorageNodeServer {
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     active_sessions: Arc<StorageNodeActiveSessions>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
+    rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
     #[cfg(test)]
     runtime_config_stage_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
     #[cfg(test)]
@@ -1966,6 +1970,7 @@ impl StorageNodeBootstrap {
 pub struct PreparedStorageNodeServer {
     config: StorageNodeProcessConfig,
     data_dir_guard: Option<StorageNodeDataDirGuard>,
+    rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
 }
 
 impl PreparedStorageNodeServer {
@@ -1974,6 +1979,7 @@ impl PreparedStorageNodeServer {
         Self {
             config,
             data_dir_guard: None,
+            rpc_auth: None,
         }
     }
 
@@ -1984,7 +1990,14 @@ impl PreparedStorageNodeServer {
         Self {
             config,
             data_dir_guard: Some(data_dir_guard),
+            rpc_auth: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_rpc_auth(mut self, rpc_auth: StorageRpcServerAuthConfig) -> Self {
+        self.rpc_auth = Some(Arc::new(rpc_auth));
+        self
     }
 
     #[must_use]
@@ -1994,10 +2007,12 @@ impl PreparedStorageNodeServer {
 
     pub fn bind(self) -> Result<StorageNodeServer, StorageNodeServerError> {
         match self.data_dir_guard {
-            Some(data_dir_guard) => {
-                StorageNodeServer::bind_with_data_dir_guard(self.config, data_dir_guard)
-            }
-            None => StorageNodeServer::bind(self.config),
+            Some(data_dir_guard) => StorageNodeServer::bind_with_data_dir_guard(
+                self.config,
+                data_dir_guard,
+                self.rpc_auth,
+            ),
+            None => StorageNodeServer::bind_with_rpc_auth(self.config, self.rpc_auth),
         }
     }
 }
@@ -2150,13 +2165,21 @@ fn metadata_command_checkpoint_candidates_for_frame(
 
 impl StorageNodeServer {
     pub fn bind(config: StorageNodeProcessConfig) -> Result<Self, StorageNodeServerError> {
+        Self::bind_with_rpc_auth(config, None)
+    }
+
+    fn bind_with_rpc_auth(
+        config: StorageNodeProcessConfig,
+        rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
+    ) -> Result<Self, StorageNodeServerError> {
         let data_dir_guard = StorageNodeDataDirGuard::acquire(&config.data_dir)?;
-        Self::bind_with_data_dir_guard(config, data_dir_guard)
+        Self::bind_with_data_dir_guard(config, data_dir_guard, rpc_auth)
     }
 
     fn bind_with_data_dir_guard(
         config: StorageNodeProcessConfig,
         data_dir_guard: StorageNodeDataDirGuard,
+        rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
     ) -> Result<Self, StorageNodeServerError> {
         validate_process_config_route_table(&config)?;
         let data_dir_lock = data_dir_guard.into_lock_for(&config.data_dir)?;
@@ -2191,6 +2214,7 @@ impl StorageNodeServer {
             read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
             active_sessions: Arc::new(StorageNodeActiveSessions::default()),
             metadata_command_locks: StorageNodeMetadataCommandLocks::default(),
+            rpc_auth,
             #[cfg(test)]
             runtime_config_stage_test_hook: Mutex::new(None),
             #[cfg(test)]
@@ -2218,13 +2242,13 @@ impl StorageNodeServer {
                     path: self.config_snapshot().socket_path,
                     source,
                 })?;
-        configure_storage_node_rpc_stream_timeout(&stream).map_err(|source| {
-            StorageNodeServerError::Io {
+        configure_storage_node_rpc_stream_timeout(&stream, self.rpc_auth.as_deref()).map_err(
+            |source| StorageNodeServerError::Io {
                 context: "configure storage-node accepted socket timeout",
                 path: self.config_snapshot().socket_path,
                 source,
-            }
-        })?;
+            },
+        )?;
         let mut handler = self.connection_handler();
         handler.handle_session(&mut stream, session_guard)
     }
@@ -2510,13 +2534,13 @@ impl StorageNodeServer {
                     path: self.config_snapshot().socket_path,
                     source,
                 })?;
-        configure_storage_node_rpc_stream_timeout(&stream).map_err(|source| {
-            StorageNodeServerError::Io {
+        configure_storage_node_rpc_stream_timeout(&stream, self.rpc_auth.as_deref()).map_err(
+            |source| StorageNodeServerError::Io {
                 context: "configure storage-node accepted socket timeout",
                 path: self.config_snapshot().socket_path,
                 source,
-            }
-        })?;
+            },
+        )?;
         let mut handler = self.connection_handler();
         thread::spawn(move || {
             if let Err(error) = handler.handle_session(&mut stream, session_guard) {
@@ -2536,6 +2560,7 @@ impl StorageNodeServer {
             node: Arc::clone(&self._node),
             read_handles: Arc::clone(&self.read_handles),
             metadata_command_locks: self.metadata_command_locks.clone(),
+            rpc_auth: self.rpc_auth.clone(),
             #[cfg(test)]
             runtime_route_capture_test_hook: Arc::clone(&self.runtime_route_capture_test_hook),
         }
@@ -2561,8 +2586,12 @@ impl StorageNodeServer {
     }
 
     fn acquire_session(&self) -> StorageNodeActiveSessionGuard {
-        self.active_sessions
-            .acquire(STORAGE_NODE_MAX_ACTIVE_SESSIONS)
+        let limit = self
+            .rpc_auth
+            .as_deref()
+            .map(|auth| auth.transport_limits().max_connections())
+            .unwrap_or(STORAGE_NODE_MAX_ACTIVE_SESSIONS);
+        self.active_sessions.acquire(limit)
     }
 
     #[cfg(test)]
@@ -3088,6 +3117,7 @@ struct StorageNodeConnectionHandler {
     node: Arc<SharedStorageNode>,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
+    rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
     #[cfg(test)]
     runtime_route_capture_test_hook: Arc<Mutex<Option<RuntimeConfigStageTestHook>>>,
 }
@@ -5091,6 +5121,75 @@ macro_rules! metadata_mutation_route_guard_or_return {
 }
 
 impl StorageNodeConnectionHandler {
+    fn read_request_frame(
+        &self,
+        stream: &mut UnixStream,
+    ) -> Result<
+        (
+            StorageRpcFrame,
+            Option<crate::control_plane_auth::ControlPlaneScopedCredential>,
+        ),
+        StorageRpcStreamError,
+    > {
+        let Some(auth) = self.rpc_auth.as_deref() else {
+            return read_storage_rpc_request_frame_from(stream).map(|frame| (frame, None));
+        };
+        let (envelope, _pre_auth_byte_reservation) = auth
+            .read_request_envelope(stream)
+            .map_err(StorageRpcStreamError::Io)?;
+        auth.verify_request(
+            self.config.node_id,
+            crate::clock::current_time_millis(),
+            &envelope,
+        )
+        .map(|verified| {
+            let (frame, credential) = verified.into_frame_and_credential();
+            (frame, Some(credential))
+        })
+        .map_err(|error| {
+            StorageRpcStreamError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("storage RPC authentication rejected: {error:?}"),
+            ))
+        })
+    }
+
+    fn write_response_frame(
+        &self,
+        stream: &mut UnixStream,
+        request_credential: Option<&crate::control_plane_auth::ControlPlaneScopedCredential>,
+        response: &StorageRpcFrame,
+    ) -> Result<(), StorageRpcStreamError> {
+        let Some(auth) = self.rpc_auth.as_deref() else {
+            return write_storage_rpc_frame_to(stream, response);
+        };
+        let request_credential = request_credential.ok_or_else(|| {
+            StorageRpcStreamError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "authenticated storage RPC response has no request credential",
+            ))
+        })?;
+        let envelope = auth
+            .sign_response(
+                request_credential,
+                self.config.node_id,
+                crate::clock::current_time_millis(),
+                response,
+            )
+            .map_err(|error| {
+                StorageRpcStreamError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("storage RPC response authentication failed: {error}"),
+                ))
+            })?;
+        write_storage_rpc_auth_transport_frame_with_limit(
+            stream,
+            &envelope,
+            auth.transport_limits().max_frame_bytes(),
+        )
+        .map_err(StorageRpcStreamError::Io)
+    }
+
     fn refresh_config_snapshot(&mut self) {
         let runtime_route = self
             .runtime_route_source
@@ -5189,7 +5288,7 @@ impl StorageNodeConnectionHandler {
         let mut session =
             StorageNodeSession::new(Arc::clone(&self.read_handles), Arc::clone(&self.node));
         loop {
-            let frame = match read_storage_rpc_request_frame_from(stream) {
+            let (frame, request_credential) = match self.read_request_frame(stream) {
                 Ok(frame) => frame,
                 Err(StorageRpcStreamError::Io(error))
                     if matches!(
@@ -5277,7 +5376,9 @@ impl StorageNodeConnectionHandler {
                     ),
                 );
             }
-            if let Err(error) = write_storage_rpc_frame_to(stream, &response) {
+            if let Err(error) =
+                self.write_response_frame(stream, request_credential.as_ref(), &response)
+            {
                 session.clear_metadata_command_lock_context(&self.metadata_command_locks);
                 return Err(rpc_stream_error(error));
             }
@@ -15067,9 +15168,15 @@ struct SessionReadHandle {
     is_acquired: bool,
 }
 
-fn configure_storage_node_rpc_stream_timeout(stream: &UnixStream) -> io::Result<()> {
-    stream.set_read_timeout(Some(STORAGE_RPC_SERVER_IDLE_TIMEOUT))?;
-    stream.set_write_timeout(Some(STORAGE_RPC_CLIENT_WRITE_TIMEOUT))?;
+fn configure_storage_node_rpc_stream_timeout(
+    stream: &UnixStream,
+    rpc_auth: Option<&StorageRpcServerAuthConfig>,
+) -> io::Result<()> {
+    let io_timeout = rpc_auth
+        .map(|auth| auth.transport_limits().io_timeout())
+        .unwrap_or(STORAGE_RPC_SERVER_IDLE_TIMEOUT);
+    stream.set_read_timeout(Some(io_timeout))?;
+    stream.set_write_timeout(Some(io_timeout))?;
     Ok(())
 }
 
@@ -15706,7 +15813,12 @@ fn canonicalize_existing_or_parent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BucketAclSummary;
+    use crate::control_plane_auth::{
+        ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+        ControlPlaneScopedCredentialStore,
+    };
+    use crate::node_client::{LocalUnixStorageNodeClientAdmissionSettings, UnixStorageNodeClient};
+    use crate::{BucketAclSummary, StorageRpcClientAuthConfig};
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -15901,6 +16013,49 @@ mod tests {
             historical_pg_routes: Vec::new(),
             pending_metadata_command_recoveries: Vec::new(),
         }
+    }
+
+    const STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn storage_rpc_auth_test_credential(
+        principal: ControlPlaneAuthPrincipal,
+    ) -> ControlPlaneScopedCredential {
+        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: "storage-node-server-auth-test".to_owned(),
+            credential_id: "storage-node-server-caller".to_owned(),
+            credential_version: 1,
+            principal,
+            secret: b"storage-node-server-auth-secret".to_vec(),
+        })
+        .unwrap()
+    }
+
+    fn storage_rpc_server_auth(
+        credential: &ControlPlaneScopedCredential,
+    ) -> StorageRpcServerAuthConfig {
+        StorageRpcServerAuthConfig::new(
+            credential.cluster_id(),
+            ControlPlaneScopedCredentialStore::new(vec![credential.clone()]).unwrap(),
+            9,
+            STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+        )
+        .unwrap()
+    }
+
+    fn storage_rpc_client_auth(
+        credential: ControlPlaneScopedCredential,
+        topology_generation: u64,
+    ) -> Arc<StorageRpcClientAuthConfig> {
+        Arc::new(
+            crate::FrontendStorageRpcClientCapability::new(
+                credential,
+                topology_generation,
+                STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+            )
+            .unwrap()
+            .into(),
+        )
     }
 
     fn bounded_runtime_refresh_config(
@@ -19136,6 +19291,96 @@ mod tests {
         let health = decode_health_response(&health_payload).unwrap();
         assert_eq!(health.node_id, NodeId::new(7));
         assert_eq!(health.cluster_epoch, ClusterEpoch::new(1).unwrap());
+    }
+
+    #[test]
+    fn authenticated_unix_storage_rpc_crosses_real_server_boundary() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .bind()
+            .unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            socket_path,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let payload = client
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        let health = decode_health_response(&payload).unwrap();
+
+        assert_eq!(health.node_id, config.node_id);
+        assert_eq!(health.cluster_epoch, config.cluster_epoch);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_storage_rpc_rejects_legacy_frame_before_dispatch() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .bind()
+            .unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::new(config.node_id, config.cluster_epoch, socket_path);
+
+        assert!(client
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .is_err());
+        let server_error = join.join().unwrap().unwrap_err();
+        assert!(server_error.to_string().contains("transport magic"));
+    }
+
+    #[test]
+    fn authenticated_unix_storage_rpc_rejects_wrong_target_and_topology() {
+        for (client_node_id, topology_generation, expected_error) in [
+            (NodeId::new(8), 9, "WrongTarget"),
+            (NodeId::new(7), 10, "WrongTopology"),
+        ] {
+            let tmp = test_util::tempdir();
+            let config = test_config(&tmp);
+            private_socket_dir(config.socket_path.parent().unwrap());
+            let credential =
+                storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+                    instance_id: "frontend-1".to_owned(),
+                });
+            let server = PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .bind()
+                .unwrap();
+            let socket_path = config.socket_path.clone();
+            let join = thread::spawn(move || server.accept_one());
+            let client = UnixStorageNodeClient::with_rpc_admission_settings_and_auth(
+                client_node_id,
+                config.cluster_epoch,
+                socket_path,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                Some(storage_rpc_client_auth(credential, topology_generation)),
+            );
+
+            assert!(client
+                .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+                .is_err());
+            let server_error = join.join().unwrap().unwrap_err();
+            assert!(server_error.to_string().contains(expected_error));
+        }
     }
 
     #[test]

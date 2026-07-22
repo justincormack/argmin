@@ -71,6 +71,38 @@ impl BackgroundWorkerMode {
     }
 }
 
+struct CoordinatorStorageContext {
+    foreground_handle: StorageClusterRuntimeMapHandle,
+    background_handle: StorageClusterRuntimeMapHandle,
+    foreground_cluster: Arc<StorageCluster>,
+    background_cluster: Arc<StorageCluster>,
+}
+
+impl CoordinatorStorageContext {
+    fn new(
+        foreground_handle: StorageClusterRuntimeMapHandle,
+        background_handle: StorageClusterRuntimeMapHandle,
+    ) -> Self {
+        let foreground_cluster = foreground_handle.current();
+        let background_cluster = background_handle.current();
+        Self {
+            foreground_handle,
+            background_handle,
+            foreground_cluster,
+            background_cluster,
+        }
+    }
+
+    fn shared(handle: StorageClusterRuntimeMapHandle, cluster: Arc<StorageCluster>) -> Self {
+        Self {
+            foreground_handle: handle.clone(),
+            background_handle: handle,
+            foreground_cluster: Arc::clone(&cluster),
+            background_cluster: cluster,
+        }
+    }
+}
+
 impl Coordinator {
     pub(super) fn random_session_id(error_reason: &'static str) -> Result<SessionId, ServerError> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -328,8 +360,8 @@ impl Coordinator {
         sse_c_validator: Option<SseCustomerValidatorConfig>,
     ) -> Result<Self, ServerError> {
         let lifecycle_sweeper_factory =
-            |storage_cluster: &Arc<StorageCluster>, read_runtime: ReadRuntime| {
-                LifecycleSweeper::acquire_shared(storage_cluster, read_runtime)
+            |storage_handle: &StorageClusterRuntimeMapHandle, read_runtime: ReadRuntime| {
+                LifecycleSweeper::acquire_shared(storage_handle, read_runtime)
             };
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
             Arc::clone(&storage_cluster),
@@ -349,8 +381,8 @@ impl Coordinator {
         managed_key_provider: StaticManagedKeyProvider,
     ) -> Result<Self, ServerError> {
         let lifecycle_sweeper_factory =
-            |storage_cluster: &Arc<StorageCluster>, read_runtime: ReadRuntime| {
-                LifecycleSweeper::acquire_shared(storage_cluster, read_runtime)
+            |storage_handle: &StorageClusterRuntimeMapHandle, read_runtime: ReadRuntime| {
+                LifecycleSweeper::acquire_shared(storage_handle, read_runtime)
             };
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
             Arc::clone(&storage_cluster),
@@ -405,11 +437,30 @@ impl Coordinator {
         managed_key_provider: StaticManagedKeyProvider,
         background_worker_mode: BackgroundWorkerMode,
     ) -> Result<Self, ServerError> {
-        let initial_storage_cluster = storage_cluster.current();
+        Self::new_with_managed_key_provider_for_storage_cluster_runtime_map_handles_with_background_worker_mode(
+            storage_cluster.clone(),
+            storage_cluster,
+            region,
+            sse_c_validator,
+            managed_key_provider,
+            background_worker_mode,
+        )
+    }
+
+    pub fn new_with_managed_key_provider_for_storage_cluster_runtime_map_handles_with_background_worker_mode(
+        storage_cluster: StorageClusterRuntimeMapHandle,
+        maintenance_storage_cluster: StorageClusterRuntimeMapHandle,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: StaticManagedKeyProvider,
+        background_worker_mode: BackgroundWorkerMode,
+    ) -> Result<Self, ServerError> {
+        let storage_context =
+            CoordinatorStorageContext::new(storage_cluster, maintenance_storage_cluster);
         let lifecycle_sweeper_factory =
-            |storage_cluster: &Arc<StorageCluster>, read_runtime: ReadRuntime| {
+            |storage_handle: &StorageClusterRuntimeMapHandle, read_runtime: ReadRuntime| {
                 if background_worker_mode.lifecycle {
-                    LifecycleSweeper::acquire_shared(storage_cluster, read_runtime)
+                    LifecycleSweeper::acquire_shared(storage_handle, read_runtime)
                 } else {
                     Ok(LifecycleSweeper::disabled())
                 }
@@ -421,11 +472,11 @@ impl Coordinator {
                 Ok(ShardScavengerSweeper::disabled())
             }
         };
-        let shard_repair_sweeper_factory = |storage_cluster: &Arc<StorageCluster>| {
+        let shard_repair_sweeper_factory = |storage_handle: &StorageClusterRuntimeMapHandle| {
             if background_worker_mode.shard_repair {
-                ShardRepairSweeper::acquire_shared(storage_cluster)
+                ShardRepairSweeper::acquire_shared(storage_handle)
             } else {
-                Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster)))
+                Ok(ShardRepairSweeper::disabled(storage_handle.clone()))
             }
         };
         let shard_backfill_sweeper_factory = |storage_handle: &StorageClusterRuntimeMapHandle| {
@@ -442,10 +493,9 @@ impl Coordinator {
                 Ok(StreamSessionSweeper::disabled())
             }
         };
-        Self::new_with_shared_caches_and_background_sweeper_factories(
-            storage_cluster,
-            Arc::clone(&initial_storage_cluster),
-            shared_caches_for_storage_cluster(&initial_storage_cluster),
+        Self::new_with_shared_caches_and_background_storage_and_sweeper_factories(
+            shared_caches_for_storage_cluster(&storage_context.foreground_cluster),
+            storage_context,
             region,
             sse_c_validator,
             Some(managed_key_provider),
@@ -469,7 +519,10 @@ impl Coordinator {
         lifecycle_sweeper_factory: F,
     ) -> Result<Self, ServerError>
     where
-        F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
+        F: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+            ReadRuntime,
+        ) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
         Self::new_with_shared_caches_and_lifecycle_sweeper_factory(
             Arc::clone(&storage_cluster),
@@ -490,11 +543,14 @@ impl Coordinator {
         background_sweepers: (bool, F, G, H, I, J),
     ) -> Result<Self, ServerError>
     where
-        F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
+        F: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+            ReadRuntime,
+        ) -> Result<Arc<LifecycleSweeper>, ServerError>,
         G: FnOnce(
             &StorageClusterRuntimeMapHandle,
         ) -> Result<Arc<ShardScavengerSweeper>, ServerError>,
-        H: FnOnce(&Arc<StorageCluster>) -> Result<Arc<ShardRepairSweeper>, ServerError>,
+        H: FnOnce(&StorageClusterRuntimeMapHandle) -> Result<Arc<ShardRepairSweeper>, ServerError>,
         I: FnOnce(
             &StorageClusterRuntimeMapHandle,
         ) -> Result<Arc<ShardBackfillSweeper>, ServerError>,
@@ -522,7 +578,10 @@ impl Coordinator {
         lifecycle_sweeper_factory: F,
     ) -> Result<Self, ServerError>
     where
-        F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
+        F: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+            ReadRuntime,
+        ) -> Result<Arc<LifecycleSweeper>, ServerError>,
     {
         Self::new_with_shared_caches_and_background_sweeper_factories(
             StorageClusterRuntimeMapHandle::new(Arc::clone(&storage_cluster)),
@@ -552,11 +611,14 @@ impl Coordinator {
         background_sweepers: (bool, F, G, H, I, J),
     ) -> Result<Self, ServerError>
     where
-        F: FnOnce(&Arc<StorageCluster>, ReadRuntime) -> Result<Arc<LifecycleSweeper>, ServerError>,
+        F: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+            ReadRuntime,
+        ) -> Result<Arc<LifecycleSweeper>, ServerError>,
         G: FnOnce(
             &StorageClusterRuntimeMapHandle,
         ) -> Result<Arc<ShardScavengerSweeper>, ServerError>,
-        H: FnOnce(&Arc<StorageCluster>) -> Result<Arc<ShardRepairSweeper>, ServerError>,
+        H: FnOnce(&StorageClusterRuntimeMapHandle) -> Result<Arc<ShardRepairSweeper>, ServerError>,
         I: FnOnce(
             &StorageClusterRuntimeMapHandle,
         ) -> Result<Arc<ShardBackfillSweeper>, ServerError>,
@@ -564,16 +626,57 @@ impl Coordinator {
             &StorageClusterRuntimeMapHandle,
         ) -> Result<Arc<StreamSessionSweeper>, ServerError>,
     {
+        Self::new_with_shared_caches_and_background_storage_and_sweeper_factories(
+            shared_caches,
+            CoordinatorStorageContext::shared(storage_handle, storage_cluster),
+            region,
+            sse_c_validator,
+            managed_key_provider,
+            background_sweepers,
+        )
+    }
+
+    fn new_with_shared_caches_and_background_storage_and_sweeper_factories<F, G, H, I, J>(
+        shared_caches: Arc<CoordinatorSharedCaches>,
+        storage_context: CoordinatorStorageContext,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        managed_key_provider: Option<StaticManagedKeyProvider>,
+        background_sweepers: (bool, F, G, H, I, J),
+    ) -> Result<Self, ServerError>
+    where
+        F: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+            ReadRuntime,
+        ) -> Result<Arc<LifecycleSweeper>, ServerError>,
+        G: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+        ) -> Result<Arc<ShardScavengerSweeper>, ServerError>,
+        H: FnOnce(&StorageClusterRuntimeMapHandle) -> Result<Arc<ShardRepairSweeper>, ServerError>,
+        I: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+        ) -> Result<Arc<ShardBackfillSweeper>, ServerError>,
+        J: FnOnce(
+            &StorageClusterRuntimeMapHandle,
+        ) -> Result<Arc<StreamSessionSweeper>, ServerError>,
+    {
+        let CoordinatorStorageContext {
+            foreground_handle: storage_handle,
+            background_handle: background_storage_handle,
+            foreground_cluster: storage_cluster,
+            background_cluster: background_storage_cluster,
+        } = storage_context;
         #[cfg(test)]
-        let pg_topology = PgTopology::new(storage_cluster.test_pg_ids()).map_err(|reason| {
-            ServerError::InternalError {
-                reason: reason.to_string(),
-            }
-        })?;
+        let pg_topology =
+            PgTopology::new(background_storage_cluster.test_pg_ids()).map_err(|reason| {
+                ServerError::InternalError {
+                    reason: reason.to_string(),
+                }
+            })?;
         let payload_buffer_pool =
             PayloadBufferPool::new(storage_cluster.default_payload_ec_shape());
         let read_runtime = ReadRuntime {
-            storage_node: Arc::clone(&storage_cluster),
+            storage_node: Arc::clone(&background_storage_cluster),
             #[cfg(test)]
             pg_topology: pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&payload_buffer_pool),
@@ -589,15 +692,16 @@ impl Coordinator {
             stream_session_sweeper_factory,
         ) = background_sweepers;
         let reclaim_sweeper = if start_reclaim_worker {
-            ReclaimSweeper::acquire_shared(&storage_handle, read_runtime.clone())?
+            ReclaimSweeper::acquire_shared(&background_storage_handle, read_runtime.clone())?
         } else {
-            ReclaimSweeper::disabled(Arc::clone(&storage_cluster))
+            ReclaimSweeper::disabled(Arc::clone(&background_storage_cluster))
         };
-        let lifecycle_sweeper = lifecycle_sweeper_factory(&storage_cluster, read_runtime.clone())?;
-        let shard_scavenger_sweeper = shard_scavenger_sweeper_factory(&storage_handle)?;
-        let shard_repair_sweeper = shard_repair_sweeper_factory(&storage_cluster)?;
-        let shard_backfill_sweeper = shard_backfill_sweeper_factory(&storage_handle)?;
-        let stream_session_sweeper = stream_session_sweeper_factory(&storage_handle)?;
+        let lifecycle_sweeper =
+            lifecycle_sweeper_factory(&background_storage_handle, read_runtime.clone())?;
+        let shard_scavenger_sweeper = shard_scavenger_sweeper_factory(&background_storage_handle)?;
+        let shard_repair_sweeper = shard_repair_sweeper_factory(&background_storage_handle)?;
+        let shard_backfill_sweeper = shard_backfill_sweeper_factory(&background_storage_handle)?;
+        let stream_session_sweeper = stream_session_sweeper_factory(&background_storage_handle)?;
         Ok(Self {
             storage_node: storage_handle,
             shared_caches,

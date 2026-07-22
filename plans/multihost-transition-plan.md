@@ -7552,6 +7552,15 @@ PG peering reconstruction design:
 
 Shard repair design:
 
+- Keep cluster-wide PG lifecycle separate from node-local payload health.
+  `PgState` describes routing and metadata-authority transitions; it must not be
+  changed to `Inconsistent` merely because one storage node is missing or has a
+  truncated payload shard. Such damage is segment/shard scoped: preserve
+  `Active` routing, allow reads when at least `k` valid EC shards are reachable,
+  record the damage in the durable repair queue, and repair from surviving
+  failure domains. Identity or metadata-integrity failures still fence startup,
+  and an individual segment with fewer than `k` reachable shards fails closed
+  without taking unrelated objects in the PG offline.
 - The current storage layer already has read-time EC reconstruction for placed
   segment payloads, but not yet a durable repair/backfill writer. Phase 11
   repair should build on that boundary explicitly: first identify missing or

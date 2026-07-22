@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -247,7 +247,10 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadSegmentsOutcome, StorageRpcStreamUploadSessionOutcome,
     StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadsListRequest,
     StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
-    STORAGE_RPC_CLIENT_WRITE_TIMEOUT,
+};
+use crate::storage_rpc_auth::{
+    read_storage_rpc_auth_transport_frame_with_limit,
+    write_storage_rpc_auth_transport_frame_with_limit, StorageRpcClientAuthConfig,
 };
 #[cfg(test)]
 use crate::types::BucketSnapshotTagsRequest;
@@ -361,12 +364,16 @@ impl From<LocalUnixStorageNodeClientAdmissionSettings> for UnixStorageNodeRpcAdm
 fn configure_storage_rpc_stream_timeout(
     stream: &UnixStream,
     context: &'static str,
+    rpc_auth: Option<&StorageRpcClientAuthConfig>,
 ) -> Result<(), StoreError> {
+    let io_timeout = rpc_auth
+        .map(|auth| auth.transport_limits().io_timeout())
+        .unwrap_or(STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT);
     stream
-        .set_read_timeout(Some(STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT))
+        .set_read_timeout(Some(io_timeout))
         .map_err(|source| StoreError::Io { context, source })?;
     stream
-        .set_write_timeout(Some(STORAGE_RPC_CLIENT_WRITE_TIMEOUT))
+        .set_write_timeout(Some(io_timeout))
         .map_err(|source| StoreError::Io { context, source })?;
     Ok(())
 }
@@ -1232,6 +1239,70 @@ pub(crate) struct UnixStorageNodeClient {
     socket_path: PathBuf,
     next_request_id: AtomicU64,
     rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
+    rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
+}
+
+fn write_unix_storage_rpc_request<W: Write>(
+    writer: &mut W,
+    node_id: NodeId,
+    auth: Option<&StorageRpcClientAuthConfig>,
+    frame: &StorageRpcFrame,
+    operation: &'static str,
+) -> Result<(), StoreError> {
+    let Some(auth) = auth else {
+        return write_storage_rpc_frame_to(writer, frame)
+            .map_err(|error| storage_rpc_stream_error(node_id, operation, error));
+    };
+    let envelope = auth
+        .sign_request(node_id, crate::clock::current_time_millis(), frame)
+        .map_err(|error| storage_rpc_auth_store_error(node_id, operation, error))?;
+    write_storage_rpc_auth_transport_frame_with_limit(
+        writer,
+        &envelope,
+        auth.transport_limits().max_frame_bytes(),
+    )
+    .map_err(|error| storage_rpc_stream_error(node_id, operation, StorageRpcStreamError::Io(error)))
+}
+
+fn read_unix_storage_rpc_response<R: Read>(
+    reader: &mut R,
+    node_id: NodeId,
+    auth: Option<&StorageRpcClientAuthConfig>,
+    request: &StorageRpcFrame,
+    operation: &'static str,
+) -> Result<StorageRpcFrame, StoreError> {
+    let Some(auth) = auth else {
+        return read_storage_rpc_frame_from(reader)
+            .map_err(|error| storage_rpc_stream_error(node_id, operation, error));
+    };
+    let envelope = read_storage_rpc_auth_transport_frame_with_limit(
+        reader,
+        auth.transport_limits().max_frame_bytes(),
+    )
+    .map_err(|error| {
+        storage_rpc_stream_error(node_id, operation, StorageRpcStreamError::Io(error))
+    })?;
+    auth.verify_response(
+        node_id,
+        crate::clock::current_time_millis(),
+        request,
+        &envelope,
+    )
+    .map(|verified| verified.into_frame())
+    .map_err(|error| storage_rpc_auth_store_error(node_id, operation, error))
+}
+
+fn storage_rpc_auth_store_error(
+    node_id: NodeId,
+    operation: &'static str,
+    error: impl std::fmt::Debug,
+) -> StoreError {
+    StoreError::StorageRpc {
+        node_id: node_id.as_u32(),
+        operation,
+        code: StorageRpcErrorCode::PayloadDecode,
+        message: format!("storage RPC authentication failed: {error:?}"),
+    }
 }
 
 struct LocalStorageNodeReadHandleLease;

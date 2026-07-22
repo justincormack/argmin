@@ -3401,6 +3401,19 @@ pub(crate) fn decode_storage_rpc_frame(
     decode_storage_rpc_frame_with_limit(bytes, STORAGE_RPC_MAX_PAYLOAD_LEN)
 }
 
+pub(crate) fn validate_storage_rpc_request_frame_payload_limit(
+    frame: &StorageRpcFrame,
+) -> Result<(), StorageRpcFrameError> {
+    let limit = message_kind_request_max_payload_len(frame.kind, STORAGE_RPC_MAX_PAYLOAD_LEN);
+    if frame.payload.len() > limit {
+        return Err(StorageRpcFrameError::PayloadTooLarge {
+            len: frame.payload.len(),
+            limit,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn decode_storage_rpc_frame_with_limit(
     bytes: &[u8],
     max_payload_len: usize,

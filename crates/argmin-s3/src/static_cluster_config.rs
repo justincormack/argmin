@@ -38,6 +38,10 @@ use storage::control_plane::{
     CONTROL_PLANE_RPC_MAX_SERVER_OPERATION_TIMEOUT, CONTROL_PLANE_RPC_TLS_ALPN,
     CONTROL_PLANE_TOPOLOGY_DIGEST_LEN,
 };
+use storage::control_plane_auth::{
+    ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+    ControlPlaneScopedCredentialStore,
+};
 use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
     validate_control_plane_command_replication_size, ControlPlaneRaftPeerFrameExchange,
@@ -45,7 +49,10 @@ use storage::control_plane_raft::{
     ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
     CONTROL_PLANE_RAFT_TLS_ALPN,
 };
-use storage::PgId;
+use storage::{
+    FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability, PgId,
+    StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig, StorageRpcTransportLimits,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -2546,6 +2553,436 @@ impl ValidatedStaticClusterManifest {
             })
     }
 
+    fn replicated_data_process_server_config<F>(
+        &self,
+        material: &ResolvedStaticClusterMaterial,
+        get: F,
+    ) -> Result<ServerConfig, String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if self.manifest.deployment.mode != DeploymentMode::Replicated {
+            return Err("replicated data-process mapping requires replicated mode".to_string());
+        }
+        let selected = &self.manifest.processes[self.selected_process_index];
+        let process_role = match selected.kind {
+            ProcessKind::Frontend => "frontend",
+            ProcessKind::StorageNode => "storage-node",
+            ProcessKind::Combined => {
+                return Err(
+                    "replicated combined-process storage RPC auth requires role-specific client credentials"
+                        .to_string(),
+                );
+            }
+            ProcessKind::ControlPlane | ProcessKind::AllInOne => {
+                return Err("selected process is not a replicated data process".to_string());
+            }
+        };
+        let selected_storage_node = self
+            .manifest
+            .storage_nodes
+            .iter()
+            .find(|node| node.process_id == selected.id);
+        if selected.kind == ProcessKind::StorageNode && selected_storage_node.is_none() {
+            return Err("selected storage process has no storage node".to_string());
+        }
+
+        let ConfiguredStaticControlPlaneRpcClients {
+            endpoints: control_plane_client_endpoints,
+            frame_transport: control_plane_rpc_frame_transport,
+        } = self.configured_static_control_plane_rpc_clients(
+            material,
+            EndpointProtocol::ControlPlane,
+        )?;
+        let control_plane_endpoint = control_plane_client_endpoints
+            .first()
+            .cloned()
+            .ok_or_else(|| "replicated data process has no control-plane route".to_string())?;
+
+        let mut storage_node_sockets = Vec::with_capacity(self.manifest.storage_nodes.len());
+        for storage_node in &self.manifest.storage_nodes {
+            let endpoint = self
+                .canonical_storage_node_endpoints
+                .get(&storage_node.node_id)
+                .expect("validated storage-node endpoint map contains every node");
+            let EndpointAddress::Unix(path) = parse_endpoint_address(&endpoint.advertise, false)?
+            else {
+                return Err(
+                    "replicated storage RPC TCP activation is not implemented; every canonical storage endpoint must be Unix"
+                        .to_string(),
+                );
+            };
+            storage_node_sockets.push(ConfiguredStorageNodeSocket {
+                node_id: storage_node.node_id,
+                socket_path: path.to_string_lossy().into_owned(),
+            });
+        }
+        storage_node_sockets.sort_by_key(|node| node.node_id);
+
+        let local_storage_socket = if let Some(storage_node) = selected_storage_node {
+            if self
+                .manifest
+                .endpoints
+                .iter()
+                .filter(|endpoint| endpoint.owner_process_id == selected.id)
+                .filter(|endpoint| endpoint.protocol == EndpointProtocol::StorageRpc)
+                .any(|endpoint| {
+                    !endpoint.listen.starts_with("unix://")
+                        || !endpoint.advertise.starts_with("unix://")
+                })
+            {
+                return Err(
+                    "replicated Unix storage-node activation cannot ignore a configured TCP storage RPC listener"
+                        .to_string(),
+                );
+            }
+            let endpoint = self.preferred_owned_endpoint(selected, EndpointProtocol::StorageRpc)?;
+            let EndpointAddress::Unix(path) = parse_endpoint_address(&endpoint.listen, true)?
+            else {
+                return Err(
+                    "replicated Unix storage-node activation requires a Unix storage RPC listener"
+                        .to_string(),
+                );
+            };
+            Some((storage_node, path.to_string_lossy().into_owned()))
+        } else {
+            None
+        };
+
+        let storage_transport_limits =
+            |endpoint_id: &str| -> Result<StorageRpcTransportLimits, String> {
+                let endpoint = self
+                    .manifest
+                    .endpoints
+                    .iter()
+                    .find(|endpoint| endpoint.id == endpoint_id)
+                    .ok_or_else(|| {
+                        format!("storage endpoint {endpoint_id} disappeared after validation")
+                    })?;
+                let profile = self
+                .manifest
+                .transport_profiles
+                .iter()
+                .find(|profile| profile.id == endpoint.transport_profile_id)
+                .ok_or_else(|| format!("storage endpoint {endpoint_id} transport profile disappeared after validation"))?;
+                StorageRpcTransportLimits::new(
+                    usize::try_from(profile.max_frame_bytes).map_err(|_| {
+                        format!("storage endpoint {endpoint_id} frame limit does not fit usize")
+                    })?,
+                    usize::try_from(profile.max_connections).map_err(|_| {
+                        format!(
+                            "storage endpoint {endpoint_id} connection limit does not fit usize"
+                        )
+                    })?,
+                    Duration::from_millis(profile.io_timeout_ms),
+                )
+                .map_err(|error| {
+                    format!("invalid storage endpoint {endpoint_id} transport limits: {error}")
+                })
+            };
+        let client_transport_limits = self
+            .canonical_storage_node_endpoints
+            .values()
+            .map(|endpoint| storage_transport_limits(&endpoint.endpoint_id))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .reduce(|left, right| {
+                StorageRpcTransportLimits::new(
+                    left.max_frame_bytes().min(right.max_frame_bytes()),
+                    left.max_connections().min(right.max_connections()),
+                    left.io_timeout().min(right.io_timeout()),
+                )
+                .expect("minimum validated storage transport limits remain valid")
+            })
+            .ok_or_else(|| "replicated data process has no storage transport limits".to_string())?;
+        let local_server_transport_limits = local_storage_socket
+            .as_ref()
+            .map(|(storage_node, _)| {
+                let endpoint = self
+                    .canonical_storage_node_endpoints
+                    .get(&storage_node.node_id)
+                    .expect("validated canonical storage endpoint exists");
+                storage_transport_limits(&endpoint.endpoint_id)
+            })
+            .transpose()?;
+
+        let scoped_credentials = material
+            .auth_credentials
+            .iter()
+            .filter_map(|credential| {
+                let principal = match (&credential.principal.principal, &credential.principal.id) {
+                    (AuthPrincipal::StorageNode, CredentialPrincipalId::Node(node_id)) => {
+                        let node_id = u32::try_from(*node_id).map_err(|_| {
+                            "storage RPC credential node id does not fit u32".to_string()
+                        });
+                        Some(node_id.map(|node_id| {
+                            ControlPlaneAuthPrincipal::StorageNodeProcess {
+                                node_id: storage::NodeId::new(node_id),
+                            }
+                        }))
+                    }
+                    (AuthPrincipal::Frontend, CredentialPrincipalId::Instance(instance_id)) => {
+                        Some(Ok(ControlPlaneAuthPrincipal::Frontend {
+                            instance_id: instance_id.clone(),
+                        }))
+                    }
+                    (AuthPrincipal::Admin, CredentialPrincipalId::Instance(instance_id)) => {
+                        Some(Ok(ControlPlaneAuthPrincipal::Admin {
+                            instance_id: instance_id.clone(),
+                        }))
+                    }
+                    (AuthPrincipal::Maintenance, CredentialPrincipalId::Instance(process_id)) => {
+                        Some(Ok(ControlPlaneAuthPrincipal::LocalMaintenance {
+                            process_id: process_id.clone(),
+                        }))
+                    }
+                    (AuthPrincipal::RaftPeer, CredentialPrincipalId::Node(_)) => None,
+                    _ => Some(Err(
+                        "resolved static storage RPC credential has a mismatched principal identity"
+                            .to_string(),
+                    )),
+                }?;
+                Some(principal.and_then(|principal| {
+                    ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+                        cluster_id: self.manifest.cluster.id.clone(),
+                        credential_id: credential.credential_id.clone(),
+                        credential_version: credential.credential_version,
+                        principal,
+                        secret: credential.secret.clone(),
+                    })
+                    .map(|scoped| (credential, scoped))
+                    .map_err(|error| format!("invalid storage RPC credential: {error}"))
+                }))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        let primary_client_credential = scoped_credentials
+            .iter()
+            .find(|(resolved, scoped)| {
+                resolved.use_for_signing
+                    && match (selected.kind, scoped.principal()) {
+                        (
+                            ProcessKind::Frontend,
+                            ControlPlaneAuthPrincipal::Frontend { instance_id },
+                        ) => selected.frontend_instance_id.as_ref() == Some(instance_id),
+                        (
+                            ProcessKind::StorageNode,
+                            ControlPlaneAuthPrincipal::StorageNodeProcess { node_id },
+                        ) => selected_storage_node
+                            .is_some_and(|node| node.node_id == node_id.as_u32()),
+                        _ => false,
+                    }
+            })
+            .map(|(_, scoped)| scoped.clone())
+            .ok_or_else(|| {
+                "selected replicated data process has no active storage RPC signing credential"
+                    .to_string()
+            })?;
+        let (storage_rpc_frontend_client_auth, storage_rpc_storage_node_client_auth) =
+            match selected.kind {
+                ProcessKind::Frontend => (
+                    Some(
+                        FrontendStorageRpcClientCapability::new_with_transport_limits(
+                            primary_client_credential,
+                            self.manifest.cluster.topology_generation,
+                            self.topology_digest.clone(),
+                            client_transport_limits,
+                        )
+                        .map_err(|error| {
+                            format!("invalid frontend storage RPC capability: {error}")
+                        })?,
+                    ),
+                    None,
+                ),
+                ProcessKind::StorageNode => (
+                    None,
+                    Some(
+                        StorageNodeStorageRpcClientCapability::new_with_transport_limits(
+                            primary_client_credential,
+                            self.manifest.cluster.topology_generation,
+                            self.topology_digest.clone(),
+                            client_transport_limits,
+                        )
+                        .map_err(|error| {
+                            format!("invalid storage-node storage RPC capability: {error}")
+                        })?,
+                    ),
+                ),
+                _ => unreachable!("replicated data process kind was validated above"),
+            };
+        let storage_rpc_maintenance_client_auth = selected
+            .maintenance_instance_id
+            .as_ref()
+            .map(|maintenance_instance_id| {
+                let maintenance_credential = scoped_credentials
+                .iter()
+                .find(|(resolved, scoped)| {
+                    resolved.use_for_signing
+                        && matches!(
+                            scoped.principal(),
+                            ControlPlaneAuthPrincipal::LocalMaintenance { process_id }
+                                if process_id == maintenance_instance_id
+                        )
+                })
+                .map(|(_, scoped)| scoped.clone())
+                .ok_or_else(|| {
+                    "selected replicated data process has no active maintenance storage RPC signing credential"
+                        .to_string()
+                })?;
+                MaintenanceStorageRpcClientCapability::new_with_transport_limits(
+                    maintenance_credential,
+                    self.manifest.cluster.topology_generation,
+                    self.topology_digest.clone(),
+                    client_transport_limits,
+                )
+                .map_err(|error| format!("invalid maintenance storage RPC capability: {error}"))
+            })
+            .transpose()?;
+        let storage_rpc_server_auth = local_storage_socket
+            .as_ref()
+            .map(|_| {
+                let verifier = ControlPlaneScopedCredentialStore::new(
+                    scoped_credentials
+                        .iter()
+                        .map(|(_, credential)| credential.clone())
+                        .collect(),
+                )
+                .map_err(|error| format!("invalid storage RPC verifier: {error}"))?;
+                StorageRpcServerAuthConfig::new(
+                    self.manifest.cluster.id.clone(),
+                    verifier,
+                    self.manifest.cluster.topology_generation,
+                    self.topology_digest.clone(),
+                )
+                .map(|config| {
+                    config.with_transport_limits(
+                        local_server_transport_limits
+                            .expect("local storage endpoint has validated transport limits"),
+                    )
+                })
+                .map_err(|error| format!("invalid storage RPC server auth config: {error}"))
+            })
+            .transpose()?;
+
+        let mut storage_control_plane_credentials = Vec::new();
+        let mut frontend_control_plane_credentials = Vec::new();
+        let mut storage_control_plane_signer = None;
+        let mut frontend_control_plane_signer = None;
+        for credential in &material.auth_credentials {
+            let signer = (
+                credential.credential_id.clone(),
+                credential.credential_version,
+            );
+            match (&credential.principal.principal, &credential.principal.id) {
+                (AuthPrincipal::StorageNode, CredentialPrincipalId::Node(node_id)) => {
+                    let node_id = u32::try_from(*node_id).map_err(|_| {
+                        "resolved storage-node auth principal does not fit u32".to_string()
+                    })?;
+                    storage_control_plane_credentials.push(
+                        ConfiguredControlPlaneStorageAuthCredential {
+                            node_id,
+                            credential_id: credential.credential_id.clone(),
+                            credential_version: credential.credential_version,
+                            secret: BinarySecretConfigValue::from_bytes(credential.secret.clone()),
+                        },
+                    );
+                    if credential.use_for_signing
+                        && selected_storage_node.is_some_and(|node| node.node_id == node_id)
+                    {
+                        storage_control_plane_signer = Some(signer);
+                    }
+                }
+                (AuthPrincipal::Frontend, CredentialPrincipalId::Instance(instance_id)) => {
+                    frontend_control_plane_credentials.push(
+                        ConfiguredControlPlaneFrontendAuthCredential {
+                            instance_id: instance_id.clone(),
+                            credential_id: credential.credential_id.clone(),
+                            credential_version: credential.credential_version,
+                            secret: BinarySecretConfigValue::from_bytes(credential.secret.clone()),
+                        },
+                    );
+                    if credential.use_for_signing
+                        && selected.frontend_instance_id.as_ref() == Some(instance_id)
+                    {
+                        frontend_control_plane_signer = Some(signer);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut manifest_values = BTreeMap::<&'static str, String>::new();
+        manifest_values.insert("ARGMIN_PROCESS_ROLE", process_role.to_string());
+        manifest_values.insert(
+            "ARGMIN_PG_COUNT",
+            self.manifest.storage.pg_count.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_STORAGE_CLUSTER_EPOCH",
+            self.manifest.storage.initial_cluster_epoch.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_EC_K",
+            self.manifest.storage.ec_data_shards.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_EC_M",
+            self.manifest.storage.ec_parity_shards.to_string(),
+        );
+        manifest_values.insert(
+            "ARGMIN_LOCAL_NODE_COUNT",
+            self.manifest.storage_nodes.len().to_string(),
+        );
+        manifest_values.insert("ARGMIN_REGION", self.manifest.cluster.region.clone());
+        manifest_values.insert("ARGMIN_HOST_ID", selected.host_id.clone());
+        manifest_values.insert("ARGMIN_CONTROL_PLANE_SOCKET_PATH", control_plane_endpoint);
+        if let Some((storage_node, socket_path)) = &local_storage_socket {
+            manifest_values.insert("ARGMIN_STORAGE_NODE_ID", "0".to_string());
+            manifest_values.insert(
+                "ARGMIN_STORAGE_NODE_DATA_DIR",
+                storage_node.data_dir.to_string_lossy().into_owned(),
+            );
+            manifest_values.insert("ARGMIN_STORAGE_NODE_SOCKET_PATH", socket_path.clone());
+        }
+        let mut config = ServerConfig::from_lookup(|key| {
+            manifest_values.get(key).cloned().or_else(|| get(key))
+        })?;
+        config.storage_node_ids = self
+            .manifest
+            .storage_nodes
+            .iter()
+            .map(|node| node.node_id)
+            .collect();
+        config.storage_node_ids.sort_unstable();
+        config.storage_node_sockets = storage_node_sockets;
+        config.storage_node_rpc_admission_limit = config
+            .storage_node_rpc_admission_limit
+            .min(client_transport_limits.max_connections());
+        config.storage_node_id = selected_storage_node.map(|node| node.node_id);
+        config.storage_node_data_dir =
+            selected_storage_node.map(|node| node.data_dir.to_string_lossy().into_owned());
+        config.storage_node_socket_path = local_storage_socket.map(|(_, path)| path);
+        config.control_plane_client_socket_paths = if control_plane_rpc_frame_transport.is_none() {
+            control_plane_client_endpoints.clone()
+        } else {
+            Vec::new()
+        };
+        config.control_plane_rpc_client_endpoints = control_plane_client_endpoints;
+        config.control_plane_rpc_frame_transport = control_plane_rpc_frame_transport;
+        config.control_plane_auth_cluster_id = Some(self.raft_cluster_identity());
+        config.control_plane_storage_auth_credentials = storage_control_plane_credentials;
+        config.control_plane_storage_auth_signing_credential = storage_control_plane_signer;
+        config.control_plane_frontend_auth_instance_id = selected.frontend_instance_id.clone();
+        config.control_plane_frontend_auth_credentials = frontend_control_plane_credentials;
+        config.control_plane_frontend_auth_signing_credential = frontend_control_plane_signer;
+        config.storage_rpc_frontend_client_auth = storage_rpc_frontend_client_auth;
+        config.storage_rpc_maintenance_client_auth = storage_rpc_maintenance_client_auth;
+        config.storage_rpc_storage_node_client_auth = storage_rpc_storage_node_client_auth;
+        config.storage_rpc_server_auth = storage_rpc_server_auth;
+        config.static_cluster_identity = Some(self.configured_static_identity());
+        Ok(config)
+    }
+
     fn standalone_legacy_server_config<F>(&self, get: F) -> Result<ServerConfig, String>
     where
         F: Fn(&str) -> Option<String>,
@@ -2729,7 +3166,19 @@ where
                 DeploymentMode::Standalone => manifest.standalone_legacy_server_config(get),
                 DeploymentMode::Replicated => {
                     let material = manifest.resolve_selected_process_material()?;
-                    manifest.replicated_unix_control_plane_server_config(&material, get)
+                    match manifest.manifest.processes[manifest.selected_process_index].kind {
+                        ProcessKind::ControlPlane => {
+                            manifest.replicated_unix_control_plane_server_config(&material, get)
+                        }
+                        ProcessKind::Frontend
+                        | ProcessKind::StorageNode
+                        | ProcessKind::Combined => {
+                            manifest.replicated_data_process_server_config(&material, get)
+                        }
+                        ProcessKind::AllInOne => {
+                            Err("all-in-one process is invalid in replicated mode".to_string())
+                        }
+                    }
                 }
             }
         }
@@ -4985,6 +5434,16 @@ fn validate_deployment(
                 process.id
             ));
         }
+        if manifest.deployment.mode == DeploymentMode::Replicated
+            && manifest.deployment.internal_auth == InternalAuth::Required
+            && process.kind.has_frontend()
+            && process.maintenance_instance_id.is_none()
+        {
+            return Err(format!(
+                "authenticated replicated frontend process {} requires maintenance_instance_id for background workflows",
+                process.id
+            ));
+        }
         if manifest.deployment.internal_auth == InternalAuth::Required
             && (process.kind.has_frontend() || process.kind.has_control_plane())
             && process.admin_instance_id.is_none()
@@ -6117,6 +6576,21 @@ mod tests {
                 );
             }
         }
+        write_material_file(
+            &material_dir.join("frontend-1.key"),
+            b"frontend-1-secret",
+            0o600,
+        );
+        write_material_file(
+            &material_dir.join("frontend-1-admin.key"),
+            b"frontend-1-admin-secret",
+            0o600,
+        );
+        write_material_file(
+            &material_dir.join("frontend-1-maintenance.key"),
+            b"frontend-1-maintenance-secret",
+            0o600,
+        );
         let manifest = manifest
             .replace("/run/argmin-secrets", material_dir.to_str().unwrap())
             .replace("tcp://control-1.internal:", "tcp://localhost:")
@@ -6643,6 +7117,93 @@ secret_ref = "file:/run/argmin-secrets/{credential_name}.key"
                 .unwrap();
             }
         }
+        manifest
+    }
+
+    fn replicated_unix_data_manifest() -> String {
+        let mut manifest =
+            replicated_manifest().replace("failure_domain = \"host\"", "failure_domain = \"disk\"");
+        for host_number in 2..=3 {
+            manifest = manifest.replace(
+                &format!("id = \"host-{host_number}-data\"\nhost_id = \"host-{host_number}\""),
+                &format!("id = \"host-{host_number}-data\"\nhost_id = \"host-1\""),
+            );
+            manifest = manifest.replace(
+                &format!(
+                    "id = \"storage-{host_number}\"\nhost_id = \"host-{host_number}\"\nkind = \"storage-node\""
+                ),
+                &format!(
+                    "id = \"storage-{host_number}\"\nhost_id = \"host-1\"\nkind = \"storage-node\""
+                ),
+            );
+        }
+        for host_number in 1..=3 {
+            let tcp_block = format!(
+                r#"[[endpoints]]
+id = "storage-{host_number}"
+owner_process_id = "storage-{host_number}"
+protocol = "storage-rpc"
+priority = 10
+listen = "tcp://0.0.0.0:{port}"
+advertise = "tcp://storage-{host_number}.internal:{port}"
+transport_profile_id = "internal"
+tls_identity_id = "host-{host_number}-identity"
+tls_trust_bundle_id = "cluster-ca"
+tls_server_name = "storage-{host_number}.internal"
+"#,
+                port = 7700 + host_number
+            );
+            let unix_block = format!(
+                r#"[[endpoints]]
+id = "storage-{host_number}"
+owner_process_id = "storage-{host_number}"
+protocol = "storage-rpc"
+priority = 10
+listen = "unix:///run/argmin/storage-{host_number}.sock"
+advertise = "unix:///run/argmin/storage-{host_number}.sock"
+transport_profile_id = "internal"
+"#
+            );
+            manifest = replace_once(&manifest, &tcp_block, &unix_block);
+        }
+        manifest.push_str(
+            r#"
+[[processes]]
+id = "frontend-1"
+host_id = "host-1"
+kind = "frontend"
+frontend_instance_id = "frontend-1"
+admin_instance_id = "frontend-1-admin"
+maintenance_instance_id = "frontend-1-maintenance"
+
+[[auth_credentials]]
+principal = "frontend"
+instance_id = "frontend-1"
+credential_id = "frontend-1"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:/run/argmin-secrets/frontend-1.key"
+
+[[auth_credentials]]
+principal = "admin"
+instance_id = "frontend-1-admin"
+credential_id = "frontend-1-admin"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:/run/argmin-secrets/frontend-1-admin.key"
+
+[[auth_credentials]]
+principal = "maintenance"
+instance_id = "frontend-1-maintenance"
+credential_id = "frontend-1-maintenance"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
+"#,
+        );
         manifest
     }
 
@@ -9063,6 +9624,87 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
             .all(|credential| credential.principal.principal != AuthPrincipal::RaftPeer));
         assert_eq!(storage_material.tls_identity_count(), 1);
         assert_eq!(storage_material.tls_trust_bundle_count(), 1);
+    }
+
+    #[test]
+    fn replicated_unix_data_processes_map_storage_rpc_auth_from_manifest() {
+        let manifest_text = replicated_unix_data_manifest();
+        let (_storage_dir, storage_manifest) =
+            materialized_replicated_manifest_from("storage-1", manifest_text.clone());
+        let storage_material = storage_manifest
+            .resolve_selected_process_material_at(1)
+            .unwrap();
+        let storage_config = storage_manifest
+            .replicated_data_process_server_config(&storage_material, |_| None)
+            .unwrap();
+
+        assert_eq!(storage_config.process_role, ProcessRole::StorageNode);
+        assert_eq!(storage_config.storage_node_id, Some(1));
+        assert_eq!(storage_config.storage_node_ids, vec![1, 2, 3]);
+        assert_eq!(
+            storage_config.storage_node_socket_path.as_deref(),
+            Some("/run/argmin/storage-1.sock")
+        );
+        assert!(storage_config
+            .storage_rpc_storage_node_client_auth
+            .is_some());
+        assert!(storage_config.storage_rpc_frontend_client_auth.is_none());
+        assert!(storage_config.storage_rpc_server_auth.is_some());
+        assert_eq!(storage_config.storage_node_rpc_admission_limit, 64);
+        assert_eq!(
+            storage_config
+                .storage_rpc_server_auth
+                .as_ref()
+                .unwrap()
+                .transport_limits()
+                .max_connections(),
+            64
+        );
+
+        let (_frontend_dir, frontend_manifest) =
+            materialized_replicated_manifest_from("frontend-1", manifest_text);
+        let frontend_material = frontend_manifest
+            .resolve_selected_process_material_at(1)
+            .unwrap();
+        let environment = standalone_runtime_environment();
+        let frontend_config = frontend_manifest
+            .replicated_data_process_server_config(&frontend_material, |key| {
+                environment.get(key).cloned()
+            })
+            .unwrap();
+
+        assert_eq!(frontend_config.process_role, ProcessRole::Frontend);
+        assert_eq!(frontend_config.storage_node_id, None);
+        assert_eq!(frontend_config.storage_node_sockets.len(), 3);
+        assert!(frontend_config.storage_rpc_frontend_client_auth.is_some());
+        assert!(frontend_config
+            .storage_rpc_maintenance_client_auth
+            .is_some());
+        assert_eq!(
+            frontend_config
+                .storage_rpc_frontend_client_auth
+                .as_ref()
+                .unwrap()
+                .transport_limits()
+                .io_timeout(),
+            Duration::from_secs(15)
+        );
+        assert!(frontend_config.storage_rpc_server_auth.is_none());
+        assert!(frontend_config.control_plane_rpc_frame_transport.is_some());
+    }
+
+    #[test]
+    fn replicated_frontend_requires_maintenance_identity_for_background_workflows() {
+        let manifest = replicated_unix_data_manifest()
+            .replace("maintenance_instance_id = \"frontend-1-maintenance\"\n", "");
+
+        let error = parse_static_cluster_manifest(&manifest, "frontend-1").unwrap_err();
+
+        assert!(
+            error.contains("requires maintenance_instance_id"),
+            "{error}"
+        );
+        assert!(error.contains("background workflows"), "{error}");
     }
 
     #[test]

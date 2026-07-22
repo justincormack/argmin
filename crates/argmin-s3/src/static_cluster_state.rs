@@ -612,6 +612,31 @@ pub(crate) fn lock_and_verify_standalone_storage_startup(
     data_dir: &Path,
     pg_ids: &[u32],
 ) -> Result<StaticStorageRuntimeLock, String> {
+    let (runtime_lock, inventory) =
+        lock_and_inspect_static_storage_startup(identity, storage_node_id, data_dir, pg_ids)?;
+    if let Some(pg_id) = inventory.incomplete_payload_pg_ids.first() {
+        return Err(format!(
+            "static storage PG {pg_id} has incomplete authoritative shard inventory"
+        ));
+    }
+    Ok(runtime_lock)
+}
+
+pub(crate) fn lock_and_inspect_replicated_storage_startup(
+    identity: &ConfiguredStaticClusterIdentity,
+    storage_node_id: u32,
+    data_dir: &Path,
+    pg_ids: &[u32],
+) -> Result<(StaticStorageRuntimeLock, StaticStorageInventoryReport), String> {
+    lock_and_inspect_static_storage_startup(identity, storage_node_id, data_dir, pg_ids)
+}
+
+fn lock_and_inspect_static_storage_startup(
+    identity: &ConfiguredStaticClusterIdentity,
+    storage_node_id: u32,
+    data_dir: &Path,
+    pg_ids: &[u32],
+) -> Result<(StaticStorageRuntimeLock, StaticStorageInventoryReport), String> {
     if !data_dir.try_exists().map_err(|error| {
         format!(
             "inspect static storage directory {}: {error}",
@@ -638,11 +663,14 @@ pub(crate) fn lock_and_verify_standalone_storage_startup(
         ));
     }
     verify_static_storage_identity(&identity_path, &expected)?;
-    verify_static_storage_pg_state(data_dir, pg_ids, &expected.encode()?)?;
+    let inventory = inspect_static_storage_pg_state(data_dir, pg_ids, &expected.encode()?)?;
     remove_completed_initialization_marker(data_dir, &expected)?;
-    Ok(StaticStorageRuntimeLock {
-        _directory_lock: directory_lock,
-    })
+    Ok((
+        StaticStorageRuntimeLock {
+            _directory_lock: directory_lock,
+        },
+        inventory,
+    ))
 }
 
 fn publish_static_storage_identity(
@@ -798,11 +826,12 @@ fn non_lock_directory_entries(path: &Path) -> Result<impl Iterator<Item = fs::Di
     }))
 }
 
-fn verify_static_storage_pg_state(
+fn inspect_static_storage_pg_state(
     data_dir: &Path,
     pg_ids: &[u32],
     expected_identity_bytes: &[u8],
-) -> Result<(), String> {
+) -> Result<StaticStorageInventoryReport, String> {
+    let mut incomplete_payload_pg_ids = Vec::new();
     for pg_id in pg_ids {
         let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
         require_real_directory(&pg_dir, "static storage PG directory")?;
@@ -813,15 +842,24 @@ fn verify_static_storage_pg_state(
         let inventory = storage::inspect_pg_shard_inventory(&pg_dir, *pg_id)
             .map_err(|error| format!("inspect static storage PG {pg_id} inventory: {error}"))?;
         if !inventory.authoritative_inventory_is_complete() {
-            return Err(format!(
-                "static storage PG {pg_id} has incomplete authoritative shard \
-                 inventory: rows={} files={} missing={} size_mismatches={}",
-                inventory.shard_row_count,
-                inventory.shard_file_count,
-                inventory.authoritative_missing_file_count,
-                inventory.authoritative_size_mismatch_count,
-            ));
+            incomplete_payload_pg_ids.push(*pg_id);
         }
+    }
+    Ok(StaticStorageInventoryReport {
+        incomplete_payload_pg_ids,
+    })
+}
+
+fn verify_static_storage_pg_state(
+    data_dir: &Path,
+    pg_ids: &[u32],
+    expected_identity_bytes: &[u8],
+) -> Result<(), String> {
+    let inventory = inspect_static_storage_pg_state(data_dir, pg_ids, expected_identity_bytes)?;
+    if let Some(pg_id) = inventory.incomplete_payload_pg_ids.first() {
+        return Err(format!(
+            "static storage PG {pg_id} has incomplete authoritative shard inventory"
+        ));
     }
     Ok(())
 }
@@ -889,6 +927,17 @@ struct StaticStorageDirectoryLock {
 #[derive(Debug)]
 pub(crate) struct StaticStorageRuntimeLock {
     _directory_lock: StaticStorageDirectoryLock,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct StaticStorageInventoryReport {
+    incomplete_payload_pg_ids: Vec<u32>,
+}
+
+impl StaticStorageInventoryReport {
+    pub(crate) fn incomplete_payload_pg_ids(&self) -> &[u32] {
+        &self.incomplete_payload_pg_ids
+    }
 }
 
 fn acquire_storage_directory_lock(data_dir: &Path) -> Result<StaticStorageDirectoryLock, String> {
@@ -1115,7 +1164,11 @@ mod tests {
     use super::*;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    use storage::{LocalClusterMap, LocalNodeStoreConfig, ShardKey};
+    use std::sync::Arc;
+    use storage::{
+        BucketName, GenerationId, LocalClusterMap, LocalNodeStoreConfig, ObjectKey, ShardKey,
+        StorageCluster,
+    };
 
     fn identity(process_id: &str, process_digest: &str) -> ConfiguredStaticClusterIdentity {
         ConfiguredStaticClusterIdentity {
@@ -1430,6 +1483,54 @@ mod tests {
         .unwrap();
 
         lock_and_verify_standalone_storage_startup(&expected, 1, &data_dir, &[0]).unwrap();
+    }
+
+    #[test]
+    fn replicated_storage_reports_missing_payload_without_rejecting_startup() {
+        let temp = test_util::tempdir();
+        let data_dir = temp.path().join("storage");
+        let expected = identity("storage-1", "b");
+        let ec_shape = EcShape { k: 1, m: 0 };
+        initialize_storage(&expected, 1, &data_dir, &[0], ec_shape).unwrap();
+
+        let node_id = NodeId::new(1);
+        let local_map = LocalClusterMap::open_with_configs(
+            node_id,
+            [LocalNodeStoreConfig::new(node_id, &data_dir)],
+            &[0],
+            ec_shape,
+        )
+        .unwrap();
+        let cluster = StorageCluster::from_local_map(Arc::new(local_map)).unwrap();
+        let written = cluster
+            .write_direct_put_segment_payload_shards(
+                &BucketName::try_from("bucket".to_string()).unwrap(),
+                &ObjectKey::try_from("key".to_string()).unwrap(),
+                GenerationId::MIN,
+                0,
+                &[7; 16],
+                b"indexed payload",
+            )
+            .unwrap();
+        cluster
+            .test_register_payload_shard_acks(written.data_pg_id, &written.written_shards)
+            .unwrap();
+        let shard_key = &written.written_shards[0].key;
+        let shard_path = data_dir
+            .join("pg-0000/shards")
+            .join(shard_key.hex_prefix())
+            .join(shard_key.to_string());
+        drop(cluster);
+        fs::remove_file(shard_path).unwrap();
+
+        let (runtime_lock, inventory) =
+            lock_and_inspect_replicated_storage_startup(&expected, 1, &data_dir, &[0]).unwrap();
+        assert_eq!(inventory.incomplete_payload_pg_ids(), &[0]);
+        drop(runtime_lock);
+
+        let error =
+            lock_and_verify_standalone_storage_startup(&expected, 1, &data_dir, &[0]).unwrap_err();
+        assert!(error.contains("incomplete authoritative shard inventory"));
     }
 
     #[test]

@@ -2413,6 +2413,7 @@ fn unix_storage_node_rpc_admission_is_shared_by_node_and_socket() {
         ClusterEpoch::new(1).unwrap(),
         socket_path.clone(),
         Arc::clone(&rpc_admission),
+        None,
     );
     let client_b =
         UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);

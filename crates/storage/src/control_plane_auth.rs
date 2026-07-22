@@ -16,9 +16,10 @@ const CONTROL_PLANE_AUTH_MAX_SECRET_LEN: usize = 4096;
 pub enum ControlPlaneAuthPrincipal {
     RaftPeer { node_id: u64 },
     StorageNode { node_id: NodeId, incarnation: u64 },
+    StorageNodeProcess { node_id: NodeId },
     Frontend { instance_id: String },
     Admin { instance_id: String },
-    LocalMaintenance { process_id: u64 },
+    LocalMaintenance { process_id: String },
     Service { service: ControlPlaneAuthService },
 }
 
@@ -44,13 +45,12 @@ impl ControlPlaneAuthPrincipal {
                     "principal instance id",
                 )?;
             }
-            Self::LocalMaintenance { process_id } => {
-                if *process_id == 0 {
-                    return Err(auth_protocol_error(
-                        "local-maintenance principal process id is zero",
-                    ));
-                }
-            }
+            Self::StorageNodeProcess { .. } => {}
+            Self::LocalMaintenance { process_id } => validate_nonempty_string(
+                process_id,
+                CONTROL_PLANE_AUTH_MAX_INSTANCE_ID_LEN,
+                "local-maintenance process id",
+            )?,
             Self::Service { .. } => {}
         }
         Ok(())
@@ -289,6 +289,7 @@ impl ControlPlaneScopedCredential {
             self.principal,
             ControlPlaneAuthPrincipal::Frontend { .. }
                 | ControlPlaneAuthPrincipal::StorageNode { .. }
+                | ControlPlaneAuthPrincipal::StorageNodeProcess { .. }
                 | ControlPlaneAuthPrincipal::Admin { .. }
                 | ControlPlaneAuthPrincipal::LocalMaintenance { .. }
         ) {
@@ -903,6 +904,10 @@ fn write_principal(
             write_u32(out, node_id.as_u32());
             write_u64(out, *incarnation);
         }
+        ControlPlaneAuthPrincipal::StorageNodeProcess { node_id } => {
+            write_u8(out, 7);
+            write_u32(out, node_id.as_u32());
+        }
         ControlPlaneAuthPrincipal::Frontend { instance_id } => {
             write_u8(out, 3);
             write_string(out, instance_id)?;
@@ -913,7 +918,7 @@ fn write_principal(
         }
         ControlPlaneAuthPrincipal::LocalMaintenance { process_id } => {
             write_u8(out, 5);
-            write_u64(out, *process_id);
+            write_string(out, process_id)?;
         }
         ControlPlaneAuthPrincipal::Service { service } => {
             write_u8(out, 6);
@@ -948,10 +953,18 @@ fn read_principal(
                 .to_owned(),
         },
         5 => ControlPlaneAuthPrincipal::LocalMaintenance {
-            process_id: reader.read_u64()?,
+            process_id: reader
+                .read_string_bounded(
+                    CONTROL_PLANE_AUTH_MAX_INSTANCE_ID_LEN,
+                    "local-maintenance process id",
+                )?
+                .to_owned(),
         },
         6 => ControlPlaneAuthPrincipal::Service {
             service: read_service(reader)?,
+        },
+        7 => ControlPlaneAuthPrincipal::StorageNodeProcess {
+            node_id: NodeId::new(reader.read_u32()?),
         },
         tag => {
             return Err(auth_protocol_error(format!(
@@ -1360,13 +1373,18 @@ mod tests {
                 node_id: NodeId::new(0),
                 incarnation: 1,
             },
+            ControlPlaneAuthPrincipal::StorageNodeProcess {
+                node_id: NodeId::new(0),
+            },
             ControlPlaneAuthPrincipal::Frontend {
                 instance_id: "frontend-1".to_owned(),
             },
             ControlPlaneAuthPrincipal::Admin {
                 instance_id: "admin-1".to_owned(),
             },
-            ControlPlaneAuthPrincipal::LocalMaintenance { process_id: 123 },
+            ControlPlaneAuthPrincipal::LocalMaintenance {
+                process_id: "maintenance-123".to_owned(),
+            },
             ControlPlaneAuthPrincipal::Service {
                 service: ControlPlaneAuthService::RuntimeMap,
             },

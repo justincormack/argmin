@@ -7,11 +7,15 @@ use crate::control_plane_auth::{
     ControlPlaneScopedCredentialStore,
 };
 use crate::storage_rpc::{
-    decode_storage_rpc_frame, encode_storage_rpc_frame, StorageRpcFrame, StorageRpcFrameError,
+    decode_storage_rpc_frame, encode_storage_rpc_frame,
+    validate_storage_rpc_request_frame_payload_limit, StorageRpcFrame, StorageRpcFrameError,
     StorageRpcMessageKind, STORAGE_RPC_MAX_FRAME_LEN,
 };
 use crate::NodeId;
 use std::fmt;
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const STORAGE_RPC_AUTH_BINDING_MAGIC: &[u8; 8] = b"ARGSRPCB";
 const STORAGE_RPC_AUTH_BINDING_VERSION: u16 = 1;
@@ -20,6 +24,445 @@ const STORAGE_RPC_AUTH_BINDING_FIXED_LEN: usize =
     STORAGE_RPC_AUTH_BINDING_MAGIC.len() + 2 + 8 + 4 + STORAGE_RPC_AUTH_TOPOLOGY_DIGEST_LEN + 4 + 4;
 const STORAGE_RPC_AUTH_MAX_BINDING_LEN: usize =
     STORAGE_RPC_AUTH_BINDING_FIXED_LEN + STORAGE_RPC_MAX_FRAME_LEN;
+const STORAGE_RPC_AUTH_TRANSPORT_MAGIC: &[u8; 8] = b"ARGSRPCA";
+const STORAGE_RPC_AUTH_TRANSPORT_VERSION: u16 = 1;
+const STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD: usize = 64 * 1024;
+pub const STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN: usize =
+    STORAGE_RPC_AUTH_MAX_BINDING_LEN + STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD;
+const STORAGE_RPC_AUTH_PRE_AUTH_BYTE_BUDGET: usize = STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN;
+
+pub const STORAGE_RPC_AUTH_REPLAY_WINDOW_MS: u64 = 5_000;
+pub const STORAGE_RPC_AUTH_ALLOWED_FUTURE_SKEW_MS: u64 = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageRpcTransportLimits {
+    max_frame_bytes: usize,
+    max_connections: usize,
+    io_timeout: std::time::Duration,
+}
+
+impl StorageRpcTransportLimits {
+    pub const DEFAULT: Self = Self {
+        max_frame_bytes: STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN,
+        max_connections: 1_024,
+        io_timeout: std::time::Duration::from_secs(1),
+    };
+
+    pub fn new(
+        max_frame_bytes: usize,
+        max_connections: usize,
+        io_timeout: std::time::Duration,
+    ) -> Result<Self, ControlPlaneError> {
+        if max_frame_bytes <= STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD
+            || max_frame_bytes > STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN
+        {
+            return Err(storage_rpc_auth_protocol_error(format!(
+                "storage RPC max frame bytes must be in {}..={STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN}",
+                STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD + 1
+            )));
+        }
+        if max_connections == 0 {
+            return Err(storage_rpc_auth_protocol_error(
+                "storage RPC max connections must be non-zero",
+            ));
+        }
+        if io_timeout.is_zero() {
+            return Err(storage_rpc_auth_protocol_error(
+                "storage RPC I/O timeout must be non-zero",
+            ));
+        }
+        Ok(Self {
+            max_frame_bytes,
+            max_connections,
+            io_timeout,
+        })
+    }
+
+    pub fn max_frame_bytes(self) -> usize {
+        self.max_frame_bytes
+    }
+
+    pub fn max_connections(self) -> usize {
+        self.max_connections
+    }
+
+    pub fn io_timeout(self) -> std::time::Duration {
+        self.io_timeout
+    }
+}
+
+#[derive(Clone)]
+struct StorageRpcClientSigner {
+    credential: ControlPlaneScopedCredential,
+    topology_generation: u64,
+    topology_digest: String,
+    transport_limits: StorageRpcTransportLimits,
+}
+
+impl fmt::Debug for StorageRpcClientSigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StorageRpcClientSigner")
+            .field("principal", self.credential.principal())
+            .field("credential_id", &self.credential.credential_id())
+            .field("credential_version", &self.credential.credential_version())
+            .field("topology_generation", &self.topology_generation)
+            .field("topology_digest", &self.topology_digest)
+            .finish()
+    }
+}
+
+impl StorageRpcClientSigner {
+    fn new(
+        credential: ControlPlaneScopedCredential,
+        topology_generation: u64,
+        topology_digest: impl Into<String>,
+    ) -> Result<Self, ControlPlaneError> {
+        let topology_digest = topology_digest.into();
+        validate_topology(topology_generation, &topology_digest)?;
+        Self::new_with_transport_limits(
+            credential,
+            topology_generation,
+            topology_digest,
+            StorageRpcTransportLimits::DEFAULT,
+        )
+    }
+
+    fn new_with_transport_limits(
+        credential: ControlPlaneScopedCredential,
+        topology_generation: u64,
+        topology_digest: impl Into<String>,
+        transport_limits: StorageRpcTransportLimits,
+    ) -> Result<Self, ControlPlaneError> {
+        let topology_digest = topology_digest.into();
+        validate_topology(topology_generation, &topology_digest)?;
+        Ok(Self {
+            credential,
+            topology_generation,
+            topology_digest,
+            transport_limits,
+        })
+    }
+
+    fn require_operation(&self, kind: StorageRpcMessageKind) -> Result<(), ControlPlaneError> {
+        if principal_allows_operation(self.credential.principal(), kind) {
+            return Ok(());
+        }
+        Err(storage_rpc_auth_protocol_error(format!(
+            "configured principal is not authorized for {}",
+            kind.operation_name()
+        )))
+    }
+
+    pub(crate) fn sign_request(
+        &self,
+        target_node_id: NodeId,
+        now_ms: u64,
+        frame: &StorageRpcFrame,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.require_operation(frame.kind)?;
+        let expires_at_ms = now_ms
+            .checked_add(STORAGE_RPC_AUTH_REPLAY_WINDOW_MS)
+            .ok_or_else(|| storage_rpc_auth_protocol_error("storage RPC auth expiry overflowed"))?;
+        sign_storage_rpc_request(StorageRpcAuthRequestInput {
+            credential: &self.credential,
+            target_node_id,
+            topology_generation: self.topology_generation,
+            topology_digest: &self.topology_digest,
+            issued_at_ms: now_ms,
+            expires_at_ms,
+            frame,
+        })
+    }
+
+    pub(crate) fn verify_response(
+        &self,
+        target_node_id: NodeId,
+        now_ms: u64,
+        request: &StorageRpcFrame,
+        envelope: &[u8],
+    ) -> Result<VerifiedStorageRpcFrame, StorageRpcAuthRejectionReason> {
+        self.require_operation(request.kind)
+            .map_err(|_| StorageRpcAuthRejectionReason::UnauthorizedRole)?;
+        verify_storage_rpc_response(StorageRpcAuthResponseVerificationInput {
+            request_credential: &self.credential,
+            expected_target_node_id: target_node_id,
+            expected_topology_generation: self.topology_generation,
+            expected_topology_digest: &self.topology_digest,
+            expected_request_id: request.request_id,
+            expected_kind: request.kind,
+            now_ms,
+            max_replay_window_ms: STORAGE_RPC_AUTH_REPLAY_WINDOW_MS,
+            allowed_future_skew_ms: STORAGE_RPC_AUTH_ALLOWED_FUTURE_SKEW_MS,
+            envelope_bytes: envelope,
+        })
+    }
+}
+
+macro_rules! define_storage_rpc_client_capability {
+    ($name:ident, $principal:pat, $label:literal) => {
+        #[derive(Clone)]
+        pub struct $name(StorageRpcClientSigner);
+
+        impl $name {
+            pub fn new(
+                credential: ControlPlaneScopedCredential,
+                topology_generation: u64,
+                topology_digest: impl Into<String>,
+            ) -> Result<Self, ControlPlaneError> {
+                if !matches!(credential.principal(), $principal) {
+                    return Err(storage_rpc_auth_protocol_error(concat!(
+                        "storage RPC ",
+                        $label,
+                        " capability requires a matching principal"
+                    )));
+                }
+                StorageRpcClientSigner::new(credential, topology_generation, topology_digest)
+                    .map(Self)
+            }
+
+            pub fn new_with_transport_limits(
+                credential: ControlPlaneScopedCredential,
+                topology_generation: u64,
+                topology_digest: impl Into<String>,
+                transport_limits: StorageRpcTransportLimits,
+            ) -> Result<Self, ControlPlaneError> {
+                if !matches!(credential.principal(), $principal) {
+                    return Err(storage_rpc_auth_protocol_error(concat!(
+                        "storage RPC ",
+                        $label,
+                        " capability requires a matching principal"
+                    )));
+                }
+                StorageRpcClientSigner::new_with_transport_limits(
+                    credential,
+                    topology_generation,
+                    topology_digest,
+                    transport_limits,
+                )
+                .map(Self)
+            }
+
+            pub fn transport_limits(&self) -> StorageRpcTransportLimits {
+                self.0.transport_limits
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_tuple(stringify!($name)).field(&self.0).finish()
+            }
+        }
+    };
+}
+
+define_storage_rpc_client_capability!(
+    FrontendStorageRpcClientCapability,
+    ControlPlaneAuthPrincipal::Frontend { .. },
+    "frontend"
+);
+define_storage_rpc_client_capability!(
+    MaintenanceStorageRpcClientCapability,
+    ControlPlaneAuthPrincipal::LocalMaintenance { .. },
+    "maintenance"
+);
+define_storage_rpc_client_capability!(
+    StorageNodeStorageRpcClientCapability,
+    ControlPlaneAuthPrincipal::StorageNode { .. }
+        | ControlPlaneAuthPrincipal::StorageNodeProcess { .. },
+    "storage-node"
+);
+define_storage_rpc_client_capability!(
+    AdminStorageRpcClientCapability,
+    ControlPlaneAuthPrincipal::Admin { .. },
+    "admin"
+);
+
+#[derive(Clone, Debug)]
+pub(crate) enum StorageRpcClientAuthConfig {
+    Frontend(FrontendStorageRpcClientCapability),
+    Maintenance(MaintenanceStorageRpcClientCapability),
+    StorageNode(StorageNodeStorageRpcClientCapability),
+    Admin(AdminStorageRpcClientCapability),
+}
+
+impl StorageRpcClientAuthConfig {
+    fn signer(&self) -> &StorageRpcClientSigner {
+        match self {
+            Self::Frontend(capability) => &capability.0,
+            Self::Maintenance(capability) => &capability.0,
+            Self::StorageNode(capability) => &capability.0,
+            Self::Admin(capability) => &capability.0,
+        }
+    }
+
+    pub(crate) fn transport_limits(&self) -> StorageRpcTransportLimits {
+        self.signer().transport_limits
+    }
+
+    pub(crate) fn sign_request(
+        &self,
+        target_node_id: NodeId,
+        now_ms: u64,
+        frame: &StorageRpcFrame,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.signer().sign_request(target_node_id, now_ms, frame)
+    }
+
+    pub(crate) fn verify_response(
+        &self,
+        target_node_id: NodeId,
+        now_ms: u64,
+        request: &StorageRpcFrame,
+        envelope: &[u8],
+    ) -> Result<VerifiedStorageRpcFrame, StorageRpcAuthRejectionReason> {
+        self.signer()
+            .verify_response(target_node_id, now_ms, request, envelope)
+    }
+}
+
+impl From<FrontendStorageRpcClientCapability> for StorageRpcClientAuthConfig {
+    fn from(value: FrontendStorageRpcClientCapability) -> Self {
+        Self::Frontend(value)
+    }
+}
+
+impl From<MaintenanceStorageRpcClientCapability> for StorageRpcClientAuthConfig {
+    fn from(value: MaintenanceStorageRpcClientCapability) -> Self {
+        Self::Maintenance(value)
+    }
+}
+
+impl From<StorageNodeStorageRpcClientCapability> for StorageRpcClientAuthConfig {
+    fn from(value: StorageNodeStorageRpcClientCapability) -> Self {
+        Self::StorageNode(value)
+    }
+}
+
+impl From<AdminStorageRpcClientCapability> for StorageRpcClientAuthConfig {
+    fn from(value: AdminStorageRpcClientCapability) -> Self {
+        Self::Admin(value)
+    }
+}
+
+#[derive(Clone)]
+pub struct StorageRpcServerAuthConfig {
+    cluster_id: String,
+    credentials: ControlPlaneScopedCredentialStore,
+    topology_generation: u64,
+    topology_digest: String,
+    pre_auth_byte_budget: Arc<StorageRpcPreAuthByteBudget>,
+    transport_limits: StorageRpcTransportLimits,
+}
+
+impl fmt::Debug for StorageRpcServerAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StorageRpcServerAuthConfig")
+            .field("cluster_id", &self.cluster_id)
+            .field("credential_count", &self.credentials.credentials().len())
+            .field("topology_generation", &self.topology_generation)
+            .field("topology_digest", &self.topology_digest)
+            .field(
+                "pre_auth_byte_budget",
+                &self.pre_auth_byte_budget.limit_bytes,
+            )
+            .finish()
+    }
+}
+
+impl StorageRpcServerAuthConfig {
+    pub fn new(
+        cluster_id: impl Into<String>,
+        credentials: ControlPlaneScopedCredentialStore,
+        topology_generation: u64,
+        topology_digest: impl Into<String>,
+    ) -> Result<Self, ControlPlaneError> {
+        let cluster_id = cluster_id.into();
+        if credentials
+            .credentials()
+            .iter()
+            .any(|credential| credential.cluster_id() != cluster_id)
+        {
+            return Err(storage_rpc_auth_protocol_error(
+                "storage RPC verifier credentials must match the configured cluster",
+            ));
+        }
+        let topology_digest = topology_digest.into();
+        validate_topology(topology_generation, &topology_digest)?;
+        Ok(Self {
+            cluster_id,
+            credentials,
+            topology_generation,
+            topology_digest,
+            pre_auth_byte_budget: Arc::new(StorageRpcPreAuthByteBudget::new(
+                STORAGE_RPC_AUTH_PRE_AUTH_BYTE_BUDGET,
+            )),
+            transport_limits: StorageRpcTransportLimits::DEFAULT,
+        })
+    }
+
+    pub fn with_transport_limits(mut self, transport_limits: StorageRpcTransportLimits) -> Self {
+        self.pre_auth_byte_budget = Arc::new(StorageRpcPreAuthByteBudget::new(
+            transport_limits.max_frame_bytes(),
+        ));
+        self.transport_limits = transport_limits;
+        self
+    }
+
+    pub fn transport_limits(&self) -> StorageRpcTransportLimits {
+        self.transport_limits
+    }
+
+    pub(crate) fn read_request_envelope<R: Read>(
+        &self,
+        reader: &mut R,
+    ) -> io::Result<(Vec<u8>, StorageRpcPreAuthByteReservation)> {
+        read_storage_rpc_auth_transport_frame_with_budget_and_limit(
+            reader,
+            &self.pre_auth_byte_budget,
+            self.transport_limits.max_frame_bytes(),
+        )
+    }
+
+    pub(crate) fn verify_request(
+        &self,
+        target_node_id: NodeId,
+        now_ms: u64,
+        envelope: &[u8],
+    ) -> Result<VerifiedStorageRpcFrame, StorageRpcAuthRejectionReason> {
+        verify_storage_rpc_request(StorageRpcAuthRequestVerificationInput {
+            verifier: &self.credentials,
+            expected_cluster_id: &self.cluster_id,
+            expected_target_node_id: target_node_id,
+            expected_topology_generation: self.topology_generation,
+            expected_topology_digest: &self.topology_digest,
+            now_ms,
+            max_replay_window_ms: STORAGE_RPC_AUTH_REPLAY_WINDOW_MS,
+            allowed_future_skew_ms: STORAGE_RPC_AUTH_ALLOWED_FUTURE_SKEW_MS,
+            envelope_bytes: envelope,
+        })
+    }
+
+    pub(crate) fn sign_response(
+        &self,
+        request_credential: &ControlPlaneScopedCredential,
+        target_node_id: NodeId,
+        now_ms: u64,
+        frame: &StorageRpcFrame,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let expires_at_ms = now_ms
+            .checked_add(STORAGE_RPC_AUTH_REPLAY_WINDOW_MS)
+            .ok_or_else(|| storage_rpc_auth_protocol_error("storage RPC auth expiry overflowed"))?;
+        sign_storage_rpc_response(StorageRpcAuthResponseInput {
+            request_credential,
+            target_node_id,
+            topology_generation: self.topology_generation,
+            topology_digest: &self.topology_digest,
+            issued_at_ms: now_ms,
+            expires_at_ms,
+            frame,
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StorageRpcAuthRejectionReason {
@@ -31,13 +474,25 @@ pub(crate) enum StorageRpcAuthRejectionReason {
     Envelope(ControlPlaneAuthRejectionReason),
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct VerifiedStorageRpcFrame {
     source: ControlPlaneAuthPrincipal,
     credential_id: String,
     credential_version: u64,
+    credential: ControlPlaneScopedCredential,
     frame: StorageRpcFrame,
 }
+
+impl PartialEq for VerifiedStorageRpcFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.credential_id == other.credential_id
+            && self.credential_version == other.credential_version
+            && self.frame == other.frame
+    }
+}
+
+impl Eq for VerifiedStorageRpcFrame {}
 
 impl fmt::Debug for VerifiedStorageRpcFrame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -53,20 +508,222 @@ impl fmt::Debug for VerifiedStorageRpcFrame {
 }
 
 impl VerifiedStorageRpcFrame {
+    #[cfg(test)]
     pub(crate) fn source(&self) -> &ControlPlaneAuthPrincipal {
         &self.source
     }
 
+    #[cfg(test)]
     pub(crate) fn credential_id(&self) -> &str {
         &self.credential_id
     }
 
+    #[cfg(test)]
     pub(crate) fn credential_version(&self) -> u64 {
         self.credential_version
     }
 
     pub(crate) fn into_frame(self) -> StorageRpcFrame {
         self.frame
+    }
+
+    pub(crate) fn into_frame_and_credential(
+        self,
+    ) -> (StorageRpcFrame, ControlPlaneScopedCredential) {
+        (self.frame, self.credential)
+    }
+}
+
+pub(crate) fn write_storage_rpc_auth_transport_frame<W: Write>(
+    writer: &mut W,
+    envelope: &[u8],
+) -> io::Result<()> {
+    if envelope.len() > STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "authenticated storage RPC frame exceeds the transport limit",
+        ));
+    }
+    let len = u32::try_from(envelope.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "authenticated storage RPC frame length exceeds u32::MAX",
+        )
+    })?;
+    writer.write_all(STORAGE_RPC_AUTH_TRANSPORT_MAGIC)?;
+    writer.write_all(&STORAGE_RPC_AUTH_TRANSPORT_VERSION.to_be_bytes())?;
+    writer.write_all(&len.to_be_bytes())?;
+    writer.write_all(&(!len).to_be_bytes())?;
+    writer.write_all(envelope)
+}
+
+pub(crate) fn write_storage_rpc_auth_transport_frame_with_limit<W: Write>(
+    writer: &mut W,
+    envelope: &[u8],
+    max_frame_bytes: usize,
+) -> io::Result<()> {
+    if envelope.len() > max_frame_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "authenticated storage RPC frame exceeds the configured transport limit",
+        ));
+    }
+    write_storage_rpc_auth_transport_frame(writer, envelope)
+}
+
+#[cfg(test)]
+pub(crate) fn read_storage_rpc_auth_transport_frame<R: Read>(
+    reader: &mut R,
+) -> io::Result<Vec<u8>> {
+    let len = read_storage_rpc_auth_transport_frame_len(reader)?;
+    read_storage_rpc_auth_transport_frame_body(reader, len)
+}
+
+pub(crate) fn read_storage_rpc_auth_transport_frame_with_limit<R: Read>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    let len = read_storage_rpc_auth_transport_frame_len(reader)?;
+    if len > max_frame_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "authenticated storage RPC frame exceeds the configured transport limit",
+        ));
+    }
+    read_storage_rpc_auth_transport_frame_body(reader, len)
+}
+
+fn read_storage_rpc_auth_transport_frame_len<R: Read>(reader: &mut R) -> io::Result<usize> {
+    let mut magic = [0_u8; STORAGE_RPC_AUTH_TRANSPORT_MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if magic != *STORAGE_RPC_AUTH_TRANSPORT_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid authenticated storage RPC transport magic",
+        ));
+    }
+    let mut version = [0_u8; 2];
+    reader.read_exact(&mut version)?;
+    let version = u16::from_be_bytes(version);
+    if version != STORAGE_RPC_AUTH_TRANSPORT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported authenticated storage RPC transport version",
+        ));
+    }
+    let mut len = [0_u8; 4];
+    reader.read_exact(&mut len)?;
+    let len = u32::from_be_bytes(len);
+    let mut complement = [0_u8; 4];
+    reader.read_exact(&mut complement)?;
+    if u32::from_be_bytes(complement) != !len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "authenticated storage RPC transport length check failed",
+        ));
+    }
+    let len = len as usize;
+    if len > STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "authenticated storage RPC frame exceeds the transport limit",
+        ));
+    }
+    Ok(len)
+}
+
+fn read_storage_rpc_auth_transport_frame_body<R: Read>(
+    reader: &mut R,
+    len: usize,
+) -> io::Result<Vec<u8>> {
+    let mut envelope = vec![0_u8; len];
+    reader.read_exact(&mut envelope)?;
+    Ok(envelope)
+}
+
+#[cfg(test)]
+fn read_storage_rpc_auth_transport_frame_with_budget<R: Read>(
+    reader: &mut R,
+    budget: &Arc<StorageRpcPreAuthByteBudget>,
+) -> io::Result<(Vec<u8>, StorageRpcPreAuthByteReservation)> {
+    read_storage_rpc_auth_transport_frame_with_budget_and_limit(
+        reader,
+        budget,
+        STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN,
+    )
+}
+
+fn read_storage_rpc_auth_transport_frame_with_budget_and_limit<R: Read>(
+    reader: &mut R,
+    budget: &Arc<StorageRpcPreAuthByteBudget>,
+    max_frame_bytes: usize,
+) -> io::Result<(Vec<u8>, StorageRpcPreAuthByteReservation)> {
+    let len = read_storage_rpc_auth_transport_frame_len(reader)?;
+    if len > max_frame_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "authenticated storage RPC frame exceeds the configured transport limit",
+        ));
+    }
+    let reservation = budget.reserve(len)?;
+    let envelope = read_storage_rpc_auth_transport_frame_body(reader, len)?;
+    Ok((envelope, reservation))
+}
+
+#[derive(Debug)]
+struct StorageRpcPreAuthByteBudget {
+    reserved_bytes: AtomicUsize,
+    limit_bytes: usize,
+}
+
+impl StorageRpcPreAuthByteBudget {
+    fn new(limit_bytes: usize) -> Self {
+        Self {
+            reserved_bytes: AtomicUsize::new(0),
+            limit_bytes,
+        }
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        frame_bytes: usize,
+    ) -> io::Result<StorageRpcPreAuthByteReservation> {
+        let result =
+            self.reserved_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                    reserved
+                        .checked_add(frame_bytes)
+                        .filter(|total| *total <= self.limit_bytes)
+                });
+        match result {
+            Ok(_) => Ok(StorageRpcPreAuthByteReservation {
+                budget: Arc::clone(self),
+                frame_bytes,
+            }),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "storage RPC pre-authentication frame budget exhausted",
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StorageRpcPreAuthByteReservation {
+    budget: Arc<StorageRpcPreAuthByteBudget>,
+    frame_bytes: usize,
+}
+
+impl Drop for StorageRpcPreAuthByteReservation {
+    fn drop(&mut self) {
+        self.budget
+            .reserved_bytes
+            .fetch_sub(self.frame_bytes, Ordering::AcqRel);
     }
 }
 
@@ -159,6 +816,18 @@ pub(crate) fn verify_storage_rpc_request(
             },
         });
     let (credential_id, credential_version) = accepted_credential(decision)?;
+    let credential = input
+        .verifier
+        .credentials()
+        .iter()
+        .find(|credential| {
+            credential.cluster_id() == input.expected_cluster_id
+                && credential.credential_id() == credential_id
+                && credential.credential_version() == credential_version
+                && credential.principal() == &source
+        })
+        .cloned()
+        .ok_or(StorageRpcAuthRejectionReason::Malformed)?;
     let binding = decode_binding(envelope.payload())?;
     validate_binding(
         &binding,
@@ -168,6 +837,8 @@ pub(crate) fn verify_storage_rpc_request(
         message_kind,
         envelope.header().sequence(),
     )?;
+    validate_storage_rpc_request_frame_payload_limit(&binding.frame)
+        .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
     if !principal_allows_operation(&source, binding.frame.kind) {
         return Err(StorageRpcAuthRejectionReason::UnauthorizedRole);
     }
@@ -175,6 +846,7 @@ pub(crate) fn verify_storage_rpc_request(
         source,
         credential_id,
         credential_version,
+        credential,
         frame: binding.frame,
     })
 }
@@ -234,7 +906,7 @@ pub(crate) fn verify_storage_rpc_response(
         .request_credential
         .storage_rpc_response_credential()
         .map_err(|_| StorageRpcAuthRejectionReason::UnauthorizedRole)?;
-    let verifier = ControlPlaneScopedCredentialStore::new(vec![response_credential])
+    let verifier = ControlPlaneScopedCredentialStore::new(vec![response_credential.clone()])
         .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
     let envelope = ControlPlaneAuthEnvelope::decode_frame(
         input.envelope_bytes,
@@ -278,6 +950,7 @@ pub(crate) fn verify_storage_rpc_response(
         source,
         credential_id,
         credential_version,
+        credential: response_credential,
         frame: binding.frame,
     })
 }
@@ -327,7 +1000,8 @@ fn principal_allows_operation(
     let roles = authorized_roles(kind);
     match principal {
         ControlPlaneAuthPrincipal::Frontend { .. } => roles.allows(StorageRpcCallerRole::Frontend),
-        ControlPlaneAuthPrincipal::StorageNode { .. } => {
+        ControlPlaneAuthPrincipal::StorageNode { .. }
+        | ControlPlaneAuthPrincipal::StorageNodeProcess { .. } => {
             roles.allows(StorageRpcCallerRole::StorageNode)
         }
         ControlPlaneAuthPrincipal::Admin { .. } => roles.allows(StorageRpcCallerRole::Admin),
@@ -730,6 +1404,7 @@ impl<'a> BindingReader<'a> {
 mod tests {
     use super::*;
     use crate::control_plane_auth::ControlPlaneScopedCredentialInput;
+    use std::io::Cursor;
 
     const TOPOLOGY_DIGEST: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -828,9 +1503,16 @@ mod tests {
     ];
 
     fn credential(principal: ControlPlaneAuthPrincipal) -> ControlPlaneScopedCredential {
+        credential_with_id(principal, "caller-key")
+    }
+
+    fn credential_with_id(
+        principal: ControlPlaneAuthPrincipal,
+        credential_id: &str,
+    ) -> ControlPlaneScopedCredential {
         ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
             cluster_id: "storage-auth-cluster".to_owned(),
-            credential_id: "caller-key".to_owned(),
+            credential_id: credential_id.to_owned(),
             credential_version: 1,
             principal,
             secret: b"storage-auth-secret".to_vec(),
@@ -848,6 +1530,157 @@ mod tests {
                 b"payload".to_vec()
             },
         }
+    }
+
+    #[test]
+    fn storage_rpc_auth_transport_frame_round_trips() {
+        let envelope = b"authenticated-storage-rpc";
+        let mut encoded = Vec::new();
+        write_storage_rpc_auth_transport_frame(&mut encoded, envelope).unwrap();
+
+        assert_eq!(
+            read_storage_rpc_auth_transport_frame(&mut Cursor::new(encoded)).unwrap(),
+            envelope
+        );
+    }
+
+    #[test]
+    fn storage_rpc_auth_transport_rejects_corrupt_length_before_reading_payload() {
+        let mut encoded = Vec::new();
+        write_storage_rpc_auth_transport_frame(&mut encoded, b"payload").unwrap();
+        let complement_offset = STORAGE_RPC_AUTH_TRANSPORT_MAGIC.len() + 2 + 4;
+        encoded[complement_offset] ^= 1;
+
+        let error = read_storage_rpc_auth_transport_frame(&mut Cursor::new(encoded)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("length check failed"));
+    }
+
+    #[test]
+    fn storage_rpc_auth_transport_rejects_legacy_storage_frame() {
+        let legacy = encode_storage_rpc_frame(17, StorageRpcMessageKind::Health, &[]).unwrap();
+
+        let error = read_storage_rpc_auth_transport_frame(&mut Cursor::new(legacy)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("transport magic"));
+    }
+
+    #[test]
+    fn storage_rpc_auth_transport_reserves_process_bytes_before_body_allocation() {
+        let mut encoded = Vec::new();
+        write_storage_rpc_auth_transport_frame(&mut encoded, b"12345678").unwrap();
+        let mut reader = Cursor::new(encoded);
+        let budget = Arc::new(StorageRpcPreAuthByteBudget::new(4));
+
+        let error =
+            read_storage_rpc_auth_transport_frame_with_budget(&mut reader, &budget).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(
+            reader.position() as usize,
+            STORAGE_RPC_AUTH_TRANSPORT_MAGIC.len() + 2 + 4 + 4
+        );
+        assert_eq!(budget.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn storage_rpc_auth_transport_holds_process_bytes_until_verification_finishes() {
+        let mut encoded = Vec::new();
+        write_storage_rpc_auth_transport_frame(&mut encoded, b"12345678").unwrap();
+        let budget = Arc::new(StorageRpcPreAuthByteBudget::new(8));
+
+        let (envelope, reservation) =
+            read_storage_rpc_auth_transport_frame_with_budget(&mut Cursor::new(encoded), &budget)
+                .unwrap();
+
+        assert_eq!(envelope, b"12345678");
+        assert_eq!(budget.reserved_bytes(), 8);
+        assert_eq!(
+            budget.reserve(1).unwrap_err().kind(),
+            io::ErrorKind::OutOfMemory
+        );
+        drop(reservation);
+        assert_eq!(budget.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn storage_rpc_client_capabilities_are_role_typed_and_exact() {
+        let frontend = credential_with_id(
+            ControlPlaneAuthPrincipal::Frontend {
+                instance_id: "frontend-1".to_owned(),
+            },
+            "frontend-key",
+        );
+        let maintenance = credential_with_id(
+            ControlPlaneAuthPrincipal::LocalMaintenance {
+                process_id: "maintenance-1".to_owned(),
+            },
+            "maintenance-key",
+        );
+        let frontend_auth = StorageRpcClientAuthConfig::from(
+            FrontendStorageRpcClientCapability::new(frontend, 9, TOPOLOGY_DIGEST).unwrap(),
+        );
+        let maintenance_auth = StorageRpcClientAuthConfig::from(
+            MaintenanceStorageRpcClientCapability::new(maintenance, 9, TOPOLOGY_DIGEST).unwrap(),
+        );
+
+        let frontend_envelope = frontend_auth
+            .sign_request(
+                NodeId::new(7),
+                1_000,
+                &frame(StorageRpcMessageKind::BucketCreateCommandBuild),
+            )
+            .unwrap();
+        assert!(frontend_auth
+            .sign_request(
+                NodeId::new(7),
+                1_000,
+                &frame(StorageRpcMessageKind::LifecycleSweepRoots),
+            )
+            .is_err());
+        let maintenance_envelope = maintenance_auth
+            .sign_request(
+                NodeId::new(7),
+                1_000,
+                &frame(StorageRpcMessageKind::LifecycleSweepRoots),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            ControlPlaneAuthEnvelope::decode_frame(
+                &frontend_envelope,
+                STORAGE_RPC_AUTH_MAX_BINDING_LEN
+            )
+            .unwrap()
+            .header()
+            .source(),
+            ControlPlaneAuthPrincipal::Frontend { .. }
+        ));
+        assert!(matches!(
+            ControlPlaneAuthEnvelope::decode_frame(
+                &maintenance_envelope,
+                STORAGE_RPC_AUTH_MAX_BINDING_LEN
+            )
+            .unwrap()
+            .header()
+            .source(),
+            ControlPlaneAuthPrincipal::LocalMaintenance { .. }
+        ));
+    }
+
+    #[test]
+    fn storage_rpc_client_capability_rejects_mismatched_principal() {
+        let credential = credential_with_id(
+            ControlPlaneAuthPrincipal::Frontend {
+                instance_id: "frontend-1".to_owned(),
+            },
+            "frontend-key",
+        );
+        let error =
+            MaintenanceStorageRpcClientCapability::new(credential, 9, TOPOLOGY_DIGEST).unwrap_err();
+        assert!(error.to_string().contains("maintenance capability"));
     }
 
     fn sign_request(
@@ -1049,7 +1882,9 @@ mod tests {
         let admin = ControlPlaneAuthPrincipal::Admin {
             instance_id: "admin-1".to_owned(),
         };
-        let maintenance = ControlPlaneAuthPrincipal::LocalMaintenance { process_id: 11 };
+        let maintenance = ControlPlaneAuthPrincipal::LocalMaintenance {
+            process_id: "maintenance-11".to_owned(),
+        };
         let raft = ControlPlaneAuthPrincipal::RaftPeer { node_id: 5 };
         let service = ControlPlaneAuthPrincipal::Service {
             service: ControlPlaneAuthService::StorageRpc,
@@ -1113,7 +1948,9 @@ mod tests {
 
     #[test]
     fn storage_rpc_auth_maintenance_workflows_sign_and_verify_every_required_operation() {
-        let credential = credential(ControlPlaneAuthPrincipal::LocalMaintenance { process_id: 11 });
+        let credential = credential(ControlPlaneAuthPrincipal::LocalMaintenance {
+            process_id: "maintenance-11".to_owned(),
+        });
 
         assert_authenticated_workflow(
             &credential,
@@ -1147,7 +1984,9 @@ mod tests {
                 StorageRpcMessageKind::ShardWrite,
             ),
             (
-                ControlPlaneAuthPrincipal::LocalMaintenance { process_id: 11 },
+                ControlPlaneAuthPrincipal::LocalMaintenance {
+                    process_id: "maintenance-11".to_owned(),
+                },
                 StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall,
             ),
             (

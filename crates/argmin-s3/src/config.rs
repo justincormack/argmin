@@ -13,7 +13,10 @@ use storage::control_plane_raft::ControlPlaneRaftPeerFrameTransport;
 use storage::control_plane_raft::ControlPlaneRaftPeerTransportLimits;
 use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS;
 use storage::LocalUnixStorageNodeClientConfig;
-use storage::{NodeId, PgId};
+use storage::{
+    FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability, NodeId, PgId,
+    StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig,
+};
 
 const LOCAL_DEBUG_ENDPOINT_COMPILED_IN: bool = cfg!(any(test, feature = "local-debug-endpoints"));
 const MAX_LOCAL_NODE_COUNT: u32 = 4_096;
@@ -441,6 +444,10 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_rpc_admission_limit: usize,
     pub(crate) storage_node_rpc_admission_wait_timeout: Duration,
     pub(crate) storage_node_rpc_control_admission_wait_timeout: Duration,
+    pub(crate) storage_rpc_frontend_client_auth: Option<FrontendStorageRpcClientCapability>,
+    pub(crate) storage_rpc_maintenance_client_auth: Option<MaintenanceStorageRpcClientCapability>,
+    pub(crate) storage_rpc_storage_node_client_auth: Option<StorageNodeStorageRpcClientCapability>,
+    pub(crate) storage_rpc_server_auth: Option<StorageRpcServerAuthConfig>,
     pub(crate) control_plane_state_path: Option<String>,
     pub(crate) control_plane_socket_path: Option<String>,
     pub(crate) control_plane_clock_recovery_socket_path: Option<String>,
@@ -1127,6 +1134,10 @@ impl ServerConfig {
             storage_node_rpc_admission_limit,
             storage_node_rpc_admission_wait_timeout,
             storage_node_rpc_control_admission_wait_timeout,
+            storage_rpc_frontend_client_auth: None,
+            storage_rpc_maintenance_client_auth: None,
+            storage_rpc_storage_node_client_auth: None,
+            storage_rpc_server_auth: None,
             control_plane_state_path,
             control_plane_socket_path,
             control_plane_clock_recovery_socket_path: None,

@@ -435,6 +435,7 @@ fn test_unix_storage_node_client_with_rpc_admission_timeout(
                 control_wait_timeout: wait_timeout,
             },
         )),
+        None,
     )
 }
 

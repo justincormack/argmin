@@ -43,8 +43,6 @@ pub mod schema;
 pub mod shard_key_hash;
 #[allow(dead_code)]
 pub(crate) mod storage_rpc;
-// Activated by the Unix storage-RPC enforcement slice before TCP reuse.
-#[allow(dead_code)]
 pub(crate) mod storage_rpc_auth;
 pub mod types;
 
@@ -123,6 +121,12 @@ pub use shard_key_hash::{
     segment_key_hash, stream_segment_key_hash,
 };
 pub use storage_rpc::StorageRpcErrorCode;
+pub(crate) use storage_rpc_auth::StorageRpcClientAuthConfig;
+pub use storage_rpc_auth::{
+    AdminStorageRpcClientCapability, FrontendStorageRpcClientCapability,
+    MaintenanceStorageRpcClientCapability, StorageNodeStorageRpcClientCapability,
+    StorageRpcServerAuthConfig, StorageRpcTransportLimits, STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN,
+};
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;
 pub use types::{
