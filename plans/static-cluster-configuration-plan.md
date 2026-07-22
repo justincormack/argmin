@@ -6,6 +6,7 @@ Related plans:
 
 - [multihost-transition-plan.md](multihost-transition-plan.md)
 - [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md)
+- [storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md)
 
 ## Purpose
 
@@ -154,7 +155,10 @@ coordination locks are opened atomically without following symlinks and must be
 regular files before their pathnames are treated as coordination metadata.
 This prepares state only;
 ordinary replicated storage startup remains unavailable until mandatory
-storage-RPC authentication is enforced at the Unix dispatch boundary.
+storage-RPC authentication is enforced at the Unix dispatch boundary and every
+stateful handler reaches its server-local, capability-requiring effect
+boundary. Activation requires composed positive and adversarial tests crossing
+both layers; outer authentication alone is not a replicated-runtime gate.
 
 Replicated control-plane process identity is initialized through the same
 command, once per configured authority process id. This creates only the
@@ -526,9 +530,15 @@ against each opened file's metadata before allocation. Startup material
 includes only credentials whose acceptance window contains the sampled startup
 authority time and requires exactly one active signing credential for every
 required principal. Outbound trust-bundle selection follows both process
-topology and authenticated capabilities, so an admin or maintenance principal
+topology and authenticated roles, so an admin or maintenance principal
 resolves remote control-plane and authority-clock-recovery bundles even when
 hosted by a control-plane process.
+
+These configured roles and their permitted outbound protocol families are not
+the request-scoped storage route capabilities defined by
+[storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md),
+which are derived only from live local routing state and are never read from
+the manifest.
 
 TLS material uses exact PEM typing. Certificate-chain and trust-bundle files
 may contain only certificate sections, private-key files must contain exactly
@@ -598,6 +608,53 @@ are adopted by deliberately updating the referenced bundle. Leaf-key and
 certificate rotation does not change the topology digest. Online reload remains
 out of scope for version 1, so each rotation stage requires controlled process
 restarts.
+
+## Storage RPC Authorization Boundary
+
+Reconciliation decision (2026-07-22): the manifest and storage-boundary plans
+own different parts of one storage RPC authorization path.
+
+This plan owns credential availability, authenticated process identity,
+topology binding, transport activation, and the exhaustive permission from a
+principal role to a concrete `StorageRpcMessageKind`. That role check is a
+coarse remote-process permission and is identical over Unix and TCP. It is not
+proof that the concrete PG, route, object, shard, command, or deadline is safe.
+
+The storage-boundary plan owns non-forgeable PG roles and request-scoped active,
+retained-cleanup, recovery, peering, transfer, payload, and publication
+capabilities. Those values are constructed from installed local state after
+wire authentication and role authorization. They are not manifest fields,
+credential claims, or serialized envelope values.
+
+Therefore an authenticated storage RPC server must perform both checks in this
+order:
+
+1. verify the signed envelope and reject a principal whose role cannot attempt
+   the exact wire message kind;
+2. decode route and subject fields as untrusted evidence;
+3. validate that evidence against the storage node's current admission domain
+   and construct the narrow server-local capability; and
+4. call only a node API that requires that capability.
+
+A valid MAC never bypasses route or subject validation. A valid local route
+never bypasses process authentication on an RPC transport. Embedded standalone
+calls may omit the transport-authentication steps, but use the same trusted
+local capability boundary; replicated Unix and every TCP path require both.
+
+The role matrix and local capability types deliberately remain separate rather
+than introducing a generic serializable operation capability. Several wire
+kinds are shared by frontend and maintenance workflows, while their concrete
+route mode, durable subject, and lifetime authority differ. Flattening those
+properties into a role token would either over-authorize maintenance or
+duplicate the local state machine in the credential layer.
+
+Before replicated storage RPC enforcement is considered complete, every
+message kind must have one explicit role decision and every stateful handler
+must have an explicit local capability construction. Workflow tests must prove
+both complete positive paths and the two independent negative dimensions:
+valid credential with the wrong role, and valid role with stale, mismatched, or
+wrong-subject route evidence. The shared per-change checklist and canonical
+dispatch ordering live in the storage-boundary plan.
 
 ## Topology Validation
 
@@ -952,8 +1009,11 @@ Progress as of 2026-07-21:
   node id, complete PG set, EC shape, initial epoch, and process identity.
   Initialization is idempotent and crash-resumable under the same durable
   marker/root/PG publication protocol. Replicated runtime activation remains
-  blocked on mandatory storage-RPC authentication rather than opening an
-  unauthenticated Unix listener.
+  blocked on both mandatory Unix storage-RPC authentication and complete
+  server-local operation-capability enforcement rather than opening a listener
+  after only the outer auth layer lands. Composed workflow tests must cross the
+  authenticated principal-role check and the local route/subject capability
+  boundary before activation.
 - Slice 5's material-resolution sub-slice is implemented: a selected process
   resolves bounded no-follow files into redacted binary credential material,
   rustls certified keys, and explicit root stores. Resolution is role/listener
@@ -1131,7 +1191,7 @@ Progress as of 2026-07-21:
      The complete nested frame binding covers its PG/shard route, epoch,
      command identity, and payload without a second partial parser. Explicit
      frontend, storage-node repair/peering, admin, and maintenance roles are
-     classified through one exhaustive per-kind capability table, so a new
+     classified through one exhaustive per-kind wire-role matrix, so a new
      message kind cannot compile without an authorization decision. Admin is
      limited to the health probe. Local maintenance explicitly covers the
      complete routine metadata-checkpoint, lifecycle expiry/abort, payload
@@ -1139,7 +1199,10 @@ Progress as of 2026-07-21:
      to issue raw frontend shard writes or storage-node transfer/bootstrap
      checkpoint installation. Independent workflow manifests sign and verify
      every required operation, alongside full role-by-kind and valid-MAC
-     unauthorized-frame tests. A composed real Unix maintenance-client test
+     unauthorized-frame tests. This is process-role authorization, not the
+     request-scoped route-capability layer; the storage-boundary plan governs
+     server-local trusted construction and storage-effect APIs. A composed real
+     Unix maintenance-client test
      lands with the still-open Unix client/listener enforcement and manifest
      credential activation sub-slice;
    - reuse it unchanged over TCP; and

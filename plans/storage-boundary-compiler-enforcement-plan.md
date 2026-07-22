@@ -2,6 +2,12 @@
 
 Status: active — Phases 0–2 complete; Phase 3 in progress
 
+Related plans:
+
+- [static-cluster-configuration-plan.md](static-cluster-configuration-plan.md)
+- [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md)
+- [multihost-transition-plan.md](multihost-transition-plan.md)
+
 ## Goal
 
 Replace the storage-cluster boundary's growing set of source-text checks with
@@ -66,6 +72,100 @@ This plan preserves the behavioral requirements in
 
 Moving an invariant out of the boundary script does not weaken it. Every
 retired textual check must have a named structural replacement.
+
+## Relationship To Storage RPC Authentication
+
+Reconciliation decision (2026-07-22): storage RPC authentication and compiler-
+enforced operation capabilities are complementary authorization layers. They
+must share one dispatch contract, but they must not be collapsed into one
+serializable or role-wide capability.
+
+The transport-independent storage RPC auth slice owns **process authority**:
+
+- authenticate cluster, topology generation/digest, source principal, target
+  storage node, request/response direction, concrete wire message kind,
+  request id, freshness, and complete frame integrity;
+- apply one exhaustive `StorageRpcMessageKind`-to-principal-role matrix before
+  dispatch; and
+- reject a signer that is valid for the cluster but not permitted to attempt
+  that wire operation.
+
+This plan owns **concrete storage authority**:
+
+- derive trusted PG-role values only from installed topology and placement;
+- validate active, retained-cleanup, recovery, peering, or transfer authority
+  against current local state;
+- bind authority to the exact route generation, subject, command/proof,
+  operation class, admission domain, and deadline required by the handler; and
+- require the resulting non-forgeable local capability at the storage effect.
+
+The wire role matrix is intentionally coarse. For example, a maintenance
+principal may be allowed to attempt a reclaim RPC, but that permission does not
+authorize an arbitrary object, PG, historical route, or shard deletion. An
+authenticated frontend principal likewise represents a trusted internal S3
+coordinator after user-facing authorization; it does not turn every decoded
+bucket, object, or PG identifier into trusted storage authority.
+
+Conversely, a local route capability is not a credential. It does not identify
+a remote process, is never serialized, and cannot be reconstructed merely by
+decoding a valid-MAC frame. Unix and TCP servers receive only authenticated
+wire evidence and construct fresh server-local capabilities after local route
+and subject validation. Embedded/local adapters enter at that trusted local
+validation boundary; they do not need a synthetic network credential, but they
+must satisfy the same operation-capability requirements before storage effects.
+
+The common dispatch order is normative:
+
+1. apply bounded connection/frame admission and decode the untrusted envelope;
+2. verify cryptographic identity, topology, target, direction, operation,
+   request binding, freshness, and complete-frame integrity;
+3. apply the exhaustive principal-role permission for the decoded wire kind;
+4. decode raw route, PG, subject, and command evidence without conferring a
+   Rust role or capability;
+5. acquire the local route-admission domain and validate the handler's active,
+   retained, recovery, peering, or transfer preconditions;
+6. construct the narrow server-local PG-role and operation capability;
+7. invoke the capability-requiring node API and then bind the authenticated
+   response to the request.
+
+Failure at either authorization layer is terminal before the storage effect.
+The role matrix must not duplicate route-state predicates, and route-capability
+code must not infer process identity from transport location or filesystem
+ownership.
+
+There is also one change-control rule for the two work streams. Adding or
+changing a storage RPC requires an exhaustive update or explicit proof of no
+change for all of:
+
+- wire frame and allocation limits;
+- principal-role permission for the message kind;
+- the handler's trusted PG-role and operation-capability construction;
+- client-side capability-bearing call paths;
+- relevant frontend, storage-node, maintenance, repair, recovery, or admin
+  workflow manifests; and
+- valid-credential/wrong-role plus valid-role/wrong-route adversarial tests.
+
+The existing `storage_rpc_auth::authorized_roles()` table is the current
+wire-role authority. It should be described as a role matrix, not as the local
+route-capability model. It may later be represented by a more typed policy
+registry, but this plan does not require a generic enum that would erase the
+subject- and lifetime-bound capability distinctions.
+
+Implementation may continue incrementally, but the sequence is explicit:
+
+1. preserve the landed bounded auth codec and exhaustive wire-role matrix as
+   the outer policy foundation;
+2. activate manifest credentials and enforce that policy at the Unix boundary,
+   retaining all existing route/subject checks while capability migration is
+   incomplete;
+3. continue converting handlers and node-client APIs by complete workflow,
+   adding a composed test that crosses both auth and local capability layers
+   for each converted workflow;
+4. reuse the same dispatch adapter for TCP only after Unix enforcement is
+   complete; and
+5. claim replicated storage RPC completion only when every stateful wire kind
+   reaches a capability-requiring effect boundary. Until then, passing the
+   outer role check is not evidence that compiler enforcement is complete.
 
 ## Current architectural weakness
 
@@ -514,9 +614,12 @@ Retired migration checks and their compiler replacements:
    lifetimes.
 5. Require these capabilities on stateful node-client operations and
    revalidate identity, operation class, and deadline at each durable effect.
-6. Validate raw serialized route evidence and construct a server-local
-   capability at the Unix server boundary.
-7. Add local and Unix adversarial tests for:
+6. At an authenticated RPC boundary, accept only the frame/principal pair
+   already verified by the storage RPC auth layer; then validate its raw
+   serialized route evidence and construct a server-local capability. The
+   verified principal is not itself that capability. Unix is wired first and
+   TCP reuses the same post-auth dispatch adapter.
+7. Add embedded, Unix, and TCP-when-enabled adversarial tests for:
    - capability use after deadline expiry
    - capability reuse after a runtime-map transition
    - retained capability use for a different command, cleanup subject, or
@@ -532,7 +635,7 @@ Completion:
 - new work cannot call a stateful client method without active-route authority
 - cleanup/recovery cannot accidentally use normal new-work authority
 - stale, expired, transitioned, or subject-mismatched capabilities fail without
-  mutation on both local and Unix paths
+  mutation on embedded and every enabled RPC transport path
 - route and PG-role grep checks are retired or reduced to API-surface checks
 
 Node-client role classification (2026-07-19):
@@ -1779,10 +1882,15 @@ Each phase must run:
 
 Boundary-changing phases also require:
 
-- local and Unix client parity tests for affected operations
+- embedded and enabled RPC-transport client parity tests for affected
+  operations
+- TCP parity once that transport is enabled, using the same post-auth dispatch
+  adapter rather than a second capability-construction path
 - runtime-map transition tests for active versus retained authority
-- adversarial local and Unix tests for expired, stale, reused, and
-  subject-mismatched route capabilities
+- adversarial embedded and enabled-transport tests for expired, stale, reused,
+  and subject-mismatched route capabilities
+- composed authenticated RPC tests that independently cover a valid credential
+  with the wrong role and a valid role with invalid route/subject evidence
 - deterministic contention/recovery tests for affected command publishers
 - review of public exports and enabled Cargo features
 
@@ -1791,9 +1899,9 @@ Where a check is retired, include a regression demonstrating the replacement:
 - a compiler-enforced inaccessible API or wrong-type call need not be tested by
   parsing compiler diagnostics, but the new boundary should be evident from
   module/crate visibility and reviewed as part of the change
-- PG-role and route-capability constructors, local application-time
-  revalidation, and Unix server-side revalidation require positive and
-  adversarial unit tests
+- PG-role and route-capability constructors, embedded application-time
+  revalidation, and server-side revalidation through the shared post-auth
+  adapter on every enabled RPC transport require positive and adversarial tests
 - typed publisher outcomes require deterministic tests for every outcome
 
 ## Risks
@@ -1804,8 +1912,10 @@ Where a check is retired, include a regression demonstrating the replacement:
 - A broad protocol/types crate can recreate the same weak boundary under a new
   name. Export request/response values, not raw engine handles or mutation
   helpers.
-- Client-side route capabilities must not be trusted across Unix RPC. The
-  server remains the authority and revalidates immediately before mutation.
+- Client-side route capabilities must not be trusted across any RPC transport.
+  The shared server adapter, entered after the transport's required
+  authentication, remains the authority and revalidates immediately before
+  mutation on Unix and TCP.
 - A locally held capability must not imply indefinite authority. Its
   admission-guard lifetime and absolute deadline are both enforced, and every
   durable effect revalidates the capability.
@@ -1823,8 +1933,10 @@ This plan is complete when:
 
 1. the repaired transitional boundary check runs in CI
 2. server-core and ordinary application code cannot name raw node/store APIs
-3. cluster code reaches storage nodes only through local/Unix client
-   interfaces
+3. cluster code reaches storage nodes only through embedded node-client or
+   transport-neutral RPC client interfaces, with every enabled RPC transport
+   entering the same capability-construction adapter after mandatory auth or
+   the explicit standalone-local auth opt-out
 4. PG role and route authority are represented by non-forgeable types with
    private trusted construction; route capabilities are request-scoped,
    non-cloneable, deadline-bound, and revalidated at durable effects

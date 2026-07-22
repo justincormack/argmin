@@ -12017,10 +12017,14 @@ Supported deployment modes, replicated topologies, and gating:
 - The replicated storage RPC authentication boundary must authenticate cluster
   identity, source role and process/node identity, target storage-node identity,
   operation kind, and request/response direction before dispatch. Authorization
-  must bind the authenticated caller to the requested PG/shard route and epoch
-  and reject wrong-role, wrong-target, stale-route, or cross-cluster traffic
-  before storage mutation. Frames require integrity, replay/freshness bounds
-  appropriate to each operation and strict payload limits before allocation.
+  then has two mandatory layers: an exhaustive wire-kind role matrix rejects a
+  valid cluster credential with the wrong process role, and the storage-node
+  handler validates the requested PG/shard route, subject, epoch, and operation
+  mode before constructing the non-serializable local capability required by
+  the storage effect. Wrong-role, wrong-target, stale-route, wrong-subject, or
+  cross-cluster traffic must fail before mutation. Frames require integrity,
+  replay/freshness bounds appropriate to each operation and strict payload
+  limits before allocation.
   Non-local transports additionally require confidentiality for credentials,
   object data, and metadata. The implementation should reuse the shared
   identity/auth primitives where their role model fits, but data-plane storage
@@ -12274,15 +12278,20 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   complete existing storage frame plus topology/source/target/direction/request
   identity, requires timestamp freshness, derives caller-bound service
   response credentials, and rejects disallowed operations before signing or
-  dispatch verification. Authorization uses one exhaustive per-message-kind
-  role table for frontend, storage-node, admin, and maintenance principals;
+  dispatch verification. Wire authorization uses one exhaustive per-message-
+  kind role table for frontend, storage-node, admin, and maintenance principals;
   new kinds require an explicit compile-time classification and valid-MAC
-  unauthorized frames still fail verification. Maintenance capabilities are
-  also checked against independent routine-checkpoint, lifecycle, and payload-
+  unauthorized frames still fail verification. Maintenance role permissions
+  are also checked against independent routine-checkpoint, lifecycle, and payload-
   reclaim workflow manifests so a complete background workflow cannot be
   blocked by a role split hidden behind its maintenance-only entry RPC. Raw
   shard writes and transfer/bootstrap checkpoint installation remain denied to
-  maintenance. Because the full nested frame is covered, its route epoch,
+  maintenance. This table is not a substitute for the non-forgeable PG roles
+  and request-scoped route/payload capabilities in
+  [storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md);
+  authenticated Unix/TCP dispatch must validate and construct those local
+  capabilities before storage effects. Because the full nested frame is
+  covered, its route epoch,
   PG/shard identity, command identity, and payload cannot be relabeled
   independently. Runtime Unix enforcement and a composed authenticated Unix
   maintenance-client regression remain open and must land before this item is

@@ -751,5 +751,10 @@ Do not expose secrets, MACs, raw credential material, or full internal payloads.
   storage RPC auth slice in
   [multihost-transition-plan.md](multihost-transition-plan.md), which may reuse
   this plan's cluster/principal/credential primitives and is then reused by TCP.
+  Its authenticated process-role permission is only the outer authorization
+  layer; trusted PG roles and request-scoped route/payload capabilities remain
+  owned by
+  [storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md)
+  and are reconstructed from local state after RPC authentication.
   Compatibility with pre-release artifacts that lack auth configuration is also
   out of scope.
