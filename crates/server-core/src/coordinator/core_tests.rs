@@ -14289,13 +14289,17 @@ fn corrupt_shard_on_disk(coord: &Coordinator, bucket: &str, key: &str, shard_ind
 
 // ── EC fault injection tests ────────────────────────────────────
 
+fn setup_ec_fault_injection_coordinator(dir: &std::path::Path) -> Coordinator {
+    setup_coordinator_with_pg_count_without_background_sweepers(dir, DEFAULT_TEST_PG_COUNT)
+}
+
 #[test]
 fn ec_reconstruction_after_shard_loss() {
     if !backend_supports_parity_recovery() {
         return;
     }
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -14350,7 +14354,7 @@ fn ec_drop_one_data_shard_get() {
         return;
     }
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -14398,7 +14402,7 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
         return;
     }
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -14475,7 +14479,7 @@ fn ec_drop_m_shards_at_limit() {
     }
     // Config: k=4, m=2. Dropping exactly m=2 shards should still recover.
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -14523,7 +14527,7 @@ fn ec_drop_m_shards_at_limit() {
 fn ec_drop_m_plus_one_shards_fails() {
     // Config: k=4, m=2. Dropping m+1=3 shards should fail.
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -14581,7 +14585,7 @@ fn ec_corrupt_one_data_shard_recovery() {
     }
     // Corrupt shard 0 on disk. PgStore detects CRC mismatch, EC reconstructs.
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -14629,7 +14633,7 @@ fn ec_range_get_with_missing_shard() {
         return;
     }
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -14726,7 +14730,7 @@ fn ec_drop_parity_shard_data_still_works() {
     }
     // Delete parity shard (index k=4). Only data shards needed for normal read.
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -14775,7 +14779,7 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
         return;
     }
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -14845,7 +14849,7 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
         return;
     }
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator(tmp.path());
+    let coord = setup_ec_fault_injection_coordinator(tmp.path());
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
