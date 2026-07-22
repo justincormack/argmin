@@ -1869,6 +1869,39 @@ Thirty-fifth Phase 3 slice:
   regressions, all 2,209 storage tests, workspace-wide strict Clippy, and the
   full parallel workspace suite (7,446 tests).
 
+Thirty-sixth Phase 3 slice:
+
+- CreateMultipartUpload retry matching and command construction now consume
+  the exact `StorageNodeActivePrimaryObjectRoute` established from the frame.
+  Both capability methods derive the trusted object PG and epoch from that
+  route and revalidate its immutable captured deadline immediately before the
+  local metadata operation.
+- the capability binds the decoded create request's bucket and key, any
+  retry-matched command's upload subject, and any caller-supplied current
+  object snapshot to the active object route. It also binds both retry-command
+  and new-command reservation proofs to the exact
+  `create-multipart-upload` operation, route key, route epoch, and bucket.
+- the handlers preserve the existing authorization registry and public error
+  mappings. In particular, proof bucket mismatch retains its established
+  precedence over route validation, while all remaining decoded route,
+  subject, and proof evidence stays untrusted until the post-auth capability
+  is constructed.
+- the deterministic active-route regression proves positive retry matching
+  and command construction, rejects mismatched create and expected-command
+  subjects and a same-bucket proof for another operation, and proves both
+  methods fail at the capability's original deadline after raw same-epoch
+  route renewal. The Unix regressions retain a correctly routed positive
+  canary and require exact `PayloadDecode` for equivalent-state wrong-PG
+  matching and command construction.
+- stream and remaining multipart mutations, payload reclaim, remaining object
+  mutations and lookups, PG-wide listing scans, data operations, frontend
+  capability migration, and capability requirements on node-client traits
+  remain open in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  active-route and Unix positive/wrong-PG regressions, all 2,209 storage tests,
+  workspace-wide strict Clippy, and the full parallel workspace suite (7,446
+  tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

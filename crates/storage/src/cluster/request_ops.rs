@@ -21,6 +21,7 @@ use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
     ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
     PutObjectMetadataMutation, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
@@ -11678,7 +11679,7 @@ impl super::StorageCluster {
                 .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
             let reservation = match self.acquire_durable_bucket_write_reservation(
                 bucket,
-                "create-multipart-upload",
+                CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
                 Some(key.as_str()),
             ) {
                 Ok(reservation) => reservation,

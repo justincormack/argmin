@@ -25,7 +25,8 @@ use crate::data_dir::prepare_private_data_dir;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
-    PutObjectMetadataMutation, DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
+    PutObjectMetadataMutation, CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
     INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
     PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
@@ -314,9 +315,9 @@ use crate::DataPgId;
 use crate::{
     BucketDeleteFinalizeClaimRecord, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
     BucketSnapshotRequest, BucketSubresourceKind, BucketWriteDrainRecord,
-    BucketWriteReservationProof, BucketWriteReservationRecord, EcShape, LifecycleSweepClaimRecord,
-    MultipartUploadRecord, NodeId, ObjectKey, ObjectPgActionError, RouteMapValidity, ShardKey,
-    ShardLocation, UploadId,
+    BucketWriteReservationProof, BucketWriteReservationRecord, CreateMultipartUploadReq, EcShape,
+    LifecycleSweepClaimRecord, MultipartUploadRecord, NodeId, ObjectKey, ObjectPgActionError,
+    RouteMapValidity, ShardKey, ShardLocation, UploadId,
 };
 use crate::{BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 
@@ -3641,6 +3642,99 @@ impl StorageNodeActiveObjectRoute<'_> {
 }
 
 impl StorageNodeActivePrimaryObjectRoute<'_> {
+    fn require_create_multipart_upload_subject(
+        &self,
+        request: &CreateMultipartUploadReq,
+        operation: &'static str,
+    ) -> Result<(), StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        if request.bucket != *self.route.bucket || request.key != *self.route.key {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: format!(
+                        "{operation} create request subject does not match active object route"
+                    ),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    fn matching_multipart_upload_initiated_at(
+        &self,
+        request: &CreateMultipartUploadReq,
+        expected_command: Option<&crate::metadata_command::CreateMultipartUploadCommand>,
+    ) -> Result<Option<u64>, StorageNodeObjectRouteError> {
+        self.require_create_multipart_upload_subject(request, "multipart upload match")?;
+        if let Some(command) = expected_command {
+            if command.upload.bucket != *self.route.bucket || command.upload.key != *self.route.key
+            {
+                return Err(StorageNodeObjectRouteError::Route(
+                    StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: "multipart upload match expected command subject does not match active object route".to_string(),
+                    },
+                ));
+            }
+            self.require_object_mutation_proof(
+                &command.bucket_write_reservation,
+                CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                "multipart upload match",
+            )?;
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
+            &local_client,
+            self.route.pg_id,
+            request,
+            expected_command,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn build_create_multipart_upload_command(
+        &self,
+        request: &CreateMultipartUploadReq,
+        expected_current: Option<&crate::StoredObject>,
+        bucket_write_reservation: &BucketWriteReservationProof,
+    ) -> Result<MetadataCommandEnvelope, StorageNodeObjectRouteError> {
+        self.require_create_multipart_upload_subject(request, "multipart upload command build")?;
+        self.require_object_mutation_proof(
+            bucket_write_reservation,
+            CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+            "multipart upload command build",
+        )?;
+        if expected_current.is_some_and(|stored| {
+            stored.bucket() != self.route.bucket || stored.key() != self.route.key
+        }) {
+            return Err(StorageNodeObjectRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "multipart upload command expected object does not match active object route".to_string(),
+                },
+            ));
+        }
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
+            &local_client,
+            BuildCreateMultipartUploadCommandReq {
+                pg_id: self.route.pg_id,
+                cluster_epoch: self.route.fence.cluster_epoch,
+                request,
+                expected_current,
+                bucket_write_reservation,
+            },
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn require_authorized_multipart_upload_subject(
         &self,
         authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
@@ -5289,7 +5383,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartUploadMatch => {
                 match decode_multipart_upload_match_request(&frame.payload) {
-                    Ok(request) => self.multipart_upload_match_response(request),
+                    Ok(request) => self.multipart_upload_match_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5360,7 +5454,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::ObjectMultipartUploadCommandBuild => {
                 match decode_create_multipart_upload_command_build_request(&frame.payload) {
-                    Ok(request) => self.create_multipart_upload_command_build_response(request),
+                    Ok(request) => {
+                        self.create_multipart_upload_command_build_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8345,36 +8441,29 @@ impl StorageNodeConnectionHandler {
 
     fn multipart_upload_match_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcMultipartUploadMatchRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "multipart upload match",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let initiated_at =
-            match ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
-                &local_client,
-                self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                &request.request,
-                request.expected_command.as_ref(),
-            ) {
-                Ok(initiated_at) => initiated_at,
-                Err(error) => {
-                    return encode_storage_rpc_error_response(&object_pg_error_response(error));
-                }
-            };
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let initiated_at = match route.matching_multipart_upload_initiated_at(
+            &request.request,
+            request.expected_command.as_ref(),
+        ) {
+            Ok(initiated_at) => initiated_at,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error));
+            }
+        };
         let payload =
             encode_multipart_upload_match_response(&StorageRpcMultipartUploadMatchResponse {
                 initiated_at,
@@ -8671,38 +8760,39 @@ impl StorageNodeConnectionHandler {
 
     fn create_multipart_upload_command_build_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcCreateMultipartUploadCommandBuildRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_object_mutation_command_request(
+        let route = match self.active_primary_object_mutation_route(
+            route_permit,
             &request.object,
             &request.bucket_write_reservation,
             "multipart upload command build",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response = match ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
-            &local_client,
-            BuildCreateMultipartUploadCommandReq {
-                pg_id: self
-                    .validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-                cluster_epoch: request.object.cluster_epoch,
-                request: &request.request,
-                expected_current: request.expected_current.as_ref(),
-                bucket_write_reservation: &request.bucket_write_reservation,
-            },
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let response = match route.build_create_multipart_upload_command(
+            &request.request,
+            request.expected_current.as_ref(),
+            &request.bucket_write_reservation,
         ) {
             Ok(command) => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command)),
-            Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot
+            Err(StorageNodeObjectRouteError::Object(
+                ObjectPgActionError::StaleObjectReadSubject,
+            )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
             }
-            Err(error) => match object_metadata_command_build_error_outcome(
-                error,
-                Some("CreateMultipartUpload"),
-            ) {
-                Ok(outcome) => outcome,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            },
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                match object_metadata_command_build_error_outcome(
+                    error,
+                    Some("CreateMultipartUpload"),
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => return encode_storage_rpc_error_response(&error),
+                }
+            }
         };
         let payload = encode_object_metadata_command_build_response(
             &StorageRpcObjectMetadataCommandBuildResponse { outcome: response },
@@ -15139,7 +15229,7 @@ fn canonicalize_existing_or_parent(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BucketAclSummary, CreateMultipartUploadReq};
+    use crate::BucketAclSummary;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -18855,6 +18945,9 @@ mod tests {
         };
         let mut metadata_proof = proof.clone();
         metadata_proof.operation_kind = "put-object-metadata".to_string();
+        let mut create_multipart_proof = proof.clone();
+        create_multipart_proof.operation_kind =
+            CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
         let mut delete_current_proof = proof.clone();
         delete_current_proof.operation_kind = "delete-current-object".to_string();
         let mut delete_specific_proof = proof.clone();
@@ -18887,6 +18980,21 @@ mod tests {
         };
         let serialized_tags =
             "<Tagging><TagSet><Tag><Key>route</Key><Value>active</Value></Tag></TagSet></Tagging>";
+        let existing_multipart_request = CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: crate::OwnerIdentity::from_principal("active-object-route-owner"),
+            owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
         crate::clock::with_time_override(1_000, || {
             let pg = server._node.get_pg(0).unwrap();
             PgMetadataStore::put_object_with_segments(
@@ -18912,25 +19020,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-            PgMetadataStore::create_multipart_upload(
-                &*pg,
-                &CreateMultipartUploadReq {
-                    upload_id: upload_id.clone(),
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    tags: None,
-                    metadata_blob: crate::SerializedMetadataBlob::default(),
-                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                    initiator: crate::OwnerIdentity::from_principal("active-object-route-owner"),
-                    owner: crate::OwnerIdentity::from_principal("active-object-route-owner"),
-                    acl_grants: AclGrants::default(),
-                    public_read: false,
-                    object_lock: crate::ObjectLockState::default(),
-                    checksum: None,
-                    encryption: crate::ObjectEncryption::None,
-                },
-            )
-            .unwrap();
+            PgMetadataStore::create_multipart_upload(&*pg, &existing_multipart_request).unwrap();
             pg.refresh_metadata_command_state_digest().unwrap();
         });
 
@@ -19093,6 +19183,30 @@ mod tests {
             upload
         });
         assert_eq!(multipart_upload.upload_id, upload_id);
+        let expected_multipart_command = crate::metadata_command::CreateMultipartUploadCommand {
+            upload: multipart_upload.clone(),
+            bucket_write_reservation: create_multipart_proof.clone(),
+        };
+        assert_eq!(
+            crate::clock::with_time_override(1_000, || {
+                primary_route.matching_multipart_upload_initiated_at(
+                    &existing_multipart_request,
+                    Some(&expected_multipart_command),
+                )
+            })
+            .unwrap(),
+            Some(multipart_upload.initiated_at)
+        );
+        let mut new_multipart_request = existing_multipart_request.clone();
+        new_multipart_request.upload_id =
+            crate::tests::multipart_upload_id("active-object-route-new-upload");
+        assert_eq!(
+            crate::clock::with_time_override(1_000, || {
+                primary_route.matching_multipart_upload_initiated_at(&new_multipart_request, None)
+            })
+            .unwrap(),
+            None
+        );
         let authorized_upload = crate::types::AuthorizedMultipartUploadRecord::assume_authorized(
             multipart_upload.clone(),
         );
@@ -19155,6 +19269,54 @@ mod tests {
             }
             other => panic!("mismatched authorized upload must fail at capability: {other:?}"),
         }
+        let mismatched_create_match = crate::clock::with_time_override(1_000, || {
+            mismatched_subject_route.matching_multipart_upload_initiated_at(
+                &existing_multipart_request,
+                Some(&expected_multipart_command),
+            )
+        });
+        match mismatched_create_match {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("subject does not match"));
+            }
+            other => panic!("mismatched multipart create request must fail: {other:?}"),
+        }
+        let mut mismatched_expected_command = expected_multipart_command.clone();
+        mismatched_expected_command.upload.key =
+            crate::tests::object_key("different-expected-command-key");
+        let mismatched_expected_match = crate::clock::with_time_override(1_000, || {
+            primary_route.matching_multipart_upload_initiated_at(
+                &new_multipart_request,
+                Some(&mismatched_expected_command),
+            )
+        });
+        match mismatched_expected_match {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error
+                    .message
+                    .contains("expected command subject does not match"));
+            }
+            other => panic!("mismatched multipart expected command must fail: {other:?}"),
+        }
+        let mut mismatched_expected_proof = expected_multipart_command.clone();
+        mismatched_expected_proof
+            .bucket_write_reservation
+            .operation_kind = "put-object-metadata".to_string();
+        let mismatched_expected_match = crate::clock::with_time_override(1_000, || {
+            primary_route.matching_multipart_upload_initiated_at(
+                &existing_multipart_request,
+                Some(&mismatched_expected_proof),
+            )
+        });
+        match mismatched_expected_match {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => panic!("mismatched multipart expected proof must fail: {other:?}"),
+        }
 
         let (metadata_stored, current_delete_snapshot, specific_delete_snapshot) =
             crate::clock::with_time_override(1_000, || {
@@ -19172,6 +19334,82 @@ mod tests {
                 assert_eq!(lifecycle_versions, vec![metadata_stored.clone()]);
                 (metadata_stored, current, specific)
             });
+        let create_multipart_command = crate::clock::with_time_override(1_000, || {
+            primary_route
+                .build_create_multipart_upload_command(
+                    &new_multipart_request,
+                    Some(&metadata_stored),
+                    &create_multipart_proof,
+                )
+                .unwrap()
+        });
+        let MetadataCommandPayload::CreateMultipartUpload(create_multipart) =
+            create_multipart_command.payload()
+        else {
+            panic!("active object route must build a create multipart upload command");
+        };
+        assert_eq!(create_multipart.upload.bucket, bucket);
+        assert_eq!(create_multipart.upload.key, key);
+        assert_eq!(
+            create_multipart.bucket_write_reservation,
+            create_multipart_proof
+        );
+
+        let mut mismatched_create_request = new_multipart_request.clone();
+        mismatched_create_request.key = crate::tests::object_key("different-create-request-key");
+        let mismatched_create_build = crate::clock::with_time_override(1_000, || {
+            primary_route.build_create_multipart_upload_command(
+                &mismatched_create_request,
+                Some(&metadata_stored),
+                &create_multipart_proof,
+            )
+        });
+        match mismatched_create_build {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("subject does not match"));
+            }
+            other => panic!("mismatched multipart create build must fail: {other:?}"),
+        }
+        let mut mismatched_create_proof = create_multipart_proof.clone();
+        mismatched_create_proof.operation_kind = "put-object-metadata".to_string();
+        let mismatched_create_build = crate::clock::with_time_override(1_000, || {
+            primary_route.build_create_multipart_upload_command(
+                &new_multipart_request,
+                Some(&metadata_stored),
+                &mismatched_create_proof,
+            )
+        });
+        match mismatched_create_build {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("proof does not match"));
+            }
+            other => panic!("mismatched multipart create proof must fail: {other:?}"),
+        }
+        let mut mismatched_expected_current = metadata_stored.clone();
+        match &mut mismatched_expected_current {
+            crate::StoredObject::Live(object) => {
+                object.key = crate::tests::object_key("different-expected-object-key");
+            }
+            crate::StoredObject::DeleteMarker(_) => {
+                panic!("active object route fixture must contain a live object");
+            }
+        }
+        let mismatched_create_build = crate::clock::with_time_override(1_000, || {
+            primary_route.build_create_multipart_upload_command(
+                &new_multipart_request,
+                Some(&mismatched_expected_current),
+                &create_multipart_proof,
+            )
+        });
+        match mismatched_create_build {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("expected object does not match"));
+            }
+            other => panic!("mismatched multipart expected object must fail: {other:?}"),
+        }
 
         let mut mismatched_mutation_proof = metadata_proof.clone();
         mismatched_mutation_proof.bucket =
@@ -19402,6 +19640,25 @@ mod tests {
                     "abort multipart cleanup load",
                     primary_route
                         .load_abort_multipart_upload_cleanup(&upload_id)
+                        .map(|_| ()),
+                ),
+                (
+                    "multipart upload retry match",
+                    primary_route
+                        .matching_multipart_upload_initiated_at(
+                            &existing_multipart_request,
+                            Some(&expected_multipart_command),
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "create multipart upload command build",
+                    primary_route
+                        .build_create_multipart_upload_command(
+                            &new_multipart_request,
+                            Some(&metadata_stored),
+                            &create_multipart_proof,
+                        )
                         .map(|_| ()),
                 ),
                 (

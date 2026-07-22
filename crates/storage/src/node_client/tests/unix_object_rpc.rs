@@ -880,6 +880,9 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             ..
         })
     ));
+    let mut create_multipart_proof = metadata_proof.clone();
+    create_multipart_proof.operation_kind =
+        crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
     let multipart_command_error =
         ObjectMutationMetadataNodeClient::build_create_multipart_upload_command(
             &client,
@@ -888,17 +891,21 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &multipart_request,
                 expected_current: current_delete_snapshot.stored.as_ref(),
-                bucket_write_reservation: &metadata_proof,
+                bucket_write_reservation: &create_multipart_proof,
             },
         )
         .unwrap_err();
-    assert!(matches!(
-        multipart_command_error,
+    match multipart_command_error {
         ObjectPgActionError::Store(StoreError::StorageRpc {
             code: StorageRpcErrorCode::PayloadDecode,
+            message,
             ..
-        })
-    ));
+        }) => {
+            assert!(message.contains("multipart upload command build PG"));
+            assert!(message.contains("does not match object"));
+        }
+        other => panic!("wrong-PG multipart command build must fail placement: {other:?}"),
+    }
 
     let delete_current_command_error =
         ObjectMutationMetadataNodeClient::build_delete_current_object_command(
@@ -2589,6 +2596,9 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         checksum: None,
         encryption: ObjectEncryption::None,
     };
+    let mut multipart_proof = proof.clone();
+    multipart_proof.operation_kind =
+        crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
     assert_eq!(
         ObjectMutationMetadataNodeClient::matching_multipart_upload_initiated_at(
             &client,
@@ -2607,7 +2617,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
                 cluster_epoch: ClusterEpoch::new(1).unwrap(),
                 request: &multipart_request,
                 expected_current: Some(&stored),
-                bucket_write_reservation: &proof,
+                bucket_write_reservation: &multipart_proof,
             },
         )
         .unwrap();
@@ -2618,7 +2628,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     };
     assert_eq!(multipart_create.upload.bucket, bucket);
     assert_eq!(multipart_create.upload.key, key);
-    assert_eq!(multipart_create.bucket_write_reservation, proof);
+    assert_eq!(multipart_create.bucket_write_reservation, multipart_proof);
     client
         .validate_multipart_upload_match_response(
             Some(multipart_create.upload.initiated_at),
