@@ -45,7 +45,10 @@ use conditional::{
 use md5_legacy::Digest;
 use request::{S3Request, TransportSecurity};
 use response::{ErrorDiagnostic, S3Response, WireResponseIds};
-use router::{route, S3Operation};
+use router::{
+    route_service, EndpointKind, S3ControlOperation, S3ControlRouteError, S3Operation, ServiceKind,
+    ServiceOperation, ServiceRouteError,
+};
 use s3_types::{
     requires_sigv4, BucketLifecycleConfiguration, BucketNamespace, LegalHoldStatus, ObjectLockMode,
     ObjectLockState, ObjectRetention, StoredLegalHoldStatus, VersionId, WebsiteRedirectLocation,
@@ -251,35 +254,33 @@ fn parse_bucket_name(name: &str) -> Result<BucketName, ServerError> {
     })
 }
 
-fn parse_bucket_resource_arn(resource_arn: &str) -> Result<BucketName, ServerError> {
-    let bucket =
-        resource_arn
-            .strip_prefix("arn:aws:s3:::")
-            .ok_or_else(|| ServerError::InvalidRequest {
-                reason: format!("unsupported TagResource resource ARN: {resource_arn}"),
-            })?;
-    if bucket.is_empty() || bucket.contains('/') {
-        return Err(ServerError::InvalidRequest {
-            reason: format!("unsupported TagResource resource ARN: {resource_arn}"),
+fn validate_untag_resource_tag_key_members(tag_keys: &[String]) -> Result<(), ServerError> {
+    if tag_keys.is_empty() {
+        return Err(xml::empty_s3_control_tag_set());
+    }
+    if tag_keys.len() > 50 || tag_keys.iter().any(String::is_empty) {
+        return Err(xml::invalid_s3_control_tag());
+    }
+    let mut unique = std::collections::HashSet::new();
+    if tag_keys.iter().any(|key| !unique.insert(key.as_str())) {
+        return Err(ServerError::InvalidTag {
+            reason: "Duplicate tag keys are not supported.".to_string(),
+            tag_key: None,
+            tag_value: None,
         });
     }
-    parse_bucket_name(bucket)
+    Ok(())
 }
 
-fn validate_untag_resource_tag_keys(tag_keys: &[String]) -> Result<(), ServerError> {
-    if tag_keys.is_empty() || tag_keys.iter().any(String::is_empty) {
-        return Err(ServerError::InvalidTag {
-            reason: "At least one tag is required.".to_string(),
-            tag_key: None,
-            tag_value: None,
-        });
-    }
-    if tag_keys.len() > 50 {
-        return Err(ServerError::InvalidTag {
-            reason: "too many tagKeys in UntagResource request".to_string(),
-            tag_key: None,
-            tag_value: None,
-        });
+fn validate_untag_resource_tag_key_values(tag_keys: &[String]) -> Result<(), ServerError> {
+    if tag_keys.iter().any(|key| {
+        key.chars().count() > 128
+            || !key.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '+' | '-' | '=' | '.' | '_' | ':' | '/')
+            })
+    }) {
+        return Err(xml::invalid_s3_control_tag());
     }
     Ok(())
 }
@@ -556,18 +557,6 @@ fn expected_bucket_owner(req: &S3Request) -> Option<&str> {
 
 fn expected_source_bucket_owner(req: &S3Request) -> Option<&str> {
     req.header("x-amz-source-expected-bucket-owner")
-}
-
-fn required_account_id(req: &S3Request) -> Result<&str, ServerError> {
-    if req.header_count("x-amz-account-id") > 1 {
-        return Err(ServerError::InvalidArgument {
-            reason: "x-amz-account-id must not be repeated".to_string(),
-        });
-    }
-    req.header("x-amz-account-id")
-        .ok_or_else(|| ServerError::InvalidRequest {
-            reason: "Missing required header for this request: x-amz-account-id".to_string(),
-        })
 }
 
 fn parse_bucket_namespace(
@@ -975,6 +964,19 @@ impl HttpFrontend {
     /// an `S3Request` and converting the `S3Response` back to an HTTP response.
     #[must_use]
     pub fn handle_s3_request(&self, s3req: &S3Request, wire_ids: &WireResponseIds) -> S3Response {
+        self.handle_service_request(EndpointKind::S3Only, s3req, wire_ids)
+    }
+
+    /// Handle a request on a listener-selected endpoint kind. The endpoint is
+    /// trusted server configuration and is never derived from request
+    /// authority text.
+    #[must_use]
+    pub(crate) fn handle_service_request(
+        &self,
+        endpoint: EndpointKind,
+        s3req: &S3Request,
+        wire_ids: &WireResponseIds,
+    ) -> S3Response {
         let query = observability::query_summary(s3req.query_string());
         observability::trace_scope!(
             TRACE_TARGET,
@@ -998,14 +1000,30 @@ impl HttpFrontend {
                 query.param_count(),
                 query.has_sigv4_params()
             );
-            match route(s3req.method.as_str(), s3req.path(), s3req.query_string()) {
+            match route_service(
+                endpoint,
+                s3req.method.as_str(),
+                s3req.path(),
+                s3req.query_string(),
+            ) {
                 Ok(op) => op,
-                Err(err) => return S3Response::error_with_ids(&err, s3req.path(), wire_ids),
+                Err(ServiceRouteError::S3(err)) => {
+                    return S3Response::error_with_ids(&err, s3req.path(), wire_ids);
+                }
+                Err(ServiceRouteError::S3Control(S3ControlRouteError::InvalidUri { uri })) => {
+                    return S3Response::s3_control_invalid_uri(&uri, wire_ids);
+                }
+                Err(ServiceRouteError::S3Control(S3ControlRouteError::EmptyBadRequest)) => {
+                    return S3Response::outer_empty_bad_request();
+                }
+                Err(ServiceRouteError::S3Control(S3ControlRouteError::FrontendBadRequest)) => {
+                    return S3Response::s3_control_frontend_bad_request(wire_ids);
+                }
             }
         };
 
         // OPTIONS (preflight CORS) bypasses authentication.
-        if let S3Operation::OptionsRequest { ref bucket, .. } = operation {
+        if let ServiceOperation::S3(S3Operation::OptionsRequest { ref bucket, .. }) = operation {
             let storage_route_admission = match self.coordinator.admit_storage_route_for_request() {
                 Ok(admission) => admission,
                 Err(err) => {
@@ -1014,14 +1032,50 @@ impl HttpFrontend {
             };
             return self.handle_options_request(s3req, &storage_route_admission, bucket, wire_ids);
         }
+        if let ServiceOperation::S3Control(S3ControlOperation::Options { bucket }) = &operation {
+            let storage_route_admission = match self.coordinator.admit_storage_route_for_request() {
+                Ok(admission) => admission,
+                Err(err) => return S3Response::s3_control_error_with_ids(&err, wire_ids),
+            };
+            return self.handle_s3_control_options(
+                s3req,
+                &storage_route_admission,
+                bucket,
+                wire_ids,
+            );
+        }
+        if let ServiceOperation::S3Control(S3ControlOperation::HeadBucketTags) = &operation {
+            return S3Response::s3_control_head_method_not_allowed();
+        }
+        if let ServiceOperation::S3Control(S3ControlOperation::MethodNotAllowed { method }) =
+            &operation
+        {
+            return S3Response::s3_control_method_not_allowed(method, wire_ids);
+        }
+        // AWS rejects complete absence of this required query member before
+        // service-scope and HMAC checks. Present values, including invalid
+        // ones, remain post-authentication validation in dispatch.
+        if matches!(
+            &operation,
+            ServiceOperation::S3Control(S3ControlOperation::UntagResource { .. })
+        ) && s3req.query_params_lossy("tagKeys").is_empty()
+        {
+            return S3Response::s3_control_error_with_ids(
+                &xml::empty_s3_control_tag_set(),
+                wire_ids,
+            );
+        }
 
-        let actual_cors_bucket = operation.bucket_name().cloned();
+        let is_s3_control = matches!(&operation, ServiceOperation::S3Control(_));
+        let s3_operation = operation.s3();
+        let actual_cors_bucket = s3_operation.and_then(S3Operation::bucket_name).cloned();
         // AWS reveals the bucket region on the pinned header/presigned
         // credential errors only for bucket-scoped requests to existing
         // buckets. Object-scoped requests, POST/streaming writes, and unknown
         // buckets omit the header.
-        let auth_error_bucket_region_bucket = if operation.object_key().is_none()
-            && !matches!(&operation, S3Operation::PostObject { .. })
+        let auth_error_bucket_region_bucket = if s3_operation
+            .is_some_and(|operation| operation.object_key().is_none())
+            && !matches!(s3_operation, Some(S3Operation::PostObject { .. }))
         {
             actual_cors_bucket.clone()
         } else {
@@ -1031,13 +1085,16 @@ impl HttpFrontend {
         // discovery surfaces — HeadBucket and ListObjects — in any auth mode
         // (probed anonymous and cross-account); bucket subresources and
         // other bucket-scoped writes omit it.
-        let denied_bucket_region_bucket = match &operation {
-            S3Operation::HeadBucket { bucket }
-            | S3Operation::ListObjectsV1 { bucket }
-            | S3Operation::ListObjectsV2 { bucket } => Some(bucket.clone()),
+        let denied_bucket_region_bucket = match s3_operation {
+            Some(S3Operation::HeadBucket { bucket })
+            | Some(S3Operation::ListObjectsV1 { bucket })
+            | Some(S3Operation::ListObjectsV2 { bucket }) => Some(bucket.clone()),
             _ => None,
         };
-        let auth_bucket = operation.bucket_name().map(BucketName::as_str);
+        let auth_bucket = s3_operation
+            .and_then(S3Operation::bucket_name)
+            .map(BucketName::as_str);
+        let service_kind = operation.service_kind();
         let auth = {
             observability::trace_scope!(
                 TRACE_TARGET,
@@ -1046,25 +1103,33 @@ impl HttpFrontend {
                 s3req.method.as_str(),
                 s3req.path()
             );
-            self.authenticate(s3req, auth_bucket)
+            self.authenticate_for_service(s3req, auth_bucket, service_kind)
         };
         let (result, mut storage_route_admission) = match auth {
             Ok(auth) => match self.coordinator.admit_storage_route_for_request() {
                 Ok(admission) => {
-                    let result = if auth_bucket.is_some() {
-                        if let Err(err) =
-                            self.enforce_bucket_region_for_operation(&admission, &operation, &auth)
-                        {
-                            Err(err)
+                    let result = if let Some(s3_operation) = s3_operation {
+                        if auth_bucket.is_some() {
+                            if let Err(err) = self.enforce_bucket_region_for_operation(
+                                &admission,
+                                s3_operation,
+                                &auth,
+                            ) {
+                                Err(err)
+                            } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
+                                Err(err)
+                            } else {
+                                self.dispatch_service(s3req, &auth, operation)
+                            }
                         } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                             Err(err)
                         } else {
-                            self.dispatch_routed(s3req, &auth, operation)
+                            self.dispatch_service(s3req, &auth, operation)
                         }
                     } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                         Err(err)
                     } else {
-                        self.dispatch_routed(s3req, &auth, operation)
+                        self.dispatch_service(s3req, &auth, operation)
                     };
                     (result, Some(admission))
                 }
@@ -1136,6 +1201,7 @@ impl HttpFrontend {
                         .push(("x-amz-delete-marker".to_string(), "true".to_string()));
                     resp
                 }
+                Err(err) if is_s3_control => S3Response::s3_control_error_with_ids(&err, wire_ids),
                 Err(err) => {
                     if err.http_status() >= 500 {
                         let _ = observability::event(
@@ -1199,6 +1265,30 @@ impl HttpFrontend {
         }
 
         resp
+    }
+
+    fn handle_s3_control_options(
+        &self,
+        req: &S3Request,
+        storage_route_admission: &storage::StorageClusterRouteAdmission,
+        bucket: &BucketName,
+        wire_ids: &WireResponseIds,
+    ) -> S3Response {
+        if req.header("origin").is_none() {
+            return S3Response::s3_control_options_missing_origin(wire_ids);
+        }
+        let requested_method = match req.header("access-control-request-method") {
+            Some(method) => method,
+            None => return S3Response::s3_control_options_missing_origin(wire_ids),
+        };
+        match self
+            .coordinator
+            .bucket_exists_on_admitted_route(storage_route_admission, bucket)
+        {
+            Ok(false) => S3Response::s3_control_cors_bucket_not_found(requested_method, wire_ids),
+            Ok(true) => S3Response::s3_control_error_with_ids(&ServerError::AccessDenied, wire_ids),
+            Err(err) => S3Response::s3_control_error_with_ids(&err, wire_ids),
+        }
     }
 
     /// Handle an OPTIONS (CORS preflight) request. No auth required.
@@ -1490,15 +1580,29 @@ impl HttpFrontend {
         })
     }
 
-    fn dispatch_routed(
+    fn dispatch_service(
         &self,
         req: &S3Request,
         auth: &AuthContext,
-        operation: S3Operation,
+        operation: ServiceOperation,
+    ) -> Result<S3Response, ServerError> {
+        match operation {
+            ServiceOperation::S3(operation) => self.dispatch_routed(req, auth, operation),
+            ServiceOperation::S3Control(operation) => {
+                self.dispatch_s3_control(req, auth, operation)
+            }
+        }
+    }
+
+    fn dispatch_s3_control(
+        &self,
+        req: &S3Request,
+        auth: &AuthContext,
+        operation: S3ControlOperation,
     ) -> Result<S3Response, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "HttpFrontend::dispatch_routed",
+            "HttpFrontend::dispatch_s3_control",
             "method={} path={:?} op={:?} principal={:?}",
             req.method.as_str(),
             req.path(),
@@ -1506,23 +1610,38 @@ impl HttpFrontend {
             auth.configured_principal()
         );
         let expected_bucket_owner = expected_bucket_owner(req);
-        // Dispatch to coordinator
         match operation {
-            S3Operation::TagResource { resource_arn } => {
-                let account_id = required_account_id(req)?;
-                let bucket = parse_bucket_resource_arn(&resource_arn)?;
+            S3ControlOperation::ListTagsForResource { bucket } => {
+                let requester = self.requester_from_auth(auth, req);
+                let control = crate::coordinator::BucketTagControlRequest {
+                    bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
+                };
+                let tags = self
+                    .coordinator
+                    .get_bucket_tags_for_control_action(
+                        &control,
+                        &[],
+                        crate::coordinator::BucketTagControlAction::ListTagsForResource,
+                    )?
+                    .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
+                    .transpose()?
+                    .unwrap_or_else(|| xml::TagSet::empty(50));
+                Ok(S3Response::list_tags_for_resource(
+                    tags.to_list_tags_for_resource_xml(),
+                ))
+            }
+            S3ControlOperation::TagResource { bucket } => {
                 let tags = xml::TagSet::parse_tag_resource_xml(&req.body)?;
                 let requester = self.requester_from_auth(auth, req);
                 let control = crate::coordinator::BucketTagControlRequest {
                     bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
-                    account_id,
                 };
                 let existing_tags = self
                     .coordinator
-                    .get_bucket_tags_for_tag_resource(
+                    .get_bucket_tags_for_control_action(
                         &control,
                         tags.as_slice(),
-                        auth::PolicyAction::TagResource,
+                        crate::coordinator::BucketTagControlAction::TagResource,
                     )?
                     .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
                     .transpose()?
@@ -1538,15 +1657,13 @@ impl HttpFrontend {
                 )?;
                 Ok(S3Response::tag_resource())
             }
-            S3Operation::UntagResource { resource_arn } => {
-                let account_id = required_account_id(req)?;
-                let bucket = parse_bucket_resource_arn(&resource_arn)?;
+            S3ControlOperation::UntagResource { bucket } => {
                 let tag_keys = req
                     .query_params_lossy("tagKeys")
                     .into_iter()
                     .map(std::borrow::Cow::into_owned)
                     .collect::<Vec<_>>();
-                validate_untag_resource_tag_keys(&tag_keys)?;
+                validate_untag_resource_tag_key_members(&tag_keys)?;
                 let request_tags = tag_keys
                     .iter()
                     .map(|key| (key.clone(), String::new()))
@@ -1554,18 +1671,24 @@ impl HttpFrontend {
                 let requester = self.requester_from_auth(auth, req);
                 let control = crate::coordinator::BucketTagControlRequest {
                     bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
-                    account_id,
                 };
                 let existing_tags = self
                     .coordinator
-                    .get_bucket_tags_for_tag_resource(
+                    .get_bucket_tags_for_control_action(
                         &control,
                         request_tags.as_slice(),
-                        auth::PolicyAction::UntagResource,
+                        crate::coordinator::BucketTagControlAction::UntagResource,
                     )?
                     .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
                     .transpose()?
                     .unwrap_or_else(|| xml::TagSet::empty(50));
+                // AWS treats invalid-character and overlong keys as a successful
+                // no-op when no resource tags exist. Once any tag exists, it
+                // validates those values before applying the removal.
+                if existing_tags.is_empty() {
+                    return Ok(S3Response::untag_resource());
+                }
+                validate_untag_resource_tag_key_values(&tag_keys)?;
                 let remaining_tags = existing_tags.remove_keys(&tag_keys);
                 if remaining_tags.is_empty() {
                     self.coordinator.delete_bucket_tags_for_untag_resource(
@@ -1586,6 +1709,32 @@ impl HttpFrontend {
                 }
                 Ok(S3Response::untag_resource())
             }
+            S3ControlOperation::HeadBucketTags
+            | S3ControlOperation::MethodNotAllowed { .. }
+            | S3ControlOperation::Options { .. } => {
+                unreachable!("S3 Control method-only operations are handled before authentication")
+            }
+        }
+    }
+
+    fn dispatch_routed(
+        &self,
+        req: &S3Request,
+        auth: &AuthContext,
+        operation: S3Operation,
+    ) -> Result<S3Response, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::dispatch_routed",
+            "method={} path={:?} op={:?} principal={:?}",
+            req.method.as_str(),
+            req.path(),
+            operation,
+            auth.configured_principal()
+        );
+        let expected_bucket_owner = expected_bucket_owner(req);
+        // Dispatch to coordinator
+        match operation {
             S3Operation::ListBuckets => {
                 let requester = self.requester_from_auth(auth, req);
                 let owner_account = Self::authenticated_account(auth)?;
@@ -3392,12 +3541,29 @@ impl HttpFrontend {
         None
     }
 
+    #[cfg(test)]
     fn authenticate(
         &self,
         req: &S3Request,
         bucket: Option<&str>,
     ) -> Result<AuthContext, ServerError> {
         self.authenticate_with_payload_check(req, true, bucket)
+    }
+
+    fn authenticate_for_service(
+        &self,
+        req: &S3Request,
+        bucket: Option<&str>,
+        service: ServiceKind,
+    ) -> Result<AuthContext, ServerError> {
+        let canonical_path = service.canonical_signing_path(req.path());
+        self.authenticate_with_payload_check_for_service(
+            req,
+            true,
+            bucket,
+            service.credential_scope_name(),
+            &canonical_path,
+        )
     }
 
     /// Authenticate a request, optionally skipping x-amz-content-sha256 body
@@ -3412,17 +3578,34 @@ impl HttpFrontend {
         verify_payload_hash: bool,
         bucket: Option<&str>,
     ) -> Result<AuthContext, ServerError> {
+        self.authenticate_with_payload_check_for_service(
+            req,
+            verify_payload_hash,
+            bucket,
+            "s3",
+            req.path(),
+        )
+    }
+
+    fn authenticate_with_payload_check_for_service(
+        &self,
+        req: &S3Request,
+        verify_payload_hash: bool,
+        bucket: Option<&str>,
+        expected_service: &str,
+        canonical_path: &str,
+    ) -> Result<AuthContext, ServerError> {
         let now = current_auth_epoch_secs()?;
 
         let auth_result = authenticate_request(
             req.method.as_str(),
-            req.path(),
+            canonical_path,
             req.query_string(),
             &req.header_source(),
             &req.body,
             &self.identity_provider,
             auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
-            "s3",
+            expected_service,
             now,
         );
 
@@ -5210,14 +5393,14 @@ pub fn s3_response_to_hyper(
         }
         validated_headers.push((parsed_name, parsed_value));
     }
-    if !has_request_id_header {
+    if resp.include_wire_ids && !has_request_id_header {
         validated_headers.push((
             http::header::HeaderName::from_static("x-amz-request-id"),
             http::header::HeaderValue::from_str(trace_meta.context.request_id())
                 .expect("request id is a valid header value"),
         ));
     }
-    if !has_host_id_header {
+    if resp.include_wire_ids && !has_host_id_header {
         validated_headers.push((
             http::header::HeaderName::from_static("x-amz-id-2"),
             http::header::HeaderValue::from_str(&trace_meta.host_id)
@@ -8640,6 +8823,7 @@ mod tests {
                 body: Vec::new(),
                 stream: None,
                 error_diagnostic: None,
+                include_wire_ids: true,
             };
             apply_response_overrides(&mut resp, &req);
             assert_eq!(find_header(&resp, header_name), Some(expected));
@@ -8685,6 +8869,7 @@ mod tests {
                 body: Vec::new(),
                 stream: None,
                 error_diagnostic: None,
+                include_wire_ids: true,
             };
             if header_name == "Content-Type" {
                 resp.headers.push((
@@ -8705,6 +8890,7 @@ mod tests {
             body: Vec::new(),
             stream: None,
             error_diagnostic: None,
+            include_wire_ids: true,
         };
         resp.headers.push((
             "Content-Type".to_string(),
@@ -8736,6 +8922,7 @@ mod tests {
             body: Vec::new(),
             stream: None,
             error_diagnostic: None,
+            include_wire_ids: true,
         };
         resp.headers.push((
             "Content-Type".to_string(),
@@ -8825,6 +9012,7 @@ mod tests {
             body: b"<Error><Code>InternalError</Code></Error>".to_vec(),
             stream: None,
             error_diagnostic: None,
+            include_wire_ids: true,
         };
 
         let result = {
@@ -8868,6 +9056,7 @@ mod tests {
             body: b"hello".to_vec(),
             stream: None,
             error_diagnostic: None,
+            include_wire_ids: true,
         };
 
         let hyper_resp = s3_response_to_hyper(
@@ -8930,6 +9119,7 @@ mod tests {
             body: Vec::new(),
             stream: None,
             error_diagnostic: None,
+            include_wire_ids: true,
         };
 
         let hyper_resp = s3_response_to_hyper(

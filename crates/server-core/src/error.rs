@@ -260,6 +260,9 @@ pub enum ServerError {
         tag_value: Option<String>,
     },
 
+    #[error("request body is empty")]
+    MissingRequestBodyError,
+
     /// An `x-amz-tagging` header that is not valid URL-encoded UTF-8.
     #[error("invalid x-amz-tagging header")]
     InvalidTaggingHeader { value: String },
@@ -656,6 +659,7 @@ impl ServerError {
             Self::NoSuchCorsConfiguration { .. } => "NoSuchCORSConfiguration",
             Self::NoSuchTagSet { .. } => "NoSuchTagSet",
             Self::InvalidTag { .. } => "InvalidTag",
+            Self::MissingRequestBodyError => "MissingRequestBodyError",
             Self::InvalidTaggingHeader { .. } => "InvalidArgument",
             Self::MalformedXMLNoDecl { .. } => "MalformedXML",
             Self::DeleteObjectsKeyTooLong { .. } => "KeyTooLongError",
@@ -810,6 +814,7 @@ impl ServerError {
             Self::ServerSideEncryptionConfigurationNotFound { .. } => 404,
             Self::InvalidBucketState | Self::OperationAborted => 409,
             Self::InvalidTag { .. }
+            | Self::MissingRequestBodyError
             | Self::InvalidTaggingHeader { .. }
             | Self::MalformedXMLNoDecl { .. }
             | Self::DeleteObjectsKeyTooLong { .. } => 400,

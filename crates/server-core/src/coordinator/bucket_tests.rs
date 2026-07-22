@@ -282,12 +282,10 @@ fn put_bucket_tags_for_tag_resource_test(
     config: &str,
     requester: Requester,
     expected_bucket_owner: Option<&str>,
-    account_id: &str,
 ) -> Result<(), ServerError> {
     coord.put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
         control: BucketTagControlRequest {
             bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
-            account_id,
         },
         config,
         request_tags: &[],
@@ -5309,7 +5307,6 @@ fn get_bucket_policy_status_bucket_tag_policy_applies_when_abac_enabled() {
         private_tags,
         test_helpers::requester("111122223333"),
         None,
-        "111122223333",
     )
     .unwrap();
 
@@ -5373,7 +5370,6 @@ fn authorize_list_bucket_bucket_tag_policy_applies_when_abac_enabled() {
         private_tags,
         test_helpers::requester("111122223333"),
         None,
-        "111122223333",
     )
     .unwrap();
 
@@ -5437,7 +5433,6 @@ fn authorize_head_bucket_bucket_tag_policy_requires_list_and_location_when_abac_
         private_tags,
         test_helpers::requester("111122223333"),
         None,
-        "111122223333",
     )
     .unwrap();
 

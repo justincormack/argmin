@@ -361,26 +361,15 @@ impl Coordinator {
         })
     }
 
-    fn validate_tag_resource_account_id(
-        bucket_info: &BucketSummary,
-        account_id: &str,
-    ) -> Result<(), ServerError> {
-        if aws_account_id_from_principal(&bucket_info.owner_principal) == Some(account_id) {
-            return Ok(());
-        }
-        Err(ServerError::AccessDenied)
-    }
-
     pub(in crate::coordinator) fn authorize_bucket_tag_control_with_storage_node(
         &self,
         storage_node: &Arc<StorageCluster>,
         req: &BucketTagControlRequest<'_>,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        let bucket = self.authorize_loaded_bucket_owner_account_admin_write_for_storage_node(
+        let _bucket = self.authorize_loaded_bucket_owner_account_admin_write_for_storage_node(
             storage_node,
             &req.bucket,
         )?;
-        Self::validate_tag_resource_account_id(bucket.bucket(), req.account_id)?;
         Ok(AuthorizedBucketConfigAccess {
             bucket: req.bucket.name_typed().clone(),
         })
@@ -395,7 +384,7 @@ impl Coordinator {
             storage_node,
             &req.control,
             req.request_tags,
-            auth::PolicyAction::TagResource,
+            BucketTagControlAction::TagResource,
         )
     }
 
@@ -408,7 +397,7 @@ impl Coordinator {
             storage_node,
             &req.control,
             req.request_tags,
-            auth::PolicyAction::UntagResource,
+            BucketTagControlAction::UntagResource,
         )
     }
 
@@ -421,7 +410,7 @@ impl Coordinator {
             storage_node,
             &req.control,
             req.request_tags,
-            auth::PolicyAction::UntagResource,
+            BucketTagControlAction::UntagResource,
         )
     }
 
@@ -429,7 +418,7 @@ impl Coordinator {
         &self,
         control: &BucketTagControlRequest<'_>,
         request_tags: &[(String, String)],
-        action: auth::PolicyAction,
+        action: BucketTagControlAction,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
         self.authorize_bucket_tag_resource_action_with_storage_node(
             &self.storage_node(),
@@ -444,7 +433,7 @@ impl Coordinator {
         storage_node: &Arc<StorageCluster>,
         control: &BucketTagControlRequest<'_>,
         request_tags: &[(String, String)],
-        action: auth::PolicyAction,
+        action: BucketTagControlAction,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
         self.with_bucket_write_handle_for_storage_node(
             storage_node,
@@ -453,12 +442,11 @@ impl Coordinator {
                 .requiring_policy_view()
                 .requiring_bucket_tags_if_abac_enabled(),
             |bucket| {
-                Self::validate_tag_resource_account_id(bucket.bucket(), control.account_id)?;
                 let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
                 let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
                     &control.bucket.requester,
                     &bucket,
-                    action,
+                    action.policy_action(),
                     PutObjectPolicyContext::default().with_request_tags(Some(request_tags)),
                     bucket_policy.as_deref(),
                 )?;

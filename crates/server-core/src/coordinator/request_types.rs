@@ -531,7 +531,27 @@ pub struct PutBucketConfigRequest<'a> {
 #[derive(Debug)]
 pub struct BucketTagControlRequest<'a> {
     pub bucket: BucketRequest<'a>,
-    pub account_id: &'a str,
+}
+
+/// Authorization action for an S3 Control bucket-tag read.
+///
+/// Keep this narrower than `PolicyAction`: callers must select one of the
+/// three operations which are valid on this endpoint surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BucketTagControlAction {
+    ListTagsForResource,
+    TagResource,
+    UntagResource,
+}
+
+impl BucketTagControlAction {
+    pub(crate) const fn policy_action(self) -> auth::PolicyAction {
+        match self {
+            Self::ListTagsForResource => auth::PolicyAction::ListTagsForResource,
+            Self::TagResource => auth::PolicyAction::TagResource,
+            Self::UntagResource => auth::PolicyAction::UntagResource,
+        }
+    }
 }
 
 /// Request for a control-plane bucket-tag update that stores a full tag set.

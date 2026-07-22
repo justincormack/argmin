@@ -471,12 +471,76 @@ fn tag_resource_bucket_policy_null_request_header_condition_matches_absent_heade
                     test_helpers::requester("444455556666"),
                     None,
                 ),
-                account_id: "111122223333",
             },
             config: "<Tagging><TagSet><Tag><Key>security</Key><Value>allow</Value></Tag></TagSet></Tagging>",
             request_tags: &[("security".to_string(), "allow".to_string())],
         })
         .unwrap();
+}
+
+#[test]
+fn list_tags_for_resource_uses_its_distinct_bucket_policy_action() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let tags =
+        "<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>";
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", false)
+        .unwrap();
+    coord
+        .put_bucket_tags(&PutBucketConfigRequest {
+            bucket: bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            config: tags,
+        })
+        .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:ListTagsForResource","Resource":"arn:aws:s3:::bucket"}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    let control = BucketTagControlRequest {
+        bucket: bucket_request_with_expected_owner(
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        ),
+    };
+    assert_eq!(
+        coord
+            .get_bucket_tags_for_control_action(
+                &control,
+                &[],
+                BucketTagControlAction::ListTagsForResource,
+            )
+            .unwrap(),
+        Some(tags.to_string())
+    );
+
+    for action in [
+        BucketTagControlAction::TagResource,
+        BucketTagControlAction::UntagResource,
+    ] {
+        assert!(matches!(
+            coord.get_bucket_tags_for_control_action(&control, &[], action),
+            Err(ServerError::AccessDenied)
+        ));
+    }
+    assert!(matches!(
+        coord.get_bucket_tags(&bucket_request_with_expected_owner(
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )),
+        Err(ServerError::AccessDenied)
+    ));
 }
 
 #[test]
@@ -2786,7 +2850,6 @@ fn upload_part_copy_boe_source_bucket_tag_abac_controls_access() {
                     test_helpers::requester(owner),
                     None,
                 ),
-                account_id: owner,
             },
             config:
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",

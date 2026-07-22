@@ -1,6 +1,9 @@
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Tag, Tagging};
+use s3_tests::shape::{
+    assert_shape, assert_shape_one_of, error_response_headers, id_headers, shape, ShapeSpec,
+};
 use s3_tests::{
     disable_bucket_public_access_block, send_signed_request_for_service_with_credentials,
     unique_bucket, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
@@ -176,6 +179,36 @@ fn raw_primary_credentials() -> SignedRequestCredentials<'static> {
     }
 }
 
+const S3_CONTROL_INVALID_TAG_MESSAGE: &str = "This request contains a tag key or value that isn't valid. Valid characters include the following: [a-zA-Z+-=._:/]. Tag keys can contain up to 128 characters. Tag values can contain up to 256 characters.";
+const S3_CONTROL_DUPLICATE_TAG_MESSAGE: &str =
+    "There are duplicate tag keys in your request. Remove the duplicate tag keys and try again.";
+
+fn s3_control_error_shape(status: u16, code: &str, message: &str) -> ShapeSpec {
+    shape()
+        .status(status)
+        .headers(error_response_headers())
+        .body(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <ErrorResponse><Error><Code>{code}</Code><Message>{message}</Message></Error>\
+             <RequestId>{{request_id}}</RequestId><HostId>{{host_id}}</HostId></ErrorResponse>"
+        ))
+}
+
+fn assert_s3_control_invalid_tag(label: &str, response: &s3_tests::RawResponse, message: &str) {
+    assert!(
+        response.body.contains(&format!(
+            "<Code>InvalidTag</Code><Message>{message}</Message>"
+        )),
+        "{label}: unexpected InvalidTag body: {}",
+        response.body
+    );
+    assert_shape(
+        label,
+        response,
+        &s3_control_error_shape(400, "InvalidTag", message),
+    );
+}
+
 fn percent_encode_path_segment(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(value.len());
@@ -214,12 +247,20 @@ fn tag_resource_with_credentials(
     tags: &[(&str, &str)],
     credentials: SignedRequestCredentials<'static>,
 ) -> s3_tests::RawResponse {
+    tag_resource_raw_body_with_credentials(bucket, tag_resource_body(tags).as_bytes(), credentials)
+}
+
+fn tag_resource_raw_body_with_credentials(
+    bucket: &str,
+    body: &[u8],
+    credentials: SignedRequestCredentials<'static>,
+) -> s3_tests::RawResponse {
     let resource = percent_encode_path_segment(&bucket_resource(bucket));
     let url = format!("{}/v20180820/tags/{resource}", CTX.s3_control_endpoint());
     send_signed_request_for_service_with_credentials(
         "POST",
         &url,
-        tag_resource_body(tags).as_bytes(),
+        body,
         [("x-amz-account-id", CTX.account_id())],
         s3_tests::SigningService::S3Control,
         credentials,
@@ -2050,6 +2091,122 @@ fn test_bucket_policy_tag_keys_string_equals_is_accepted_but_does_not_match() {
 }
 
 #[test]
+fn test_tag_resource_member_validation_matches_aws() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let overlong_key = "x".repeat(129);
+        let overlong_value = "x".repeat(257);
+        let cases = [
+            (
+                "empty-key",
+                tag_resource_body(&[("", "value")]),
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "overlong-key",
+                tag_resource_body(&[(&overlong_key, "value")]),
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "overlong-value",
+                tag_resource_body(&[("key", &overlong_value)]),
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+            (
+                "duplicate-key",
+                tag_resource_body(&[("duplicate", "one"), ("duplicate", "two")]),
+                S3_CONTROL_DUPLICATE_TAG_MESSAGE,
+            ),
+            (
+                "invalid-character",
+                tag_resource_body(&[("invalid!", "value")]),
+                S3_CONTROL_INVALID_TAG_MESSAGE,
+            ),
+        ];
+
+        for (label, body, message) in cases {
+            let response = tag_resource_raw_body_with_credentials(
+                &bucket,
+                body.as_bytes(),
+                raw_primary_credentials(),
+            );
+            assert_s3_control_invalid_tag(label, &response, message);
+        }
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_tag_resource_character_grammar_matches_aws() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_policy(client).await;
+
+        for (label, key, value) in [
+            ("space-key", "space key", "value"),
+            ("at-key", "at@key", "value"),
+            ("unicode-key", "環境", "value"),
+            ("unicode-digit-key", "digit-١", "value"),
+            ("no-break-space-key", "key\u{00a0}", "value"),
+            ("line-separator-key", "key\u{2028}", "value"),
+            ("paragraph-separator-key", "key\u{2029}", "value"),
+            ("letter-number-key", "key-\u{2167}", "value"),
+            ("other-number-key", "key-\u{00b2}", "value"),
+            ("punctuation-key", "punctuation+-=._:/@", "value"),
+            ("space-value", "space-value", "with space"),
+            ("at-value", "at-value", "value@example"),
+            ("unicode-value", "unicode-value", "本番"),
+            ("unicode-digit-value", "unicode-digit-value", "value-١"),
+            (
+                "no-break-space-value",
+                "no-break-space-value",
+                "value\u{00a0}",
+            ),
+            (
+                "line-separator-value",
+                "line-separator-value",
+                "value\u{2028}",
+            ),
+            (
+                "paragraph-separator-value",
+                "paragraph-separator-value",
+                "value\u{2029}",
+            ),
+            (
+                "letter-number-value",
+                "letter-number-value",
+                "value-\u{2167}",
+            ),
+            ("other-number-value", "other-number-value", "value-\u{00b2}"),
+            ("punctuation-value", "punctuation-value", "value+-=._:/@"),
+        ] {
+            let response =
+                tag_resource_with_credentials(&bucket, &[(key, value)], raw_primary_credentials());
+            assert_shape(
+                label,
+                &response,
+                &shape().status(204).headers(id_headers()).body_empty(),
+            );
+        }
+
+        for (label, key, value) in [
+            ("rejected-key", "invalid!", "value"),
+            ("rejected-value", "valid-key", "invalid!"),
+            ("combining-mark-key", "key-\u{0345}", "value"),
+            ("combining-mark-value", "valid-key", "value-\u{0345}"),
+        ] {
+            let response =
+                tag_resource_with_credentials(&bucket, &[(key, value)], raw_primary_credentials());
+            assert_s3_control_invalid_tag(label, &response, S3_CONTROL_INVALID_TAG_MESSAGE);
+        }
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_untag_resource_rejects_missing_empty_and_invalid_tag_keys() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -2101,14 +2258,74 @@ fn test_untag_resource_rejects_missing_empty_and_invalid_tag_keys() {
             Some(&too_many_query),
             raw_primary_credentials(),
         );
-        let matches_aws_bug =
-            too_many.status == 500 && too_many.body.contains("<Code>InternalError</Code>");
-        let matches_argmin =
-            too_many.status == 400 && too_many.body.contains("<Code>InvalidTag</Code>");
-        assert!(
-            matches_aws_bug || matches_argmin,
-            "expected AWS 500/InternalError or Argmin 400/InvalidTag for too many tagKeys, got {too_many:?}"
+        assert_shape_one_of(
+            "51 distinct tagKeys",
+            &too_many,
+            &[
+                s3_control_error_shape(
+                    500,
+                    "InternalError",
+                    "We encountered an internal error. Please try again.",
+                ),
+                s3_control_error_shape(400, "InvalidTag", S3_CONTROL_INVALID_TAG_MESSAGE),
+            ],
         );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_untag_resource_invalid_key_validation_depends_on_existing_tags() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_policy(client).await;
+        let long_key = "x".repeat(129);
+        let long_query = format!("tagKeys={long_key}");
+
+        for (label, query) in [
+            ("invalid-character", "tagKeys=%21"),
+            ("overlong", long_query.as_str()),
+        ] {
+            let response = untag_resource_query_with_credentials(
+                &bucket,
+                Some(query),
+                raw_primary_credentials(),
+            );
+            assert_eq!(
+                response.status, 204,
+                "unexpected untagged-resource {label} tagKeys response: {response:?}"
+            );
+        }
+
+        let seed = tag_resource_with_credentials(
+            &bucket,
+            &[("existing", "value")],
+            raw_primary_credentials(),
+        );
+        assert_eq!(
+            seed.status, 204,
+            "unexpected TagResource response: {seed:?}"
+        );
+
+        for (label, query) in [
+            ("invalid-character", "tagKeys=%21"),
+            ("overlong", long_query.as_str()),
+        ] {
+            let response = untag_resource_query_with_credentials(
+                &bucket,
+                Some(query),
+                raw_primary_credentials(),
+            );
+            assert_eq!(
+                response.status, 400,
+                "unexpected tagged-resource {label} tagKeys response: {response:?}"
+            );
+            assert!(
+                response.body.contains("<Code>InvalidTag</Code>"),
+                "unexpected tagged-resource {label} tagKeys response: {response:?}"
+            );
+        }
 
         cleanup(&bucket, &[]).await;
     });

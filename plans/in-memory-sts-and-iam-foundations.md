@@ -5,8 +5,11 @@
 Phase 0 design, AWS-oracle, and fixture work is complete for the first usable
 `AssumeRole` milestone as of 2026-07-19. Phase 1 identity-provider and stateless
 credential foundations and Phase 2 temporary-credential authentication
-plumbing are complete as of 2026-07-20. The first implementation target is a
-test-enablement vertical slice, not a production identity service.
+plumbing are complete as of 2026-07-20. Phase 3 role authorization is complete,
+and the Phase 4 typed S3/S3 Control endpoint-routing foundation is complete as
+of 2026-07-22. The bounded STS Query classifier/parser is the next
+implementation slice. The first implementation target is a test-enablement
+vertical slice, not a production identity service.
 
 The first public STS operation will be `AssumeRole`. It will be exposed on the
 existing HTTP listener and backed by process-local, in-memory role state. Issued
@@ -860,16 +863,15 @@ typed-configuration seams without claiming production-quality persistence.
 
 ### 8. Generalize the existing S3 Control routing before S3 routing
 
-The HTTP router already has a small endpoint-family preclassification: it
-recognizes the S3 Control-style `/v20180820/tags/<resource-arn>` path before
-normal bucket/key parsing and routes `TagResource` and `UntagResource`; AWS also
-routes `GET` on that path to the distinct `ListTagsForResource` operation, which
-the local router does not yet implement. The
-external tests give S3 Control its own endpoint URL and sign those requests with
-service `s3`, while the embedded server currently serves them on the shared
-listener and expects the same signing scope. Preserve those behaviors and use
-this existing split as the starting point for an explicit HTTP-layer service/
-endpoint classification:
+The HTTP router now has explicit trusted endpoint and typed service
+classification. `S3Only` listeners route only ordinary S3. `SharedRegional`
+listeners recognize the S3 Control-style
+`/v20180820/tags/<resource-arn>` path before normal bucket/key parsing and route
+typed `ListTagsForResource`, `TagResource`, and `UntagResource` operations.
+Those operations no longer inhabit `S3Operation`. Both services use the `s3`
+credential-scope name through an exhaustive typed mapping, while remaining
+distinct services because their endpoint paths and wire behavior differ. The
+next extension adds STS to that same service-level boundary:
 
 - normal S3 request: existing bucket/key path, expected SigV4 service `s3`
 - S3 Control request: existing versioned resource path and account-ID header
@@ -884,8 +886,10 @@ uses TLS. AWS documents ordinary S3 regional endpoints as supporting HTTP and
 HTTPS, but documents both S3 Control and STS endpoints as HTTPS-only. The
 shared listener may continue serving ordinary S3 over plain HTTP only when the
 S3 Control and STS service routes are disabled; enabling either service requires
-a TLS listener. This transport rule is part of endpoint classification and must
-be checked before service authentication or operation parsing.
+a TLS listener. This is now enforced structurally: the plain serve entry point
+constructs `S3Only`, the TLS entry point constructs `SharedRegional`, and the
+latter cannot be constructed internally without a TLS acceptor. Focused network
+tests prove that a valid S3 Control path remains an ordinary S3 path over HTTP.
 
 Represent the origin of classification explicitly as a typed endpoint kind,
 not as an inferred string inside an operation parser. The oracle has distinct
@@ -902,25 +906,20 @@ method, content type, `x-amz-account-id`, `Action`, `Version`, Host, and SigV4
 credential service. Ambiguous requests must receive the same error family AWS
 uses rather than falling through to an unrelated S3 operation.
 
-Do not fold STS operations into `S3Operation`, and do not leave S3 Control
-endpoint operations there once the service boundary is introduced.
-Introduce a service-level request enum or equivalent with typed S3, S3 Control,
-and STS operation payloads so each service's parsing, auth expectation, response
-format, and errors stay explicit. The initial typed S3 Control operation set is
-`ListTagsForResource`, `TagResource`, and `UntagResource`.
-`ListTagsForResource` must use its own `s3:ListTagsForResource` authorization
-action and S3 Control response renderer; it must not be aliased to ordinary S3
-`GetBucketTagging` merely because both read bucket tags. The existing S3
-Control scenarios provide
-valid-dispatch and policy-evaluation controls, but they do not pin the routing
-boundary or error precedence. The current implementation selects the HTTP
-method and strictly percent-decodes the versioned resource path before
-authentication, then validates the account ID, ARN semantics, XML or `tagKeys`,
-and authorization afterward. That implementation order is not itself AWS
-evidence and must not be accidentally preserved or changed without an oracle.
+Do not fold STS operations into `S3Operation`. Extend the existing
+`ServiceOperation` with a typed STS payload so each service's parsing, auth
+expectation, response format, and errors stay explicit. `ListTagsForResource`
+now uses its own `s3:ListTagsForResource` authorization action and exact S3
+Control response renderer rather than aliasing ordinary S3
+`GetBucketTagging`. The bucket-tag authorization API accepts a narrow exhaustive
+`ListTagsForResource`/`TagResource`/`UntagResource` enum instead of an arbitrary
+policy action. The versioned path classifier selects the method and strictly
+percent-decodes the resource path before authentication, then validates ARN
+semantics, XML or `tagKeys`, and authorization afterward, as pinned by the
+oracle. `x-amz-account-id` is deliberately not an authority input for these
+operations.
 
-Before moving the tag-resource operations out of `S3Operation`, add complete
-AWS-facing routing-boundary goldens for:
+The completed AWS-facing routing-boundary goldens cover:
 
 - the bounded method set `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `OPTIONS`, and
   `PATCH` on the versioned tags path, plus representative extension methods
@@ -936,6 +935,18 @@ AWS-facing routing-boundary goldens for:
   form content types, in both valid- and invalid-signature cases
 - STS-shaped requests sent to the S3 Control path and S3 Control-shaped requests
   sent to the shared-listener STS classifier
+
+The matching local end-to-end regression now locks that bounded method/path
+matrix, including complete nested S3 Control error envelopes and semantic
+headers, bodyless outer malformed-percent responses, ordinary S3-shaped outer
+extension-method errors, and URI/ARN rejection before HMAC validation. The
+ordinary S3 streaming-write pre-router explicitly defers both successful S3
+Control routes and S3 Control route errors to buffered service dispatch, so a
+`PUT` on the reserved path cannot be consumed as an S3 `PutObject`. A distinct
+typed `S3Control` service also owns its signing-path rule: the encoded
+`tags%2F` separator is canonicalized as `tags/`, matching the independently
+SDK-checked request accepted by AWS, without changing ordinary S3 object-key
+canonicalization.
 
 Send the identical cross-service collision requests to both the regional AWS
 STS endpoint and the account/region-specific AWS S3 Control endpoint, signing
@@ -2297,6 +2308,10 @@ Control returns HTTP 200 with only the two normal AWS request-ID headers and no
 `Tags/Tag/Key` and `Value` in that order. This pins a real typed
 `ListTagsForResource` success and its distinct response renderer; the Phase 4
 refactor must not implement it as an alias for the normal S3 tagging operation.
+The AWS oracle also removes the fixture's only tag, captures the empty success,
+restores and verifies the fixture tag before asserting the captured response,
+and pins the empty collection as the self-closing `<Tags/>` member. The local
+serializer and network regression use that exact representation.
 
 The endpoint-transport review completed on 2026-07-15. AWS's endpoint tables
 list ordinary S3 regional endpoints as HTTP and HTTPS, but list S3 Control and
@@ -2462,10 +2477,49 @@ request without printing live credentials. Together with the completed local
 Host/authority/SNI trust-boundary matrix, the routing-boundary evidence required
 before the Phase 4 service refactor is complete.
 
-The narrow current local `TagResource`/`UntagResource` routes still inherit the
-ordinary S3 listener's transport and are therefore a documented temporary gap;
-the typed Phase 4 endpoint refactor must remove that gap rather than inventing
-an operation-level HTTP error without an AWS transport contract.
+The matching local body/query regression now implements and locks those
+validation boundaries. A completely absent `tagKeys` member is rejected before
+service-scope or HMAC validation; present values and TagResource XML are
+validated only after authentication. Empty bodies, malformed XML, structurally
+empty tag requests, invalid characters, and length limits use the exact typed
+S3 Control error codes and messages above. Permanent AWS-facing TagResource
+member probes lock empty and overlong keys, overlong values, and invalid
+characters to the common `InvalidTag` message; duplicate member keys use AWS's
+distinct `There are duplicate tag keys in your request` message. The shared
+incremental parser carries an explicit S3 Control schema so these errors cannot
+leak ordinary S3 tagging diagnostics. A separate key/value character matrix
+proves that `!` and an `Alphabetic` nonspacing combining mark are rejected in
+either member, while the Unicode `L`, `Z`, and `N` general-category boundaries
+(`Zs`/`Zl`/`Zp` and `Nd`/`Nl`/`No`) and every `+-=._:/@` punctuation character
+are accepted in both keys and values. Production uses
+`unicode-general-category` to implement that exact AWS-confirmed category rule
+rather than Rust's broader derived `Alphabetic` property. A further AWS-facing
+regression locks the tag-state branch that the tagged-fixture oracle did not
+exercise:
+invalid-character and 129-character removal keys are successful `204` no-ops
+when the resource has no tags, but become the common `InvalidTag` response once
+any resource tag exists. Local validation therefore performs the authorized
+tag lookup before applying character and length checks. Malformed-short and
+malformed-alpha account-ID values are included in the existing-resource
+GET/POST/DELETE matrix, confirming that they remain non-authoritative.
+
+There are two deliberate bounded incompatibilities where AWS repeatedly returns
+`500 InternalError` for deterministic client input. Identical duplicate
+`tagKeys` become nested local `400 InvalidTag` with `Duplicate tag keys are not
+supported.`; 51 distinct `tagKeys` become the exact common nested local `400
+InvalidTag` validation response. Exact local goldens lock both conversions.
+The duplicate regression distinguishes identical values from two distinct
+repeated keys, which retain AWS's `204` behavior, and both local conversions
+confirm that a bad HMAC still wins before value/count validation.
+
+The typed Phase 4 endpoint refactor has removed the former transport gap.
+Embedded tests default to HTTPS and enable the shared S3/S3 Control endpoint;
+explicit plain-HTTP tests get S3-only routing. Exact local success tests pin the
+absence of a content type on `ListTagsForResource`, the ID-header-only `204`
+responses for `TagResource` and `UntagResource`, and every missing, empty,
+correct, wrong, and duplicate `x-amz-account-id` form across all three
+operations. Separate policy tests prove the list operation uses only its
+distinct action.
 
 The oracle executable is a temporary Phase 0 research artifact, not a test of
 Argmin and not a normal testing-guide workflow. Remove it after its observations
@@ -2910,6 +2964,20 @@ involved. An injected current-role authorization-provider failure fails closed
 without being misreported as an authentication failure.
 
 ### Phase 4: STS Query endpoint and core `AssumeRole`
+
+The typed endpoint-routing foundation is complete as of 2026-07-22. Trusted
+listener configuration selects `S3Only` or TLS-only `SharedRegional` without
+consulting Host, authority, or SNI; the service operation and expected signing
+service mappings are exhaustive. S3 Control tag operations are typed outside
+`S3Operation`, ignore the non-authoritative account-ID header, and have distinct
+authorization and wire coverage. The bounded S3 Control route/error follow-up
+is also complete: service context survives route, authentication, and dispatch
+errors; ARN validation precedes authentication; the full method/path matrix is
+locally locked; empty tag-list XML is AWS-oracle-backed; and the body/query
+validation and authentication-precedence matrix is locally locked with the
+explicit duplicate-`tagKeys` non-500 incompatibility documented above. The next
+slice is the bounded STS Query classifier/parser and typed STS operation
+payload.
 
 - generalize the existing S3 Control endpoint-family routing into typed service
   and endpoint-kind routing only after the dual-endpoint AWS method/path/

@@ -516,6 +516,13 @@ fn load_private_key_from_pem(data: &[u8]) -> Result<PrivateKeyDer<'static>, Stri
 
 #[cfg(test)]
 mod tests {
+    use crate::helpers::{
+        send_checked_signed_request_for_service_with_credentials,
+        send_checked_signed_request_to_endpoint_for_service_with_credentials,
+        send_signed_request_to_endpoint_for_service_with_credentials, RawResponse,
+        SignedRequestCredentials, SigningService,
+    };
+    use crate::shape::{assert_shape, shape};
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::client::WebPkiServerVerifier;
     use rustls::pki_types::{ServerName, UnixTime};
@@ -528,7 +535,7 @@ mod tests {
     use super::*;
 
     const ROUTING_BOUNDARY_TARGET: &str =
-        "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Aauthority-probe%GG?tagKeys=probe";
+        "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Aauthority-probe?tagKeys=probe";
 
     #[derive(Debug)]
     struct FixedCertificateNameVerifier {
@@ -582,10 +589,24 @@ mod tests {
         absolute_form: bool,
         amz_date: &str,
     ) -> Vec<u8> {
+        routing_boundary_request_for_target(
+            ROUTING_BOUNDARY_TARGET,
+            host_headers,
+            absolute_form,
+            amz_date,
+        )
+    }
+
+    fn routing_boundary_request_for_target(
+        request_target: &str,
+        host_headers: &[&str],
+        absolute_form: bool,
+        amz_date: &str,
+    ) -> Vec<u8> {
         let target = if absolute_form {
-            format!("http://absolute-target.invalid{ROUTING_BOUNDARY_TARGET}")
+            format!("http://absolute-target.invalid{request_target}")
         } else {
-            ROUTING_BOUNDARY_TARGET.to_string()
+            request_target.to_string()
         };
         let date = &amz_date[..8];
         let mut request = format!(
@@ -694,6 +715,7 @@ mod tests {
         code: Option<&'a str>,
         message: Option<&'a str>,
         s3_error_root: bool,
+        s3_control_error_root: bool,
         semantic_body_empty: bool,
         has_s3_request_id_header: bool,
     }
@@ -723,12 +745,13 @@ mod tests {
             code: xml_element(body, "Code"),
             message: xml_element(body, "Message"),
             s3_error_root: body.contains("<Error><Code>"),
+            s3_control_error_root: body.contains("<ErrorResponse><Error><Code>"),
             semantic_body_empty: body.is_empty() || body == "0\r\n\r\n",
             has_s3_request_id_header,
         }
     }
 
-    fn assert_shared_classifier_or_http_rejection(fingerprint: &ClassifierFingerprint<'_>) {
+    fn assert_s3_only_classifier_or_http_rejection(fingerprint: &ClassifierFingerprint<'_>) {
         if fingerprint.status == "HTTP/1.1 400 Bad Request" && fingerprint.code.is_none() {
             assert!(
                 fingerprint.semantic_body_empty,
@@ -740,19 +763,13 @@ mod tests {
             );
             return;
         }
-        assert_eq!(fingerprint.status, "HTTP/1.1 403 Forbidden");
+        assert_eq!(fingerprint.status, "HTTP/1.1 405 Method Not Allowed");
         assert!(fingerprint.s3_error_root);
-        assert!(
-            matches!(
-                fingerprint.code,
-                Some("SignatureDoesNotMatch" | "AccessDenied")
-            ),
-            "accepted authority shape must remain in the shared S3 authentication path: {fingerprint:?}"
-        );
+        assert_eq!(fingerprint.code, Some("MethodNotAllowed"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn shared_listener_host_authority_cannot_select_an_endpoint_kind() {
+    async fn s3_only_listener_host_authority_cannot_select_an_endpoint_kind() {
         let server = TestServer::start_http().await;
         let port = endpoint_port(&server);
         let configured = format!("127.0.0.1:{port}");
@@ -774,10 +791,11 @@ mod tests {
         assert_eq!(
             baseline_fingerprint,
             ClassifierFingerprint {
-                status: "HTTP/1.1 403 Forbidden",
-                code: Some("SignatureDoesNotMatch"),
-                message: Some("The request signature we calculated does not match the signature you provided. Check your key and signing method."),
+                status: "HTTP/1.1 405 Method Not Allowed",
+                code: Some("MethodNotAllowed"),
+                message: Some("method not allowed"),
                 s3_error_root: true,
+                s3_control_error_root: false,
                 semantic_body_empty: false,
                 has_s3_request_id_header: true,
             }
@@ -800,7 +818,7 @@ mod tests {
             let response =
                 send_raw_http(&server, &routing_boundary_request(&hosts, false, &amz_date)).await;
             let fingerprint = classifier_fingerprint(&response);
-            assert_shared_classifier_or_http_rejection(&fingerprint);
+            assert_s3_only_classifier_or_http_rejection(&fingerprint);
         }
 
         let absolute = send_raw_http(
@@ -809,6 +827,1086 @@ mod tests {
         )
         .await;
         assert_eq!(classifier_fingerprint(&absolute), baseline_fingerprint);
+    }
+
+    fn local_signed_request_credentials(server: &TestServer) -> SignedRequestCredentials<'_> {
+        SignedRequestCredentials {
+            access_key: TEST_ACCESS_KEY,
+            secret_key: TEST_SECRET_KEY,
+            region: TEST_REGION,
+            tls_ca_pem: server.tls_ca_pem(),
+        }
+    }
+
+    fn assert_local_s3_control_error(
+        label: &str,
+        response: &RawResponse,
+        status: u16,
+        code: &str,
+        message: &str,
+        detail: &str,
+        allow: Option<&str>,
+    ) {
+        let mut expected = shape().status(status).headers([
+            ("content-type", "application/xml"),
+            ("x-amz-id-2", "{host_id}"),
+            ("x-amz-request-id", "{request_id}"),
+        ]);
+        if let Some(allow) = allow {
+            expected = expected.header("allow", allow);
+        }
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <ErrorResponse><Error><Code>{code}</Code><Message>{message}</Message>{detail}</Error>\
+             <RequestId>{{request_id}}</RequestId><HostId>{{host_id}}</HostId></ErrorResponse>"
+        );
+        assert_shape(label, response, &expected.body(body));
+    }
+
+    fn assert_local_s3_control_frontend_bad_request(label: &str, response: &RawResponse) {
+        assert_shape(
+            label,
+            response,
+            &shape()
+                .status(400)
+                .headers([
+                    ("content-type", "application/xml"),
+                    ("x-amz-id-2", "{host_id}"),
+                    ("x-amz-request-id", "{request_id}"),
+                ])
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>BadRequest</Code><Message>An error occurred when parsing the HTTP request.</Message>\
+                     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                ),
+        );
+    }
+
+    fn assert_local_s3_control_signature_mismatch(label: &str, response: &RawResponse) {
+        assert_shape(
+            label,
+            response,
+            &shape().status(403).headers([
+                ("content-type", "application/xml"),
+                ("x-amz-id-2", "{host_id}"),
+                ("x-amz-request-id", "{request_id}"),
+            ]),
+        );
+        assert_eq!(
+            xml_element(&response.body, "Code"),
+            Some("SignatureDoesNotMatch"),
+            "{label}: wrong error code: {response:?}"
+        );
+        assert!(
+            response
+                .body
+                .contains("<ErrorResponse><Error><Code>SignatureDoesNotMatch</Code>"),
+            "{label}: signature mismatch did not use the nested S3 Control envelope: {response:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plain_http_listener_does_not_enable_s3_control() {
+        let server = TestServer::start_http().await;
+        let url = format!(
+            "{}/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Aplain-http-probe",
+            server.endpoint()
+        );
+        let response = send_checked_signed_request_for_service_with_credentials(
+            "GET",
+            &url,
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3Control,
+            "s3",
+            local_signed_request_credentials(&server),
+        );
+
+        assert_eq!(response.status, 404);
+        assert!(response.body.contains("<Code>NoSuchBucket</Code>"));
+        assert!(response.body.contains("<BucketName>v20180820</BucketName>"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_tls_s3_control_method_path_and_auth_precedence_match_aws() {
+        let server = TestServer::start_https().await;
+        let endpoint = server.endpoint();
+        let credentials = local_signed_request_credentials(&server);
+        let raw_resource = "arn:aws:s3:::bounded-routing-probe";
+        let resource = "arn%3Aaws%3As3%3A%3A%3Abounded-routing-probe";
+        let tags_path = format!("/v20180820/tags/{resource}");
+        let tag_body = concat!(
+            "<TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">",
+            "<Tags><Tag><Key>routing</Key><Value>probe</Value></Tag></Tags>",
+            "</TagResourceRequest>"
+        );
+
+        for method in ["GET", "POST", "DELETE"] {
+            let target = if method == "DELETE" {
+                format!("{tags_path}?tagKeys=routing")
+            } else {
+                tags_path.clone()
+            };
+            let body = if method == "POST" {
+                tag_body.as_bytes()
+            } else {
+                b""
+            };
+            let headers = if method == "POST" {
+                vec![("content-type", "application/xml")]
+            } else {
+                vec![]
+            };
+            let response = send_checked_signed_request_for_service_with_credentials(
+                method,
+                &format!("{endpoint}{target}"),
+                body,
+                headers,
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_local_s3_control_error(
+                &format!("S3 Control {method} missing resource"),
+                &response,
+                404,
+                "NoSuchResource",
+                "The specified resource doesn't exist.",
+                "",
+                None,
+            );
+        }
+
+        let head = send_checked_signed_request_for_service_with_credentials(
+            "HEAD",
+            &format!("{endpoint}{tags_path}"),
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3Control,
+            "s3",
+            credentials,
+        );
+        assert_shape(
+            "S3 Control HEAD method rejection",
+            &head,
+            &shape()
+                .status(405)
+                .headers([
+                    ("allow", "DELETE, POST, GET"),
+                    ("x-amz-id-2", "{host_id}"),
+                    ("x-amz-request-id", "{request_id}"),
+                ])
+                .body_empty(),
+        );
+
+        for method in ["PUT", "PATCH"] {
+            let response = send_checked_signed_request_for_service_with_credentials(
+                method,
+                &format!("{endpoint}{tags_path}"),
+                b"",
+                Vec::<(&str, &str)>::new(),
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_local_s3_control_error(
+                &format!("S3 Control {method} method rejection"),
+                &response,
+                405,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+                &format!("<Method>{method}</Method><ResourceType>BUCKET_TAGS</ResourceType>"),
+                Some("DELETE, POST, GET"),
+            );
+        }
+
+        let options = send_checked_signed_request_for_service_with_credentials(
+            "OPTIONS",
+            &format!("{endpoint}{tags_path}"),
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3Control,
+            "s3",
+            credentials,
+        );
+        assert_local_s3_control_error(
+            "S3 Control OPTIONS missing Origin",
+            &options,
+            400,
+            "BadRequest",
+            "Insufficient information. Origin request header needed.",
+            "",
+            None,
+        );
+
+        let options_cors = send_checked_signed_request_for_service_with_credentials(
+            "OPTIONS",
+            &format!("{endpoint}{tags_path}"),
+            b"",
+            [
+                ("origin", "https://example.com"),
+                ("access-control-request-method", "POST"),
+            ],
+            SigningService::S3Control,
+            "s3",
+            credentials,
+        );
+        assert_local_s3_control_error(
+            "S3 Control OPTIONS missing bucket CORS",
+            &options_cors,
+            403,
+            "AccessForbidden",
+            "CORSResponse: Bucket not found",
+            "<Method>POST</Method><ResourceType>BUCKET</ResourceType>",
+            None,
+        );
+
+        for method in ["PROPFIND", "X-ARGMIN-PROBE"] {
+            let response = send_checked_signed_request_for_service_with_credentials(
+                method,
+                &format!("{endpoint}{tags_path}"),
+                b"",
+                Vec::<(&str, &str)>::new(),
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_local_s3_control_frontend_bad_request(
+                &format!("S3 Control {method} frontend rejection"),
+                &response,
+            );
+        }
+
+        enum PathResult {
+            NoSuchResource,
+            InvalidUri(String),
+            EmptyBadRequest,
+        }
+
+        let path_cases = vec![
+            (
+                "tags-no-resource",
+                "/v20180820/tags".to_string(),
+                None,
+                PathResult::InvalidUri("tags".to_string()),
+            ),
+            (
+                "tags-empty-resource",
+                "/v20180820/tags/".to_string(),
+                None,
+                PathResult::InvalidUri("tags/".to_string()),
+            ),
+            (
+                "tags-extra-segment",
+                format!("{tags_path}/unexpected"),
+                None,
+                PathResult::InvalidUri(format!("tags/{raw_resource}/unexpected")),
+            ),
+            (
+                "tag-singular",
+                format!("/v20180820/tag/{resource}"),
+                None,
+                PathResult::InvalidUri(format!("tag/{raw_resource}")),
+            ),
+            (
+                "tags-prefix-suffix",
+                format!("/v20180820/tagsx/{resource}"),
+                None,
+                PathResult::InvalidUri(format!("tagsx/{raw_resource}")),
+            ),
+            (
+                "wrong-version",
+                format!("/v20180819/tags/{resource}"),
+                None,
+                PathResult::InvalidUri(format!("/v20180819/tags/{resource}")),
+            ),
+            (
+                "uppercase-version",
+                format!("/V20180820/tags/{resource}"),
+                None,
+                PathResult::InvalidUri(format!("/V20180820/tags/{resource}")),
+            ),
+            (
+                "double-leading-slash",
+                format!("//v20180820/tags/{resource}"),
+                None,
+                PathResult::InvalidUri(format!("//v20180820/tags/{resource}")),
+            ),
+            (
+                "encoded-path-separator",
+                format!("/v20180820/tags%2F{resource}"),
+                Some(tags_path.clone()),
+                PathResult::NoSuchResource,
+            ),
+            (
+                "unencoded-valid-arn",
+                format!("/v20180820/tags/{raw_resource}"),
+                Some(tags_path.clone()),
+                PathResult::NoSuchResource,
+            ),
+            (
+                "malformed-percent-bare",
+                "/v20180820/tags/%".to_string(),
+                None,
+                PathResult::EmptyBadRequest,
+            ),
+            (
+                "malformed-percent-short",
+                "/v20180820/tags/%2".to_string(),
+                None,
+                PathResult::EmptyBadRequest,
+            ),
+            (
+                "malformed-percent-hex",
+                "/v20180820/tags/%GG".to_string(),
+                None,
+                PathResult::EmptyBadRequest,
+            ),
+            (
+                "invalid-utf8-percent",
+                "/v20180820/tags/%FF".to_string(),
+                None,
+                PathResult::InvalidUri("/v20180820/tags/%FF".to_string()),
+            ),
+            (
+                "malformed-arn",
+                "/v20180820/tags/not-an-arn".to_string(),
+                None,
+                PathResult::InvalidUri("tags/not-an-arn".to_string()),
+            ),
+            (
+                "empty-bucket-arn",
+                "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3A".to_string(),
+                None,
+                PathResult::InvalidUri("tags/arn:aws:s3:::".to_string()),
+            ),
+            (
+                "wrong-service-arn",
+                "/v20180820/tags/arn%3Aaws%3Aiam%3A%3A111122223333%3Arole%2Fprobe".to_string(),
+                None,
+                PathResult::InvalidUri("tags/arn:aws:iam::111122223333:role/probe".to_string()),
+            ),
+            (
+                "object-arn",
+                format!("{tags_path}%2Fobject"),
+                None,
+                PathResult::InvalidUri(format!("tags/{raw_resource}/object")),
+            ),
+            (
+                "double-encoded-arn",
+                format!("/v20180820/tags/{}", resource.replace('%', "%25")),
+                None,
+                PathResult::InvalidUri(format!("tags/{resource}")),
+            ),
+        ];
+
+        for (label, wire_path, signed_path, expected) in path_cases {
+            let signed_path = signed_path.as_deref().unwrap_or(&wire_path);
+            let connect_url = format!("{endpoint}{wire_path}");
+            let signed_url = format!("{endpoint}{signed_path}");
+            let response = if matches!(&expected, PathResult::EmptyBadRequest) {
+                send_signed_request_to_endpoint_for_service_with_credentials(
+                    "GET",
+                    &connect_url,
+                    &signed_url,
+                    b"",
+                    Vec::<(&str, &str)>::new(),
+                    SigningService::S3Control,
+                    credentials,
+                )
+            } else {
+                send_checked_signed_request_to_endpoint_for_service_with_credentials(
+                    "GET",
+                    &connect_url,
+                    &signed_url,
+                    b"",
+                    Vec::<(&str, &str)>::new(),
+                    SigningService::S3Control,
+                    "s3",
+                    credentials,
+                )
+            };
+            match expected {
+                PathResult::NoSuchResource => assert_local_s3_control_error(
+                    label,
+                    &response,
+                    404,
+                    "NoSuchResource",
+                    "The specified resource doesn't exist.",
+                    "",
+                    None,
+                ),
+                PathResult::InvalidUri(uri) => assert_local_s3_control_error(
+                    label,
+                    &response,
+                    400,
+                    "InvalidURI",
+                    "Couldn't parse the specified URI.",
+                    &format!("<URI>{uri}</URI>"),
+                    None,
+                ),
+                PathResult::EmptyBadRequest => {
+                    assert_shape(
+                        label,
+                        &response,
+                        &shape()
+                            .status(400)
+                            .headers(std::iter::empty::<(&str, &str)>())
+                            .body_empty(),
+                    );
+                }
+            }
+        }
+
+        let port = endpoint_port(&server);
+        let configured = format!("localhost:{port}");
+        let malformed_arn_bad_hmac = routing_boundary_request_for_target(
+            "/v20180820/tags/not-an-arn",
+            &[&configured],
+            false,
+            &current_amz_date(),
+        );
+        let stream = connect_raw_tls(
+            &server,
+            ServerName::try_from("localhost")
+                .expect("valid DNS name")
+                .to_owned(),
+            false,
+        )
+        .await
+        .expect("TLS connection");
+        let response = read_raw_response(stream, &malformed_arn_bad_hmac).await;
+        let fingerprint = classifier_fingerprint(&response);
+        assert_eq!(fingerprint.status, "HTTP/1.1 400 Bad Request");
+        assert_eq!(fingerprint.code, Some("InvalidURI"));
+        assert!(fingerprint.s3_control_error_root);
+        assert_eq!(
+            xml_element(std::str::from_utf8(&response).unwrap(), "URI"),
+            Some("tags/not-an-arn")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_tls_s3_control_body_query_validation_and_auth_precedence_match_aws() {
+        let server = TestServer::start_https().await;
+        let credentials = local_signed_request_credentials(&server);
+        let bucket = "body-query-validation";
+        let create_url = format!("{}/{bucket}", server.endpoint());
+        let create = send_checked_signed_request_for_service_with_credentials(
+            "PUT",
+            &create_url,
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3,
+            "s3",
+            credentials,
+        );
+        assert_eq!(create.status, 200, "create bucket response: {create:?}");
+        let resource_url = format!(
+            "{}/v20180820/tags/arn%3Aaws%3As3%3A%3A%3A{bucket}",
+            server.endpoint(),
+        );
+        let wrong_secret = "0".repeat(40);
+        let bad_signature_credentials = SignedRequestCredentials {
+            secret_key: &wrong_secret,
+            ..credentials
+        };
+        let malformed_xml_message =
+            "The XML you provided was not well-formed or did not validate against our published schema";
+        let invalid_tag_message = "This request contains a tag key or value that isn't valid. Valid characters include the following: [a-zA-Z+-=._:/]. Tag keys can contain up to 128 characters. Tag values can contain up to 256 characters.";
+        let success_headers = [
+            ("x-amz-id-2", "{host_id}"),
+            ("x-amz-request-id", "{request_id}"),
+        ];
+
+        for (label, body, code, message) in [
+            (
+                "empty body",
+                b"".as_slice(),
+                "MissingRequestBodyError",
+                "Request Body is empty",
+            ),
+            (
+                "truncated XML",
+                b"<TagResourceRequest".as_slice(),
+                "MalformedXML",
+                malformed_xml_message,
+            ),
+            (
+                "wrong root",
+                b"<WrongRoot/>".as_slice(),
+                "InvalidTag",
+                "At least one tag is required.",
+            ),
+            (
+                "missing Tags",
+                b"<TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"/>".as_slice(),
+                "InvalidTag",
+                "At least one tag is required.",
+            ),
+            (
+                "empty Tags",
+                b"<TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags/></TagResourceRequest>".as_slice(),
+                "InvalidTag",
+                "At least one tag is required.",
+            ),
+        ] {
+            let response = send_checked_signed_request_for_service_with_credentials(
+                "POST",
+                &resource_url,
+                body,
+                [("content-type", "application/xml")],
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_local_s3_control_error(label, &response, 400, code, message, "", None);
+
+            let bad_signature = send_checked_signed_request_for_service_with_credentials(
+                "POST",
+                &resource_url,
+                body,
+                [("content-type", "application/xml")],
+                SigningService::S3Control,
+                "s3",
+                bad_signature_credentials,
+            );
+            assert_local_s3_control_signature_mismatch(
+                &format!("{label} with bad signature"),
+                &bad_signature,
+            );
+        }
+
+        let tag_resource_body = |members: &str| {
+            format!(
+                "<TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags>{members}</Tags></TagResourceRequest>"
+            )
+        };
+        let member_cases = [
+            (
+                "empty tag key",
+                tag_resource_body("<Tag><Key/><Value>value</Value></Tag>"),
+                invalid_tag_message,
+            ),
+            (
+                "overlong tag key",
+                tag_resource_body(&format!(
+                    "<Tag><Key>{}</Key><Value>value</Value></Tag>",
+                    "x".repeat(129)
+                )),
+                invalid_tag_message,
+            ),
+            (
+                "overlong tag value",
+                tag_resource_body(&format!(
+                    "<Tag><Key>key</Key><Value>{}</Value></Tag>",
+                    "x".repeat(257)
+                )),
+                invalid_tag_message,
+            ),
+            (
+                "duplicate tag member key",
+                tag_resource_body(
+                    "<Tag><Key>duplicate</Key><Value>one</Value></Tag><Tag><Key>duplicate</Key><Value>two</Value></Tag>",
+                ),
+                "There are duplicate tag keys in your request. Remove the duplicate tag keys and try again.",
+            ),
+            (
+                "invalid tag member character",
+                tag_resource_body("<Tag><Key>invalid!</Key><Value>value</Value></Tag>"),
+                invalid_tag_message,
+            ),
+            (
+                "invalid tag value character",
+                tag_resource_body("<Tag><Key>valid-key</Key><Value>invalid!</Value></Tag>"),
+                invalid_tag_message,
+            ),
+            (
+                "alphabetic combining mark in tag key",
+                tag_resource_body("<Tag><Key>key-\u{0345}</Key><Value>value</Value></Tag>"),
+                invalid_tag_message,
+            ),
+            (
+                "alphabetic combining mark in tag value",
+                tag_resource_body("<Tag><Key>valid-key</Key><Value>value-\u{0345}</Value></Tag>"),
+                invalid_tag_message,
+            ),
+        ];
+        for (label, body, message) in member_cases {
+            let response = send_checked_signed_request_for_service_with_credentials(
+                "POST",
+                &resource_url,
+                body.as_bytes(),
+                [("content-type", "application/xml")],
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_local_s3_control_error(label, &response, 400, "InvalidTag", message, "", None);
+
+            let bad_signature = send_checked_signed_request_for_service_with_credentials(
+                "POST",
+                &resource_url,
+                body.as_bytes(),
+                [("content-type", "application/xml")],
+                SigningService::S3Control,
+                "s3",
+                bad_signature_credentials,
+            );
+            assert_local_s3_control_signature_mismatch(
+                &format!("{label} with bad signature"),
+                &bad_signature,
+            );
+        }
+
+        let wrong_service = send_checked_signed_request_for_service_with_credentials(
+            "POST",
+            &resource_url,
+            b"<TagResourceRequest",
+            [("content-type", "application/xml")],
+            SigningService::S3Control,
+            "sts",
+            credentials,
+        );
+        assert_local_s3_control_error(
+            "malformed body with wrong credential service",
+            &wrong_service,
+            400,
+            "AuthorizationHeaderMalformed",
+            "The authorization header is malformed; incorrect service \"sts\". This endpoint belongs to \"s3\".",
+            "",
+            None,
+        );
+
+        for (label, credential_service, signing_credentials) in [
+            ("valid signature", "s3", credentials),
+            ("bad signature", "s3", bad_signature_credentials),
+            ("wrong credential service", "sts", credentials),
+        ] {
+            let response = send_checked_signed_request_for_service_with_credentials(
+                "DELETE",
+                &resource_url,
+                b"",
+                Vec::<(&str, &str)>::new(),
+                SigningService::S3Control,
+                credential_service,
+                signing_credentials,
+            );
+            assert_local_s3_control_error(
+                &format!("missing tagKeys with {label}"),
+                &response,
+                400,
+                "InvalidTag",
+                "At least one tag is required.",
+                "",
+                None,
+            );
+        }
+
+        let empty_key_url = format!("{resource_url}?tagKeys=");
+        let empty_key = send_checked_signed_request_for_service_with_credentials(
+            "DELETE",
+            &empty_key_url,
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3Control,
+            "s3",
+            credentials,
+        );
+        assert_local_s3_control_error(
+            "empty tag key",
+            &empty_key,
+            400,
+            "InvalidTag",
+            invalid_tag_message,
+            "",
+            None,
+        );
+        let empty_key_bad_signature = send_checked_signed_request_for_service_with_credentials(
+            "DELETE",
+            &empty_key_url,
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3Control,
+            "s3",
+            bad_signature_credentials,
+        );
+        assert_local_s3_control_signature_mismatch(
+            "empty tag key with bad signature",
+            &empty_key_bad_signature,
+        );
+
+        let overlong_key = "x".repeat(129);
+        let state_dependent_queries = [
+            ("invalid tag key pattern", "tagKeys=%21".to_string()),
+            ("overlong tag key", format!("tagKeys={overlong_key}")),
+        ];
+        for (label, query) in &state_dependent_queries {
+            let url = format!("{resource_url}?{query}");
+            let response = send_checked_signed_request_for_service_with_credentials(
+                "DELETE",
+                &url,
+                b"",
+                Vec::<(&str, &str)>::new(),
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_shape(
+                &format!("{label} with empty tag set"),
+                &response,
+                &shape().status(204).headers(success_headers).body_empty(),
+            );
+
+            let bad_signature = send_checked_signed_request_for_service_with_credentials(
+                "DELETE",
+                &url,
+                b"",
+                Vec::<(&str, &str)>::new(),
+                SigningService::S3Control,
+                "s3",
+                bad_signature_credentials,
+            );
+            assert_local_s3_control_signature_mismatch(
+                &format!("{label} with empty tag set and bad signature"),
+                &bad_signature,
+            );
+        }
+
+        for (label, key, value) in [
+            ("space tag key", "space key", "value"),
+            ("at-sign tag key", "at@key", "value"),
+            ("Unicode tag key", "環境", "value"),
+            ("Unicode digit tag key", "digit-١", "value"),
+            ("no-break space tag key", "key\u{00a0}", "value"),
+            ("line separator tag key", "key\u{2028}", "value"),
+            ("paragraph separator tag key", "key\u{2029}", "value"),
+            ("letter number tag key", "key-\u{2167}", "value"),
+            ("other number tag key", "key-\u{00b2}", "value"),
+            ("punctuation tag key", "punctuation+-=._:/@", "value"),
+            ("space tag value", "space-value", "with space"),
+            ("at-sign tag value", "at-value", "value@example"),
+            ("Unicode tag value", "unicode-value", "本番"),
+            ("Unicode digit tag value", "unicode-digit-value", "value-١"),
+            (
+                "no-break space tag value",
+                "no-break-space-value",
+                "value\u{00a0}",
+            ),
+            (
+                "line separator tag value",
+                "line-separator-value",
+                "value\u{2028}",
+            ),
+            (
+                "paragraph separator tag value",
+                "paragraph-separator-value",
+                "value\u{2029}",
+            ),
+            (
+                "letter number tag value",
+                "letter-number-value",
+                "value-\u{2167}",
+            ),
+            (
+                "other number tag value",
+                "other-number-value",
+                "value-\u{00b2}",
+            ),
+            (
+                "punctuation tag value",
+                "punctuation-value",
+                "value+-=._:/@",
+            ),
+        ] {
+            let body = tag_resource_body(&format!(
+                "<Tag><Key>{key}</Key><Value>{value}</Value></Tag>"
+            ));
+            let response = send_checked_signed_request_for_service_with_credentials(
+                "POST",
+                &resource_url,
+                body.as_bytes(),
+                [("content-type", "application/xml")],
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_shape(
+                label,
+                &response,
+                &shape().status(204).headers(success_headers).body_empty(),
+            );
+
+            let bad_signature = send_checked_signed_request_for_service_with_credentials(
+                "POST",
+                &resource_url,
+                body.as_bytes(),
+                [("content-type", "application/xml")],
+                SigningService::S3Control,
+                "s3",
+                bad_signature_credentials,
+            );
+            assert_local_s3_control_signature_mismatch(
+                &format!("{label} with bad signature"),
+                &bad_signature,
+            );
+        }
+
+        let seed_body = b"<TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags><Tag><Key>existing</Key><Value>value</Value></Tag></Tags></TagResourceRequest>";
+        let seed = send_checked_signed_request_for_service_with_credentials(
+            "POST",
+            &resource_url,
+            seed_body,
+            [("content-type", "application/xml")],
+            SigningService::S3Control,
+            "s3",
+            credentials,
+        );
+        assert_shape(
+            "seed resource tag",
+            &seed,
+            &shape().status(204).headers(success_headers).body_empty(),
+        );
+
+        for (label, query, message) in [
+            (
+                "invalid tag key pattern",
+                "tagKeys=%21".to_string(),
+                invalid_tag_message,
+            ),
+            (
+                "overlong tag key",
+                format!("tagKeys={overlong_key}"),
+                invalid_tag_message,
+            ),
+            (
+                "identical duplicate tag keys",
+                "tagKeys=body-probe&tagKeys=body-probe".to_string(),
+                "Duplicate tag keys are not supported.",
+            ),
+        ] {
+            let url = format!("{resource_url}?{query}");
+            let response = send_checked_signed_request_for_service_with_credentials(
+                "DELETE",
+                &url,
+                b"",
+                Vec::<(&str, &str)>::new(),
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_local_s3_control_error(label, &response, 400, "InvalidTag", message, "", None);
+
+            let bad_signature = send_checked_signed_request_for_service_with_credentials(
+                "DELETE",
+                &url,
+                b"",
+                Vec::<(&str, &str)>::new(),
+                SigningService::S3Control,
+                "s3",
+                bad_signature_credentials,
+            );
+            assert_local_s3_control_signature_mismatch(
+                &format!("{label} with bad signature"),
+                &bad_signature,
+            );
+        }
+
+        let too_many_query = (0..51)
+            .map(|index| format!("tagKeys=key-{index}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let too_many_url = format!("{resource_url}?{too_many_query}");
+        let too_many = send_checked_signed_request_for_service_with_credentials(
+            "DELETE",
+            &too_many_url,
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3Control,
+            "s3",
+            credentials,
+        );
+        assert_local_s3_control_error(
+            "51 distinct tag keys",
+            &too_many,
+            400,
+            "InvalidTag",
+            invalid_tag_message,
+            "",
+            None,
+        );
+        let too_many_bad_signature = send_checked_signed_request_for_service_with_credentials(
+            "DELETE",
+            &too_many_url,
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3Control,
+            "s3",
+            bad_signature_credentials,
+        );
+        assert_local_s3_control_signature_mismatch(
+            "51 distinct tag keys with bad signature",
+            &too_many_bad_signature,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_tls_s3_control_tag_operations_ignore_all_account_id_header_forms() {
+        let server = TestServer::start_https().await;
+        let credentials = local_signed_request_credentials(&server);
+        let bucket = "shared-regional-tags";
+        let create_url = format!("{}/{bucket}", server.endpoint());
+        let create = send_checked_signed_request_for_service_with_credentials(
+            "PUT",
+            &create_url,
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3,
+            "s3",
+            credentials,
+        );
+        assert_eq!(create.status, 200, "create bucket response: {create:?}");
+
+        let resource_url = format!(
+            "{}/v20180820/tags/arn%3Aaws%3As3%3A%3A%3A{bucket}",
+            server.endpoint()
+        );
+        let delete_url = format!("{resource_url}?tagKeys=team");
+        let tag_body = concat!(
+            "<TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">",
+            "<Tags><Tag><Key>team</Key><Value>storage</Value></Tag></Tags>",
+            "</TagResourceRequest>"
+        );
+        let list_body = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<ListTagsForResourceResult xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">",
+            "<Tags><Tag><Key>team</Key><Value>storage</Value></Tag></Tags>",
+            "</ListTagsForResourceResult>"
+        );
+        let success_headers = [
+            ("x-amz-id-2", "{host_id}"),
+            ("x-amz-request-id", "{request_id}"),
+        ];
+        let account_header_cases = [
+            ("missing", vec![]),
+            ("empty", vec![("x-amz-account-id", "")]),
+            ("correct", vec![("x-amz-account-id", TEST_ACCOUNT_ID)]),
+            ("wrong", vec![("x-amz-account-id", "999900001111")]),
+            ("malformed-short", vec![("x-amz-account-id", "1")]),
+            (
+                "malformed-alpha",
+                vec![("x-amz-account-id", "not-an-account")],
+            ),
+            (
+                "duplicate-correct",
+                vec![
+                    ("x-amz-account-id", TEST_ACCOUNT_ID),
+                    ("x-amz-account-id", TEST_ACCOUNT_ID),
+                ],
+            ),
+            (
+                "duplicate-correct-wrong",
+                vec![
+                    ("x-amz-account-id", TEST_ACCOUNT_ID),
+                    ("x-amz-account-id", "999900001111"),
+                ],
+            ),
+            (
+                "duplicate-wrong-correct",
+                vec![
+                    ("x-amz-account-id", "999900001111"),
+                    ("x-amz-account-id", TEST_ACCOUNT_ID),
+                ],
+            ),
+            (
+                "duplicate-wrong",
+                vec![
+                    ("x-amz-account-id", "999900001111"),
+                    ("x-amz-account-id", "222233334444"),
+                ],
+            ),
+        ];
+
+        for (case, account_headers) in account_header_cases {
+            let tag = send_checked_signed_request_for_service_with_credentials(
+                "POST",
+                &resource_url,
+                tag_body.as_bytes(),
+                account_headers.iter().copied(),
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_shape(
+                &format!("TagResource ({case})"),
+                &tag,
+                &shape().status(204).headers(success_headers).body_empty(),
+            );
+
+            let list = send_checked_signed_request_for_service_with_credentials(
+                "GET",
+                &resource_url,
+                b"",
+                account_headers.iter().copied(),
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_shape(
+                &format!("ListTagsForResource ({case})"),
+                &list,
+                &shape().status(200).headers(success_headers).body(list_body),
+            );
+
+            let untag = send_checked_signed_request_for_service_with_credentials(
+                "DELETE",
+                &delete_url,
+                b"",
+                account_headers,
+                SigningService::S3Control,
+                "s3",
+                credentials,
+            );
+            assert_shape(
+                &format!("UntagResource ({case})"),
+                &untag,
+                &shape().status(204).headers(success_headers).body_empty(),
+            );
+        }
+
+        let empty = send_checked_signed_request_for_service_with_credentials(
+            "GET",
+            &resource_url,
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3Control,
+            "s3",
+            credentials,
+        );
+        assert_shape(
+            "ListTagsForResource empty tag set",
+            &empty,
+            &shape().status(200).headers(success_headers).body(concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<ListTagsForResourceResult xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">",
+                "<Tags/></ListTagsForResourceResult>"
+            )),
+        );
+
+        let distinct_absent_keys = send_checked_signed_request_for_service_with_credentials(
+            "DELETE",
+            &format!("{resource_url}?tagKeys=absent-a&tagKeys=absent-b"),
+            b"",
+            Vec::<(&str, &str)>::new(),
+            SigningService::S3Control,
+            "s3",
+            credentials,
+        );
+        assert_shape(
+            "UntagResource distinct absent tag keys",
+            &distinct_absent_keys,
+            &shape().status(204).headers(success_headers).body_empty(),
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -837,6 +1935,7 @@ mod tests {
                 code: Some("SignatureDoesNotMatch"),
                 message: Some("The request signature we calculated does not match the signature you provided. Check your key and signing method."),
                 s3_error_root: true,
+                s3_control_error_root: true,
                 semantic_body_empty: false,
                 has_s3_request_id_header: true,
             }

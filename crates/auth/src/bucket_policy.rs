@@ -226,6 +226,7 @@ pub enum PolicyAction {
     PutLifecycleConfiguration,
     PutBucketPublicAccessBlock,
     PutBucketObjectLockConfiguration,
+    ListTagsForResource,
     TagResource,
     UntagResource,
     GetObject,
@@ -284,6 +285,7 @@ impl PolicyAction {
             Self::PutLifecycleConfiguration => "s3:PutLifecycleConfiguration",
             Self::PutBucketPublicAccessBlock => "s3:PutBucketPublicAccessBlock",
             Self::PutBucketObjectLockConfiguration => "s3:PutBucketObjectLockConfiguration",
+            Self::ListTagsForResource => "s3:ListTagsForResource",
             Self::TagResource => "s3:TagResource",
             Self::UntagResource => "s3:UntagResource",
             Self::GetObject => "s3:GetObject",
@@ -1841,7 +1843,7 @@ fn validate_resource_applicability(
     Ok(())
 }
 
-const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 29] = [
+const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 30] = [
     PolicyAction::DeleteBucket,
     PolicyAction::GetBucketPolicy,
     PolicyAction::PutBucketPolicy,
@@ -1869,6 +1871,7 @@ const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 29] = [
     PolicyAction::PutLifecycleConfiguration,
     PolicyAction::PutBucketPublicAccessBlock,
     PolicyAction::PutBucketObjectLockConfiguration,
+    PolicyAction::ListTagsForResource,
     PolicyAction::TagResource,
     PolicyAction::UntagResource,
 ];

@@ -137,6 +137,7 @@ pub struct S3Response {
     pub body: Vec<u8>,
     pub stream: Option<ReadHandle>,
     pub(crate) error_diagnostic: Option<ErrorDiagnostic>,
+    pub(crate) include_wire_ids: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -359,6 +360,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::MalformedPOSTRequest { reason }
         | ServerError::MalformedChunkedBody { reason }
         | ServerError::InvalidTag { reason, .. } => reason.clone(),
+        ServerError::MissingRequestBodyError => "Request Body is empty".to_string(),
         ServerError::InvalidUploadPartNumber { .. }
         | ServerError::InvalidUploadPartCopyNumber { .. } => {
             "Part number must be an integer between 1 and 10000, inclusive".to_string()
@@ -1506,6 +1508,7 @@ impl S3Response {
             body: Vec::new(),
             stream: None,
             error_diagnostic: None,
+            include_wire_ids: true,
         }
     }
 
@@ -2284,6 +2287,13 @@ impl S3Response {
         Self::new(204)
     }
 
+    /// Build a response for S3 Control `ListTagsForResource` (200 OK, XML
+    /// representation without a Content-Type header, matching AWS).
+    #[must_use]
+    pub fn list_tags_for_resource(xml: String) -> Self {
+        Self::new(200).chunked_xml_body_no_content_type(xml)
+    }
+
     /// Build a response for `TagResource` (204 No Content).
     #[must_use]
     pub fn tag_resource() -> Self {
@@ -2294,6 +2304,144 @@ impl S3Response {
     #[must_use]
     pub fn untag_resource() -> Self {
         Self::new(204)
+    }
+
+    /// Build a pre-service HTTP parser rejection without service request IDs.
+    #[must_use]
+    pub fn outer_empty_bad_request() -> Self {
+        let mut response = Self::new(400);
+        response.include_wire_ids = false;
+        response
+    }
+
+    /// Build the outer S3-shaped parser error observed on extension methods at
+    /// the S3 Control endpoint.
+    #[must_use]
+    pub fn s3_control_frontend_bad_request(wire_ids: &WireResponseIds) -> Self {
+        let body = xml::error_xml_with_host_id(
+            "BadRequest",
+            "An error occurred when parsing the HTTP request.",
+            wire_ids.request_id(),
+            wire_ids.host_id(),
+        );
+        Self::new(400).chunked_xml_body(body)
+    }
+
+    fn s3_control_error(
+        status: u16,
+        code: &str,
+        message: &str,
+        detail_xml: &str,
+        wire_ids: &WireResponseIds,
+    ) -> Self {
+        let body = xml::s3_control_error_xml(
+            code,
+            message,
+            detail_xml,
+            wire_ids.request_id(),
+            wire_ids.host_id(),
+        );
+        Self::new(status).chunked_xml_body(body)
+    }
+
+    /// Build the S3 Control URI error selected before authentication.
+    #[must_use]
+    pub fn s3_control_invalid_uri(uri: &str, wire_ids: &WireResponseIds) -> Self {
+        Self::s3_control_error(
+            400,
+            "InvalidURI",
+            "Couldn't parse the specified URI.",
+            &format!("<URI>{}</URI>", xml::xml_escape(uri)),
+            wire_ids,
+        )
+    }
+
+    /// Build S3 Control's bodyless HEAD method rejection.
+    #[must_use]
+    pub fn s3_control_head_method_not_allowed() -> Self {
+        Self::new(405).header("Allow", "DELETE, POST, GET")
+    }
+
+    /// Build S3 Control's nested method rejection.
+    #[must_use]
+    pub fn s3_control_method_not_allowed(method: &str, wire_ids: &WireResponseIds) -> Self {
+        Self::s3_control_error(
+            405,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+            &format!(
+                "<Method>{}</Method><ResourceType>BUCKET_TAGS</ResourceType>",
+                xml::xml_escape(method)
+            ),
+            wire_ids,
+        )
+        .header("Allow", "DELETE, POST, GET")
+    }
+
+    /// Build S3 Control's missing-Origin OPTIONS response.
+    #[must_use]
+    pub fn s3_control_options_missing_origin(wire_ids: &WireResponseIds) -> Self {
+        Self::s3_control_error(
+            400,
+            "BadRequest",
+            "Insufficient information. Origin request header needed.",
+            "",
+            wire_ids,
+        )
+    }
+
+    /// Build the bounded S3 Control CORS missing-bucket response.
+    #[must_use]
+    pub fn s3_control_cors_bucket_not_found(method: &str, wire_ids: &WireResponseIds) -> Self {
+        Self::s3_control_error(
+            403,
+            "AccessForbidden",
+            "CORSResponse: Bucket not found",
+            &format!(
+                "<Method>{}</Method><ResourceType>BUCKET</ResourceType>",
+                xml::xml_escape(method)
+            ),
+            wire_ids,
+        )
+    }
+
+    /// Render a dispatch or authentication failure in the S3 Control envelope.
+    #[must_use]
+    pub fn s3_control_error_with_ids(err: &ServerError, wire_ids: &WireResponseIds) -> Self {
+        let response = match err {
+            ServerError::BucketNotFound { .. } => Self::s3_control_error(
+                404,
+                "NoSuchResource",
+                "The specified resource doesn't exist.",
+                "",
+                wire_ids,
+            ),
+            ServerError::Auth(auth::AuthError::SignatureMismatch { diagnostics }) => {
+                let body = xml::s3_control_signature_does_not_match_error_xml(
+                    diagnostics.as_deref(),
+                    wire_ids.request_id(),
+                    wire_ids.host_id(),
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::InvalidHeaderCredentialService { .. }) => {
+                Self::s3_control_error(
+                    400,
+                    "AuthorizationHeaderMalformed",
+                    &client_error_message(err),
+                    "",
+                    wire_ids,
+                )
+            }
+            _ => Self::s3_control_error(
+                err.http_status(),
+                err.s3_error_code(),
+                &client_error_message(err),
+                "",
+                wire_ids,
+            ),
+        };
+        response.with_error_diagnostic(err)
     }
 
     /// Build a response for `PutBucketAbac` (200 OK, no body).

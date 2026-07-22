@@ -10955,6 +10955,17 @@ fn assert_list_tags_for_resource_success(label: &str, response: &RawResponse) {
     );
 }
 
+fn assert_empty_list_tags_for_resource_success(label: &str, response: &RawResponse) {
+    let expected_body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListTagsForResourceResult xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">\
+         <Tags/></ListTagsForResourceResult>";
+    assert_shape(label, response, &shape().status(200).headers(id_headers()));
+    assert_eq!(
+        response.body, expected_body,
+        "{label}: unexpected complete empty ListTagsForResource body"
+    );
+}
+
 fn assert_s3_control_write_success(label: &str, response: &RawResponse) {
     assert_shape(
         label,
@@ -11960,6 +11971,68 @@ fn run_list_tags_for_resource_success_probe(
         &s3_control_response,
     );
     println!("routing-list-tags-existing-s3-control: ok");
+
+    let untag_response = send_signed_request_for_service_with_credentials(
+        "DELETE",
+        &format!("{s3_control_endpoint}{path}?tagKeys=routing-key"),
+        b"",
+        [("x-amz-account-id", account_id)],
+        SigningService::S3Control,
+        "s3",
+        credentials,
+    );
+    assert_s3_control_write_success(
+        "routing-list-tags-empty-remove-fixture-tag",
+        &untag_response,
+    );
+
+    let empty_response = send_signed_request_for_service_with_credentials(
+        "GET",
+        &format!("{s3_control_endpoint}{path}"),
+        b"",
+        [("x-amz-account-id", account_id)],
+        SigningService::S3Control,
+        "s3",
+        credentials,
+    );
+
+    let fixture_tag_body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?><TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags><Tag><Key>routing-key</Key><Value>routing-value</Value></Tag></Tags></TagResourceRequest>";
+    let restore_response = send_signed_request_for_service_with_credentials(
+        "POST",
+        &format!("{s3_control_endpoint}{path}"),
+        fixture_tag_body,
+        [
+            ("content-type", "application/xml"),
+            ("x-amz-account-id", account_id),
+        ],
+        SigningService::S3Control,
+        "s3",
+        credentials,
+    );
+    assert_s3_control_write_success(
+        "routing-list-tags-empty-restore-fixture-tag",
+        &restore_response,
+    );
+    assert_empty_list_tags_for_resource_success(
+        "routing-list-tags-empty-s3-control",
+        &empty_response,
+    );
+    println!("routing-list-tags-empty-s3-control: ok");
+
+    let restored_response = send_signed_request_for_service_with_credentials(
+        "GET",
+        &format!("{s3_control_endpoint}{path}"),
+        b"",
+        [("x-amz-account-id", account_id)],
+        SigningService::S3Control,
+        "s3",
+        credentials,
+    );
+    assert_list_tags_for_resource_success(
+        "routing-list-tags-restored-s3-control",
+        &restored_response,
+    );
+    println!("routing-list-tags-restored-s3-control: ok");
 
     let overlong_tag_key = "x".repeat(129);
     let invalid_tag_message = "This request contains a tag key or value that isn't valid. Valid characters include the following: [a-zA-Z+-=._:/]. Tag keys can contain up to 128 characters. Tag values can contain up to 256 characters.";

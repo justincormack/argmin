@@ -953,6 +953,7 @@ fn bucket_tag_supported_for_action(action: PolicyAction) -> bool {
             | PolicyAction::PutLifecycleConfiguration
             | PolicyAction::PutBucketPublicAccessBlock
             | PolicyAction::PutBucketObjectLockConfiguration
+            | PolicyAction::ListTagsForResource
             | PolicyAction::TagResource
             | PolicyAction::UntagResource
     )

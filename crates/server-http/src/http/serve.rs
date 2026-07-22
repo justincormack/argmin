@@ -25,7 +25,10 @@ use super::request::{
     MAX_BUFFERED_CONTROL_BODY_SIZE,
 };
 use super::response::{S3Response, WireResponseIds};
-use super::router::{route, S3Operation};
+use super::router::{
+    route, route_service, EndpointKind, S3ControlOperation, S3Operation, ServiceOperation,
+    ServiceRouteError,
+};
 use super::s3_response_to_hyper;
 use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
@@ -229,6 +232,7 @@ struct ServerState {
     request_semaphore: Arc<Semaphore>,
     segment_buffer_pool: SegmentBufferPool,
     config: ServeConfig,
+    endpoint_kind: EndpointKind,
 }
 
 struct SegmentBufferPool {
@@ -523,6 +527,7 @@ pub async fn serve(
         max_connections,
         max_inflight_requests,
         config,
+        EndpointKind::S3Only,
         None,
     )
     .await;
@@ -542,6 +547,7 @@ pub async fn serve_tls(
         max_connections,
         max_inflight_requests,
         config,
+        EndpointKind::SharedRegional,
         Some(tls_acceptor),
     )
     .await;
@@ -553,8 +559,13 @@ async fn serve_plain_or_tls(
     max_connections: u32,
     max_inflight_requests: u32,
     config: ServeConfig,
+    endpoint_kind: EndpointKind,
     tls_acceptor: Option<TlsAcceptor>,
 ) {
+    assert!(
+        endpoint_kind != EndpointKind::SharedRegional || tls_acceptor.is_some(),
+        "SharedRegional endpoints require TLS"
+    );
     assert!(!frontends.is_empty(), "at least one frontend required");
     let host_id = frontends
         .first()
@@ -584,6 +595,7 @@ async fn serve_plain_or_tls(
         request_semaphore: Arc::new(Semaphore::new(max_inflight_requests as usize)),
         segment_buffer_pool: SegmentBufferPool::new(max_inflight_requests as usize),
         config,
+        endpoint_kind,
     });
 
     let conn_semaphore = Arc::new(Semaphore::new(max_connections as usize));
@@ -865,7 +877,7 @@ async fn handle(
     let (parts, body) = req.into_parts();
 
     // Check if this request should use the streaming write path.
-    let streaming_op = match is_streaming_write(&parts) {
+    let streaming_op = match is_streaming_write_for_endpoint(state.endpoint_kind, &parts) {
         Ok(op) => op,
         Err(err) => {
             // Routing has rejected a request whose body has not been
@@ -1075,7 +1087,7 @@ async fn handle(
         let wire_ids_for_blocking = wire_ids.clone();
         let resp = spawn_blocking_with_trace(trace, move || {
             let frontend = acquire_frontend(&state_ref);
-            frontend.handle_s3_request(&s3req, &wire_ids_for_blocking)
+            frontend.handle_service_request(state_ref.endpoint_kind, &s3req, &wire_ids_for_blocking)
         })
         .await
         .unwrap_or_else(|_| internal_error_response(&wire_ids));
@@ -1091,7 +1103,7 @@ async fn handle(
 
     // Non-streaming path: collect the full body for buffered control-plane
     // style requests (mostly XML payloads).
-    let body_limit = buffered_body_limit_for_request_parts(&parts);
+    let body_limit = buffered_body_limit_for_request_parts(state.endpoint_kind, &parts);
     let body_bytes =
         match collect_body_with_limit(body, state.config.body_idle_timeout, body_limit).await {
             Ok(bytes) => bytes,
@@ -1133,7 +1145,7 @@ async fn handle(
     let wire_ids_for_blocking = wire_ids.clone();
     let resp = spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state_ref);
-        frontend.handle_s3_request(&s3req, &wire_ids_for_blocking)
+        frontend.handle_service_request(state_ref.endpoint_kind, &s3req, &wire_ids_for_blocking)
     })
     .await
     .unwrap_or_else(|_| internal_error_response(&wire_ids));
@@ -1192,6 +1204,7 @@ fn local_debug_response(
                 body: body.into_bytes(),
                 stream: None,
                 error_diagnostic: None,
+                include_wire_ids: true,
             })
         }
         (&http::Method::POST, "/__argmin/debug/flight-recorder/dump") => {
@@ -1202,6 +1215,7 @@ fn local_debug_response(
                 body: Vec::new(),
                 stream: None,
                 error_diagnostic: None,
+                include_wire_ids: true,
             })
         }
         (&http::Method::GET, path)
@@ -1298,6 +1312,7 @@ fn local_debug_response(
                 body,
                 stream: None,
                 error_diagnostic: None,
+                include_wire_ids: true,
             })
         }
         _ => None,
@@ -1318,6 +1333,7 @@ fn local_debug_text_response(status_code: u16, body: String) -> S3Response {
         body: body.into_bytes(),
         stream: None,
         error_diagnostic: None,
+        include_wire_ids: true,
     }
 }
 
@@ -1931,6 +1947,13 @@ async fn append_actual_cors_headers(
 fn is_streaming_write(
     parts: &http::request::Parts,
 ) -> Result<Option<StreamingWriteOp>, ServerError> {
+    is_streaming_write_for_endpoint(EndpointKind::S3Only, parts)
+}
+
+fn is_streaming_write_for_endpoint(
+    endpoint_kind: EndpointKind,
+    parts: &http::request::Parts,
+) -> Result<Option<StreamingWriteOp>, ServerError> {
     if parts.method != http::Method::PUT {
         return Ok(None);
     }
@@ -1939,10 +1962,15 @@ fn is_streaming_write(
     let query = parts.uri.query().unwrap_or("");
     let method = parts.method.as_str();
 
-    let op = match route(method, path, query) {
-        Ok(op) => op,
-        Err(err @ ServerError::PutMultipartUploadMethodNotAllowed) => return Err(err),
-        Err(_) => return Ok(None),
+    let op = match route_service(endpoint_kind, method, path, query) {
+        Ok(ServiceOperation::S3(op)) => op,
+        Ok(ServiceOperation::S3Control(_)) | Err(ServiceRouteError::S3Control(_)) => {
+            return Ok(None);
+        }
+        Err(ServiceRouteError::S3(err @ ServerError::PutMultipartUploadMethodNotAllowed)) => {
+            return Err(err);
+        }
+        Err(ServiceRouteError::S3(_)) => return Ok(None),
     };
 
     // Check headers via hyper types (not yet parsed into S3Request). Do this
@@ -1970,14 +1998,29 @@ fn is_streaming_write(
     }
 }
 
-fn buffered_body_limit_for_request_parts(parts: &http::request::Parts) -> usize {
+fn buffered_body_limit_for_request_parts(
+    endpoint_kind: EndpointKind,
+    parts: &http::request::Parts,
+) -> usize {
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
     let method = parts.method.as_str();
-    let Ok(op) = route(method, path, query) else {
+    let Ok(op) = super::router::route_service(endpoint_kind, method, path, query) else {
         return MAX_BUFFERED_CONTROL_BODY_SIZE;
     };
-    buffered_body_limit_for_operation(&op)
+    match op {
+        ServiceOperation::S3(operation) => buffered_body_limit_for_operation(&operation),
+        ServiceOperation::S3Control(S3ControlOperation::TagResource { .. }) => {
+            MAX_TAGGING_XML_BYTES
+        }
+        ServiceOperation::S3Control(
+            S3ControlOperation::ListTagsForResource { .. }
+            | S3ControlOperation::UntagResource { .. }
+            | S3ControlOperation::HeadBucketTags
+            | S3ControlOperation::MethodNotAllowed { .. }
+            | S3ControlOperation::Options { .. },
+        ) => MAX_BUFFERED_CONTROL_BODY_SIZE,
+    }
 }
 
 fn buffered_body_limit_for_operation(op: &S3Operation) -> usize {
@@ -5265,19 +5308,19 @@ mod tests {
     fn buffered_body_limits_use_operation_specific_caps() {
         let parts = make_parts("PUT", "/bucket?encryption", &[]);
         assert_eq!(
-            buffered_body_limit_for_request_parts(&parts),
+            buffered_body_limit_for_request_parts(EndpointKind::S3Only, &parts),
             MAX_BUCKET_ENCRYPTION_CONFIGURATION_BYTES
         );
 
         let parts = make_parts("POST", "/bucket/key?uploadId=upload-id", &[]);
         assert_eq!(
-            buffered_body_limit_for_request_parts(&parts),
+            buffered_body_limit_for_request_parts(EndpointKind::S3Only, &parts),
             MAX_COMPLETE_MULTIPART_UPLOAD_XML_BYTES
         );
 
         let parts = make_parts("GET", "/bucket/key", &[]);
         assert_eq!(
-            buffered_body_limit_for_request_parts(&parts),
+            buffered_body_limit_for_request_parts(EndpointKind::S3Only, &parts),
             MAX_BUFFERED_CONTROL_BODY_SIZE
         );
     }
@@ -5470,6 +5513,7 @@ mod tests {
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(request_slots)),
             segment_buffer_pool: SegmentBufferPool::new(segment_buffer_pool_slots),
             config,
+            endpoint_kind: EndpointKind::S3Only,
         });
 
         let handle = tokio::spawn(async move {
@@ -6227,6 +6271,7 @@ Connection: close\r\n\r\n",
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
+            endpoint_kind: EndpointKind::S3Only,
         });
         let abort_guard = StreamingAbortGuard::new(&state);
         abort_guard.arm_post(&ctx);
@@ -6359,6 +6404,7 @@ Connection: close\r\n\r\n",
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
+            endpoint_kind: EndpointKind::S3Only,
         });
         let abort_guard = StreamingAbortGuard::new(&state);
         abort_guard.arm_part(&ctx);
@@ -9200,6 +9246,7 @@ Connection: close\r\n\r\n",
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
+            endpoint_kind: EndpointKind::S3Only,
         });
 
         let guard = StreamingAbortGuard::new(&state);
@@ -9424,6 +9471,7 @@ Connection: close\r\n\r\n",
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
+            endpoint_kind: EndpointKind::S3Only,
         });
 
         let guard = StreamingAbortGuard::new(&state);
@@ -9462,6 +9510,7 @@ Connection: close\r\n\r\n",
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
+            endpoint_kind: EndpointKind::S3Only,
         });
 
         let guard = StreamingAbortGuard::new(&state);
@@ -9517,6 +9566,7 @@ Connection: close\r\n\r\n",
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             segment_buffer_pool: SegmentBufferPool::new(8),
             config: ServeConfig::default(),
+            endpoint_kind: EndpointKind::S3Only,
         });
 
         let guard = StreamingAbortGuard::new(&state);

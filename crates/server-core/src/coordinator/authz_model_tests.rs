@@ -10477,7 +10477,6 @@ mod phase12_harness {
                                         owner_requester,
                                         None,
                                     ),
-                                    account_id: "111122223333",
                                 },
                                 config,
                                 request_tags: &[],

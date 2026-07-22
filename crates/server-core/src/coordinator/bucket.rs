@@ -12,10 +12,10 @@ use storage::{
 use super::trusted_bucket_name;
 use super::{
     AuthorizedDeleteBucket, AuthorizedHeadBucket, AuthorizedListBuckets, AuthorizedPutBucketAcl,
-    BucketCreateOutcome, BucketRequest, BucketSummary, BucketTagControlRequest, Coordinator,
-    CreateBucketAcl, CreateBucketRequest, GetBucketAclResult, ListBucketsRequest,
-    PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest, PutBucketConfigRequest,
-    PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
+    BucketCreateOutcome, BucketRequest, BucketSummary, BucketTagControlAction,
+    BucketTagControlRequest, Coordinator, CreateBucketAcl, CreateBucketRequest, GetBucketAclResult,
+    ListBucketsRequest, PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest,
+    PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
     PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
     PutBucketTagControlRequest, PutBucketTagsForUntagResourceRequest, PutBucketVersioningRequest,
     UntagBucketTagControlRequest, TRACE_TARGET,
@@ -816,15 +816,15 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_tags_for_tag_resource(
+    pub fn get_bucket_tags_for_control_action(
         &self,
         req: &BucketTagControlRequest<'_>,
         request_tags: &[(String, String)],
-        action: auth::PolicyAction,
+        action: BucketTagControlAction,
     ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_tags_for_tag_resource",
+            "Coordinator::get_bucket_tags_for_control_action",
             "bucket={:?}",
             req.bucket.name
         );

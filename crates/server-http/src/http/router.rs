@@ -7,12 +7,6 @@ use storage::{BucketName, ObjectKey};
 #[derive(Debug, PartialEq, Eq)]
 pub enum S3Operation {
     ListBuckets,
-    TagResource {
-        resource_arn: String,
-    },
-    UntagResource {
-        resource_arn: String,
-    },
     CreateBucket {
         bucket: BucketName,
     },
@@ -246,7 +240,7 @@ impl S3Operation {
 
     pub fn bucket_name(&self) -> Option<&BucketName> {
         match self {
-            Self::ListBuckets | Self::TagResource { .. } | Self::UntagResource { .. } => None,
+            Self::ListBuckets => None,
             Self::CreateBucket { bucket }
             | Self::DeleteBucket { bucket }
             | Self::HeadBucket { bucket }
@@ -311,6 +305,227 @@ impl S3Operation {
     }
 }
 
+/// Trusted local endpoint configuration. This value is selected by the
+/// listener entry point, never from `Host`, SNI, or another request field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EndpointKind {
+    /// Ordinary S3 only. This is the only endpoint kind available over HTTP.
+    S3Only,
+    /// One TLS listener serving S3 and the initial S3 Control surface. STS is
+    /// added to this endpoint after the bounded Query parser lands.
+    SharedRegional,
+}
+
+/// Service selected from the trusted endpoint and request target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceKind {
+    S3,
+    S3Control,
+}
+
+impl ServiceKind {
+    #[must_use]
+    pub const fn credential_scope_name(self) -> &'static str {
+        match self {
+            Self::S3 | Self::S3Control => "s3",
+        }
+    }
+
+    #[must_use]
+    pub fn canonical_signing_path(self, path: &str) -> String {
+        match self {
+            Self::S3 => path.to_string(),
+            Self::S3Control => path
+                .replacen("/v20180820/tags%2F", "/v20180820/tags/", 1)
+                .replacen("/v20180820/tags%2f", "/v20180820/tags/", 1),
+        }
+    }
+}
+
+/// Recognized S3 Control operations on the versioned tag-resource path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum S3ControlOperation {
+    ListTagsForResource { bucket: BucketName },
+    TagResource { bucket: BucketName },
+    UntagResource { bucket: BucketName },
+    HeadBucketTags,
+    MethodNotAllowed { method: String },
+    Options { bucket: BucketName },
+}
+
+/// S3 Control routing failures selected before service authentication.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum S3ControlRouteError {
+    InvalidUri { uri: String },
+    EmptyBadRequest,
+    FrontendBadRequest,
+}
+
+/// Routing failures retain the endpoint service family needed for rendering.
+#[derive(Debug)]
+pub(crate) enum ServiceRouteError {
+    S3(ServerError),
+    S3Control(S3ControlRouteError),
+}
+
+/// Service-level operation selected before authentication.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ServiceOperation {
+    S3(S3Operation),
+    S3Control(S3ControlOperation),
+}
+
+impl ServiceOperation {
+    #[must_use]
+    pub(crate) const fn service_kind(&self) -> ServiceKind {
+        match self {
+            Self::S3(_) => ServiceKind::S3,
+            Self::S3Control(_) => ServiceKind::S3Control,
+        }
+    }
+
+    #[must_use]
+    pub const fn s3(&self) -> Option<&S3Operation> {
+        match self {
+            Self::S3(operation) => Some(operation),
+            Self::S3Control(_) => None,
+        }
+    }
+}
+
+fn s3_control_resource_path(path: &str) -> Option<&str> {
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    trimmed
+        .strip_prefix("v20180820/tags/")
+        .or_else(|| trimmed.strip_prefix("v20180820/tags%2F"))
+        .or_else(|| trimmed.strip_prefix("v20180820/tags%2f"))
+}
+
+fn has_malformed_percent_triplet(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        if index + 2 >= bytes.len()
+            || !bytes[index + 1].is_ascii_hexdigit()
+            || !bytes[index + 2].is_ascii_hexdigit()
+        {
+            return true;
+        }
+        index += 3;
+    }
+    false
+}
+
+fn is_s3_control_candidate_path(path: &str) -> bool {
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let path = path.strip_prefix('/').unwrap_or(path);
+    let mut components = path.split('/');
+    let Some(version) = components.next() else {
+        return false;
+    };
+    let Some(resource_family) = components.next() else {
+        return version == "v20180820" && path.ends_with("/tags");
+    };
+    let version_shape = version.len() == 9
+        && matches!(version.as_bytes().first(), Some(b'v' | b'V'))
+        && version.as_bytes()[1..].iter().all(u8::is_ascii_digit);
+    version_shape && resource_family.starts_with("tag")
+}
+
+fn invalid_s3_control_uri(path: &str, decoded_resource: Option<&str>) -> String {
+    if let Some(decoded_resource) = decoded_resource {
+        if path.starts_with("/v20180820/tags/")
+            || path.starts_with("/v20180820/tags%2F")
+            || path.starts_with("/v20180820/tags%2f")
+        {
+            return format!("tags/{decoded_resource}");
+        }
+    }
+    path.to_string()
+}
+
+fn parse_s3_control_bucket_resource(
+    path: &str,
+    resource_path: &str,
+) -> Result<BucketName, S3ControlRouteError> {
+    if has_malformed_percent_triplet(path) {
+        return Err(S3ControlRouteError::EmptyBadRequest);
+    }
+    let resource_arn =
+        crate::http::request::percent_decode_strict(resource_path).map_err(|_| {
+            S3ControlRouteError::InvalidUri {
+                uri: path.to_string(),
+            }
+        })?;
+    let bucket = resource_arn
+        .strip_prefix("arn:aws:s3:::")
+        .filter(|bucket| !bucket.is_empty() && !bucket.contains('/'))
+        .and_then(|bucket| BucketName::try_from(bucket.to_string()).ok())
+        .ok_or_else(|| S3ControlRouteError::InvalidUri {
+            uri: invalid_s3_control_uri(path, Some(&resource_arn)),
+        })?;
+    Ok(bucket)
+}
+
+fn route_s3_control(method: &str, path: &str) -> Result<S3ControlOperation, S3ControlRouteError> {
+    if has_malformed_percent_triplet(path) {
+        return Err(S3ControlRouteError::EmptyBadRequest);
+    }
+    if matches!(method, "PROPFIND" | "X-ARGMIN-PROBE") {
+        return Err(S3ControlRouteError::FrontendBadRequest);
+    }
+    let Some(resource_path) = s3_control_resource_path(path) else {
+        let decoded = crate::http::request::percent_decode_strict(path).map_err(|_| {
+            S3ControlRouteError::InvalidUri {
+                uri: path.to_string(),
+            }
+        })?;
+        let uri = if let Some(relative) = decoded.strip_prefix("/v20180820/") {
+            relative.to_string()
+        } else {
+            path.to_string()
+        };
+        return Err(S3ControlRouteError::InvalidUri { uri });
+    };
+    let bucket = parse_s3_control_bucket_resource(path, resource_path)?;
+    match method {
+        "GET" => Ok(S3ControlOperation::ListTagsForResource { bucket }),
+        "POST" => Ok(S3ControlOperation::TagResource { bucket }),
+        "DELETE" => Ok(S3ControlOperation::UntagResource { bucket }),
+        "HEAD" => Ok(S3ControlOperation::HeadBucketTags),
+        "OPTIONS" => Ok(S3ControlOperation::Options { bucket }),
+        "PUT" | "PATCH" => Ok(S3ControlOperation::MethodNotAllowed {
+            method: method.to_string(),
+        }),
+        _ => Ok(S3ControlOperation::MethodNotAllowed {
+            method: method.to_string(),
+        }),
+    }
+}
+
+/// Route a request using only trusted listener configuration and its request
+/// target. Request authority text is deliberately absent from this API.
+pub(crate) fn route_service(
+    endpoint: EndpointKind,
+    method: &str,
+    path: &str,
+    query: &str,
+) -> Result<ServiceOperation, ServiceRouteError> {
+    if endpoint == EndpointKind::SharedRegional && is_s3_control_candidate_path(path) {
+        return route_s3_control(method, path)
+            .map(ServiceOperation::S3Control)
+            .map_err(ServiceRouteError::S3Control);
+    }
+
+    route(method, path, query)
+        .map(ServiceOperation::S3)
+        .map_err(ServiceRouteError::S3)
+}
+
 /// Validate an S3 bucket name per AWS rules.
 ///
 /// Rules enforced:
@@ -351,15 +566,6 @@ pub(crate) fn validate_object_key(key: &str) -> Result<(), ServerError> {
 pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, ServerError> {
     // Split path into segments
     let trimmed = path.strip_prefix('/').unwrap_or(path);
-
-    if let Some(resource_arn) = trimmed.strip_prefix("v20180820/tags/") {
-        let resource_arn = crate::http::request::percent_decode_strict(resource_arn)?;
-        return match method {
-            "POST" => Ok(S3Operation::TagResource { resource_arn }),
-            "DELETE" => Ok(S3Operation::UntagResource { resource_arn }),
-            _ => Err(ServerError::MethodNotAllowed),
-        };
-    }
 
     if trimmed.is_empty() {
         // Root path: GET / = ListBuckets
@@ -720,28 +926,62 @@ mod tests {
     }
 
     #[test]
-    fn tag_resource() {
+    fn shared_regional_routes_s3_control_operations_before_s3() {
+        let path = "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Abucket";
         assert_eq!(
-            route("POST", "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Abucket", "").unwrap(),
-            S3Operation::TagResource {
-                resource_arn: "arn:aws:s3:::bucket".to_string(),
-            }
+            route_service(EndpointKind::SharedRegional, "GET", path, "").unwrap(),
+            ServiceOperation::S3Control(S3ControlOperation::ListTagsForResource {
+                bucket: bucket_name("bucket"),
+            })
+        );
+        assert_eq!(
+            route_service(EndpointKind::SharedRegional, "POST", path, "").unwrap(),
+            ServiceOperation::S3Control(S3ControlOperation::TagResource {
+                bucket: bucket_name("bucket"),
+            })
+        );
+        assert_eq!(
+            route_service(
+                EndpointKind::SharedRegional,
+                "DELETE",
+                path,
+                "tagKeys=env&tagKeys=security"
+            )
+            .unwrap(),
+            ServiceOperation::S3Control(S3ControlOperation::UntagResource {
+                bucket: bucket_name("bucket"),
+            })
         );
     }
 
     #[test]
-    fn untag_resource() {
-        assert_eq!(
-            route(
-                "DELETE",
-                "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Abucket",
-                "tagKeys=env&tagKeys=security"
-            )
-            .unwrap(),
-            S3Operation::UntagResource {
-                resource_arn: "arn:aws:s3:::bucket".to_string(),
-            }
-        );
+    fn s3_only_endpoint_does_not_select_s3_control_from_reserved_path() {
+        let routed = route_service(
+            EndpointKind::S3Only,
+            "GET",
+            "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Abucket",
+            "",
+        )
+        .unwrap();
+        assert!(matches!(
+            routed,
+            ServiceOperation::S3(S3Operation::GetObject { .. })
+        ));
+    }
+
+    #[test]
+    fn shared_regional_accepts_encoded_s3_control_path_separator() {
+        assert!(matches!(
+            route_service(
+                EndpointKind::SharedRegional,
+                "GET",
+                "/v20180820/tags%2Farn%3Aaws%3As3%3A%3A%3Abucket",
+                "",
+            ),
+            Ok(ServiceOperation::S3Control(
+                S3ControlOperation::ListTagsForResource { .. }
+            ))
+        ));
     }
 
     #[test]

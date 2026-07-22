@@ -10715,7 +10715,6 @@ fn head_object_uses_validated_boe_policy_and_abac_tags_fast_path_when_warm() {
                     test_helpers::requester("111122223333"),
                     None,
                 ),
-                account_id: "111122223333",
             },
             config:
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
@@ -11491,7 +11490,6 @@ fn head_object_validates_independent_fast_path_before_stale_abac_tags() {
         .put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
             control: BucketTagControlRequest {
                 bucket: bucket_request_with_expected_owner(bucket, owner_requester, None),
-                account_id: owner_account,
             },
             config:
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
@@ -12631,7 +12629,6 @@ fn put_bucket_tags_invalidates_warm_fast_path_tags() {
         .put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
             control: BucketTagControlRequest {
                 bucket: bucket_request_with_expected_owner(bucket, owner_requester, None),
-                account_id: owner_account,
             },
             config:
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
