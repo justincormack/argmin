@@ -43,6 +43,9 @@ pub mod schema;
 pub mod shard_key_hash;
 #[allow(dead_code)]
 pub(crate) mod storage_rpc;
+// Activated by the Unix storage-RPC enforcement slice before TCP reuse.
+#[allow(dead_code)]
+pub(crate) mod storage_rpc_auth;
 pub mod types;
 
 // Narrow facades preserve the crate's established module paths while the

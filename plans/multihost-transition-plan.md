@@ -12269,7 +12269,24 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   and authorize the authenticated role before storage dispatch or mutation.
   Keep the authorization matrix explicit for frontend/coordinator,
   storage-node/repair, and maintenance operations rather than treating a valid
-  MAC as permission for every storage RPC.
+  MAC as permission for every storage RPC. The codec/policy foundation is now
+  implemented: it reuses the scoped symmetric credential primitive, binds the
+  complete existing storage frame plus topology/source/target/direction/request
+  identity, requires timestamp freshness, derives caller-bound service
+  response credentials, and rejects disallowed operations before signing or
+  dispatch verification. Authorization uses one exhaustive per-message-kind
+  role table for frontend, storage-node, admin, and maintenance principals;
+  new kinds require an explicit compile-time classification and valid-MAC
+  unauthorized frames still fail verification. Maintenance capabilities are
+  also checked against independent routine-checkpoint, lifecycle, and payload-
+  reclaim workflow manifests so a complete background workflow cannot be
+  blocked by a role split hidden behind its maintenance-only entry RPC. Raw
+  shard writes and transfer/bootstrap checkpoint installation remain denied to
+  maintenance. Because the full nested frame is covered, its route epoch,
+  PG/shard identity, command identity, and payload cannot be relabeled
+  independently. Runtime Unix enforcement and a composed authenticated Unix
+  maintenance-client regression remain open and must land before this item is
+  considered complete.
 - Wire that storage auth boundary into Unix clients/listeners first and make it
   mandatory in replicated mode. Add shared credential/test helpers and negative
   coverage for every storage RPC operation family: missing/malformed auth,

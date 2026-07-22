@@ -77,6 +77,7 @@ pub enum ControlPlaneAuthService {
     ControlPlane,
     RuntimeMap,
     Admin,
+    StorageRpc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -91,6 +92,8 @@ pub enum ControlPlaneAuthOperation {
     AdminControlPlaneCommand,
     RuntimeMapResponse,
     AdminControlPlaneResponse,
+    StorageRpcRequest { message_kind: u16 },
+    StorageRpcResponse { message_kind: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -275,6 +278,30 @@ impl ControlPlaneScopedCredential {
             credential_version: self.credential_version,
             principal: ControlPlaneAuthPrincipal::Service {
                 service: ControlPlaneAuthService::Admin,
+            },
+            secret: self.secret.clone(),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn storage_rpc_response_credential(&self) -> Result<Self, ControlPlaneError> {
+        if !matches!(
+            self.principal,
+            ControlPlaneAuthPrincipal::Frontend { .. }
+                | ControlPlaneAuthPrincipal::StorageNode { .. }
+                | ControlPlaneAuthPrincipal::Admin { .. }
+                | ControlPlaneAuthPrincipal::LocalMaintenance { .. }
+        ) {
+            return Err(auth_protocol_error(
+                "storage RPC response credential requires an internal caller credential",
+            ));
+        }
+        Self::new(ControlPlaneScopedCredentialInput {
+            cluster_id: self.cluster_id.clone(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            principal: ControlPlaneAuthPrincipal::Service {
+                service: ControlPlaneAuthService::StorageRpc,
             },
             secret: self.secret.clone(),
         })
@@ -977,6 +1004,7 @@ fn write_service(out: &mut Vec<u8>, service: ControlPlaneAuthService) {
             ControlPlaneAuthService::ControlPlane => 1,
             ControlPlaneAuthService::RuntimeMap => 3,
             ControlPlaneAuthService::Admin => 5,
+            ControlPlaneAuthService::StorageRpc => 6,
         },
     );
 }
@@ -988,6 +1016,7 @@ fn read_service(
         1 => Ok(ControlPlaneAuthService::ControlPlane),
         3 => Ok(ControlPlaneAuthService::RuntimeMap),
         5 => Ok(ControlPlaneAuthService::Admin),
+        6 => Ok(ControlPlaneAuthService::StorageRpc),
         tag => Err(auth_protocol_error(format!(
             "unknown control-plane auth service tag {tag}"
         ))),
@@ -995,21 +1024,26 @@ fn read_service(
 }
 
 fn write_operation(out: &mut Vec<u8>, operation: ControlPlaneAuthOperation) {
-    write_u8(
-        out,
-        match operation {
-            ControlPlaneAuthOperation::RaftAppendEntries => 1,
-            ControlPlaneAuthOperation::RaftVote => 2,
-            ControlPlaneAuthOperation::RaftPreVote => 3,
-            ControlPlaneAuthOperation::RaftSnapshot => 4,
-            ControlPlaneAuthOperation::RaftTransferLeader => 5,
-            ControlPlaneAuthOperation::StorageRuntimeMapRefresh => 7,
-            ControlPlaneAuthOperation::FrontendRuntimeMapRead => 8,
-            ControlPlaneAuthOperation::AdminControlPlaneCommand => 9,
-            ControlPlaneAuthOperation::RuntimeMapResponse => 10,
-            ControlPlaneAuthOperation::AdminControlPlaneResponse => 11,
-        },
-    );
+    let tag = match operation {
+        ControlPlaneAuthOperation::RaftAppendEntries => 1,
+        ControlPlaneAuthOperation::RaftVote => 2,
+        ControlPlaneAuthOperation::RaftPreVote => 3,
+        ControlPlaneAuthOperation::RaftSnapshot => 4,
+        ControlPlaneAuthOperation::RaftTransferLeader => 5,
+        ControlPlaneAuthOperation::StorageRuntimeMapRefresh => 7,
+        ControlPlaneAuthOperation::FrontendRuntimeMapRead => 8,
+        ControlPlaneAuthOperation::AdminControlPlaneCommand => 9,
+        ControlPlaneAuthOperation::RuntimeMapResponse => 10,
+        ControlPlaneAuthOperation::AdminControlPlaneResponse => 11,
+        ControlPlaneAuthOperation::StorageRpcRequest { .. } => 12,
+        ControlPlaneAuthOperation::StorageRpcResponse { .. } => 13,
+    };
+    write_u8(out, tag);
+    if let ControlPlaneAuthOperation::StorageRpcRequest { message_kind }
+    | ControlPlaneAuthOperation::StorageRpcResponse { message_kind } = operation
+    {
+        write_u16(out, message_kind);
+    }
 }
 
 fn read_operation(
@@ -1026,6 +1060,12 @@ fn read_operation(
         9 => Ok(ControlPlaneAuthOperation::AdminControlPlaneCommand),
         10 => Ok(ControlPlaneAuthOperation::RuntimeMapResponse),
         11 => Ok(ControlPlaneAuthOperation::AdminControlPlaneResponse),
+        12 => Ok(ControlPlaneAuthOperation::StorageRpcRequest {
+            message_kind: reader.read_u16()?,
+        }),
+        13 => Ok(ControlPlaneAuthOperation::StorageRpcResponse {
+            message_kind: reader.read_u16()?,
+        }),
         tag => Err(auth_protocol_error(format!(
             "unknown control-plane auth operation tag {tag}"
         ))),

@@ -78,6 +78,8 @@ use std::num::NonZeroU32;
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
 pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 3;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
+    4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
 pub(crate) const STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(1);
 pub(crate) const STORAGE_RPC_CLIENT_WRITE_TIMEOUT: std::time::Duration =
@@ -1051,7 +1053,7 @@ impl StorageRpcMessageKind {
         }
     }
 
-    fn from_u16(value: u16) -> Result<Self, StorageRpcFrameError> {
+    pub(crate) fn from_u16(value: u16) -> Result<Self, StorageRpcFrameError> {
         match value {
             1 => Ok(Self::Health),
             2 => Ok(Self::MetadataCommand),

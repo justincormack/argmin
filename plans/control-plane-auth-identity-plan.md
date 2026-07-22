@@ -71,7 +71,8 @@ The first version should define explicit internal principals:
   control-plane operations.
 - `Admin { instance_id }`: invokes internal admin/control-plane operations.
 - `LocalMaintenance { process_id }`: internal process-owned maintenance loops
-  such as lease expiry scans, checkpoint compaction, and debug/status reads.
+  such as lease expiry scans, checkpoint compaction, lifecycle expiry/abort,
+  payload reclaim, and debug/status reads.
 
 The principal set should be encoded as a versioned enum, not as free-form
 strings. Unknown roles fail closed.

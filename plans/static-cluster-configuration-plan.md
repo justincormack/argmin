@@ -1009,9 +1009,10 @@ Progress as of 2026-07-21:
   coverage includes source-specific all-Unix/all-TCP endpoint resolution,
   listener activation, safe pre-request failover, no automatic failover after
   a request may have been sent, and a composed authenticated TLS recovery RPC.
-  Replicated storage/frontend process mapping and storage RPC authentication
-  and TCP remain open, so this slice still does not claim a complete
-  cross-host data-plane workload.
+  The transport-independent storage RPC auth codec and role-policy foundation
+  is now implemented and tested, but replicated storage/frontend process
+  mapping, Unix enforcement, and storage RPC TCP remain open. This slice still
+  does not claim a complete cross-host data-plane workload.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state
@@ -1121,7 +1122,26 @@ Progress as of 2026-07-21:
      needed for startup, routing, diagnostics, and explicit clock recovery has
      a routable authenticated transport.
 7. **Storage RPC auth and TCP**
-   - implement the transport-independent storage authorization slice over Unix;
+   - implement the transport-independent storage authorization slice over Unix.
+     The bounded auth codec and authorization-policy foundation is implemented:
+     it reuses the scoped symmetric credential envelope, authenticates the
+     complete existing storage frame, and additionally binds topology
+     generation/digest, source principal, target storage node, operation kind,
+     request/response direction, request id, and a mandatory freshness window.
+     The complete nested frame binding covers its PG/shard route, epoch,
+     command identity, and payload without a second partial parser. Explicit
+     frontend, storage-node repair/peering, admin, and maintenance roles are
+     classified through one exhaustive per-kind capability table, so a new
+     message kind cannot compile without an authorization decision. Admin is
+     limited to the health probe. Local maintenance explicitly covers the
+     complete routine metadata-checkpoint, lifecycle expiry/abort, payload
+     reclaim, repair, backfill, and scavenger workflows while remaining unable
+     to issue raw frontend shard writes or storage-node transfer/bootstrap
+     checkpoint installation. Independent workflow manifests sign and verify
+     every required operation, alongside full role-by-kind and valid-MAC
+     unauthorized-frame tests. A composed real Unix maintenance-client test
+     lands with the still-open Unix client/listener enforcement and manifest
+     credential activation sub-slice;
    - reuse it unchanged over TCP; and
    - promote the cross-host workload to a complete data-plane release gate.
 
