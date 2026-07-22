@@ -4,7 +4,8 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, content_md5_header, create_objects, create_objects_with_keys,
-    delete_all_and_bucket, delete_objects_with_md5, err_status, send_signed_request,
+    delete_all_and_bucket, delete_objects_retrying_exact_operation_aborted_result,
+    delete_objects_with_md5, err_status, send_signed_request,
     shape::{assert_body_with_unordered_blocks, assert_shape, shape, xml_response_headers},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
@@ -130,12 +131,12 @@ async fn race_conditional_delete_objects_with_put(
     let delete_barrier = Arc::clone(&barrier);
     let delete_task = tokio::spawn(async move {
         delete_barrier.wait().await;
-        delete_client
-            .delete_objects()
-            .bucket(delete_bucket)
-            .delete(delete)
-            .send()
-            .await
+        delete_objects_retrying_exact_operation_aborted_result(
+            &delete_client,
+            &delete_bucket,
+            delete,
+        )
+        .await
     });
     let put_client = CTX.client().clone();
     let put_bucket = bucket.to_string();
@@ -894,12 +895,12 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         let batch_barrier = Arc::clone(&marker_barrier);
         let batch = tokio::spawn(async move {
             batch_barrier.wait().await;
-            batch_client
-                .delete_objects()
-                .bucket(batch_bucket)
-                .delete(marker_delete)
-                .send()
-                .await
+            delete_objects_retrying_exact_operation_aborted_result(
+                &batch_client,
+                &batch_bucket,
+                marker_delete,
+            )
+            .await
         });
         let competing_client = client.clone();
         let competing_bucket = bucket.clone();

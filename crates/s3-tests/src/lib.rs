@@ -13,6 +13,7 @@ pub use helpers::{
     create_bucket_with_sse_c_enabled, create_objects, create_objects_with_keys,
     create_public_bucket, create_public_write_bucket, delete_all_and_bucket,
     delete_bucket_retrying_operation_aborted, delete_object_retrying_operation_aborted,
+    delete_objects_retrying_exact_operation_aborted_result,
     delete_objects_retrying_operation_aborted, delete_objects_with_md5,
     disable_bucket_public_access_block, enable_bucket_sse_c, enable_bucket_versioning, err_status,
     eventually_raw_alt_object_status, expected_raw_bucket_location_constraint,

@@ -1088,8 +1088,60 @@ pub async fn delete_objects_retrying_operation_aborted(
     bucket: &str,
     delete: Delete,
 ) -> DeleteObjectsOutput {
-    const RETRY_DELAY: Duration = Duration::from_millis(100);
+    delete_objects_retrying_operation_contention_result(
+        client,
+        bucket,
+        delete,
+        OperationContentionRetryScope::OperationAbortedOrSlowDown,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("delete objects: {err:?}"))
+}
+
+/// Retry only whole-request and per-entry `OperationAborted` results from a
+/// DeleteObjects request, preserving successful entries across retries.
+pub async fn delete_objects_retrying_exact_operation_aborted_result(
+    client: &Client,
+    bucket: &str,
+    delete: Delete,
+) -> Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>> {
+    delete_objects_retrying_operation_contention_result(
+        client,
+        bucket,
+        delete,
+        OperationContentionRetryScope::OperationAbortedOnly,
+    )
+    .await
+}
+
+async fn delete_objects_retrying_operation_contention_result(
+    client: &Client,
+    bucket: &str,
+    delete: Delete,
+    scope: OperationContentionRetryScope,
+) -> Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>> {
     let deadline = std::time::Instant::now() + configured_test_timeout();
+    delete_objects_retrying_operation_contention_result_until(
+        delete,
+        scope,
+        deadline,
+        |request_delete| delete_objects_with_md5(client, bucket, request_delete).send(),
+    )
+    .await
+}
+
+async fn delete_objects_retrying_operation_contention_result_until<F, Fut>(
+    delete: Delete,
+    scope: OperationContentionRetryScope,
+    deadline: std::time::Instant,
+    mut send: F,
+) -> Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>>
+where
+    F: FnMut(Delete) -> Fut,
+    Fut: Future<
+        Output = Result<DeleteObjectsOutput, aws_sdk_s3::error::SdkError<DeleteObjectsError>>,
+    >,
+{
     let quiet = delete.quiet();
     let all_objects = delete.objects().to_vec();
     let mut pending = all_objects.clone();
@@ -1103,40 +1155,51 @@ pub async fn delete_objects_retrying_operation_aborted(
             .build()
             .unwrap();
 
-        let resp = match delete_objects_with_md5(client, bucket, request_delete)
-            .send()
-            .await
-        {
+        let resp = match send(request_delete).await {
             Ok(resp) => resp,
-            Err(err)
-                if is_retryable_operation_contention(&err)
-                    && std::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(RETRY_DELAY).await;
+            Err(err) if scope.includes_sdk_error(&err, false) => {
+                let Some(delay) =
+                    operation_contention_retry_delay(deadline, std::time::Instant::now())
+                else {
+                    return Err(err);
+                };
+                tokio::time::sleep(delay).await;
+                if std::time::Instant::now() >= deadline {
+                    return Err(err);
+                }
                 continue;
             }
-            Err(err) => panic!("delete objects: {err:?}"),
+            Err(err) => return Err(err),
         };
 
         deleted.extend(resp.deleted().iter().cloned());
 
         let mut retry = Vec::new();
+        let mut retry_errors = Vec::new();
         for error in resp.errors() {
-            if matches!(error.code(), Some("OperationAborted" | "SlowDown"))
-                && std::time::Instant::now() < deadline
-            {
+            if scope.includes(error.code()) {
                 retry.push(matching_delete_object(&all_objects, error));
+                retry_errors.push(error.clone());
             } else {
                 errors.push(error.clone());
             }
         }
 
         if retry.is_empty() {
-            return build_delete_objects_output(deleted, errors);
+            return Ok(build_delete_objects_output(deleted, errors));
         }
 
+        let Some(delay) = operation_contention_retry_delay(deadline, std::time::Instant::now())
+        else {
+            errors.extend(retry_errors);
+            return Ok(build_delete_objects_output(deleted, errors));
+        };
         pending = retry;
-        tokio::time::sleep(RETRY_DELAY).await;
+        tokio::time::sleep(delay).await;
+        if std::time::Instant::now() >= deadline {
+            errors.extend(retry_errors);
+            return Ok(build_delete_objects_output(deleted, errors));
+        }
     }
 }
 
@@ -2960,8 +3023,43 @@ pub fn is_sdk_stream_disconnect_or_status<E: std::fmt::Debug>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    fn fake_delete_objects_request(keys: &[&str]) -> Delete {
+        Delete::builder()
+            .set_objects(Some(
+                keys.iter()
+                    .map(|key| ObjectIdentifier::builder().key(*key).build().unwrap())
+                    .collect(),
+            ))
+            .quiet(false)
+            .build()
+            .unwrap()
+    }
+
+    fn fake_deleted_object(key: &str) -> DeletedObject {
+        DeletedObject::builder().key(key).build()
+    }
+
+    fn fake_delete_error(key: &str, code: &str) -> DeleteObjectError {
+        DeleteObjectError::builder()
+            .key(key)
+            .code(code)
+            .message("fake error")
+            .build()
+    }
+
+    fn fake_delete_objects_output(
+        deleted: Vec<DeletedObject>,
+        errors: Vec<DeleteObjectError>,
+    ) -> DeleteObjectsOutput {
+        DeleteObjectsOutput::builder()
+            .set_deleted((!deleted.is_empty()).then_some(deleted))
+            .set_errors((!errors.is_empty()).then_some(errors))
+            .build()
+    }
 
     #[derive(Clone)]
     struct FakeRetryBuilder {
@@ -3031,6 +3129,96 @@ mod tests {
             operation_contention_retry_delay(now, now + Duration::from_millis(1)),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn delete_objects_retry_preserves_successes_and_replays_only_operation_aborted_entries() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            fake_delete_objects_output(
+                vec![fake_deleted_object("canary")],
+                vec![
+                    fake_delete_error("target", "OperationAborted"),
+                    fake_delete_error("terminal", "PreconditionFailed"),
+                    fake_delete_error("slow", "SlowDown"),
+                ],
+            ),
+            fake_delete_objects_output(vec![fake_deleted_object("target")], Vec::new()),
+        ])));
+        let send_calls = Arc::clone(&calls);
+        let send_responses = Arc::clone(&responses);
+
+        let output = delete_objects_retrying_operation_contention_result_until(
+            fake_delete_objects_request(&["target", "canary", "terminal", "slow"]),
+            OperationContentionRetryScope::OperationAbortedOnly,
+            std::time::Instant::now() + Duration::from_secs(1),
+            move |delete| {
+                send_calls.lock().unwrap().push(
+                    delete
+                        .objects()
+                        .iter()
+                        .map(|object| object.key().to_string())
+                        .collect::<Vec<_>>(),
+                );
+                let response = send_responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("fake response for every send");
+                std::future::ready(Ok(response))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[vec!["target", "canary", "terminal", "slow"], vec!["target"],]
+        );
+        assert_eq!(
+            output
+                .deleted()
+                .iter()
+                .map(|deleted| deleted.key().unwrap())
+                .collect::<Vec<_>>(),
+            ["canary", "target"]
+        );
+        assert_eq!(
+            output
+                .errors()
+                .iter()
+                .map(|error| (error.key().unwrap(), error.code().unwrap()))
+                .collect::<Vec<_>>(),
+            [("terminal", "PreconditionFailed"), ("slow", "SlowDown"),]
+        );
+        assert!(responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_objects_retry_does_not_send_again_after_deadline() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let send_calls = Arc::clone(&calls);
+
+        let output = delete_objects_retrying_operation_contention_result_until(
+            fake_delete_objects_request(&["target"]),
+            OperationContentionRetryScope::OperationAbortedOnly,
+            std::time::Instant::now(),
+            move |_delete| {
+                send_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(fake_delete_objects_output(
+                    Vec::new(),
+                    vec![fake_delete_error("target", "OperationAborted")],
+                )))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(output.deleted().is_empty());
+        assert_eq!(output.errors().len(), 1);
+        assert_eq!(output.errors()[0].key(), Some("target"));
+        assert_eq!(output.errors()[0].code(), Some("OperationAborted"));
     }
 
     #[tokio::test]
