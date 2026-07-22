@@ -2467,11 +2467,7 @@ impl PgStore {
             "abort stream upload command (begin txn)",
             "abort stream upload command (commit txn)",
             |store| {
-                let session = match store.get_stream_upload(&command.session_id) {
-                    Ok(session) => session,
-                    Err(MetadataError::StreamSessionNotFound { .. }) => return Ok(()),
-                    Err(error) => return Err(error),
-                };
+                let session = store.get_stream_upload(&command.session_id)?;
                 if session.bucket != command.bucket || session.key != command.key {
                     return Err(MetadataError::Db {
                         context: "abort stream upload command session binding mismatch",
@@ -2481,6 +2477,22 @@ impl PgStore {
                 if session.state != StreamUploadState::InProgress {
                     return Err(MetadataError::StreamSessionNotInProgress {
                         state: session.state as u8,
+                    });
+                }
+                let reservation_matches = match (
+                    session.bucket_write_reservation.as_ref(),
+                    command.stream_create_bucket_write_reservation.as_ref(),
+                ) {
+                    (None, None) => true,
+                    (Some(session_proof), Some(command_proof)) => {
+                        session_proof.has_same_stable_identity(command_proof)
+                    }
+                    (None, Some(_)) | (Some(_), None) => false,
+                };
+                if !reservation_matches {
+                    return Err(MetadataError::Db {
+                        context: "abort stream upload command reservation mismatch",
+                        source: rusqlite::Error::InvalidQuery,
                     });
                 }
                 let staged_segments = store.list_stream_segments(&command.session_id)?;

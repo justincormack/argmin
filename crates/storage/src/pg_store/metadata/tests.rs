@@ -6269,6 +6269,87 @@ fn terminal_stream_upload_cleanup_record_excludes_allocator_floor() {
 }
 
 #[test]
+fn abort_stream_upload_command_binds_stable_reservation_identity() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("abort-stream-proof-bucket");
+    let key = trusted_object_key("abort-stream-proof-key");
+    let session_id = SessionId::try_from("ad".repeat(16)).unwrap();
+    let proof = test_bucket_write_reservation_proof(
+        &bucket,
+        &key,
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+    );
+    let session = StreamUploadRecord {
+        session_id: session_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        target: StreamUploadTarget::PutObject,
+        state: StreamUploadState::InProgress,
+        created_at: 123,
+        cleanup_after: None,
+        encryption: ObjectEncryption::None,
+        next_segment_vid: GenerationId::MIN,
+        bucket_write_reservation: Some(proof.clone()),
+    };
+    store
+        .create_stream_upload_explicit(
+            &StreamUploadCommandRecord::from(&session),
+            session.next_segment_vid,
+            session.cleanup_after,
+            session.bucket_write_reservation.as_ref(),
+        )
+        .unwrap();
+
+    let mut substituted_proof = proof.clone();
+    substituted_proof.reservation_id = "different-reservation".to_string();
+    let substituted = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            session_id: session_id.clone(),
+            staged_segments: Vec::new(),
+            stream_create_bucket_write_reservation: Some(substituted_proof),
+        })),
+    );
+    assert!(matches!(
+        store.apply_metadata_command(&substituted),
+        Err(MetadataError::Db {
+            context: "abort stream upload command reservation mismatch",
+            ..
+        })
+    ));
+    assert_eq!(store.get_stream_upload(&session_id).unwrap(), session);
+
+    let mut renewed_proof = proof;
+    renewed_proof.lease_deadline += 1_000;
+    let renewed = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
+            bucket,
+            key,
+            session_id: session_id.clone(),
+            staged_segments: Vec::new(),
+            stream_create_bucket_write_reservation: Some(renewed_proof),
+        })),
+    );
+    store.apply_metadata_command(&renewed).unwrap();
+    assert!(matches!(
+        store.get_stream_upload(&session_id),
+        Err(MetadataError::StreamSessionNotFound { .. })
+    ));
+}
+
+#[test]
 fn abort_multipart_command_accepts_lagging_stream_allocator_floor() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

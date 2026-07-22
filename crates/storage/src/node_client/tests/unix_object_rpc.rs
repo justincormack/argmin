@@ -4,10 +4,41 @@ use super::*;
 fn unix_retained_stream_abort_cleans_expired_route_session() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    config.pg_routes = vec![
+        StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: config.cluster_epoch,
+            state: crate::types::PgState::Active,
+            primary_node_id: config.node_id,
+            acting_set: vec![config.node_id],
+        },
+        StorageNodePgRoute {
+            pg_id: 1,
+            cluster_epoch: config.cluster_epoch,
+            state: crate::types::PgState::Active,
+            primary_node_id: config.node_id,
+            acting_set: vec![config.node_id],
+        },
+    ];
     config.route_map_validity =
         RouteMapValidity::until_ms(crate::clock::current_time_millis().saturating_sub(1)).unwrap();
-    let bucket = crate::tests::bucket_name("retained-stream-abort-bucket");
-    let key = crate::tests::object_key("retained-stream-abort-key");
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let (bucket, key, correct_pg_id) = (0..100)
+        .map(|index| {
+            let bucket = crate::tests::bucket_name(format!("retained-stream-abort-bucket-{index}"));
+            let key = crate::tests::object_key(format!("retained-stream-abort-key-{index}"));
+            let pg_id = node.pg_topology().object_pg_for(&bucket, &key);
+            (bucket, key, pg_id)
+        })
+        .find(|(_, _, pg_id)| *pg_id < 2)
+        .expect("two-PG topology must place a test object");
+    let wrong_pg_id = if correct_pg_id == 0 { 1 } else { 0 };
     let session_id = crate::tests::stream_session_id("retained-abort");
     let segment = StreamUploadSegmentRecord {
         session_id: session_id.clone(),
@@ -22,14 +53,8 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         ec_k: 1,
         ec_m: 0,
     };
-    {
-        let node = SharedStorageNode::open_with_default_ec_shape(
-            &config.data_dir,
-            &config.pg_ids,
-            config.default_ec_shape,
-        )
-        .unwrap();
-        let pg = node.get_pg(0).unwrap();
+    for pg_id in [correct_pg_id, wrong_pg_id] {
+        let pg = node.get_pg(pg_id).unwrap();
         PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &session_id).unwrap();
         PgMetadataStore::create_stream_upload(
             &*pg,
@@ -45,10 +70,88 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         PgMetadataStore::append_stream_segment(&*pg, &segment).unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
     }
+    let wrong_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            config.cluster_epoch,
+            PgId::new(wrong_pg_id),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::AbortStreamUpload(Box::new(
+            crate::metadata_command::AbortStreamUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: session_id.clone(),
+                staged_segments: vec![segment.clone()],
+                stream_create_bucket_write_reservation: None,
+            },
+        )),
+    );
+    node.get_pg(wrong_pg_id)
+        .unwrap()
+        .try_insert_pending_metadata_command_slot(
+            config.node_id.as_u32(),
+            &wrong_command,
+            Some(&bucket),
+        )
+        .unwrap();
+    let part_upload_id = crate::tests::multipart_upload_id("retained-abort-upload");
+    let part_session_id = crate::tests::stream_session_id("retained-part");
+    let part_segment = StreamUploadSegmentRecord {
+        session_id: part_session_id.clone(),
+        segment_index: 0,
+        size: 23,
+        segment_crc64: 43,
+        payload_crc64: 43,
+        segment_okh: [0x62; 16],
+        segment_vid: GenerationId::new(3).unwrap(),
+        data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: 1,
+        ec_m: 0,
+    };
+    {
+        let pg = node.get_pg(correct_pg_id).unwrap();
+        PgMetadataStore::create_multipart_upload(
+            &*pg,
+            &CreateMultipartUploadReq {
+                upload_id: part_upload_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                tags: None,
+                metadata_blob: SerializedMetadataBlob::default(),
+                system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                initiator: OwnerIdentity::from_principal("owner"),
+                owner: OwnerIdentity::from_principal("owner"),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                object_lock: ObjectLockState::default(),
+                checksum: None,
+                encryption: ObjectEncryption::None,
+            },
+        )
+        .unwrap();
+        PgMetadataStore::create_stream_upload(
+            &*pg,
+            &CreateStreamUploadReq {
+                session_id: part_session_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                target: StreamUploadTarget::UploadPart {
+                    upload_id: part_upload_id.clone(),
+                    part_number: 1,
+                },
+                encryption: ObjectEncryption::None,
+            },
+        )
+        .unwrap();
+        PgMetadataStore::append_stream_segment(&*pg, &part_segment).unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+    drop(node);
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..4)
+    let server_threads: Vec<_> = (0..10)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -59,11 +162,12 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         config.cluster_epoch,
         config.socket_path.clone(),
     );
-    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    let correct_pg = ObjectMetadataPgId::new_for_test(PgId::new(correct_pg_id));
+    let wrong_pg = ObjectMetadataPgId::new_for_test(PgId::new(wrong_pg_id));
 
     let active_error = ObjectMutationMetadataNodeClient::load_stream_upload_session(
         &client,
-        pg_id,
+        correct_pg,
         &bucket,
         &key,
         &session_id,
@@ -77,9 +181,46 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         })
     ));
 
+    assert!(matches!(
+        ObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
+            &client,
+            wrong_pg,
+            config.cluster_epoch,
+            &bucket,
+            &key,
+            &session_id,
+        ),
+        Err(ObjectPgActionError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        MetadataCommandNodeClient::apply_retained_stream_upload_abort(
+            &client,
+            PgId::new(wrong_pg_id),
+            &wrong_command,
+        ),
+        Err(BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        MetadataCommandNodeClient::finish_retained_stream_upload_abort(
+            &client,
+            PgId::new(wrong_pg_id),
+            &wrong_command,
+        ),
+        Err(StoreError::StorageRpc {
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
     let command = ObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
         &client,
-        pg_id,
+        correct_pg,
         config.cluster_epoch,
         &bucket,
         &key,
@@ -93,15 +234,53 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             if abort.bucket == bucket
                 && abort.key == key
                 && abort.session_id == session_id
-                && abort.staged_segments == vec![segment]
+                && abort.staged_segments == vec![segment.clone()]
     ));
-    MetadataCommandNodeClient::apply_retained_stream_upload_abort(&client, PgId::new(0), &command)
-        .unwrap();
+    MetadataCommandNodeClient::apply_retained_stream_upload_abort(
+        &client,
+        PgId::new(correct_pg_id),
+        &command,
+    )
+    .unwrap();
     assert!(
         MetadataCommandNodeClient::finish_retained_stream_upload_abort(
             &client,
-            PgId::new(0),
+            PgId::new(correct_pg_id),
             &command,
+        )
+        .unwrap()
+    );
+
+    let part_command = ObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
+        &client,
+        correct_pg,
+        config.cluster_epoch,
+        &bucket,
+        &key,
+        &part_session_id,
+    )
+    .unwrap()
+    .expect("expired-route retained cleanup must prepare the UploadPart abort");
+    assert!(matches!(
+        part_command.payload(),
+        MetadataCommandPayload::AbortStreamUpload(abort)
+            if abort.bucket == bucket
+                && abort.key == key
+                && abort.session_id == part_session_id
+                && abort.staged_segments == vec![part_segment.clone()]
+                && abort.stream_create_bucket_write_reservation.is_none()
+    ));
+    MetadataCommandNodeClient::apply_retained_stream_upload_abort(
+        &client,
+        PgId::new(correct_pg_id),
+        &part_command,
+    )
+    .unwrap();
+    assert!(
+        MetadataCommandNodeClient::finish_retained_stream_upload_abort(
+            &client,
+            PgId::new(correct_pg_id),
+            &part_command,
         )
         .unwrap()
     );
@@ -115,7 +294,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         config.default_ec_shape,
     )
     .unwrap();
-    let pg = node.get_pg(0).unwrap();
+    let pg = node.get_pg(correct_pg_id).unwrap();
     assert!(matches!(
         PgMetadataStore::get_stream_upload(&*pg, &session_id),
         Err(MetadataError::StreamSessionNotFound { .. })
@@ -131,6 +310,135 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
         .pending_metadata_command_slot(config.node_id.as_u32(), config.cluster_epoch)
         .unwrap()
         .is_none());
+    assert!(matches!(
+        PgMetadataStore::get_stream_upload(&*pg, &part_session_id),
+        Err(MetadataError::StreamSessionNotFound { .. })
+    ));
+    assert!(
+        PgMetadataStore::list_stream_segments(&*pg, &part_session_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        PgMetadataStore::get_multipart_upload(&*pg, &part_upload_id)
+            .unwrap()
+            .state,
+        UploadState::InProgress
+    );
+
+    let wrong_pg = node.get_pg(wrong_pg_id).unwrap();
+    assert_eq!(
+        PgMetadataStore::get_stream_upload(&*wrong_pg, &session_id)
+            .unwrap()
+            .state,
+        StreamUploadState::InProgress
+    );
+    assert_eq!(
+        PgMetadataStore::list_stream_segments(&*wrong_pg, &session_id).unwrap(),
+        vec![segment]
+    );
+    assert_eq!(
+        wrong_pg
+            .pending_metadata_command_envelope(config.node_id.as_u32(), config.cluster_epoch)
+            .unwrap(),
+        Some(wrong_command)
+    );
+}
+
+#[test]
+fn unix_retained_stream_abort_prepare_response_binds_reservation_subject() {
+    let tmp = test_util::tempdir();
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::INITIAL,
+        tmp.path().join("unused.sock"),
+    );
+    let bucket = crate::tests::bucket_name("retained-abort-response-bucket");
+    let key = crate::tests::object_key("retained-abort-response-key");
+    let session_id = crate::tests::stream_session_id("abort-response");
+    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    proof.operation_kind =
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id.pg_id(),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::AbortStreamUpload(Box::new(
+            crate::metadata_command::AbortStreamUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: session_id.clone(),
+                staged_segments: Vec::new(),
+                stream_create_bucket_write_reservation: Some(proof.clone()),
+            },
+        )),
+    );
+    client
+        .validate_retained_stream_upload_abort_prepare_command(
+            &command,
+            pg_id,
+            ClusterEpoch::INITIAL,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap();
+
+    proof.operation_kind =
+        crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+    let upload_part_command = MetadataCommandEnvelope::new(
+        command.id(),
+        MetadataCommandPayload::AbortStreamUpload(Box::new(
+            crate::metadata_command::AbortStreamUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: session_id.clone(),
+                staged_segments: Vec::new(),
+                stream_create_bucket_write_reservation: Some(proof.clone()),
+            },
+        )),
+    );
+    client
+        .validate_retained_stream_upload_abort_prepare_command(
+            &upload_part_command,
+            pg_id,
+            ClusterEpoch::INITIAL,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap();
+
+    proof.operation_kind = "put-object".to_string();
+    let malformed = MetadataCommandEnvelope::new(
+        command.id(),
+        MetadataCommandPayload::AbortStreamUpload(Box::new(
+            crate::metadata_command::AbortStreamUploadCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id: session_id.clone(),
+                staged_segments: Vec::new(),
+                stream_create_bucket_write_reservation: Some(proof),
+            },
+        )),
+    );
+    assert!(matches!(
+        client.validate_retained_stream_upload_abort_prepare_command(
+            &malformed,
+            pg_id,
+            ClusterEpoch::INITIAL,
+            &bucket,
+            &key,
+            &session_id,
+        ),
+        Err(ObjectPgActionError::Store(StoreError::StorageRpc {
+            operation: "validate retained stream upload abort prepare response",
+            ..
+        }))
+    ));
 }
 
 #[test]

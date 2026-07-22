@@ -2100,6 +2100,48 @@ Fortieth Phase 3 slice:
   workspace-wide strict Clippy, plus the full parallel workspace suite (7,483
   tests).
 
+Forty-first Phase 3 slice:
+
+- retained stream-upload cleanup now enters storage through explicit retained
+  route capabilities rather than separately validating decoded route fields
+  before raw local-client calls. Prepare and pending-slot finish require the
+  retained historical primary; replica application requires an admitted
+  retained acting-set member. Each effect revalidates the retained admission
+  domain, active historical route, role, object placement, cluster epoch,
+  command PG, command kind, bucket/key/session subject, staged-segment subject,
+  and optional stream-create reservation subject immediately before node
+  access.
+- abort command application now centrally binds the optional stream-create
+  reservation to the proof persisted in the durable stream session. The
+  comparison uses the complete stable reservation identity while deliberately
+  excluding the renewable lease deadline, so a primary heartbeat followed by
+  replica application remains convergent. Missing, added, or substituted
+  proofs fail closed before session or segment mutation on every ordinary,
+  recovery, and retained-cleanup application path.
+- the Unix response validator independently rejects returned abort commands
+  whose command route, segment sessions, or reservation operation/target do
+  not match the requested cleanup subject. Its syntactic operation check
+  accepts both canonical stream-create operations. UploadPart create proofs
+  are transient command authority and are not persisted on the stream session,
+  so ordinary retained UploadPart abort commands remain proofless; any supplied
+  proof must still match the durable session exactly at central application.
+- the expired-route Unix regression now seeds equivalent sessions, staged
+  segments, generation reservations, and an exact pending abort on both object
+  PGs. Wrong-PG prepare, apply, and finish calls must return `PayloadDecode`,
+  after which the complete wrong-PG state remains exact; correct-PG retained
+  cleanup remains a positive canary. A PgStore command-dispatch regression
+  rejects an otherwise-valid same-key proof substitution without mutation and
+  accepts the same stable proof with a replica-lagging lease deadline. The same
+  expired-route Unix workflow also cleans a staged UploadPart stream while
+  preserving its in-progress multipart upload.
+- payload reclaim, PG-wide listing scans, data operations, frontend capability
+  migration, and capability requirements on node-client traits remain open in
+  Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  retained-cleanup and central command-application regressions, all 2,224
+  storage tests, workspace-wide strict Clippy, and the full parallel workspace
+  suite (7,485 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

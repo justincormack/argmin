@@ -1226,6 +1226,14 @@ pub(crate) const DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND: &str = "dele
 pub(crate) const DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND: &str = "delete-object-version";
 pub(crate) const INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND: &str = "insert-delete-marker";
 
+pub(crate) fn is_stream_create_bucket_write_operation_kind(operation_kind: &str) -> bool {
+    matches!(
+        operation_kind,
+        PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+            | UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND
+    )
+}
+
 impl From<&BucketWriteReservationRecord> for BucketWriteReservationProof {
     fn from(record: &BucketWriteReservationRecord) -> Self {
         Self {

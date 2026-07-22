@@ -2164,6 +2164,14 @@ fn stream_abort_matching_pending_install_race_returns_success() {
             crate::ObjectEncryption::None,
         )
         .unwrap();
+    let stream_create_bucket_write_reservation = {
+        let node = map.node(NodeId::new(1)).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        crate::PgMetadataStore::get_stream_upload(&*pg, &session_id)
+            .unwrap()
+            .bucket_write_reservation
+    };
+    assert!(stream_create_bucket_write_reservation.is_some());
 
     let pg_id = PgId::new(object_pg);
     let command = MetadataCommandEnvelope::new(
@@ -2177,7 +2185,7 @@ fn stream_abort_matching_pending_install_race_returns_success() {
             key: key.clone(),
             session_id: session_id.clone(),
             staged_segments: Vec::new(),
-            stream_create_bucket_write_reservation: None,
+            stream_create_bucket_write_reservation,
         })),
     );
     let inserted = Arc::new(AtomicBool::new(false));

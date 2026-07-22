@@ -24,8 +24,9 @@ use crate::control_plane_lease::{
 use crate::data_dir::prepare_private_data_dir;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
-    PutObjectMetadataMutation, ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    is_stream_create_bucket_write_operation_kind, MetadataCommandEnvelope, MetadataCommandId,
+    MetadataCommandLogIndex, MetadataCommandPayload, PutObjectMetadataMutation,
+    ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
@@ -3142,6 +3143,16 @@ enum StorageNodeMultipartUploadRouteError {
     Upload(BucketSnapshotLoadError),
 }
 
+enum StorageNodeRetainedStreamAbortApplyError {
+    Route(StorageRpcErrorResponse),
+    Apply(BucketSnapshotLoadError),
+}
+
+enum StorageNodeRetainedStreamAbortFinishError {
+    Route(StorageRpcErrorResponse),
+    Finish(StoreError),
+}
+
 struct StorageNodeActiveBucketRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     _route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -3216,6 +3227,44 @@ struct StorageNodeRetainedLifecycleSweepClaimRoute<'a> {
     raw_pg_id: PgId,
     pg_id: BucketPgId,
     claim: &'a LifecycleSweepClaimRecord,
+}
+
+struct StorageNodeRetainedStreamAbortRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    route_permit: &'a StorageNodeRouteAdmissionPermit,
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    pg_id: ObjectMetadataPgId,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+}
+
+struct StorageNodeRetainedStreamAbortSubject<'a> {
+    node_id: NodeId,
+    route_cluster_epoch: ClusterEpoch,
+    raw_pg_id: PgId,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+}
+
+struct StorageNodeRetainedPrimaryStreamAbortRoute<'a> {
+    route: StorageNodeRetainedStreamAbortRoute<'a>,
+}
+
+struct StorageNodeRetainedPrimaryStreamAbortSessionRoute<'a> {
+    route: StorageNodeRetainedPrimaryStreamAbortRoute<'a>,
+    session_id: &'a SessionId,
+}
+
+struct StorageNodeRetainedStreamAbortCommandRoute<'a> {
+    route: StorageNodeRetainedStreamAbortRoute<'a>,
+    command: &'a MetadataCommandEnvelope,
+}
+
+struct StorageNodeRetainedPrimaryStreamAbortCommandRoute<'a> {
+    route: StorageNodeRetainedPrimaryStreamAbortRoute<'a>,
+    command: &'a MetadataCommandEnvelope,
 }
 
 impl StorageNodeActiveBucketRoute<'_> {
@@ -5354,6 +5403,104 @@ impl StorageNodeRetainedLifecycleSweepClaimRoute<'_> {
             self.claim,
         )
         .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+}
+
+impl StorageNodeRetainedStreamAbortRoute<'_> {
+    fn require_valid_now(&self, operation: &'static str) -> Result<(), StorageRpcErrorResponse> {
+        self.handler.validate_retained_stream_abort_object_route(
+            self.route_permit,
+            &StorageRpcObjectRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.route_cluster_epoch,
+                pg_id: self.raw_pg_id,
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+            },
+            false,
+            operation,
+        )
+    }
+}
+
+impl StorageNodeRetainedPrimaryStreamAbortRoute<'_> {
+    fn require_valid_now(&self, operation: &'static str) -> Result<(), StorageRpcErrorResponse> {
+        self.route
+            .handler
+            .validate_retained_stream_abort_object_route(
+                self.route.route_permit,
+                &StorageRpcObjectRequest {
+                    node_id: self.route.node_id,
+                    cluster_epoch: self.route.route_cluster_epoch,
+                    pg_id: self.route.raw_pg_id,
+                    bucket: self.route.bucket.clone(),
+                    key: self.route.key.clone(),
+                },
+                true,
+                operation,
+            )
+    }
+}
+
+impl StorageNodeRetainedPrimaryStreamAbortSessionRoute<'_> {
+    fn prepare(self) -> Result<Option<MetadataCommandEnvelope>, StorageNodeObjectRouteError> {
+        self.route
+            .require_valid_now("retained stream abort prepare")
+            .map_err(StorageNodeObjectRouteError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.route.handler.config.node_id,
+            Arc::clone(&self.route.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
+            &local_client,
+            self.route.route.pg_id,
+            self.route.route.route_cluster_epoch,
+            self.route.route.bucket,
+            self.route.route.key,
+            self.session_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+}
+
+impl StorageNodeRetainedStreamAbortCommandRoute<'_> {
+    fn apply(
+        self,
+    ) -> Result<
+        crate::metadata_command::MetadataCommandReplicaState,
+        StorageNodeRetainedStreamAbortApplyError,
+    > {
+        self.route
+            .require_valid_now("retained stream abort apply")
+            .map_err(StorageNodeRetainedStreamAbortApplyError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        MetadataCommandNodeClient::apply_retained_stream_upload_abort(
+            &local_client,
+            self.route.raw_pg_id,
+            self.command,
+        )
+        .map_err(StorageNodeRetainedStreamAbortApplyError::Apply)
+    }
+}
+
+impl StorageNodeRetainedPrimaryStreamAbortCommandRoute<'_> {
+    fn finish(self) -> Result<bool, StorageNodeRetainedStreamAbortFinishError> {
+        self.route
+            .require_valid_now("retained stream abort finish")
+            .map_err(StorageNodeRetainedStreamAbortFinishError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.route.handler.config.node_id,
+            Arc::clone(&self.route.route.handler.node),
+        );
+        MetadataCommandNodeClient::finish_retained_stream_upload_abort(
+            &local_client,
+            self.route.route.raw_pg_id,
+            self.command,
+        )
+        .map_err(StorageNodeRetainedStreamAbortFinishError::Finish)
     }
 }
 
@@ -8808,29 +8955,24 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcStreamUploadSessionRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_retained_stream_abort_object_route(
+        let route = match self.retained_primary_stream_abort_session_route(
             route_permit,
-            &request.object,
-            true,
+            &request,
             "retained stream abort prepare",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.object.pg_id);
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let outcome = match ObjectMutationMetadataNodeClient::prepare_retained_stream_upload_abort(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            request.object.cluster_epoch,
-            &request.object.bucket,
-            &request.object.key,
-            &request.session_id,
-        ) {
+        let outcome = match route.prepare() {
             Ok(Some(command)) => {
                 StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(command))
             }
             Ok(None) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 match object_metadata_command_build_error_outcome(error, Some("AbortStreamUpload"))
                 {
                     Ok(outcome) => outcome,
@@ -12566,32 +12708,29 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_retained_stream_abort_command_route(
+        let route = match self.retained_stream_abort_command_route(
             route_permit,
             &request,
-            false,
             "retained stream abort apply",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let response = match MetadataCommandNodeClient::apply_retained_stream_upload_abort(
-            &local_client,
-            request.pg_id,
-            &request.command,
-        ) {
+        let response = match route.apply() {
             Ok(state) => encode_metadata_command_state_outcome_response(
                 &StorageRpcMetadataCommandStateOutcomeResponse {
                     outcome: StorageRpcMetadataCommandStateOutcome::State(state),
                 },
             ),
-            Err(BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id,
-                cluster_epoch,
-                log_index,
-            })) => encode_metadata_command_state_outcome_response(
+            Err(StorageNodeRetainedStreamAbortApplyError::Apply(
+                BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                }),
+            )) => encode_metadata_command_state_outcome_response(
                 &StorageRpcMetadataCommandStateOutcomeResponse {
                     outcome: StorageRpcMetadataCommandStateOutcome::LogConflict {
                         node_id,
@@ -12601,7 +12740,10 @@ impl StorageNodeConnectionHandler {
                     },
                 },
             ),
-            Err(error) => {
+            Err(StorageNodeRetainedStreamAbortApplyError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error);
+            }
+            Err(StorageNodeRetainedStreamAbortApplyError::Apply(error)) => {
                 return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::Internal,
                     message: error.to_string(),
@@ -12617,23 +12759,23 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_retained_stream_abort_command_route(
+        let route = match self.retained_primary_stream_abort_command_route(
             route_permit,
             &request,
-            true,
             "retained stream abort finish",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let removed = match MetadataCommandNodeClient::finish_retained_stream_upload_abort(
-            &local_client,
-            request.pg_id,
-            &request.command,
-        ) {
+        let removed = match route.finish() {
             Ok(removed) => removed,
-            Err(error) => return encode_storage_rpc_error_response(&store_error_response(error)),
+            Err(StorageNodeRetainedStreamAbortFinishError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeRetainedStreamAbortFinishError::Finish(error)) => {
+                return encode_storage_rpc_error_response(&store_error_response(error))
+            }
         };
         let payload = encode_metadata_command_pending_slot_remove_response(
             &StorageRpcMetadataCommandPendingSlotRemoveResponse { removed },
@@ -14860,32 +15002,167 @@ impl StorageNodeConnectionHandler {
         self.validate_pg_for_object(object.pg_id, &object.bucket, &object.key, operation)
     }
 
-    fn validate_retained_stream_abort_command_route(
-        &self,
-        route_permit: &StorageNodeRouteAdmissionPermit,
-        request: &StorageRpcMetadataCommandRequest,
+    fn retained_stream_abort_route_with_primary<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        subject: StorageNodeRetainedStreamAbortSubject<'a>,
         require_primary: bool,
         operation: &'static str,
-    ) -> Result<(), StorageRpcErrorResponse> {
+    ) -> Result<StorageNodeRetainedStreamAbortRoute<'a>, StorageRpcErrorResponse> {
+        self.validate_retained_stream_abort_object_route(
+            route_permit,
+            &StorageRpcObjectRequest {
+                node_id: subject.node_id,
+                cluster_epoch: subject.route_cluster_epoch,
+                pg_id: subject.raw_pg_id,
+                bucket: subject.bucket.clone(),
+                key: subject.key.clone(),
+            },
+            require_primary,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedStreamAbortRoute {
+            handler: self,
+            route_permit,
+            node_id: subject.node_id,
+            route_cluster_epoch: subject.route_cluster_epoch,
+            raw_pg_id: subject.raw_pg_id,
+            pg_id: self
+                .node
+                .object_metadata_pg_for(subject.bucket, subject.key),
+            bucket: subject.bucket,
+            key: subject.key,
+        })
+    }
+
+    fn retained_primary_stream_abort_session_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcStreamUploadSessionRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedPrimaryStreamAbortSessionRoute<'a>, StorageRpcErrorResponse>
+    {
+        let route = self.retained_stream_abort_route_with_primary(
+            route_permit,
+            StorageNodeRetainedStreamAbortSubject {
+                node_id: request.object.node_id,
+                route_cluster_epoch: request.object.cluster_epoch,
+                raw_pg_id: request.object.pg_id,
+                bucket: &request.object.bucket,
+                key: &request.object.key,
+            },
+            true,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedPrimaryStreamAbortSessionRoute {
+            route: StorageNodeRetainedPrimaryStreamAbortRoute { route },
+            session_id: &request.session_id,
+        })
+    }
+
+    fn validate_retained_stream_abort_command_subject<'a>(
+        request: &'a StorageRpcMetadataCommandRequest,
+        operation: &'static str,
+    ) -> Result<&'a crate::metadata_command::AbortStreamUploadCommand, StorageRpcErrorResponse>
+    {
         validate_metadata_command_request_epoch(request)?;
+        if request.command.id().pg_id() != request.pg_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} command PG {} does not match request route PG {}",
+                    request.command.id().pg_id().get(),
+                    request.pg_id.get()
+                ),
+            });
+        }
         let MetadataCommandPayload::AbortStreamUpload(abort) = request.command.payload() else {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::PayloadDecode,
                 message: format!("{operation} accepts only AbortStreamUpload commands"),
             });
         };
-        self.validate_retained_stream_abort_object_route(
+        if abort
+            .staged_segments
+            .iter()
+            .any(|segment| segment.session_id != abort.session_id)
+        {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} staged segment does not match the abort stream session"
+                ),
+            });
+        }
+        if abort
+            .stream_create_bucket_write_reservation
+            .as_ref()
+            .is_some_and(|proof| {
+                proof.bucket != abort.bucket
+                    || proof.cluster_epoch != request.cluster_epoch
+                    || !is_stream_create_bucket_write_operation_kind(&proof.operation_kind)
+                    || proof.target_context.as_deref() != Some(abort.key.as_str())
+            })
+        {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: format!(
+                    "{operation} stream-create reservation does not match the abort route"
+                ),
+            });
+        }
+        Ok(abort)
+    }
+
+    fn retained_stream_abort_command_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcMetadataCommandRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedStreamAbortCommandRoute<'a>, StorageRpcErrorResponse> {
+        let abort = Self::validate_retained_stream_abort_command_subject(request, operation)?;
+        let route = self.retained_stream_abort_route_with_primary(
             route_permit,
-            &StorageRpcObjectRequest {
+            StorageNodeRetainedStreamAbortSubject {
                 node_id: request.node_id,
-                cluster_epoch: request.cluster_epoch,
-                pg_id: request.pg_id,
-                bucket: abort.bucket.clone(),
-                key: abort.key.clone(),
+                route_cluster_epoch: request.cluster_epoch,
+                raw_pg_id: request.pg_id,
+                bucket: &abort.bucket,
+                key: &abort.key,
             },
-            require_primary,
+            false,
             operation,
-        )
+        )?;
+        Ok(StorageNodeRetainedStreamAbortCommandRoute {
+            route,
+            command: &request.command,
+        })
+    }
+
+    fn retained_primary_stream_abort_command_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcMetadataCommandRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeRetainedPrimaryStreamAbortCommandRoute<'a>, StorageRpcErrorResponse>
+    {
+        let abort = Self::validate_retained_stream_abort_command_subject(request, operation)?;
+        let route = self.retained_stream_abort_route_with_primary(
+            route_permit,
+            StorageNodeRetainedStreamAbortSubject {
+                node_id: request.node_id,
+                route_cluster_epoch: request.cluster_epoch,
+                raw_pg_id: request.pg_id,
+                bucket: &abort.bucket,
+                key: &abort.key,
+            },
+            true,
+            operation,
+        )?;
+        Ok(StorageNodeRetainedPrimaryStreamAbortCommandRoute {
+            route: StorageNodeRetainedPrimaryStreamAbortRoute { route },
+            command: &request.command,
+        })
     }
 
     fn active_bucket_route_pair<'a>(
