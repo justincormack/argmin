@@ -1672,6 +1672,32 @@ Thirty-second Phase 3 slice:
   workspace-wide strict Clippy, and the full parallel workspace suite (7,422
   tests).
 
+Thirty-third Phase 3 slice:
+
+- the exact-object version scan used by lifecycle expiration now consumes the
+  `StorageNodeActivePrimaryObjectRoute` established from the frame. The
+  capability fixes the trusted `ObjectMetadataPgId`, bucket, and key and
+  revalidates the frame's immutable captured deadline immediately before the
+  local metadata read.
+- the handler retains the existing request-shape precedence: a lifecycle scan
+  carrying a version ID is rejected as `PayloadDecode` before route
+  construction. Valid requests can no longer reach the node client without
+  active admission, primary validation, and exact object placement.
+- the deterministic active-object regression positively reads the complete
+  version list and proves the scan fails at the capability's original
+  deadline after a raw same-epoch validity extension. The Unix two-PG
+  regression reads the expected list through the correct route, then requires
+  exact `PayloadDecode` for an equivalent-state wrong PG that would otherwise
+  return the same object history.
+- stream and multipart mutations, payload reclaim, remaining object
+  mutations, PG-wide listing scans, data operations, frontend capability
+  migration, and capability requirements on node-client traits remain open
+  in Phase 3.
+- validation passed formatting, the storage boundary checker, the focused
+  active-object deadline regression, both Unix lifecycle positive and
+  equivalent-state wrong-PG paths, all 2,200 storage tests, workspace-wide
+  strict Clippy, and the full parallel workspace suite (7,436 tests).
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

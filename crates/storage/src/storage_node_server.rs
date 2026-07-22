@@ -3809,6 +3809,23 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
+    fn list_object_versions_for_lifecycle(
+        &self,
+    ) -> Result<Vec<crate::StoredObject>, StorageNodeObjectRouteError> {
+        self.route.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.route.handler.config.node_id,
+            Arc::clone(&self.route.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::list_object_versions_for_lifecycle(
+            &local_client,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)
+    }
+
     fn build_put_object_metadata_command(
         &self,
         requested_version_id: Option<s3_types::VersionId>,
@@ -4873,7 +4890,7 @@ impl StorageNodeConnectionHandler {
                 match decode_object_delete_snapshot_request(&frame.payload) {
                     Ok(request) => match frame.kind {
                         StorageRpcMessageKind::ObjectLifecycleVersionListLoad => {
-                            self.object_lifecycle_version_list_response(request)
+                            self.object_lifecycle_version_list_response(route_permit, request)
                         }
                         _ => {
                             self.object_delete_snapshot_response(route_permit, frame.kind, request)
@@ -7326,6 +7343,7 @@ impl StorageNodeConnectionHandler {
 
     fn object_lifecycle_version_list_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectDeleteSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if request.version_id.is_some() {
@@ -7334,30 +7352,20 @@ impl StorageNodeConnectionHandler {
                 message: "lifecycle version list request must not include version id".to_string(),
             });
         }
-        if let Err(error) = self.validate_pg_route(
-            request.object.node_id,
-            request.object.cluster_epoch,
-            request.object.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_object(
-            request.object.pg_id,
-            &request.object.bucket,
-            &request.object.key,
+        let route = match self.active_primary_object_route(
+            route_permit,
+            &request.object,
             "object lifecycle version list load",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let versions = match ObjectMutationMetadataNodeClient::list_object_versions_for_lifecycle(
-            &local_client,
-            self.validated_object_metadata_pg(&request.object.bucket, &request.object.key),
-            &request.object.bucket,
-            &request.object.key,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let versions = match route.list_object_versions_for_lifecycle() {
             Ok(versions) => versions,
-            Err(error) => {
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
                 return encode_storage_rpc_error_response(&object_pg_error_response(error))
             }
         };
@@ -18917,8 +18925,11 @@ mod tests {
                 let specific = primary_route
                     .load_specific_object_delete_snapshot(VersionId::Null)
                     .unwrap();
+                let lifecycle_versions =
+                    primary_route.list_object_versions_for_lifecycle().unwrap();
                 assert_eq!(current.stored.as_ref(), Some(&metadata_stored));
                 assert_eq!(specific, current);
+                assert_eq!(lifecycle_versions, vec![metadata_stored.clone()]);
                 (metadata_stored, current, specific)
             });
 
@@ -19087,6 +19098,12 @@ mod tests {
                     "specific object delete snapshot load",
                     primary_route
                         .load_specific_object_delete_snapshot(VersionId::Null)
+                        .map(|_| ()),
+                ),
+                (
+                    "lifecycle object version list load",
+                    primary_route
+                        .list_object_versions_for_lifecycle()
                         .map(|_| ()),
                 ),
                 (

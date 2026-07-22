@@ -525,7 +525,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..35)
+    let server_threads: Vec<_> = (0..36)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -760,6 +760,14 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         })
     ));
 
+    let lifecycle_versions = ObjectMutationMetadataNodeClient::list_object_versions_for_lifecycle(
+        &client,
+        correct_object_pg,
+        &bucket,
+        &key,
+    )
+    .unwrap();
+    assert_eq!(lifecycle_versions, vec![metadata_stored.clone()]);
     let lifecycle_list_error =
         ObjectMutationMetadataNodeClient::list_object_versions_for_lifecycle(
             &client,
